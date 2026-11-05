@@ -1455,6 +1455,14 @@ async def drain(body: dict[str, Any], authorization: str | None = Header(default
     return {"drained": await runtime.hold_gate(float(body.get("seconds", 30)))}
 
 
+@app.post("/internal/release")
+async def release(authorization: str | None = Header(default=None)) -> dict[str, str]:
+    """The pool change this worker was drained for is over."""
+    verify_token(authorization)
+    await runtime.release_gate()
+    return {"status": "released"}
+
+
 @app.post("/internal/configure")
 async def configure(body: ConfigureRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     verify_token(authorization)

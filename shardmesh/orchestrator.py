@@ -92,6 +92,8 @@ MAX_ROUTE_MOVES = 8
 # New streams a reply may open while recovering, before going one token at a time.
 STREAM_ATTEMPTS = 6
 DRAIN_WAIT_SECONDS = 45.0
+# Long enough for a planned move to finish, for a reply that arrives during one.
+MOVE_WAIT_SECONDS = 90.0
 # How often a reply with nothing arriving checks that its entry worker is still there.
 STREAM_CHECK_SECONDS = 5.0
 # How long workers get to come back before a saved route is rebuilt from scratch.
@@ -394,6 +396,7 @@ class Orchestrator:
         self.stage_errors = 0
         self.replies_in_flight = 0
         self.warned_interception: set[str] = set()
+        self.drained: set[str] = set()
         self.reply_checker: TicketChecker | None = None
         self.maintenance_task: asyncio.Task[None] | None = None
         self.gossip_task: asyncio.Task[None] | None = None
@@ -1100,6 +1103,7 @@ class Orchestrator:
                 raise RuntimeError(response.text[:400])
 
         results = await asyncio.gather(*(configure(stage) for stage in route), return_exceptions=True)
+        await self._release_entries()
         failed = {
             stage.worker_id: str(result)
             for stage, result in zip(route, results)
@@ -1136,6 +1140,7 @@ class Orchestrator:
             for stage in (route[:1] + self.route[:1])
             if (record := self.workers.get(stage.worker_id)) is not None and record.live
         }
+        self.drained = entries
 
         async def drain(url: str) -> None:
             try:
@@ -1149,6 +1154,29 @@ class Orchestrator:
                 pass  # a dead entry has nothing left to protect
 
         await asyncio.gather(*(drain(url) for url in entries))
+
+    async def _release_entries(self) -> None:
+        """Let drained entry workers go, once the route has moved on.
+
+        A worker leaving the route gets no configure to release it, and replies
+        queued there would otherwise sit until its timer ran out: seen as 178 s of
+        silence. Released, they find their epoch is gone and move to the new route.
+        """
+
+        async def release(url: str) -> None:
+            try:
+                await self.client.post(url.rstrip("/") + "/internal/release", headers=auth_headers(self.pool_token), timeout=5.0)
+            except httpx.HTTPError:
+                pass  # its own timer still covers it
+
+        drained, self.drained = self.drained, set()
+        await asyncio.gather(*(release(url) for url in drained))
+
+    async def wait_for_route(self) -> None:
+        """A reply arriving during a move waits for it, rather than being turned away."""
+        deadline = time.monotonic() + MOVE_WAIT_SECONDS
+        while not self.route and self.active is not None and time.monotonic() < deadline:
+            await asyncio.sleep(0.25)
 
     async def deploy(
         self,
@@ -1410,6 +1438,7 @@ class Orchestrator:
         # Real failures are limited to two. A route moving on is not a failure,
         # and several changes in a row must not use those attempts up.
         while attempt < 2 and moves < MAX_ROUTE_MOVES:
+            await self.wait_for_route()
             if not self.route:
                 raise HTTPException(status_code=409, detail="no active model pipeline")
             must_replay = session.needs_reset or session.epoch != self.epoch
@@ -2424,9 +2453,10 @@ async def models(authorization: str | None = Header(default=None)) -> dict[str, 
     return {"object": "list", "data": data}
 
 
-def check_request(model: str | None) -> None:
+async def check_request(model: str | None) -> None:
     if model and runtime.model_id and model != runtime.model_id:
         raise HTTPException(status_code=404, detail=f"model {model!r} is not loaded")
+    await runtime.wait_for_route()
     if not runtime.tokenizer or not runtime.route:
         raise HTTPException(status_code=409, detail="no model is ready; load one first")
 
@@ -2477,7 +2507,7 @@ async def completions(
     authorization: str | None = Header(default=None),
 ) -> Any:
     verify_user(authorization)
-    check_request(body.model)
+    await check_request(body.model)
     if isinstance(body.prompt, list):
         if len(body.prompt) != 1:
             raise HTTPException(status_code=400, detail="prototype supports one prompt per request")
@@ -2518,7 +2548,7 @@ async def chat_completions(
     authorization: str | None = Header(default=None),
 ) -> Any:
     verify_user(authorization)
-    check_request(body.model)
+    await check_request(body.model)
     messages = [message.model_dump() for message in body.messages]
     assert runtime.tokenizer is not None
     prompt = await asyncio.to_thread(runtime.tokenizer.render_chat, messages, body.enable_thinking)

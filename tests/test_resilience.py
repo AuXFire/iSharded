@@ -946,3 +946,51 @@ def test_merged_passes_stay_off_unless_asked_for():
     assert not WorkerRuntime._can_merge(held, torch.zeros(1, 2, 4), step)
     step.reset = True
     assert not WorkerRuntime._can_merge(held, hidden, step)
+
+
+def test_a_worker_leaving_the_route_is_released_from_its_drain():
+    asked = []
+
+    def handler(request):
+        asked.append(request.url.path)
+        return httpx.Response(200, json={"drained": True})
+
+    orchestrator = pool(w1=record("w1"), w2=record("w2"))
+
+    async def scenario():
+        orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        orchestrator.route = [stage("w1")]
+        await orchestrator._drain_entries([stage("w2")])
+        await orchestrator._release_entries()
+        await orchestrator._release_entries()
+        await orchestrator.close()
+
+    asyncio.run(scenario())
+    assert asked.count("/internal/drain") == 2
+    assert asked.count("/internal/release") == 2
+
+
+def test_a_reply_arriving_during_a_move_waits_for_it():
+    orchestrator = pool(w1=record("w1"))
+    orchestrator.active = object()
+
+    async def scenario():
+        async def finish_move():
+            await asyncio.sleep(0.05)
+            orchestrator.route = [stage("w1")]
+
+        moved = asyncio.ensure_future(finish_move())
+        await orchestrator.wait_for_route()
+        await moved
+        await orchestrator.close()
+
+    asyncio.run(scenario())
+    assert orchestrator.route
+
+
+def test_with_no_model_loaded_a_reply_does_not_wait():
+    orchestrator = pool()
+    started = time.monotonic()
+    asyncio.run(orchestrator.wait_for_route())
+    assert time.monotonic() - started < 0.5
+    done(orchestrator)
