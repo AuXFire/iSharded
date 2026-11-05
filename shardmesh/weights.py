@@ -849,6 +849,12 @@ class UnitCache:
             return False
         return path.stat().st_size == len(_unit_layout(unit)[0]) + unit.nbytes
 
+    def _discard(self, model_id: str, revision: str, unit: WeightUnit) -> None:
+        try:
+            self.path(model_id, revision, unit.name).unlink()
+        except PermissionError as exc:  # Windows will not delete a file a running stage has open
+            raise WeightSourceError(f"{unit.name} does not match its hash, and a running stage is using it") from exc
+
     def _intact(self, model_id: str, revision: str, unit: WeightUnit) -> bool:
         return file_sha256(self.path(model_id, revision, unit.name)) == unit.sha256
 
@@ -924,7 +930,7 @@ class UnitCache:
         for unit in units:
             # What is already on disk gets no more trust than what arrives.
             if unit.sha256 and self.has(model_id, revision, unit) and not self._intact(model_id, revision, unit):
-                self.path(model_id, revision, unit.name).unlink()
+                self._discard(model_id, revision, unit)
         missing = [unit for unit in units if not self.has(model_id, revision, unit)]
         progress.units_total = len(units)
         progress.units_done = len(units) - len(missing)
@@ -945,7 +951,7 @@ class UnitCache:
         def accepted(unit: WeightUnit) -> bool:
             if not unit.sha256 or self._intact(model_id, revision, unit):
                 return True
-            self.path(model_id, revision, unit.name).unlink()
+            self._discard(model_id, revision, unit)
             return False
 
         def fetch_one(unit: WeightUnit) -> None:
