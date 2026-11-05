@@ -388,7 +388,7 @@ class Orchestrator:
         self.installed_epoch: int | None = None
         self.following = False
         self.follow_retry_at = 0.0
-        self.last_repair_at = 0.0
+        self.last_repair_at = float("-inf")  # monotonic time starts near zero after a reboot
         self.stage_restarts = 0
         self.stream_fallbacks = 0
         self.stage_errors = 0
