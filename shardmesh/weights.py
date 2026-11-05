@@ -691,6 +691,48 @@ class FetchProgress:
         }
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def manifest_sha256(manifest: Manifest) -> str:
+    """Covers what nodes are told about a model beyond its weights: config, shapes, offsets."""
+    tensors = {name: tensor.model_dump() for name, tensor in sorted(manifest.tensors.items())}
+    body = json.dumps({"config": manifest.config, "tensors": tensors}, sort_keys=True, default=str)
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
+MANIFEST_KEY = "manifest"
+
+
+def apply_model_hashes(manifest: Manifest, units: list[WeightUnit], hashes: dict[str, str]) -> None:
+    """Check a model's description, and tell each unit what it must hash to."""
+    if hashes.get(MANIFEST_KEY) != manifest_sha256(manifest):
+        raise WeightSourceError("this model's description does not match the hashes given; it is a different file, or altered")
+    missing = [unit.name for unit in units if unit.name not in hashes]
+    if missing:
+        raise WeightSourceError(f"the hashes given have no entry for {missing[0]} and {len(missing) - 1} others")
+    for unit in units:
+        unit.sha256 = hashes[unit.name]
+
+
+def hash_model(manifest: Manifest, units: list[WeightUnit], reader: Reader, folder: Path) -> dict[str, str]:
+    """Hash every unit exactly as a worker would build it. Reads the whole model."""
+    hashes = {MANIFEST_KEY: manifest_sha256(manifest)}
+    scratch = folder / "unit.hashing"
+    try:
+        for unit in units:
+            fetch_unit(reader, unit, scratch, lambda count: None)
+            hashes[unit.name] = file_sha256(scratch)
+    finally:
+        scratch.unlink(missing_ok=True)
+    return hashes
+
+
 def fetch_from_peer(
     peer_url: str,
     token: str | None,
@@ -801,6 +843,9 @@ class UnitCache:
             return False
         return path.stat().st_size == len(_unit_layout(unit)[0]) + unit.nbytes
 
+    def _intact(self, model_id: str, revision: str, unit: WeightUnit) -> bool:
+        return file_sha256(self.path(model_id, revision, unit.name)) == unit.sha256
+
     def held(self, model_id: str, revision: str) -> dict[str, int]:
         """Finished units of a model, by name, with their file sizes."""
         if not SAFE_NAME.fullmatch(revision):
@@ -870,6 +915,10 @@ class UnitCache:
     ) -> None:
         """Bring every unit into the cache, skipping any already present."""
         self.root.mkdir(parents=True, exist_ok=True)  # it may have been cleared by hand
+        for unit in units:
+            # What is already on disk gets no more trust than what arrives.
+            if unit.sha256 and self.has(model_id, revision, unit) and not self._intact(model_id, revision, unit):
+                self.path(model_id, revision, unit.name).unlink()
         missing = [unit for unit in units if not self.has(model_id, revision, unit)]
         progress.units_total = len(units)
         progress.units_done = len(units) - len(missing)
@@ -887,17 +936,24 @@ class UnitCache:
 
         local = {name: self.local_copy(name, size) for name, size in (file_sizes or {}).items()}
 
+        def accepted(unit: WeightUnit) -> bool:
+            if not unit.sha256 or self._intact(model_id, revision, unit):
+                return True
+            self.path(model_id, revision, unit.name).unlink()
+            return False
+
         def fetch_one(unit: WeightUnit) -> None:
             destination = self.path(model_id, revision, unit.name)
             copy = local.get(unit.tensors[0].file)
             if copy is not None:
                 reader = LocalReader(str(copy.parent))
                 fetch_unit(reader, unit, destination, add_bytes)
-                with lock:
-                    progress.units_done += 1
-                return
+                if accepted(unit):
+                    with lock:
+                        progress.units_done += 1
+                    return
             for peer in (peers or {}).get(unit.name, []):
-                if fetch_from_peer(peer, token, model_id, revision, unit, destination, add_bytes):
+                if fetch_from_peer(peer, token, model_id, revision, unit, destination, add_bytes) and accepted(unit):
                     with lock:
                         # A unit file is its tensors plus a small header.
                         progress.bytes_done += unit.nbytes - destination.stat().st_size
@@ -909,6 +965,8 @@ class UnitCache:
                 fetch_unit(reader, unit, self.path(model_id, revision, unit.name), add_bytes)
             finally:
                 reader.close()
+            if not accepted(unit):
+                raise WeightSourceError(f"{unit.name} did not match its hash from any source")
             with lock:
                 progress.units_done += 1
 

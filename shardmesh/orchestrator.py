@@ -20,7 +20,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from starlette.background import BackgroundTask
 
 from . import __version__
-from .access import node_of, ROLE_ADMIN, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, Caller
+from .access import Authority, NeedsAuthority, node_of, ROLE_ADMIN, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, Caller
 from .gguf import parse_source
 from .mesh import GOSSIP_SECONDS, ControlMesh
 from .models import Adapter, GgufAdapter, SUPPORTED_TYPES, UnsupportedModel, create_adapter
@@ -49,7 +49,7 @@ from .pool import check_exposure, home as pool_home, load_token
 from .serving import BodyLimit, serve
 from .tls import PEER, client_verify
 from .tokenizer import ChatTokenizer, IncrementalText, load_tokenizer
-from .weights import Manifest, WeightSourceError, build_manifest
+from .weights import apply_model_hashes, Manifest, WeightSourceError, build_manifest
 
 # Replans allowed when workers fail mid-load before the job gives up.
 MAX_DEPLOY_ATTEMPTS = 4
@@ -166,6 +166,7 @@ class ModelTarget:
     # Workers that hold the whole GGUF, for a pool that cannot reach a model host.
     file_sources: list[str] = field(default_factory=list)
     slots: int = 1
+    merge_passes: bool = False
 
     @property
     def file_sizes(self) -> dict[str, int]:
@@ -234,6 +235,8 @@ def build_target(
     speculate_tokens = request.draft_tokens if draft else 0
     slots = request.parallel if isinstance(adapter, GgufAdapter) else 1
     units = adapter.partition(manifest.tensors)
+    if request.model_hashes:
+        apply_model_hashes(manifest, units, request.model_hashes)
     by_kind = {unit.kind: unit for unit in units if unit.kind in {"embed", "head"}}
     embedding = by_kind["embed"].tensors
     head_tensors = {tensor.name for tensor in by_kind["head"].tensors}
@@ -272,6 +275,7 @@ def build_target(
         request=request,
         file_sources=holders,
         slots=slots,
+        merge_passes=request.merge_passes,
     )
 
 
@@ -360,8 +364,12 @@ class Orchestrator:
         self.epoch = 0
         self.job: LoadJob | None = None
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(3600.0, connect=10.0), verify=client_verify())
+        authority_file = os.getenv("SHARDMESH_CA_FILE")
         self.access = AccessControl.load(
-            self.pool_token, os.getenv("SHARDMESH_KEYS_FILE"), identities=bool(os.getenv("SHARDMESH_CA_FILE"))
+            self.pool_token,
+            os.getenv("SHARDMESH_KEYS_FILE"),
+            identities=bool(authority_file),
+            authority=Authority(authority_file) if authority_file else None,
         )
         self.audit = AuditLog(os.getenv("SHARDMESH_AUDIT_FILE"), os.getenv("SHARDMESH_NODE_ID") or socket.gethostname())
         self.control_lock = asyncio.Lock()
@@ -482,11 +490,19 @@ class Orchestrator:
         held = self.mesh.replica_version
         lost_leadership = self.mesh.observe(message)
         self.access.merge(message.get("access"))
-        self.mesh.forget(self.access.revoked)
+        self.apply_revocations()
         if self.mesh.replica_version != held and self.mesh.replica:
             self._write_state(self.mesh.replica)
         if lost_leadership:
             self._step_down()
+
+    def apply_revocations(self) -> None:
+        """Act on revoked nodes, wherever the news came from."""
+        if self.mesh:
+            self.mesh.forget(self.access.revoked)
+        for worker_id, record in self.workers.items():
+            if node_of(worker_id) in self.access.revoked and not record.quarantined:
+                self._quarantine(worker_id, "its node was revoked")
 
     def _step_down(self) -> None:
         """Another node outranks this one, so it stops coordinating at once.
@@ -1048,6 +1064,7 @@ class Orchestrator:
                 draft=target.draft,
                 term=self.mesh.term if self.mesh else 0,
                 slots=target.slots,
+                merge_passes=target.merge_passes,
             )
             response = await self.client.post(
                 stage.url.rstrip("/") + "/internal/configure",
@@ -2219,6 +2236,8 @@ async def create_api_key(body: dict[str, Any], authorization: str | None = Heade
     verify_admin(authorization)
     try:
         key = runtime.access.add_key(str(body["name"]), str(body.get("role", ROLE_USER)), int(body.get("requests_per_minute", 0)))
+    except NeedsAuthority as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     runtime.add_event("security", "API key created", f"{body['name']} ({body.get('role', ROLE_USER)})")
@@ -2228,7 +2247,11 @@ async def create_api_key(body: dict[str, Any], authorization: str | None = Heade
 @app.delete("/admin/keys/{name}")
 async def delete_api_key(name: str, authorization: str | None = Header(default=None)) -> dict[str, str]:
     verify_admin(authorization)
-    if not runtime.access.remove_key(name):
+    try:
+        removed = runtime.access.remove_key(name)
+    except NeedsAuthority as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not removed:
         raise HTTPException(status_code=404, detail=f"no key named {name!r}")
     runtime.add_event("security", "API key revoked", name)
     return {"status": "revoked"}
@@ -2238,14 +2261,25 @@ async def delete_api_key(name: str, authorization: str | None = Header(default=N
 async def revoke_node(name: str, authorization: str | None = Header(default=None)) -> dict[str, str]:
     """Stop trusting a node's certificate and take its workers out of the route."""
     verify_admin(authorization)
-    runtime.access.revoke_node(name)
+    try:
+        runtime.access.revoke_node(name)
+    except NeedsAuthority as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     runtime.add_event("security", "Node revoked", name)
-    if runtime.mesh:
-        runtime.mesh.forget([name])
-    for worker_id in list(runtime.workers):
-        if node_of(worker_id) == name:
-            runtime._quarantine(worker_id, "its node was revoked")
+    runtime.apply_revocations()
     return {"status": "revoked"}
+
+
+@app.post("/access/entries")
+async def add_access_entry(body: dict[str, Any]) -> dict[str, str]:
+    """Take a change signed by the pool authority. The signature is the credential."""
+    if runtime.access.authority is None:
+        raise HTTPException(status_code=404, detail="this pool has no authority")
+    if not runtime.access.add_signed(body):
+        raise HTTPException(status_code=403, detail="this entry is not signed by the pool authority")
+    runtime.add_event("security", "Access list changed", str(body["entry"].get("type")))
+    runtime.apply_revocations()
+    return {"status": "accepted"}
 
 
 @app.post("/admin/nodes/{name}/cordon")

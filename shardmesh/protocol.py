@@ -145,6 +145,8 @@ class WeightUnit(BaseModel):
     kind: str  # embed | head | dense | experts
     layer: int | None = None
     tensors: list[TensorRef]
+    # When set, what this unit's file must hash to, wherever it came from.
+    sha256: str | None = None
 
     @property
     def nbytes(self) -> int:
@@ -207,6 +209,8 @@ class ConfigureRequest(BaseModel):
     # Leadership generation. Workers refuse orders older than the newest they saw.
     term: int = 0
     slots: int = 1
+    # Let conversations share a pass through each stage. See worker._can_merge.
+    merge_passes: bool = False
 
 
 class CacheRestoreRequest(BaseModel):
@@ -243,6 +247,10 @@ class LoadModelRequest(BaseModel):
     draft_tokens: int = Field(default=6, ge=1, le=16)  # the most guesses per pass
     # Replies the pipeline runs at once. Each costs its own context memory.
     parallel: int = Field(default=1, ge=1, le=32)
+    merge_passes: bool = False
+    # From `shardmesh model hash`, run on a copy you trust. Every node then checks
+    # every unit against it, so no peer or mirror has to be believed.
+    model_hashes: dict[str, str] | None = None
     # False returns as soon as the job starts; poll /admin/status for progress.
     wait: bool = True
 

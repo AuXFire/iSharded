@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
+from typing import Any
+from pathlib import Path
+import ssl
+import secrets
 import os
 import subprocess
 import sys
@@ -130,6 +135,8 @@ def run_load(args: argparse.Namespace) -> int:
         "wait": False,
         "placement": args.placement,
         "context_tokens": args.context_tokens,
+        "merge_passes": args.merge_passes,
+        "model_hashes": json.loads(Path(args.hashes).read_text(encoding="utf-8")) if args.hashes else None,
     }
     if args.entry:
         body["entry_worker"] = args.entry
@@ -165,6 +172,34 @@ def run_load(args: argparse.Namespace) -> int:
             return 1
 
 
+def send_signed(args: argparse.Namespace, entry: dict[str, Any]) -> None:
+    """Sign a change with the pool authority and hand it to any node."""
+    from .pool import sign_entry
+
+    authority = str(Path(args.dir) / "ca.pem")
+    response = httpx.post(args.url.rstrip("/") + "/access/entries", json=sign_entry(args.dir, entry), verify=ssl.create_default_context(cafile=authority), timeout=30, trust_env=False)
+    if response.status_code != 200:
+        raise SystemExit(f"{response.status_code}: {response.text[:200]}")
+
+
+def run_model_hash(args: argparse.Namespace) -> int:
+    """Hash a model the way workers build it. Reads all of it, so run it near the file."""
+    from .models import create_adapter
+    from .weights import build_manifest, hash_model, open_reader
+
+    manifest = build_manifest(args.source)
+    units = create_adapter(manifest.config).partition(manifest.tensors)
+    out = Path(args.out).resolve()
+    reader = open_reader(args.source)
+    try:
+        hashes = hash_model(manifest, units, reader, out.parent)
+    finally:
+        reader.close()
+    out.write_text(json.dumps(hashes, indent=1), encoding="utf-8")
+    print(f"Hashed {len(units)} units into {out}.")
+    return 0
+
+
 def run_cordon(args: argparse.Namespace) -> int:
     """Take a node out of service, or put it back. Replies finish first."""
     token = args.token or load_token()
@@ -198,14 +233,24 @@ def main() -> None:
     issue.add_argument("name")
     issue.add_argument("--dir", required=True)
     issue.add_argument("--address", action="append", required=True, help="an address peers use for this node; repeatable")
+    revoke = pool_commands.add_parser("revoke", help="throw a node out for good, signed by the pool authority")
+    revoke.add_argument("name")
+    revoke.add_argument("--dir", required=True)
+    revoke.add_argument("--url", default="http://127.0.0.1:8000", help="any node's control address")
 
     key = subparsers.add_parser("key", help="manage API keys")
     key_commands = key.add_subparsers(dest="key_command", required=True)
     create = key_commands.add_parser("create", help="add a key; it is shown once")
     create.add_argument("name")
     create.add_argument("--role", choices=["user", "admin"], default="user")
-    create.add_argument("--file", required=True, help="the key file nodes read with --keys-file")
+    create.add_argument("--file", help="the key file nodes read with --keys-file")
+    create.add_argument("--dir", help="the pool's secrets folder: sign this with its authority and send it to --url")
+    create.add_argument("--url", default="http://127.0.0.1:8000", help="any node's control address, with --dir")
     create.add_argument("--requests-per-minute", type=int, default=0, help="0 is no limit")
+    remove = key_commands.add_parser("remove", help="remove a key for good, signed by the pool authority")
+    remove.add_argument("name")
+    remove.add_argument("--dir", required=True)
+    remove.add_argument("--url", default="http://127.0.0.1:8000")
 
     for name, summary in (("cordon", "move a node's share elsewhere, for maintenance"), ("uncordon", "put a node back in service")):
         change = subparsers.add_parser(name, help=summary)
@@ -215,6 +260,12 @@ def main() -> None:
         if name == "cordon":
             change.add_argument("--force", action="store_true", help="go ahead even if this moves a lot of data between nodes")
         change.set_defaults(handler=run_cordon)
+    model = subparsers.add_parser("model", help="work with model files")
+    model_commands = model.add_subparsers(dest="model_command", required=True)
+    hashes = model_commands.add_parser("hash", help="hash a model on a copy you trust, for load --hashes")
+    hashes.add_argument("source", help="a GGUF file or a safetensors folder")
+    hashes.add_argument("--out", required=True, help="the file to write")
+    hashes.set_defaults(handler=run_model_hash)
     load = subparsers.add_parser("load", help="load a model on a running pool")
     load.add_argument("model")
     load.add_argument("--url", default="http://127.0.0.1:8000", help="orchestrator address")
@@ -228,6 +279,8 @@ def main() -> None:
     load.add_argument("--parallel", type=int, help="replies to run at once; each costs its own context memory")
     load.add_argument("--no-peer-fetch", action="store_true", help="download every shard from the model host")
     load.add_argument("--pool-token", default=load_token())
+    load.add_argument("--merge-passes", action="store_true", help="let conversations share a pass through each stage")
+    load.add_argument("--hashes", default=None, help="file from `shardmesh model hash`: every node checks every unit against it")
     load.set_defaults(handler=run_load)
     node = subparsers.add_parser("node", help="contribute CPU, RAM, GPU, or any combination")
     add_node_arguments(node)
@@ -236,16 +289,31 @@ def main() -> None:
     if args.command == "pool":
         from .pool import add_node, init_pool
 
-        if args.pool_command == "init":
+        if args.pool_command == "revoke":
+            send_signed(args, {"type": "revoke", "name": args.name})
+            print(f"{args.name} is revoked.")
+        elif args.pool_command == "init":
             folder = init_pool(args.dir)
-            print(f"Created pool credentials in {folder}. Copy pool.token to each node, and keep ca.key off them.")
+            print(f"Created pool credentials in {folder}. For a shared-token pool, copy pool.token to each node. With certificates, nodes need only ca.pem and their own files. Keep ca.key off them.")
         else:
             certificate, key_file = add_node(args.dir, args.name, args.address)
             print(f"Issued {certificate} and {key_file}. Give the node those and ca.pem.")
         return
     if args.command == "key":
-        from .access import create_key
+        from .access import create_key, digest
 
+        if args.key_command == "remove":
+            send_signed(args, {"type": "remove_key", "name": args.name})
+            print(f"Removed {args.name}.")
+            return
+        if args.dir:
+            key = "smk-" + secrets.token_urlsafe(32)
+            send_signed(args, {"type": "key", "name": args.name, "role": args.role, "sha256": digest(key), "requests_per_minute": args.requests_per_minute})
+            print(f"Key for {args.name} ({args.role}). Save it now: it is stored only as a hash.")
+            print(key)
+            return
+        if not args.file:
+            parser.error("give --file for a key file, or --dir and --url to sign one for a running pool")
         key = create_key(args.file, args.name, args.role, args.requests_per_minute)
         print(f"Key for {args.name} ({args.role}). Save it now: it is stored only as a hash.")
         print(key)

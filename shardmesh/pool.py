@@ -7,11 +7,13 @@ service, so a pool on a closed network can set itself up.
 
 from __future__ import annotations
 
+import base64
 import datetime
 import ipaddress
 import os
 from pathlib import Path
 import secrets
+from typing import Any
 from urllib.parse import urlsplit
 
 LOOPBACK = {"127.0.0.1", "localhost", "::1"}
@@ -131,6 +133,19 @@ def init_pool(folder: str) -> Path:
     )
     (root / "ca.pem").write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
     return root
+
+
+def sign_entry(folder: str, entry: dict[str, Any]) -> dict[str, Any]:
+    """Sign a change to the pool's access list. Only the authority's private key can."""
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    from .access import canonical
+
+    signer = serialization.load_pem_private_key((Path(folder) / "ca.key").read_bytes(), password=None)
+    entry = {**entry, "issued_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"), "id": secrets.token_hex(8)}
+    signature = signer.sign(canonical(entry), ec.ECDSA(hashes.SHA256()))
+    return {"entry": entry, "signature": base64.b64encode(signature).decode()}
 
 
 def add_node(folder: str, name: str, addresses: list[str]) -> tuple[Path, Path]:

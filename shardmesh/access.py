@@ -14,10 +14,15 @@ revoked nodes is one versioned document. An admin changes it through any node, a
 gossip carries it to the rest, so nothing has to be copied by hand. Revocations and
 removed keys are kept for good and merged entry by entry, so neither a split nor a
 forged document can bring one back. To return a machine, issue it a new name.
+
+With a pool authority, every key and revocation is an entry signed with the
+authority's private key, which stays off the nodes. Nodes check the signature and
+ignore anything else, so a compromised node cannot add a key or revoke a peer.
 """
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field
 import hashlib
 import hmac
@@ -48,6 +53,39 @@ def digest(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()
 
 
+def canonical(entry: dict[str, Any]) -> bytes:
+    """The exact bytes an entry's signature covers."""
+    return json.dumps(entry, sort_keys=True, separators=(",", ":")).encode()
+
+
+class NeedsAuthority(ValueError):
+    """Only the pool authority can make this change."""
+
+
+class Authority:
+    """Checks signatures against the pool authority's certificate."""
+
+    def __init__(self, certificate_path: str) -> None:
+        try:
+            from cryptography import x509
+        except ImportError as exc:
+            raise SystemExit("A pool with an authority needs the cryptography package: pip install shardmesh[pool]") from exc
+        self.key = x509.load_pem_x509_certificate(Path(certificate_path).read_bytes()).public_key()
+
+    def verified(self, signed: Any) -> dict[str, Any] | None:
+        """The entry, if the authority really signed it."""
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        try:
+            entry, signature = signed["entry"], base64.b64decode(signed["signature"], validate=True)
+            self.key.verify(signature, canonical(entry), ec.ECDSA(hashes.SHA256()))
+        except (InvalidSignature, KeyError, TypeError, ValueError):
+            return None
+        return entry if isinstance(entry, dict) else None
+
+
 @dataclass(slots=True)
 class Caller:
     name: str
@@ -71,12 +109,24 @@ class AccessControl:
     path: Path | None = None
     # Nodes prove themselves with certificates, so nothing is open even with no token.
     identities: bool = False
+    authority: Authority | None = None
+    # Signed entries, by signature. Everything a pool with an authority shares.
+    signed: dict[str, dict[str, Any]] = field(default_factory=dict)
+    removed_names: set[str] = field(default_factory=set)
 
     @classmethod
-    def load(cls, pool_token: str | None, path: str | None, identities: bool = False) -> "AccessControl":
-        control = cls(pool_token=pool_token, path=Path(path) if path else None, identities=identities)
+    def load(
+        cls,
+        pool_token: str | None,
+        path: str | None,
+        identities: bool = False,
+        authority: Authority | None = None,
+    ) -> "AccessControl":
+        control = cls(pool_token=pool_token, path=Path(path) if path else None, identities=identities, authority=authority)
         if control.path and control.path.is_file():
-            control._apply(json.loads(control.path.read_text(encoding="utf-8")))
+            document = json.loads(control.path.read_text(encoding="utf-8"))
+            control._apply(document)
+            control._take_signed(document)  # checked again: the file may be older than the authority
         return control
 
     def _apply(self, document: dict[str, Any]) -> None:
@@ -107,7 +157,60 @@ class AccessControl:
             "revoked_nodes": sorted(self.revoked),
             "removed_keys": sorted(self.removed),
             "cordoned_nodes": sorted(self.cordoned),
+            "signed": [self.signed[signature] for signature in sorted(self.signed)],
         }
+
+    def _take_signed(self, document: dict[str, Any]) -> bool:
+        """Apply new signed entries from a document. Anything unsigned is ignored."""
+        if self.authority is None:
+            return False
+        changed = False
+        for signed in document.get("signed", []):
+            signature = signed.get("signature") if isinstance(signed, dict) else None
+            if not isinstance(signature, str) or signature in self.signed:
+                continue
+            entry = self.authority.verified(signed)
+            if entry is not None and self._apply_entry(entry):
+                self.signed[signature] = signed
+                changed = True
+        return changed
+
+    def _apply_entry(self, entry: dict[str, Any]) -> bool:
+        kind, name = entry.get("type"), str(entry.get("name", ""))
+        if kind == "key" and entry.get("role") in {ROLE_USER, ROLE_ADMIN} and isinstance(entry.get("sha256"), str):
+            if name not in self.removed_names:
+                self.keys[entry["sha256"]] = Caller(name, entry["role"], int(entry.get("requests_per_minute", 0)))
+            return True
+        if kind == "remove_key" and name:
+            self.removed_names.add(name)
+            for hashed in [hashed for hashed, caller in self.keys.items() if caller.name == name]:
+                del self.keys[hashed]
+                self.removed.add(hashed)
+            return True
+        if kind == "revoke" and name:
+            self.revoked.add(name)
+            return True
+        return False
+
+    def add_signed(self, signed: Any) -> bool:
+        """Take one signed entry from an operator. False if the signature is wrong."""
+        if self.authority is None or self.authority.verified(signed) is None:
+            return False
+        if self._take_signed({"signed": [signed]}):
+            self._changed()
+        return True
+
+    def _merge_with_authority(self, document: dict[str, Any]) -> bool:
+        mine = self.document()
+        changed = self._take_signed(document)
+        if self._rank(document) > self._rank(mine):
+            cordoned = set(document.get("cordoned_nodes", []))
+            changed = changed or cordoned != self.cordoned
+            self.cordoned = cordoned
+            self.version = max(self.version, int(document.get("version", 0)))
+        if changed:
+            self._save()
+        return changed
 
     def _rank(self, document: dict[str, Any]) -> tuple[int, str]:
         # Two sides of a split can reach one version. Any fixed rule settles it.
@@ -121,6 +224,8 @@ class AccessControl:
         """
         if not document:
             return False
+        if self.authority is not None:
+            return self._merge_with_authority(document)
         mine = self.document()
         newest = document if self._rank(document) > self._rank(mine) else mine
         removed = self.removed | set(document.get("removed_keys", []))
@@ -131,6 +236,7 @@ class AccessControl:
             "revoked_nodes": sorted(self.revoked | set(document.get("revoked_nodes", []))),
             "removed_keys": sorted(removed),
             "cordoned_nodes": sorted(newest.get("cordoned_nodes", [])),
+            "signed": mine["signed"],
         }
         if merged == mine:
             return False
@@ -150,7 +256,12 @@ class AccessControl:
         self.version += 1
         self._save()
 
+    def _refuse_with_authority(self, change: str) -> None:
+        if self.authority is not None:
+            raise NeedsAuthority(f"{change} needs the pool authority's signature; use the shardmesh command with --dir")
+
     def add_key(self, name: str, role: str, requests_per_minute: int = 0) -> str:
+        self._refuse_with_authority("a new key")
         if role not in {ROLE_USER, ROLE_ADMIN}:
             raise ValueError(f"role must be {ROLE_USER} or {ROLE_ADMIN}")
         if any(caller.name == name for caller in self.keys.values()):
@@ -161,6 +272,7 @@ class AccessControl:
         return key
 
     def remove_key(self, name: str) -> bool:
+        self._refuse_with_authority("removing a key")
         found = [hashed for hashed, caller in self.keys.items() if caller.name == name]
         for hashed in found:
             del self.keys[hashed]
@@ -170,6 +282,7 @@ class AccessControl:
         return bool(found)
 
     def revoke_node(self, name: str) -> None:
+        self._refuse_with_authority("revoking a node")
         self.revoked.add(name)
         self._changed()
 

@@ -360,3 +360,117 @@ def test_a_page_on_a_dead_node_can_still_fail_over_but_a_revoked_one_cannot():
     assert "http://a" in mesh.known_urls()
     mesh.forget(["a"])
     assert "http://a" not in mesh.known_urls()
+
+
+@pytest.fixture
+def signed_pool(tmp_path):
+    from shardmesh.access import Authority
+    from shardmesh.pool import init_pool
+
+    pytest.importorskip("cryptography")
+    folder = init_pool(str(tmp_path / "pool"))
+    return str(folder), AccessControl(identities=True, authority=Authority(str(folder / "ca.pem")))
+
+
+def key_entry(name="alice", role="admin", key="smk-test"):
+    from shardmesh.access import digest
+
+    return {"type": "key", "name": name, "role": role, "sha256": digest(key)}
+
+
+def test_a_signed_key_spreads_and_works(signed_pool):
+    from shardmesh.access import Authority
+    from shardmesh.pool import sign_entry
+
+    folder, access = signed_pool
+    assert access.add_signed(sign_entry(folder, key_entry()))
+    assert access.permits(access.identify("Bearer smk-test"), ROLE_ADMIN)
+    peer = AccessControl(identities=True, authority=Authority(folder + "/ca.pem"))
+    assert peer.merge(access.document())
+    assert peer.permits(peer.identify("Bearer smk-test"), ROLE_ADMIN)
+
+
+def test_a_compromised_node_cannot_add_a_key_through_gossip(signed_pool):
+    from shardmesh.access import digest
+
+    _, access = signed_pool
+    forged = {
+        "version": 999,
+        "keys": [{"name": "evil", "role": "admin", "sha256": digest("evil")}],
+        "revoked_nodes": ["good-node"],
+        "signed": [{"entry": key_entry("evil", key="evil"), "signature": "AAAA"}],
+    }
+    access.merge(forged)
+    assert access.identify("Bearer evil") is None
+    assert "good-node" not in access.revoked
+
+
+def test_an_entry_signed_by_another_authority_is_ignored(signed_pool, tmp_path):
+    from shardmesh.pool import init_pool, sign_entry
+
+    _, access = signed_pool
+    other = init_pool(str(tmp_path / "other"))
+    assert not access.add_signed(sign_entry(str(other), key_entry()))
+    assert access.identify("Bearer smk-test") is None
+
+
+def test_changing_a_signed_entry_breaks_it(signed_pool):
+    from shardmesh.pool import sign_entry
+
+    folder, access = signed_pool
+    signed = sign_entry(folder, key_entry(role="user"))
+    signed["entry"]["role"] = "admin"
+    assert not access.add_signed(signed)
+
+
+def test_a_signed_revocation_and_removal_stick(signed_pool):
+    from shardmesh.pool import sign_entry
+
+    folder, access = signed_pool
+    held = access.document()
+    access.add_signed(sign_entry(folder, key_entry()))
+    access.add_signed(sign_entry(folder, {"type": "remove_key", "name": "alice"}))
+    access.add_signed(sign_entry(folder, {"type": "revoke", "name": "bad"}))
+    access.merge({**held, "version": 500})
+    assert "bad" in access.revoked
+    assert access.identify("Bearer smk-test") is None
+    late = sign_entry(folder, key_entry(key="again"))
+    access.add_signed(late)
+    assert access.identify("Bearer again") is None, "a removed name stays removed"
+
+
+def test_signed_entries_survive_a_restart(signed_pool, tmp_path):
+    from shardmesh.access import Authority
+    from shardmesh.pool import sign_entry
+
+    folder, _ = signed_pool
+    path = tmp_path / "access.json"
+    authority = Authority(folder + "/ca.pem")
+    access = AccessControl.load(None, str(path), identities=True, authority=authority)
+    access.add_signed(sign_entry(folder, key_entry()))
+    again = AccessControl.load(None, str(path), identities=True, authority=authority)
+    assert again.permits(again.identify("Bearer smk-test"), ROLE_ADMIN)
+
+
+def test_with_an_authority_nodes_cannot_change_access_themselves(signed_pool):
+    from shardmesh.access import NeedsAuthority
+
+    _, access = signed_pool
+    for change in (lambda: access.add_key("x", ROLE_USER), lambda: access.remove_key("x"), lambda: access.revoke_node("x")):
+        with pytest.raises(NeedsAuthority):
+            change()
+
+
+def test_the_api_takes_signed_entries_and_refuses_the_rest(signed_pool, monkeypatch):
+    from shardmesh.pool import sign_entry
+
+    folder, access = signed_pool
+    runtime = Orchestrator()
+    runtime.access = access
+    monkeypatch.setattr(orchestrator_module, "runtime", runtime)
+    client = TestClient(orchestrator_module.app)
+    assert client.post("/access/entries", json={"entry": key_entry(), "signature": "AAAA"}).status_code == 403
+    assert client.post("/access/entries", json=sign_entry(folder, key_entry())).status_code == 200
+    admin = {"Authorization": "Bearer smk-test"}
+    assert client.post("/admin/keys", json={"name": "x"}, headers=admin).status_code == 409
+    assert client.post("/admin/nodes/x/revoke", headers=admin).status_code == 409

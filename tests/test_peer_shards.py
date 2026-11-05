@@ -219,3 +219,69 @@ def test_a_shard_a_peer_holds_is_cheaper_than_downloading_it() -> None:
     near = plan_placement([with_peers, other], [], profile())
     far = plan_placement([alone, other], [], profile())
     assert layers_of(near)["a"][1] - layers_of(near)["a"][0] >= layers_of(far)["a"][1] - layers_of(far)["a"][0]
+
+
+def hashed(unit: WeightUnit, file: Path) -> WeightUnit:
+    from shardmesh.weights import file_sha256
+
+    return unit.model_copy(update={"sha256": file_sha256(file)})
+
+
+def test_a_peer_serving_altered_weights_is_refused_for_the_real_source(held, tmp_path: Path, monkeypatch) -> None:
+    from shardmesh import weights
+
+    unit, file = held
+    unit = hashed(unit, file)
+    cache = UnitCache(tmp_path / "cache")
+    bad = bytearray(file.read_bytes())
+    bad[-1] ^= 0xFF
+
+    def lying_peer(peer, token, model_id, revision, wanted, destination, on_bytes, client=None):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(bad)
+        return True
+
+    monkeypatch.setattr(weights, "fetch_from_peer", lying_peer)
+    cache.fetch(str(tmp_path / "model"), "m", "r", [unit], FetchProgress("j"), peers={"unit": ["http://peer"]})
+    assert cache.path("m", "r", "unit").read_bytes() == file.read_bytes()
+
+
+def test_a_source_with_altered_weights_stops_the_load(held, tmp_path: Path) -> None:
+    from shardmesh.weights import WeightSourceError
+
+    unit, _ = held
+    unit = unit.model_copy(update={"sha256": "0" * 64})
+    cache = UnitCache(tmp_path / "cache")
+    with pytest.raises(WeightSourceError, match="did not match"):
+        cache.fetch(str(tmp_path / "model"), "m", "r", [unit], FetchProgress("j"))
+    assert not cache.path("m", "r", "unit").exists()
+
+
+def test_weights_altered_on_disk_are_fetched_again(held, tmp_path: Path) -> None:
+    unit, file = held
+    unit = hashed(unit, file)
+    cache = UnitCache(tmp_path / "cache")
+    cache.fetch(str(tmp_path / "model"), "m", "r", [unit], FetchProgress("j"))
+    path = cache.path("m", "r", "unit")
+    bad = bytearray(path.read_bytes())
+    bad[-1] ^= 0xFF
+    path.write_bytes(bad)
+    cache.fetch(str(tmp_path / "model"), "m", "r", [unit], FetchProgress("j"))
+    assert path.read_bytes() == file.read_bytes()
+
+
+def test_model_hashes_cover_every_unit_and_the_description(held, tmp_path: Path) -> None:
+    from shardmesh.weights import Manifest, MANIFEST_KEY, WeightSourceError, apply_model_hashes, hash_model
+
+    unit, file = held
+    manifest = Manifest(source="s", revision="r", config={"a": 1}, tensors={tensor.name: tensor for tensor in unit.tensors})
+    hashes = hash_model(manifest, [unit], LocalReader(str(tmp_path / "model")), tmp_path)
+    assert hashes["unit"] == hashed(unit, file).sha256
+    copy = unit.model_copy()
+    apply_model_hashes(manifest, [copy], hashes)
+    assert copy.sha256 == hashes["unit"]
+    altered = Manifest(source="s", revision="r", config={"a": 2}, tensors=manifest.tensors)
+    with pytest.raises(WeightSourceError, match="description"):
+        apply_model_hashes(altered, [copy], hashes)
+    with pytest.raises(WeightSourceError, match="no entry"):
+        apply_model_hashes(manifest, [copy], {MANIFEST_KEY: hashes[MANIFEST_KEY]})

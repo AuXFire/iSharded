@@ -308,7 +308,7 @@ class WorkerRuntime:
         self.llama_dir = os.getenv("SHARDMESH_LLAMA_DIR") or None
         self.gguf: GgufStage | None = None
         self.gguf_logits: torch.Tensor | None = None
-        self.merge_passes = os.getenv("SHARDMESH_MERGE_PASSES") == "1"
+        self.merge_passes = False
         self.merge_queue: list[MergedStep] = []
         self.merge_task: asyncio.Task[None] | None = None
         self.merged_passes = 0
@@ -742,6 +742,7 @@ class WorkerRuntime:
         self.route = request.route
         self.cache_url = request.cache_url.rstrip("/") if request.cache_url else None
         self.caches.clear()
+        self.merge_passes = request.merge_passes
         if self.gate.size != request.slots:
             self.gate.resize(request.slots)
         await self.release_gate()
