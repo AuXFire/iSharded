@@ -67,6 +67,7 @@ from .llamacpp import LlamaError, StageLost, ensure_build, pick_build, rocm_libr
 from .pool import check_exposure, load_token
 from .serving import MAX_STAGE_BYTES, BodyLimit, serve
 from .slots import SlotGate
+from .access import Authority
 from .tickets import TicketIdentity, client_auth
 from .tls import PEER, client_verify
 from .weights import FetchProgress, LoadedUnit, UnitCache, WeightSourceError, gguf_reader, load_unit, map_unit
@@ -275,6 +276,7 @@ class WorkerRuntime:
         self.advertised_url = os.getenv("SHARDMESH_ADVERTISE_URL", "http://127.0.0.1:8100").rstrip("/")
         self.pool_token = load_token()
         self.requires_identity = bool(os.getenv("SHARDMESH_CA_FILE"))
+        self.authority = Authority(os.environ["SHARDMESH_CA_FILE"]) if self.requires_identity else None
         self.revoked_nodes: set[str] = set()
         self.roles = {
             role.strip()
@@ -447,7 +449,7 @@ class WorkerRuntime:
                 link.registered = True
                 link.failures = 0
                 answer = response.json()
-                self.revoked_nodes = set(answer.get("revoked_nodes", []))
+                self._take_revocations(answer)
                 for other in answer.get("controls", []):
                     self.control_urls.setdefault(str(other).rstrip("/"), ControlLink())
         except (httpx.HTTPError, OSError, ValueError):
@@ -455,6 +457,20 @@ class WorkerRuntime:
             link.failures += 1
             if link.failures >= CONTROL_LINK_FAILURES and url not in self.seed_urls:
                 self.control_urls.pop(url, None)
+
+    def _take_revocations(self, answer: dict[str, Any]) -> None:
+        """Revocations only ever add up. With an authority, only signed ones count.
+
+        Any control plane answers this, so one must not be able to clear the
+        list, or to lock its peers out by naming them.
+        """
+        if self.authority is None:
+            self.revoked_nodes |= set(answer.get("revoked_nodes", []))
+            return
+        for signed in answer.get("signed_revocations", []):
+            entry = self.authority.verified(signed)
+            if entry is not None and entry.get("type") == "revoke":
+                self.revoked_nodes.add(str(entry.get("name")))
 
     async def registration_loop(self) -> None:
         """Stay known to every control plane, so a new coordinator needs no introduction."""
@@ -590,6 +606,7 @@ class WorkerRuntime:
             request.speculate_tokens,
             request.slots,
             request.draft.file if request.draft and stage.start_layer == 0 else None,
+            tuple(sorted(request.unit_hashes.items())),
         )
 
     async def hold_gate(self, seconds: float) -> bool:
@@ -1081,7 +1098,10 @@ class WorkerRuntime:
             for row, (index, step, entry) in zip(output, ready):
                 entry.length += 1
                 if self.gguf.last:
-                    results[index] = {"token_id": self._sample(step.hidden, step.request, torch.from_numpy(row.copy()))}
+                    try:
+                        results[index] = {"token_id": self._sample(step.hidden, step.request, torch.from_numpy(row.copy()))}
+                    except (RuntimeError, ValueError) as exc:
+                        results[index] = exc  # one reply's sampling is no reason to fail the others
                 else:
                     results[index] = torch.from_numpy(row.copy()).reshape(1, 1, -1)
             self.merged_passes += 1

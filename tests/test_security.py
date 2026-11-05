@@ -514,7 +514,7 @@ def test_a_ticket_expires(ticket_pool):
     ticket = maker(ticket_pool, clock=clock).ticket("b:1")
     check = checker(ticket_pool, clock=clock)
     assert check.name(ticket) == "node-a"
-    clock.now += 301
+    clock.now += 121
     assert check.name(ticket) is None
 
 
@@ -619,3 +619,161 @@ def test_certificate_interception_gets_a_plain_explanation():
     asyncio.run(scenario())
     warnings = [event for event in orchestrator.events if "antivirus" in event["detail"]]
     assert len(warnings) == 1
+
+
+def test_a_control_plane_cannot_clear_or_invent_a_workers_revocations(signed_pool):
+    from shardmesh.access import Authority
+    from shardmesh.pool import sign_entry
+    from shardmesh.worker import WorkerRuntime
+
+    folder, _ = signed_pool
+    worker = SimpleNamespace(authority=Authority(folder + "/ca.pem"), revoked_nodes={"bad"})
+    real = sign_entry(folder, {"type": "revoke", "name": "worse"})
+    forged = {"entry": {"type": "revoke", "name": "good"}, "signature": real["signature"]}
+    WorkerRuntime._take_revocations(worker, {"revoked_nodes": ["good"], "signed_revocations": [real, forged]})
+    assert worker.revoked_nodes == {"bad", "worse"}
+    WorkerRuntime._take_revocations(worker, {"revoked_nodes": [], "signed_revocations": []})
+    assert worker.revoked_nodes == {"bad", "worse"}
+
+
+def test_without_an_authority_a_workers_revocations_only_add_up():
+    from shardmesh.worker import WorkerRuntime
+
+    worker = SimpleNamespace(authority=None, revoked_nodes={"bad"})
+    WorkerRuntime._take_revocations(worker, {"revoked_nodes": []})
+    assert worker.revoked_nodes == {"bad"}
+
+
+def proof_pool(ticket_pool, signed_access):
+    orchestrator = Orchestrator()
+    orchestrator.access = signed_access
+    orchestrator.mesh = ControlMesh("me", "http://me:1", (), Clock())
+    return orchestrator
+
+
+def test_a_gossip_reply_must_prove_who_sent_it(ticket_pool, monkeypatch):
+    from shardmesh.access import Authority
+    from shardmesh.tickets import reply_audience
+
+    monkeypatch.setenv("SHARDMESH_CA_FILE", str(ticket_pool / "ca.pem"))
+    orchestrator = proof_pool(ticket_pool, AccessControl(identities=True, authority=Authority(str(ticket_pool / "ca.pem"))))
+    proof = maker(ticket_pool).ticket(reply_audience("http://me:1"))
+    assert orchestrator._reply_is_genuine({"node_id": "node-a", "proof": proof})
+    assert not orchestrator._reply_is_genuine({"node_id": "ghost", "proof": proof})
+    assert not orchestrator._reply_is_genuine({"node_id": "node-a"})
+    wrong = maker(ticket_pool).ticket(reply_audience("http://someone-else:1"))
+    assert not orchestrator._reply_is_genuine({"node_id": "node-a", "proof": wrong})
+    asyncio.run(orchestrator.close())
+
+
+def test_a_persons_key_never_leaves_the_node_they_gave_it_to(signed_pool, monkeypatch):
+    from shardmesh.pool import sign_entry
+
+    folder, access = signed_pool
+    access.add_signed(sign_entry(folder, key_entry()))
+    seen = {}
+
+    def handler(request):
+        seen.update(request.headers)
+        return httpx.Response(200, stream=httpx.ByteStream(b'{"ok": true}'), headers={"content-type": "application/json"})
+
+    runtime = Orchestrator()
+    runtime.access = access
+    runtime.mesh = ControlMesh("me", "http://me", (), Clock())
+    runtime.mesh.leader_id = "evil"
+    runtime.mesh.observe({"node_id": "evil", "url": "http://evil:9", "term": 1, "leader_id": "evil"})
+    runtime.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(orchestrator_module, "runtime", runtime)
+    client = TestClient(orchestrator_module.app)
+    assert client.get("/admin/status").status_code == 401
+    assert client.get("/admin/status", headers={"Authorization": "Bearer smk-test"}).status_code == 200
+    assert "authorization" not in seen
+    assert seen["x-shardmesh-on-behalf"] == "admin:alice"
+
+
+def test_a_verified_node_can_vouch_for_a_caller_but_a_stranger_cannot(signed_pool, monkeypatch):
+    _, access = signed_pool
+    runtime = Orchestrator()
+    runtime.access = access
+    monkeypatch.setattr(orchestrator_module, "runtime", runtime)
+    headers = {FORWARD_MARK: "node-b", "x-shardmesh-on-behalf": "admin:alice"}
+    assert TestClient(orchestrator_module.app).get("/admin/keys", headers=headers).status_code == 401
+    node = TestClient(connected_as(orchestrator_module.app, "node-b"))
+    assert node.get("/admin/keys", headers=headers).status_code == 200
+
+
+def test_a_signed_entry_with_a_new_signature_changes_nothing(signed_pool):
+    from shardmesh.pool import sign_entry
+
+    folder, access = signed_pool
+    signed = sign_entry(folder, key_entry())
+    access.add_signed(signed)
+    version = access.version
+    again = dict(signed)
+    assert access.add_signed(again)
+    assert access.version == version
+
+
+def test_a_report_about_a_healthy_worker_quarantines_nobody():
+    from test_resilience import pool, record
+
+    orchestrator = pool(w1=record("w1"))
+    orchestrator.active = object()
+
+    async def scenario():
+        orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"status": "ok"})))
+        await orchestrator.handle_report("w1", "a peer says so")
+        await orchestrator.close()
+
+    asyncio.run(scenario())
+    assert not orchestrator.workers["w1"].quarantined
+
+
+def test_a_tiny_temperature_is_greedy():
+    assert ChatCompletionRequest(messages=[], temperature=1e-300).temperature == 0.0
+    assert ChatCompletionRequest(messages=[], temperature=0.7).temperature == 0.7
+
+
+def test_a_ticket_with_no_real_expiry_is_refused(ticket_pool):
+    import json
+
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    from shardmesh.tickets import PREFIX, _encode
+
+    made = maker(ticket_pool)
+    body = json.dumps({"aud": "b:1", "exp": float("nan"), "cert": made.certificate.decode()}).encode()
+    ticket = f"{PREFIX}{_encode(body)}.{_encode(made.key.sign(body, ec.ECDSA(hashes.SHA256())))}"
+    assert checker(ticket_pool).name(ticket) is None
+
+
+def test_a_stage_cannot_be_built_from_units_that_fail_their_hash(tmp_path):
+    from shardmesh.gguf_stage import build_stage_file
+    from shardmesh.weights import UnitCache
+
+    cache = UnitCache(tmp_path / "cache")
+    path = cache.path("m", "r", "unit")
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"altered")
+    request = SimpleNamespace(model_id="m", revision="r", unit_hashes={"unit": "0" * 64})
+    with pytest.raises(ValueError, match="does not match"):
+        build_stage_file(cache, request, None, ["unit"], 0, 4, True)
+
+
+def test_a_stage_built_with_hashes_does_not_reuse_an_older_file(tmp_path):
+    from shardmesh.gguf_stage import build_stage_file
+    from shardmesh.weights import UnitCache, file_sha256
+
+    cache = UnitCache(tmp_path / "cache")
+    folder = cache.directory("m", "r") / "stages"
+    folder.mkdir(parents=True)
+    poisoned = folder / "stage-0-4.gguf"
+    poisoned.write_bytes(b"poisoned")
+    unit = cache.path("m", "r", "unit")
+    unit.write_bytes(b"good")
+    request = SimpleNamespace(model_id="m", revision="r", unit_hashes={"unit": "0" * 64})
+    with pytest.raises(ValueError):
+        build_stage_file(cache, request, None, ["unit"], 0, 4, True)
+    assert not poisoned.exists()
+    assert file_sha256(unit)

@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import datetime
 import json
+import math
 import os
 from pathlib import Path
 import threading
@@ -28,7 +29,7 @@ import httpx
 from .tls import PEER
 
 PREFIX = "smn-"
-TICKET_SECONDS = 300
+TICKET_SECONDS = 120
 # Clocks differ between machines, and a ticket from slightly ahead is still good.
 CLOCK_SKEW_SECONDS = 60
 MAX_REMEMBERED = 4096
@@ -110,7 +111,9 @@ class TicketChecker:
             body = _decode(body_text)
             claims = json.loads(body)
             expires = float(claims["exp"])
-            if claims["aud"] not in self.audiences or expires <= now or expires > now + TICKET_SECONDS + CLOCK_SKEW_SECONDS:
+            if not math.isfinite(expires) or claims["aud"] not in self.audiences:
+                return None
+            if expires <= now or expires > now + TICKET_SECONDS + CLOCK_SKEW_SECONDS:
                 return None
             certificate = x509.load_pem_x509_certificate(str(claims["cert"]).encode())
             certificate.verify_directly_issued_by(self.authority)
@@ -135,6 +138,11 @@ class NodeTickets(httpx.Auth):
             audience = request.url.netloc.decode()
             request.headers["Authorization"] = f"Bearer {self.maker.ticket(audience)}"
         yield request
+
+
+def reply_audience(url: str) -> str:
+    """A gossip reply's proof names who asked, so it is no use anywhere else."""
+    return f"reply:{url}"
 
 
 def client_auth() -> NodeTickets | None:

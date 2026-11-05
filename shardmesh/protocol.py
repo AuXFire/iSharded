@@ -125,6 +125,8 @@ ModelFile = Annotated[str, AfterValidator(_file_in_folder)]
 GgufFile = Annotated[str, AfterValidator(_gguf_file)]
 # torch and numpy refuse anything wider, and a refused seed must not look like a dead node.
 Seed = Annotated[int, Field(ge=0, lt=2**63)]
+# Below this, sampling overflows. Nobody can tell it from greedy anyway.
+Temperature = Annotated[float, Field(ge=0.0, le=5.0), AfterValidator(lambda value: 0.0 if value < 1e-3 else value)]
 
 
 class TensorRef(BaseModel):
@@ -211,6 +213,8 @@ class ConfigureRequest(BaseModel):
     slots: int = 1
     # Let conversations share a pass through each stage. See worker._can_merge.
     merge_passes: bool = True
+    # What this stage's units must hash to, when the model was loaded with hashes.
+    unit_hashes: dict[str, str] = Field(default_factory=dict)
 
 
 class CacheRestoreRequest(BaseModel):
@@ -260,7 +264,7 @@ class InferRequest(BaseModel):
     epoch: int
     input_ids: list[int]
     reset: bool = False
-    temperature: float = Field(default=0.0, ge=0.0, le=5.0)
+    temperature: Temperature = 0.0
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     top_k: int = Field(default=0, ge=0)
     seed: Seed | None = None
@@ -297,7 +301,7 @@ class CompletionRequest(BaseModel):
     model: str | None = None
     prompt: str | list[str]
     max_tokens: int = Field(default=32, ge=1, le=32768)
-    temperature: float = Field(default=0.0, ge=0.0, le=5.0)
+    temperature: Temperature = 0.0
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     top_k: int = Field(default=0, ge=0)
     seed: Seed | None = None
@@ -314,7 +318,7 @@ class ChatCompletionRequest(BaseModel):
     model: str | None = None
     messages: list[ChatMessage]
     max_tokens: int = Field(default=32, ge=1, le=32768)
-    temperature: float = Field(default=0.0, ge=0.0, le=5.0)
+    temperature: Temperature = 0.0
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     top_k: int = Field(default=0, ge=0)
     seed: Seed | None = None

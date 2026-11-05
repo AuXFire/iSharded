@@ -16,7 +16,7 @@ from .llama_host import StageHost
 from .llamacpp import LlamaError, StageLost
 from .models.gguf import GgufAdapter
 from .protocol import ConfigureRequest, MemoryPool, UnitPlacement
-from .weights import UnitCache, _read_unit_header, iter_unit_tensor, unit_tensor_span
+from .weights import file_sha256, UnitCache, _read_unit_header, iter_unit_tensor, unit_tensor_span
 
 FAST_POOLS = {"vram", "unified"}
 INITIAL_GUESSES = 3
@@ -62,7 +62,13 @@ def build_stage_file(
     """Assemble a stage file from cached units, reusing a finished one."""
     folder = cache.directory(request.model_id, request.revision) / "stages"
     folder.mkdir(parents=True, exist_ok=True)
-    target = folder / f"stage-{start}-{end}.gguf"
+    # With hashes, the name says what the file was built from, so a stage file
+    # left by an earlier load cannot stand in for one built from checked units.
+    label = ""
+    if request.unit_hashes:
+        listing = json.dumps(sorted(request.unit_hashes.items()))
+        label = "-" + hashlib.sha256(listing.encode()).hexdigest()[:16]
+    target = folder / f"stage-{start}-{end}{label}.gguf"
     for old in folder.glob("stage-*.gguf"):
         if old != target:
             old.unlink(missing_ok=True)  # a new split makes the old file useless
@@ -72,6 +78,9 @@ def build_stage_file(
     owners: dict[str, Path] = {}
     for unit in units:
         path = cache.path(request.model_id, request.revision, unit)
+        expected = request.unit_hashes.get(unit)
+        if request.unit_hashes and (expected is None or file_sha256(path) != expected):
+            raise ValueError(f"{unit} does not match its hash, so this stage cannot be built from it")
         for name in _read_unit_header(path):
             if name != "__metadata__":
                 owners[name] = path

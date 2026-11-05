@@ -183,6 +183,7 @@ def test_rocm_launcher_contributes_gpu_cpu_and_ram_as_one_worker(monkeypatch) ->
     assert 'weights_ram_gb="auto"' in source
     assert "cpu_threads=8" in source
     assert 'gpu_dtype="auto"' in source
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)  # CI machines have no GPU
     commands = launched(monkeypatch, gpu_device="auto", cpu_threads=8, weights_ram_gb="auto", gpu_memory_gb=16.0)
     assert len(commands) == 1
     assert flag(commands[0], "--device") == "auto"

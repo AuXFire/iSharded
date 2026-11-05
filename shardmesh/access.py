@@ -110,7 +110,8 @@ class AccessControl:
     # Nodes prove themselves with certificates, so nothing is open even with no token.
     identities: bool = False
     authority: Authority | None = None
-    # Signed entries, by signature. Everything a pool with an authority shares.
+    # Signed entries, by the hash of what they say, since one entry can carry many
+    # valid signatures. Everything a pool with an authority shares.
     signed: dict[str, dict[str, Any]] = field(default_factory=dict)
     removed_names: set[str] = field(default_factory=set)
 
@@ -125,8 +126,10 @@ class AccessControl:
         control = cls(pool_token=pool_token, path=Path(path) if path else None, identities=identities, authority=authority)
         if control.path and control.path.is_file():
             document = json.loads(control.path.read_text(encoding="utf-8"))
+            # Keys in this file are trusted here, because an operator can write it,
+            # and go no further. Signed entries are checked again, as peers' would be.
             control._apply(document)
-            control._take_signed(document)  # checked again: the file may be older than the authority
+            control._take_signed(document)
         return control
 
     def _apply(self, document: dict[str, Any]) -> None:
@@ -157,7 +160,7 @@ class AccessControl:
             "revoked_nodes": sorted(self.revoked),
             "removed_keys": sorted(self.removed),
             "cordoned_nodes": sorted(self.cordoned),
-            "signed": [self.signed[signature] for signature in sorted(self.signed)],
+            "signed": [self.signed[held] for held in sorted(self.signed)],
         }
 
     def _take_signed(self, document: dict[str, Any]) -> bool:
@@ -166,14 +169,20 @@ class AccessControl:
             return False
         changed = False
         for signed in document.get("signed", []):
-            signature = signed.get("signature") if isinstance(signed, dict) else None
-            if not isinstance(signature, str) or signature in self.signed:
+            claimed = signed.get("entry") if isinstance(signed, dict) else None
+            if not isinstance(claimed, dict):
+                continue
+            held = hashlib.sha256(canonical(claimed)).hexdigest()
+            if held in self.signed:
                 continue
             entry = self.authority.verified(signed)
             if entry is not None and self._apply_entry(entry):
-                self.signed[signature] = signed
+                self.signed[held] = signed
                 changed = True
         return changed
+
+    def signed_revocations(self) -> list[dict[str, Any]]:
+        return [signed for signed in self.signed.values() if signed["entry"].get("type") == "revoke"]
 
     def _apply_entry(self, entry: dict[str, Any]) -> bool:
         kind, name = entry.get("type"), str(entry.get("name", ""))

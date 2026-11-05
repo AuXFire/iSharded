@@ -316,6 +316,10 @@ def run_node(args: argparse.Namespace) -> int:
     if getattr(args, "tls_cert", None):
         args.advertise_scheme = "https"
         os.environ.setdefault("SHARDMESH_TLS_CERT", str(Path(args.tls_cert).resolve()))
+        if getattr(args, "tls_key", None) and os.getenv("SHARDMESH_CA_FILE"):
+            # The same certificate also signs what TLS cannot vouch for: gossip replies.
+            os.environ.setdefault("SHARDMESH_IDENTITY_CERT", str(Path(args.tls_cert).resolve()))
+            os.environ.setdefault("SHARDMESH_IDENTITY_KEY", str(Path(args.tls_key).resolve()))
     check_exposure(
         args.bind_host,
         load_token(),
@@ -324,6 +328,8 @@ def run_node(args: argparse.Namespace) -> int:
         args.advertise_host,
         getattr(args, "trusted_network", False),
     )
+    for seed in _seeds(args):  # credentials go to the peers named here, too
+        check_exposure(args.bind_host, load_token(), os.getenv("SHARDMESH_CA_FILE"), getattr(args, "open_pool", False), seed, getattr(args, "trusted_network", False))
     specs: list[tuple[str, list[str]]] = []
     port = args.base_port
     gpu_device = args.gpu_device

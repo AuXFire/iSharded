@@ -47,8 +47,9 @@ from .protocol import (
 )
 from .pool import check_exposure, home as pool_home, load_token
 from .serving import BodyLimit, serve
-from .tickets import TicketIdentity, client_auth
-from .tls import INTERCEPTED, intercepted, PEER, client_verify
+from .mesh import clean_url
+from .tickets import PREFIX as TICKET_PREFIX, NodeTickets, TicketChecker, TicketIdentity, client_auth, reply_audience
+from .tls import BEHALF, INTERCEPTED, intercepted, PEER, client_verify
 from .tokenizer import ChatTokenizer, IncrementalText, load_tokenizer
 from .weights import apply_model_hashes, Manifest, WeightSourceError, build_manifest
 
@@ -393,6 +394,7 @@ class Orchestrator:
         self.stage_errors = 0
         self.replies_in_flight = 0
         self.warned_interception: set[str] = set()
+        self.reply_checker: TicketChecker | None = None
         self.maintenance_task: asyncio.Task[None] | None = None
         self.gossip_task: asyncio.Task[None] | None = None
         self.mesh: ControlMesh | None = None
@@ -498,6 +500,16 @@ class Orchestrator:
         if lost_leadership:
             self._step_down()
 
+    def _reply_is_genuine(self, reply: dict[str, Any]) -> bool:
+        """A reply must prove it comes from the node it names, as a request must."""
+        if self.access.authority is None:
+            return True
+        assert self.mesh is not None
+        if self.reply_checker is None:
+            self.reply_checker = TicketChecker(os.environ["SHARDMESH_CA_FILE"], {reply_audience(self.mesh.url)})
+        proof = str(reply.get("proof", ""))
+        return proof.startswith(TICKET_PREFIX) and self.reply_checker.name(proof) == reply.get("node_id")
+
     def apply_revocations(self) -> None:
         """Act on revoked nodes, wherever the news came from."""
         if self.mesh:
@@ -539,7 +551,9 @@ class Orchestrator:
                     timeout=2.5,
                 )
                 response.raise_for_status()
-                self.receive_gossip(response.json())
+                reply = response.json()
+                if self._reply_is_genuine(reply):
+                    self.receive_gossip(reply)
             except (httpx.HTTPError, httpx.InvalidURL, ValueError, KeyError, TypeError) as exc:
                 # Silence is how a peer's absence is noticed, so this says nothing
                 # unless the cause is one a person has to fix.
@@ -1071,6 +1085,11 @@ class Orchestrator:
                 term=self.mesh.term if self.mesh else 0,
                 slots=target.slots,
                 merge_passes=target.merge_passes,
+                unit_hashes={
+                    item.unit: target.request.model_hashes[item.unit]
+                    for item in stage.placements
+                    if item.unit in (target.request.model_hashes or {})
+                },
             )
             response = await self.client.post(
                 stage.url.rstrip("/") + "/internal/configure",
@@ -1316,8 +1335,26 @@ class Orchestrator:
         except httpx.HTTPError:
             pass  # if the coordinator is gone too, the next one finds this for itself
 
+    async def _answers(self, worker_id: str) -> bool:
+        record = self.workers.get(worker_id)
+        if record is None:
+            return False
+        try:
+            url = str(record.registration.advertised_url).rstrip("/") + "/health"
+            response = await self.client.get(url, headers=auth_headers(self.pool_token), timeout=3.0)
+            return response.status_code == 200
+        except httpx.HTTPError:
+            return False
+
     async def handle_report(self, worker_id: str, reason: str) -> None:
-        """A follower's reply hit a dead stage. Repair now, as a local failure would."""
+        """A follower's reply hit a dead stage. Repair now, as a local failure would.
+
+        Any node can report any other, so this checks first. A worker that answers
+        here keeps its place: the problem is the reporter's link, or the report.
+        """
+        if await self._answers(worker_id):
+            self.add_event("failure", f"{worker_id} reported, but it answers here", reason[:160])
+            return
         self._quarantine(worker_id, reason)
         async with self.control_lock:
             await self.rebalance(generation_lock_held=False)
@@ -1935,7 +1972,8 @@ app = FastAPI(title="ShardMesh orchestrator", version="0.2.0", lifespan=lifespan
 
 
 def require(authorization: str | None, role: str) -> Caller:
-    caller = runtime.access.identify(authorization, PEER.get())
+    behalf = BEHALF.get()
+    caller = Caller(*behalf) if behalf else runtime.access.identify(authorization, PEER.get())
     if caller is None:
         raise HTTPException(status_code=401, detail="a valid key is required")
     if not runtime.access.permits(caller, role):
@@ -1974,6 +2012,7 @@ def verify_user(authorization: str | None) -> None:
 
 FORWARDED_PATHS = ("/v1/", "/admin/")
 FORWARD_MARK = "x-shardmesh-forwarded"
+BEHALF_HEADER = "x-shardmesh-on-behalf"
 # Connection details belong to each hop, and httpx sets the length itself.
 HOP_HEADERS = {"host", "content-length", "connection", "transfer-encoding", "keep-alive", "content-encoding"}
 
@@ -1988,6 +2027,11 @@ async def forward_to_coordinator(request: Request, call_next: Any) -> Any:
     """
     if FORWARD_MARK in request.headers:
         # This connection proves which node passed the request on, not who sent it.
+        # With an authority, that node checked the key and kept it, and says who asked.
+        vouched = request.headers.get(BEHALF_HEADER, "")
+        role, _, name = vouched.partition(":")
+        if PEER.get() is not None and runtime.access.authority is not None and role in {ROLE_USER, ROLE_ADMIN}:
+            BEHALF.set((name, role))
         PEER.set(None)
     mesh = runtime.mesh
     path = request.url.path
@@ -2002,6 +2046,18 @@ async def forward_to_coordinator(request: Request, call_next: Any) -> Any:
         return JSONResponse(status_code=503, content={"detail": "no coordinator yet; try again in a few seconds"})
     headers = {name: value for name, value in request.headers.items() if name.lower() not in HOP_HEADERS}
     headers[FORWARD_MARK] = mesh.node_id
+    headers.pop(BEHALF_HEADER, None)
+    if runtime.access.authority is not None:
+        # Anyone can claim to coordinate, so a person's key never leaves the node
+        # they gave it to. It is checked here, and only the result travels.
+        caller = runtime.access.identify(request.headers.get("authorization"), None)
+        if caller is None:
+            return JSONResponse(status_code=401, content={"detail": "a valid key is required"})
+        wait = runtime.access.spend(caller)
+        if wait:
+            return JSONResponse(status_code=429, content={"detail": f"rate limit reached for {caller.name}"})
+        headers.pop("authorization", None)
+        headers[BEHALF_HEADER] = f"{caller.role}:{caller.name}"
     try:
         upstream = await runtime.client.send(
             runtime.client.build_request(
@@ -2055,10 +2111,13 @@ async def audit_requests(request: Request, call_next: Any) -> Any:
     path = request.url.path
     if request.method != "GET" and path.startswith(FORWARDED_PATHS):
         # Every node that handles a request records it: anyone can send the forward mark.
-        peer = None if FORWARD_MARK in request.headers else PEER.get()
+        marked = FORWARD_MARK in request.headers
+        peer = None if marked else PEER.get()
         caller = runtime.access.identify(request.headers.get("authorization"), peer)
+        vouched = request.headers.get(BEHALF_HEADER) if marked and PEER.get() else None
         client = request.client.host if request.client else None
-        runtime.audit.record(caller.name if caller else "unknown", request.method, path, response.status_code, client)
+        actor = f"{vouched} via {PEER.get()}" if vouched else caller.name if caller else "unknown"
+        runtime.audit.record(actor, request.method, path, response.status_code, client)
     return response
 
 
@@ -2120,6 +2179,7 @@ async def register(
         "active_epoch": runtime.epoch,
         "controls": control_urls(),
         "revoked_nodes": sorted(runtime.access.revoked),
+        "signed_revocations": runtime.access.signed_revocations(),
     }
 
 
@@ -2129,7 +2189,12 @@ async def heartbeat(body: Heartbeat, authorization: str | None = Header(default=
     verify_worker_name(body.worker_id)
     if not runtime.heartbeat(body.worker_id):
         raise HTTPException(status_code=404, detail="worker must register")
-    return {"status": "ok", "controls": control_urls(), "revoked_nodes": sorted(runtime.access.revoked)}
+    return {
+        "status": "ok",
+        "controls": control_urls(),
+        "revoked_nodes": sorted(runtime.access.revoked),
+        "signed_revocations": runtime.access.signed_revocations(),
+    }
 
 
 def control_urls() -> list[str]:
@@ -2146,9 +2211,13 @@ async def gossip(body: dict[str, Any], authorization: str | None = Header(defaul
         raise HTTPException(status_code=403, detail=f"{peer} cannot speak for {body.get('node_id')}")
     try:
         runtime.receive_gossip(body)
+        reply = runtime.gossip_message()
+        tickets = runtime.client.auth if isinstance(runtime.client.auth, NodeTickets) else None
+        if tickets is not None:
+            reply["proof"] = tickets.maker.ticket(reply_audience(clean_url(body["url"])))
     except (KeyError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"bad gossip: {exc}") from exc
-    return runtime.gossip_message()
+    return reply
 
 
 @app.post("/internal/report")

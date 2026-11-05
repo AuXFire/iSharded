@@ -125,10 +125,13 @@ Every node then checks every unit against that list, whether it came from a peer
 
 ## Reviews and known gaps
 
-The code has had two security reviews, both by an AI model reading the source. The first found one critical and five high findings, all fixed, with a regression test for each in `tests/test_security.py`. The critical and certificate attacks were also repeated against real control planes over mutual TLS. No human has reviewed or penetration tested it, and reviews like these do not show the code is free of other flaws.
+The code has had two security reviews, both by an AI model reading the source. The first found one critical and five high findings, and the second, of the signing, ticket, hashing, and merging code added after it, found four high. Those and most medium and low findings are fixed, with regression tests in `tests/test_security.py`. No human has reviewed or penetration tested it, and reviews like these do not show the code is free of other flaws.
 
 - A node in the route sees prompts and can return wrong results, and nothing detects it. Certificates limit who is in the pool. They do not make a hostile member safe.
-- An unrevoked node can still claim leadership, publish a route, or cordon nodes through gossip. Keys and revocations are protected, but these are not.
+- An unrevoked node can still claim leadership, publish a route, or cordon nodes through gossip, and a node that holds a verified identity can act for a caller it claims to have checked. It cannot add keys, revoke peers, or learn anyone's key, because in a pool with an authority a key never leaves the node it was given to.
+- Tickets can be replayed for up to two minutes by anyone who can read the link, which is why they need a private one.
+- The hash list covers weights and the model's description, not the tokenizer or chat template, and it reaches workers through the coordinator, so a dishonest coordinator could leave it out.
+- If a node stops answering, the chat page asks before sending your key and conversation to another member, because members declare their own addresses.
 - Without a pool authority, the shared token is everyone's identity. Nodes cannot be told apart, and revocation only blocks a name.
 - Weight bytes are only checked when you load with `--hashes`.
 - Prompts are in memory on every stage, and hidden states are readable by anyone who can read the link if it has no TLS or Tailscale.

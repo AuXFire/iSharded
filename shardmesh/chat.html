@@ -235,7 +235,7 @@
   <script>
     const $ = id => document.getElementById(id);
     const storage = { get: key => { try { return localStorage.getItem(key); } catch { return null; } }, set: (key, value) => { try { localStorage.setItem(key, value); } catch {} } };
-    const state = { token: storage.get('shardmesh-token') || '', status: null, turns: [], streaming: false, abort: null, selected: '', previewTimer: null, previewId: 0, lastPulse: 0 };
+    const state = { approved: new Set(), token: storage.get('shardmesh-token') || '', status: null, turns: [], streaming: false, abort: null, selected: '', previewTimer: null, previewId: 0, lastPulse: 0 };
     const TIER = { vram: 'VRAM', unified: 'Unified', ram: 'RAM', disk: 'Disk' };
     const PHASE = { resolving: 'Reading the model\'s tensor list', fetching: 'Downloading each worker\'s shards', loading: 'Moving weights into memory' };
     // GGUF ids carry a repository and a file; the file names the model and its quantization.
@@ -386,6 +386,10 @@
           try { turn.text = ''; await attempt(nodes[index]); break; }
           catch (error) {
             if (!(error instanceof TypeError) || index === nodes.length - 1) throw error;
+            // A member names its own address, so sending it a key and this conversation is your call.
+            const next = nodes[index + 1];
+            if (!state.approved.has(next) && !confirm(`This node stopped answering. Send your key and this conversation to ${next} to finish the reply?`)) throw error;
+            state.approved.add(next);
             turn.text = ''; turn.notice = 'Lost the connection, so this reply restarted on another node.'; renderTurns();
           }
         }

@@ -775,6 +775,8 @@ def fetch_from_peer(
                             if head != prefix:
                                 return False
                             checked = True
+                    if received + len(chunk) > expected:
+                        return False  # a peer must not be able to fill the disk
                     handle.write(chunk)
                     received += len(chunk)
                     on_bytes(len(chunk))
