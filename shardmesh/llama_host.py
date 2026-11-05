@@ -52,6 +52,7 @@ class _Host:
             cpu_tensors=meta["cpu_tensors"],
             rollback_tokens=meta.get("rollback_tokens", 0),
             sequences=meta.get("slots", 1),
+            map_file=meta.get("map_file", True),
         )
         table = meta.get("table")
         if table:
@@ -124,6 +125,7 @@ class _Host:
             threads=meta["threads"],
             sequences=meta.get("slots", 1) + 1,
             unified_cache=True,
+            map_file=False,
         )
         self.scratch = meta.get("slots", 1)
         return {}, b""

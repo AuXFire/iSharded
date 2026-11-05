@@ -474,3 +474,129 @@ def test_the_api_takes_signed_entries_and_refuses_the_rest(signed_pool, monkeypa
     admin = {"Authorization": "Bearer smk-test"}
     assert client.post("/admin/keys", json={"name": "x"}, headers=admin).status_code == 409
     assert client.post("/admin/nodes/x/revoke", headers=admin).status_code == 409
+
+
+@pytest.fixture
+def ticket_pool(tmp_path):
+    from shardmesh.pool import add_node, init_pool
+
+    pytest.importorskip("cryptography")
+    folder = init_pool(str(tmp_path / "pool"))
+    add_node(str(folder), "node-a", ["10.0.0.1"])
+    return folder
+
+
+def maker(folder, name="node-a", clock=None):
+    from shardmesh.tickets import TicketMaker
+
+    options = {"clock": clock} if clock else {}
+    return TicketMaker(str(folder / f"{name}.pem"), str(folder / f"{name}.key"), **options)
+
+
+def checker(folder, audiences=("b:1",), clock=None):
+    from shardmesh.tickets import TicketChecker
+
+    options = {"clock": clock} if clock else {}
+    return TicketChecker(str(folder / "ca.pem"), set(audiences), **options)
+
+
+def test_a_ticket_proves_a_nodes_name(ticket_pool):
+    assert checker(ticket_pool).name(maker(ticket_pool).ticket("b:1")) == "node-a"
+
+
+def test_a_ticket_only_works_at_the_node_it_names(ticket_pool):
+    assert checker(ticket_pool).name(maker(ticket_pool).ticket("elsewhere:1")) is None
+
+
+def test_a_ticket_expires(ticket_pool):
+    clock = Clock()
+    clock.now = 1_800_000_000.0
+    ticket = maker(ticket_pool, clock=clock).ticket("b:1")
+    check = checker(ticket_pool, clock=clock)
+    assert check.name(ticket) == "node-a"
+    clock.now += 301
+    assert check.name(ticket) is None
+
+
+def test_a_ticket_from_another_authority_is_refused(ticket_pool, tmp_path):
+    from shardmesh.pool import add_node, init_pool
+
+    other = init_pool(str(tmp_path / "other"))
+    add_node(str(other), "node-a", ["10.0.0.1"])
+    assert checker(ticket_pool).name(maker(other).ticket("b:1")) is None
+
+
+def test_an_altered_ticket_is_refused(ticket_pool):
+    import json
+
+    from shardmesh.tickets import PREFIX, _decode, _encode
+
+    ticket = maker(ticket_pool).ticket("b:1")
+    body, signature = ticket[len(PREFIX):].split(".")
+    claims = json.loads(_decode(body))
+    claims["aud"] = "c:1"
+    forged = PREFIX + _encode(json.dumps(claims).encode()) + "." + signature
+    assert checker(ticket_pool, ("c:1",)).name(forged) is None
+    assert checker(ticket_pool).name("smn-garbage") is None
+    assert checker(ticket_pool).name("smn-a.b") is None
+
+
+def test_a_far_future_ticket_is_refused(ticket_pool):
+    clock = Clock()
+    clock.now = 1_800_000_000.0
+    ahead = Clock()
+    ahead.now = clock.now + 3600
+    assert checker(ticket_pool, clock=clock).name(maker(ticket_pool, clock=ahead).ticket("b:1")) is None
+
+
+def test_a_ticket_identifies_a_node_to_a_control_plane(ticket_pool, monkeypatch):
+    from shardmesh.tickets import TicketIdentity
+
+    monkeypatch.setenv("SHARDMESH_CA_FILE", str(ticket_pool / "ca.pem"))
+    monkeypatch.setenv("SHARDMESH_NODE_URL", "http://b:1")
+    runtime = Orchestrator()
+    runtime.mesh = ControlMesh("me", "http://b:1", (), Clock())
+    runtime.mesh.leader_id = "me"
+    runtime.access = AccessControl(identities=True)
+    monkeypatch.setattr(orchestrator_module, "runtime", runtime)
+    client = TestClient(TicketIdentity(orchestrator_module.app))
+    good = {"Authorization": "Bearer " + maker(ticket_pool).ticket("b:1")}
+    assert client.get("/internal/mesh", headers=good).status_code == 200
+    assert client.post("/admin/keys", json={"name": "x"}, headers=good).status_code == 403
+    assert client.get("/internal/mesh").status_code == 401
+    runtime.access.revoke_node("node-a")
+    assert client.get("/internal/mesh", headers=good).status_code == 401
+
+
+def test_a_worker_takes_tickets_and_refuses_the_revoked(ticket_pool, monkeypatch):
+    from shardmesh.tickets import TicketIdentity
+
+    monkeypatch.setenv("SHARDMESH_CA_FILE", str(ticket_pool / "ca.pem"))
+    monkeypatch.setenv("SHARDMESH_ADVERTISE_URL", "http://b:1")
+    runtime = SimpleNamespace(pool_token=None, requires_identity=True, revoked_nodes=set())
+    monkeypatch.setattr(worker_module, "runtime", runtime)
+    seen = {}
+
+    async def site(scope, receive, send):
+        seen["allowed"] = worker_module.authorized(None)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    client = TestClient(TicketIdentity(site))
+    client.get("/", headers={"Authorization": "Bearer " + maker(ticket_pool).ticket("b:1")})
+    assert seen["allowed"]
+    client.get("/")
+    assert not seen["allowed"]
+    runtime.revoked_nodes.add("node-a")
+    client.get("/", headers={"Authorization": "Bearer " + maker(ticket_pool).ticket("b:1")})
+    assert not seen["allowed"]
+
+
+def test_tickets_leave_a_callers_own_credentials_alone(ticket_pool):
+    from shardmesh.tickets import NodeTickets
+
+    auth = NodeTickets(maker(ticket_pool))
+    plain = httpx.Request("GET", "http://b:1/x")
+    assert next(auth.auth_flow(plain)).headers["authorization"].startswith("Bearer smn-")
+    theirs = httpx.Request("GET", "http://b:1/x", headers={"Authorization": "Bearer user-key"})
+    assert next(auth.auth_flow(theirs)).headers["authorization"] == "Bearer user-key"

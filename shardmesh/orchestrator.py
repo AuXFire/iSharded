@@ -47,6 +47,7 @@ from .protocol import (
 )
 from .pool import check_exposure, home as pool_home, load_token
 from .serving import BodyLimit, serve
+from .tickets import TicketIdentity, client_auth
 from .tls import PEER, client_verify
 from .tokenizer import ChatTokenizer, IncrementalText, load_tokenizer
 from .weights import apply_model_hashes, Manifest, WeightSourceError, build_manifest
@@ -363,7 +364,7 @@ class Orchestrator:
         self.active_cache_url: str | None = None
         self.epoch = 0
         self.job: LoadJob | None = None
-        self.client = httpx.AsyncClient(timeout=httpx.Timeout(3600.0, connect=10.0), verify=client_verify())
+        self.client = httpx.AsyncClient(timeout=httpx.Timeout(3600.0, connect=10.0), verify=client_verify(), auth=client_auth())
         authority_file = os.getenv("SHARDMESH_CA_FILE")
         self.access = AccessControl.load(
             self.pool_token,
@@ -2057,6 +2058,7 @@ async def audit_requests(request: Request, call_next: Any) -> Any:
 
 
 # Added last, so it runs first: nothing oversized is read, forwarded or parsed.
+app.add_middleware(TicketIdentity)
 app.add_middleware(BodyLimit)
 
 

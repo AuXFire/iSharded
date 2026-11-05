@@ -90,6 +90,11 @@ def build_stage_file(
     return target
 
 
+def needs_mapping(placements: list[UnitPlacement], pools: dict[str, MemoryPool]) -> bool:
+    """Disk-tier weights only work mapped, because the OS pages them in on use."""
+    return any(item.bytes and item.pool_id in pools and pools[item.pool_id].kind == "disk" for item in placements)
+
+
 class GgufStage:
     def __init__(
         self,
@@ -136,6 +141,7 @@ class GgufStage:
             "table": table,
             "rollback_tokens": request.speculate_tokens,
             "slots": request.slots,
+            "map_file": needs_mapping(placements, pools),
         }
         self.host = self._start()
 

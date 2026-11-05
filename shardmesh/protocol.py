@@ -334,8 +334,8 @@ def pass_seconds(tokens: int, hops: int = 1) -> float:
 
 
 def auth_headers(token: str | None) -> dict[str, str]:
-    # With a pool authority, nodes prove themselves by certificate. The token
-    # stays home, since any address gossip mentions would otherwise receive it.
+    # With a pool authority, nodes prove themselves by certificate or ticket. The
+    # token stays home, since any address gossip mentions would otherwise receive it.
     if not token or os.getenv("SHARDMESH_CA_FILE"):
         return {}
     return {"Authorization": f"Bearer {token}"}

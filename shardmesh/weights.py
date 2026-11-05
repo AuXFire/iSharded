@@ -40,7 +40,8 @@ import torch
 from safetensors import safe_open
 
 from .gguf import GgufError, GgufHeader, parse_header, parse_source
-from .protocol import TensorRef, WeightUnit
+from .protocol import auth_headers, TensorRef, WeightUnit
+from .tickets import client_auth
 from .tls import client_verify
 
 # Mapped weights are read-only by design, and nothing writes to them.
@@ -231,9 +232,12 @@ class PeerReader:
 
     def __init__(self, urls: list[str], token: str | None = None) -> None:
         self.urls = [url.rstrip("/") for url in urls]
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
         self.client = httpx.Client(
-            headers=headers, timeout=httpx.Timeout(60.0, connect=5.0), trust_env=False, verify=client_verify()
+            headers=auth_headers(token),
+            timeout=httpx.Timeout(60.0, connect=5.0),
+            trust_env=False,
+            verify=client_verify(),
+            auth=client_auth(),
         )
 
     def file_size(self, name: str) -> int:
@@ -753,8 +757,8 @@ def fetch_from_peer(
     expected = len(prefix) + unit.nbytes
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_name(f"{destination.name}.{os.getpid()}.{threading.get_ident()}.peer.part")
-    owned = client or httpx.Client(timeout=httpx.Timeout(60.0, connect=5.0), verify=client_verify())
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    owned = client or httpx.Client(timeout=httpx.Timeout(60.0, connect=5.0), verify=client_verify(), auth=client_auth())
+    headers = auth_headers(token)
     params = {"model_id": model_id, "revision": revision, "unit": unit.name}
     received = 0
     try:

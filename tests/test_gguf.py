@@ -906,3 +906,17 @@ def test_two_conversations_do_not_touch_each_other():
         assert got == expected
     finally:
         host.close()
+
+
+def test_only_disk_tier_stages_map_their_file():
+    from shardmesh.gguf_stage import needs_mapping
+    from shardmesh.protocol import MemoryPool, UnitPlacement
+
+    def pool(kind):
+        return MemoryPool(pool_id=kind, kind=kind, device="cpu", label=kind, capacity_group=kind, total_bytes=1, budget_bytes=1, free_bytes=1, bandwidth_gbps=1.0, dtype="bfloat16")
+
+    pools = {kind: pool(kind) for kind in ("vram", "ram", "disk")}
+    fast = [UnitPlacement(unit="a", pool_id="vram", bytes=5), UnitPlacement(unit="b", pool_id="ram", bytes=5)]
+    assert not needs_mapping(fast, pools)
+    assert needs_mapping([*fast, UnitPlacement(unit="c", pool_id="disk", bytes=5)], pools)
+    assert not needs_mapping([UnitPlacement(unit="c", pool_id="disk", bytes=0)], pools)

@@ -67,6 +67,7 @@ from .llamacpp import LlamaError, StageLost, ensure_build, pick_build, rocm_libr
 from .pool import check_exposure, load_token
 from .serving import MAX_STAGE_BYTES, BodyLimit, serve
 from .slots import SlotGate
+from .tickets import TicketIdentity, client_auth
 from .tls import PEER, client_verify
 from .weights import FetchProgress, LoadedUnit, UnitCache, WeightSourceError, gguf_reader, load_unit, map_unit
 
@@ -348,7 +349,7 @@ class WorkerRuntime:
         self.caches: dict[str, CacheEntry] = {}
         self.lock = asyncio.Lock()
         # A disk-tier prompt can take minutes, and a slow hop is not a failure.
-        self.client = httpx.AsyncClient(timeout=httpx.Timeout(1800.0, connect=10.0), verify=client_verify())
+        self.client = httpx.AsyncClient(timeout=httpx.Timeout(1800.0, connect=10.0), verify=client_verify(), auth=client_auth())
         self.registration_task: asyncio.Task[None] | None = None
         self.inference_calls = 0
         self.tokens_processed = 0
@@ -1170,6 +1171,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="ShardMesh worker", version="0.2.0", lifespan=lifespan)
+app.add_middleware(TicketIdentity)
 app.add_middleware(
     BodyLimit,
     large={"/internal/forward": MAX_STAGE_BYTES, "/internal/diag/echo": MAX_STAGE_BYTES},

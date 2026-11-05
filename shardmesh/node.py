@@ -57,6 +57,8 @@ def add_node_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tls-cert", default=None, help="certificate for this node's servers")
     parser.add_argument("--tls-key", default=None, help="key for that certificate")
     parser.add_argument("--ca-file", default=None, help="authority that signed the other nodes' certificates")
+    parser.add_argument("--identity-cert", default=None, help="this node's certificate, to prove its name without TLS")
+    parser.add_argument("--identity-key", default=None, help="the key for --identity-cert")
     parser.add_argument("--keys-file", default=None, help="where this node keeps the pool's API keys")
     parser.add_argument("--log-file", default=None, help="write this node's output here; the last one is kept as .1")
     parser.add_argument("--pool-token-file", default=None, help="file holding the pool token; default is pool.token in the ShardMesh folder")
@@ -303,6 +305,9 @@ def run_node(args: argparse.Namespace) -> int:
         os.environ["SHARDMESH_POOL_TOKEN_FILE"] = str(Path(args.pool_token_file).resolve())
     if getattr(args, "ca_file", None):
         os.environ["SHARDMESH_CA_FILE"] = str(Path(args.ca_file).resolve())
+    if getattr(args, "identity_cert", None) and getattr(args, "identity_key", None):
+        os.environ["SHARDMESH_IDENTITY_CERT"] = str(Path(args.identity_cert).resolve())
+        os.environ["SHARDMESH_IDENTITY_KEY"] = str(Path(args.identity_key).resolve())
     if getattr(args, "model_dir", None):
         os.environ["SHARDMESH_MODEL_DIRS"] = os.pathsep.join(str(Path(item).resolve()) for item in args.model_dir)
     if getattr(args, "advertise_host", "auto") == "auto":

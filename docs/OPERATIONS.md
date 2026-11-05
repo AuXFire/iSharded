@@ -158,6 +158,10 @@ Metrics worth alerting on:
 | Fetched shards | `--cache-dir` | Evicted by age past `--cache-budget-gb`. |
 | Stage files | Inside the cache | Rebuilt from shards when a stage moves. Count double the node's share. |
 
+The dashboard's "Memory for weights" counts weights only. Real use is higher: KV cache, compute buffers, a draft model, and each worker's own GPU context.
+
+Stages read their weights once rather than mapping the file, unless some of them are on the disk tier. A mapped file stays resident in RAM even when the tensors live in VRAM: with Qwen3.6-27B on the 7900 XT, mapping cost 15.1 GiB of RAM and reading cost 1.0 GiB, at the same 35.6 tok/s. Windows reports "private" memory near the VRAM size in both cases, which is GPU allocation and not RAM.
+
 Request logging is off, because nodes poll each other constantly. Set `SHARDMESH_ACCESS_LOG=1` to turn it on while debugging.
 
 ## Upgrading

@@ -64,6 +64,7 @@ class ModelParams(C.Structure):
     ]
 
 
+LOAD_READ = 0
 EVAL_CALLBACK = C.CFUNCTYPE(C.c_bool, C.c_void_p, C.c_bool, C.c_void_p)
 
 
@@ -424,12 +425,17 @@ class LlamaStage:
         rollback_tokens: int = 0,
         sequences: int = 1,
         unified_cache: bool = False,
+        map_file: bool = True,
     ) -> None:
         self.library = library
         self.last = last
         lib = library.llama
         params = lib.llama_model_default_params()
         params.n_gpu_layers = gpu_layers
+        if not map_file:
+            # A mapped file stays resident in RAM even when its tensors live in
+            # VRAM: measured at 15 GiB for a 15 GiB model. Reading it once uses 1 GiB.
+            params.load_mode = LOAD_READ
         overrides = None
         if cpu_tensors and gpu_layers:
             buffer_type = library.cpu_buffer_type()
@@ -446,6 +452,9 @@ class LlamaStage:
         self.batch_tokens = batch_tokens
         self._target = f"l_out-{self.layers - 1}".encode()
         self._captured: np.ndarray | None = None
+        # llama.cpp can split a pass into several, and this sees each of them.
+        self._parts: list[np.ndarray] = []
+        self._collecting = False
         self._callback = EVAL_CALLBACK(self._on_eval)
 
         context = lib.llama_context_default_params()
@@ -475,6 +484,8 @@ class LlamaStage:
         captured = np.empty(size // 4, dtype=np.float32)
         base.ggml_backend_tensor_get(tensor, captured.ctypes.data, 0, size)
         self._captured = captured
+        if self._collecting:
+            self._parts.append(captured)
         return False  # stop here: the output norm and LM head are not needed
 
     def clear(self, slot: int | None = None) -> None:
@@ -630,15 +641,20 @@ class LlamaStage:
             seq_id=C.cast(sequence_ids, C.c_void_p).value,
             logits=outputs.ctypes.data,
         )
-        self._captured = None
-        status = self.library.llama.llama_decode(self.context, batch)
+        self._parts = []
+        self._collecting = True
+        try:
+            status = self.library.llama.llama_decode(self.context, batch)
+        finally:
+            self._collecting = False
         if status != 0:
             raise LlamaError(f"llama_decode failed with status {status}")
         if self.last:
             return np.stack([self.logits_at(index).copy() for index in range(count)])
-        if self._captured is None or self._captured.size != count * self.hidden_size:
+        rows = np.concatenate(self._parts) if self._parts else np.empty(0, dtype=np.float32)
+        if rows.size != count * self.hidden_size:
             raise LlamaError("a merged pass did not produce one row per conversation")
-        return self._captured.reshape(count, self.hidden_size)
+        return rows.reshape(count, self.hidden_size)
 
     def close(self) -> None:
         lib = self.library.llama
