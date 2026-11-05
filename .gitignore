@@ -8,7 +8,7 @@ build/
 .env
 .smoke-model/
 .playwright-mcp/
-models/
+/models/
 
 
 # Credentials and pool state never belong in the repository.
