@@ -1,0 +1,573 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>ShardMesh Chat</title>
+  <link rel="icon" href="data:,">
+  <style>
+    :root {
+      --bg: #090c11;
+      --surface: #10141c;
+      --raised: #171d27;
+      --line: rgba(255, 255, 255, .09);
+      --text: #f1f4f2;
+      --muted: #94a0ae;
+      --faint: #5f6b7a;
+      --vram: #7cf0c6;
+      --unified: #6fc3ff;
+      --ram: #a897ff;
+      --disk: #ffc56e;
+      --red: #ff7f90;
+      --rail-width: 300px;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      color: var(--text);
+      background: var(--bg);
+      font: 15px/1.6 "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", sans-serif;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+    }
+    button, input, textarea, select { font: inherit; color: inherit; }
+    button { cursor: pointer; }
+    button:disabled { cursor: not-allowed; opacity: .5; }
+    :focus-visible { outline: 2px solid var(--vram); outline-offset: 2px; }
+    a { color: var(--muted); }
+    a:hover { color: var(--text); }
+
+    .bar { display: flex; align-items: center; gap: 14px; padding: 10px 18px; border-bottom: 1px solid var(--line); min-width: 0; }
+    .wordmark { font-weight: 650; letter-spacing: -.01em; }
+    .model-button {
+      display: inline-flex; align-items: center; gap: 9px; min-width: 0; max-width: min(460px, 56vw);
+      height: 36px; padding: 0 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+    }
+    .model-button:hover { border-color: rgba(255, 255, 255, .22); }
+    .model-button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .light { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--faint); }
+    .light.ready { background: var(--vram); }
+    .light.busy { background: var(--disk); }
+    .spacer { flex: 1; }
+    .quiet { background: none; border: 0; padding: 6px 8px; color: var(--muted); border-radius: 6px; text-decoration: none; font-size: 14px; white-space: nowrap; }
+    .rail-action { margin: 0 0 14px; }
+    .quiet:hover { color: var(--text); background: var(--surface); }
+
+    .workspace { display: grid; grid-template-columns: minmax(0, 1fr) var(--rail-width); min-height: 0; }
+    .conversation { display: grid; grid-template-rows: minmax(0, 1fr) auto; min-height: 0; min-width: 0; }
+    .log { overflow-y: auto; padding: 28px 24px 12px; scroll-behavior: smooth; }
+    .column { width: min(72ch, 100%); margin: 0 auto; }
+
+    .empty { margin-top: 14vh; color: var(--muted); }
+    .empty h1 { color: var(--text); font-size: 26px; line-height: 1.25; font-weight: 600; letter-spacing: -.02em; margin: 0 0 8px; }
+    .empty p { margin: 0 0 18px; }
+
+    .turn { margin-bottom: 26px; }
+    .turn.user { padding-left: 14px; border-left: 2px solid var(--faint); color: #d6dcdf; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .answer { overflow-wrap: anywhere; }
+    .answer p { margin: 0 0 12px; }
+    .answer p:last-child { margin-bottom: 0; }
+    .answer ul, .answer ol { margin: 0 0 12px; padding-left: 22px; }
+    .answer code { font: .92em ui-monospace, "Cascadia Mono", Consolas, monospace; background: var(--raised); padding: 1px 5px; border-radius: 4px; }
+    .answer pre { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; overflow-x: auto; margin: 0 0 12px; }
+    .answer pre code { background: none; padding: 0; }
+    .waiting { color: var(--muted); }
+    .reasoning { margin-bottom: 12px; color: var(--muted); font-size: 14px; }
+    .reasoning summary { cursor: pointer; }
+    .reasoning div { padding: 8px 0 0 14px; border-left: 2px solid var(--line); margin-top: 6px; white-space: pre-wrap; }
+    .receipt { margin-top: 8px; color: var(--faint); font-size: 13px; font-variant-numeric: tabular-nums; }
+    .failure { color: var(--red); }
+
+    .composer { padding: 10px 24px 16px; }
+    .box { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 10px 10px 8px 14px; }
+    .box:focus-within { border-color: rgba(255, 255, 255, .26); }
+    textarea { display: block; width: 100%; max-height: 220px; resize: none; background: none; border: 0; outline: 0; padding: 2px 0 6px; }
+    textarea::placeholder { color: var(--faint); }
+    .controls { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
+    .controls label { display: inline-flex; align-items: center; gap: 6px; }
+    .controls input[type=number] { width: 72px; background: var(--raised); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; }
+    .send { margin-left: auto; height: 34px; padding: 0 16px; border: 0; border-radius: 8px; background: var(--vram); color: #06140f; font-weight: 650; }
+    .send.stop { background: var(--raised); color: var(--text); }
+
+    .rail { border-left: 1px solid var(--line); overflow-y: auto; padding: 16px 16px 20px; position: relative; min-height: 0; }
+    .rail h2 { font-size: 14px; font-weight: 600; margin: 0 0 2px; }
+    .rail-note { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+    .stage { margin-bottom: 16px; }
+    .stage-title { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; margin-bottom: 6px; }
+    .stage-title b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .stage-title span { color: var(--faint); flex: none; font-variant-numeric: tabular-nums; }
+    .stack { position: relative; display: grid; gap: 2px; overflow: hidden; border-radius: 3px; }
+    .layer { display: grid; grid-template-columns: 1fr; gap: 2px; height: 7px; }
+    .layer.moe { grid-template-columns: 2fr 5fr; }
+    .cell { background: var(--tier); }
+    .tier-vram { --tier: var(--vram); }
+    .tier-unified { --tier: var(--unified); }
+    .tier-ram { --tier: var(--ram); }
+    .tier-disk { --tier: var(--disk); }
+    .stack.fetching .cell { opacity: .22; }
+    .stack.fetching .layer.done .cell { opacity: 1; }
+    .pulse { position: absolute; left: 0; right: 0; height: 26px; top: -26px; pointer-events: none; background: linear-gradient(transparent, rgba(255, 255, 255, .55), transparent); }
+    .pulse.run { animation: travel .42s linear; }
+    @keyframes travel { to { top: 100%; } }
+    .stage-memory { margin: 7px 0 0; padding: 0; list-style: none; font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .stage-memory li { display: flex; justify-content: space-between; gap: 10px; }
+    .progress { font-size: 13px; color: var(--muted); margin-top: 6px; font-variant-numeric: tabular-nums; }
+    .hop { color: var(--faint); font-size: 12px; margin: -8px 0 8px; }
+    .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 13px; color: var(--muted); padding-top: 12px; border-top: 1px solid var(--line); }
+    .legend i { display: inline-block; width: 9px; height: 9px; margin-right: 6px; background: var(--tier); }
+
+    dialog { color: var(--text); background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 0; width: min(620px, calc(100vw - 24px)); max-height: calc(100vh - 32px); }
+    dialog::backdrop { background: rgba(4, 6, 9, .68); }
+    .sheet { padding: 20px; display: grid; gap: 14px; }
+    .sheet h2 { margin: 0; font-size: 19px; font-weight: 600; letter-spacing: -.01em; }
+    .catalog { display: grid; max-height: 300px; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; }
+    .pick { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 14px; text-align: left; background: none; border: 0; border-bottom: 1px solid var(--line); padding: 8px 12px; }
+    .pick:last-child { border-bottom: 0; }
+    .pick:hover { background: var(--raised); }
+    .pick[aria-pressed=true] { background: var(--raised); box-shadow: inset 2px 0 var(--vram); }
+    .pick span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .pick .meta { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+    .field { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
+    .field input, .field select { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; color: var(--text); font-size: 15px; width: 100%; }
+    .fields { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .preview { min-height: 66px; font-size: 14px; color: var(--muted); }
+    .preview b { color: var(--text); font-weight: 600; }
+    .preview ul { margin: 6px 0 0; padding: 0; list-style: none; font-variant-numeric: tabular-nums; }
+    .sheet-actions { display: flex; justify-content: flex-end; gap: 10px; }
+    .primary { height: 36px; padding: 0 16px; border: 0; border-radius: 8px; background: var(--vram); color: #06140f; font-weight: 650; }
+    .secondary { height: 36px; padding: 0 14px; border: 1px solid var(--line); border-radius: 8px; background: none; }
+
+    @media (max-width: 860px) {
+      .workspace { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+      .rail { order: -1; display: flex; flex-wrap: wrap; gap: 10px; border-left: 0; border-bottom: 1px solid var(--line); padding: 10px 16px; overflow: visible; }
+      .rail h2, .rail-note, .stage-memory, .legend, .hop { display: none; }
+      .rail-action { display: block; flex-basis: 100%; margin: 0; }
+      .stage { flex: 1; min-width: 0; margin: 0; }
+      .stack { display: flex; flex-direction: column; gap: 1px; height: 40px; }
+      .layer { flex: 1; height: auto; min-height: 0; }
+      .log { padding: 18px 16px 8px; }
+      .composer { padding: 8px 12px 12px; }
+      .fields { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 480px) {
+      .wordmark { display: none; }
+      .bar { gap: 6px; padding: 8px 12px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .log { scroll-behavior: auto; }
+      .pulse.run { animation: none; }
+    }
+  </style>
+</head>
+<body>
+  <header class="bar">
+    <div class="wordmark">ShardMesh</div>
+    <button class="model-button" id="modelButton" aria-haspopup="dialog"><i class="light" id="light"></i><span id="modelLabel">Choose a model</span></button>
+    <div class="spacer"></div>
+    <button class="quiet" id="newChat">New chat</button>
+    <a class="quiet" href="/dashboard">Dashboard</a>
+  </header>
+
+  <div class="workspace">
+    <main class="conversation">
+      <div class="log" id="log" role="log" aria-label="Conversation"><div class="column" id="turns"></div></div>
+      <form class="composer" id="composer">
+        <div class="column box">
+          <textarea id="prompt" rows="1" placeholder="Message the model" aria-label="Message"></textarea>
+          <div class="controls">
+            <label title="Lets the model reason before it answers, on models that support it"><input type="checkbox" id="thinking"> Thinking</label>
+            <label>Temperature <input type="number" id="temperature" min="0" max="2" step="0.1" value="0.7"></label>
+            <label>Max tokens <input type="number" id="maxTokens" min="1" max="32768" step="1" value="1024"></label>
+            <button class="send" id="send" type="submit">Send</button>
+          </div>
+        </div>
+      </form>
+    </main>
+    <aside class="rail" id="rail" aria-label="Where the model is running"></aside>
+  </div>
+
+  <dialog id="picker" aria-labelledby="pickerTitle">
+    <form class="sheet" id="pickerForm" method="dialog">
+      <h2 id="pickerTitle">Load a model</h2>
+      <div class="catalog" id="catalog"></div>
+      <label class="field">Or any Hugging Face model, or a folder on the orchestrator
+        <input id="customModel" placeholder="Qwen/Qwen3-4B" autocomplete="off" spellcheck="false">
+      </label>
+      <div class="fields">
+        <label class="field">Context length
+          <input id="contextTokens" type="number" min="128" step="128" value="4096">
+        </label>
+        <label class="field">Placement
+          <select id="placement">
+            <option value="spread">Use every worker</option>
+            <option value="compact">Use as few workers as fit</option>
+          </select>
+        </label>
+      </div>
+      <div class="fields">
+        <label class="field">Entry node, which sees your prompt
+          <select id="entryWorker"></select>
+        </label>
+        <label class="field">Exit node, which sees the reply
+          <select id="exitWorker"></select>
+        </label>
+      </div>
+      <div class="preview" id="preview" aria-live="polite">Choose a model to see where it would run.</div>
+      <div class="sheet-actions">
+        <button class="secondary" type="button" id="closePicker">Close</button>
+        <button class="primary" type="button" id="loadModel" disabled>Load model</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="auth" aria-labelledby="authTitle">
+    <form class="sheet" id="authForm">
+      <h2 id="authTitle">Enter the pool token</h2>
+      <label class="field">This pool is protected. The token stays in this browser.
+        <input id="tokenInput" type="password" autocomplete="current-password">
+      </label>
+      <div class="sheet-actions"><button class="primary" type="submit">Connect</button></div>
+    </form>
+  </dialog>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    const storage = { get: key => { try { return localStorage.getItem(key); } catch { return null; } }, set: (key, value) => { try { localStorage.setItem(key, value); } catch {} } };
+    const state = { token: storage.get('shardmesh-token') || '', status: null, turns: [], streaming: false, abort: null, selected: '', previewTimer: null, previewId: 0, lastPulse: 0 };
+    const TIER = { vram: 'VRAM', unified: 'Unified', ram: 'RAM', disk: 'Disk' };
+    const PHASE = { resolving: 'Reading the model\'s tensor list', fetching: 'Downloading each worker\'s shards', loading: 'Moving weights into memory' };
+    // GGUF ids carry a repository and a file; the file names the model and its quantization.
+    const modelName = id => /\.gguf$/i.test(id || '') ? id.split(/[:\\/]/).pop().replace(/\.gguf$/i, '') : (id || '');
+    const esc = value => String(value ?? '').replace(/[&<>'"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[c]));
+    const size = value => { if (!value) return '0 B'; const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']; const i = Math.min(Math.floor(Math.log(value) / Math.log(1024)), 4); return `${(value / 1024 ** i).toFixed(i > 2 ? 2 : 0)} ${units[i]}`; };
+    const headers = () => state.token ? { Authorization: `Bearer ${state.token}` } : {};
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, { ...options, headers: { 'Content-Type': 'application/json', ...headers(), ...(options.headers || {}) } });
+      if (response.status === 401) { if (!$('auth').open) $('auth').showModal(); throw new Error('Pool token required'); }
+      if (!response.ok) {
+        let message = `Request failed with HTTP ${response.status}`;
+        try { const body = await response.json(); message = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail); } catch {}
+        const error = new Error(message); error.status = response.status; throw error;
+      }
+      return response.json();
+    }
+
+    function inlineMarkdown(text) {
+      return text.replace(/`([^`\n]+)`/g, '<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+    }
+    function renderProse(text) {
+      const blocks = [];
+      let list = null;
+      const flush = () => { if (list) { blocks.push(`<${list.tag}>${list.items.map(item => `<li>${item}</li>`).join('')}</${list.tag}>`); list = null; } };
+      let paragraph = [];
+      const endParagraph = () => { if (paragraph.length) { blocks.push(`<p>${paragraph.join('<br>')}</p>`); paragraph = []; } };
+      for (const line of text.split('\n')) {
+        const bullet = line.match(/^\s*[-*]\s+(.*)$/), numbered = line.match(/^\s*\d+\.\s+(.*)$/);
+        if (bullet || numbered) {
+          endParagraph();
+          const tag = bullet ? 'ul' : 'ol';
+          if (!list || list.tag !== tag) { flush(); list = { tag, items: [] }; }
+          list.items.push(inlineMarkdown(esc((bullet || numbered)[1])));
+        } else if (!line.trim()) { flush(); endParagraph(); }
+        else { flush(); paragraph.push(inlineMarkdown(esc(line))); }
+      }
+      flush(); endParagraph();
+      return blocks.join('');
+    }
+    function renderMarkdown(text) {
+      return text.split(/(```[\s\S]*?(?:```|$))/g).map(part => {
+        if (!part.startsWith('```')) return renderProse(part);
+        const body = part.replace(/^```[^\n]*\n?/, '').replace(/```$/, '');
+        return `<pre><code>${esc(body)}</code></pre>`;
+      }).join('');
+    }
+    function splitReasoning(text) {
+      const end = text.indexOf('</think>');
+      if (end >= 0) return { reasoning: text.slice(0, end).replace('<think>', '').trim(), answer: text.slice(end + 8).trimStart(), thinking: false };
+      if (text.trimStart().startsWith('<think>')) return { reasoning: text.replace('<think>', '').trim(), answer: '', thinking: true };
+      return { reasoning: '', answer: text, thinking: false };
+    }
+    function renderAnswer(turn) {
+      const { reasoning, answer, thinking } = splitReasoning(turn.text);
+      let html = '';
+      if (reasoning) html += `<details class="reasoning"${thinking ? ' open' : ''}><summary>${thinking ? 'Thinking' : 'Show reasoning'}</summary><div>${esc(reasoning)}</div></details>`;
+      html += answer ? `<div class="answer">${renderMarkdown(answer)}</div>` : (turn.pending && !reasoning ? `<div class="waiting">${esc(turn.waiting || 'Running the prompt through the pipeline')}</div>` : '');
+      if (turn.notice) html += `<div class="receipt">${esc(turn.notice)}</div>`;
+      if (turn.error) html += `<div class="failure">${esc(turn.error)}</div>`;
+      if (turn.receipt) html += `<div class="receipt">${esc(turn.receipt)}</div>`;
+      return html;
+    }
+    const jobRunning = status => { const job = status?.load_job; return Boolean(job) && !['ready', 'failed', 'cancelled'].includes(job.phase); };
+    const workerCount = route => `${route.length} worker${route.length === 1 ? '' : 's'}`;
+    function renderEmpty() {
+      const ready = state.status?.status === 'ready';
+      if (ready && jobRunning(state.status)) {
+        const job = state.status.load_job, serving = state.status.route || [];
+        const change = job.model === state.status.model ? `A new layout across ${workerCount(job.route || [])} is being prepared` : `${modelName(job.model)} is being prepared`;
+        return `<div class="empty"><h1>${esc(modelName(state.status.model))} is running on ${workerCount(serving)}</h1><p>${esc(change)}. Chat stays on the current layout, which has all its weights, until every new shard is in place.</p></div>`;
+      }
+      if (ready) return `<div class="empty"><h1>${esc(modelName(state.status.model))} is ready</h1><p>Send a message to run it across the mesh.</p></div>`;
+      if (jobRunning(state.status)) {
+        const job = state.status.load_job;
+        const percent = job.phase === 'fetching' && job.bytes_total ? `, ${Math.floor(job.bytes_done / job.bytes_total * 100)}%` : '';
+        return `<div class="empty"><h1>Loading ${esc(modelName(job.model))}</h1><p>${esc(PHASE[job.phase] || job.phase)}${percent}. Chat opens when every shard is in place.</p></div>`;
+      }
+      const workers = Object.values(state.status?.workers || {}).filter(w => w.live && (w.hardware?.memory_pools || []).length).length;
+      if (!workers) return '<div class="empty"><h1>No workers connected</h1><p>Start a node with <code>python -m shardmesh node</code> and point it at this orchestrator. It will appear here.</p></div>';
+      return `<div class="empty"><h1>Load a model to start</h1><p>${workers} worker${workers === 1 ? ' is' : 's are'} connected. Each one downloads only the layers it will run.</p><button class="primary" type="button" id="emptyPick">Choose a model</button></div>`;
+    }
+    function renderTurns() {
+      const root = $('turns');
+      if (!state.turns.length) { root.innerHTML = renderEmpty(); const button = $('emptyPick'); if (button) button.onclick = openPicker; return; }
+      root.innerHTML = state.turns.map(turn => turn.role === 'user' ? `<div class="turn user">${esc(turn.text)}</div>` : `<div class="turn">${renderAnswer(turn)}</div>`).join('');
+    }
+    function stickToBottom(force) {
+      const log = $('log');
+      if (force || log.scrollHeight - log.scrollTop - log.clientHeight < 140) log.scrollTop = log.scrollHeight;
+    }
+
+    function pulse() {
+      const now = performance.now();
+      if (now - state.lastPulse < 420) return;
+      state.lastPulse = now;
+      document.querySelectorAll('.pulse').forEach((element, index) => {
+        setTimeout(() => { element.classList.remove('run'); void element.offsetWidth; element.classList.add('run'); }, index * 90);
+      });
+    }
+
+    async function send(text) {
+      const history = state.turns.filter(turn => !turn.error).map(turn => ({ role: turn.role, content: turn.role === 'assistant' ? splitReasoning(turn.text).answer : turn.text }));
+      history.push({ role: 'user', content: text });
+      state.turns.push({ role: 'user', text });
+      const turn = { role: 'assistant', text: '', pending: true };
+      state.turns.push(turn);
+      state.streaming = true; state.abort = new AbortController();
+      syncComposer(); renderTurns(); stickToBottom(true);
+      const started = performance.now();
+      const attempt = async base => {
+        const response = await fetch(base + '/v1/chat/completions', {
+          method: 'POST', signal: state.abort.signal,
+          headers: { 'Content-Type': 'application/json', ...headers() },
+          body: JSON.stringify({ messages: history, stream: true, temperature: Number($('temperature').value), top_p: 0.9, top_k: 40, max_tokens: Number($('maxTokens').value), enable_thinking: $('thinking').checked }),
+        });
+        if (!response.ok) { let message = `The request failed with HTTP ${response.status}.`; try { message = (await response.json()).detail; } catch {} throw new Error(message); }
+        const reader = response.body.getReader(), decoder = new TextDecoder();
+        let buffer = '', scheduled = false;
+        const paint = () => { scheduled = false; renderTurns(); stickToBottom(); };
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const events = buffer.split('\n\n'); buffer = events.pop();
+          for (const event of events) {
+            if (!event.startsWith('data: ') || event === 'data: [DONE]') continue;
+            const data = JSON.parse(event.slice(6));
+            if (data.error) throw new Error(data.error.message);
+            const delta = data.choices?.[0]?.delta?.content;
+            if (delta) { turn.text += delta; pulse(); if (!scheduled) { scheduled = true; requestAnimationFrame(paint); } }
+            if (data.usage) {
+              const info = data.shardmesh || {}, parts = [`${data.usage.completion_tokens} tokens`];
+              if (info.tokens_per_second) parts.push(`${info.tokens_per_second} tokens/s`);
+              parts.push(`first token in ${(info.time_to_first_token_ms / 1000).toFixed(2)} s`);
+              parts.push(`${info.stages} stage${info.stages === 1 ? '' : 's'}`);
+              if (data.choices?.[0]?.finish_reason === 'length') parts.push('stopped at the token limit');
+              turn.receipt = parts.join(', ');
+            }
+          }
+        }
+      };
+      try {
+        // Each node serves replies itself, so if this one is lost, another can.
+        const here = location.origin, nodes = ['', ...Object.values(state.status?.mesh?.members || {}).filter(url => url !== here && url.startsWith(location.protocol))];
+        for (let index = 0; ; index += 1) {
+          try { turn.text = ''; await attempt(nodes[index]); break; }
+          catch (error) {
+            if (!(error instanceof TypeError) || index === nodes.length - 1) throw error;
+            turn.text = ''; turn.notice = 'Lost the connection, so this reply restarted on another node.'; renderTurns();
+          }
+        }
+      } catch (error) {
+        if (error.name === 'AbortError') turn.receipt = `Stopped after ${((performance.now() - started) / 1000).toFixed(1)} s`;
+        else turn.error = error.message;
+      } finally {
+        turn.pending = false; state.streaming = false; state.abort = null;
+        syncComposer(); renderTurns(); stickToBottom();
+      }
+    }
+
+    function syncComposer() {
+      const ready = state.status?.status === 'ready';
+      const button = $('send');
+      button.textContent = state.streaming ? 'Stop' : 'Send';
+      button.classList.toggle('stop', state.streaming);
+      button.disabled = !state.streaming && !ready;
+      $('prompt').placeholder = ready ? 'Message the model' : 'Load a model to start chatting';
+    }
+
+    function tierOf(status, workerId, poolId) {
+      const pools = status.workers?.[workerId]?.hardware?.memory_pools || [];
+      return pools.find(pool => pool.pool_id === poolId)?.kind || 'disk';
+    }
+    function stageRole(index, count) {
+      if (count === 1) return 'Entry and exit';
+      return index === 0 ? 'Entry' : index === count - 1 ? 'Exit' : '';
+    }
+    function renderStage(status, stage, index, count, progress) {
+      const placed = Object.fromEntries((stage.placements || []).map(item => [item.unit, item]));
+      const layerName = (layer, part) => `layer-${String(layer).padStart(5, '0')}.${part}`;
+      const totals = {};
+      for (const item of stage.placements || []) { const kind = tierOf(status, stage.worker_id, item.pool_id); totals[kind] = (totals[kind] || 0) + item.bytes; }
+      const fetched = progress ? (progress.bytes_total ? progress.bytes_done / progress.bytes_total : 1) : 1;
+      const layers = stage.end_layer - stage.start_layer;
+      let rows = '';
+      for (let offset = 0; offset < layers; offset++) {
+        const layer = stage.start_layer + offset;
+        const dense = placed[layerName(layer, 'dense')], experts = placed[layerName(layer, 'experts')];
+        const cell = item => `<div class="cell tier-${item ? tierOf(status, stage.worker_id, item.pool_id) : 'disk'}"></div>`;
+        const done = progress && (offset + 1) / layers <= fetched ? ' done' : '';
+        rows += `<div class="layer${experts ? ' moe' : ''}${done}" title="Layer ${layer}">${cell(dense)}${experts ? cell(experts) : ''}</div>`;
+      }
+      const memory = Object.entries(totals).map(([kind, bytes]) => `<li><span>${esc(TIER[kind] || kind)}</span><span>${size(bytes)}</span></li>`).join('');
+      let fetchLine = '';
+      if (progress) {
+        const speed = progress.bytes_per_second ? `, ${size(progress.bytes_per_second)}/s` : '';
+        fetchLine = `<div class="progress">${progress.phase === 'ready' ? 'Shards ready' : `${size(progress.bytes_done)} of ${size(progress.bytes_total)}${speed}`}${progress.bytes_from_peers ? `, ${size(progress.bytes_from_peers)} from other nodes` : ''}${progress.bytes_reused ? `, ${size(progress.bytes_reused)} already here` : ''}</div>`;
+      }
+      const hop = index < count - 1 ? '<div class="hop">Activations hop to the next worker</div>' : '';
+      return `<section class="stage"><div class="stage-title"><b>${esc(stage.worker_id)}</b><span>${stageRole(index, count) ? `${stageRole(index, count)}, layers` : 'Layers'} ${stage.start_layer}–${stage.end_layer - 1}</span></div><div class="stack${progress ? ' fetching' : ''}">${rows}<div class="pulse"></div></div><ul class="stage-memory">${memory}</ul>${fetchLine}</section>${hop}`;
+    }
+    function renderRail(status) {
+      const job = status.load_job, active = jobRunning(status);
+      const route = active && job.route?.length ? job.route : status.route || [];
+      const serving = status.route || [];
+      let html = '';
+      if (active) {
+        const percent = job.bytes_total ? Math.floor(job.bytes_done / job.bytes_total * 100) : null;
+        html += `<h2>${serving.length ? 'Preparing a new layout' : esc(modelName(job.model))}</h2><p class="rail-note">${esc(PHASE[job.phase] || job.phase)}${job.phase === 'fetching' && percent != null ? `, ${percent}%` : ''}</p>`;
+        if (serving.length) html += `<p class="rail-note">Chat is running on ${esc(serving.map(stage => stage.worker_id).join(', '))} until this finishes. Below is the layout it will switch to.</p>`;
+        if (job.phase !== 'loading') html += '<p class="rail-action"><button class="quiet" id="cancelLoad" type="button">Cancel load</button></p>';
+      } else if (route.length) {
+        const speed = status.active_plan?.estimated_tokens_per_second;
+        html += `<h2>Where this model runs</h2><p class="rail-note">${route.length} stage${route.length === 1 ? '' : 's'}, ${status.active_plan?.layers ?? ''} layers${speed ? `, planned for about ${speed} tokens/s` : ''}</p>`;
+      } else {
+        html += `<h2>Nothing loaded</h2><p class="rail-note">The model's layers appear here, colored by the memory each one sits in.</p>`;
+      }
+      if (job?.phase === 'failed' && !route.length) html += `<p class="rail-note failure">${esc(job.error)}</p>`;
+      html += route.map((stage, index) => renderStage(status, stage, index, route.length, active && job.phase === 'fetching' ? job.workers?.[stage.worker_id] : null)).join('');
+      const kinds = new Set();
+      for (const stage of route) for (const item of stage.placements || []) kinds.add(tierOf(status, stage.worker_id, item.pool_id));
+      if (kinds.size) html += `<div class="legend">${[...kinds].map(kind => `<span class="tier-${esc(kind)}"><i></i>${esc(TIER[kind] || kind)}</span>`).join('')}</div>`;
+      $('rail').innerHTML = html;
+      const cancel = $('cancelLoad');
+      if (cancel) cancel.onclick = () => api('/admin/load/cancel', { method: 'POST' }).catch(() => {});
+    }
+    function renderBar(status) {
+      const busy = status.status === 'loading', moving = status.status === 'ready' && jobRunning(status);
+      $('light').className = `light${moving || busy ? ' busy' : status.status === 'ready' ? ' ready' : ''}`;
+      $('modelLabel').textContent = busy ? `Loading ${modelName(status.load_job?.model)}` : status.model && status.status === 'ready' ? modelName(status.model) : 'Choose a model';
+    }
+
+    let pollTimer = null;
+    async function poll() {
+      clearTimeout(pollTimer);
+      try {
+        const status = await api('/admin/status');
+        const changed = status.status !== state.status?.status || jobRunning(status) !== jobRunning(state.status);
+        state.status = status;
+        renderBar(status); renderRail(status); syncComposer();
+        if ((changed || !state.turns.length) && !state.streaming) renderTurns();
+      } catch {}
+      pollTimer = setTimeout(poll, state.status?.status === 'loading' ? 1000 : 2500);
+    }
+
+    function selectModel(id) {
+      state.selected = id.trim();
+      document.querySelectorAll('.pick').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.id === state.selected)));
+      $('loadModel').disabled = true;
+      schedulePreview();
+    }
+    function schedulePreview() {
+      clearTimeout(state.previewTimer);
+      if (!state.selected) { $('preview').textContent = 'Choose a model to see where it would run.'; return; }
+      $('preview').textContent = 'Reading the model\'s tensor list…';
+      state.previewTimer = setTimeout(runPreview, 350);
+    }
+    function loadOptions() {
+      const options = { model_id: state.selected, context_tokens: Number($('contextTokens').value) || 4096, placement: $('placement').value };
+      if ($('entryWorker').value) options.entry_worker = $('entryWorker').value;
+      if ($('exitWorker').value) options.exit_worker = $('exitWorker').value;
+      return options;
+    }
+    async function runPreview() {
+      const ticket = ++state.previewId;
+      try {
+        const plan = await api('/admin/plan', { method: 'POST', body: JSON.stringify(loadOptions()) });
+        if (ticket !== state.previewId) return;
+        const status = state.status || { workers: {} };
+        const lines = plan.route.map(stage => {
+          const totals = {};
+          for (const item of stage.placements) { const kind = tierOf(status, stage.worker_id, item.pool_id); totals[kind] = (totals[kind] || 0) + item.bytes; }
+          const memory = Object.entries(totals).map(([kind, bytes]) => `${size(bytes)} ${TIER[kind] || kind}`).join(', ');
+          const role = stageRole(plan.route.indexOf(stage), plan.route.length);
+          return `<li>${esc(stage.worker_id)}${role ? ` (${role.toLowerCase()})` : ''}: layers ${stage.start_layer}–${stage.end_layer - 1} in ${esc(memory)}</li>`;
+        }).join('');
+        const speed = plan.estimated_tokens_per_second ? `, about ${plan.estimated_tokens_per_second} tokens/s` : '';
+        const download = (plan.download_bytes ? `Needs ${size(plan.download_bytes)} of new shards.` : 'Every shard is already in place.') + (plan.draft_model ? ` A draft model (${modelName(plan.draft_model)}) will speed up replies.` : '');
+        const busy = jobRunning(state.status) ? ` ${modelName(state.status.load_job.model)} is still loading, so cancel it first to load this one.` : '';
+        $('preview').innerHTML = `<b>Fits: ${size(plan.model_bytes)} across ${plan.route.length} worker${plan.route.length === 1 ? '' : 's'}${speed}</b><ul>${lines}</ul>${esc(download + busy)}`;
+        $('loadModel').disabled = Boolean(busy);
+      } catch (error) {
+        if (ticket !== state.previewId) return;
+        $('preview').innerHTML = `<span class="failure">${esc(error.message)}</span>`;
+      }
+    }
+    function fillWorkerChoices() {
+      const workers = Object.entries(state.status?.workers || {}).filter(([, worker]) => worker.live && (worker.hardware?.memory_pools || []).length).map(([id]) => id);
+      for (const select of [$('entryWorker'), $('exitWorker')]) {
+        const current = select.value;
+        select.innerHTML = '<option value="">Fastest, chosen automatically</option>' + workers.map(id => `<option value="${esc(id)}">${esc(id)}</option>`).join('');
+        select.value = workers.includes(current) ? current : '';
+      }
+    }
+    async function openPicker() {
+      fillWorkerChoices();
+      $('picker').showModal();
+      try {
+        const { models } = await api('/admin/catalog');
+        $('catalog').innerHTML = models.map(model => `<button class="pick" type="button" data-id="${esc(model.id)}" aria-pressed="${model.id === state.selected}"><span>${esc(model.id)}</span><span class="meta">${esc(model.kind)}</span><span class="meta">${esc(model.size)}</span></button>`).join('');
+        $('catalog').querySelectorAll('.pick').forEach(button => { button.onclick = () => { $('customModel').value = ''; selectModel(button.dataset.id); }; });
+      } catch {}
+    }
+
+    $('modelButton').onclick = openPicker;
+    $('closePicker').onclick = () => $('picker').close();
+    $('customModel').oninput = event => selectModel(event.target.value);
+    $('contextTokens').onchange = schedulePreview;
+    $('placement').onchange = schedulePreview;
+    $('entryWorker').onchange = schedulePreview;
+    $('exitWorker').onchange = schedulePreview;
+    $('loadModel').onclick = async () => {
+      try {
+        await api('/admin/load', { method: 'POST', body: JSON.stringify({ ...loadOptions(), wait: false }) });
+        $('picker').close(); poll();
+      } catch (error) { $('preview').innerHTML = `<span class="failure">${esc(error.message)}</span>`; }
+    };
+    $('newChat').onclick = () => { if (state.abort) state.abort.abort(); state.turns = []; renderTurns(); $('prompt').focus(); };
+    $('authForm').onsubmit = event => { event.preventDefault(); state.token = $('tokenInput').value.trim(); storage.set('shardmesh-token', state.token); $('auth').close(); poll(); };
+    $('composer').onsubmit = event => {
+      event.preventDefault();
+      if (state.streaming) { state.abort.abort(); return; }
+      const text = $('prompt').value.trim();
+      if (!text || state.status?.status !== 'ready') return;
+      $('prompt').value = ''; $('prompt').style.height = '';
+      send(text);
+    };
+    $('prompt').onkeydown = event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); $('composer').requestSubmit(); } };
+    $('prompt').oninput = event => { const box = event.target; box.style.height = 'auto'; box.style.height = `${box.scrollHeight}px`; };
+    renderTurns(); syncComposer(); poll();
+  </script>
+</body>
+</html>

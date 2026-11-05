@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+dist/
+build/
+*.egg-info/
+.env
+.smoke-model/
+.playwright-mcp/
+models/
+
+
+# Credentials and pool state never belong in the repository.
+*.key
+*.pem
+*.token
+pool-secrets/
+pool-authority/
+access*.json
+keys*.json
+audit*.jsonl
+orchestrator-state*.json
+
+# Model files and logs
+*.gguf
+*.safetensors
+*.log

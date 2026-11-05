@@ -1,0 +1,38 @@
+# Run a ShardMesh node at boot on Linux, restarting it if it stops.
+#
+#   sudo useradd --system --create-home --home-dir /var/lib/shardmesh shardmesh
+#   sudo python3 -m venv /opt/shardmesh && sudo /opt/shardmesh/bin/pip install 'shardmesh[pool]'
+#   sudo cp shardmesh-node.service /etc/systemd/system/
+#   sudo install -d -m 750 -o shardmesh /etc/shardmesh
+#   sudo cp shardmesh-node.env /etc/shardmesh/node.env   # then edit it
+#   sudo systemctl enable --now shardmesh-node
+#
+# A node's services restart themselves. This only has to get the node going and
+# bring it back if the supervisor itself stops.
+
+[Unit]
+Description=ShardMesh node
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=shardmesh
+EnvironmentFile=/etc/shardmesh/node.env
+ExecStart=/opt/shardmesh/bin/shardmesh node $SHARDMESH_NODE_ARGS
+Restart=always
+RestartSec=5
+# Replies get a moment to finish, and stage processes a moment to exit.
+TimeoutStopSec=30
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+StateDirectory=shardmesh
+LogsDirectory=shardmesh
+ReadWritePaths=/var/lib/shardmesh
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target
