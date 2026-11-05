@@ -48,7 +48,7 @@ from .protocol import (
 from .pool import check_exposure, home as pool_home, load_token
 from .serving import BodyLimit, serve
 from .tickets import TicketIdentity, client_auth
-from .tls import PEER, client_verify
+from .tls import INTERCEPTED, intercepted, PEER, client_verify
 from .tokenizer import ChatTokenizer, IncrementalText, load_tokenizer
 from .weights import apply_model_hashes, Manifest, WeightSourceError, build_manifest
 
@@ -167,7 +167,7 @@ class ModelTarget:
     # Workers that hold the whole GGUF, for a pool that cannot reach a model host.
     file_sources: list[str] = field(default_factory=list)
     slots: int = 1
-    merge_passes: bool = False
+    merge_passes: bool = True
 
     @property
     def file_sizes(self) -> dict[str, int]:
@@ -392,6 +392,7 @@ class Orchestrator:
         self.stream_fallbacks = 0
         self.stage_errors = 0
         self.replies_in_flight = 0
+        self.warned_interception: set[str] = set()
         self.maintenance_task: asyncio.Task[None] | None = None
         self.gossip_task: asyncio.Task[None] | None = None
         self.mesh: ControlMesh | None = None
@@ -539,8 +540,12 @@ class Orchestrator:
                 )
                 response.raise_for_status()
                 self.receive_gossip(response.json())
-            except (httpx.HTTPError, httpx.InvalidURL, ValueError, KeyError, TypeError):
-                pass  # silence is how a peer's absence is noticed
+            except (httpx.HTTPError, httpx.InvalidURL, ValueError, KeyError, TypeError) as exc:
+                # Silence is how a peer's absence is noticed, so this says nothing
+                # unless the cause is one a person has to fix.
+                if intercepted(exc) and url not in self.warned_interception:
+                    self.warned_interception.add(url)
+                    self.add_event("failure", f"Cannot trust {url}", INTERCEPTED)
 
         # One bad address must never stop the election below.
         await asyncio.gather(*(talk(url) for url in self.mesh.targets()), return_exceptions=True)

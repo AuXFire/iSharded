@@ -10,7 +10,7 @@ A node in the route sees prompts and replies in plain text, as hidden states or 
 
 | Caller | Credential | Can do |
 |---|---|---|
-| Node, with a pool authority | Certificate | Node routes only: gossip, registration, stage traffic |
+| Node, with a pool authority | Certificate, over TLS or as a ticket | Node routes only: gossip, registration, stage traffic |
 | Node, without one | Pool token | Everything, including the node protocol |
 | Admin | API key, role `admin` | Load models, rebalance, cordon, manage keys, revoke nodes, read metrics, and all user actions |
 | User | API key, role `user` | Chat, completions, read status |
@@ -30,39 +30,56 @@ shardmesh pool init --dir pool-secrets
 
 Copy `pool.token` to each node as `%LOCALAPPDATA%\ShardMesh\pool.token` (Windows) or `~/.shardmesh/pool.token`. Anyone holding it can act as any node.
 
-For machines you may need to throw out individually, or remotes across the internet, give each node a certificate. This needs the `pool` extra (`pip install shardmesh[pool]`) on the machine that issues them, and nothing on the nodes:
+For machines you may need to throw out individually, or remotes across the internet, give each node a certificate. Every node then needs the `pool` extra (`pip install shardmesh[pool]`).
 
 ```bash
 shardmesh pool add-node --dir pool-secrets node-b --address 10.0.0.6
 ```
 
-```bash
-shardmesh node --node-id node-b --tls-cert node-b.pem --tls-key node-b.key --ca-file ca.pem --keys-file access.json --join https://10.0.0.5:8000
-```
-
 Keep `ca.key` off the nodes. The name in the certificate must match `--node-id`, because a node may only speak for itself and its own workers.
 
-With a pool authority the pool token counts for nothing, on control planes and workers alike, so do not copy it to nodes. Admins use API keys. Make the first one before starting the pool, and give every node the file once:
+A node proves its name in one of two ways, using the same certificate:
+
+| | Use it when | How |
+|---|---|---|
+| Tickets | The link is already private, as on Tailscale, or antivirus intercepts TLS | `--ca-file ca.pem --identity-cert node-b.pem --identity-key node-b.key` |
+| Mutual TLS | The link needs encrypting, and nothing intercepts TLS | `--ca-file ca.pem --tls-cert node-b.pem --tls-key node-b.key` |
+
+A ticket is a short signed statement in an ordinary header. It names the node it is for and expires within five minutes, so a peer that receives one cannot use it elsewhere. Tickets encrypt nothing, so a node using them on an ordinary LAN refuses to start without `--trusted-network`. Clocks must agree to within a minute.
+
+With a pool authority the pool token counts for nothing, on control planes and workers alike, so do not copy it to nodes.
+
+### Antivirus on nodes
+
+Many antivirus products intercept TLS on every port, even on loopback, and replace the certificates in it. Nodes only trust the pool authority, so this fails closed: mutual TLS stops working rather than becoming insecure. AVG does this on the development laptop. There are three ways to run such a node:
+
+- Use Tailscale and tickets. Nothing depends on TLS, so antivirus has nothing to intercept. This is what the two-machine test pool runs, with AVG on.
+- Exclude the pool's ports or `python.exe` from HTTPS scanning, and use mutual TLS.
+- On a private network, use tickets with `--trusted-network`, accepting that traffic is unencrypted.
+
+## Managing keys and nodes
+
+With a pool authority, keys and revocations are signed with `ca.key` and sent to any node, and gossip carries them to the rest. Nodes ignore anything unsigned, so a compromised node cannot add a key, remove one, or revoke a peer.
 
 ```bash
-shardmesh key create root --role admin --file access.json
+shardmesh key create alice --role user --requests-per-minute 60 --dir pool-secrets --url http://10.0.0.5:8000
 ```
-
-After that, keys are managed through any node and gossip carries them to the rest:
 
 ```bash
-shardmesh key create alice --role user --requests-per-minute 60 --file keys.json
+shardmesh key remove alice --dir pool-secrets --url http://10.0.0.5:8000
 ```
 
-A key is shown once and stored as a SHA-256 hash. `POST /admin/keys` does the same on a running pool, and `DELETE /admin/keys/{name}` removes one.
+```bash
+shardmesh pool revoke node-b --dir pool-secrets --url http://10.0.0.5:8000
+```
 
-## Revoking a node
+A key is shown once and stored as a SHA-256 hash. `/admin/keys` and `/admin/nodes/{name}/revoke` refuse these changes in such a pool, and say to use these commands.
 
-`POST /admin/nodes/{name}/revoke` with an admin key stops every node accepting that certificate, takes its workers out of the route, and stops gossip with it. A revoked name cannot register new workers.
+Without a pool authority, an admin key or the pool token changes these through any node: `POST /admin/keys`, `DELETE /admin/keys/{name}`, `POST /admin/nodes/{name}/revoke`. To seed a key before a pool starts, in either kind of pool, use `shardmesh key create root --role admin --file access.json`, and give each node the file with `--keys-file`. A key file is trusted by the node that reads it, and nothing else.
 
-Revocation is permanent for that name, and so is removing a key. Both are kept for good and merged entry by entry, so neither a network split nor a forged document can undo them. To bring a machine back, issue it a certificate under a new name.
+Revocation stops every node accepting that certificate, takes its workers out of the route, and stops gossip with it. A revoked name cannot register new workers.
 
-If a compromised node might have added an API key before it was revoked, review `GET /admin/keys` afterwards. See the gaps below.
+Revocation is permanent for that name, and so is removing a key. Both are kept for good and merged entry by entry, so neither a network split nor a forged document can undo them. To bring a machine back, issue it a certificate under a new name. A removed key's name cannot be used again in a pool with an authority.
 
 ## Encryption
 
@@ -94,14 +111,27 @@ GGUF files are data, but they are parsed by native code, in a separate stage pro
 
 Fetched ranges are checked for size, and pinned to a commit or a content fingerprint. The fingerprint covers the file's first megabyte and its size, which identifies a file but would not detect tampering deeper in it.
 
+To check every byte, hash the model on a copy you trust and load with the result:
+
+```bash
+shardmesh model hash D:\models\model.gguf --out model.hashes
+```
+
+```bash
+shardmesh load model.gguf --hashes model.hashes
+```
+
+Every node then checks every unit against that list, whether it came from a peer, a mirror, or its own disk. A peer serving altered weights is passed over, and if no source matches, the load stops. The list also covers the model's description: config, tensor shapes, and offsets. It does not cover the tokenizer's source or a draft model. A wrong draft can only slow replies, because the main model checks every guess.
+
 ## Reviews and known gaps
 
-The code has had one security review, by an AI model reading the source, which found one critical and five high findings. Those and the medium and low findings are fixed, with a regression test for each in `tests/test_security.py`. The attacks on the critical and certificate findings were also repeated against real control planes over real mutual TLS. No human has reviewed or penetration tested it, and a review like this does not show the code is free of other flaws.
+The code has had two security reviews, both by an AI model reading the source. The first found one critical and five high findings, all fixed, with a regression test for each in `tests/test_security.py`. The critical and certificate attacks were also repeated against real control planes over mutual TLS. No human has reviewed or penetration tested it, and reviews like these do not show the code is free of other flaws.
 
-- An unrevoked node is still trusted by the pool. It can claim leadership, publish a route, or add an API key through gossip, because access documents are not signed. Signing them with a key held by admins would close this.
+- A node in the route sees prompts and can return wrong results, and nothing detects it. Certificates limit who is in the pool. They do not make a hostile member safe.
+- An unrevoked node can still claim leadership, publish a route, or cordon nodes through gossip. Keys and revocations are protected, but these are not.
 - Without a pool authority, the shared token is everyone's identity. Nodes cannot be told apart, and revocation only blocks a name.
-- A node can return wrong results, and nothing detects it.
-- Weight units are not verified by hash, so a peer serving a file can serve wrong bytes.
+- Weight bytes are only checked when you load with `--hashes`.
 - Prompts are in memory on every stage, and hidden states are readable by anyone who can read the link if it has no TLS or Tailscale.
-- Certificates expire after 825 days and renewal is by hand. There is no certificate revocation list, so revocation lives in the pool's access document.
+- Certificates expire after 825 days and renewal is by hand. Revocation lives in the access list, not a certificate revocation list.
+- `ca.key` is not protected by a passphrase, and whoever holds it controls the pool.
 - The chat page keeps its key in the browser's local storage.

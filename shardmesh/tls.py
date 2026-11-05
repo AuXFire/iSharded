@@ -47,6 +47,18 @@ def server_options() -> dict[str, Any]:
     return options
 
 
+def intercepted(error: BaseException) -> bool:
+    """Whether a failed connection looks like someone replacing certificates."""
+    return "CERTIFICATE_VERIFY_FAILED" in str(error)
+
+
+INTERCEPTED = (
+    "a node's certificate did not come from the pool authority. If antivirus scans HTTPS on this "
+    "machine, it is probably replacing certificates: exclude this pool's ports from scanning, or use "
+    "tickets (--identity-cert, --identity-key) on a private link. See docs/SECURITY.md"
+)
+
+
 def peer_name(certificate: dict[str, Any] | None) -> str | None:
     """The node name in a certificate the TLS layer has already verified."""
     for field in (certificate or {}).get("subject", ()):

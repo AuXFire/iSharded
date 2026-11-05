@@ -279,7 +279,7 @@ def main() -> None:
     load.add_argument("--parallel", type=int, help="replies to run at once; each costs its own context memory")
     load.add_argument("--no-peer-fetch", action="store_true", help="download every shard from the model host")
     load.add_argument("--pool-token", default=load_token())
-    load.add_argument("--merge-passes", action="store_true", help="let conversations share a pass through each stage")
+    load.add_argument("--no-merge-passes", dest="merge_passes", action="store_false", help="make conversations take turns on each stage")
     load.add_argument("--hashes", default=None, help="file from `shardmesh model hash`: every node checks every unit against it")
     load.set_defaults(handler=run_load)
     node = subparsers.add_parser("node", help="contribute CPU, RAM, GPU, or any combination")

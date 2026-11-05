@@ -1002,11 +1002,7 @@ class WorkerRuntime:
         return hidden
 
     def _can_merge(self, hidden: torch.Tensor, request: InferRequest) -> bool:
-        """Ordinary next-token steps can share a pass. Anything with its own state work cannot.
-
-        Off unless asked for. Answers are right, and one model on one GPU gained
-        2.8x at four conversations, but a two-node pool measured slower with it.
-        """
+        """Ordinary next-token steps can share a pass. Anything with its own state work cannot."""
         return (
             self.merge_passes
             and self.gguf is not None

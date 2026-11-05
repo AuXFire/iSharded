@@ -600,3 +600,22 @@ def test_tickets_leave_a_callers_own_credentials_alone(ticket_pool):
     assert next(auth.auth_flow(plain)).headers["authorization"].startswith("Bearer smn-")
     theirs = httpx.Request("GET", "http://b:1/x", headers={"Authorization": "Bearer user-key"})
     assert next(auth.auth_flow(theirs)).headers["authorization"] == "Bearer user-key"
+
+
+def test_certificate_interception_gets_a_plain_explanation():
+    orchestrator = Orchestrator()
+    clock = Clock()
+    orchestrator.mesh = ControlMesh("me", "https://me", ("https://peer",), clock)
+
+    def handler(request):
+        raise httpx.ConnectError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+
+    async def scenario():
+        orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await orchestrator._gossip_round()
+        await orchestrator._gossip_round()
+        await orchestrator.close()
+
+    asyncio.run(scenario())
+    warnings = [event for event in orchestrator.events if "antivirus" in event["detail"]]
+    assert len(warnings) == 1

@@ -39,7 +39,7 @@ A node will not start on a network without protection. See `docs/SECURITY.md` fo
 | Closed network, no internet | Put GGUF files on any node with `--gguf-dir`, and load by file name: `shardmesh load Qwen3.6-27B-Q4_K_M.gguf`. Give each node a llama.cpp build with `--llama-dir`, because automatic downloads need GitHub. |
 | LAN | Use TLS, or pass `--trusted-network` if nobody else can read the network. Without either a node refuses to start, because the pool token would cross the LAN unencrypted. |
 | VLANs | As for a LAN. Peers must be able to route to each other's ports. Discovery does not use broadcast, so `--join` works across VLANs. Open the control port and worker ports between them. |
-| Tailscale | Nothing special. Links are encrypted, and addresses work from anywhere on the tailnet. |
+| Tailscale | Nothing special. Links are encrypted, and addresses work from anywhere on the tailnet. Add certificates with tickets for per-node identity. This works with antivirus intercepting TLS. |
 | Remote machines over the internet | Use a pool authority and TLS on every node (`--tls-cert`, `--tls-key`, `--ca-file`). Expect each extra stage to cost the round trip between those machines. |
 
 A pool can mix these, as long as every node can reach every other node's advertised address.
