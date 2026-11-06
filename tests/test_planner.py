@@ -1,16 +1,19 @@
 import asyncio
 from dataclasses import replace
 from itertools import combinations, permutations
+import math
 import random
+import time
 from types import SimpleNamespace
 
 import httpx
 import pytest
 
-from isharded import planner
+from isharded import cli, planner
+from isharded.gguf import holds_both_kinds
 from isharded.orchestrator import Orchestrator
 from isharded.planner import Candidate, ModelProfile, PlacementError, keep_layers, memory_report, plan_placement, stored_bytes
-from isharded.protocol import MemoryPool, TensorRef, WeightUnit
+from isharded.protocol import LoadModelRequest, MemoryPool, TensorRef, WeightUnit
 
 MIB = 1024**2
 GIB = 1024**3
@@ -1271,3 +1274,211 @@ def test_a_hybrid_model_can_be_cut_off_its_blocks_but_each_stage_holds_both_kind
     assert [stage.start_layer for stage in route][0] == 0 and route[-1].end_layer == 16
     assert all(holds_both_kinds(stage.start_layer, stage.end_layer, 4) for stage in route)
     assert any(stage.start_layer % 4 for stage in route)
+
+
+def stages_on(*names: str) -> list[SimpleNamespace]:
+    return [SimpleNamespace(worker_id=name) for name in names]
+
+
+def names_of(route) -> list[str]:
+    return [stage.worker_id for stage in route]
+
+
+def touching(route) -> set[tuple[str, str]]:
+    """Which workers sit next to each other around a loop, in both directions."""
+    names = names_of(route)
+    pairs = set(zip(names, names[1:] + names[:1]))
+    return pairs | {(right, left) for left, right in pairs}
+
+
+def test_a_loop_costs_one_way_around_and_a_nested_route_every_round_trip() -> None:
+    route = stages_on("a", "c", "e1")
+    assert planner.route_network_ms(route, LINKS) == 112 + 42
+    assert planner.route_network_ms(route, LINKS, ring=True) == (112 + 42 + 104) / 2 + 3 * planner.RING_HOP_MS
+
+
+def test_one_stage_has_no_network_time_either_way() -> None:
+    assert planner.route_network_ms(stages_on("a"), LINKS) == 0
+    assert planner.route_network_ms(stages_on("a"), LINKS, ring=True) == 0
+
+
+def test_a_loop_falls_back_on_the_constant_for_an_unmeasured_hop() -> None:
+    assert planner.route_network_ms(stages_on("x", "y"), {}, ring=True) == planner.HOP_MS + 2 * planner.RING_HOP_MS
+
+
+@pytest.mark.parametrize("model", [block_profile([2.72] * 32), moe_profile()], ids=["block rule", "no block rule"])
+def test_a_ring_route_is_the_shortest_loop_through_the_real_table(model) -> None:
+    route = plan_placement(mesh_cards(), [], model, links=LINKS, ring=True)
+    assert len(route) == 5
+    assert ("a", "b") not in touching(route)  # a loop can avoid that link, closing hop included
+    assert planner.route_network_ms(route, LINKS, ring=True) == 424 / 2 + 5 * planner.RING_HOP_MS
+
+
+def test_with_ring_off_the_same_table_still_costs_round_trips() -> None:
+    route = plan_placement(mesh_cards(), [], moe_profile(), links=LINKS, ring=False)
+    assert hops_of(route) == 251
+
+
+def test_ring_comes_from_the_profile_unless_it_is_given() -> None:
+    model = moe_profile()
+    model.ring = True
+    route = plan_placement(mesh_cards(), [], model, links=LINKS)
+    assert ("a", "b") not in touching(route)
+
+
+def test_a_dead_closing_link_is_survivable_and_ranks_below_a_dead_forward_link() -> None:
+    # Both cards are needed. One way round has a dead forward link and the other only
+    # a dead closing one, whose answer walks back along the route.
+    links = {("a", "b"): 50, ("b", "a"): planner.UNREACHABLE_LINK_MS}
+    workers = [card("a", 30, 850), card("b", 30, 900)]
+    route = plan_placement(workers, [], block_profile([2.72] * 16), links=links, ring=True)
+    assert names_of(route) == ["a", "b"]
+    assert planner.route_network_ms(route, links, ring=True) == 2 * (25 + planner.RING_HOP_MS)
+
+
+def test_a_dead_forward_link_still_outranks_everything_on_a_ring() -> None:
+    links = {("a", "b"): planner.UNREACHABLE_LINK_MS, ("b", "a"): planner.UNREACHABLE_LINK_MS}
+    workers = [card("a", 30, 900, 64), card("b", 20, 850)]
+    assert names_of(plan_placement(workers, [], block_profile([2.72] * 16), links=links, ring=True, spread=False)) == ["a"]
+
+
+def test_auto_gives_a_model_one_stage_if_one_node_holds_it() -> None:
+    workers = [card("big", 300, 700), card("c", 41, 900), card("d", 41, 900)]
+    route = plan_placement(workers, [], moe_profile(), spread=None, ring=True)
+    assert names_of(route) == ["big"]
+
+
+def test_auto_takes_the_fewest_close_workers_and_leaves_the_rest() -> None:
+    workers = [card(name, 100, speed) for name, speed in MESH_SPEEDS.items()]
+    for ring in (True, False):
+        assert set(names_of(plan_placement(workers, [], moe_profile(), spread=None, links=LINKS, ring=ring))) == {"e1", "e2"}
+
+
+def test_auto_holds_a_model_in_vram_before_it_takes_closer_workers() -> None:
+    # The closest pair could hold this with RAM, but a third card keeps it all in VRAM.
+    workers = [card("a", 70, 900), card("b", 70, 900), card("c", 70, 900), card("e1", 70, 900, 200), card("e2", 70, 900, 200)]
+    route = plan_placement(workers, [], moe_profile(), spread=None, links=LINKS, ring=True)
+    assert experts_in_ram(route) == 0
+    assert set(names_of(route)) == {"c", "e1", "e2"}
+
+
+def test_auto_uses_the_least_ram_when_nothing_holds_it_all() -> None:
+    route = plan_placement(moe_cards(), [], moe_profile(), spread=None, ring=True)
+    assert len(route) == 7
+    assert experts_in_ram(route) == 3 * MOE_EXPERT_BYTES
+
+
+def test_auto_on_the_seven_card_sizes_drops_what_it_does_not_need() -> None:
+    sizes = {"a": 4.0, "b": 24.0, "c": 24.0, "d": 48.0, "e": 48.0, "f": 48.0, "g": 20.0}
+    route = plan_placement(moe_cards(sizes), [], moe_profile(), spread=None, ring=True)
+    assert experts_in_ram(route) == 0
+    assert len(route) < 7
+
+
+def test_auto_honours_pins() -> None:
+    workers = [card(name, 100, speed) for name, speed in MESH_SPEEDS.items()]
+    route = plan_placement(workers, [], moe_profile(), spread=None, links=LINKS, ring=True, entry_worker="a", exit_worker="c")
+    assert names_of(route)[0] == "a" and names_of(route)[-1] == "c"
+
+
+def test_auto_leaves_standby_alone_unless_vram_needs_it() -> None:
+    model = block_profile([2.72] * 16)
+    assert names_of(plan_placement([card("a", 60, 800)], [card("spare", 60, 900)], model, spread=None)) == ["a"]
+    route = plan_placement([card("a", 30, 800, 32)], [card("spare", 30, 800)], model, spread=None)
+    assert set(names_of(route)) == {"a", "spare"}
+    assert spill_of(route) == {}
+
+
+def test_auto_works_on_workers_with_no_vram() -> None:
+    workers = [worker(name, pool("ram", "ram", 4 * GIB, 30, f"{name}:ram")) for name in "abc"]
+    assert len(plan_placement(workers, [], profile(), spread=None)) == 1
+
+
+def test_auto_keeps_a_held_layout_unless_moving_it_pays(monkeypatch) -> None:
+    model = moe_profile(amortize=planner.AMORTIZE_TOKENS)
+    layout_held = [("a", 0, 47), ("c", 47, 94)]
+
+    def pool_of(rate: float) -> list[Candidate]:
+        workers = [card(name, 100, speed) for name, speed in MESH_SPEEDS.items()]
+        for item in workers:
+            item.fetch_bytes_per_second = rate
+        return holding(workers, layout_held)
+
+    # Slow links for fetching: 180 GiB takes longer than the loop saves in 20,000 tokens.
+    assert layout_of(plan_placement(pool_of(40e6), [], model, spread=None, links=LINKS, ring=True)) == layout_held
+    # Fast ones: the closer pair earns its download.
+    assert set(names_of(plan_placement(pool_of(4e9), [], model, spread=None, links=LINKS, ring=True))) == {"e1", "e2"}
+
+
+@pytest.mark.parametrize("ring", [False, True], ids=["nested", "loop"])
+def test_a_spare_that_adds_least_to_the_route_takes_over(ring) -> None:
+    model = moe_profile()
+    model.ring = ring
+    current = plan_placement([card("e1", 100, 800), card("c", 100, 800)], [], model, entry_worker="e1", exit_worker="c")
+    alive = planner.with_links([card(name, 100, 800) for name in ("e1", "a", "b", "e2")], LINKS)
+    # "a" and "b" come first and both fit, but "e2" is next door to what stayed.
+    assert names_of(keep_layers(current, alive, [], model)) == ["e1", "e2"]
+
+
+def test_a_spare_behind_a_dead_link_is_passed_over() -> None:
+    model = block_profile([2.72] * 16)
+    current = plan_placement([card("a", 30, 800), card("c", 30, 800)], [], model)
+    spare, near = card("b", 30, 900), card("e1", 30, 800)
+    first = current[0].worker_id
+    links = {(first, "b"): planner.UNREACHABLE_LINK_MS, ("b", first): planner.UNREACHABLE_LINK_MS, (first, "e1"): 200, ("e1", first): 200}
+    lost = current[-1].worker_id
+    alive = planner.with_links([card(first, 30, 800), spare, near], links)
+    replaced = keep_layers(current, alive, [], model)
+    assert names_of(replaced)[-1] == "e1" and lost not in names_of(replaced)
+
+
+def scattered(count: int, sizes: tuple[float, ...], seed: int) -> tuple[list[Candidate], dict[tuple[str, str], float]]:
+    rng = random.Random(seed)
+    hubs = ((0, 0), (10, 3), (60, 12), (66, 9), (120, 40))
+    points = [(hub[0] + rng.gauss(0, 3), hub[1] + rng.gauss(0, 3)) for hub in (rng.choice(hubs) for _ in range(count))]
+    workers = [card(f"w{index}", rng.choice(sizes), rng.choice((300, 450, 650, 900))) for index in range(count)]
+    links = {
+        (f"w{left}", f"w{right}"): 1 + 1.6 * math.dist(points[left], points[right])
+        for left in range(count)
+        for right in range(count)
+        if left != right
+    }
+    return workers, links
+
+
+@pytest.mark.parametrize("sizes", [(6, 12, 16, 24, 24, 48, 48, 80), (8,), (4, 6)], ids=["mixed", "small", "tiny"])
+def test_two_hundred_workers_plan_in_time_and_hold_the_model_in_vram(sizes) -> None:
+    workers, links = scattered(200, sizes, 1)
+    started = time.perf_counter()
+    route = plan_placement(workers, [], moe_profile(), spread=None, links=links, ring=True)
+    seconds = time.perf_counter() - started
+    assert sum(stage.end_layer - stage.start_layer for stage in route) == MOE_LAYERS
+    assert experts_in_ram(route) == 0
+    assert seconds < 4  # measured under 2 s on a busy laptop, with room for a slower one
+
+
+def test_growing_a_loop_finds_what_trying_every_subset_finds(monkeypatch) -> None:
+    workers = [card(name, 100, speed) for name, speed in MESH_SPEEDS.items()]
+    monkeypatch.setattr(planner, "MAX_SUBSET_WORKERS", 0)
+    assert set(names_of(plan_placement(workers, [], moe_profile(), spread=None, links=LINKS, ring=True))) == {"e1", "e2"}
+
+
+def test_a_loop_that_grew_uncrosses_itself() -> None:
+    hops = [[0, 1, 9, 1], [1, 0, 1, 9], [9, 1, 0, 1], [1, 9, 1, 0]]
+    loop = planner._untangled([0, 2, 1, 3], hops)
+    assert sum(hops[left][right] for left, right in zip(loop, loop[1:] + loop[:1])) == 4
+
+
+def test_a_short_hybrid_stage_does_not_rule_out_a_longer_one() -> None:
+    # One layer cannot stand alone here, and that is no reason to stop looking.
+    model = block_profile([2.72] * 16)
+    model.layer_step = 1
+    model.attention_interval = 4
+    route = plan_placement([card("a", 30, 800), card("b", 30, 800)], [], model)
+    assert sum(stage.end_layer - stage.start_layer for stage in route) == 16
+    assert all(holds_both_kinds(stage.start_layer, stage.end_layer, 4) for stage in route)
+
+
+def test_auto_is_the_default_placement() -> None:
+    assert LoadModelRequest(model_id="m").placement == "auto"
+    assert cli.build_parser().parse_args(["load", "m"]).placement == "auto"

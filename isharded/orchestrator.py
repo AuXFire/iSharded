@@ -36,7 +36,7 @@ from .lanes import LaneDoor
 from .mcp_server import INVALID_REQUEST, McpHandler, MeshTools, RpcError, answer_http
 from .mesh import GOSSIP_SECONDS, ControlMesh
 from .models import Adapter, GgufAdapter, SUPPORTED_TYPES, UnsupportedModel, create_adapter
-from .planner import AMORTIZE_TOKENS, UNREACHABLE_LINK_MS, Candidate, ModelProfile, PlacementError, keep_layers, link_ms, memory_report, plan_placement
+from .planner import AMORTIZE_TOKENS, UNREACHABLE_LINK_MS, Candidate, ModelProfile, PlacementError, keep_layers, memory_report, plan_placement, route_network_ms, with_links
 from .protocol import (
     hosts_model,
     pass_seconds,
@@ -209,7 +209,7 @@ class ModelTarget:
     adapter: Adapter
     units: dict[str, WeightUnit]
     profile: ModelProfile
-    spread: bool
+    spread: bool | None  # every worker, the fewest that fit, or None for the fewest and closest
     tokenizer: ChatTokenizer | None = None
     source_revision: str = "main"
     worker_model_ids: dict[str, str] = field(default_factory=dict)
@@ -331,7 +331,7 @@ def build_target(
         adapter=adapter,
         units={unit.name: unit for unit in units},
         profile=profile,
-        spread=request.placement == "spread" and not request.embedding,
+        spread=None if request.placement == "auto" and not request.embedding else request.placement == "spread" and not request.embedding,
         source_revision=request.revision if hosted_copy else manifest.revision,
         worker_model_ids=dict(request.worker_model_ids),
         entry_worker=request.entry_worker,
@@ -457,7 +457,7 @@ def describe_plan(target: ModelTarget, route: list[StageAssignment]) -> dict[str
     # costs its kernel launches, and every stage boundary costs a network hop.
     milliseconds = sum(
         max(stage.estimated_ms_per_token, (stage.end_layer - stage.start_layer) * LAYER_FLOOR_MS) for stage in route
-    ) + sum(link_ms(runtime.links, left.worker_id, right.worker_id) for left, right in zip(route, route[1:]))
+    ) + route_network_ms(route, runtime.links, target.profile.ring)
     download = sum(
         target.units[item.unit].nbytes
         for stage in route
@@ -1257,7 +1257,8 @@ class Orchestrator:
                 if worker_id and worker_id not in available:
                     self.add_event("failure", f"{worker_id} is unavailable", f"Planning without its {role} pin")
                     pins[role] = None
-        preferred, standby = self._with_holdings(preferred, target), self._with_holdings(standby, target)
+        preferred = with_links(self._with_holdings(preferred, target), self.links)
+        standby = with_links(self._with_holdings(standby, target), self.links)
         kept = None if honor_pins_strictly else self._keep_stages(target, preferred, standby, available, pins)
         route = kept or plan_placement(preferred, standby, target.profile, spread=target.spread, links=self.links, **pins)
         if target.embedding and len(route) > 1:
@@ -1280,7 +1281,7 @@ class Orchestrator:
         if route is not None or not standby:
             return route
         try:
-            plan_placement(preferred, [], target.profile, spread=target.spread, **pins)
+            plan_placement(preferred, [], target.profile, spread=target.spread, links=self.links, **pins)
             return None
         except PlacementError:
             return keep_layers(self.route, preferred, standby, target.profile)
