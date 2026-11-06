@@ -31,7 +31,18 @@ def is_type(value: Any, name: str) -> bool:
 
 
 def errors(value: Any, schema: Any, where: str = "value") -> list[str]:
-    """Everything wrong with value, as sentences a person can act on."""
+    """Everything wrong with value, as sentences a person can act on.
+
+    A schema can come from a stranger's server. One that cannot be used fails closed,
+    since a check that crashes must never read as a check that passed.
+    """
+    try:
+        return _errors(value, schema, where)
+    except (TypeError, ValueError, KeyError, AttributeError, RecursionError):
+        return [f"{where} has a schema that cannot be used."]
+
+
+def _errors(value: Any, schema: Any, where: str) -> list[str]:
     if schema is True or schema == {}:
         return []
     if schema is False:
@@ -57,7 +68,7 @@ def errors(value: Any, schema: Any, where: str = "value") -> list[str]:
         found += _sized(len(value), schema, "minItems", "maxItems", where, "items")
         if "items" in schema:
             for index, item in enumerate(value):
-                found += errors(item, schema["items"], f"{where}[{index}]")
+                found += _errors(item, schema["items"], f"{where}[{index}]")
     if isinstance(value, dict):
         found += _object(value, schema, where)
     return found
@@ -66,12 +77,12 @@ def errors(value: Any, schema: Any, where: str = "value") -> list[str]:
 def _combined(value: Any, schema: dict[str, Any], where: str) -> list[str]:
     found: list[str] = []
     for part in schema.get("allOf", []):
-        found += errors(value, part, where)
-    if "anyOf" in schema and not any(not errors(value, part, where) for part in schema["anyOf"]):
+        found += _errors(value, part, where)
+    if "anyOf" in schema and not any(not _errors(value, part, where) for part in schema["anyOf"]):
         found.append(f"{where} matches none of the allowed forms.")
-    if "oneOf" in schema and sum(not errors(value, part, where) for part in schema["oneOf"]) != 1:
+    if "oneOf" in schema and sum(not _errors(value, part, where) for part in schema["oneOf"]) != 1:
         found.append(f"{where} should match exactly one of the allowed forms.")
-    if "not" in schema and not errors(value, schema["not"], where):
+    if "not" in schema and not _errors(value, schema["not"], where):
         found.append(f"{where} is a form that is not allowed.")
     return found
 
@@ -104,9 +115,9 @@ def _object(value: dict[str, Any], schema: dict[str, Any], where: str) -> list[s
     extra = schema.get("additionalProperties", True)
     for name, item in value.items():
         if name in properties:
-            found += errors(item, properties[name], f"{where}.{name}")
+            found += _errors(item, properties[name], f"{where}.{name}")
         elif extra is False:
             found.append(f"{where} has {name!r}, which is not allowed.")
         elif isinstance(extra, dict):
-            found += errors(item, extra, f"{where}.{name}")
+            found += _errors(item, extra, f"{where}.{name}")
     return found

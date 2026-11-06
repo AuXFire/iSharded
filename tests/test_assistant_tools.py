@@ -717,6 +717,18 @@ def test_system_info_measures_this_machine(assistant):
     assert json.loads(result.output)["memory"]["total"] == result.data["memory"]["total"]
 
 
+def test_system_info_sees_a_gpu_that_nvidia_smi_can_see(assistant):
+    """A scrubbed environment once broke this quietly: it reported no GPUs at all."""
+    tool = shutil.which("nvidia-smi")
+    if tool is None:
+        pytest.skip("this machine has no nvidia-smi")
+    plain = subprocess.run([tool, "--query-gpu=name", "--format=csv,noheader"], capture_output=True, text=True)
+    if plain.returncode != 0 or not plain.stdout.strip():
+        pytest.skip("nvidia-smi sees no GPU here")
+    names = [gpu["name"] for gpu in use(assistant, "system.info").data["gpus"]]
+    assert names == [line.strip() for line in plain.stdout.splitlines() if line.strip()]
+
+
 def test_a_gpu_line_is_read_and_missing_values_stay_missing():
     assert parse_gpu_line("RTX 4090, 24564, 1200, 7, 41") == {
         "name": "RTX 4090", "memory_total_mb": 24564, "memory_used_mb": 1200, "percent": 7, "temperature_c": 41,

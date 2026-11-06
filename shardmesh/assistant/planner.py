@@ -123,8 +123,8 @@ def only_steps(plan: Any) -> Any:
 
 def plan_problems(plan: Any, known: Mapping[str, Capability], capacity: Mapping[str, int]) -> list[str]:
     problems = plan_errors(plan, capacity)
-    if not isinstance(plan, Mapping):
-        return problems
+    if problems:
+        return problems  # the checks below rely on the plan having the right shape
     if count_steps(plan) > MAX_PLAN_STEPS:
         problems.append(f"A plan can have at most {MAX_PLAN_STEPS} steps.")
     for step in walk_steps(plan):

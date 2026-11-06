@@ -102,8 +102,9 @@ def redacted(arguments: dict[str, Any]) -> dict[str, Any]:
 def scope_kind(capability: Capability) -> str:
     """How a grant's scope is compared: by real path, by host, or as a glob."""
     field = capability.scope_field or ""
-    properties = capability.input_schema.get("properties", {}) if isinstance(capability.input_schema, dict) else {}
-    declared = properties.get(field, {}).get("format") if isinstance(properties.get(field), dict) else None
+    properties = capability.input_schema.get("properties") if isinstance(capability.input_schema, dict) else None
+    entry = properties.get(field) if isinstance(properties, dict) else None
+    declared = entry.get("format") if isinstance(entry, dict) else None
     if declared in ("path", "uri", "url"):
         return "path" if declared == "path" else "url"
     name = field.lower()
@@ -277,8 +278,8 @@ class CapabilityBroker:
             return "Arguments must be a JSON object."
         try:
             canonical(call.arguments)
-        except (TypeError, ValueError):
-            return "Arguments must be plain JSON values."
+        except (TypeError, ValueError, RecursionError):
+            return "Arguments must be plain JSON values, nested no deeper than JSON can carry."
         problems = errors(call.arguments, capability.input_schema, "arguments") if capability.input_schema else []
         if problems:
             return " ".join(problems[:5])
@@ -363,7 +364,7 @@ class CapabilityBroker:
     def _safe_hash(arguments: Any) -> str:
         try:
             return argument_hash(arguments)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
             return "unhashable"
 
     def _provenance(self, call: ToolCall) -> Provenance:

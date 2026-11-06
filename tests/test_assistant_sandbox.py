@@ -130,6 +130,12 @@ def test_the_environment_is_an_allow_list(monkeypatch, tmp_path):
     assert environment["TEMP"] == str(tmp_path)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="these are Windows system locations")
+def test_ordinary_windows_programs_get_what_they_need_to_run(tmp_path):
+    environment = scrubbed_env(tmp_path)
+    assert {"SYSTEMROOT", "PROGRAMFILES", "PROGRAMDATA", "COMSPEC"} <= set(environment)
+
+
 def test_a_variable_passed_on_purpose_arrives(sandbox, tmp_path):
     result = sandbox.run(python("import os; print(os.environ['WANTED'])"), tmp_path, env={"WANTED": "yes"})
     assert result.stdout.strip() == "yes"
@@ -150,7 +156,7 @@ def test_output_is_capped_and_a_flood_does_not_block_the_command(tmp_path):
 
 
 def test_the_memory_limit_is_real(tmp_path):
-    small = LocalSandbox(prefer="process", memory_mb=64)
+    small = LocalSandbox(prefer="process", memory_mb=256)  # room for Python itself under a Linux address limit
     result = small.run(python("data = bytearray(1024 * 1024 * 1024); print('allocated', len(data))"), tmp_path, timeout=60)
     assert result.exit_code != 0
     assert "allocated" not in result.stdout

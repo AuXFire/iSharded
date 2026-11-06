@@ -1803,6 +1803,14 @@ def test_task_run_refuses_a_bad_plan_plainly(tmp_path, capsys):
     assert "Could not read" in capsys.readouterr().out
 
 
+def test_task_run_says_why_it_failed(tmp_path, capsys):
+    plan = tmp_path / "refused.json"
+    plan.write_text(json.dumps(plan_of(tool_step("a", "files.read", arguments={"path": str(tmp_path / "x")}))), encoding="utf-8")
+    assert command(tmp_path / "home", "task", "run", str(plan)) == 1
+    shown = capsys.readouterr().out
+    assert "Step a failed" in shown and "grant add files.read" in shown
+
+
 def test_task_detach_then_work(tmp_path, capsys, plan_file):
     home = tmp_path / "home"
     assert command(home, "task", "run", str(plan_file), "--detach") == 0

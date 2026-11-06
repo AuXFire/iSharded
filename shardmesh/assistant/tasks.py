@@ -386,10 +386,13 @@ def steps_referenced(value: Any) -> list[str]:
     return found
 
 
+def is_number(value: Any) -> bool:
+    """A real number. Python's JSON also accepts Infinity and NaN, which no clock can use."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
 def parse_time(value: Any) -> float:
-    if isinstance(value, bool):
-        raise ValueError("A time must be a number of seconds since 1970, or text such as 2026-11-05T09:00:00Z.")
-    if isinstance(value, (int, float)):
+    if is_number(value):
         return float(value)
     if isinstance(value, str):
         return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
@@ -399,8 +402,13 @@ def parse_time(value: Any) -> float:
 def parse_resources(resources: Iterable[str]) -> dict[str, int]:
     wanted: dict[str, int] = {}
     for resource in resources:
-        name, _, count = str(resource).partition(":")
-        wanted[name] = wanted.get(name, 0) + (int(count) if count else 1)
+        if not isinstance(resource, str):
+            raise ValueError("A resource is text.")
+        name, _, count = resource.partition(":")
+        amount = int(count) if count else 1
+        if not name or amount < 1:
+            raise ValueError("A resource needs a name and a count of at least 1.")
+        wanted[name] = wanted.get(name, 0) + amount
     return wanted
 
 
@@ -416,21 +424,24 @@ def _check_errors(spec: Any, where: str, ids: set[str], own_output: bool = False
     if not isinstance(spec, Mapping):
         return [f"{where} must be an object with a type."]
     kind = spec.get("type")
-    if kind not in CHECK_TYPES:
+    if not isinstance(kind, str) or kind not in CHECK_TYPES:
         return [f"{where} has type {kind!r}; use one of {', '.join(CHECK_TYPES)}."]
     found = []
-    if kind in ("exit_code", "ok"):
-        if not own_output and spec.get("step") not in ids:
-            found.append(f"{where} must name a step in this plan.")
+    target = spec.get("step")
+    if target is not None and not isinstance(target, str):
+        found.append(f"{where} must name a step by its id.")
+    elif kind in ("exit_code", "ok") and not own_output and target not in ids:
+        found.append(f"{where} must name a step in this plan.")
     if kind in ("regex", "json_schema") and not own_output and "text" not in spec:
         found.append(f"{where} needs text to look at.")
     if kind == "regex":
+        pattern = spec.get("pattern")
+        if not isinstance(pattern, str):
+            return [*found, f"{where} needs a pattern."]
         try:
-            re.compile(str(spec.get("pattern", "")))
-        except re.error as error:
+            re.compile(pattern)
+        except (re.error, OverflowError, RecursionError) as error:
             found.append(f"{where} has a bad pattern: {error}.")
-        if "pattern" not in spec:
-            found.append(f"{where} needs a pattern.")
     if kind == "json_schema" and not isinstance(spec.get("schema"), Mapping):
         found.append(f"{where} needs a schema.")
     if kind == "file_exists" and not isinstance(spec.get("path"), str):
@@ -446,19 +457,17 @@ def _kind_errors(step: Mapping[str, Any], where: str, ids: set[str], capacity: M
             found.append(f"{where}: arguments must be an object.")
         return found
     if kind == "model":
-        found = [] if isinstance(step.get("prompt"), str) and step["prompt"] else [f"{where} needs a prompt."]
-        if not isinstance(step.get("escalate_to", []), list):
-            found.append(f"{where}: escalate_to must be a list of roles.")
-        return found
+        return _model_errors(step, where)
     if kind == "check":
         return _check_errors(step.get("check"), f"{where}: check", ids)
+    if kind == "approval":
+        return [] if isinstance(step.get("message", ""), str) else [f"{where}: message must be text."]
     if kind == "wait":
         if ("seconds" in step) == ("until" in step):
             return [f"{where} needs seconds or until, and not both."]
         if "until" in step:
             return _time_errors(step["until"], where)
-        seconds = step["seconds"]
-        return [] if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and seconds >= 0 else [f"{where}: seconds must be zero or more."]
+        return [] if is_number(step["seconds"]) and step["seconds"] >= 0 else [f"{where}: seconds must be zero or more."]
     if kind == "subtask":
         child_inputs = step.get("inputs", {})
         if not isinstance(child_inputs, Mapping):
@@ -467,13 +476,30 @@ def _kind_errors(step: Mapping[str, Any], where: str, ids: set[str], capacity: M
     return []
 
 
+def _model_errors(step: Mapping[str, Any], where: str) -> list[str]:
+    found = [] if isinstance(step.get("prompt"), str) and step["prompt"] else [f"{where} needs a prompt."]
+    if not isinstance(step.get("role", "worker"), str):
+        found.append(f"{where}: role must be text.")
+    roles = step.get("escalate_to", [])
+    if not isinstance(roles, list) or not all(isinstance(role, str) for role in roles):
+        found.append(f"{where}: escalate_to must be a list of roles.")
+    if not isinstance(step.get("system", ""), str):
+        found.append(f"{where}: system must be text.")
+    tokens = step.get("max_tokens", 1)
+    if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 1:
+        found.append(f"{where}: max_tokens must be a whole number above 0.")
+    if not is_number(step.get("temperature", 0)):
+        found.append(f"{where}: temperature must be a number.")
+    return found
+
+
 def _step_errors(step: Any, index: int, ids: set[str], inputs: set[str], capacity: Mapping[str, int] | None, depth: int) -> list[str]:
     if not isinstance(step, Mapping):
         return [f"Step {index + 1} must be an object."]
     name = step.get("id", index + 1)
     where = f"Step {name}"
     kind = step.get("kind")
-    if kind not in STEP_KINDS:
+    if not isinstance(kind, str) or kind not in STEP_KINDS:
         return [f"{where} has kind {kind!r}; use one of {', '.join(STEP_KINDS)}."]
     found = []
     for extra in sorted(set(step) - COMMON_FIELDS - KIND_FIELDS[kind]):
@@ -488,17 +514,17 @@ def _step_errors(step: Any, index: int, ids: set[str], inputs: set[str], capacit
 def _control_errors(step: Mapping[str, Any], where: str, ids: set[str], capacity: Mapping[str, int] | None) -> list[str]:
     found = []
     depends = step.get("depends_on", [])
-    if not isinstance(depends, list):
-        found.append(f"{where}: depends_on must be a list.")
+    if not isinstance(depends, list) or not all(isinstance(name, str) for name in depends):
+        found.append(f"{where}: depends_on must be a list of step ids.")
     else:
         found += [f"{where} depends on {name!r}, which is not in this plan." for name in depends if name not in ids]
     retries = step.get("retries", 0)
     if not isinstance(retries, int) or isinstance(retries, bool) or not 0 <= retries <= MAX_RETRIES:
         found.append(f"{where}: retries must be from 0 to {MAX_RETRIES}.")
     backoff = step.get("backoff_seconds", DEFAULT_BACKOFF)
-    if not isinstance(backoff, (int, float)) or isinstance(backoff, bool) or backoff < 0:
+    if not is_number(backoff) or backoff < 0:
         found.append(f"{where}: backoff_seconds must be zero or more.")
-    if step.get("on_failure", "stop") not in ON_FAILURE:
+    if not isinstance(step.get("on_failure", "stop"), str) or step.get("on_failure", "stop") not in ON_FAILURE:
         found.append(f"{where}: on_failure must be one of {', '.join(ON_FAILURE)}.")
     if not isinstance(step.get("priority", 0), int):
         found.append(f"{where}: priority must be a whole number.")
@@ -514,7 +540,7 @@ def _resource_errors(resources: Any, where: str, capacity: Mapping[str, int] | N
     try:
         wanted = parse_resources(resources)
     except ValueError:
-        return [f"{where}: a resource is written name or name:count, such as gpu:1."]
+        return [f"{where}: a resource is written name or name:count, such as gpu:1, with a count of at least 1."]
     if capacity is None:
         return []
     return [
@@ -539,9 +565,9 @@ def _top_errors(plan: Mapping[str, Any]) -> list[str]:
     if "run_at" in plan:
         found += _time_errors(plan["run_at"], "run_at")
     every = plan.get("every_seconds")
-    if every is not None and (not isinstance(every, (int, float)) or isinstance(every, bool) or every < 1):
+    if every is not None and (not is_number(every) or every < 1):
         found.append("every_seconds must be at least 1.")
-    if plan.get("on_missed", "run_once") not in ON_MISSED:
+    if not isinstance(plan.get("on_missed", "run_once"), str) or plan.get("on_missed", "run_once") not in ON_MISSED:
         found.append(f"on_missed must be one of {', '.join(ON_MISSED)}.")
     if not isinstance(plan.get("priority", 0), int):
         found.append("priority must be a whole number.")
@@ -1865,8 +1891,12 @@ def run_task_run(assistant: Any, args: Any) -> int:
         return 0
     status = engine.run_until_settled(task_id, print)
     print(f"Task {task_id} {status}.")
+    report = engine.status(task_id)
     if status == "blocked":
-        print(engine.status(task_id)["blocked_reason"])
+        print(report["blocked_reason"])
+    for step in report["steps"]:
+        if step["status"] == "failed":
+            print(f"Step {step['id']} failed: {step['error']}")
     return 0 if status in ("done", "partial") else 1
 
 

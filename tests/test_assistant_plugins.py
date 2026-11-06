@@ -57,6 +57,13 @@ CRASH = """
 """
 
 
+def gone(pid):
+    try:
+        return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return True
+
+
 def context(tainted=False, user="ann", actor="conversation"):
     return CallContext(user, actor, tainted)
 
@@ -149,9 +156,9 @@ def test_a_slow_plugin_is_killed_with_everything_it_started(assistant, tmp_path)
     assert time.monotonic() - started < 20
     deadline = time.monotonic() + 15
     pids = [int(pid) for pid in (tmp_path / "pids.txt").read_text().split()]
-    while any(psutil.pid_exists(pid) for pid in pids) and time.monotonic() < deadline:
+    while not all(gone(pid) for pid in pids) and time.monotonic() < deadline:
         time.sleep(0.02)
-    assert not any(psutil.pid_exists(pid) for pid in pids)
+    assert all(gone(pid) for pid in pids)
 
 
 def test_a_plugin_that_never_reads_its_input_does_not_hang_us(assistant, tmp_path):
