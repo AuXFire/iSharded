@@ -1637,6 +1637,72 @@ def test_the_audit_trail_survives_a_kill_and_records_the_unknown(crash):
     assert {"step.start", "step.unknown", "task.block"} <= set(actions)
 
 
+def engine_process(home, plan_path):
+    """The real command line, as a person would leave it running in another terminal."""
+    environment = {**os.environ, "SHARDMESH_SANDBOX": "process"}
+    command_line = [sys.executable, "-m", "shardmesh.cli", "assistant", "--home", str(home), "task", "run", str(plan_path), "--user", "ann"]
+    return subprocess.Popen(command_line, cwd=ROOT, env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
+def wait_until(condition, process, seconds=60):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        assert process.poll() is None, f"the engine ended early: {process.stdout.read()}"
+        time.sleep(0.05)
+    return False
+
+
+def test_cancel_from_another_process_stops_the_sandbox_in_the_engines_process(tmp_path):
+    home, work = tmp_path / "home", tmp_path / "work"
+    work.mkdir()
+    command_words = [sys.executable, "-c", textwrap.dedent(FAMILY)]
+    plan = tmp_path / "plan.json"
+    plan.write_text(json.dumps(plan_of(tool_step("a", "shell.run", arguments={"command": command_words, "cwd": str(work)}))), encoding="utf-8")
+    with Assistant(home) as me:
+        me.broker.add_grant("ann", "shell.run", str(work), "ann")
+    running = engine_process(home, plan)
+    try:
+        assert wait_until((work / "pids.txt").exists, running), "the command never started"
+        pids = [int(pid) for pid in (work / "pids.txt").read_text().split()]
+        with Assistant(home) as me:  # this process is not the engine, and only writes down the request
+            task = me.tasks.list_tasks()[0]["id"]
+            me.tasks.cancel(task, "ann")
+        output, _ = running.communicate(timeout=60)
+    finally:
+        running.kill()
+    assert "cancelled" in output
+    deadline = time.monotonic() + 15
+    while not all(gone(pid) for pid in pids) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert all(gone(pid) for pid in pids), "a cancel from another process left code running"
+    with Assistant(home) as me:
+        assert me.tasks.status(task)["status"] == "cancelled"
+
+
+def test_an_approval_from_another_process_reaches_the_running_engine(tmp_path):
+    home = tmp_path / "home"
+    plan = tmp_path / "plan.json"
+    plan.write_text(json.dumps(plan_of({"id": "gate", "kind": "approval", "message": "Go on?"}, {"id": "w", "kind": "wait", "seconds": 0, "depends_on": ["gate"]})), encoding="utf-8")
+    Assistant(home).close()
+    running = engine_process(home, plan)
+
+    def waiting():
+        with Assistant(home) as me:
+            return bool(me.broker.approvals("ann"))
+
+    try:
+        assert wait_until(waiting, running), "nothing asked a person"
+        with Assistant(home) as me:
+            assert me.broker.decide(me.broker.approvals("ann")[0]["id"], True, "ann")
+        output, _ = running.communicate(timeout=60)
+    finally:
+        running.kill()
+    assert running.returncode == 0, output
+    assert "approvals approve" in output and " done." in output
+
+
 def test_a_new_engine_cannot_take_over_from_one_that_is_alive(assistant, engine, tmp_path, clock):
     started, release, hold = blocker()
     tool(assistant, "demo.hold", hold)
