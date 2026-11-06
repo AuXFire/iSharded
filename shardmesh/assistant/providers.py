@@ -287,18 +287,22 @@ class VisibleText:
     Text is only released once it cannot be the start of something hidden. Code
     fences that cannot be a tool call pass straight through. One that might be is
     held until it closes: a real call disappears and anything else is released.
+
+    A call with no fence is held the same way, and only the whole reply can settle it,
+    since a call has to end the reply. So what is still held at the end comes back from
+    ``flush``, and the router drops it if the reply turned out to hold a call.
     """
 
     def __init__(self, offered: Sequence[Capability] = ()) -> None:
         self.names = frozenset(capability.name for capability in offered)
-        self.markers = ("<think>", "<tool_call>", "```") if self.names else ("<think>",)
+        self.markers = ("<think>", "<tool_call>", "```", "{") if self.names else ("<think>",)
         self.held = ""
-        self.state = "text"  # or think, tool, fence, code
+        self.state = "text"  # or think, tool, fence, code, bare
 
     def feed(self, text: str) -> str:
         self.held += text
         released: list[str] = []
-        step = {"text": self._text, "think": self._think, "tool": self._tool, "fence": self._fence, "code": self._code}
+        step = {"text": self._text, "think": self._think, "tool": self._tool, "fence": self._fence, "code": self._code, "bare": self._bare}
         while self.held and step[self.state](released):
             pass
         return "".join(released)
@@ -349,6 +353,31 @@ class VisibleText:
             released.append(block)
         return True
 
+    def _bare(self, released: list[str]) -> bool:
+        if self._may_be_calls():
+            return False
+        released.append(self.held[0])  # only the brace, as a call can still start after it
+        self.held = self.held[1:]
+        self.state = "text"
+        return True
+
+    def _may_be_calls(self) -> bool:
+        """Whether what is held is nothing but tool calls so far, as ``bare_calls`` requires."""
+        position = 0
+        while True:
+            rest = self.held[position:].lstrip()
+            if not rest:
+                return True
+            if rest[0] != "{":
+                return False
+            start = len(self.held) - len(rest)
+            end = balanced_span(self.held, start)
+            if end is None:
+                return True  # still arriving
+            if not as_calls(loose_json(self.held[start:end]), self.names):
+                return False
+            position = end
+
     def _partial(self, marker: str) -> int:
         """How much of the end of the held text could be the start of a marker."""
         for size in range(len(marker) - 1, 0, -1):
@@ -361,8 +390,8 @@ class VisibleText:
         if hits:
             start, marker = min(hits)
             released.append(self.held[:start])
-            if marker == "```":
-                self.held, self.state = self.held[start:], "fence"
+            if marker in ("```", "{"):
+                self.held, self.state = self.held[start:], "fence" if marker == "```" else "bare"
             else:
                 self.held = self.held[start + len(marker) :]
                 self.state = "think" if marker == "<think>" else "tool"
