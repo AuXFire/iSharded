@@ -30,3 +30,4 @@ orchestrator-state*.json
 
 # The Rust engine
 engine/target/
+isharded/native/
