@@ -88,6 +88,10 @@ class AllFailed(Exception):
         self.reasons = list(reasons)
 
 
+def all_failed(failures: Sequence[str]) -> AllFailed:
+    return AllFailed(f"Every model failed: {'; '.join(failures)}. `shardmesh assistant provider list` shows which are up.", failures)
+
+
 class StoppedPartway(Exception):
     """A stream failed after text had already gone out, so it cannot move to another model."""
 
@@ -318,7 +322,7 @@ class ModelRouter:
                 continue
             self._succeeded(candidate, request.role, reply)
             return reply
-        raise AllFailed("Every model failed: " + "; ".join(failures) + ".", failures)
+        raise all_failed(failures)
 
     def stream(self, request: ModelRequest) -> Iterator[str | ModelReply]:
         """Text as it comes, then the ModelReply. Moves on only before any text went out."""
@@ -352,7 +356,7 @@ class ModelRouter:
                 if sent:
                     raise StoppedPartway(str(error)) from None
                 failures.append(f"{candidate}: {error}")
-        raise AllFailed("Every model failed: " + "; ".join(failures) + ".", failures)
+        raise all_failed(failures)
 
     def embed(self, texts: Sequence[str], reach: Reach = Reach.POOL) -> tuple[list[list[float]], str]:
         """Vectors from the best allowed embedding model, and that model's name."""

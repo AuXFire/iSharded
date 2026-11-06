@@ -449,6 +449,24 @@ def test_the_whole_approval_path_works_from_the_command_line_across_processes(mo
     assert tidied.read_text(encoding="utf-8") == "eggs, milk"
 
 
+def test_the_terminal_shows_a_real_read_apart_from_a_made_up_one(install, model, tmp_path):
+    """A real 0.6B model invented a file's contents, and its reply looked just like a real read."""
+    notes = tmp_path / "notes.txt"
+    notes.write_text("The spare key is under the blue pot.", encoding="utf-8")
+    install.use(model)
+    install.grant("files.read", str(tmp_path))
+    model.on("really read it", [Call("files.read", {"path": str(notes)}), "It says the key is under the blue pot."])
+    model.on("pretend to read it", "The file says the key is under the mat.")
+
+    real = cli(install.home, "say", "Please really read it")
+    assert real.returncode == 0, real.stdout + real.stderr
+    assert "used files.read" in real.stdout
+
+    invented = cli(install.home, "say", "Please pretend to read it")
+    assert invented.returncode == 0, invented.stdout + invented.stderr
+    assert "under the mat" in invented.stdout and "used " not in invented.stdout
+
+
 def test_only_what_a_person_granted_is_offered_to_a_model(install, model, tmp_path):
     """With every part attached the list used to fill up and drop shell.run even when granted."""
     install.use(model, tools="auto")

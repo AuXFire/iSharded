@@ -610,6 +610,8 @@ def footer(result: TurnResult) -> str:
     parts = [f"turn {result.turn_id}"]
     if result.model:
         parts.insert(0, f"{result.provider}/{result.model}")
+    if result.tools:  # a small model can invent what a tool would have said, and it reads just the same
+        parts.append("used " + " ".join(result.tools))
     if result.tainted:
         parts.append("tainted")
     return "[" + ", ".join(parts) + "]"
