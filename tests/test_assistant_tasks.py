@@ -1435,6 +1435,36 @@ def test_two_passes_at_once_finish_a_task_once(assistant, engine):
     assert len(series(engine, task)) == 2
 
 
+def test_only_one_pass_runs_at_a_time(assistant, engine, monkeypatch):
+    """Each pass is held open, so without the lock they would certainly overlap."""
+    state = {"inside": 0, "most": 0}
+    guard = threading.Lock()
+    real = engine._free
+
+    def held_open():
+        with guard:
+            state["inside"] += 1
+            state["most"] = max(state["most"], state["inside"])
+        time.sleep(0.05)
+        with guard:
+            state["inside"] -= 1
+        return real()
+
+    monkeypatch.setattr(engine, "_free", held_open)
+    assert engine.acquire()
+
+    def one_pass():
+        engine.tick()
+        engine.store.close()
+
+    threads = [threading.Thread(target=one_pass) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert state["most"] == 1
+
+
 def test_a_task_that_ended_keeps_its_ending(assistant, engine):
     tool(assistant, "demo.first")
     task = run(engine, plan_of(tool_step("a", "demo.first")))
