@@ -10,6 +10,7 @@ This module must not import torch, directly or through other iSharded modules.
 from __future__ import annotations
 
 from collections import OrderedDict
+import ctypes as C
 import json
 from multiprocessing.connection import Client, Connection, Listener
 import mmap
@@ -33,6 +34,8 @@ EXIT_SECONDS = 15.0
 ENCODED_IMAGE_BYTES = 128 * 1024 * 1024
 # States a draft model keeps. It is small, and a draft that loses one just reads more.
 DRAFT_STATE_BYTES = 256 * 1024 * 1024
+# Operations that touch only the engine's links, and so need not wait for a running pass.
+UNGATED = {"load", "ring_open", "ring_connect", "ring_close", "ring_stats"}
 
 
 class _Host:
@@ -62,6 +65,7 @@ class _Host:
             map_file=meta.get("map_file", True),
             embedding=meta.get("embedding", False),
             kv_type=meta.get("kv_type", "f16"),
+            native=not meta.get("embedding", False),
         )
         self.states = StateStore(meta.get("state_dir"), meta.get("state_ram_bytes", 0), meta.get("state_disk_bytes", 0))
         table = meta.get("table")
@@ -70,7 +74,18 @@ class _Host:
                 self.table = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
             self.table_view = memoryview(self.table)[table["offset"] : table["offset"] + table["length"]]
             self.embedding = TokenEmbedding(self.library, self.table_view, table["ggml_type"], self.stage.hidden_size)
-        return {"hidden_size": self.stage.hidden_size, "vocab_size": self.stage.vocab_size}, b""
+        if self.stage.engine is not None:
+            found = self.embedding
+            self.stage.engine.attach(
+                self.stage,
+                meta.get("wire_bf16", True),
+                self.table_view,
+                len(self.table_view) // found.row_bytes if found else 0,
+                found.row_bytes if found else 0,
+                C.cast(found.to_float, C.c_void_p).value if found and found.to_float else None,
+            )
+        answer = {"hidden_size": self.stage.hidden_size, "vocab_size": self.stage.vocab_size}
+        return {**answer, "engine": self.stage.engine is not None}, b""
 
     def embed(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
         if self.embedding is None:
@@ -203,6 +218,30 @@ class _Host:
         tokens = self.stage.guess(meta["commit"], meta["position"], meta["count"], meta.get("slot", 0), self.scratch)
         return {"tokens": tokens}, b""
 
+    @property
+    def engine(self) -> Any:
+        return None if self.stage is None else self.stage.engine
+
+    def ring_open(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+        if self.engine is None:
+            return {"engine": False}, b""
+        door = self.engine.listen(meta["host"], meta["port"])
+        self.engine.open(meta["epoch"], meta["index"], meta["count"], bytes.fromhex(meta["key"]), meta["ack_timeout_ms"], meta["silence_timeout_ms"])
+        return {"engine": True, **door}, b""
+
+    def ring_connect(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+        assert self.engine is not None
+        self.engine.connect(meta["links"])
+        return {}, b""
+
+    def ring_close(self, _: dict[str, Any], __: bytes) -> tuple[dict[str, Any], bytes]:
+        if self.engine is not None:
+            self.engine.close_ring()
+        return {}, b""
+
+    def ring_stats(self, _: dict[str, Any], __: bytes) -> tuple[dict[str, Any], bytes]:
+        return ({} if self.engine is None else self.engine.stats()), b""
+
 
 def run(address: Any, key: bytes) -> None:
     connection = Client(address, authkey=key)
@@ -220,7 +259,15 @@ def run(address: Any, key: bytes) -> None:
             connection.send_bytes(b"")
             return
         try:
-            answer, data = getattr(host, operation)(meta, payload)
+            # The engine runs passes on its own threads, and llama.cpp allows one at a time.
+            engine = None if operation in UNGATED else host.engine
+            if engine is not None:
+                engine.lock()
+            try:
+                answer, data = getattr(host, operation)(meta, payload)
+            finally:
+                if engine is not None:
+                    engine.unlock()
             connection.send_bytes(json.dumps({"ok": True, **answer}).encode())
             connection.send_bytes(data)
         except (LlamaError, OSError, ValueError, AttributeError, AssertionError) as exc:

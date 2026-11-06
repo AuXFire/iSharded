@@ -123,6 +123,7 @@ class GgufStage:
         state_folder: Path | None = None,
         state_ram_bytes: int = 0,
         state_disk_bytes: int = 0,
+        wire_bf16: bool = True,
     ) -> None:
         assignment = request.assignment
         self.first = assignment.start_layer == 0
@@ -165,6 +166,7 @@ class GgufStage:
             "map_file": needs_mapping(placements, pools),
             "embedding": request.embedding,
             "kv_type": request.kv_type,
+            "wire_bf16": wire_bf16,
             "state_dir": None if state_folder is None else str(state_folder),
             "state_ram_bytes": state_ram_bytes,
             "state_disk_bytes": state_disk_bytes,
@@ -238,6 +240,16 @@ class GgufStage:
 
     def clear(self, slot: int = 0) -> None:
         self.host.call("clear", slot=slot)
+
+    def ring_call(self, operation: str, **meta: Any) -> dict[str, Any]:
+        return self.host.call(operation, **meta)[0]
+
+    def ring_stats(self) -> dict[str, Any] | None:
+        """How the engine is doing, unless asking would wait behind a pass."""
+        try:
+            return self.host.ask_if_idle("ring_stats")
+        except LlamaError:
+            return None
 
     def refresh_states(self) -> None:
         """Bring the store's report up to date, unless that would mean waiting."""

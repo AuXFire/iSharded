@@ -149,23 +149,17 @@ pub unsafe extern "C" fn isharded_engine_open(engine: *mut Engine, plan: *const 
     0
 }
 
-/// Dials the neighbours. Zero or one says whether the closing link is up; negative is failure.
+/// Starts dialling the neighbours, and returns at once. The stats say how it went.
 ///
 /// # Safety
-/// `links` must be a NUL-terminated JSON string, and `out` must have room for `capacity` bytes.
+/// `links` must be a NUL-terminated JSON string.
 #[no_mangle]
-pub unsafe extern "C" fn isharded_engine_connect(engine: *mut Engine, links: *const c_char, out: *mut c_char, capacity: usize) -> i32 {
+pub unsafe extern "C" fn isharded_engine_connect(engine: *mut Engine, links: *const c_char) -> i32 {
     let Some(links) = read_text(links).and_then(|text| serde_json::from_str::<Links>(text).ok()) else {
-        write_text(b"could not read the links", out, capacity);
         return -1;
     };
-    match (*engine).node.connect(links) {
-        Ok(closing) => i32::from(closing),
-        Err(error) => {
-            write_text(error.as_bytes(), out, capacity);
-            -1
-        }
-    }
+    (*engine).node.connect_in_background(links);
+    0
 }
 
 /// # Safety

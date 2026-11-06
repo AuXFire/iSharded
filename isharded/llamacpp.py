@@ -28,6 +28,7 @@ import httpx
 import numpy as np
 
 from .embedding import PASS_SEQUENCES
+from .engine import Engine
 from .statestore import PASS_ROWS
 
 PINNED_BUILD = "b12119"
@@ -538,9 +539,11 @@ class LlamaStage:
         map_file: bool = True,
         embedding: bool = False,
         kv_type: str = "f16",
+        native: bool = False,
     ) -> None:
         self.library = library
         self.last = last
+        self.engine: Engine | None = None
         lib = library.llama
         params = lib.llama_model_default_params()
         params.n_gpu_layers = gpu_layers
@@ -593,8 +596,15 @@ class LlamaStage:
             # Offloading would borrow the GPU for any pass of 32 rows or more, over
             # 1 GiB of it at this batch size, on a node that gave this stage none.
             context.op_offload = gpu_layers != 0
+        if native:
+            self.engine = Engine.create(self._target, library)
         if not last:
-            context.cb_eval = C.cast(self._callback, C.c_void_p).value
+            if self.engine is not None:
+                # llama.cpp calls this for every node of every pass, thousands of times.
+                context.cb_eval = self.engine.eval_callback
+                context.cb_eval_user_data = self.engine.handle
+            else:
+                context.cb_eval = C.cast(self._callback, C.c_void_p).value
         self.context = lib.llama_init_from_model(self.model, context)
         if not self.context:
             lib.llama_model_free(self.model)
@@ -672,9 +682,13 @@ class LlamaStage:
             seq_id=C.cast(sequence_ids, C.c_void_p).value,
             logits=outputs.ctypes.data,
         )
+        if self.engine is not None:
+            self.engine.capture_begin()
         status = self.library.llama.llama_decode(self.context, batch)
         if status != 0:
             raise LlamaError(f"llama_decode failed with status {status}")
+        if self.engine is not None and not self.last:
+            self._captured = self.engine.capture_read(count * self.hidden_size)
 
     def logits_at(self, index: int) -> np.ndarray:
         pointer = self.library.llama.llama_get_logits_ith(self.context, index)
@@ -786,6 +800,8 @@ class LlamaStage:
         )
         self._parts = []
         self._collecting = True
+        if self.engine is not None:
+            self.engine.capture_begin()
         try:
             status = self.library.llama.llama_decode(self.context, batch)
         finally:
@@ -794,6 +810,8 @@ class LlamaStage:
             raise LlamaError(f"llama_decode failed with status {status}")
         if self.last:
             return np.stack([self.logits_at(index).copy() for index in range(count)])
+        if self.engine is not None:
+            self._parts = [self.engine.capture_read(count * self.hidden_size)]
         rows = np.concatenate(self._parts) if self._parts else np.empty(0, dtype=np.float32)
         if rows.size != count * self.hidden_size:
             raise LlamaError("a merged pass did not produce one row per conversation")

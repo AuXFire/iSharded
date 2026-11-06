@@ -14,6 +14,7 @@ import socket
 import sys
 import threading
 import time
+from urllib.parse import urlsplit
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Iterator
 import contextlib
@@ -40,6 +41,7 @@ from .memory import (
     discover_accelerators,
     live_free_bytes,
 )
+from .engine import REFUSE_EPOCH, REFUSE_FAILED_STAGE, REFUSE_STAGE_ERROR, EngineClient, EngineRefusal
 from .geo import country_code, node_country
 from .models import Adapter, GgufAdapter, create_adapter
 from .models.base import layer_unit
@@ -171,6 +173,9 @@ DRAIN_LIMIT_SECONDS = 180.0
 # A control plane this worker only heard about, and that stays silent, is forgotten.
 CONTROL_LINK_FAILURES = 60
 CHECK_IN_SECONDS = 5.0
+# How long a link may go without an acknowledgement, and how long a stage keeps dialling.
+RING_ACK_MS = 5000
+RING_DIAL_MS = 10_000
 UNAVAILABLE_STATUSES = {502, 503, 504}
 
 
@@ -190,6 +195,8 @@ class CacheEntry:
     slot: int = 0
     states: dict[int, dict[str, torch.Tensor]] = field(default_factory=dict)
     length: int = 0
+    # This reply's passes left the Python path, so the later stages' own counts are stale.
+    ring: bool = False
 
 
 @dataclass(slots=True)
@@ -301,6 +308,10 @@ class WorkerRuntime:
         self.control_urls: dict[str, ControlLink] = {url: ControlLink() for url in self.seed_urls}
         self.term = 0
         self.advertised_url = os.getenv("ISHARDED_ADVERTISE_URL", "http://127.0.0.1:8100").rstrip("/")
+        self.ring_live = False
+        self.ring_epoch: int | None = None
+        self.ring_door: dict[str, Any] | None = None
+        self.ring_client: EngineClient | None = None
         self.country = node_country(self.advertised_url, os.getenv("ISHARDED_LOCATION"))
         self.pool_token = load_token()
         self.requires_identity = bool(os.getenv("ISHARDED_CA_FILE"))
@@ -882,6 +893,7 @@ class WorkerRuntime:
             self.state_root / namespace if caching else None,
             self.state_ram_bytes if caching else 0,
             self.state_disk_bytes if caching else 0,
+            self.dtype_name != "float32",
         )
         self._load_draft(request, folder, threads)
         self._load_projector(request, adapter, folder, threads)
@@ -979,6 +991,7 @@ class WorkerRuntime:
         if request.term < self.term:
             raise ValueError(f"order from term {request.term}, but term {self.term} already took over")
         self.term = request.term
+        self.ring_stop()
         adapter = create_adapter(request.architecture)
         if not (0 <= request.assignment.start_layer < request.assignment.end_layer <= adapter.num_layers):
             raise ValueError("invalid layer interval")
@@ -1004,6 +1017,121 @@ class WorkerRuntime:
         if self.gate.size != request.slots:
             self.gate.resize(request.slots)
         await self.release_gate()
+
+    def ring_stop(self) -> None:
+        """Leave the ring. Replies go on over HTTP, or replay if one was using it."""
+        self.ring_live = False
+        self.ring_epoch = None
+        self.ring_door = None
+        if self.ring_client is not None:
+            self.ring_client.close()
+            self.ring_client = None
+
+    async def ring_open(self, body: dict[str, Any]) -> dict[str, Any]:
+        if self.gguf is None or body["epoch"] != self.epoch:
+            raise HTTPException(status_code=409, detail="this worker is not on that route")
+        self.ring_stop()
+        answer = await asyncio.to_thread(
+            self.gguf.ring_call,
+            "ring_open",
+            host=os.getenv("ISHARDED_HOST", "0.0.0.0"),
+            port=int(os.getenv("ISHARDED_DATA_PORT", "0")),
+            epoch=body["epoch"],
+            index=body["index"],
+            count=body["count"],
+            key=body["key"],
+            ack_timeout_ms=body.get("ack_timeout_ms", RING_ACK_MS),
+            silence_timeout_ms=body.get("silence_timeout_ms", RING_ACK_MS),
+        )
+        if not answer.get("engine"):
+            return {"engine": False}
+        self.ring_door = answer
+        self.ring_epoch = body["epoch"]
+        host = urlsplit(self.advertised_url).hostname or "127.0.0.1"
+        return {"engine": True, "address": f"[{host}]:{answer['port']}" if ":" in host else f"{host}:{answer['port']}", "fingerprint": answer["fingerprint"]}
+
+    async def ring_connect(self, body: dict[str, Any]) -> dict[str, Any]:
+        if self.gguf is None or self.ring_door is None or body["epoch"] != self.ring_epoch:
+            raise HTTPException(status_code=409, detail="this worker has not opened that ring")
+        links = {"next": body.get("next"), "entry": body.get("entry"), "timeout_ms": RING_DIAL_MS}
+        await asyncio.to_thread(self.gguf.ring_call, "ring_connect", links=links)
+        give_up = time.monotonic() + RING_DIAL_MS / 500
+        state = "dialling"
+        while state == "dialling" and time.monotonic() < give_up:
+            await asyncio.sleep(0.02)
+            stats = await asyncio.to_thread(self.gguf.ring_stats)
+            state = (stats or {}).get("connect", state)
+        if state != "up":
+            raise HTTPException(status_code=502, detail=f"could not reach the next stage: {state}")
+        if self.assignment is not None and self.assignment.start_layer == 0:
+            self.ring_client = await EngineClient.open(self.ring_door["local_port"], bytes(self.ring_door["local_key"]))
+        return {"connected": True}
+
+    def ring_go(self, body: dict[str, Any]) -> None:
+        if body["epoch"] != self.ring_epoch or self.ring_client is None:
+            raise HTTPException(status_code=409, detail="this worker has not joined that ring")
+        self.ring_live = True
+
+    def ring_ready(self, request: InferRequest) -> bool:
+        """Whether this pass can take the native path.
+
+        Only plain next-token and verify passes do. Prompts, restores and images change
+        what a stage holds, and those stay on the path that knows how.
+        """
+        return (
+            self.ring_live
+            and self.ring_client is not None
+            and self.ring_client.alive
+            and request.epoch == self.ring_epoch
+            and not (request.reset or request.prompt_rows or request.saves or request.cuts or request.images)
+            and request.restore_length is None
+            and request.next_position is None
+        )
+
+    def ring_refused(self, refused: EngineRefusal) -> HTTPException:
+        """The error the HTTP path would have raised, so recovery is the same."""
+        if refused.refusal == REFUSE_EPOCH:
+            return HTTPException(status_code=409, detail=f"pipeline epoch mismatch; worker has {self.epoch}")
+        if refused.refusal == REFUSE_STAGE_ERROR:
+            return HTTPException(status_code=500, detail={"stage_error": refused.message})
+        if refused.refusal == REFUSE_FAILED_STAGE and refused.stage < len(self.route):
+            self.ring_live = False
+            return HTTPException(status_code=502, detail={"failed_worker": self.route[refused.stage].worker_id, "message": refused.message})
+        self.ring_live = False
+        return HTTPException(status_code=503, detail={"retry": True, "message": refused.message})
+
+    async def ring_step(self, request: InferRequest) -> dict[str, Any]:
+        """One pass along the ring. Nothing on this machine waits on a stage but this."""
+        assert self.ring_client is not None
+        entry = self.caches.get(request.session_id)
+        if entry is None or entry.epoch != request.epoch:
+            raise HTTPException(status_code=503, detail={"retry": True, "message": "this session's state is gone"})
+        position = entry.length if request.rollback_to is None else min(entry.length, request.rollback_to)
+        entry.ring = True
+        try:
+            tokens = await self.ring_client.run(
+                pass_seconds(len(request.input_ids), len(self.route)),
+                epoch=request.epoch,
+                slot=request.slot,
+                position=position,
+                rollback_to=request.rollback_to,
+                tokens=request.input_ids,
+                guesses=request.input_ids[1:] if request.verify else [],
+                verify=request.verify,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                top_k=request.top_k,
+                seed=request.seed,
+            )
+        except EngineRefusal as refused:
+            raise self.ring_refused(refused) from refused
+        except asyncio.TimeoutError as exc:
+            self.ring_live = False
+            raise HTTPException(status_code=503, detail={"retry": True, "message": "a pass did not come back"}) from exc
+        entry.length = position + len(request.input_ids)
+        self.inference_calls += 1
+        self.tokens_processed += len(request.input_ids)
+        return {"token_ids": tokens} if request.verify else {"token_id": tokens[0]}
 
     def _next_stage(self) -> StageAssignment | None:
         assert self.assignment is not None
@@ -1545,6 +1673,7 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
             "checkpoints_dropped": runtime.checkpoints_dropped,
             "cache": runtime.cache_report(),
             "phases_ms": runtime.phases,
+            "ring": await asyncio.to_thread(runtime.gguf.ring_stats) if runtime.gguf is not None else None,
         },
     }
 
@@ -1970,6 +2099,14 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
 
     async def step(request: InferRequest, part: PromptPart | None = None) -> dict[str, Any]:
         arrived = time.perf_counter()
+        if part is None and runtime.ring_ready(request):
+            result = await runtime.ring_step(request)
+            runtime._record("handler", arrived)
+            return result
+        held = runtime.caches.get(request.session_id)
+        if held is not None and held.ring and not request.reset and request.restore_length is None:
+            # The other stages' own counts stopped when this reply took the ring.
+            raise HTTPException(status_code=503, detail={"retry": True, "message": "the ring went down during this reply"})
         async with runtime.lock:
             hidden = await asyncio.to_thread(runtime._prepare_entry, request, part)
         runtime._record("embed", arrived)
@@ -2190,6 +2327,34 @@ async def embed(body: EmbedPass, authorization: str | None = Header(default=None
         raise HTTPException(status_code=500, detail=runtime.last_error) from exc
     finally:
         await runtime.gate.release(slot)
+
+
+@app.post("/internal/ring/open")
+async def ring_open(body: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    verify_token(authorization)
+    return await runtime.ring_open(body)
+
+
+@app.post("/internal/ring/connect")
+async def ring_connect(body: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    verify_token(authorization)
+    return await runtime.ring_connect(body)
+
+
+@app.post("/internal/ring/close")
+async def ring_close(authorization: str | None = Header(default=None)) -> dict[str, str]:
+    verify_token(authorization)
+    runtime.ring_stop()
+    if runtime.gguf is not None:
+        await asyncio.to_thread(runtime.gguf.ring_call, "ring_close")
+    return {"status": "closed"}
+
+
+@app.post("/internal/ring/go")
+async def ring_go(body: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, str]:
+    verify_token(authorization)
+    runtime.ring_go(body)
+    return {"status": "live"}
 
 
 @app.post("/internal/forward")

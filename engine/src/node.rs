@@ -105,6 +105,8 @@ pub struct Stats {
     pub next_up: bool,
     pub closing_up: bool,
     pub epoch: Option<u64>,
+    /// "idle", "dialling", "up", or why it failed.
+    pub connect: String,
 }
 
 #[derive(Default)]
@@ -193,6 +195,7 @@ struct Inner {
     strangers: AtomicUsize,
     counters: Counters,
     listening: Mutex<Option<Listening>>,
+    connect: Mutex<String>,
 }
 
 pub struct Node {
@@ -214,6 +217,7 @@ impl Node {
             strangers: AtomicUsize::new(0),
             counters: Counters::default(),
             listening: Mutex::new(None),
+            connect: Mutex::new("idle".to_string()),
         });
         let worker = inner.clone();
         thread::Builder::new().name("isharded-compute".into()).spawn(move || compute_loop(&worker)).map_err(|error| error.to_string())?;
@@ -282,23 +286,23 @@ impl Node {
 
     /// Dials the next stage and, at the last stage, the entry. The closing link may fail.
     pub fn connect(&self, links: Links) -> Result<bool, String> {
-        let ring = self.inner.ring.read().clone().ok_or("no route has been opened")?;
-        if let Some(next) = &links.next {
-            let link = dial_with_retry(next, &ring, Role::Hop, Duration::from_millis(links.timeout_ms)).map_err(|error| error.to_string())?;
-            let peer = Peer::new(link, ring.index + 1, false);
-            *ring.next.lock() = Some(peer.clone());
-            start_peer(&self.inner, &ring, &peer);
+        connect(&self.inner, &links)
+    }
+
+    /// The same, off this thread, so the stage goes on serving meanwhile.
+    pub fn connect_in_background(&self, links: Links) {
+        *self.inner.connect.lock() = "dialling".to_string();
+        let inner = self.inner.clone();
+        let spawned = thread::Builder::new().name("isharded-dial".into()).spawn(move || {
+            let outcome = connect(&inner, &links);
+            *inner.connect.lock() = match outcome {
+                Ok(_) => "up".to_string(),
+                Err(error) => error,
+            };
+        });
+        if spawned.is_err() {
+            *self.inner.connect.lock() = "could not start a thread".to_string();
         }
-        let mut closing = false;
-        if let Some(entry) = &links.entry {
-            if let Ok(link) = dial_with_retry(entry, &ring, Role::Closing, Duration::from_millis(links.timeout_ms)) {
-                let peer = Peer::new(link, 0, true);
-                *ring.closing.lock() = Some(peer.clone());
-                start_peer(&self.inner, &ring, &peer);
-                closing = true;
-            }
-        }
-        Ok(closing)
     }
 
     pub fn close_ring(&self) {
@@ -321,6 +325,7 @@ impl Node {
             next_up: ring.as_ref().is_some_and(|item| item.next.lock().is_some()),
             closing_up: ring.as_ref().is_some_and(|item| item.closing.lock().is_some() || item.entry_closing.lock().is_some()),
             epoch: ring.as_ref().map(|item| item.epoch),
+            connect: self.inner.connect.lock().clone(),
         }
     }
 
@@ -338,6 +343,26 @@ impl Drop for Node {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+fn connect(inner: &Arc<Inner>, links: &Links) -> Result<bool, String> {
+    let ring = inner.ring.read().clone().ok_or("no route has been opened")?;
+    if let Some(next) = &links.next {
+        let link = dial_with_retry(next, &ring, Role::Hop, Duration::from_millis(links.timeout_ms)).map_err(|error| error.to_string())?;
+        let peer = Peer::new(link, ring.index + 1, false);
+        *ring.next.lock() = Some(peer.clone());
+        start_peer(inner, &ring, &peer);
+    }
+    let mut closing = false;
+    if let Some(entry) = &links.entry {
+        if let Ok(link) = dial_with_retry(entry, &ring, Role::Closing, Duration::from_millis(links.timeout_ms)) {
+            let peer = Peer::new(link, 0, true);
+            *ring.closing.lock() = Some(peer.clone());
+            start_peer(inner, &ring, &peer);
+            closing = true;
+        }
+    }
+    Ok(closing)
 }
 
 fn dial_with_retry(target: &Address, ring: &Ring, role: Role, patience: Duration) -> Result<Arc<Link>, LinkError> {

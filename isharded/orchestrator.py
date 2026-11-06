@@ -5,6 +5,7 @@ import asyncio
 import base64
 import json
 import os
+import secrets
 import re
 import socket
 import time
@@ -112,6 +113,8 @@ ACTIVATE_RETRIES = 2
 ACTIVATE_RETRY_SECONDS = 5.0
 # How long a measured link is believed, how many tries make one measurement, and the
 # most a load waits for measuring.
+RING_RETRY_SECONDS = 30.0
+RING_CALL_SECONDS = 30.0
 LINK_TTL_SECONDS = 600.0
 LINK_PROBE_ROUNDS = 3
 LINK_PROBE_SECONDS = 30.0
@@ -487,6 +490,9 @@ class Orchestrator:
         self.reuse_cached = os.getenv("ISHARDED_REUSE_CACHED", "1") != "0"
         self.peer_fetch = os.getenv("ISHARDED_PEER_FETCH", "1") != "0"
         self.workers: dict[str, WorkerRecord] = {}
+        self.ring_epoch: int | None = None
+        self.ring_tried: int | None = None
+        self.ring_tried_at = 0.0
         self.links: dict[tuple[str, str], float] = {}  # round trip in ms, from one worker to another
         self.links_checked: dict[tuple[str, str], float] = {}
         self.model_id: str | None = None
@@ -847,6 +853,7 @@ class Orchestrator:
         self._review_quarantine()
         await self._adopt_saved_route()
         await self._repair_route()
+        await self._start_ring()
 
     def _review_quarantine(self) -> None:
         """Let a quarantined worker back once it has stayed healthy for a while."""
@@ -1192,6 +1199,48 @@ class Orchestrator:
             )
         return updated
 
+    async def _start_ring(self) -> None:
+        """Open direct links along the route, for the passes every token makes.
+
+        The route already serves over HTTP, so this only makes it faster: if any stage has
+        no engine, or a link cannot be opened, replies stay on the path they were on.
+        """
+        if os.getenv("ISHARDED_RING", "1") == "0" or not self.coordinating or not self.route or self.ring_epoch == self.epoch:
+            return
+        route, epoch = list(self.route), self.epoch
+        if self.ring_tried == epoch and time.monotonic() - self.ring_tried_at < RING_RETRY_SECONDS:
+            return
+        self.ring_tried, self.ring_tried_at = epoch, time.monotonic()
+        headers = auth_headers(self.pool_token)
+
+        async def ask(stage: StageAssignment, path: str, body: dict[str, Any]) -> dict[str, Any]:
+            response = await self.client.post(stage.url.rstrip("/") + path, json=body, headers=headers, timeout=RING_CALL_SECONDS)
+            response.raise_for_status()
+            return response.json()
+
+        key = secrets.token_hex(32)
+        try:
+            doors = await asyncio.gather(
+                *(ask(stage, "/internal/ring/open", {"epoch": epoch, "index": index, "count": len(route), "key": key}) for index, stage in enumerate(route))
+            )
+            if not all(door.get("engine") for door in doors):
+                return
+            links = [{"address": door["address"], "fingerprint": door["fingerprint"]} for door in doors]
+            last = len(route) - 1
+
+            def connect(index: int) -> dict[str, Any]:
+                entry = links[0] if index == last and last > 0 else None
+                return {"epoch": epoch, "next": links[index + 1] if index < last else None, "entry": entry}
+
+            await asyncio.gather(*(ask(stage, "/internal/ring/connect", connect(index)) for index, stage in enumerate(route)))
+            await ask(route[0], "/internal/ring/go", {"epoch": epoch})
+        except (httpx.HTTPError, KeyError, ValueError) as exc:
+            self.add_event("mesh", "Direct links not up", f"Replies stay on HTTP for now: {str(exc) or type(exc).__name__}")
+            return
+        if self.epoch == epoch:
+            self.ring_epoch = epoch
+            self.add_event("mesh", "Direct links up", f"Tokens now cross {len(route)} stages on the native path")
+
     async def measure_links(self) -> None:
         """Time the links between workers, which the planner routes by.
 
@@ -1452,6 +1501,7 @@ class Orchestrator:
             self.spawn(self._clear_old_copies(target, route))
         if self.mesh is not None:
             self.spawn(self._gossip_round())  # peers should not wait for the next tick
+        self.spawn(self._start_ring())
         summary = " → ".join(f"{stage.worker_id} L{stage.start_layer}–{stage.end_layer - 1}" for stage in route)
         self.add_event("rebalance", f"Pipeline epoch {new_epoch}", summary)
         return {}
