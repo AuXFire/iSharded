@@ -86,6 +86,8 @@ class WorkerRegistration(BaseModel):
     hardware: HardwareInfo
     protocol_version: int = 0
     code_version: str = "unknown"
+    # From --location or the advertised address. None means nobody knows.
+    country: str | None = Field(default=None, pattern=r"^[A-Z]{2}$")
 
 
 class Heartbeat(BaseModel):

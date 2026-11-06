@@ -381,6 +381,10 @@ Every node serves both, so any node's address works.
 
 If the node serving your chat dies mid-reply, the page asks before sending your key and conversation to another member, then restarts the reply there.
 
+The dashboard shows a flag beside each worker whose country is known, with the name on hover and in the worker's details. The country comes from a table in the package, so no outside service sees a node's address. Only a public address can be looked up. A private, loopback, or Tailscale address shows nothing, and so does a host name, because resolving it would tell a DNS server. A node on Tailscale or a LAN therefore needs `--location` to show a flag.
+
+The table records who holds an address, which is not always where the machine is. A cloud's address can name the cloud's home country, and a node behind a relay has the relay's address. `--location` corrects both.
+
 ### Calling the API
 
 Any node's control address works. With curl:
@@ -518,6 +522,7 @@ With real processes, as three nodes on one machine started with `isharded node`,
 | `--cache-budget-gb` | Set it on a small disk | Evicts old models past this size |
 | `--ram-budget-gb` | 0 for GGUF hybrid models, a few GB otherwise | KV checkpoints speed up recovery where a model supports them. Hybrid Qwen models replay instead |
 | `--log-file` | Always | Nothing is kept otherwise |
+| `--location` | Set it on Tailscale, on a LAN, behind a relay, or in a cloud | The address cannot show the right country there |
 | `--gguf-dir` | Point it at LM Studio's or your own model folder | Files there are read locally, not downloaded |
 
 The entry node also carries the draft model, about 1.7 GiB of VRAM for the default one, and the planner does not reserve room for it. If you want it on a particular machine, pin that machine with `--entry`.
@@ -580,6 +585,7 @@ Starts a node with everything worked out, and is the easy way in. See [Quick sta
 | `--port` | 8209 | Port for the chat page and API |
 | `--worker-port` | Nine below `--port` | This node's worker port, for clouds that hand out ports |
 | `--address` | Found for you | The address other nodes reach this one on |
+| `--location` | Looked up from `--address` | Two letter country code for the dashboard's flag, such as `DE`. Kept for next time, and a new one replaces it |
 | `--tls` | Off on Tailscale | Use TLS even on Tailscale |
 | `--trusted-network` | Off | Skip TLS, because nobody else can read this network |
 | `--no-gpu` | Off | Contribute CPU and RAM only |
@@ -646,6 +652,7 @@ Network:
 | `--bind-host` | `0.0.0.0` | Address to listen on |
 | `--advertise-host` | `auto` | Address other nodes reach this one on. `auto` prefers Tailscale, then the LAN |
 | `--advertise-scheme` | `http` | `http` or `https`. Set to `https` for you by `--tls-cert` |
+| `--location` | Looked up from `--advertise-host` | Two letter country code for the dashboard's flag, such as `DE` |
 | `--base-port` | 8200 | First worker's port. Later workers take the next ones |
 
 Security:
@@ -850,6 +857,7 @@ The state folder is `%LOCALAPPDATA%\iSharded` on Windows and `~/.cache/iSharded`
 | `--worker-id` | Computer name | Unique name. Use `node-gpu`, `node-cpu`, or `node-memory` so certificates match |
 | `--orchestrator-url` | `http://127.0.0.1:8000` | One or more control planes, comma separated. The rest are found from them |
 | `--advertise-url` | `http://127.0.0.1:PORT` | How other nodes reach this worker |
+| `--location` | Looked up from `--advertise-url` | Two letter country code to report |
 | `--device` | `auto` | `auto`, `cpu`, `cuda:0`, `mps`, or `xpu:0` |
 | `--roles` | `inference` | `inference`, or `kv-cache,checkpoint` for a memory worker |
 | `--dtype` | `auto` | `auto` is BF16. `float32` runs this worker at full precision |
@@ -886,7 +894,7 @@ A flag takes priority over its variable.
 | `ISHARDED_HOST`, `ISHARDED_PORT` | `--host`, `--port` |
 | `ISHARDED_OWN_ADDRESS` | Set by a node for its own services, so a request for its public address goes over loopback. Many networks will not loop a machine's public address back to it. Behind a relay that other nodes share, set it to a list of `host:port` |
 | `ISHARDED_NODE_ID`, `ISHARDED_NODE_URL`, `ISHARDED_JOIN` | The control plane's `--node-id`, `--advertise-url`, `--join` |
-| `ISHARDED_WORKER_ID`, `ISHARDED_ORCHESTRATOR_URL`, `ISHARDED_ADVERTISE_URL` | The worker's `--worker-id`, `--orchestrator-url`, `--advertise-url` |
+| `ISHARDED_WORKER_ID`, `ISHARDED_ORCHESTRATOR_URL`, `ISHARDED_ADVERTISE_URL`, `ISHARDED_LOCATION` | The worker's `--worker-id`, `--orchestrator-url`, `--advertise-url`, `--location` |
 | `ISHARDED_DEVICE`, `ISHARDED_ROLES`, `ISHARDED_CPU_THREADS` | `--device`, `--roles`, `--cpu-threads` |
 | `ISHARDED_GPU_MEMORY_GB`, `ISHARDED_RAM_BUDGET_GB` | `--gpu-memory-gb`, `--ram-budget-gb` |
 | `ISHARDED_CACHE_DIR`, `ISHARDED_LLAMA_DIR` | `--cache-dir`, `--llama-dir` |
@@ -920,7 +928,7 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `POST` | `/v1/embeddings` | User key | Vectors for text, from an embedding model. See [Embeddings](#embeddings) |
 | `GET` | `/v1/models` | User key | Every running model, and what each is for |
 | `POST` | `/mcp` | User key | [MCP](#mcp) over Streamable HTTP. `GET` and `DELETE` answer 405, since there is no stream or session |
-| `GET` | `/admin/status` | User key | Workers, memory pools, route, epoch, mesh, lanes, load progress, and the last answer check |
+| `GET` | `/admin/status` | User key | Workers and their `country`, memory pools, route, epoch, mesh, lanes, load progress, and the last answer check |
 | `GET` | `/admin/catalog` | User key | Suggested models and supported architectures |
 | `POST` | `/admin/plan` | Admin key | Show where a model would run, without moving anything |
 | `POST` | `/admin/load` | Admin key | Load a model |
@@ -1620,6 +1628,8 @@ Adapter tests compare every family with the reference `transformers` implementat
 | `scripts/build_tiny_model.py` | Builds the offline test model |
 | `scripts/verify_model.py` | Compares a running checkpoint with an unsharded reference |
 | `scripts/build_diagrams.py` | Redraws the diagrams in this file |
+| `scripts/build_countries.py` | Rebuilds the country table from the registries' files |
+| `scripts/build_flags.py` | Rebuilds the dashboard's flags. Needs Node |
 | `scripts/ci_local.sh` | Runs the tests from a clean clone |
 | `scripts/install_node_task.ps1` | Starts a node at boot on Windows |
 
@@ -1688,3 +1698,5 @@ Behavior:
 ## License
 
 iSharded is licensed under the [Apache License 2.0](LICENSE). Copyright 2026 AuXFire.
+
+The flags in `isharded/flags.svg` come from [country-flag-icons](https://gitlab.com/catamphetamine/country-flag-icons), under the MIT license, whose text is at the top of that file. The country table in `isharded/countries.bin` is built from the delegation files published by AFRINIC, APNIC, ARIN, LACNIC, and the RIPE NCC, as fetched on 6 November 2026.

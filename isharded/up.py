@@ -36,6 +36,7 @@ import psutil
 
 from .access import digest
 from .discovery import find_meshes
+from .geo import country_code
 from .inventory import ram
 from .node import add_node_arguments, detect_address, run_node
 from .tls import OWN_ADDRESS, stay_on_this_machine
@@ -339,6 +340,8 @@ def node_arguments(settings: dict[str, Any], home: Path) -> argparse.Namespace:
         arguments += ["--gpu-memory-gb", str(settings["gpu_gb"])]
     for folder in settings.get("gguf_dirs", []):
         arguments += ["--gguf-dir", folder]
+    if settings.get("location"):
+        arguments += ["--location", settings["location"]]
     parser = argparse.ArgumentParser()
     add_node_arguments(parser)
     return parser.parse_args(arguments)
@@ -478,6 +481,7 @@ def first_settings(args: argparse.Namespace, home: Path) -> dict[str, Any]:
     return {
         "name": args.name or machine_name(),
         "address": address,
+        "location": args.location,
         "port": args.port,
         "worker_port": args.worker_port,
         "tls": tls and not args.ownerless,
@@ -542,6 +546,9 @@ def run_up(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+    if args.location and args.location != settings.get("location"):  # a node that already exists can say where it is
+        settings["location"] = args.location
+        write_settings(home, settings)
     address = settings["address"]
     if not settings["tls"] and not _private_link(address) and not settings.get("trusted_network"):
         print(f"{address} is not an encrypted network, so this node needs TLS or --trusted-network.", file=sys.stderr)
@@ -667,6 +674,7 @@ def add_arguments(subparsers: Any) -> None:
     up.add_argument("--worker-port", type=int, default=None, help="this node's worker port, for clouds that hand out ports; default is nine below --port")
     up.add_argument("--port", type=int, default=DEFAULT_PORT, help="port for the chat page and API")
     up.add_argument("--address", default=None, help="the address other nodes reach this one on; found for you if not set")
+    up.add_argument("--location", type=country_code, default=None, help="two letter country code for the dashboard's flag, kept for next time; default is looked up from --address")
     up.add_argument("--tls", action="store_true", help="use TLS even on Tailscale")
     up.add_argument("--trusted-network", action="store_true", help="skip TLS, because nobody else can read this network")
     up.add_argument("--no-gpu", action="store_true", help="contribute CPU and RAM only")
