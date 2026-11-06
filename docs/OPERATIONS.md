@@ -57,9 +57,10 @@ The rule is that a failure or a pool change must not drop a reply, and that weig
 | Event | What happens | Effect on a reply in progress | Measured |
 |---|---|---|---|
 | The coordinator dies | The lowest-named live node takes over and adopts the running route | None: replies go straight to the entry worker | Longest pause 0.22 s; new coordinator in 16 s; no weights moved |
-| A stage process crashes | The worker starts a new one in place. The worker is not penalized | Pauses, replays the prompt, carries on | 10 s on CPU with a small model; text identical |
-| A worker process or whole node restarts | The node's services restart, and the coordinator gives it its stage back. Stages elsewhere stay loaded | Pauses, replays, carries on | Back in 25 s with cached shards, same layout, 27B model |
-| A whole node dies | After 30 s away, the coordinator replans on the survivors | Pauses for as long as moving those layers takes | 22 s when survivors had the layers |
+| A stage process crashes | The worker starts a new one in place, which finds its saved states on disk. The worker is not penalized | Pauses, restores, reads only what came after the last saved state, carries on | 2.6 s on CPU with a small model, reading 149 tokens where it used to read 1,414; text identical |
+| A worker process or whole node restarts | The node's services restart, and the coordinator gives it its stage back. Stages elsewhere stay loaded, and the node restores from its own disk | Pauses, restores, carries on | 11 s on CPU with a small model; back in 25 s with cached shards on a 27B model |
+| A whole node dies, and a spare can take its layers | A spare takes those layers and nothing else moves. It fetches the copy of the lost stage's states | Pauses for as long as loading those layers takes, then restores | 23 s on CPU with a small model, reading 149 tokens; text identical |
+| A whole node dies, with no spare | After 30 s away, the coordinator replans on the survivors, and the layers change, so no saved state applies | Pauses for as long as moving those layers takes, and reads the prompt | 36 s on CPU with a small model; 22 s when survivors had the layers |
 | A node blips for under 30 s | Nothing moves | Waits, or replays if a request failed | Not measured on real hardware |
 | A quarantined node recovers | It returns after three healthy checks, more if it keeps failing, and the coordinator takes it back while idle | None | Not measured on real hardware |
 | A model loads or the layout changes | Nodes fetch in the background while the old layout serves. Entry workers let replies finish first. Stages whose job did not change stay loaded | Finishes first, up to 45 s | An unchanged layout re-applies in 3 s |
@@ -114,7 +115,7 @@ On the test pool, cordoning the laptop during a reply with Qwen3.6-27B: the repl
 
 If the network splits, each side elects a coordinator and carries on with the workers it can reach. With two nodes there is no majority to tell which side should stop, so this favors staying up. It cannot corrupt anything: a worker obeys only the highest leadership term it has seen, and stale requests fail its epoch check. When the sides reconnect, the higher term wins and the other coordinator steps down. Keys and revocations made on either side are merged, so neither side loses its changes.
 
-A lost link usually gives no error: packets just stop. A stage that gets no answer gives up after 30 s plus 1 s per token, and each hop waits longer than the one after it, so the right stage takes the blame. A reply waiting on an entry worker ends once that worker stops checking in. Either way the reply replays on what is left.
+A lost link usually gives no error: packets just stop. A stage that gets no answer gives up after 30 s plus 1 s per token, and each hop waits longer than the one after it, so the right stage takes the blame. A reply waiting on an entry worker ends once that worker stops checking in. Either way the reply carries on with what is left, from a saved state if the stages can reach one.
 
 Measured with real processes, a small model that fits on either side, and links that went silent rather than resetting:
 

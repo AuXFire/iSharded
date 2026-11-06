@@ -1688,6 +1688,7 @@ Adapter tests compare every family with the reference `transformers` implementat
 | `isharded/serving.py` | The HTTP server's limits and diagnostics |
 | `isharded/models/` | Each model family's forward pass, for safetensors models, and the GGUF model description |
 | `isharded/gguf.py`, `isharded/gguf_stage.py`, `isharded/llamacpp.py`, `isharded/llama_host.py` | GGUF parsing, stage files, the llama.cpp binding, and the stage process |
+| `isharded/statestore.py`, `isharded/statecopy.py` | Saved prompt states, where prompts are cut, and the copy of each on another node |
 | `isharded/weights.py` | Readers, the unit cache, and hash checks |
 | `isharded/access.py`, `isharded/pool.py`, `isharded/tickets.py`, `isharded/tls.py` | Keys, certificates, signed entries, tickets, and TLS |
 | `isharded/chat.html`, `isharded/dashboard.html`, `isharded/ui.css` | The chat page and the dashboard |
@@ -1720,6 +1721,7 @@ Behavior:
 - The planner uses measured memory bandwidth and a fixed cost per network hop, but not per-layer benchmarks or pairwise network telemetry. Its disk estimate assumes cold reads, so warm runs beat it.
 - Workers on one host split shared RAM evenly during planning, which can refuse a plan an uneven split would allow.
 - There is one active RAM checkpoint service per route, for PyTorch models. Snapshots are not yet replicated or compressed. If the store is behind when a stage fails, recovery replays the prompt.
+- Cutting prompts into the same passes every time has a cost. A long chat of short messages, read with nothing saved, runs as many small passes: 1,770 tokens in 49 messages took 17.6 s where it took 13.5 s before, on CPU. Prompts with few turns cost the same as before. Turns under 64 tokens can also reread up to 64 tokens more than the last turn did.
 - A saved state is only good for the layers it came from. If a node is lost with no spare, the survivors split the layers differently and the prompt is read in full, with or without copies.
 - A different split of the layers can change a near-tie at temperature 0, because rows round to BF16 at each stage boundary. So a reply is the same with the cache on or off for a given split, and not across splits.
 - A reply that recovers from a failure reads the tokens it already generated as prompt rows, which round differently from the first time. So the rest of a recovered reply can differ at a near-tie, with or without the cache.

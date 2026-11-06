@@ -55,7 +55,8 @@ PREFIX = "prefix"
 HISTORY = "history"
 # Rows in one pass. Every stage has to use the same number, as cuts depend on it.
 PASS_ROWS = 512
-# Rows a piece must have. A state costs more to restore than this many rows to read.
+# Rows a piece must have. Lower, and short turns reuse more, but a long chat read with
+# nothing saved runs as more small passes: at 64 that already costs it 30% on CPU.
 CUT_LEAST = 64
 # What an entry worker remembers. Forgetting one only costs a replay.
 INDEX_LIMIT = 4096
