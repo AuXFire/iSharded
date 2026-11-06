@@ -163,3 +163,91 @@ If `assistant.providers` has `register` or `add`, a provider is registered for e
 | Setting | Means |
 |---|---|
 | `SHARDMESH_ASSISTANT_USER` | Who `peer ask` acts as, if the identity part does not name an owner. Default `owner` |
+
+## Skills
+
+Learning improves what the assistant does and can never add to what it may do. `assistant.skills` keeps versioned procedures per user, because a skill grows out of that user's private tasks.
+
+### A version
+
+A skill version holds instructions, required capabilities, applicability rules, stop conditions, and verification tests. Its content is fixed and hashed, so a change behind the store is noticed and refused. Its text is trust `MODEL` until it passes its tests, even if the owner wrote it.
+
+| State | Means |
+|---|---|
+| `candidate` | Waiting to prove itself. It can be evaluated, and can never run for real |
+| `active` | In use. A skill has at most one, enforced by the database |
+| `retired` | Replaced by a newer version. It is what a rollback restores |
+| `rejected` | Turned down, or rolled back. This is final, so a bad version cannot come back |
+
+**Applicability** has `task_types`, `all_of`, `any_of`, and `none_of`, matched mechanically against a task. It is never empty: with no rules given, a skill applies only to its own task type.
+
+**Stop conditions** are `max_steps` (default 8, at most 50), `max_seconds` (default 300), and `stop_phrases`.
+
+**A verification test** is `{"name": ..., "input": ..., "checks": [...]}`. Each check has a `kind` and a `value`:
+
+| Kind | Passes when |
+|---|---|
+| `contains`, `not_contains` | The answer has, or lacks, the text, ignoring case |
+| `equals`, `starts_with` | The answer matches, ignoring surrounding space |
+| `min_length`, `max_length` | The answer is at least, or at most, that long |
+| `json_field` | The answer is JSON and `path` (such as `a.b.0`) equals `value` |
+| `calls`, `not_calls` | The model did, or did not, ask for that capability |
+
+There are no regular expressions, because a model writes these tests and a bad pattern could hang this process.
+
+### How a skill is learned
+
+`reflect(task_id)` needs a finished task, and records what worked, what failed, and what needed a person. Reflecting twice counts once.
+
+From a success it can draft a candidate. The `worker` role writes it, and the `verification` role reviews it, or `planning` if that is down. A review can turn a draft down, but cannot approve anything. The capabilities come from what the task actually used, whatever the draft says.
+
+It reads these keys from `tasks.status(task_id)`, and tolerates others: `state` or `status`, `user`, `task_type`, `type`, or `kind`, `goal`, `title`, or `summary`, `error`, `tainted`, and `steps`, each with `name`, `title`, or `id`, `state` or `status`, `capability`, `error`, `tainted`, and `approval_id` or `needs_person`. A task that does not say `tainted: false` counts as tainted.
+
+### How a candidate proves itself
+
+`evaluate(version)` runs the candidate and the active version on the same cases, at temperature 0, and checks the answers mechanically.
+
+- The cases are the candidate's tests plus the active version's, so a candidate cannot drop a test it would fail.
+- It is eligible only if all its own tests pass, and no case passes on the active version and fails on the candidate.
+- A test that accepts an empty answer or a nonsense one proves nothing, and counts against it.
+- Tools are declared to the model and never run, so evaluating has no effect on anything. `calls` checks see what it asked for.
+- If no model answers, nothing is recorded, since that says nothing about the skill.
+
+Passing all its tests makes the text trust `VERIFIED`. Failing later takes that away.
+
+`promote` needs the owner. It holds only for the exact version and active version that were compared, so if the active version has changed, evaluate again. There is deliberately no capability for promoting a skill, so no model, task, or peer can reach it.
+
+With `SHARDMESH_ASSISTANT_SKILL_AUTO_PROMOTE` on, an eligible candidate promotes itself only if every capability it needs is declared and read-only, and it did not come from a tainted task. A capability nobody declared counts as consequential. A skill cannot use this to hide what it does, as it can only call what it declared.
+
+### In use
+
+`execute(name, text, user)` runs the active version under the actor `skill:<id>` for that user.
+
+- It can call only what it declared, even if the user has granted more.
+- Each call goes to the broker, so a capability the user never granted fails there.
+- What a tool returned taints the rest of the run, so a consequential step after it needs a person.
+
+Each run is counted, or reported with `record_run(version, ok)`. Once a new version has 10 runs, and its predecessor at least 3, it is rolled back by itself if its success rate is more than 0.1 lower. The reason is kept with the version and in the audit record. A run waiting on a person, or a model outage, does not count. With no baseline for its predecessor there is no verdict, so check `skill show`.
+
+`relevant(user, text, task_type)` returns active skills as `ContextItem`s, source `skill`, with their trust, at reach `POOL`. `gaps(user)` reports repeated failures by task type over 30 days: a type shows after two failures, with recent reasons, how often it needed a person, and whether a skill exists.
+
+### Commands
+
+`skill` takes `--user U` before the subcommand, for another user's skills. A version is `name@number` or its id.
+
+| Command | Does |
+|---|---|
+| `skill list` | Every version, with state and trust |
+| `skill show VERSION` | Its text, rules, tests, review, reason, success rate, and last evaluation |
+| `skill evaluate VERSION` | Evaluates a candidate. Exits 1 if it cannot be promoted |
+| `skill promote VERSION` | Puts an eligible candidate into use |
+| `skill reject VERSION [--reason R]` | Turns a version down for good. On an active version with a predecessor, this is a rollback |
+| `skill rollback NAME [--reason R]` | Restores the previous version |
+| `skill gaps` | Repeated failures by task type |
+| `skill reflect TASK [--no-draft]` | Records a finished task. `--no-draft` skips drafting a skill |
+
+### Settings
+
+| Setting | Means |
+|---|---|
+| `SHARDMESH_ASSISTANT_SKILL_AUTO_PROMOTE` | `1`, `true`, `yes`, or `on` allows automatic promotion as above. Off by default |
