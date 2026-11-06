@@ -40,6 +40,7 @@ from .inventory import ram
 from .node import add_node_arguments, detect_address, run_node
 from .tls import OWN_ADDRESS, stay_on_this_machine
 from .pool import _private_link, _write_private, add_node, approve_membership, home as pool_home, init_pool, request_membership, sign_entry
+from .statements import VERIFIER_LENGTH, key_verifier
 
 DEFAULT_PORT = 8209
 INVITE_PREFIX = "isi-"
@@ -104,8 +105,20 @@ def make_owner(home: Path, name: str, address: str) -> None:
     add_node(str(home), name, [address, "127.0.0.1"])
     key = "isk-" + secrets.token_urlsafe(32)
     _write_private(home / "admin.key", key.encode())
-    signed = sign_entry(str(home), {"type": "key", "name": "owner", "role": "admin", "sha256": digest(key), "requests_per_minute": 0})
+    signed = sign_entry(str(home), {"type": "key", "name": "owner", "role": "admin", "sha256": digest(key), "requests_per_minute": 0, "verifier": key_verifier(key)})
     (home / "access.json").write_text(json.dumps({"version": 1, "keys": [], "signed": [signed]}), encoding="utf-8")
+
+
+def give_owner_a_verifier(home: Path, client: httpx.Client, base: str, key: str) -> None:
+    """A mesh made before verifiers has an owner key that only commands the node it is
+    given to. The owner's machine holds that key and the authority, so it can fix this.
+    """
+    document = json.loads((home / "access.json").read_text(encoding="utf-8"))
+    entries = [held["entry"] for held in document.get("signed", [])]
+    mine = [entry for entry in entries if entry.get("type") == "key" and entry.get("sha256") == digest(key)]
+    if mine and not any(entry.get("verifier") for entry in mine):
+        kept = {field: mine[0][field] for field in ("type", "name", "role", "sha256", "requests_per_minute") if field in mine[0]}
+        client.post(base + "/access/entries", json=sign_entry(str(home), {**kept, "verifier": key_verifier(key)}))
 
 
 def authority_hash(pem: str) -> str:
@@ -145,16 +158,20 @@ def read_invite(code: str) -> dict[str, Any]:
         raise ValueError("this invite is damaged; copy the whole code") from exc
 
 
-def invite_proof(secret: str, request: str, key_hash: str) -> str:
-    """Ties the secret to one request, so seeing a proof pass by lets nobody reuse it."""
-    return hmac.new(secret.encode(), f"{request}\n{key_hash}".encode(), hashlib.sha256).hexdigest()
+def invite_proof(secret: str, request: str, key_hash: str, verifier: str = "") -> str:
+    """Ties the secret to one request, so seeing a proof pass by lets nobody reuse it.
+
+    A machine running older code sends no verifier, and its proof still has to pass.
+    """
+    message = f"{request}\n{key_hash}\n{verifier}" if verifier else f"{request}\n{key_hash}"
+    return hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
 
 
 def matching_invite(invites: list[dict[str, Any]], item: dict[str, Any], clock: Any = time.time) -> dict[str, Any] | None:
     for invite in invites:
         if invite["uses"] < 1 or invite["expires_at"] <= clock():
             continue
-        expected = invite_proof(invite["secret"], str(item.get("request", "")), str(item.get("key_sha256", "")))
+        expected = invite_proof(invite["secret"], str(item.get("request", "")), str(item.get("key_sha256", "")), str(item.get("key_verifier", "")))
         if hmac.compare_digest(expected, str(item.get("proof", ""))):
             return invite
     return None
@@ -192,6 +209,9 @@ def approve_invited(home: Path, client: httpx.Client, base: str, key: str, clock
         key_hash = str(item.get("key_sha256", ""))
         if re.fullmatch(r"[0-9a-f]{64}", key_hash):
             entry = {"type": "key", "name": f"{name}-user", "role": "user", "sha256": key_hash, "requests_per_minute": 0}
+            verifier = str(item.get("key_verifier", ""))
+            if re.fullmatch(rf"[A-Za-z0-9_-]{{{VERIFIER_LENGTH}}}", verifier):
+                entry["verifier"] = verifier
             client.post(base + "/access/entries", json=sign_entry(str(home), entry))
         if invite is not None:
             invite["uses"] -= 1
@@ -238,6 +258,16 @@ def certificate_matches_key(certificate: str, key_file: Path) -> bool:
     return public.public_bytes(*raw) == private.public_key().public_bytes(*raw)
 
 
+def ask_to_join(client: httpx.Client, url: str, asking: dict[str, str], deadline: float) -> httpx.Response:
+    """Machines behind one address share its limit, so a batch of them takes turns."""
+    while True:
+        answer = client.post(url + "/join/requests", json=asking)
+        wait = float(answer.headers.get("Retry-After", 30))
+        if answer.status_code != 429 or time.monotonic() + wait > deadline:
+            return answer
+        time.sleep(wait)
+
+
 def join_mesh(home: Path, invite: dict[str, Any], name: str, address: str) -> str:
     """Ask for a place in the mesh, with an invite's secret or for a person to approve.
 
@@ -249,13 +279,13 @@ def join_mesh(home: Path, invite: dict[str, Any], name: str, address: str) -> st
     verify: Any = str(home / "ca.pem") if url.startswith("https") else True
     key = "isk-" + secrets.token_urlsafe(32)
     request = request_membership(str(home), name, [address, "127.0.0.1"])
-    key_hash = digest(key)
+    key_hash, verifier = digest(key), key_verifier(key)
     secret = invite.get("secret")
-    asking = {"request": request, "key_sha256": key_hash}
+    asking = {"request": request, "key_sha256": key_hash, "key_verifier": verifier}
     if secret:
-        asking["proof"] = invite_proof(secret, request, key_hash)
+        asking["proof"] = invite_proof(secret, request, key_hash, verifier)
     with httpx.Client(event_hooks={"request": [stay_on_this_machine]}, timeout=30.0, trust_env=False, verify=verify) as client:
-        answer = client.post(url + "/join/requests", json=asking)
+        answer = ask_to_join(client, url, asking, time.monotonic() + APPROVAL_WAIT_SECONDS)
         if answer.status_code != 200:
             raise ValueError(answer.text[:200])
         state = answer.json().get("status")
@@ -408,6 +438,10 @@ def keep_watch(home: Path, settings: dict[str, Any], args: argparse.Namespace) -
             threading.Thread(target=load_first_model, args=(settings, home, key, args.model), daemon=True).start()
         if settings.get("ownerless") or not (home / "ca.key").is_file():
             return
+        try:
+            give_owner_a_verifier(home, client, base, key or "")
+        except (httpx.HTTPError, OSError, ValueError) as exc:
+            print(f"Could not update the owner's key: {exc}", flush=True)
         while True:
             time.sleep(APPROVAL_SECONDS)
             try:

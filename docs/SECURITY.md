@@ -25,7 +25,7 @@ This suits a pool whose members trust each other. It is not a public mesh. A pub
 
 ## Finding a mesh
 
-A mesh started with `isharded up` answers a UDP broadcast on port 8208, and serves its public certificate at `/join/authority`, so anyone on the network can learn that it exists, its name, and its address. `--no-discovery` turns the broadcast off.
+A mesh started with `isharded up` answers a UDP broadcast on port 8208 with a node's name, its address, and a hash of the authority, so anyone on the network can learn that it exists. `--no-discovery` turns the broadcast off. Every node also serves the public certificate at `/join/authority`, which says nothing else.
 
 An answer proves nothing, and anyone can send one. A machine that finds a mesh only asks to join. A person on the owner's side approves it after comparing the key fingerprint both machines show, so nothing gets in by being found. Going the other way, a rogue answer can lure a new machine to ask a stranger, so a new machine shows the authority's hash and asks you before it does. `--find` skips that question, so use it only on a network you trust.
 
@@ -60,6 +60,39 @@ A node starts refusing to serve a network if it would be exposed:
 
 - With no credentials, it will not listen beyond loopback. Run `isharded pool init`, or pass `--open` if the network itself is the protection.
 - With credentials but no encryption, it will not advertise an ordinary LAN address, because every gossip round carries the pool token. Use TLS or a Tailscale address, or pass `--trusted-network` if nobody else can read that network.
+
+## When one node passes a request to another
+
+Any node takes any request, but some have to run elsewhere: management runs on the coordinator, and a model in a lane runs in that lane. In a pool with an authority, a person's key never goes with the request, because anyone can claim to coordinate. The next node still has to know who asked.
+
+A node's certificate cannot say, because every member holds one. A key's hash cannot say either, because every member holds the list of hashes. So each key also has a verifier: the public half of an Ed25519 key pair derived from the key. It sits beside the hash in the signed key entry, and it reveals nothing about the key.
+
+The node holding the key uses it to sign a short statement of what was asked, and the receiving node checks that against the verifier. The name and role then come from the key entry. Nothing in a request can set a role, so a node can only claim what it can prove. A member who sends a role in a header gets a 401.
+
+A statement covers the method, the path and query, a hash of the body, the node sending it, the control plane it is for, the time, and a nonce. It is refused, and the reply says why, if:
+
+- It was not signed with that key, or the key has been removed.
+- It names another control plane. A node and each of its lanes count as different ones.
+- It comes from a node other than the one that made it, or that node has been revoked.
+- It does not match the request it came with.
+- It is over 90 seconds old, or over a minute ahead. Clocks must agree to within a minute, as for tickets.
+- It has been used before on this control plane.
+
+Every node has to run the same code for this. A forward between nodes on either side of this change is refused, and direct use of a key still works on any node.
+
+### Lanes
+
+A node that was reached through a forward has no key to sign with, and may need to send the request on to a lane. It sends the statement it was given. A lane accepts such a statement only from the node it was addressed to, for the same method and path, for up to five minutes, because a lane's workers can take two minutes to start before a load can be sent. It cannot check the body or query, because the front door rewrites them.
+
+So a node that receives a statement could use it on a lane, once for each lane, with a body of its own. That is the same person asking for the same action, and only in a lane. A front door that does hold the key signs a new statement for the lane instead, which is held to every rule above. If a load has to wait for a lane's workers, the node keeps the key in memory until the load is sent.
+
+A new lane starts with an empty access list and cannot check anyone, so its front door keeps sending the list until the lane reports holding it. Keys from a file reach the lanes on the node that reads the file, and go no further.
+
+### Keys made before verifiers
+
+A key with no verifier cannot prove anything, so through a forward it acts only as `user`, under its own name. It still works in full directly on any node that holds it. Any member could claim such a key, which gets them no more than `user`.
+
+An `isharded up` owner key fixes itself: the owner's machine holds the key and the authority, so it signs a new entry the next time it starts. A key on a machine that joined with an invite only ever needed `user`. For any other admin key, make a new one with `isharded key create`, under a new name, and remove the old one.
 
 ## Setting up a pool
 
@@ -120,7 +153,13 @@ isharded pool approve node-c --dir pool-secrets --url http://10.0.0.5:8209 --tok
 isharded pool deny node-c --dir pool-secrets --url http://10.0.0.5:8209 --token <admin key>
 ```
 
-Asking grants nothing. An approved node collects its certificate from any member and starts with `--ca-file`, `--identity-cert`, and `--identity-key`. A denied key stays denied, and a revoked name cannot ask again. Up to 64 requests wait at once. Check `ca.pem` against the owner's copy before trusting it, because the node that hands it over could be lying.
+Asking grants nothing. An approved node collects its certificate from any member and starts with `--ca-file`, `--identity-cert`, and `--identity-key`. A denied key stays denied, and a revoked name cannot ask again. Check `ca.pem` against the owner's copy before trusting it, because the node that hands it over could be lying.
+
+Anyone can ask, so asking is limited:
+
+- Up to 64 requests wait at once. A request nobody answers is dropped after 30 minutes, or after 5 minutes if it carries an invite's proof, because a machine with an invite stops waiting after 3 minutes and the owner's machine answers one in seconds. `--wait` asks again every 10 minutes, so it can wait as long as it needs.
+- One address can ask 10 times at once, then once a minute, on each node. That counts refused requests too. The rest get a 429 that says when to return, and `isharded up` waits and tries again.
+- When the queue is full, a request with an invite's proof takes the place of the oldest request without one. Only the owner's machine can check a proof, so a false one passes this point, but it lasts minutes rather than half an hour. Someone waiting on a person may have to ask again during a flood.
 
 ## Managing keys and nodes
 
@@ -138,9 +177,9 @@ isharded key remove alice --dir pool-secrets --url http://10.0.0.5:8209
 isharded pool revoke node-b --dir pool-secrets --url http://10.0.0.5:8209
 ```
 
-A key is shown once and stored as a SHA-256 hash. `/admin/keys` and `/admin/nodes/{name}/revoke` refuse these changes in such a pool, and say to use these commands.
+A key is shown once, and stored as a SHA-256 hash and a [verifier](#when-one-node-passes-a-request-to-another). `/admin/keys` and `/admin/nodes/{name}/revoke` refuse these changes in such a pool, and say to use these commands.
 
-Without a pool authority, an admin key or the pool token changes these through any node: `POST /admin/keys`, `DELETE /admin/keys/{name}`, `POST /admin/nodes/{name}/revoke`. To seed a key before a pool starts, in either kind of pool, use `isharded key create root --role admin --file access.json`, and give each node the file with `--keys-file`. A key file is trusted by the node that reads it, and nothing else.
+Without a pool authority, an admin key or the pool token changes these through any node: `POST /admin/keys`, `DELETE /admin/keys/{name}`, `POST /admin/nodes/{name}/revoke`. To seed a key before a pool starts, in either kind of pool, use `isharded key create root --role admin --file access.json`, and give each node the file with `--keys-file`. A key file is trusted by the node that reads it, and nothing else, so in a pool with an authority such a key works through a forward only if the receiving node holds the same file.
 
 Revocation stops every node accepting that certificate, takes its workers out of the route, and stops gossip with it. A revoked name cannot register new workers.
 
@@ -156,11 +195,19 @@ Revocation is permanent for that name, and so is removing a key. Both are kept f
 
 Certificates need the address each node advertises in their subject alternative names.
 
+A node with TLS speaks TLS 1.3, and TLS 1.2 at the lowest, and only with ciphers that have forward secrecy and authenticated encryption. Something in between, such as antivirus, can still make a connection look like TLS 1.2.
+
 Antivirus web shields can intercept TLS even on loopback, replacing the node's certificate with their own. AVG does this on the development laptop, which is why the TLS tests skip there. On such a machine, exclude the pool's ports from inspection, or connections will fail verification.
 
 ## Limits
 
 Requests above 16 MiB are refused from their headers before any of the body is read, and bodies must declare a length. Stage traffic may reach 1 GiB, and only `/internal/forward` and the bandwidth probe accept that much.
+
+The two routes that take a body with no credentials, `POST /join/requests` and `POST /access/entries`, take 16 KiB. Every real request fits in a few. An entry that is badly signed, or that changes nothing, counts against the sender's address: 20 at once, then 6 a minute. A good entry is never limited, so strangers cannot lock out the owner.
+
+A node drops a client that stops sending partway through a request, or sends less than 1 KiB in 30 seconds. An idle connection closes after 15 seconds. Neither touches a request that has fully arrived, so a reply can stream for as long as it needs, and a stage's large body is safe while it keeps moving. A node holds 2048 connections, then answers 503, which `ISHARDED_MAX_CONNECTIONS` changes.
+
+The pages that describe the API, `/docs`, `/redoc`, and `/openapi.json`, are off. `/ready` says only whether a node can serve.
 
 A request whose content a stage cannot process fails with an error and costs nobody their place in the route. Only losing contact with a stage can quarantine it, so a user cannot empty the pool one request at a time.
 
@@ -168,7 +215,7 @@ Peers name model sources, so a worker in a secured pool only loads local models 
 
 ## Audit log
 
-Each node records who loaded models, changed the pool, and asked for replies: time, node, caller, path, status, and client address. It never records prompts or replies. Every node that handles a request records it, so a forwarded request appears twice, and you need the files from every node for the full picture.
+Each node records who loaded models, changed the pool, and asked for replies: time, node, caller, path, status, and client address. It never records prompts or replies. Every node that handles a request records it, so a forwarded request appears twice, and you need the files from every node for the full picture. A forwarded request shows the caller the node proved, such as `admin:alice via node-b`, and `unknown` if it proved nothing.
 
 ## Models
 
@@ -190,10 +237,14 @@ Every node then checks every unit against that list, whether it came from a peer
 
 ## Reviews and known gaps
 
-The code has had two security reviews, both by an AI model reading the source. The first found one critical and five high findings, and the second, of the signing, ticket, hashing, and merging code added after it, found four high. Those and most medium and low findings are fixed, with regression tests in `tests/test_security.py`. No human has reviewed or penetration tested it, and reviews like these do not show the code is free of other flaws.
+The code has had three security reviews, all by an AI model. The first read the source and found one critical and five high findings. The second, of the signing, ticket, hashing, and merging code added after it, found four high. The third tried a live mesh, and found that a member could claim the admin role with a header, because a node's word was taken for who it was acting for. That is what statements now prove. Those and most medium and low findings are fixed, with regression tests in `tests/test_security.py`. No human has reviewed or penetration tested it, and reviews like these do not show the code is free of other flaws.
 
 - A node in the route sees prompts and can return wrong results. Nothing detects it reading them. Comparing routes with `isharded audit` catches a route that disagrees with others, but not one that behaves whenever it might be watched. Certificates limit who is in the pool. They do not make a hostile member safe.
-- An unrevoked node can still claim leadership, publish a route, or cordon nodes through gossip, and a node that holds a verified identity can act for a caller it claims to have checked. It cannot add keys, revoke peers, or learn anyone's key, because in a pool with an authority a key never leaves the node it was given to.
+- An unrevoked node can still claim leadership, publish a route, or cordon nodes through gossip. It cannot add keys, revoke peers, claim a role, or learn anyone's key, because in a pool with an authority a key never leaves the node it was given to.
+- A node a person gives their key to can do anything that key can. A coordinator handed a statement can use it once on each lane. Any member can act as `user` under the name of a key made before verifiers.
+- A control plane forgets the statements it has seen when it restarts, so one read off the link could work again for the rest of its 90 seconds.
+- In a network nobody owns, keys never travel, so nothing can be proven and a forwarded caller counts as a member or user of the node that passed it on.
+- Enough addresses can still fill the join queue, and keep requests that carry false proofs in it. Enough connections can still hold a node at its limit, by reconnecting as each is dropped. The limits raise the cost, and do not remove it.
 - Tickets can be replayed for up to two minutes by anyone who can read the link, which is why they need a private one.
 - The hash list covers weights and the model's description, not the tokenizer or chat template, and it reaches workers through the coordinator, so a dishonest coordinator could leave it out.
 - If a node stops answering, the chat page asks before sending your key and conversation to another member, because members declare their own addresses.

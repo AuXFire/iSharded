@@ -771,7 +771,7 @@ Hashes a model on a copy you trust, for `load --hashes`. It reads the whole mode
 
 ### isharded key
 
-`key create NAME` makes an API key and shows it once. `key remove NAME` removes one for good, and needs the authority.
+`key create NAME` makes an API key and shows it once. `key remove NAME` removes one for good, and needs the authority. An admin key made before this version acts only as `user` when another node passes its requests on, so [make a new one](docs/SECURITY.md#keys-made-before-verifiers) if you use it through more than one node.
 
 | Option | Applies to | Default | What it does |
 |---|---|---|---|
@@ -900,6 +900,7 @@ A flag takes priority over its variable.
 | `ISHARDED_HOST_ID` | Which physical machine a worker is on. Defaults to the computer name, so workers sharing a host do not count its RAM twice |
 | `ISHARDED_FETCH_CONCURRENCY` | Units a worker fetches at once. Default 4 |
 | `ISHARDED_ACCESS_LOG` | Set to `1` to log every request while debugging. Off by default, because nodes poll each other constantly |
+| `ISHARDED_MAX_CONNECTIONS` | Connections one process holds before it answers 503. Default 2048. Raise it for a pool of many nodes |
 | `ISHARDED_INSTALL_DIR`, `ISHARDED_SOURCE` | For the install scripts only: where to install, and the package to install in place of the one on GitHub |
 | `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` | Hugging Face token, for gated models. Needed on each worker |
 | `HF_ENDPOINT` | Another Hugging Face address, such as a mirror |
@@ -908,7 +909,7 @@ A worker's launcher also passes some flags through `ISHARDED_WEIGHTS_RAM_GB`, `I
 
 ## HTTP API
 
-Send `Authorization: Bearer KEY`, except where it says none. Requests are limited to 16 MiB. Each node serves all of this, and passes `/admin` requests to the coordinator for you.
+Send `Authorization: Bearer KEY`, except where it says none. Requests are limited to 16 MiB, or 16 KiB on routes that take a body with no credentials, which are also limited per address and answer 429 with `Retry-After`. Each node serves all of this, and passes `/admin` requests to the coordinator for you. In a pool with an authority your key stays on the node you gave it to, and that node [signs a statement](docs/SECURITY.md#when-one-node-passes-a-request-to-another) saying you asked. There is no `/docs` or `/openapi.json`, so this table is the reference.
 
 ### Endpoints
 
@@ -1453,6 +1454,8 @@ Who can do what:
 | User | API key, role `user` | Chat, completions, read status |
 | Owner | The authority's private key | Add, remove, and revoke, in a pool with an authority |
 
+A node cannot pass on a role it cannot prove. When one node hands a request to another, it sends a statement signed with the person's key, and the other node takes the name and role from the signed key list. The key itself stays where it was given.
+
 Antivirus that scans HTTPS replaces certificates, which ends mutual TLS. Nodes refuse to trust it, so the failure is safe, and a node reports it plainly. Use Tailscale with tickets, which need no TLS at all, or exclude the pool's ports from scanning.
 
 ## Checking answers
@@ -1643,7 +1646,7 @@ Adapter tests compare every family with the reference `transformers` implementat
 | `isharded/models/` | Each model family's forward pass, for safetensors models, and the GGUF model description |
 | `isharded/gguf.py`, `isharded/gguf_stage.py`, `isharded/llamacpp.py`, `isharded/llama_host.py` | GGUF parsing, stage files, the llama.cpp binding, and the stage process |
 | `isharded/weights.py` | Readers, the unit cache, and hash checks |
-| `isharded/access.py`, `isharded/pool.py`, `isharded/tickets.py`, `isharded/tls.py` | Keys, certificates, signed entries, tickets, and TLS |
+| `isharded/access.py`, `isharded/pool.py`, `isharded/tickets.py`, `isharded/tls.py`, `isharded/statements.py` | Keys, certificates, signed entries, tickets, TLS, and proving who asked when a request is passed on |
 | `isharded/chat.html`, `isharded/dashboard.html`, `isharded/ui.css` | The chat page and the dashboard |
 | `isharded/assistant/` | The assistant. [Its guide](docs/ASSISTANT.md) says which part does what |
 

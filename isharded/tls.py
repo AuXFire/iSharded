@@ -18,8 +18,12 @@ from typing import Any
 
 # The verified node name on the connection serving this request, if any.
 PEER: ContextVar[str | None] = ContextVar("isharded_peer", default=None)
-# Who a verified node says it is passing a request on for: (name, role).
+# Who a request is proven to come from, when a node passed it on: (name, role).
 BEHALF: ContextVar[tuple[str, str] | None] = ContextVar("isharded_behalf", default=None)
+# The key a person gave this node, for as long as their request lasts here.
+KEY_HELD: ContextVar[str | None] = ContextVar("isharded_key_held", default=None)
+# The statement that proved BEHALF, when the person's key stayed on another node.
+STATEMENT: ContextVar[str | None] = ContextVar("isharded_statement", default=None)
 FORWARD_MARK = "x-isharded-forwarded"
 BEHALF_HEADER = "x-isharded-on-behalf"
 
@@ -69,6 +73,12 @@ def client_verify() -> Any:
     return context
 
 
+# Uvicorn's default, "TLSv1", leaves TLS 1.2 with old CBC ciphers and anonymous ones, and
+# nothing a current Python client offers. These have forward secrecy and authenticated
+# encryption. TLS 1.3 has its own list, so this leaves it alone.
+SERVER_CIPHERS = "ECDHE+AESGCM:ECDHE+CHACHA20"
+
+
 def server_options() -> dict[str, Any]:
     certificate = os.getenv("ISHARDED_TLS_CERT")
     key = os.getenv("ISHARDED_TLS_KEY")
@@ -76,7 +86,7 @@ def server_options() -> dict[str, Any]:
         raise ValueError("TLS needs both a certificate and a key")
     if not certificate:
         return {}
-    options: dict[str, Any] = {"ssl_certfile": certificate, "ssl_keyfile": key}
+    options: dict[str, Any] = {"ssl_certfile": certificate, "ssl_keyfile": key, "ssl_ciphers": SERVER_CIPHERS}
     authority = os.getenv("ISHARDED_CA_FILE")
     if authority:
         options["ssl_ca_certs"] = authority

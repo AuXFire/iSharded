@@ -48,7 +48,11 @@ MAX_JOIN_REQUESTS = 64
 MAX_SIGNED_ENTRIES = 8192
 # What an invited node adds to its request. They grant nothing: the owner's machine
 # checks the proof against an invite it made, over this exact request.
-INVITE_FIELDS = ("proof", "key_sha256")
+INVITE_FIELDS = ("proof", "key_sha256", "key_verifier")
+# Nobody is listening for a request after these. A machine with an invite gives up in
+# three minutes, and the owner's machine answers one in seconds. A person takes longer.
+INVITED_REQUEST_SECONDS = 300
+JOIN_REQUEST_SECONDS = 1800
 
 
 def node_of(worker_id: str) -> str:
@@ -112,6 +116,9 @@ class Caller:
     requests_per_minute: int = 0
     tokens: float = 0.0
     refilled_at: float | None = None
+    # The public half of a key pair derived from the key, so that it can prove itself
+    # to nodes it never reached. Empty on keys made before there were any.
+    verifier: str = ""
 
 
 @dataclass
@@ -139,6 +146,8 @@ class AccessControl:
     # Certificates the owner issued, for new members to collect.
     certificates: dict[str, str] = field(default_factory=dict)
     denied: set[str] = field(default_factory=set)
+    # Join requests travel between machines, so their age has to mean the same on each.
+    wall_clock: Callable[[], float] = time.time
 
     @classmethod
     def load(
@@ -163,6 +172,11 @@ class AccessControl:
     def ownerless(self) -> bool:
         return bool(getattr(self.authority, "ownerless", False))
 
+    @property
+    def entries_held(self) -> int:
+        """How much of the access list is here, so a lane that is behind can be told."""
+        return len(self.keys) + len(self.signed)
+
     def _tell_authority(self) -> None:
         saved = getattr(self.authority, "saved", None)
         if saved:
@@ -175,7 +189,7 @@ class AccessControl:
             if role not in {ROLE_USER, ROLE_ADMIN}:
                 raise ValueError(f"key {item.get('name')!r} has unknown role {role!r}")
             held = self.keys.get(item["sha256"])
-            caller = Caller(item["name"], role, int(item.get("requests_per_minute", 0)))
+            caller = Caller(item["name"], role, int(item.get("requests_per_minute", 0)), verifier=str(item.get("verifier", "")))
             if held is not None:  # an allowance survives an unrelated change
                 caller.tokens, caller.refilled_at = held.tokens, held.refilled_at
             keys[item["sha256"]] = caller
@@ -187,9 +201,10 @@ class AccessControl:
 
     def document(self) -> dict[str, Any]:
         keys = [
-            {"name": caller.name, "role": caller.role, "sha256": hashed, "requests_per_minute": caller.requests_per_minute}
+            {"name": caller.name, "role": caller.role, "sha256": hashed, "requests_per_minute": caller.requests_per_minute, **({"verifier": caller.verifier} if caller.verifier else {})}
             for hashed, caller in sorted(self.keys.items())
         ]
+        self.expire_join_requests()
         return {
             "version": self.version,
             "keys": keys,
@@ -210,7 +225,8 @@ class AccessControl:
                 details = read_membership_request(held["request"])
             except (ImportError, ValueError):
                 continue  # each node checks for itself, since gossip proves nothing
-            self.add_join_request(details, held["request"], {key: held[key] for key in INVITE_FIELDS if isinstance(held.get(key), str)})
+            invite = {key: held[key] for key in INVITE_FIELDS if isinstance(held.get(key), str)}
+            self.add_join_request(details, held["request"], invite, held.get("asked_at"))
 
     def _take_signed(self, document: dict[str, Any]) -> bool:
         """Apply new signed entries from a document. Anything unsigned is ignored."""
@@ -237,7 +253,10 @@ class AccessControl:
         kind, name = entry.get("type"), str(entry.get("name", ""))
         if kind == "key" and entry.get("role") in {ROLE_USER, ROLE_ADMIN} and isinstance(entry.get("sha256"), str):
             if name not in self.removed_names:
-                self.keys[entry["sha256"]] = Caller(name, entry["role"], int(entry.get("requests_per_minute", 0)))
+                # Entries come back in no fixed order, so a key never loses its verifier.
+                held = self.keys.get(entry["sha256"])
+                verifier = str(entry.get("verifier") or (held.verifier if held else ""))
+                self.keys[entry["sha256"]] = Caller(name, entry["role"], int(entry.get("requests_per_minute", 0)), verifier=verifier)
             return True
         if kind == "vouch" and name:
             return True  # the commons works out what vouches add up to
@@ -264,16 +283,56 @@ class AccessControl:
             return True
         return False
 
-    def add_join_request(self, details: dict[str, Any], request: str, invite: dict[str, str] | None = None) -> str:
-        """Hold a request for the owner. Says what happened, for whoever asked."""
+    def expire_join_requests(self) -> None:
+        """Drop requests nobody is waiting on. Any stranger can make one, so none lasts."""
+        now = self.wall_clock()
+        for name, held in list(self.join_requests.items()):
+            lifetime = INVITED_REQUEST_SECONDS if held.get("proof") else JOIN_REQUEST_SECONDS
+            if now - float(held.get("asked_at", now)) >= lifetime:
+                del self.join_requests[name]
+
+    def _room_for(self, invite: dict[str, str] | None) -> bool:
+        """Whether the queue can take one more, making room for an invite if it must.
+
+        Only the owner's machine can check a proof, so a stranger can send a false one.
+        But such a request lasts minutes, so holding the queue with them takes far more
+        asking. So an invite gets through while strangers fill the queue, and someone
+        waiting on a person may have to ask again.
+        """
+        if len(self.join_requests) < MAX_JOIN_REQUESTS:
+            return True
+        waiting = [name for name, held in self.join_requests.items() if not held.get("proof")]
+        if not waiting or not (invite and invite.get("proof")):
+            return False
+        del self.join_requests[min(waiting, key=lambda name: float(self.join_requests[name].get("asked_at", 0)))]
+        return True
+
+    def add_join_request(self, details: dict[str, Any], request: str, invite: dict[str, str] | None = None, asked_at: Any = None) -> str:
+        """Hold a request for the owner. Says what happened, for whoever asked.
+
+        ``asked_at`` comes with a request heard through gossip. It travels with the
+        request so that nodes cannot keep handing an expired one back to each other.
+        """
         name = details["name"]
         if name in self.revoked or details["fingerprint"] in self.denied:
             return "refused"
         if name in self.certificates:
             return "approved"
-        if name not in self.join_requests and len(self.join_requests) >= MAX_JOIN_REQUESTS:
+        self.expire_join_requests()
+        now = self.wall_clock()
+        try:
+            asked = min(float(asked_at), now) if asked_at is not None else now
+        except (TypeError, ValueError):
+            asked = now
+        held = self.join_requests.get(name)
+        if held is not None and float(held.get("asked_at", 0)) > asked:
+            return "waiting"  # the newest ask wins, on every node alike
+        lifetime = INVITED_REQUEST_SECONDS if invite and invite.get("proof") else JOIN_REQUEST_SECONDS
+        if not now - asked < lifetime:  # a NaN lands here too
+            return "expired"
+        if held is None and not self._room_for(invite):
             return "busy"
-        self.join_requests[name] = {**details, "request": request, **(invite or {})}
+        self.join_requests[name] = {**details, "request": request, **(invite or {}), "asked_at": asked}
         return "waiting"
 
     def add_signed(self, signed: Any) -> bool:
@@ -301,6 +360,17 @@ class AccessControl:
         if changed:
             self._save()
         return changed
+
+    def take_node_keys(self, document: dict[str, Any]) -> None:
+        """For a lane, from the front door beside it.
+
+        A key from a file stops at the node that reads it. A lane is that same node, and
+        it must hold such a key to check a statement made with it.
+        """
+        for item in document.get("keys", []):
+            hashed, name, role = str(item.get("sha256")), str(item.get("name", "")), item.get("role")
+            if hashed not in self.keys and hashed not in self.removed and name not in self.removed_names and role in {ROLE_USER, ROLE_ADMIN}:
+                self.keys[hashed] = Caller(name, role, int(item.get("requests_per_minute", 0)), verifier=str(item.get("verifier", "")))
 
     def _rank(self, document: dict[str, Any]) -> tuple[int, str]:
         # Two sides of a split can reach one version. Any fixed rule settles it.
@@ -359,8 +429,10 @@ class AccessControl:
             raise ValueError(f"role must be {ROLE_USER} or {ROLE_ADMIN}")
         if any(caller.name == name for caller in self.keys.values()):
             raise ValueError(f"a key named {name!r} already exists")
+        from .statements import key_verifier
+
         key = "isk-" + secrets.token_urlsafe(32)
-        self.keys[digest(key)] = Caller(name, role, requests_per_minute)
+        self.keys[digest(key)] = Caller(name, role, requests_per_minute, verifier=key_verifier(key))
         self._changed()
         return key
 
@@ -398,13 +470,13 @@ class AccessControl:
     def open(self) -> bool:
         return not self.pool_token and not self.keys and not self.identities
 
-    def _bearer(self, authorization: str | None) -> str | None:
+    def bearer(self, authorization: str | None) -> str | None:
         if authorization and authorization.startswith("Bearer "):
             return authorization[7:]
         return None
 
     def identify(self, authorization: str | None, peer: str | None = None) -> Caller | None:
-        presented = self._bearer(authorization)
+        presented = self.bearer(authorization)
         if peer is not None:
             # The TLS layer verified this name against the pool's authority.
             if peer in self.revoked:
@@ -450,8 +522,10 @@ def create_key(path: str, name: str, role: str, requests_per_minute: int = 0) ->
     data = json.loads(file.read_text(encoding="utf-8")) if file.is_file() else {"keys": []}
     if any(item["name"] == name for item in data["keys"]):
         raise ValueError(f"a key named {name!r} already exists")
+    from .statements import key_verifier
+
     key = "isk-" + secrets.token_urlsafe(32)
-    data["keys"].append({"name": name, "role": role, "sha256": digest(key), "requests_per_minute": requests_per_minute})
+    data["keys"].append({"name": name, "role": role, "sha256": digest(key), "requests_per_minute": requests_per_minute, "verifier": key_verifier(key)})
     file.parent.mkdir(parents=True, exist_ok=True)
     file.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return key

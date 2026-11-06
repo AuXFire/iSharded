@@ -15,7 +15,7 @@ from contextlib import aclosing, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 import numpy as np
@@ -58,10 +58,11 @@ from .protocol import (
     auth_headers,
 )
 from .pool import LOOPBACK, check_exposure, home as pool_home, load_token, read_membership_request
-from .serving import BodyLimit, ChunkedResponses, serve, where_everything_is
+from .serving import MAX_STRANGER_BYTES, AddressLimit, BodyLimit, ChunkedResponses, client_address, serve, where_everything_is
 from .mesh import clean_url
+from .statements import Refused, Statements, make_statement
 from .tickets import PREFIX as TICKET_PREFIX, NodeTickets, TicketChecker, TicketIdentity, client_auth, make_checker, reply_audience
-from .tls import BEHALF, BEHALF_HEADER, FORWARD_MARK, INTERCEPTED, intercepted, PEER, client_verify, node_transport, stay_on_this_machine_async
+from .tls import BEHALF, BEHALF_HEADER, FORWARD_MARK, INTERCEPTED, KEY_HELD, STATEMENT, intercepted, PEER, client_verify, node_transport, stay_on_this_machine_async
 from .tokenizer import ChatTokenizer, IncrementalText, load_tokenizer
 from .toolcalls import (
     MARKER_TOKENS,
@@ -129,6 +130,14 @@ MOVE_WAIT_SECONDS = 90.0
 STREAM_CHECK_SECONDS = 5.0
 # How long workers get to come back before a saved route is rebuilt from scratch.
 ADOPTION_GRACE_SECONDS = 60.0
+# Anyone can ask to join, so this is how much of it one address may do. A real machine
+# asks once, and one address cannot fill the queue before its first requests expire.
+JOIN_BURST = 10
+JOINS_PER_MINUTE = 1.0
+# A good entry is free, or a stranger's bad ones could lock out an owner sharing their
+# address. This is for entries that cost a signature check and changed nothing.
+WASTED_ENTRY_BURST = 20
+WASTED_ENTRIES_PER_MINUTE = 6.0
 CATALOG = [
     {"id": "Qwen/Qwen2.5-0.5B-Instruct", "family": "Qwen2.5", "kind": "dense", "size": "1 GB"},
     {"id": "Qwen/Qwen3-0.6B", "family": "Qwen3", "kind": "dense", "size": "1.5 GB"},
@@ -508,6 +517,9 @@ class Orchestrator:
             self.mesh = ControlMesh(os.getenv("ISHARDED_NODE_ID") or socket.gethostname(), seen_as, seeds)
         self.background: set[asyncio.Task[Any]] = set()
         self.lanes = LaneDoor(self)
+        self.statements = Statements()
+        self.join_limit = AddressLimit(JOIN_BURST, JOINS_PER_MINUTE)
+        self.entry_limit = AddressLimit(WASTED_ENTRY_BURST, WASTED_ENTRIES_PER_MINUTE)
         self.round_trip_ms: dict[str, float] = {}
         self.join_answers: dict[str, set[str]] = {}
         self.last_audit: dict[str, Any] | None = None
@@ -543,6 +555,21 @@ class Orchestrator:
         self.background.add(task)
         task.add_done_callback(self.background.discard)
         return task
+
+    def control_name(self, node: str | None = None) -> str:
+        """A control plane, as a statement names it. A lane shares its node's name."""
+        name = node or (self.mesh.node_id if self.mesh else "")
+        return f"{name}/{self.lane_name}" if self.lane_name else name
+
+    def speak_for(self, caller: Caller, target: str, method: str, path: str, body: bytes = b"") -> str:
+        """What tells the next control plane who asked. The person's key does not go with it."""
+        if self.access.ownerless:
+            return f"{caller.role}:{caller.name}"  # keys never travel here, so nobody could check it
+        statement, key = STATEMENT.get(), KEY_HELD.get()
+        if statement or not key:
+            return statement or ""
+        assert self.mesh is not None
+        return make_statement(key, self.mesh.node_id, target, method, path, body)
 
     async def close(self) -> None:
         for task in (self.maintenance_task, self.gossip_task):
@@ -2276,7 +2303,7 @@ async def lifespan(_: FastAPI):
         await runtime.close()
 
 
-app = FastAPI(title="iSharded orchestrator", version=__version__, lifespan=lifespan)
+app = FastAPI(title="iSharded orchestrator", version=__version__, lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
 
 def require(authorization: str | None, role: str) -> Caller:
@@ -2346,6 +2373,36 @@ SAFE_NODE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 HOP_HEADERS = {"host", "content-length", "connection", "transfer-encoding", "keep-alive", "content-encoding"}
 
 
+def asked_path(request: Request) -> str:
+    """A request's path and query, written the same way by every node that handles it."""
+    query = urlencode(sorted(request.query_params.multi_items()))
+    return f"{request.url.path}?{query}" if query else request.url.path
+
+
+async def believe_forward(request: Request) -> str | None:
+    """Take from a forwarded request only what it can prove. Says why, if it proved nothing."""
+    access, peer = runtime.access, PEER.get()
+    claim = request.headers.get(BEHALF_HEADER)
+    if peer is None or not claim or access.authority is None or peer in access.revoked:
+        return None
+    if access.ownerless:
+        # An operator commands their own node. Here they are only a member,
+        # and the node that passed this on is the one that answers for them.
+        role, _, name = claim.partition(":")
+        if role not in {ROLE_USER, ROLE_MEMBER, ROLE_ADMIN}:
+            return None
+        proven = f"{peer}/{name.rpartition('/')[2]}", ROLE_USER if role == ROLE_USER else ROLE_MEMBER
+    else:
+        try:
+            proven = runtime.statements.check(access, claim, peer, runtime.control_name(), request.method, asked_path(request), await request.body(), bool(runtime.lane_name))
+        except Refused as exc:
+            return str(exc)
+        STATEMENT.set(claim)
+    BEHALF.set(proven)
+    request.state.vouched = f"{proven[1]}:{proven[0]}"
+    return None
+
+
 @app.middleware("http")
 async def forward_to_coordinator(request: Request, call_next: Any) -> Any:
     """Serve the API from any node.
@@ -2354,18 +2411,13 @@ async def forward_to_coordinator(request: Request, call_next: Any) -> Any:
     do not depend on the coordinator. Only management goes there, along with
     replies from a node that has not installed the route yet.
     """
+    KEY_HELD.set(runtime.access.bearer(request.headers.get("authorization")))
     if FORWARD_MARK in request.headers:
         # This connection proves which node passed the request on, not who sent it.
-        # With an authority, that node checked the key and kept it, and says who asked.
-        vouched = request.headers.get(BEHALF_HEADER, "")
-        role, _, name = vouched.partition(":")
-        if PEER.get() is not None and runtime.access.authority is not None and role in {ROLE_USER, ROLE_MEMBER, ROLE_ADMIN}:
-            if runtime.access.ownerless:
-                # An operator commands their own node. Here they are only a member,
-                # and the node that passed this on is the one that answers for them.
-                name, role = f"{PEER.get()}/{name.rpartition('/')[2]}", ROLE_USER if role == ROLE_USER else ROLE_MEMBER
-            BEHALF.set((name, role))
+        refused = await believe_forward(request)
         PEER.set(None)
+        if refused:
+            return JSONResponse(status_code=401, content={"detail": refused})
     mesh = runtime.mesh
     path = request.url.path
     if any(part in {".", ".."} for part in path.replace("\\", "/").split("/")):
@@ -2383,7 +2435,7 @@ async def forward_to_coordinator(request: Request, call_next: Any) -> Any:
     headers.pop(BEHALF_HEADER, None)
     if runtime.access.authority is not None:
         # Anyone can claim to coordinate, so a person's key never leaves the node
-        # they gave it to. It is checked here, and only the result travels.
+        # they gave it to. It is checked here, and only a statement signed with it travels.
         caller = runtime.access.identify(request.headers.get("authorization"), None)
         if caller is None:
             return JSONResponse(status_code=401, content={"detail": "a valid key is required"})
@@ -2391,7 +2443,7 @@ async def forward_to_coordinator(request: Request, call_next: Any) -> Any:
         if wait:
             return JSONResponse(status_code=429, content={"detail": f"rate limit reached for {caller.name}"})
         headers.pop("authorization", None)
-        headers[BEHALF_HEADER] = f"{caller.role}:{caller.name}"
+        headers[BEHALF_HEADER] = runtime.speak_for(caller, runtime.control_name(mesh.leader_id), request.method, asked_path(request), await request.body())
     try:
         upstream = await runtime.client.send(
             runtime.client.build_request(
@@ -2450,7 +2502,7 @@ async def audit_requests(request: Request, call_next: Any) -> Any:
         marked = FORWARD_MARK in request.headers
         peer = None if marked else PEER.get()
         caller = runtime.access.identify(request.headers.get("authorization"), peer)
-        vouched = request.headers.get(BEHALF_HEADER) if marked and PEER.get() else None
+        vouched = getattr(request.state, "vouched", None)  # what was proven, and never what was claimed
         client = request.client.host if request.client else None
         actor = f"{vouched} via {PEER.get()}" if vouched else caller.name if caller else "unknown"
         runtime.audit.record(actor, request.method, path, response.status_code, client)
@@ -2459,7 +2511,7 @@ async def audit_requests(request: Request, call_next: Any) -> Any:
 
 # Added last, so it runs first: nothing oversized is read, forwarded or parsed.
 app.add_middleware(TicketIdentity)
-app.add_middleware(BodyLimit)
+app.add_middleware(BodyLimit, paths={"/join/requests": MAX_STRANGER_BYTES, "/access/entries": MAX_STRANGER_BYTES})
 app.add_middleware(ChunkedResponses, path="/mcp")
 
 
@@ -2467,7 +2519,7 @@ app.add_middleware(ChunkedResponses, path="/mcp")
 async def ready() -> JSONResponse:
     """For load balancers: can this node serve a reply right now?"""
     serving = bool(runtime.route and runtime.tokenizer)
-    return JSONResponse(status_code=200 if serving else 503, content={"ready": serving, "model": runtime.model_id})
+    return JSONResponse(status_code=200 if serving else 503, content={"ready": serving})
 
 
 @app.get("/metrics")
@@ -2706,11 +2758,24 @@ async def unblock_node(name: str, authorization: str | None = Header(default=Non
     return {"status": "unblocked"}
 
 
+def hold_back(limit: AddressLimit, address: str) -> None:
+    wait = limit.wait(address)
+    if wait:
+        raise HTTPException(status_code=429, detail="too many requests from this address; try again soon", headers={"Retry-After": str(int(wait) + 1)})
+
+
+def address_of(request: Request) -> str:
+    return client_address(request.client.host if request.client else None)
+
+
 @app.post("/join/requests")
-async def request_to_join(body: dict[str, Any]) -> dict[str, str]:
+async def request_to_join(request: Request, body: dict[str, Any]) -> dict[str, str]:
     """Anyone may ask. Asking grants nothing until the owner signs an answer."""
     if runtime.access.authority is None or runtime.access.ownerless:
         raise HTTPException(status_code=404, detail="this pool has no owner to ask")
+    address = address_of(request)
+    hold_back(runtime.join_limit, address)
+    runtime.join_limit.charge(address)  # before the parsing, which is the work a stranger is asking for
     try:
         details = read_membership_request(str(body["request"]))
     except (KeyError, ValueError) as exc:
@@ -2727,6 +2792,7 @@ async def request_to_join(body: dict[str, Any]) -> dict[str, str]:
 @app.get("/join/requests")
 async def join_requests(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     verify_admin(authorization)
+    runtime.access.expire_join_requests()
     # What a person decided stays on this machine, for the signer beside it to act on.
     return {"requests": [{**held, "approved": name in runtime.join_answers.get("approve", ()), "denied": name in runtime.join_answers.get("deny", ())} for name, held in runtime.access.join_requests.items()]}
 
@@ -2751,7 +2817,7 @@ async def join_authority() -> dict[str, str]:
     """The mesh's public certificate, for a new machine to check against its invite."""
     if runtime.access.authority is None or runtime.access.ownerless:
         raise HTTPException(status_code=404, detail="this pool has no authority")
-    return {"authority": Path(os.environ["ISHARDED_CA_FILE"]).read_text(encoding="utf-8"), "name": runtime.mesh.node_id if runtime.mesh else ""}
+    return {"authority": Path(os.environ["ISHARDED_CA_FILE"]).read_text(encoding="utf-8")}
 
 
 @app.post("/admin/invites")
@@ -2778,12 +2844,19 @@ async def join_certificate(name: str) -> dict[str, str]:
 
 
 @app.post("/access/entries")
-async def add_access_entry(body: dict[str, Any]) -> dict[str, str]:
+async def add_access_entry(request: Request, body: dict[str, Any]) -> dict[str, str]:
     """Take a change signed by the pool authority. The signature is the credential."""
     if runtime.access.authority is None:
         raise HTTPException(status_code=404, detail="this pool has no authority")
+    address = address_of(request)
+    hold_back(runtime.entry_limit, address)
+    held = len(runtime.access.signed)
     if not runtime.access.add_signed(body):
+        runtime.entry_limit.charge(address)
         raise HTTPException(status_code=403, detail="this entry is not signed by the pool authority")
+    if len(runtime.access.signed) == held:
+        runtime.entry_limit.charge(address)  # a repeat costs the same to check and changes nothing
+        return {"status": "accepted"}
     runtime.add_event("security", "Access list changed", str(body["entry"].get("type")))
     runtime.apply_revocations()
     return {"status": "accepted"}
@@ -2860,7 +2933,9 @@ async def lane_status(authorization: str | None = Header(default=None)) -> dict[
         "lane": runtime.lane_name,
         "model": runtime.model_id or state.get("request", {}).get("model_id"),
         "ready": bool(runtime.tokenizer and runtime.route),
+        "leader": runtime.mesh.leader_id if runtime.mesh else None,
         "leader_url": runtime.mesh.leader_url if runtime.mesh else None,
+        "entries_held": runtime.access.entries_held,
         "workers": sum(1 for record in runtime.workers.values() if record.live),
         "route": [{key: stage[key] for key in ("worker_id", "start_layer", "end_layer")} for stage in route],
         "load_job": runtime.job.snapshot() if runtime.job else None,
@@ -2873,6 +2948,8 @@ async def lane_access(body: dict[str, Any], authorization: str | None = Header(d
     """Signed access changes, passed in by this node's front door. Signatures are checked in merge."""
     verify_token(authorization)
     runtime.access.merge(body)
+    if runtime.lane_name and runtime.mesh and PEER.get() == runtime.mesh.node_id and not runtime.access.ownerless:
+        runtime.access.take_node_keys(body)
     runtime.apply_revocations()
     return {"status": "merged"}
 

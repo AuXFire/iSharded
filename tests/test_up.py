@@ -1,6 +1,7 @@
 """One-command setup: invites must be easy to use and hard to abuse."""
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
@@ -12,6 +13,7 @@ pytest.importorskip("cryptography")
 from isharded import up
 from isharded.access import AccessControl, Authority, digest
 from isharded.pool import read_membership_request, request_membership
+from isharded.statements import key_verifier
 
 
 def owner(tmp_path: Path) -> Path:
@@ -106,13 +108,154 @@ def test_the_owners_machine_signs_a_good_request_once_and_ignores_the_rest(tmp_p
 
 def test_the_invite_fields_travel_with_a_request_through_gossip(tmp_path: Path) -> None:
     text = request_membership(str(tmp_path / "joiner"), "joiner", ["100.64.0.2"])
-    held = {**read_membership_request(text), "request": text, "proof": "p" * 64, "key_sha256": "k" * 64, "role": "admin"}
+    held = {**read_membership_request(text), "request": text, "proof": "p" * 64, "key_sha256": "k" * 64, "key_verifier": "v" * 43, "role": "admin"}
     home = owner(tmp_path)
     access = AccessControl(authority=Authority(str(home / "ca.pem")), identities=True)
     access.merge({"join_requests": [held], "signed": []})
     kept = access.join_requests["joiner"]
-    assert kept["proof"] == "p" * 64 and kept["key_sha256"] == "k" * 64
+    assert kept["proof"] == "p" * 64 and kept["key_sha256"] == "k" * 64 and kept["key_verifier"] == "v" * 43
     assert "role" not in kept  # nothing else rides along
+
+
+def test_a_new_owner_key_can_prove_itself_to_other_nodes(tmp_path: Path) -> None:
+    home = owner(tmp_path)
+    key = (home / "admin.key").read_text(encoding="utf-8")
+    access = AccessControl.load(None, str(home / "access.json"), identities=True, authority=Authority(str(home / "ca.pem")))
+    assert access.keys[digest(key)].verifier == key_verifier(key)
+
+
+def test_an_invited_machine_gets_a_key_that_can_prove_itself(tmp_path: Path) -> None:
+    home = owner(tmp_path)
+    secret = up.read_invite(up.create_invite(home, ["http://a:1"], uses=1)["code"])["secret"]
+    good = request_membership(str(tmp_path / "joiner"), "joiner", ["100.64.0.2"])
+    key = "isk-joiner"
+    fields = {"key_sha256": digest(key), "key_verifier": key_verifier(key)}
+    proof = up.invite_proof(secret, good, fields["key_sha256"], fields["key_verifier"])
+    posted: list[dict[str, str]] = []
+    with transport(home, [{**read_membership_request(good), "request": good, **fields, "proof": proof}], posted) as client:
+        assert up.approve_invited(home, client, "http://a:1", "key") == ["joiner"]
+    assert posted[1]["entry"]["verifier"] == key_verifier(key)
+
+
+def test_a_member_cannot_swap_the_verifier_on_a_request_passing_through(tmp_path: Path) -> None:
+    home = owner(tmp_path)
+    secret = up.read_invite(up.create_invite(home, ["http://a:1"])["code"])["secret"]
+    good = request_membership(str(tmp_path / "joiner"), "joiner", ["100.64.0.2"])
+    proof = up.invite_proof(secret, good, "a" * 64, key_verifier("isk-real"))
+    item = {"request": good, "key_sha256": "a" * 64, "key_verifier": key_verifier("isk-real"), "proof": proof}
+    invites = up.read_invites(home)
+    assert up.matching_invite(invites, item)
+    assert up.matching_invite(invites, {**item, "key_verifier": key_verifier("isk-theirs")}) is None
+    assert up.matching_invite(invites, {**item, "key_verifier": ""}) is None
+
+
+def test_a_machine_running_older_code_can_still_use_an_invite(tmp_path: Path) -> None:
+    home = owner(tmp_path)
+    secret = up.read_invite(up.create_invite(home, ["http://a:1"], uses=1)["code"])["secret"]
+    good = request_membership(str(tmp_path / "joiner"), "joiner", ["100.64.0.2"])
+    item = {**read_membership_request(good), "request": good, "key_sha256": "c" * 64, "proof": up.invite_proof(secret, good, "c" * 64)}
+    posted: list[dict[str, str]] = []
+    with transport(home, [item], posted) as client:
+        assert up.approve_invited(home, client, "http://a:1", "key") == ["joiner"]
+    assert "verifier" not in posted[1]["entry"]
+
+
+def test_a_bad_verifier_is_left_out_of_a_signed_entry(tmp_path: Path) -> None:
+    home = owner(tmp_path)
+    secret = up.read_invite(up.create_invite(home, ["http://a:1"], uses=1)["code"])["secret"]
+    good = request_membership(str(tmp_path / "joiner"), "joiner", ["100.64.0.2"])
+    item = {**read_membership_request(good), "request": good, "key_sha256": "c" * 64, "key_verifier": "not one", "proof": up.invite_proof(secret, good, "c" * 64, "not one")}
+    posted: list[dict[str, str]] = []
+    with transport(home, [item], posted) as client:
+        up.approve_invited(home, client, "http://a:1", "key")
+    assert "verifier" not in posted[1]["entry"]
+
+
+def older_owner(tmp_path: Path) -> tuple[Path, str]:
+    """A mesh made before keys had verifiers."""
+    from isharded.pool import sign_entry
+
+    home = owner(tmp_path)
+    key = (home / "admin.key").read_text(encoding="utf-8")
+    signed = sign_entry(str(home), {"type": "key", "name": "owner", "role": "admin", "sha256": digest(key), "requests_per_minute": 0})
+    (home / "access.json").write_text(json.dumps({"version": 1, "keys": [], "signed": [signed]}), encoding="utf-8")
+    return home, key
+
+
+def test_the_owners_machine_gives_an_older_owner_key_a_verifier_once(tmp_path: Path) -> None:
+    home, key = older_owner(tmp_path)
+    posted: list[dict[str, str]] = []
+    with transport(home, [], posted) as client:
+        up.give_owner_a_verifier(home, client, "http://a:1", key)
+    access = AccessControl.load(None, str(home / "access.json"), identities=True, authority=Authority(str(home / "ca.pem")))
+    assert access.keys[digest(key)].verifier == ""
+    assert access.add_signed(posted[0])
+    assert access.keys[digest(key)].verifier == key_verifier(key)
+    assert access.keys[digest(key)].role == "admin"
+    with transport(home, [], posted) as client:
+        up.give_owner_a_verifier(home, client, "http://a:1", key)
+    assert len(posted) == 1  # the node saved it, so restarting signs nothing new
+
+
+def test_someone_elses_key_is_not_given_a_verifier_by_accident(tmp_path: Path) -> None:
+    home, _ = older_owner(tmp_path)
+    posted: list[dict[str, str]] = []
+    with transport(home, [], posted) as client:
+        up.give_owner_a_verifier(home, client, "http://a:1", "isk-not-on-the-list")
+    assert not posted
+
+
+def test_a_batch_behind_one_address_takes_turns(monkeypatch: pytest.MonkeyPatch) -> None:
+    answers = [httpx.Response(429, headers={"Retry-After": "1"}), httpx.Response(200, json={"status": "waiting"})]
+    waited: list[float] = []
+    monkeypatch.setattr(up.time, "sleep", waited.append)
+    with httpx.Client(transport=httpx.MockTransport(lambda request: answers.pop(0))) as client:
+        answer = up.ask_to_join(client, "http://a:1", {}, up.time.monotonic() + 60)
+    assert answer.status_code == 200 and waited == [1.0]
+
+
+def test_asking_to_join_gives_up_at_the_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(up.time, "sleep", lambda _: pytest.fail("must not wait past the deadline"))
+    with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(429, headers={"Retry-After": "100"}))) as client:
+        assert up.ask_to_join(client, "http://a:1", {}, up.time.monotonic() + 60).status_code == 429
+
+
+def test_waiting_for_an_answer_keeps_the_request_from_expiring(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from isharded import cli
+
+    asked: list[dict[str, str]] = []
+    looks = iter([httpx.Response(404), httpx.Response(200, json={"certificate": "c", "authority": "a"})])
+
+    def post(url: str, **options: object) -> httpx.Response:
+        asked.append(options["json"])  # type: ignore[arg-type]
+        return httpx.Response(200, json={"status": "waiting", "fingerprint": "f"})
+
+    monkeypatch.setattr(cli, "ASK_AGAIN_SECONDS", -1.0)
+    monkeypatch.setattr(cli.time, "sleep", lambda _: None)
+    monkeypatch.setattr(cli.httpx, "post", post)
+    monkeypatch.setattr(cli.httpx, "get", lambda *_, **__: next(looks))
+    args = argparse.Namespace(url="http://a:1", pool_command="request-join", dir=str(tmp_path), name="joiner", address=["100.64.0.2"], wait=True)
+    assert cli.run_membership(args) == 0
+    assert len(asked) == 2 and asked[0] == asked[1]
+
+
+def test_a_key_signed_for_a_running_pool_gets_a_verifier(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    from isharded import cli
+
+    sent: list[dict[str, str]] = []
+    monkeypatch.setattr(cli, "send_signed", lambda args, entry: sent.append(entry))
+    monkeypatch.setattr(cli.sys, "argv", ["isharded", "key", "create", "alice", "--role", "admin", "--dir", str(tmp_path), "--url", "http://a:1"])
+    cli.main()
+    key = capsys.readouterr().out.strip().splitlines()[-1]
+    assert sent[0]["sha256"] == digest(key) and sent[0]["verifier"] == key_verifier(key)
+
+
+def test_a_mesh_with_no_name_to_give_is_listed_by_its_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    from isharded import discovery
+
+    pem = "-----BEGIN CERTIFICATE-----"
+    monkeypatch.setattr(discovery.httpx, "get", lambda *_, **__: httpx.Response(200, json={"authority": pem}))
+    assert discovery.ask_peer("100.64.0.5") == {"url": "http://100.64.0.5:8209", "authority": up.authority_hash(pem), "name": "100.64.0.5"}
 
 
 def test_a_name_taken_by_another_key_is_noticed(tmp_path: Path) -> None:
