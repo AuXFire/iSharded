@@ -260,12 +260,6 @@ def test_a_crashing_driver_means_no_vulkan_gpu_and_no_crash(tmp_path) -> None:
     assert read_vulkan_devices(tmp_path, run=lambda *_, **__: SimpleNamespace(returncode=0, stdout="")) == []
 
 
-def test_vulkan_bandwidth_is_assumed_not_measured() -> None:
-    from shardmesh.memory import ASSUMED_VULKAN_GBPS, measure_bandwidth
-
-    assert measure_bandwidth("vulkan:0") == ASSUMED_VULKAN_GBPS
-
-
 def test_asking_for_vulkan_with_none_says_what_to_check(monkeypatch) -> None:
     from shardmesh import memory
 

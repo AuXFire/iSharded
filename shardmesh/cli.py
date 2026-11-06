@@ -170,20 +170,28 @@ def run_load(args: argparse.Namespace) -> int:
     if args.no_peer_fetch:
         body["peer_fetch"] = False
     if args.lane:
-        body.update({"lane": args.lane, "lane_gpu_gb": args.lane_gpu_gb, "lane_ram_gb": args.lane_ram_gb})
+        body.update({"lane": args.lane, "lane_gpu_gb": args.lane_gpu_gb, "lane_ram_gb": args.lane_ram_gb, "lane_apart": args.lane_apart})
     response = httpx.post(base + "/admin/load", json=body, headers=headers, timeout=120.0)
     if response.status_code >= 400:
         print(f"Load refused: {response.text}", file=sys.stderr)
         return 1
     while True:
         time.sleep(2)
-        status = httpx.get(base + "/admin/status", headers=headers, timeout=30.0).json()
-        job = status["load_job"]
+        try:
+            status = httpx.get(base + "/admin/status", headers=headers, timeout=30.0).json()
+        except (httpx.HTTPError, ValueError):
+            continue  # a busy or changing coordinator is no reason to give up on the load
+        job = status.get("load_job")
+        if job is None and not args.lane:
+            continue
         if args.lane:
             lane = next((item for item in status["lanes"] if item["name"] == args.lane), {})
             if lane.get("error"):
                 print(lane["error"], file=sys.stderr)
                 return 1
+            if lane.get("ready") and lane.get("model") == args.model:
+                print(f"Lane {args.lane} is ready.", flush=True)
+                return 0  # a change of coordinator can end the job that reported progress
             job = lane.get("load_job")
             if job is None or job.get("model") != args.model:
                 print(f"Starting lane {args.lane}: {lane.get('workers', 0)} workers so far.", flush=True)
@@ -222,6 +230,28 @@ def run_net(args: argparse.Namespace) -> int:
     response = method(f"{args.url.rstrip('/')}/admin/nodes/{args.name}/revoke", headers=headers, timeout=30.0)
     print(f"Done: {args.net_command} {args.name}." if response.status_code < 400 else f"Refused: {response.text}")
     return 0 if response.status_code < 400 else 1
+
+
+def run_audit(args: argparse.Namespace) -> int:
+    headers = {"Authorization": f"Bearer {args.pool_token}"} if args.pool_token else {}
+    while True:
+        response = httpx.post(args.url.rstrip("/") + "/admin/audit", json={"model": args.model, "samples": args.samples}, headers=headers, timeout=1800.0)
+        if response.status_code >= 400:
+            print(f"Refused: {response.text}", file=sys.stderr)
+            return 1
+        result = response.json()
+        for pair in result["pairs"]:
+            print(f"{pair['routes'][0]} and {pair['routes'][1]}: {pair['agreement']:.0%} agreement over {result['samples']} questions")
+        if result["verdict"] == "agree":
+            print("The routes agree.")
+        elif result["suspects"]:
+            for name in result["suspects"]:
+                print(f"{name} disagrees with the others. It runs on: {', '.join(result['routes'].get(name, []))}")
+        else:
+            print("The routes disagree, and with two it cannot be said which is wrong. Load a third with --lane-apart.")
+        if not args.every:
+            return 0 if result["verdict"] == "agree" else 1
+        time.sleep(args.every)
 
 
 def run_lane(args: argparse.Namespace) -> int:
@@ -413,8 +443,16 @@ def build_parser() -> argparse.ArgumentParser:
     load.add_argument("--lane", default=None, help="load beside the running model, in a lane of this name")
     load.add_argument("--lane-gpu-gb", type=float, default=None, help="most VRAM per node for this lane; default is what is spare")
     load.add_argument("--lane-ram-gb", type=float, default=None, help="most RAM per node for this lane; default is what is spare")
+    load.add_argument("--lane-apart", action="store_true", help="keep this lane off every node another route uses, so routes can check each other")
     load.add_argument("--hashes", default=None, help="file from `shardmesh model hash`: every node checks every unit against it")
     load.set_defaults(handler=run_load)
+    check = subparsers.add_parser("audit", help="ask routes serving a model the same questions, and compare their answers")
+    check.add_argument("--model", default=None, help="the model to check; default is the main one")
+    check.add_argument("--samples", type=int, default=8, help="questions to ask each route")
+    check.add_argument("--every", type=float, default=0, help="keep checking, this many seconds apart")
+    check.add_argument("--url", default="http://127.0.0.1:8000", help="any node's control address")
+    check.add_argument("--token", "--pool-token", dest="pool_token", default=load_token(), help="an admin key for this node")
+    check.set_defaults(handler=run_audit)
     lane = subparsers.add_parser("lane", help="see or remove models running beside the main one")
     lane_commands = lane.add_subparsers(dest="lane_command", required=True)
     for name, text in (("list", "show the pool's lanes"), ("remove", "stop a lane and free its memory on every node")):

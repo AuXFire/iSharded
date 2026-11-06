@@ -251,6 +251,8 @@ class LoadModelRequest(BaseModel):
     lane: str | None = None
     lane_gpu_gb: float | None = None
     lane_ram_gb: float | None = None
+    # Keep this lane off every node another route uses, so routes can check each other.
+    lane_apart: bool = False
     control_model_id: str | None = None
     worker_model_ids: dict[str, str] = Field(default_factory=dict)
     revision: str = "main"

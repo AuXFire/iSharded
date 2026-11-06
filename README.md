@@ -24,6 +24,7 @@ This is execution sharding, not simulated work distribution: each token really c
 - [Memory and placement](#memory-and-placement)
 - [Precision](#precision)
 - [Networks and security](#networks-and-security)
+- [Checking answers](#checking-answers)
 - [Running a pool](#running-a-pool)
 - [Troubleshooting](#troubleshooting)
 - [Measured performance](#measured-performance)
@@ -675,6 +676,7 @@ Loads a model on a running pool and shows progress. `model` is any [model id](#l
 | `--lane` | None | Load beside the running model, in a lane of this name. See [Several models at once](#several-models-at-once) |
 | `--lane-gpu-gb` | What is spare | Most VRAM per node for this lane |
 | `--lane-ram-gb` | What is spare | Most RAM per node for this lane |
+| `--lane-apart` | Off | Keep this lane off every node another route uses, so routes can check each other |
 
 ### shardmesh lane
 
@@ -691,6 +693,19 @@ For a [network nobody owns](#a-network-nobody-owns).
 | `shardmesh net show --url URL --token KEY` | This node's own view: who it accepts, blocks, and can see |
 | `shardmesh net block NAME --url URL --token KEY` | Stop this node dealing with another. Only this node is affected |
 | `shardmesh net unblock NAME --url URL --token KEY` | Undo that |
+
+### shardmesh audit
+
+Asks every route serving a model the same questions, and compares the answers. See [Checking answers](#checking-answers).
+
+| Option | Default | What it does |
+|---|---|---|
+| `--model` | The main model | The model to check |
+| `--samples` | 8 | Questions to ask each route |
+| `--every` | Off | Keep checking, this many seconds apart |
+| `--url`, `--token` (`--pool-token`) | | As for `load` |
+
+It exits with 1 if routes disagree, so it can sit in a script.
 
 ### shardmesh cordon and uncordon
 
@@ -841,6 +856,7 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `POST` | `/admin/load/cancel` | Admin key | Stop a load. Finished units stay cached |
 | `DELETE` | `/admin/lanes/{name}` | Admin key | Stop a lane and free its memory on every node |
 | `POST` | `/admin/join/{name}/{answer}` | Admin key | Answer a machine asking to join, with `approve` or `deny`, on the machine that made the mesh |
+| `POST` | `/admin/audit` | Admin key | Ask routes serving `model` the same `samples` questions, and compare. Each node runs this itself |
 | `POST` | `/admin/invites` | Admin key | Make a code that adds a machine. Takes `uses` and `hours`, and only the machine that made the mesh can |
 | `GET` | `/join/authority` | None | The mesh's public certificate, for a new machine to check against its invite |
 | `GET` | `/admin/network` | User key | In a network nobody owns, this node's own view. `/admin/status` shows the coordinator's |
@@ -906,6 +922,7 @@ Prompts longer than the loaded context are refused with a 400. A reply that woul
 | `model_id` | `distilbert/distilgpt2` | Any [model id](#loading-a-model) |
 | `lane` | None | Load beside the main model, in a lane of this name |
 | `lane_gpu_gb`, `lane_ram_gb` | What is spare | Most VRAM and RAM per node for a new lane |
+| `lane_apart` | `false` | Keep a new lane off every node another route uses |
 | `revision` | `main` | Branch, tag, or commit on the model host |
 | `control_model_id` | None | Read the description from here instead of `model_id` |
 | `worker_model_ids` | None | A local source per worker, as worker name to path |
@@ -1101,6 +1118,24 @@ Who can do what:
 
 Antivirus that scans HTTPS replaces certificates, which ends mutual TLS. Nodes refuse to trust it, so the failure is safe, and a node reports it plainly. Use Tailscale with tickets, which need no TLS at all, or exclude the pool's ports from scanning.
 
+## Checking answers
+
+Any node in a route can return anything, and nothing in a reply proves otherwise. What can be measured is agreement: identical prompts, with no randomness, on routes built from different machines. They hold the same weights, so honest routes run together, and a broken or tampering one parts from them.
+
+Load the same model again on other machines, then ask:
+
+```bash
+shardmesh load Qwen3-0.6B-Q8_0.gguf --lane check --lane-apart --url http://node-a:8209
+```
+
+```bash
+shardmesh audit --url http://node-a:8209
+```
+
+With two routes, a disagreement says something is wrong without saying where. With three or more, the route out of line with the others is named, along with the machines it runs on. What you do about that is yours: cordon or revoke it in an owned network, or `shardmesh net block` it for your own node in one nobody owns.
+
+The questions are made up and look like ordinary chat, so nobody's real words travel anywhere extra, and a node cannot easily tell it is being tested. This is a smoke alarm, not a proof. It catches a stage that is broken, or that tampers with what it handles. It does not catch one that behaves whenever it might be watched, or that only touches certain topics. It costs a second copy of the model, which a large mesh can spare and a small one may not.
+
 ## Running a pool
 
 The full guide is [Operating ShardMesh](docs/OPERATIONS.md).
@@ -1230,6 +1265,7 @@ Adapter tests compare every family with the reference `transformers` implementat
 | `shardmesh/lanes.py` | Several models at once: the front door and each node's lanes |
 | `shardmesh/commons.py` | A network nobody owns: self-made identities, vouches, and each node's view |
 | `shardmesh/inventory.py`, `shardmesh/gpu_probe.py` | What a node reports about itself, and how it finds GPUs PyTorch cannot see |
+| `shardmesh/audit.py` | Comparing routes that serve the same model |
 | `shardmesh/formats.py` | Anthropic's, OpenAI Responses', and Ollama's request and reply shapes |
 | `shardmesh/mesh.py` | Membership and leader election, as pure logic |
 | `shardmesh/planner.py`, `shardmesh/memory.py` | Placement, and memory pool discovery |
@@ -1242,7 +1278,7 @@ Adapter tests compare every family with the reference `transformers` implementat
 Trust and status:
 
 - Two machines is the most this has run on, so everything about larger meshes is design, not measurement. See [Scaling to many nodes](#scaling-to-many-nodes). The longest test ran under an hour. No human has audited it, and reviews by AI do not show it is free of flaws.
-- A node in the route can read prompts and return wrong answers, and nothing detects that. Certificates limit who is in a pool. They do not make a hostile member safe.
+- A node in the route can read prompts. It can return wrong answers too: [checking answers](#checking-answers) catches a route that disagrees with others, but not one that only misbehaves when it is not being tested. Certificates limit who is in a pool. They do not make a hostile member safe.
 - An owned network has an owner.
 - A network nobody owns has run on three processes on one machine, not between strangers. Identities are free, so `--joining open` lets one person run many nodes, and a low name can be ground out to win coordination. A coordinator can stall a route. Traffic is not encrypted, so run it over a network that is, such as Tailscale. Use `--joining vouched` with a quorum unless you accept all of that.
 - Several models run in lanes with fixed memory shares. The main model's planner does not see a lane's memory, so moving layers after a failure can run a node short. Workers started with `--no-control` do not join lanes.

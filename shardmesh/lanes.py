@@ -27,6 +27,8 @@ MAX_LANES = 7
 LANE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 LANE_REFRESH_SECONDS = 3.0
 LANE_WORKERS_WAIT_SECONDS = 120.0
+LANE_SETTLED_LOOKS = 8
+LANE_ASK_ATTEMPTS = 10
 # A new process needs room for its own runtime before any weights arrive.
 LANE_GPU_OVERHEAD_GB = 0.5
 GIB = 1024**3
@@ -185,7 +187,14 @@ class LaneDoor:
         try:
             response = await self.runtime.client.get(url + "/internal/lane", headers=self._node_headers(), timeout=5.0)
             response.raise_for_status()
-            self.seen[name] = response.json()
+            info = response.json()
+            leader = str(info.get("leader_url") or "").rstrip("/")
+            if leader and leader != url:
+                # A load runs on the lane's coordinator, so only it knows how one went.
+                answer = await self.runtime.client.get(leader + "/internal/lane", headers=self._node_headers(), timeout=5.0)
+                if answer.status_code == 200:
+                    info["load_job"] = answer.json().get("load_job")
+            self.seen[name] = info
         except (httpx.HTTPError, ValueError):
             self.seen.pop(name, None)
 
@@ -270,7 +279,43 @@ class LaneDoor:
             background=BackgroundTask(response.aclose),
         )
 
-    def create(self, name: str, gpu_gb: float | None, ram_gb: float | None, by: str = "") -> None:
+    def nodes_in_use(self) -> set[str]:
+        """Every node on any route, so a lane can be built from the others."""
+        used = {node_of(stage.worker_id) for stage in self.runtime.route}
+        for info in self.seen.values():
+            used |= {node_of(str(stage["worker_id"])) for stage in info.get("route", [])}
+        return used
+
+    def routes_for(self, model: str) -> list[str]:
+        return sorted(name for name, info in self.seen.items() if info.get("ready") and info.get("model") == model)
+
+    async def ask(self, name: str, payload: dict[str, Any], caller: Any) -> str:
+        """One whole reply from a lane, waiting out a change of coordinator."""
+        from fastapi import HTTPException
+
+        for attempt in range(LANE_ASK_ATTEMPTS):
+            try:
+                url = self._target(name) + "/v1/chat/completions"
+                response = await self.runtime.client.post(url, json=payload, headers=self._headers(caller), timeout=300.0)
+                if response.status_code != 503:
+                    response.raise_for_status()
+                    return str(response.json()["choices"][0]["message"]["content"])
+            except HTTPException:
+                pass  # no coordinator this moment
+            await asyncio.sleep(3.0)
+            await self._look(name)
+        raise HTTPException(status_code=503, detail=f"lane {name} has no coordinator; try again in a few seconds")
+
+    def settled(self, lanes: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        """Lanes as they really stand. Once one has a route, it holds only the nodes on it."""
+        held = {}
+        for name, lane in lanes.items():
+            route = self.seen.get(name, {}).get("route") or []
+            on_route = {node_of(str(stage["worker_id"])) for stage in route}
+            held[name] = {**lane, "budgets": {node: budget for node, budget in lane["budgets"].items() if not on_route or node in on_route}}
+        return held
+
+    def create(self, name: str, gpu_gb: float | None, ram_gb: float | None, by: str = "", apart: bool = False) -> None:
         from fastapi import HTTPException
 
         if not self.active:
@@ -284,7 +329,10 @@ class LaneDoor:
         slot = next((slot for slot in range(1, MAX_LANES + 1) if slot not in {lane["slot"] for lane in lanes.values()}), None)
         if slot is None:
             raise HTTPException(status_code=409, detail=f"this pool already runs {MAX_LANES} lanes")
-        budgets = lane_budgets(spare_budgets(self.runtime.workers), lanes, gpu_gb, ram_gb)
+        spare = spare_budgets(self.runtime.workers)
+        if apart:
+            spare = {node: left for node, left in spare.items() if node not in self.nodes_in_use()}
+        budgets = lane_budgets(spare, self.settled(lanes), gpu_gb, ram_gb)
         if not any(budget["gpu_gb"] or budget["ram_gb"] for budget in budgets.values()):
             raise HTTPException(status_code=409, detail="no node has memory left under the limits its owner set")
         lanes[name] = {"slot": slot, "budgets": budgets, "by": by}
@@ -298,13 +346,18 @@ class LaneDoor:
         lane = clean_lanes(self.runtime.mesh.lanes)[name]
         expected = sum(1 for budget in lane["budgets"].values() if budget["gpu_gb"] or budget["ram_gb"])
         deadline = loop.time() + LANE_WORKERS_WAIT_SECONDS
+        leader, steady = None, 0
         while True:
             await self._look(name)
             info = self.seen.get(name, {})
-            if info.get("leader_url") and int(info.get("workers", 0)) >= expected:
+            # A lane's nodes start at different moments and settle on a coordinator
+            # between them. A load begun before that would be lost in the change.
+            steady = steady + 1 if info.get("leader_url") and info.get("leader_url") == leader else 0
+            leader = info.get("leader_url")
+            if steady >= LANE_SETTLED_LOOKS and int(info.get("workers", 0)) >= expected:
                 break
             if loop.time() > deadline:
-                if info.get("leader_url") and int(info.get("workers", 0)) > 0:
+                if leader and int(info.get("workers", 0)) > 0:
                     break
                 raise RuntimeError(f"lane {name} started no workers in {LANE_WORKERS_WAIT_SECONDS:.0f} s")
             await asyncio.sleep(1.0)
@@ -315,9 +368,11 @@ class LaneDoor:
 
     async def load(self, body: Any, caller: Any) -> dict[str, Any]:
         name = body.lane
-        self.create(name, body.lane_gpu_gb, body.lane_ram_gb, proposer(caller, self.runtime.mesh.node_id))
+        if self.active:
+            await asyncio.gather(*(self._look(known) for known in clean_lanes(self.runtime.mesh.lanes)))
+        self.create(name, body.lane_gpu_gb, body.lane_ram_gb, proposer(caller, self.runtime.mesh.node_id), body.lane_apart)
         self.problems.pop(name, None)
-        payload = body.model_dump(exclude_none=True, exclude={"lane", "lane_gpu_gb", "lane_ram_gb"})
+        payload = body.model_dump(exclude_none=True, exclude={"lane", "lane_gpu_gb", "lane_ram_gb", "lane_apart"})
         payload["wait"] = False
 
         async def start() -> None:

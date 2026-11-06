@@ -23,7 +23,7 @@ from starlette.background import BackgroundTask
 from . import __version__
 from .access import INVITE_FIELDS, load_authority, NeedsAuthority, node_of, ROLE_ADMIN, ROLE_MEMBER, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, Caller
 from .gguf import parse_source
-from . import formats
+from . import audit, formats
 from .discovery import start_beacon
 from .lanes import LaneDoor
 from .mesh import GOSSIP_SECONDS, ControlMesh
@@ -416,6 +416,7 @@ class Orchestrator:
         self.lanes = LaneDoor(self)
         self.round_trip_ms: dict[str, float] = {}
         self.join_answers: dict[str, set[str]] = {}
+        self.last_audit: dict[str, Any] | None = None
         self.beacon: Any = None
         self.lane_name = os.getenv("SHARDMESH_LANE") or None
         self.started_at = time.time()
@@ -1996,6 +1997,7 @@ class Orchestrator:
             "cordoned_nodes": sorted(self.access.cordoned),
             "lanes": self.lanes.status(),
             "ownerless": self.network_view(),
+            "last_audit": self.last_audit,
             "model": self.model_id,
             "load_job": self.job.snapshot() if self.job else None,
             "active_plan": describe_plan(self.active, self.route) if self.active and self.route else None,
@@ -2190,7 +2192,7 @@ async def forward_to_coordinator(request: Request, call_next: Any) -> Any:
         # httpx would resolve these, turning a forwarded path into any other.
         return JSONResponse(status_code=400, content={"detail": "bad path"})
     serves_locally = path.startswith(("/v1/", "/api/")) and bool(runtime.route)
-    own_choice = path in {"/admin/invites", "/admin/network"} or path.startswith("/admin/join/") or (runtime.access.ownerless and (path.startswith("/admin/keys") or path.endswith("/revoke")))
+    own_choice = path in {"/admin/invites", "/admin/network", "/admin/audit"} or path.startswith("/admin/join/") or (runtime.access.ownerless and (path.startswith("/admin/keys") or path.endswith("/revoke")))
     if mesh is None or mesh.is_leader or serves_locally or own_choice or not path.startswith(FORWARDED_PATHS):
         return await call_next(request)
     target = mesh.leader_url
@@ -2670,13 +2672,16 @@ async def remove_lane(name: str, authorization: str | None = Header(default=None
 async def lane_status(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     """What a front door needs to know about the lane it sits beside."""
     verify_token(authorization)
+    # A node that has not installed the route yet still knows it from gossip.
+    state = (runtime.mesh.replica if runtime.mesh else None) or {}
+    route = [stage.model_dump() for stage in runtime.route] or state.get("route", [])
     return {
         "lane": runtime.lane_name,
-        "model": runtime.model_id,
+        "model": runtime.model_id or state.get("request", {}).get("model_id"),
         "ready": bool(runtime.tokenizer and runtime.route),
         "leader_url": runtime.mesh.leader_url if runtime.mesh else None,
         "workers": sum(1 for record in runtime.workers.values() if record.live),
-        "route": [{"worker_id": stage.worker_id, "start_layer": stage.start_layer, "end_layer": stage.end_layer} for stage in runtime.route],
+        "route": [{key: stage[key] for key in ("worker_id", "start_layer", "end_layer")} for stage in route],
         "load_job": runtime.job.snapshot() if runtime.job else None,
     }
 
@@ -2695,6 +2700,48 @@ async def status(authorization: str | None = Header(default=None)) -> dict[str, 
     verify_user(authorization)
     await runtime.refresh_worker_metrics()
     return runtime.status()
+
+
+@app.post("/admin/audit")
+async def audit_routes(body: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """Ask every route serving a model the same made-up questions, and compare."""
+    caller = network_caller(authorization)
+    model = str(body.get("model") or runtime.model_id or "")
+    samples = min(max(int(body.get("samples", audit.SAMPLES)), 1), audit.MOST_SAMPLES)
+    lanes = runtime.lanes.routes_for(model)
+    on_main = model == runtime.model_id and bool(runtime.route)
+    if len(lanes) + on_main < 2:
+        raise HTTPException(status_code=409, detail=f"checking needs two routes for {model or 'a model'}; load another with --lane NAME --lane-apart")
+    questions = audit.canaries(samples)
+
+    def request(question: str) -> dict[str, Any]:
+        return {"model": model, "messages": [{"role": "user", "content": question}], "max_tokens": audit.REPLY_TOKENS, "temperature": 0.0, "seed": 1, "enable_thinking": False}
+
+    async def ask_main() -> list[str]:
+        answers = []
+        for question in questions:
+            reply = await chat_completions(ChatCompletionRequest(**request(question)), authorization)
+            answers.append(reply["choices"][0]["message"]["content"])
+        return answers
+
+    async def ask_lane(name: str) -> list[str]:
+        return [await runtime.lanes.ask(name, request(question), caller) for question in questions]
+
+    names = (["main"] if on_main else []) + lanes
+    work = ([ask_main()] if on_main else []) + [ask_lane(name) for name in lanes]
+    try:
+        answers = await asyncio.gather(*work)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail=f"a route did not answer: {exc}") from exc
+    result = audit.judge(dict(zip(names, answers)))
+    workers = {"main": [stage.worker_id for stage in runtime.route]} if on_main else {}
+    workers |= {name: [str(stage["worker_id"]) for stage in runtime.lanes.seen.get(name, {}).get("route", [])] for name in lanes}
+    result |= {"model": model, "samples": samples, "routes": workers, "at": int(time.time())}
+    runtime.last_audit = result
+    if result["verdict"] != "agree":
+        detail = f"{model}: suspects {result['suspects']}" if result["suspects"] else f"{model}: two routes differ, so a third is needed to say which"
+        runtime.add_event("failure", "Routes disagree", detail)
+    return result
 
 
 @app.get("/admin/network")
