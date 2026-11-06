@@ -344,6 +344,23 @@ None of this has been measured past two machines, so the first milestone is a re
 
 ### Chat page and dashboard
 
+Every node serves a chat page at `/chat` and a console at `/dashboard`. These screenshots show the real pages with simulated data, because no mesh this size has run yet. Each page shows what it does today, and none of these figures are measurements.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/dashboard-dark.png">
+  <img alt="The dashboard: the model's layers across machines, pool metrics, the route's stages, and what needs attention." src="docs/screenshots/dashboard-light.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/chat-dark.png">
+  <img alt="The chat page: a reply with its speed, and the stages it ran on." src="docs/screenshots/chat-light.png">
+</picture>
+
+The console is built to stay readable at 60 workers, grouping them by state so what needs you comes first:
+
+![The dashboard with 60 simulated workers, marked as simulated at the top of the page.](docs/screenshots/dashboard-60-workers.png)
+
+
 Every node serves both, so any node's address works.
 
 | Page | What it shows |
