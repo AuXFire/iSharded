@@ -23,6 +23,7 @@ from isharded.gguf import (
     read_strings,
     write_stage,
 )
+from isharded.gguf import GgufHeader, split_parts
 from isharded.gguf_stage import cpu_tensor_patterns
 from isharded.models import create_adapter
 from isharded.planner import Candidate, ModelProfile, plan_placement, stored_bytes
@@ -998,6 +999,19 @@ def test_a_missing_system_library_names_its_package(tmp_path, monkeypatch) -> No
         llamacpp.load_native(tmp_path / "libggml-base.so")
 
 
+def test_a_system_with_an_old_glibc_is_told_what_to_do(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    from isharded import llamacpp
+
+    def refuse(_):
+        raise OSError("/lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found (required by libllama.so)")
+
+    monkeypatch.setattr(llamacpp.C, "CDLL", refuse)
+    with pytest.raises(llamacpp.LlamaError, match="needs glibc 2.38 or newer.*--llama-dir"):
+        llamacpp.load_native(tmp_path / "libllama.so")
+
+
 def test_a_platform_without_that_build_says_what_it_offers(monkeypatch) -> None:
     import pytest
 
@@ -1017,3 +1031,65 @@ def test_a_gpu_reading_a_card_cannot_give_is_left_out(monkeypatch) -> None:
     answer = SimpleNamespace(returncode=0, stdout="RTX 3060, 57, [N/A], 3, 3971, 6144\nbroken line\n")
     (gpu,) = inventory.nvidia_gpus(run=lambda *_, **__: answer)
     assert gpu == {"name": "RTX 3060", "temperature_c": 57.0, "load_percent": 3.0, "memory_used_mib": 3971.0, "memory_total_mib": 6144.0}
+
+
+def split_blob(blob, name_of, folder):
+    """Two valid parts of a GGUF, the way llama-gguf-split writes them."""
+    header = header_of(blob)
+    names = list(header.tensors)
+    halves = [names[: len(names) // 2], names[len(names) // 2 :]]
+    files = []
+    for index, chosen in enumerate(halves):
+        entries = [
+            key("split.no", 4, struct.pack("<H", index)),  # uint16 in real files; the value is not read
+            key("split.count", 4, struct.pack("<H", 2)),
+            key("split.tensors.count", T_UINT32, struct.pack("<I", len(names))),
+        ][1 if False else 2 :]
+        if index == 0:
+            entries = entries + [key(entry.key, entry.kind, entry.raw) for entry in header.keys.values()]
+        infos, data = b"", b""
+        for tensor_name in chosen:
+            tensor = header.tensors[tensor_name]
+            infos += text(tensor_name) + struct.pack("<I", 1) + struct.pack("<Q", tensor.nbytes // 4) + struct.pack("<IQ", 0, len(data))
+            data += blob[header.data_start + tensor.offset : header.data_start + tensor.offset + tensor.nbytes]
+            data += bytes(-len(data) % 32)
+        head = b"GGUF" + struct.pack("<IQQ", 3, len(chosen), len(entries)) + b"".join(entries) + infos
+        head += bytes(-len(head) % 32)
+        path = folder / name_of(index + 1)
+        path.write_bytes(head + data)
+        files.append(path)
+    return files
+
+
+def test_every_part_is_named_from_any_part():
+    assert split_parts("a/Model-Q3-00002-of-00003.gguf") == [f"a/Model-Q3-0000{index}-of-00003.gguf" for index in (1, 2, 3)]
+    assert split_parts("whole.gguf") == ["whole.gguf"]
+
+
+def test_a_split_gguf_reads_as_one_model_with_each_tensor_in_its_own_part(tmp_path):
+    blob = build_file()
+    whole = header_of(blob)
+    first, second = split_blob(blob, lambda index: f"m-{index:05d}-of-00002.gguf", tmp_path)
+
+    manifest = build_manifest(str(second))  # any part names the model
+
+    assert set(manifest.tensors) == set(whole.tensors)
+    assert {ref.file for ref in manifest.tensors.values()} == {first.name, second.name}
+    assert manifest.config["gguf_parts"] == {first.name: first.stat().st_size, second.name: second.stat().st_size}
+    assert manifest.config["gguf_file"] == first.name
+    for name, ref in manifest.tensors.items():
+        tensor = whole.tensors[name]
+        expected = blob[whole.data_start + tensor.offset : whole.data_start + tensor.offset + tensor.nbytes]
+        got = (tmp_path / ref.file).read_bytes()[ref.start : ref.end]
+        assert got == expected, name
+    skeleton = GgufHeader.from_skeleton(manifest.config["gguf"])
+    assert not [name for name in skeleton.keys if name.startswith("split.")]  # a stage is one whole file
+    assert skeleton.vocab_size == whole.vocab_size
+
+
+def test_a_missing_part_or_tensor_is_refused_by_name(tmp_path):
+    blob = build_file()
+    first, second = split_blob(blob, lambda index: f"m-{index:05d}-of-00002.gguf", tmp_path)
+    second.unlink()
+    with pytest.raises(Exception, match="m-00002-of-00002"):
+        build_manifest(str(first))

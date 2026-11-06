@@ -15,7 +15,7 @@ from contextlib import aclosing, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 import numpy as np
@@ -27,7 +27,7 @@ from starlette.background import BackgroundTask
 from . import __version__
 from .access import INVITE_FIELDS, load_authority, NeedsAuthority, node_of, ROLE_ADMIN, ROLE_MEMBER, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, Caller
 from .embedding import POOLED_TYPES, dimensions_problem, encoded, inputs_problem, length_problem, passes, shaped, smallest_dimensions
-from .gguf import GgufHeader, parse_source
+from .gguf import GgufHeader, parse_source, split_parts
 from . import audit
 from .discovery import start_beacon
 from .lanes import LaneDoor
@@ -58,10 +58,11 @@ from .protocol import (
     auth_headers,
 )
 from .pool import LOOPBACK, check_exposure, home as pool_home, load_token, read_membership_request
-from .serving import BodyLimit, ChunkedResponses, serve, where_everything_is
+from .serving import MAX_STRANGER_BYTES, AddressLimit, BodyLimit, ChunkedResponses, client_address, serve, where_everything_is
 from .mesh import clean_url
+from .statements import Refused, Statements, make_statement
 from .tickets import PREFIX as TICKET_PREFIX, NodeTickets, TicketChecker, TicketIdentity, client_auth, make_checker, reply_audience
-from .tls import BEHALF, BEHALF_HEADER, FORWARD_MARK, INTERCEPTED, intercepted, PEER, client_verify
+from .tls import BEHALF, BEHALF_HEADER, FORWARD_MARK, INTERCEPTED, KEY_HELD, STATEMENT, intercepted, PEER, client_verify, node_transport, stay_on_this_machine_async
 from .tokenizer import ChatTokenizer, IncrementalText, load_tokenizer
 from .toolcalls import (
     MARKER_TOKENS,
@@ -76,7 +77,7 @@ from .toolcalls import (
     uses_tools,
 )
 from .vision import ImageRefused, chat_images, expand_prompt, image_id, projector_marker
-from .weights import apply_model_hashes, Manifest, WeightSourceError, build_manifest
+from .weights import apply_model_hashes, Manifest, WeightSourceError, build_manifest, has_model_host
 
 # Replans allowed when workers fail mid-load before the job gives up.
 MAX_DEPLOY_ATTEMPTS = 4
@@ -88,6 +89,8 @@ MAX_MISSED_POLLS = 6
 LAYER_FLOOR_MS = 0.5
 # Small models that share a vocabulary with a family, for speculative decoding.
 AUTO_DRAFTS = {
+    "qwen3": "unsloth/Qwen3-0.6B-GGUF:Qwen3-0.6B-Q8_0.gguf",
+    "qwen3moe": "unsloth/Qwen3-0.6B-GGUF:Qwen3-0.6B-Q8_0.gguf",
     "qwen35": "lmstudio-community/Qwen3.5-0.8B-GGUF:Qwen3.5-0.8B-Q8_0.gguf",
     "qwen35moe": "lmstudio-community/Qwen3.5-0.8B-GGUF:Qwen3.5-0.8B-Q8_0.gguf",
 }
@@ -105,8 +108,18 @@ LOGGED_EVENTS = {"failure", "recovery", "mesh", "rebalance", "security"}
 # A live worker that failed to activate gets this many more tries, this far apart.
 ACTIVATE_RETRIES = 2
 ACTIVATE_RETRY_SECONDS = 5.0
+# How long a measured link is believed, how many tries make one measurement, and the
+# most a load waits for measuring. A link nobody could cross counts as this slow.
+LINK_TTL_SECONDS = 600.0
+LINK_PROBE_ROUNDS = 3
+LINK_PROBE_SECONDS = 30.0
+UNREACHABLE_LINK_MS = 10_000.0
 # Replanning around a worker that is alive but failed may move this much at most.
 REPLAN_MOVE_LIMIT_BYTES = 2 * 1024**3
+# A restarted worker is back in seconds with its weights on disk, while moving them
+# takes minutes. Replacing a lost worker waits this long, if replacing it would move much.
+WORKER_RETURN_SECONDS = 75.0
+WORKER_RETURN_CHECK_SECONDS = 5.0
 # Healthy checks before a quarantined worker may return, doubling per offense.
 PROBATION_PASSES = 3
 MAX_PROBATION_PASSES = 48
@@ -129,6 +142,14 @@ MOVE_WAIT_SECONDS = 90.0
 STREAM_CHECK_SECONDS = 5.0
 # How long workers get to come back before a saved route is rebuilt from scratch.
 ADOPTION_GRACE_SECONDS = 60.0
+# Anyone can ask to join, so this is how much of it one address may do. A real machine
+# asks once, and one address cannot fill the queue before its first requests expire.
+JOIN_BURST = 10
+JOINS_PER_MINUTE = 1.0
+# A good entry is free, or a stranger's bad ones could lock out an owner sharing their
+# address. This is for entries that cost a signature check and changed nothing.
+WASTED_ENTRY_BURST = 20
+WASTED_ENTRIES_PER_MINUTE = 6.0
 CATALOG = [
     {"id": "Qwen/Qwen2.5-0.5B-Instruct", "family": "Qwen2.5", "kind": "dense", "size": "1 GB"},
     {"id": "Qwen/Qwen3-0.6B", "family": "Qwen3", "kind": "dense", "size": "1.5 GB"},
@@ -209,7 +230,7 @@ class ModelTarget:
     @property
     def file_sizes(self) -> dict[str, int]:
         config = self.manifest.config
-        return {config["gguf_file"]: config["gguf_file_size"]} if "gguf_file" in config else {}
+        return config.get("gguf_parts") or ({config["gguf_file"]: config["gguf_file_size"]} if "gguf_file" in config else {})
 
     def source_for(self, worker_id: str) -> str:
         return self.worker_model_ids.get(worker_id, self.model_id)
@@ -339,7 +360,11 @@ def check_pooling(request: LoadModelRequest, adapter: Adapter) -> None:
 
 def holders_of(sources: dict[str, list[str]], model: str) -> list[str]:
     located = parse_source(model)
-    return sources.get(located[1], []) if located else []
+    if not located:
+        return []
+    # A node holding only some parts of a split file cannot serve the rest.
+    parts = split_parts(located[1])
+    return [holder for holder in sources.get(parts[0], []) if all(holder in sources.get(part, []) for part in parts)]
 
 
 def resolve_draft(
@@ -456,6 +481,8 @@ class Orchestrator:
         self.reuse_cached = os.getenv("ISHARDED_REUSE_CACHED", "1") != "0"
         self.peer_fetch = os.getenv("ISHARDED_PEER_FETCH", "1") != "0"
         self.workers: dict[str, WorkerRecord] = {}
+        self.links: dict[tuple[str, str], float] = {}  # round trip in ms, from one worker to another
+        self.links_checked: dict[tuple[str, str], float] = {}
         self.model_id: str | None = None
         self.planning_model: str | None = None
         self.active: ModelTarget | None = None
@@ -464,7 +491,7 @@ class Orchestrator:
         self.active_cache_url: str | None = None
         self.epoch = 0
         self.job: LoadJob | None = None
-        self.client = httpx.AsyncClient(timeout=httpx.Timeout(3600.0, connect=10.0), verify=client_verify(), auth=client_auth())
+        self.client = httpx.AsyncClient(transport=node_transport(), event_hooks={"request": [stay_on_this_machine_async]}, timeout=httpx.Timeout(3600.0, connect=10.0), verify=client_verify(), auth=client_auth())
         authority = load_authority()
         self.access = AccessControl.load(
             self.pool_token,
@@ -504,6 +531,9 @@ class Orchestrator:
             self.mesh = ControlMesh(os.getenv("ISHARDED_NODE_ID") or socket.gethostname(), seen_as, seeds)
         self.background: set[asyncio.Task[Any]] = set()
         self.lanes = LaneDoor(self)
+        self.statements = Statements()
+        self.join_limit = AddressLimit(JOIN_BURST, JOINS_PER_MINUTE)
+        self.entry_limit = AddressLimit(WASTED_ENTRY_BURST, WASTED_ENTRIES_PER_MINUTE)
         self.round_trip_ms: dict[str, float] = {}
         self.join_answers: dict[str, set[str]] = {}
         self.last_audit: dict[str, Any] | None = None
@@ -539,6 +569,21 @@ class Orchestrator:
         self.background.add(task)
         task.add_done_callback(self.background.discard)
         return task
+
+    def control_name(self, node: str | None = None) -> str:
+        """A control plane, as a statement names it. A lane shares its node's name."""
+        name = node or (self.mesh.node_id if self.mesh else "")
+        return f"{name}/{self.lane_name}" if self.lane_name else name
+
+    def speak_for(self, caller: Caller, target: str, method: str, path: str, body: bytes = b"") -> str:
+        """What tells the next control plane who asked. The person's key does not go with it."""
+        if self.access.ownerless:
+            return f"{caller.role}:{caller.name}"  # keys never travel here, so nobody could check it
+        statement, key = STATEMENT.get(), KEY_HELD.get()
+        if statement or not key:
+            return statement or ""
+        assert self.mesh is not None
+        return make_statement(key, self.mesh.node_id, target, method, path, body)
 
     async def close(self) -> None:
         for task in (self.maintenance_task, self.gossip_task):
@@ -1087,6 +1132,44 @@ class Orchestrator:
             )
         return updated
 
+    async def measure_links(self) -> None:
+        """Time the links between workers, which the planner routes by.
+
+        Every token crosses each link on its route and comes back, so on a mesh that
+        spans cities these round trips set the speed. Each is measured from the end
+        that would send, and a link that fails stays on record so that no route needs it.
+        """
+        urls = {
+            worker_id: str(record.registration.advertised_url).rstrip("/")
+            for worker_id, record in self.workers.items()
+            if record.live and not record.quarantined
+        }
+        now = time.monotonic()
+
+        async def probe(source: str, target: str) -> None:
+            try:
+                response = await self.client.post(
+                    urls[source] + "/internal/diag/probe",
+                    json={"url": urls[target], "sizes": [100], "rounds": LINK_PROBE_ROUNDS},
+                    headers=auth_headers(self.pool_token),
+                    timeout=10.0,
+                )
+                response.raise_for_status()
+                self.links[source, target] = float(response.json()["100"]["median_ms"])
+            except (httpx.HTTPError, KeyError, TypeError, ValueError):
+                self.links[source, target] = UNREACHABLE_LINK_MS
+            self.links_checked[source, target] = now
+
+        async def from_one(source: str) -> None:
+            for target in urls:
+                if target != source and now - self.links_checked.get((source, target), -LINK_TTL_SECONDS) >= LINK_TTL_SECONDS:
+                    await probe(source, target)
+
+        try:
+            await asyncio.wait_for(asyncio.gather(*map(from_one, urls)), LINK_PROBE_SECONDS)
+        except asyncio.TimeoutError:
+            self.add_event("mesh", "Link measuring cut short", f"Planning with what {LINK_PROBE_SECONDS:.0f} s could measure")
+
     def plan_memory(self, target: ModelTarget, route: list[StageAssignment]) -> dict[str, Any]:
         """A route's use of the memory on offer, with what each stage spills.
 
@@ -1161,7 +1244,7 @@ class Orchestrator:
                 units=units,
                 peers=self._peers_for(target, stage.worker_id, units),
                 file_sizes=target.file_sizes,
-                file_sources=target.file_sources,
+                file_sources=target.file_sources if target.peer_fetch or not has_model_host(target.source_for(stage.worker_id)) else [],
             )
             try:
                 response = await self.client.post(
@@ -1174,7 +1257,7 @@ class Orchestrator:
                 job.workers[stage.worker_id] = response.json()
                 pending[stage.worker_id] = stage
             except httpx.HTTPError as exc:
-                failed[stage.worker_id] = f"could not start download: {exc}"
+                failed[stage.worker_id] = f"could not start download: {str(exc) or type(exc).__name__}"
 
         missed = dict.fromkeys(pending, 0)
         while pending and not failed and not job.cancelled:
@@ -1352,6 +1435,7 @@ class Orchestrator:
         for _ in range(MAX_DEPLOY_ATTEMPTS):
             await self.refresh_worker_metrics()
             await self.refresh_holdings(target)
+            await self.measure_links()
             try:
                 route = self.plan(target)
             except PlacementError as exc:
@@ -1468,11 +1552,33 @@ class Orchestrator:
                 if record.live:
                     record.quarantined = False
                     record.quarantine_reason = None
+        else:
+            await self._await_lost_workers()
         self.job = LoadJob(job_id=uuid.uuid4().hex, model_id=self.active.model_id)
         return await self.run_job(
             self.job,
             self.deploy(self.active, self.job, generation_lock_held=generation_lock_held),
         )
+
+    async def _await_lost_workers(self) -> None:
+        """Give a lost worker time to come back, when replacing it would move many weights.
+
+        Nothing is lost by waiting, since the replies on this route would wait for the
+        move anyway. A worker that does not return is replaced as before.
+        """
+        deadline = time.monotonic() + WORKER_RETURN_SECONDS
+        assert self.active is not None
+        while self._absent_from_route() and time.monotonic() < deadline:
+            await self.refresh_holdings(self.active)
+            try:
+                moved = describe_plan(self.active, self.plan(self.active))["download_bytes"]
+            except PlacementError:
+                moved = None  # nothing could take the model without it
+            if moved is not None and moved <= REPLAN_MOVE_LIMIT_BYTES:
+                return
+            await asyncio.sleep(WORKER_RETURN_CHECK_SECONDS)
+            await self.refresh_worker_metrics()
+            self._review_quarantine()
 
     async def restore_session_from_cache(
         self,
@@ -2291,7 +2397,7 @@ async def lifespan(_: FastAPI):
         await runtime.close()
 
 
-app = FastAPI(title="iSharded orchestrator", version=__version__, lifespan=lifespan)
+app = FastAPI(title="iSharded orchestrator", version=__version__, lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
 
 def require(authorization: str | None, role: str) -> Caller:
@@ -2358,7 +2464,38 @@ def verify_user(authorization: str | None) -> Caller:
 FORWARDED_PATHS = ("/v1/", "/admin/")
 SAFE_NODE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 # Connection details belong to each hop, and httpx sets the length itself.
+REPEATABLE_METHODS = {"GET", "HEAD"}
 HOP_HEADERS = {"host", "content-length", "connection", "transfer-encoding", "keep-alive", "content-encoding"}
+
+
+def asked_path(request: Request) -> str:
+    """A request's path and query, written the same way by every node that handles it."""
+    query = urlencode(sorted(request.query_params.multi_items()))
+    return f"{request.url.path}?{query}" if query else request.url.path
+
+
+async def believe_forward(request: Request) -> str | None:
+    """Take from a forwarded request only what it can prove. Says why, if it proved nothing."""
+    access, peer = runtime.access, PEER.get()
+    claim = request.headers.get(BEHALF_HEADER)
+    if peer is None or not claim or access.authority is None or peer in access.revoked:
+        return None
+    if access.ownerless:
+        # An operator commands their own node. Here they are only a member,
+        # and the node that passed this on is the one that answers for them.
+        role, _, name = claim.partition(":")
+        if role not in {ROLE_USER, ROLE_MEMBER, ROLE_ADMIN}:
+            return None
+        proven = f"{peer}/{name.rpartition('/')[2]}", ROLE_USER if role == ROLE_USER else ROLE_MEMBER
+    else:
+        try:
+            proven = runtime.statements.check(access, claim, peer, runtime.control_name(), request.method, asked_path(request), await request.body(), bool(runtime.lane_name))
+        except Refused as exc:
+            return str(exc)
+        STATEMENT.set(claim)
+    BEHALF.set(proven)
+    request.state.vouched = f"{proven[1]}:{proven[0]}"
+    return None
 
 
 @app.middleware("http")
@@ -2369,18 +2506,13 @@ async def forward_to_coordinator(request: Request, call_next: Any) -> Any:
     do not depend on the coordinator. Only management goes there, along with
     replies from a node that has not installed the route yet.
     """
+    KEY_HELD.set(runtime.access.bearer(request.headers.get("authorization")))
     if FORWARD_MARK in request.headers:
         # This connection proves which node passed the request on, not who sent it.
-        # With an authority, that node checked the key and kept it, and says who asked.
-        vouched = request.headers.get(BEHALF_HEADER, "")
-        role, _, name = vouched.partition(":")
-        if PEER.get() is not None and runtime.access.authority is not None and role in {ROLE_USER, ROLE_MEMBER, ROLE_ADMIN}:
-            if runtime.access.ownerless:
-                # An operator commands their own node. Here they are only a member,
-                # and the node that passed this on is the one that answers for them.
-                name, role = f"{PEER.get()}/{name.rpartition('/')[2]}", ROLE_USER if role == ROLE_USER else ROLE_MEMBER
-            BEHALF.set((name, role))
+        refused = await believe_forward(request)
         PEER.set(None)
+        if refused:
+            return JSONResponse(status_code=401, content={"detail": refused})
     mesh = runtime.mesh
     path = request.url.path
     if any(part in {".", ".."} for part in path.replace("\\", "/").split("/")):
@@ -2398,7 +2530,7 @@ async def forward_to_coordinator(request: Request, call_next: Any) -> Any:
     headers.pop(BEHALF_HEADER, None)
     if runtime.access.authority is not None:
         # Anyone can claim to coordinate, so a person's key never leaves the node
-        # they gave it to. It is checked here, and only the result travels.
+        # they gave it to. It is checked here, and only a statement signed with it travels.
         caller = runtime.access.identify(request.headers.get("authorization"), None)
         if caller is None:
             return JSONResponse(status_code=401, content={"detail": "a valid key is required"})
@@ -2406,9 +2538,13 @@ async def forward_to_coordinator(request: Request, call_next: Any) -> Any:
         if wait:
             return JSONResponse(status_code=429, content={"detail": f"rate limit reached for {caller.name}"})
         headers.pop("authorization", None)
-        headers[BEHALF_HEADER] = f"{caller.role}:{caller.name}"
-    try:
-        upstream = await runtime.client.send(
+    else:
+        caller = None
+
+    async def ask_coordinator() -> httpx.Response:
+        if caller is not None:  # a statement is good once, so each try makes its own
+            headers[BEHALF_HEADER] = runtime.speak_for(caller, runtime.control_name(mesh.leader_id), request.method, asked_path(request), await request.body())
+        return await runtime.client.send(
             runtime.client.build_request(
                 request.method,
                 target + request.url.path,
@@ -2418,6 +2554,15 @@ async def forward_to_coordinator(request: Request, call_next: Any) -> Any:
             ),
             stream=True,
         )
+
+    try:
+        try:
+            upstream = await ask_coordinator()
+        except httpx.RemoteProtocolError:
+            # A keep-alive connection can die while idle, seen only on its next use.
+            if request.method not in REPEATABLE_METHODS:
+                raise
+            upstream = await ask_coordinator()
     except httpx.HTTPError as exc:
         return JSONResponse(status_code=503, content={"detail": f"the coordinator did not answer: {exc}"})
     passed = {name: value for name, value in upstream.headers.items() if name.lower() not in HOP_HEADERS}
@@ -2430,6 +2575,7 @@ def page(name: str) -> HTMLResponse:
     folder = Path(__file__).parent
     styles = (folder / "ui.css").read_text(encoding="utf-8")
     content = (folder / name).read_text(encoding="utf-8").replace("/* isharded:ui.css */", styles)
+    content = content.replace("<!-- isharded:flags.svg -->", (folder / "flags.svg").read_text(encoding="utf-8"))
     return HTMLResponse(content, headers={"Cache-Control": "no-store"})
 
 
@@ -2465,7 +2611,7 @@ async def audit_requests(request: Request, call_next: Any) -> Any:
         marked = FORWARD_MARK in request.headers
         peer = None if marked else PEER.get()
         caller = runtime.access.identify(request.headers.get("authorization"), peer)
-        vouched = request.headers.get(BEHALF_HEADER) if marked and PEER.get() else None
+        vouched = getattr(request.state, "vouched", None)  # what was proven, and never what was claimed
         client = request.client.host if request.client else None
         actor = f"{vouched} via {PEER.get()}" if vouched else caller.name if caller else "unknown"
         runtime.audit.record(actor, request.method, path, response.status_code, client)
@@ -2474,7 +2620,7 @@ async def audit_requests(request: Request, call_next: Any) -> Any:
 
 # Added last, so it runs first: nothing oversized is read, forwarded or parsed.
 app.add_middleware(TicketIdentity)
-app.add_middleware(BodyLimit)
+app.add_middleware(BodyLimit, paths={"/join/requests": MAX_STRANGER_BYTES, "/access/entries": MAX_STRANGER_BYTES})
 app.add_middleware(ChunkedResponses, path="/mcp")
 
 
@@ -2482,7 +2628,7 @@ app.add_middleware(ChunkedResponses, path="/mcp")
 async def ready() -> JSONResponse:
     """For load balancers: can this node serve a reply right now?"""
     serving = bool(runtime.route and runtime.tokenizer)
-    return JSONResponse(status_code=200 if serving else 503, content={"ready": serving, "model": runtime.model_id})
+    return JSONResponse(status_code=200 if serving else 503, content={"ready": serving})
 
 
 @app.get("/metrics")
@@ -2653,6 +2799,7 @@ async def preview_plan(body: LoadModelRequest, authorization: str | None = Heade
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     await runtime.refresh_worker_metrics()
     await runtime.refresh_holdings(target)
+    await runtime.measure_links()
     try:
         route = runtime.plan(target, honor_pins_strictly=True)
     except PlacementError as exc:
@@ -2722,11 +2869,24 @@ async def unblock_node(name: str, authorization: str | None = Header(default=Non
     return {"status": "unblocked"}
 
 
+def hold_back(limit: AddressLimit, address: str) -> None:
+    wait = limit.wait(address)
+    if wait:
+        raise HTTPException(status_code=429, detail="too many requests from this address; try again soon", headers={"Retry-After": str(int(wait) + 1)})
+
+
+def address_of(request: Request) -> str:
+    return client_address(request.client.host if request.client else None)
+
+
 @app.post("/join/requests")
-async def request_to_join(body: dict[str, Any]) -> dict[str, str]:
+async def request_to_join(request: Request, body: dict[str, Any]) -> dict[str, str]:
     """Anyone may ask. Asking grants nothing until the owner signs an answer."""
     if runtime.access.authority is None or runtime.access.ownerless:
         raise HTTPException(status_code=404, detail="this pool has no owner to ask")
+    address = address_of(request)
+    hold_back(runtime.join_limit, address)
+    runtime.join_limit.charge(address)  # before the parsing, which is the work a stranger is asking for
     try:
         details = read_membership_request(str(body["request"]))
     except (KeyError, ValueError) as exc:
@@ -2743,6 +2903,7 @@ async def request_to_join(body: dict[str, Any]) -> dict[str, str]:
 @app.get("/join/requests")
 async def join_requests(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     verify_admin(authorization)
+    runtime.access.expire_join_requests()
     # What a person decided stays on this machine, for the signer beside it to act on.
     return {"requests": [{**held, "approved": name in runtime.join_answers.get("approve", ()), "denied": name in runtime.join_answers.get("deny", ())} for name, held in runtime.access.join_requests.items()]}
 
@@ -2767,7 +2928,7 @@ async def join_authority() -> dict[str, str]:
     """The mesh's public certificate, for a new machine to check against its invite."""
     if runtime.access.authority is None or runtime.access.ownerless:
         raise HTTPException(status_code=404, detail="this pool has no authority")
-    return {"authority": Path(os.environ["ISHARDED_CA_FILE"]).read_text(encoding="utf-8"), "name": runtime.mesh.node_id if runtime.mesh else ""}
+    return {"authority": Path(os.environ["ISHARDED_CA_FILE"]).read_text(encoding="utf-8")}
 
 
 @app.post("/admin/invites")
@@ -2794,12 +2955,19 @@ async def join_certificate(name: str) -> dict[str, str]:
 
 
 @app.post("/access/entries")
-async def add_access_entry(body: dict[str, Any]) -> dict[str, str]:
+async def add_access_entry(request: Request, body: dict[str, Any]) -> dict[str, str]:
     """Take a change signed by the pool authority. The signature is the credential."""
     if runtime.access.authority is None:
         raise HTTPException(status_code=404, detail="this pool has no authority")
+    address = address_of(request)
+    hold_back(runtime.entry_limit, address)
+    held = len(runtime.access.signed)
     if not runtime.access.add_signed(body):
+        runtime.entry_limit.charge(address)
         raise HTTPException(status_code=403, detail="this entry is not signed by the pool authority")
+    if len(runtime.access.signed) == held:
+        runtime.entry_limit.charge(address)  # a repeat costs the same to check and changes nothing
+        return {"status": "accepted"}
     runtime.add_event("security", "Access list changed", str(body["entry"].get("type")))
     runtime.apply_revocations()
     return {"status": "accepted"}
@@ -2876,7 +3044,9 @@ async def lane_status(authorization: str | None = Header(default=None)) -> dict[
         "lane": runtime.lane_name,
         "model": runtime.model_id or state.get("request", {}).get("model_id"),
         "ready": bool(runtime.tokenizer and runtime.route),
+        "leader": runtime.mesh.leader_id if runtime.mesh else None,
         "leader_url": runtime.mesh.leader_url if runtime.mesh else None,
+        "entries_held": runtime.access.entries_held,
         "workers": sum(1 for record in runtime.workers.values() if record.live),
         "route": [{key: stage[key] for key in ("worker_id", "start_layer", "end_layer")} for stage in route],
         "load_job": runtime.job.snapshot() if runtime.job else None,
@@ -2889,6 +3059,8 @@ async def lane_access(body: dict[str, Any], authorization: str | None = Header(d
     """Signed access changes, passed in by this node's front door. Signatures are checked in merge."""
     verify_token(authorization)
     runtime.access.merge(body)
+    if runtime.lane_name and runtime.mesh and PEER.get() == runtime.mesh.node_id and not runtime.access.ownerless:
+        runtime.access.take_node_keys(body)
     runtime.apply_revocations()
     return {"status": "merged"}
 

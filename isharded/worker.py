@@ -27,6 +27,7 @@ import torch
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 
+from .inventory import ram
 from .memory import (
     AUTO_RAM_SHARE,
     Accelerator,
@@ -36,6 +37,7 @@ from .memory import (
     discover_accelerators,
     live_free_bytes,
 )
+from .geo import country_code, node_country
 from .models import Adapter, GgufAdapter, create_adapter
 from .models.base import layer_unit
 from .protocol import (
@@ -75,9 +77,9 @@ from .slots import SlotGate
 from .access import load_authority
 from .inventory import inventory
 from .tickets import TicketIdentity, client_auth
-from .tls import PEER, client_verify
+from .tls import client_verify, node_transport, PEER, stay_on_this_machine_async
 from .vision import PromptPart, PromptRows, lay_out
-from .weights import FetchProgress, LoadedUnit, UnitCache, WeightSourceError, gguf_reader, load_unit, map_unit
+from .weights import FetchProgress, LoadedUnit, UnitCache, WeightSourceError, gguf_reader, has_model_host, load_unit, map_unit
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "isharded" / "units"
 SUPPORTED_DTYPES = ["bfloat16", "float32", "float16"]
@@ -106,7 +108,7 @@ def parse_ram_budget(value: str) -> int | None:
     if not value:
         return None
     if value == "auto":
-        return int(psutil.virtual_memory().available * AUTO_RAM_SHARE)
+        return int(ram().available * AUTO_RAM_SHARE)
     return int(float(value) * 1024**3)
 
 
@@ -129,7 +131,7 @@ def hardware_info(
         runtime_version=primary.runtime_version if primary else platform.python_version(),
         supported_dtypes=SUPPORTED_DTYPES,
         cpu_cores=os.cpu_count() or 1,
-        ram_total_bytes=psutil.virtual_memory().total,
+        ram_total_bytes=ram().total,
         accelerator_name=" + ".join(item.name for item in accelerators) or None,
         accelerator_memory_bytes=accelerator_memory,
         contribution=ResourceContribution(
@@ -153,6 +155,8 @@ MAX_WAITING_REPLIES = 32
 DRAIN_LIMIT_SECONDS = 180.0
 # A control plane this worker only heard about, and that stays silent, is forgotten.
 CONTROL_LINK_FAILURES = 60
+CHECK_IN_SECONDS = 5.0
+UNAVAILABLE_STATUSES = {502, 503, 504}
 
 
 @dataclass(slots=True)
@@ -282,6 +286,7 @@ class WorkerRuntime:
         self.control_urls: dict[str, ControlLink] = {url: ControlLink() for url in self.seed_urls}
         self.term = 0
         self.advertised_url = os.getenv("ISHARDED_ADVERTISE_URL", "http://127.0.0.1:8100").rstrip("/")
+        self.country = node_country(self.advertised_url, os.getenv("ISHARDED_LOCATION"))
         self.pool_token = load_token()
         self.requires_identity = bool(os.getenv("ISHARDED_CA_FILE"))
         self.authority = load_authority()
@@ -362,7 +367,7 @@ class WorkerRuntime:
         self.caches: dict[str, CacheEntry] = {}
         self.lock = asyncio.Lock()
         # A disk-tier prompt can take minutes, and a slow hop is not a failure.
-        self.client = httpx.AsyncClient(timeout=httpx.Timeout(1800.0, connect=10.0), verify=client_verify(), auth=client_auth())
+        self.client = httpx.AsyncClient(transport=node_transport(), event_hooks={"request": [stay_on_this_machine_async]}, timeout=httpx.Timeout(1800.0, connect=10.0), verify=client_verify(), auth=client_auth())
         self.registration_task: asyncio.Task[None] | None = None
         self.inference_calls = 0
         self.tokens_processed = 0
@@ -435,6 +440,7 @@ class WorkerRuntime:
             hardware=self.hardware,
             protocol_version=PROTOCOL_VERSION,
             code_version=__version__,
+            country=self.country,
         )
 
     async def _check_in(self, url: str, link: ControlLink) -> None:
@@ -484,10 +490,17 @@ class WorkerRuntime:
                 self.revoked_nodes.add(str(entry.get("name")))
 
     async def registration_loop(self) -> None:
-        """Stay known to every control plane, so a new coordinator needs no introduction."""
+        """Stay known to every control plane, so a new coordinator needs no introduction.
+
+        Each link keeps its own time. Waiting for all of them let one flaky link hold
+        up every check-in, until this worker looked dead even to the node beside it.
+        """
+        running: dict[str, asyncio.Task[None]] = {}
         while True:
-            await asyncio.gather(*(self._check_in(url, link) for url, link in list(self.control_urls.items())))
-            await asyncio.sleep(5)
+            for url, link in list(self.control_urls.items()):
+                if url not in running or running[url].done():
+                    running[url] = asyncio.create_task(self._check_in(url, link))
+            await asyncio.sleep(CHECK_IN_SECONDS)
 
     def pool_status(self) -> list[dict[str, Any]]:
         """Live view of each pool, for the planner and the dashboard."""
@@ -504,6 +517,9 @@ class WorkerRuntime:
 
     def start_prepare(self, request: PrepareRequest) -> FetchProgress:
         """Begin downloading in the background. Serving is not interrupted."""
+        running = self.prepare_jobs.get(request.job_id)
+        if running is not None:
+            return running  # asked twice, as a retry after a lost reply would
         progress = FetchProgress(request.job_id)
         self.prepare_jobs[request.job_id] = progress
         while len(self.prepare_jobs) > 8:
@@ -526,7 +542,7 @@ class WorkerRuntime:
                 request.peers if self.peer_fetch else None,
                 self.pool_token,
                 request.file_sizes,
-                request.file_sources,
+                request.file_sources if self.peer_fetch or not has_model_host(request.source) else None,
             )
             progress.phase = "ready"
         except (WeightSourceError, httpx.HTTPError, OSError, ValueError) as exc:
@@ -1206,10 +1222,10 @@ class WorkerRuntime:
                 headers=headers,
                 timeout=httpx.Timeout(pass_seconds(hidden.shape[1], self._stages_after()), connect=10.0),
             )
-            if response.status_code == 503:
-                detail = response.json().get("detail")
-                if isinstance(detail, dict) and detail.get("retry"):
-                    raise HTTPException(status_code=503, detail=detail)
+            report = failure_report(response)
+            if report is not None:
+                # Said further down the route. Only the stage that saw it knows who failed.
+                raise HTTPException(status_code=response.status_code, detail=report)
             response.raise_for_status()
             self.downstream_ms_ema = self._ema(
                 self.downstream_ms_ema,
@@ -1224,8 +1240,10 @@ class WorkerRuntime:
             if exc.response.status_code == 409:
                 # The route moved on. Nothing failed, and the reply can follow it.
                 raise HTTPException(status_code=409, detail=f"pipeline epoch mismatch; worker has {self.epoch}") from exc
-            # The next stage is up and refused this request, so blame the request.
             self.last_error = str(exc)
+            if exc.response.status_code in UNAVAILABLE_STATUSES:
+                raise HTTPException(status_code=502, detail={"failed_worker": next_stage.worker_id, "message": str(exc)}) from exc
+            # The next stage is up and refused this request, so blame the request.
             raise HTTPException(status_code=500, detail={"stage_error": str(exc)}) from exc
         except httpx.HTTPError as exc:
             self.last_error = str(exc)
@@ -1233,6 +1251,17 @@ class WorkerRuntime:
                 status_code=502,
                 detail={"failed_worker": next_stage.worker_id, "message": str(exc)},
             ) from exc
+
+
+def failure_report(response: httpx.Response) -> dict[str, Any] | None:
+    """What a stage further down says failed, so that it reaches the entry unchanged."""
+    if response.status_code not in UNAVAILABLE_STATUSES:
+        return None
+    try:
+        detail = response.json().get("detail")
+    except (ValueError, AttributeError):
+        return None
+    return detail if isinstance(detail, dict) and (detail.get("retry") or detail.get("failed_worker")) else None
 
 
 runtime = WorkerRuntime()
@@ -1248,11 +1277,11 @@ async def lifespan(_: FastAPI):
         await runtime.close()
 
 
-app = FastAPI(title="iSharded worker", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="iSharded worker", version="0.2.0", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(TicketIdentity)
 app.add_middleware(
     BodyLimit,
-    large={"/internal/forward": MAX_STAGE_BYTES, "/internal/diag/echo": MAX_STAGE_BYTES},
+    paths={"/internal/forward": MAX_STAGE_BYTES, "/internal/diag/echo": MAX_STAGE_BYTES},
 )
 
 
@@ -1890,6 +1919,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="one or more control planes, comma separated; the rest are found from them",
     )
     parser.add_argument("--advertise-url", default=os.getenv("ISHARDED_ADVERTISE_URL"), help="how other nodes reach this worker")
+    parser.add_argument("--location", type=country_code, default=os.getenv("ISHARDED_LOCATION") or None, help="two letter country code to report, or none to report no country; default is looked up from the advertised address")
     parser.add_argument("--device", default=os.getenv("ISHARDED_DEVICE", "auto"), help="auto, cpu, cuda:0, mps, or xpu:0")
     parser.add_argument("--roles", default=os.getenv("ISHARDED_ROLES", "inference"), help="inference, or kv-cache,checkpoint for a memory worker")
     parser.add_argument("--cpu-threads", type=int, default=int(os.getenv("ISHARDED_CPU_THREADS", "0")), help="CPU threads; 0 uses half the cores for a stage")
@@ -1921,6 +1951,7 @@ def main() -> None:
     os.environ["ISHARDED_WORKER_ID"] = args.worker_id
     os.environ["ISHARDED_ORCHESTRATOR_URL"] = args.orchestrator_url
     os.environ["ISHARDED_ADVERTISE_URL"] = args.advertise_url or f"http://127.0.0.1:{args.port}"
+    os.environ["ISHARDED_LOCATION"] = args.location or ""
     os.environ["ISHARDED_DEVICE"] = args.device
     os.environ["ISHARDED_ROLES"] = args.roles
     os.environ["ISHARDED_CPU_THREADS"] = str(args.cpu_threads)

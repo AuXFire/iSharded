@@ -19,7 +19,7 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 from tokenizers import AddedToken, Regex, Tokenizer, decoders, normalizers, pre_tokenizers
 from tokenizers.models import BPE
 
-from .gguf import GgufHeader, parse_source, read_numbers, read_strings
+from .gguf import GgufHeader, parse_source, read_numbers, read_strings, split_parts
 from .weights import Reader, WeightSourceError, gguf_reader, open_reader, read_gguf_header
 
 # GGUF names a tokenizer's text-splitting rule instead of storing it.
@@ -246,7 +246,7 @@ def load_tokenizer(
     if located:
         reader = gguf_reader(source, revision, holders, token)
         try:
-            return tokenizer_from_gguf(read_gguf_header(reader, located[1]))
+            return tokenizer_from_gguf(read_gguf_header(reader, split_parts(located[1])[0]))
         finally:
             reader.close()
     reader = open_reader(source, revision)

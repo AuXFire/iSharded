@@ -45,6 +45,18 @@ class GgufError(ValueError):
     pass
 
 
+SPLIT_NAME = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", re.IGNORECASE)
+
+
+def split_parts(name: str) -> list[str]:
+    """Every file of a GGUF, in order, from the name of any one of them."""
+    match = SPLIT_NAME.match(name)
+    if not match:
+        return [name]
+    stem, _, count = match.groups()
+    return [f"{stem}-{index:05d}-of-{count}.gguf" for index in range(1, int(count) + 1)]
+
+
 def parse_source(source: str) -> tuple[str, str] | None:
     """Split a GGUF model id into where it lives and the file's name.
 
@@ -235,6 +247,21 @@ def parse_header(read: Callable[[int, int], bytes], file_size: int) -> GgufHeade
         end = following.offset if following else file_size - data_start
         current.nbytes = end - current.offset
     return GgufHeader(version, keys, tensors, data_start, file_size, alignment)
+
+
+def join_parts(parts: list[GgufHeader]) -> GgufHeader:
+    """One header for a split GGUF. The first part holds the keys, and each part its own tensors.
+
+    The split keys go, because a stage is one whole file and llama.cpp would go
+    looking for the others. Offsets stay relative to each part.
+    """
+    first = parts[0]
+    keys = {key: entry for key, entry in first.keys.items() if not key.startswith("split.")}
+    tensors = {tensor.name: tensor for part in parts for tensor in part.tensors.values()}
+    expected = first.get("split.tensors.count")
+    if expected is not None and len(tensors) != int(expected):
+        raise GgufError(f"the parts hold {len(tensors)} tensors, and the first says there are {expected}")
+    return GgufHeader(first.version, keys, tensors, 0, sum(part.file_size for part in parts), first.alignment)
 
 
 def _take_span(cursor: _Cursor, count: int) -> bytes:

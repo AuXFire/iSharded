@@ -262,3 +262,20 @@ def test_asking_for_vulkan_with_none_says_what_to_check(monkeypatch) -> None:
     monkeypatch.setattr(memory, "vulkan_accelerators", lambda: ())
     with pytest.raises(ValueError, match="no Vulkan GPU found"):
         memory.discover_accelerators("vulkan")
+
+
+def test_a_container_limit_is_the_memory_a_node_can_use(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from isharded import inventory
+
+    gib = 1024**3
+    monkeypatch.setattr(inventory.psutil, "virtual_memory", lambda: SimpleNamespace(total=500 * gib, available=450 * gib))
+    assert inventory.ram(tmp_path).total == 500 * gib  # no cgroup files: the host is all there is
+    (tmp_path / "memory.max").write_text("max\n")
+    assert inventory.ram(tmp_path).total == 500 * gib  # a container with no limit
+    (tmp_path / "memory.max").write_text(f"{50 * gib}\n")
+    (tmp_path / "memory.current").write_text(f"{30 * gib}\n")
+    (tmp_path / "memory.stat").write_text(f"anon 1\ninactive_file {10 * gib}\n")
+    limited = inventory.ram(tmp_path)
+    assert (limited.total, limited.available) == (50 * gib, 30 * gib)  # page cache comes back on demand

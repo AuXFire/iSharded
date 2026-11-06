@@ -95,7 +95,7 @@ def test_progress_matches_the_plan_when_a_peer_delivers(held, tmp_path: Path, mo
     monkeypatch.setattr("isharded.weights.fetch_from_peer", copy)
     cache = UnitCache(tmp_path / "cache")
     progress = FetchProgress("job")
-    cache.fetch("unused-source", "m", "r", [unit], progress, peers={"unit": ["http://peer"]})
+    cache.fetch("only-in-the-pool.gguf", "m", "r", [unit], progress, peers={"unit": ["http://peer"]})
     assert progress.bytes_done == unit.nbytes
     assert progress.bytes_from_peers == unit.nbytes
     assert progress.units_done == 1
@@ -242,6 +242,7 @@ def test_a_peer_serving_altered_weights_is_refused_for_the_real_source(held, tmp
         return True
 
     monkeypatch.setattr(weights, "fetch_from_peer", lying_peer)
+    monkeypatch.setattr(weights.SourcePicker, "pick", lambda self, sources: sources[-1])  # the peer, first
     cache.fetch(str(tmp_path / "model"), "m", "r", [unit], FetchProgress("j"), peers={"unit": ["http://peer"]})
     assert cache.path("m", "r", "unit").read_bytes() == file.read_bytes()
 
@@ -255,6 +256,22 @@ def test_a_source_with_altered_weights_stops_the_load(held, tmp_path: Path) -> N
     with pytest.raises(WeightSourceError, match="did not match"):
         cache.fetch(str(tmp_path / "model"), "m", "r", [unit], FetchProgress("j"))
     assert not cache.path("m", "r", "unit").exists()
+
+
+def test_partial_files_from_a_dead_process_are_cleared(held, tmp_path: Path) -> None:
+    import os
+
+    unit, _ = held
+    cache = UnitCache(tmp_path / "cache")
+    folder = cache.path("m", "r", "unit").parent
+    folder.mkdir(parents=True)
+    dead, live = folder / "unit.1.2.part", folder / "unit.3.4.part"
+    dead.write_bytes(b"x")
+    live.write_bytes(b"x")
+    os.utime(dead, (1, 1))
+    cache.fetch(str(tmp_path / "model"), "m", "r", [unit], FetchProgress("j"))
+    assert not dead.exists()
+    assert live.exists()
 
 
 def test_weights_altered_on_disk_are_fetched_again(held, tmp_path: Path) -> None:

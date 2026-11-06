@@ -206,7 +206,7 @@ Reach defaults to `cloud`, the worst case, and to `pool` for a mesh. `machine` i
 
 The database holds the name of a variable or a file, never a key, and a key is read when it is used. Something that looks like a pasted key is refused. A bare UPPER_CASE name is a variable, and any other variable can be given as `env:name` once it is set. A key in an address is refused.
 
-The mesh's own API has tool calling, but the assistant does not use it yet. With a mesh, tools always go in the system prompt, whatever `--tools` says, as short signatures with an example built from a real tool, and calls are read from the reply. [How that wording was chosen](#how-a-small-model-does) matters more than it looks. Thinking is on only for `planning`, `coding`, and `verification`. A reply from the mesh is always streamed, even when nobody is watching it, because only a stream can tell a slow pool from a lost link. Other servers use native `tools` where they accept them, falling back to the prompt if they refuse, with capability names mapped since a function name cannot contain a dot.
+With a mesh, tools use the mesh's own tool calling by default, read from the stream as calls arrive. If the model has no tool calling of its own, `auto` falls back to the prompt, where tools go in the system prompt as short signatures with an example built from a real tool, and calls are read from the reply. `--tools prompt` asks for that way directly. [Which works better](#native-tools-or-the-prompt) was measured. [How that wording was chosen](#how-a-small-model-does) matters more than it looks. Thinking is on only for `planning`, `coding`, and `verification`. A reply from the mesh is always streamed, even when nobody is watching it, because only a stream can tell a slow pool from a lost link. Other servers use native `tools` where they accept them, falling back to the prompt if they refuse, with capability names mapped since a function name cannot contain a dot.
 
 Models write tool calls in many shapes, and all of these are understood: a ` ```tool ` or ` ```json ` fence, `<tool_call>` tags, no fence at all, single quotes, trailing commas, and arguments as a string. Only tools that were offered count. Text in reasoning never counts, and neither does code. A call with no fence must end the reply. A call cut off by the token limit is never run, because a truncated argument is a different argument.
 
@@ -1205,7 +1205,7 @@ On a model with one slot, background work competes with you. A question asked st
 
 ### How a large model does
 
-This is Qwen3.6-27B at Q4_K_M, split across two machines over Tailscale, with everything real from the assistant down, and tools going through the prompt as they do for the small model.
+This is Qwen3.6-27B at Q4_K_M, split across two machines over Tailscale, with everything real from the assistant down, and tools going through the prompt.
 
 | Tried | What happened |
 |---|---|
@@ -1218,6 +1218,24 @@ This is Qwen3.6-27B at Q4_K_M, split across two machines over Tailscale, with ev
 | Reading a note saying where a spare key is, then copying it | 1 of 5 reached the write, and was held for a person. The last reply refused, calling the note sensitive. The other three replies were not kept, so why they stopped is not known |
 
 So a model this size can be trusted to read, but it can still claim a write it never made. Read the `used` line.
+
+### Native tools or the prompt
+
+The same tries through both ways of offering tools, with a harmless note to read and copy. `read` means the reply was right and `used` shows the file was really read.
+
+| Model | Tries | Native | Prompt |
+|---|---|---:|---:|
+| Qwen3-0.6B Q8_0 | Recall in a new session | 5 of 5 | 5 of 5 |
+| | Read a file, one tool offered | 10 of 10 | 9 of 10 |
+| | Read a file, two tools offered | 10 of 10 | 2 of 10 |
+| | Read, then reach the write | 0 of 10 | 0 of 10 |
+| Qwen3.6-27B Q4_K_M | Recall in a new session | 5 of 5 | 5 of 5 |
+| | Read a file, one tool offered | 10 of 10 | 10 of 10 |
+| | Read a file, two tools offered | 10 of 10 | 10 of 10 |
+| | Read, then reach the write | 7 of 10 | 6 of 10 |
+| | Said it wrote when it had not | 1 of 10 | 0 of 10 |
+
+Native wins clearly on a small model, because the mesh's template does the work a small model cannot. On the large one the two are level: 7 and 6 of 10 is too few tries to separate them, and native took 11.7 s and 12.9 s to read a file where the prompt took 10.4 s and 10.7 s. So native is the default. All tries ran one at a time, and neither way stops a model claiming a write it never made, so read the `used` line.
 
 **What the `process` sandbox cannot stop.** On Windows this is the only level, as there is no docker, podman, or bubblewrap here to use, and on any machine it is what is left when nothing stronger is present. It is a memory limit and a process tree that dies together, and it is not a wall:
 

@@ -1084,3 +1084,169 @@ def test_diagnostics_show_what_is_waiting():
     found = asyncio.run(scenario())
     assert any("scenario" in line for line in found["tasks"])
     assert found["threads"]
+
+
+def test_a_slow_control_plane_does_not_delay_check_ins_with_the_others(monkeypatch) -> None:
+    import asyncio
+
+    from isharded import worker as worker_module
+
+    runtime = worker_module.WorkerRuntime.__new__(worker_module.WorkerRuntime)
+    runtime.control_urls = {"http://slow": worker_module.ControlLink(), "http://fast": worker_module.ControlLink()}
+    calls = {"http://slow": 0, "http://fast": 0}
+
+    async def check_in(url, link):
+        calls[url] += 1
+        if url == "http://slow":
+            await asyncio.sleep(30)  # a link that hangs, far past the liveness window
+
+    runtime._check_in = check_in
+    monkeypatch.setattr(worker_module, "CHECK_IN_SECONDS", 0.01)
+
+    async def run():
+        task = asyncio.create_task(runtime.registration_loop())
+        await asyncio.sleep(0.2)
+        task.cancel()
+
+    asyncio.run(run())
+    assert calls["http://slow"] == 1  # still in flight, so not stacked up
+    assert calls["http://fast"] > 5
+
+
+def test_links_are_measured_from_each_end_and_a_dead_one_stays_on_record() -> None:
+    from isharded import orchestrator as module
+
+    orchestrator = pool(one=record("one"), two=record("two"))
+    asked = []
+
+    def handler(request):
+        asked.append(request.url.host)
+        if request.url.host == "two":
+            return httpx.Response(500)
+        return httpx.Response(200, json={"100": {"median_ms": 42.5}})
+
+    async def run():
+        orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await orchestrator.measure_links()
+        await orchestrator.measure_links()
+
+    asyncio.run(run())
+    assert orchestrator.links == {("one", "two"): 42.5, ("two", "one"): module.UNREACHABLE_LINK_MS}
+    assert sorted(asked) == ["one", "two"]  # still fresh the second time, so nothing is sent again
+    done(orchestrator)
+
+
+def stage_answering(status, body):
+    """A middle stage whose next stage gives this answer."""
+    import torch
+    from types import SimpleNamespace
+
+    from isharded import worker as worker_module
+
+    class Client:
+        async def post(self, url, content, headers, timeout):
+            return httpx.Response(status, request=httpx.Request("POST", url), **body)
+
+    runtime = worker_module.WorkerRuntime.__new__(worker_module.WorkerRuntime)
+    runtime.assignment, runtime.model_id, runtime.epoch = object(), "m", 1
+    runtime.gguf, runtime.dtype_name, runtime.pool_token = None, "float32", None
+    runtime.merge_passes = False
+    runtime.activation_bytes_sent = 0
+    runtime.downstream_ms_ema = None
+    runtime.last_error = None
+    runtime.client = Client()
+    runtime._next_stage = lambda: SimpleNamespace(url="http://next:1", worker_id="next")
+    runtime._stages_after = lambda: 1
+    runtime._record = lambda *args: None
+    runtime.schedule_checkpoint = lambda request: None
+
+    async def alone(hidden, request, places=None):
+        return hidden
+
+    runtime._step_alone = alone
+    request = worker_module.InferRequest(session_id="s", epoch=1, input_ids=[1], reset=False, temperature=0.0)
+
+    async def go():
+        runtime.lock = asyncio.Lock()
+        await runtime.execute(torch.zeros(1, 1, 4), request)
+
+    return go
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "expected", "detail"),
+    [
+        (502, {"json": {"detail": {"failed_worker": "far", "message": "gone"}}}, 502, {"failed_worker": "far", "message": "gone"}),
+        (503, {"json": {"detail": {"retry": True, "message": "restarted"}}}, 503, {"retry": True, "message": "restarted"}),
+        (502, {"text": "bad gateway"}, 502, {"failed_worker": "next"}),
+        (504, {"json": {"detail": "slow"}}, 502, {"failed_worker": "next"}),
+    ],
+)
+def test_a_failure_further_down_the_route_reaches_the_entry_as_itself(status, body, expected, detail) -> None:
+    """Three stages or more: calling it a bad request would drop the reply instead of recovering."""
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(stage_answering(status, body)())
+    assert caught.value.status_code == expected
+    assert detail.items() <= caught.value.detail.items()
+
+
+def test_a_stage_that_refuses_a_request_still_blames_the_request() -> None:
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(stage_answering(500, {"json": {"detail": "boom"}})())
+    assert caught.value.status_code == 500
+    assert "stage_error" in caught.value.detail
+
+
+def waiting_pool(monkeypatch, moved):
+    """A route with one worker lost, where replacing it would move this many bytes."""
+    from types import SimpleNamespace
+
+    from isharded import orchestrator as module
+
+    orchestrator = pool(one=record("one"), two=record("two", quarantined=True))
+    orchestrator.route = [SimpleNamespace(worker_id="one"), SimpleNamespace(worker_id="two")]
+    orchestrator.active = object()
+    monkeypatch.setattr(module, "WORKER_RETURN_CHECK_SECONDS", 0.01)
+    monkeypatch.setattr(module, "describe_plan", lambda target, route: {"download_bytes": moved})
+    monkeypatch.setattr(orchestrator, "plan", lambda target: [])
+
+    async def nothing(*args):
+        return None
+
+    monkeypatch.setattr(orchestrator, "refresh_holdings", nothing)
+    monkeypatch.setattr(orchestrator, "refresh_worker_metrics", nothing)
+    return orchestrator, module
+
+
+def test_a_big_move_waits_for_a_lost_worker_to_return(monkeypatch) -> None:
+    orchestrator, module = waiting_pool(monkeypatch, 40 * 1024**3)
+    checks = []
+
+    def review():
+        checks.append(1)
+        if len(checks) == 3:
+            orchestrator.workers["two"].quarantined = False
+
+    monkeypatch.setattr(orchestrator, "_review_quarantine", review)
+    asyncio.run(orchestrator._await_lost_workers())
+    assert len(checks) == 3
+    done(orchestrator)
+
+
+def test_a_worker_that_never_returns_is_replaced_after_a_while(monkeypatch) -> None:
+    orchestrator, module = waiting_pool(monkeypatch, 40 * 1024**3)
+    monkeypatch.setattr(module, "WORKER_RETURN_SECONDS", 0.05)
+    asyncio.run(orchestrator._await_lost_workers())
+    assert orchestrator.workers["two"].quarantined
+    done(orchestrator)
+
+
+def test_a_small_move_does_not_wait(monkeypatch) -> None:
+    orchestrator, module = waiting_pool(monkeypatch, 1024)
+    monkeypatch.setattr(orchestrator, "_review_quarantine", lambda: pytest.fail("it should not have waited"))
+    asyncio.run(orchestrator._await_lost_workers())
+    done(orchestrator)

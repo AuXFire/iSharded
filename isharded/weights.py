@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import mmap
 import os
@@ -39,10 +40,13 @@ import httpx
 import torch
 from safetensors import safe_open
 
-from .gguf import GgufError, GgufHeader, parse_header, parse_source
+from .gguf import GgufError, GgufHeader, join_parts, parse_header, parse_source, split_parts
 from .protocol import auth_headers, TensorRef, WeightUnit
 from .tickets import client_auth
-from .tls import client_verify
+from .tls import client_verify, stay_on_this_machine
+from .transfers import MODEL_HOST, SlowSource, SourcePicker
+
+logger = logging.getLogger(__name__)
 
 # Mapped weights are read-only by design, and nothing writes to them.
 warnings.filterwarnings("ignore", message="The given buffer is not writable")
@@ -54,6 +58,8 @@ SINGLE_FILE = "model.safetensors"
 COALESCE_GAP_BYTES = 256 * 1024
 CHUNK_BYTES = 1024 * 1024
 FETCH_RETRIES = 6
+HOST_CHECK_SECONDS = 5.0
+STALE_PART_SECONDS = 600.0  # a live transfer writes far more often than this
 # Disk space a fetch must leave behind, so a download cannot fill the volume.
 DISK_RESERVE_BYTES = 2 * 1024**3
 
@@ -235,6 +241,7 @@ class PeerReader:
     def __init__(self, urls: list[str], token: str | None = None) -> None:
         self.urls = [url.rstrip("/") for url in urls]
         self.client = httpx.Client(
+            event_hooks={"request": [stay_on_this_machine]},
             headers=auth_headers(token),
             timeout=httpx.Timeout(60.0, connect=5.0),
             trust_env=False,
@@ -350,6 +357,29 @@ def read_gguf_header(reader: Reader, name: str) -> GgufHeader:
         raise WeightSourceError(f"{name}: {exc}") from exc
 
 
+def has_model_host(source: str) -> bool:
+    """Whether a model lives somewhere besides the pool. On a closed network it may not."""
+    located = parse_source(source)
+    return bool(located[0] if located else source)
+
+
+def model_host_answers(source: str, revision: str, name: str) -> bool:
+    """A closed network has no model host, and nothing should wait on one."""
+    try:
+        reader = open_reader(source, revision)
+    except WeightSourceError:
+        return False
+    try:
+        if isinstance(reader, HubReader):
+            reader.client.timeout = httpx.Timeout(HOST_CHECK_SECONDS)
+        reader.file_size(name)
+        return True
+    except (WeightSourceError, httpx.HTTPError, OSError):
+        return False
+    finally:
+        reader.close()
+
+
 def gguf_reader(source: str, revision: str, holders: list[str] | None, token: str | None) -> Reader:
     """Prefer a copy inside the pool: it is closer, and may be the only one."""
     return PeerReader(holders, token) if holders else open_reader(source, revision)
@@ -359,32 +389,43 @@ def build_gguf_manifest(
     source: str, name: str, revision: str, holders: list[str] | None = None, token: str | None = None
 ) -> Manifest:
     """Read a GGUF header. Costs megabytes, however large the model is."""
-    if re.search(r"-\d{5}-of-\d{5}\.gguf$", name, re.IGNORECASE):
-        raise WeightSourceError(f"{name} is one part of a split GGUF, which is not supported yet")
+    names = split_parts(name)
     reader = gguf_reader(source, revision, holders, token)
     try:
-        header = read_gguf_header(reader, name)
-        pinned = reader.resolve_revision(revision) if isinstance(reader, HubReader) else file_fingerprint(reader, name, header.file_size)
+        parts = {part: read_gguf_header(reader, part) for part in names}
+        if isinstance(reader, HubReader):
+            pinned = reader.resolve_revision(revision)
+        else:
+            prints = [file_fingerprint(reader, part, header.file_size) for part, header in parts.items()]
+            pinned = prints[0] if len(prints) == 1 else "gguf-" + hashlib.sha1("".join(prints).encode()).hexdigest()[:16]
+    except GgufError as exc:
+        raise WeightSourceError(f"{name}: {exc}") from exc
     finally:
         reader.close()
     tensors = {
         tensor.name: TensorRef(
             name=tensor.name,
-            file=name,
+            file=part,
             dtype="U8",
             shape=[tensor.nbytes],
             start=header.data_start + tensor.offset,
             end=header.data_start + tensor.offset + tensor.nbytes,
         )
+        for part, header in parts.items()
         for tensor in header.tensors.values()
     }
+    try:
+        header = join_parts(list(parts.values()))
+    except GgufError as exc:
+        raise WeightSourceError(f"{name}: {exc}") from exc
     tokens = header.keys.get("tokenizer.ggml.tokens")
     config = {
         "model_type": "gguf",
         "gguf": header.skeleton(),
         "gguf_vocabulary": hashlib.sha1(tokens.raw).hexdigest() if tokens else "",
-        "gguf_file": name,
-        "gguf_file_size": header.file_size,
+        "gguf_file": names[0],
+        "gguf_file_size": parts[names[0]].file_size,
+        "gguf_parts": {part: parts[part].file_size for part in names},
     }
     return Manifest(source=source, revision=pinned, config=config, tensors=tensors)
 
@@ -680,6 +721,7 @@ class FetchProgress:
     bytes_done: int = 0
     bytes_reused: int = 0
     bytes_from_peers: int = 0
+    source_speeds: dict[str, float] = field(default_factory=dict)
     units_total: int = 0
     units_done: int = 0
     phase: str = "fetching"  # fetching | ready | failed
@@ -697,6 +739,7 @@ class FetchProgress:
             "bytes_done": self.bytes_done,
             "bytes_reused": self.bytes_reused,
             "bytes_from_peers": self.bytes_from_peers,
+            "source_speeds": dict(self.source_speeds),
             "units_total": self.units_total,
             "units_done": self.units_done,
             "bytes_per_second": self.bytes_done / elapsed if elapsed > 0 else 0.0,
@@ -766,7 +809,7 @@ def fetch_from_peer(
     expected = len(prefix) + unit.nbytes
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_name(f"{destination.name}.{os.getpid()}.{threading.get_ident()}.peer.part")
-    owned = client or httpx.Client(timeout=httpx.Timeout(60.0, connect=5.0), verify=client_verify(), auth=client_auth())
+    owned = client or httpx.Client(event_hooks={"request": [stay_on_this_machine]}, timeout=httpx.Timeout(60.0, connect=5.0), verify=client_verify(), auth=client_auth())
     headers = auth_headers(token)
     params = {"model_id": model_id, "revision": revision, "unit": unit.name}
     received = 0
@@ -893,6 +936,16 @@ class UnitCache:
     def used_bytes(self) -> int:
         return sum(path.stat().st_size for path in self._files())
 
+    def _clear_leftovers(self) -> None:
+        """A process that dies mid-transfer leaves its partial files, and nothing else would remove them."""
+        stale = time.time() - STALE_PART_SECONDS
+        for path in self.root.rglob("*.part"):
+            try:
+                if path.stat().st_mtime < stale:
+                    path.unlink()
+            except OSError:
+                pass  # another process may be finishing with it
+
     def make_room(self, needed: int, protected: set[Path]) -> None:
         """Evict least recently used units until ``needed`` bytes fit."""
         files = sorted(
@@ -936,6 +989,7 @@ class UnitCache:
     ) -> None:
         """Bring every unit into the cache, skipping any already present."""
         self.root.mkdir(parents=True, exist_ok=True)  # it may have been cleared by hand
+        self._clear_leftovers()
         for unit in units:
             # What is already on disk gets no more trust than what arrives.
             if unit.sha256 and self.has(model_id, revision, unit) and not self._intact(model_id, revision, unit):
@@ -963,6 +1017,28 @@ class UnitCache:
             self._discard(model_id, revision, unit)
             return False
 
+        picker = SourcePicker()
+        progress.source_speeds = picker.speeds
+        holders = list(file_sources or [])
+        host = has_model_host(source)
+        if missing and host and (holders or peers) and not model_host_answers(source, source_revision, missing[0].tensors[0].file):
+            picker.fail(MODEL_HOST)
+
+        def sources_for(unit: WeightUnit) -> list[str]:
+            """Everywhere this unit can come from, the host first so that it wins a tie."""
+            nodes = dict.fromkeys([*(peers or {}).get(unit.name, []), *holders])
+            return [MODEL_HOST, *nodes] if host or not nodes else list(nodes)
+
+        def deliver(origin: str, unit: WeightUnit, destination: Path, on_bytes: Callable[[int], None]) -> bool:
+            if origin in (peers or {}).get(unit.name, []):
+                return fetch_from_peer(origin, token, model_id, revision, unit, destination, on_bytes)
+            reader = open_reader(source, source_revision) if origin == MODEL_HOST else PeerReader([origin], token)
+            try:
+                fetch_unit(reader, unit, destination, on_bytes)
+            finally:
+                reader.close()
+            return True
+
         def fetch_one(unit: WeightUnit) -> None:
             destination = self.path(model_id, revision, unit.name)
             copy = local.get(unit.tensors[0].file)
@@ -973,23 +1049,40 @@ class UnitCache:
                     with lock:
                         progress.units_done += 1
                     return
-            for peer in (peers or {}).get(unit.name, []):
-                if fetch_from_peer(peer, token, model_id, revision, unit, destination, add_bytes) and accepted(unit):
-                    with lock:
-                        # A unit file is its tensors plus a small header.
-                        progress.bytes_done += unit.nbytes - destination.stat().st_size
-                        progress.bytes_from_peers += unit.nbytes
-                        progress.units_done += 1
-                    return
-            reader = gguf_reader(source, source_revision, file_sources, token)
-            try:
-                fetch_unit(reader, unit, self.path(model_id, revision, unit.name), add_bytes)
-            finally:
-                reader.close()
-            if not accepted(unit):
-                raise WeightSourceError(f"{unit.name} did not match its hash from any source")
-            with lock:
-                progress.units_done += 1
+            sources = sources_for(unit)
+            abandoned: set[str] = set()
+            failure: Exception | None = None
+            while sources:
+                origin = picker.pick(sources)
+                others = [item for item in sources if item != origin]
+                transfer = picker.transfer(origin, others, unit.nbytes, add_bytes, patient=origin in abandoned)
+                try:
+                    with transfer:
+                        delivered = deliver(origin, unit, destination, transfer)
+                    if delivered and accepted(unit):
+                        with lock:
+                            if origin != MODEL_HOST:
+                                progress.bytes_from_peers += unit.nbytes
+                            if origin in (peers or {}).get(unit.name, []):
+                                # A unit file is its tensors plus a small header.
+                                progress.bytes_done += unit.nbytes - destination.stat().st_size
+                            progress.units_done += 1
+                        return
+                    if delivered:
+                        failure = WeightSourceError(f"{unit.name} did not match its hash from any source")
+                except SlowSource as reason:
+                    logger.info("%s: moving on from %s", unit.name, reason)
+                    abandoned.add(origin)
+                    add_bytes(-transfer.arrived)
+                    continue
+                except (WeightSourceError, httpx.HTTPError, OSError, ValueError) as exc:
+                    if progress.cancelled:
+                        raise
+                    failure = exc
+                add_bytes(-transfer.arrived)  # the next source delivers these bytes instead
+                picker.fail(origin)
+                sources.remove(origin)
+            raise failure or WeightSourceError(f"no source could deliver {unit.name}")
 
         with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
             list(pool.map(fetch_one, missing))

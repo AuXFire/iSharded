@@ -688,18 +688,554 @@ def test_a_persons_key_never_leaves_the_node_they_gave_it_to(signed_pool, monkey
     assert client.get("/admin/status").status_code == 401
     assert client.get("/admin/status", headers={"Authorization": "Bearer isk-test"}).status_code == 200
     assert "authorization" not in seen
-    assert seen["x-isharded-on-behalf"] == "admin:alice"
+    assert "isk-test" not in str(seen)
 
 
-def test_a_verified_node_can_vouch_for_a_caller_but_a_stranger_cannot(signed_pool, monkeypatch):
-    _, access = signed_pool
+def proven_key_entry(name="alice", role="admin", key="isk-test"):
+    from isharded.statements import key_verifier
+
+    return {**key_entry(name, role, key), "verifier": key_verifier(key)}
+
+
+@pytest.fixture
+def coordinator(signed_pool, monkeypatch):
+    """A node that coordinates. Alice's key has a verifier, and an older one does not."""
+    from isharded.pool import sign_entry
+
+    folder, access = signed_pool
+    access.add_signed(sign_entry(folder, proven_key_entry()))
+    access.add_signed(sign_entry(folder, proven_key_entry("bob", "user", "isk-bob")))
+    access.add_signed(sign_entry(folder, key_entry("old", "admin", "isk-old")))
     runtime = Orchestrator()
     runtime.access = access
+    runtime.mesh = ControlMesh("boss", "http://boss:9", (), Clock())
+    runtime.mesh.leader_id = "boss"
     monkeypatch.setattr(orchestrator_module, "runtime", runtime)
-    headers = {FORWARD_MARK: "node-b", "x-isharded-on-behalf": "admin:alice"}
-    assert TestClient(orchestrator_module.app).get("/admin/keys", headers=headers).status_code == 401
-    node = TestClient(connected_as(orchestrator_module.app, "node-b"))
+    return runtime
+
+
+@pytest.fixture
+def follow(coordinator, monkeypatch):
+    """What a real follower sends the coordinator for a person's request."""
+
+    def send(method, path, key="isk-test", body=b"", follower="follower"):
+        seen = {}
+
+        def handler(request):
+            seen.update(request.headers)
+            seen["sent"] = request.content
+            return httpx.Response(200, stream=httpx.ByteStream(b"{}"), headers={"content-type": "application/json"})
+
+        node = Orchestrator()
+        node.access = coordinator.access
+        node.mesh = ControlMesh(follower, f"http://{follower}:1", (), Clock())
+        node.mesh.observe({"node_id": "boss", "url": "http://boss:9", "term": 1, "leader_id": "boss"})
+        node.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        monkeypatch.setattr(orchestrator_module, "runtime", node)
+        headers = {"Authorization": f"Bearer {key}", "content-type": "application/json"}
+        assert TestClient(orchestrator_module.app).request(method, path, headers=headers, content=body).status_code == 200
+        monkeypatch.setattr(orchestrator_module, "runtime", coordinator)
+        sent = seen.pop("sent")
+        return {name: value for name, value in seen.items() if name not in {"host", "content-length"}}, sent
+
+    return send
+
+
+def from_node(name):
+    return TestClient(connected_as(orchestrator_module.app, name))
+
+
+def plain_statement(**changed):
+    """A statement any node could write, signed with whatever it holds."""
+    from isharded.statements import make_statement
+
+    fields = {"key": "isk-test", "sender": "follower", "target": "boss", "method": "GET", "path": "/admin/keys"}
+    return make_statement(**{**fields, **changed})
+
+
+def forwarded(statement, by="follower"):
+    return {FORWARD_MARK: by, "x-isharded-on-behalf": statement}
+
+
+def test_a_real_forward_works_with_the_key_left_behind(follow):
+    headers, _ = follow("GET", "/admin/keys")
+    assert "isk-test" not in str(headers)
+    assert from_node("follower").get("/admin/keys", headers=headers).status_code == 200
+
+
+@pytest.mark.parametrize(("method", "tries", "status"), [("GET", 2, 200), ("POST", 1, 503)])
+def test_a_dead_keep_alive_is_retried_for_a_read_only(coordinator, monkeypatch, method, tries, status):
+    statements = []
+
+    def handler(request):
+        statements.append(request.headers.get("x-isharded-on-behalf"))
+        if len(statements) == 1:
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        return httpx.Response(200, stream=httpx.ByteStream(b"{}"), headers={"content-type": "application/json"})
+
+    node = Orchestrator()
+    node.access = coordinator.access
+    node.mesh = ControlMesh("follower", "http://follower:1", (), Clock())
+    node.mesh.observe({"node_id": "boss", "url": "http://boss:9", "term": 1, "leader_id": "boss"})
+    node.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(orchestrator_module, "runtime", node)
+    answer = TestClient(orchestrator_module.app).request(method, "/admin/keys", headers={"Authorization": "Bearer isk-test"})
+    assert answer.status_code == status
+    assert len(statements) == tries
+    assert len(set(statements)) == tries  # a statement is good once
+
+
+def test_a_real_forward_carries_its_body_and_query(follow):
+    body = b'{"name": "x", "role": "user"}'
+    headers, sent = follow("POST", "/admin/keys?note=a%20b&first=1", body=body)
+    assert sent == body
+    assert from_node("follower").post("/admin/keys?first=1&note=a+b", headers=headers, content=sent).status_code == 409  # past the key check
+
+
+def test_a_statement_works_once(follow):
+    headers, _ = follow("GET", "/admin/keys")
+    node = from_node("follower")
     assert node.get("/admin/keys", headers=headers).status_code == 200
+    replayed = node.get("/admin/keys", headers=headers)
+    assert replayed.status_code == 401 and "already been used" in replayed.text
+
+
+def test_a_statement_for_another_node_is_refused(follow):
+    headers, _ = follow("GET", "/admin/keys")
+    orchestrator_module.runtime.mesh = ControlMesh("other", "http://other:9", (), Clock())
+    orchestrator_module.runtime.mesh.leader_id = "other"
+    refused = from_node("follower").get("/admin/keys", headers=headers)
+    assert refused.status_code == 401 and "this statement is for boss" in refused.text
+
+
+def test_a_statement_is_no_use_to_a_node_that_saw_it_pass(follow):
+    headers, _ = follow("GET", "/admin/keys")
+    assert from_node("thief").get("/admin/keys", headers=headers).status_code == 401
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"method": "POST"},
+        {"path": "/admin/status"},
+        {"path": "/admin/keys?force=true"},
+        {"body": b"something else"},
+    ],
+)
+def test_a_statement_covers_exactly_one_request(coordinator, changed):
+    statement = plain_statement(**changed)
+    assert from_node("follower").get("/admin/keys", headers=forwarded(statement)).status_code == 401
+
+
+def test_a_stale_statement_is_refused_and_a_fresh_one_from_a_slow_clock_is_not(coordinator):
+    import time
+
+    from isharded.statements import STATEMENT_SECONDS
+    from isharded.tickets import CLOCK_SKEW_SECONDS
+
+    node = from_node("follower")
+    good = plain_statement(clock=lambda: time.time() - STATEMENT_SECONDS)
+    assert node.get("/admin/keys", headers=forwarded(good)).status_code == 200
+    stale = plain_statement(clock=lambda: time.time() - STATEMENT_SECONDS - CLOCK_SKEW_SECONDS - 5)
+    assert node.get("/admin/keys", headers=forwarded(stale)).status_code == 401
+    ahead = plain_statement(clock=lambda: time.time() + CLOCK_SKEW_SECONDS + 5)
+    assert node.get("/admin/keys", headers=forwarded(ahead)).status_code == 401
+    nonsense = plain_statement(clock=lambda: float("nan"))
+    assert node.get("/admin/keys", headers=forwarded(nonsense)).status_code == 401
+
+
+def test_a_node_cannot_sign_for_a_key_it_does_not_hold(coordinator):
+    """Everything a member can see of the key: its hash and its verifier."""
+    import json
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    from isharded.access import digest
+    from isharded.statements import body_hash
+    from isharded.tickets import _encode
+
+    claims = {"key": digest("isk-test"), "from": "follower", "to": "boss", "method": "GET", "path": "/admin/keys", "body": body_hash(b""), "at": __import__("time").time(), "nonce": "n"}
+    raw = json.dumps(claims).encode()
+    forged = f"{_encode(raw)}.{_encode(Ed25519PrivateKey.generate().sign(raw))}"
+    assert from_node("follower").get("/admin/keys", headers=forwarded(forged)).status_code == 401
+
+
+def test_a_statement_that_cannot_be_read_proves_nothing(coordinator):
+    for junk in ("", ".", "a.b", "e30.AA", "W10.AA", "admin:alice"):
+        assert from_node("follower").get("/admin/keys", headers=forwarded(junk)).status_code == 401
+
+
+def test_the_role_comes_from_the_signed_entry(follow):
+    headers, _ = follow("GET", "/admin/status", key="isk-bob")
+    node = from_node("follower")
+    assert node.get("/admin/status", headers=headers).status_code == 200
+    headers, _ = follow("GET", "/admin/status", key="isk-bob")
+    attempt = dict(headers, **{"x-isharded-role": "admin"})
+    assert node.get("/admin/keys", headers=attempt).status_code == 401
+    assert node.get("/admin/keys", headers=forwarded(plain_statement(key="isk-bob"))).status_code == 403
+
+
+def test_a_removed_key_cannot_be_passed_on(coordinator, signed_pool):
+    from isharded.pool import sign_entry
+
+    coordinator.access.add_signed(sign_entry(signed_pool[0], {"type": "remove_key", "name": "alice"}))
+    assert from_node("follower").get("/admin/keys", headers=forwarded(plain_statement())).status_code == 401
+
+
+def test_a_revoked_node_cannot_pass_anything_on(coordinator, signed_pool):
+    from isharded.pool import sign_entry
+
+    coordinator.access.add_signed(sign_entry(signed_pool[0], {"type": "revoke", "name": "follower"}))
+    assert from_node("follower").get("/admin/keys", headers=forwarded(plain_statement())).status_code == 401
+
+
+def test_a_stranger_gets_nothing_from_a_good_statement(coordinator):
+    client = TestClient(orchestrator_module.app)
+    assert client.get("/admin/keys", headers=forwarded(plain_statement())).status_code == 401
+
+
+def test_a_key_made_before_verifiers_is_a_user_through_a_forward(follow):
+    node = from_node("follower")
+    headers, _ = follow("GET", "/admin/status", key="isk-old")
+    assert node.get("/admin/status", headers=headers).status_code == 200
+    headers, _ = follow("GET", "/admin/keys", key="isk-old")
+    assert node.get("/admin/keys", headers=headers).status_code == 403
+    direct = TestClient(orchestrator_module.app).get("/admin/keys", headers={"Authorization": "Bearer isk-old"})
+    assert direct.status_code == 200
+
+
+def test_the_audit_log_records_what_was_proven(follow, coordinator, tmp_path):
+    import json
+
+    from isharded.access import AuditLog
+
+    coordinator.audit = AuditLog(str(tmp_path / "audit.jsonl"), "boss")
+    headers, sent = follow("POST", "/admin/keys", body=b"{}")
+    from_node("follower").post("/admin/keys", headers=headers, content=sent)
+    from_node("member").post("/admin/keys", headers=forwarded("admin:root", "member"), content=b"{}")
+    actors = [json.loads(line)["actor"] for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert actors == ["admin:alice via follower", "unknown"]
+
+
+def test_one_key_cannot_use_up_what_others_are_remembered_by(coordinator, monkeypatch):
+    from isharded import statements
+
+    monkeypatch.setattr(statements, "MAX_NONCES", 2)
+    node = from_node("follower")
+    for _ in range(2):
+        assert node.get("/admin/status", headers=forwarded(plain_statement(key="isk-bob", path="/admin/status"))).status_code == 200
+    assert node.get("/admin/status", headers=forwarded(plain_statement(key="isk-bob", path="/admin/status"))).status_code == 401
+    assert node.get("/admin/keys", headers=forwarded(plain_statement())).status_code == 200
+
+
+def test_a_key_keeps_its_verifier_whatever_order_entries_arrive_in(signed_pool):
+    from isharded.access import digest
+    from isharded.pool import sign_entry
+
+    folder, access = signed_pool
+    access.add_signed(sign_entry(folder, proven_key_entry()))
+    access.add_signed(sign_entry(folder, key_entry()))
+    assert access.keys[digest("isk-test")].verifier
+
+
+def test_every_way_of_making_a_key_gives_it_a_verifier(tmp_path):
+    from isharded.access import create_key, digest
+    from isharded.statements import key_verifier
+
+    path = str(tmp_path / "keys.json")
+    key = create_key(path, "alice", ROLE_ADMIN)
+    loaded = AccessControl.load(None, path)
+    assert loaded.keys[digest(key)].verifier == key_verifier(key)
+    other = loaded.add_key("bob", ROLE_USER)
+    again = AccessControl.load(None, path)
+    assert again.keys[digest(other)].verifier == key_verifier(other)
+
+
+def test_a_verifier_says_nothing_about_the_key_it_came_from():
+    from isharded.statements import VERIFIER_LENGTH, key_verifier
+
+    assert len(key_verifier("isk-one")) == VERIFIER_LENGTH
+    assert key_verifier("isk-one") == key_verifier("isk-one") != key_verifier("isk-two")
+    assert "isk" not in key_verifier("isk-one")
+
+
+@pytest.fixture
+def lane(coordinator):
+    """The same runtime, as the lane called small on a node called lane-node."""
+    coordinator.lane_name = "small"
+    coordinator.mesh = ControlMesh("lane-node", "http://lane-node:1009", (), Clock())
+    coordinator.mesh.leader_id = "lane-node"
+    return coordinator
+
+
+def test_a_statement_for_a_node_is_no_use_on_its_lane_and_the_other_way(coordinator):
+    for_lane = plain_statement(target="boss/small")
+    assert from_node("follower").get("/admin/keys", headers=forwarded(for_lane)).status_code == 401
+    coordinator.lane_name = "small"
+    coordinator.mesh.node_id = coordinator.mesh.leader_id = "boss"
+    for_node = plain_statement(target="boss")
+    assert from_node("follower").get("/admin/keys", headers=forwarded(for_node)).status_code == 401
+    assert from_node("follower").get("/admin/keys", headers=forwarded(for_lane)).status_code == 200
+
+
+def test_a_lane_takes_a_passed_on_statement_only_from_the_node_it_was_for(lane):
+    statement = plain_statement(path="/admin/keys", target="boss", sender="follower")
+    assert from_node("member").get("/admin/keys", headers=forwarded(statement, "member")).status_code == 401
+    assert from_node("follower").get("/admin/keys", headers=forwarded(statement)).status_code == 401
+    assert from_node("boss").get("/admin/keys", headers=forwarded(statement, "boss")).status_code == 200
+    assert from_node("boss").get("/admin/keys", headers=forwarded(statement, "boss")).status_code == 401
+
+
+def test_only_a_lane_takes_a_passed_on_statement(coordinator):
+    statement = plain_statement(target="other-coordinator")
+    assert from_node("other-coordinator").get("/admin/keys", headers=forwarded(statement, "other-coordinator")).status_code == 401
+
+
+def test_a_passed_on_statement_must_be_for_the_same_request(lane):
+    statement = plain_statement(path="/admin/status", target="boss")
+    assert from_node("boss").get("/admin/keys", headers=forwarded(statement, "boss")).status_code == 401
+
+
+def test_a_passed_on_statement_outlasts_a_lanes_workers_starting(lane):
+    import time
+
+    from isharded.lanes import LANE_WORKERS_WAIT_SECONDS
+    from isharded.statements import PASSED_ON_SECONDS
+
+    assert PASSED_ON_SECONDS > LANE_WORKERS_WAIT_SECONDS
+    late = plain_statement(target="boss", clock=lambda: time.time() - LANE_WORKERS_WAIT_SECONDS - 20)
+    assert from_node("boss").get("/admin/keys", headers=forwarded(late, "boss")).status_code == 200
+    too_late = plain_statement(target="boss", clock=lambda: time.time() - 1000)
+    assert from_node("boss").get("/admin/keys", headers=forwarded(too_late, "boss")).status_code == 401
+
+
+def lane_door(coordinator, handler):
+    """A front door for a lane whose control planes answer through ``handler``."""
+    coordinator.lanes.path = Path("unused")
+    coordinator.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    coordinator.mesh.lanes = {"small": {"slot": 1, "budgets": {}}}
+    coordinator.lanes.seen["small"] = {"ready": False, "leader": "lane-boss", "leader_url": "http://lane-boss:1009"}
+    return coordinator
+
+
+def test_a_front_door_holding_the_key_signs_for_the_lane_it_is_sending_to(coordinator, signed_pool):
+    from isharded.access import Caller
+    from isharded.statements import Statements
+    from isharded.tls import KEY_HELD
+
+    seen = {}
+
+    def handler(request):
+        seen.update(request.headers)
+        seen["url"], seen["content"] = str(request.url), request.content
+        return httpx.Response(200, json={"choices": [{"message": {"content": "hello"}}]})
+
+    door = lane_door(coordinator, handler)
+    held = KEY_HELD.set("isk-test")
+    try:
+        answer = asyncio.run(door.lanes.ask("small", {"messages": []}, Caller("alice", ROLE_ADMIN)))
+    finally:
+        KEY_HELD.reset(held)
+    assert answer == "hello"
+    assert "isk-test" not in str(seen)
+    proven = Statements().check(door.access, seen["x-isharded-on-behalf"], "boss", "lane-boss/small", "POST", "/v1/chat/completions", seen["content"], in_lane=True)
+    assert proven == ("alice", ROLE_ADMIN)
+
+
+def test_a_front_door_with_no_key_passes_on_what_it_was_given(coordinator):
+    from isharded.access import Caller
+    from isharded.tls import STATEMENT
+
+    seen = {}
+
+    def handler(request):
+        seen.update(request.headers)
+        return httpx.Response(200)
+
+    door = lane_door(coordinator, handler)
+    held = STATEMENT.set("the statement")
+    try:
+        asyncio.run(door.lanes.tell_all("/admin/nodes/x/cordon?force=true", Caller("alice", ROLE_ADMIN)))
+    finally:
+        STATEMENT.reset(held)
+    assert seen["x-isharded-on-behalf"] == "the statement"
+
+
+def test_the_key_is_still_there_for_a_load_that_starts_later(coordinator):
+    """A lane's load waits for workers, long after the request that asked for it returned."""
+    from isharded.access import Caller
+    from isharded.lanes import LANE_SETTLED_LOOKS
+    from isharded.statements import Statements
+    from isharded.tls import KEY_HELD
+
+    sent = []
+
+    def handler(request):
+        if request.url.path == "/internal/lane":
+            return httpx.Response(200, json={"leader": "lane-boss", "leader_url": "http://lane-boss:1009", "workers": 1})
+        sent.append(request)
+        return httpx.Response(202)
+
+    door = lane_door(coordinator, handler)
+    door.lanes.seen.clear()
+
+    async def scenario():
+        KEY_HELD.set("isk-test")
+        door.mesh.lanes = {"small": {"slot": 1, "budgets": {"n": {"gpu_gb": 1, "ram_gb": 0}}}}
+        task = door.spawn(door.lanes._start_load("small", {"model_id": "m"}, Caller("alice", ROLE_ADMIN)))
+        KEY_HELD.set(None)
+        await task
+
+    real_sleep = asyncio.sleep
+    asyncio.sleep = lambda _: real_sleep(0)
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.sleep = real_sleep
+    assert LANE_SETTLED_LOOKS and sent[0].url.path == "/admin/load"
+    assert Statements().check(door.access, sent[0].headers["x-isharded-on-behalf"], "boss", "lane-boss/small", "POST", "/admin/load", sent[0].content, in_lane=True)[1] == ROLE_ADMIN
+
+
+@pytest.fixture
+def door_with_a_lane(coordinator):
+    """A coordinating front door whose lane serves a model, recording what reaches the lane."""
+    seen = {}
+
+    def handler(request):
+        seen.update(request.headers)
+        seen["content"] = request.content
+        return httpx.Response(200, stream=httpx.ByteStream(b'{"ok": true}'), headers={"content-type": "application/json"})
+
+    door = lane_door(coordinator, handler)
+    door.lanes.seen["small"] = {"ready": True, "model": "lane-model", "leader": "boss", "leader_url": "http://boss:1009"}
+    return door, seen
+
+
+CHAT = {"model": "lane-model", "messages": [{"role": "user", "content": "hello"}]}
+
+
+def test_a_key_given_to_a_front_door_signs_for_its_lane_through_the_real_route(door_with_a_lane):
+    from isharded.statements import Statements
+
+    door, seen = door_with_a_lane
+    answer = TestClient(orchestrator_module.app).post("/v1/chat/completions", json=CHAT, headers={"Authorization": "Bearer isk-test"})
+    assert answer.status_code == 200 and answer.json() == {"ok": True}
+    assert "isk-test" not in str(seen) and "authorization" not in seen
+    proven = Statements().check(door.access, seen["x-isharded-on-behalf"], "boss", "boss/small", "POST", "/v1/chat/completions", seen["content"], in_lane=True)
+    assert proven == ("alice", ROLE_ADMIN)
+
+
+def test_a_forward_reaches_a_lane_through_the_coordinator_it_was_sent_to(door_with_a_lane, follow):
+    """Follower to coordinator to lane, with the person's key still on the follower."""
+    import json
+
+    from isharded.statements import Statements
+
+    door, seen = door_with_a_lane
+    headers, sent = follow("POST", "/v1/chat/completions", body=json.dumps(CHAT).encode())
+    answer = from_node("follower").post("/v1/chat/completions", headers=headers, content=sent)
+    assert answer.status_code == 200
+    assert seen["x-isharded-on-behalf"] == headers["x-isharded-on-behalf"]
+    door.lane_name = "small"
+    proven = Statements().check(door.access, seen["x-isharded-on-behalf"], "boss", "other-node/small", "POST", "/v1/chat/completions", seen["content"], in_lane=True)
+    assert proven == ("alice", ROLE_ADMIN)  # a lane on any node, from the node it was addressed to
+
+
+def test_a_door_tells_a_lane_that_started_after_the_last_change(coordinator):
+    pushed = []
+
+    def handler(request):
+        pushed.append(request.url.path)
+        return httpx.Response(200, json={"status": "merged"})
+
+    door = lane_door(coordinator, handler)
+    door.mesh.url = "http://boss:9"
+
+    async def scenario():
+        await door.lanes._tell_lanes(["small"])
+        assert len(pushed) == 1
+        door.lanes.seen["small"]["entries_held"] = door.access.entries_held
+        await door.lanes._tell_lanes(["small"])
+        assert len(pushed) == 1  # a lane that has it all is left alone
+        door.lanes.seen["small"]["entries_held"] = 0  # it restarted, or has only just started
+        await door.lanes._tell_lanes(["small"])
+        assert pushed == ["/internal/lane/access"] * 2
+
+    asyncio.run(scenario())
+
+
+def test_a_lane_says_how_to_name_its_coordinator_and_what_it_holds(lane):
+    answer = from_node("lane-node").get("/internal/lane").json()
+    assert answer["leader"] == "lane-node"
+    assert answer["entries_held"] == lane.access.entries_held
+
+
+def test_a_lane_takes_file_keys_from_its_own_node_and_nobody_else(lane):
+    from isharded.access import digest
+    from isharded.statements import key_verifier
+
+    document = {"keys": [{"name": "root", "role": "admin", "sha256": digest("isk-root"), "verifier": key_verifier("isk-root")}]}
+    assert from_node("member").post("/internal/lane/access", json=document).status_code == 200
+    assert digest("isk-root") not in lane.access.keys
+    assert from_node("lane-node").post("/internal/lane/access", json=document).status_code == 200
+    assert lane.access.keys[digest("isk-root")].name == "root"
+    assert lane.access.keys[digest("isk-root")].verifier == key_verifier("isk-root")
+
+
+def test_nobody_is_given_a_role_a_lane_never_had(lane):
+    from isharded.access import digest
+
+    document = {"keys": [{"name": "root", "role": "node", "sha256": digest("isk-root")}]}
+    from_node("lane-node").post("/internal/lane/access", json=document)
+    assert digest("isk-root") not in lane.access.keys
+
+
+def test_where_nobody_owns_the_network_a_forwarded_caller_is_reduced(tmp_path, monkeypatch):
+    from isharded.commons import Commons, make_identity
+
+    make_identity(tmp_path)
+    runtime = Orchestrator()
+    runtime.access = AccessControl(identities=True, authority=Commons(tmp_path))
+    runtime.mesh = ControlMesh("n-boss", "http://boss:9", (), Clock())
+    runtime.mesh.leader_id = "n-boss"
+    monkeypatch.setattr(orchestrator_module, "runtime", runtime)
+    seen = []
+    real = orchestrator_module.require
+
+    def watching(authorization, role):
+        seen.append(real(authorization, ROLE_USER))
+        return real(authorization, role)
+
+    monkeypatch.setattr(orchestrator_module, "require", watching)
+    node = from_node("n-peer")
+    assert node.get("/admin/keys", headers=forwarded("admin:owner", "n-peer")).status_code == 403
+    assert (seen[-1].name, seen[-1].role) == ("n-peer/owner", "member")
+    assert node.get("/admin/status", headers=forwarded("user:someone", "n-peer")).status_code == 200
+    assert (seen[-1].name, seen[-1].role) == ("n-peer/someone", ROLE_USER)
+    assert node.get("/admin/keys", headers=forwarded("nonsense", "n-peer")).status_code == 401
+
+
+def test_where_nobody_owns_the_network_a_forward_still_says_who_asked(tmp_path, monkeypatch):
+    from isharded.access import Caller
+    from isharded.commons import Commons, make_identity
+
+    make_identity(tmp_path)
+    runtime = Orchestrator()
+    runtime.access = AccessControl(identities=True, authority=Commons(tmp_path))
+    assert runtime.speak_for(Caller("owner", ROLE_ADMIN), "n-boss", "GET", "/admin/status") == "admin:owner"
+
+
+@pytest.mark.parametrize("claim", ["admin:x", "admin:alice", "member:x", "user:x", "node:x"])
+def test_a_member_cannot_claim_a_role_with_a_header(coordinator, claim):
+    """A node certificate proves which node is talking, and says nothing about who asked."""
+    member = TestClient(connected_as(orchestrator_module.app, "member"))
+    forged = {FORWARD_MARK: "member", "x-isharded-on-behalf": claim}
+    assert member.get("/admin/keys", headers=forged).status_code == 401
+    assert member.post("/admin/keys", json={"name": "x", "role": "admin"}, headers=forged).status_code == 401
+    assert member.post("/admin/nodes/victim/revoke", headers=forged).status_code == 401
+    assert member.post("/admin/load", json={"model_id": "evil"}, headers=forged).status_code == 401
+    assert member.get("/admin/status", headers=forged).status_code == 401
+    assert "victim" not in coordinator.access.revoked
 
 
 def test_a_signed_entry_with_a_new_signature_changes_nothing(signed_pool):
@@ -874,3 +1410,368 @@ def test_join_requests_are_bounded_and_spread(owned):
         access.join_requests[f"n{index}"] = {}
     second = request_membership(str(home), "late", ["10.0.0.9"])
     assert access.add_join_request(read_membership_request(second), second) == "busy"
+
+
+def from_address(app, host):
+    async def with_address(scope, receive, send):
+        scope["client"] = (host, 5000)
+        await app(scope, receive, send)
+
+    return with_address
+
+
+def fake_request(home, name):
+    from isharded.pool import request_membership
+
+    return {"request": request_membership(str(home), name, ["10.0.0.9"])}
+
+
+def test_a_stranger_cannot_send_much_to_the_routes_anyone_can_reach(owned):
+    from isharded.serving import MAX_STRANGER_BYTES
+
+    _, _, client, _ = owned
+    big = b'{"request": "' + b"x" * MAX_STRANGER_BYTES + b'"}'
+    assert client.post("/join/requests", content=big).status_code == 413
+    assert client.post("/access/entries", content=big).status_code == 413
+
+
+def test_the_largest_real_entry_and_request_fit_under_the_limit(owned):
+    import json
+
+    from isharded.pool import approve_membership, request_membership, sign_entry
+    from isharded.serving import MAX_STRANGER_BYTES
+
+    folder, _, _, home = owned
+    addresses = [f"10.0.0.{index}" for index in range(1, 30)] + ["a-long-name.tailnet-with-a-long-name.ts.net"]
+    request = request_membership(str(home), "newcomer", addresses)
+    asking = {"request": request, "key_sha256": "a" * 64, "key_verifier": "v" * 43, "proof": "p" * 64}
+    entry = sign_entry(folder, {"type": "member", "name": "newcomer", "certificate": approve_membership(folder, request)})
+    assert len(json.dumps(asking)) < MAX_STRANGER_BYTES and len(json.dumps(entry)) < MAX_STRANGER_BYTES
+
+
+def test_one_address_can_only_ask_to_join_so_often(owned):
+    from isharded.orchestrator import JOIN_BURST
+
+    _, access, _, home = owned
+    client = TestClient(from_address(orchestrator_module.app, "198.51.100.7"))
+    for index in range(JOIN_BURST):
+        assert client.post("/join/requests", json=fake_request(home, f"n{index}")).status_code == 200
+    refused = client.post("/join/requests", json=fake_request(home, "one-too-many"))
+    assert refused.status_code == 429 and int(refused.headers["Retry-After"]) >= 1
+    assert "one-too-many" not in access.join_requests
+    other = TestClient(from_address(orchestrator_module.app, "198.51.100.8"))
+    assert other.post("/join/requests", json=fake_request(home, "elsewhere")).status_code == 200
+
+
+def test_junk_costs_as_much_as_a_real_request_to_join(owned):
+    from isharded.orchestrator import JOIN_BURST
+
+    client = TestClient(from_address(orchestrator_module.app, "198.51.100.7"))
+    for _ in range(JOIN_BURST):
+        assert client.post("/join/requests", json={"request": "junk"}).status_code == 400
+    assert client.post("/join/requests", json={"request": "junk"}).status_code == 429
+
+
+def test_one_address_cannot_hold_the_whole_queue():
+    from isharded.access import JOIN_REQUEST_SECONDS, MAX_JOIN_REQUESTS
+    from isharded.orchestrator import JOIN_BURST, JOINS_PER_MINUTE
+
+    assert JOIN_BURST + JOINS_PER_MINUTE * JOIN_REQUEST_SECONDS / 60 < MAX_JOIN_REQUESTS
+
+
+def test_the_limit_sees_one_ipv6_customer_as_one_address():
+    from isharded.serving import client_address
+
+    assert client_address("2001:db8:1:2::5") == client_address("2001:db8:1:2:ffff::9")
+    assert client_address("2001:db8:1:2::5") != client_address("2001:db8:1:3::5")
+    assert client_address("::ffff:198.51.100.7") == client_address("198.51.100.7") == "198.51.100.7"
+    assert client_address(None) == "unknown" and client_address("testclient") == "testclient"
+
+
+def test_a_limit_refills_and_forgets_only_what_it_can():
+    from isharded import serving
+    from isharded.serving import AddressLimit
+
+    clock = Clock()
+    limit = AddressLimit(2, 60.0, clock)
+    limit.charge("a")
+    limit.charge("a")
+    assert limit.wait("a") == 1.0 and limit.wait("b") == 0.0
+    clock.now += 1.0
+    assert limit.wait("a") == 0.0
+    limit.held = {f"x{index}": (0.0, clock.now) for index in range(serving.MOST_ADDRESSES)}
+    limit.charge("new")
+    assert len(limit.held) == serving.MOST_ADDRESSES and "x0" not in limit.held and "new" in limit.held
+
+
+def test_a_flood_of_requests_expires_and_the_queue_opens_again(owned):
+    from isharded.access import JOIN_REQUEST_SECONDS, MAX_JOIN_REQUESTS
+    from isharded.pool import read_membership_request
+
+    _, access, _, home = owned
+    clock = Clock()
+    access.wall_clock = clock
+    text = fake_request(home, "fake")["request"]
+    details = read_membership_request(text)
+    for index in range(MAX_JOIN_REQUESTS):
+        assert access.add_join_request({**details, "name": f"fake{index}"}, text) == "waiting"
+    real = fake_request(home, "real")["request"]
+    assert access.add_join_request(read_membership_request(real), real) == "busy"
+    clock.now += JOIN_REQUEST_SECONDS
+    assert access.add_join_request(read_membership_request(real), real) == "waiting"
+    assert list(access.join_requests) == ["real"]
+
+
+def test_an_invite_gets_through_a_queue_full_of_strangers(owned):
+    from isharded.access import MAX_JOIN_REQUESTS
+    from isharded.pool import read_membership_request
+
+    _, access, client, home = owned
+    text = fake_request(home, "fake")["request"]
+    details = read_membership_request(text)
+    for index in range(MAX_JOIN_REQUESTS):
+        access.add_join_request({**details, "name": f"fake{index}"}, text)
+    asked = client.post("/join/requests", json={**fake_request(home, "invited"), "proof": "p" * 64, "key_sha256": "k" * 64})
+    assert asked.json()["status"] == "waiting"
+    assert "invited" in access.join_requests and "fake0" not in access.join_requests
+    assert len(access.join_requests) == MAX_JOIN_REQUESTS
+
+
+def test_a_false_proof_buys_only_minutes(owned):
+    from isharded.access import INVITED_REQUEST_SECONDS, JOIN_REQUEST_SECONDS
+    from isharded.pool import read_membership_request
+
+    _, access, _, home = owned
+    clock = Clock()
+    access.wall_clock = clock
+    text = fake_request(home, "fake")["request"]
+    access.add_join_request(read_membership_request(text), text, {"proof": "p" * 64})
+    assert "fake" in access.join_requests
+    clock.now += INVITED_REQUEST_SECONDS
+    access.expire_join_requests()
+    assert "fake" not in access.join_requests
+    assert INVITED_REQUEST_SECONDS < JOIN_REQUEST_SECONDS
+
+
+def test_a_real_invite_outlasts_the_machine_waiting_on_it():
+    from isharded.access import INVITED_REQUEST_SECONDS, JOIN_REQUEST_SECONDS
+    from isharded.up import APPROVAL_WAIT_SECONDS, PERSON_WAIT_SECONDS
+
+    assert INVITED_REQUEST_SECONDS >= APPROVAL_WAIT_SECONDS and JOIN_REQUEST_SECONDS >= PERSON_WAIT_SECONDS
+
+
+def test_an_expired_request_does_not_come_back_through_gossip(owned):
+    from isharded.access import AccessControl, Authority, JOIN_REQUEST_SECONDS
+
+    folder, access, _, home = owned
+    clock = Clock()
+    access.wall_clock = clock
+    peer = AccessControl(identities=True, authority=Authority(folder + "/ca.pem"), wall_clock=clock)
+    text = fake_request(home, "fake")["request"]
+    from isharded.pool import read_membership_request
+
+    access.add_join_request(read_membership_request(text), text)
+    peer.merge(access.document())
+    held = access.document()
+    assert "fake" in peer.join_requests
+    clock.now += JOIN_REQUEST_SECONDS + 1
+    access.expire_join_requests()
+    peer.merge(held)  # a late copy, from a node yet to notice
+    access.merge(held)
+    assert not access.join_requests and not peer.join_requests
+
+
+def test_asking_again_keeps_a_request_alive_on_every_node(owned):
+    from isharded.access import AccessControl, Authority, JOIN_REQUEST_SECONDS
+    from isharded.pool import read_membership_request
+
+    folder, access, _, home = owned
+    clock = Clock()
+    access.wall_clock = clock
+    peer = AccessControl(identities=True, authority=Authority(folder + "/ca.pem"), wall_clock=clock)
+    text = fake_request(home, "patient")["request"]
+    access.add_join_request(read_membership_request(text), text)
+    peer.merge(access.document())
+    clock.now += JOIN_REQUEST_SECONDS / 2 + 1
+    stale = peer.document()
+    access.add_join_request(read_membership_request(text), text)
+    access.merge(stale)  # an older copy must not undo it
+    peer.merge(access.document())
+    clock.now += JOIN_REQUEST_SECONDS / 2 + 1
+    access.expire_join_requests()
+    peer.expire_join_requests()
+    assert "patient" in access.join_requests and "patient" in peer.join_requests
+
+
+@pytest.mark.parametrize("asked_at", ["nonsense", float("nan"), float("-inf"), -5.0])
+def test_a_bad_time_from_gossip_never_keeps_a_request(owned, asked_at):
+    from isharded.pool import read_membership_request
+
+    _, access, _, home = owned
+    text = fake_request(home, "fake")["request"]
+    state = access.add_join_request(read_membership_request(text), text, None, asked_at)
+    if asked_at == "nonsense":
+        assert state == "waiting" and access.join_requests["fake"]["asked_at"] <= access.wall_clock()
+    else:
+        assert state == "expired" and "fake" not in access.join_requests
+
+
+def test_a_time_from_the_future_counts_as_now(owned):
+    from isharded.pool import read_membership_request
+
+    _, access, _, home = owned
+    text = fake_request(home, "fake")["request"]
+    access.add_join_request(read_membership_request(text), text, None, access.wall_clock() + 10**9)
+    assert access.join_requests["fake"]["asked_at"] <= access.wall_clock()
+
+
+def test_bad_entries_run_out_and_good_ones_never_do(owned):
+    from isharded.orchestrator import WASTED_ENTRY_BURST
+    from isharded.pool import sign_entry
+
+    folder, access, _, _ = owned
+    client = TestClient(from_address(orchestrator_module.app, "198.51.100.7"))
+    for _ in range(WASTED_ENTRY_BURST + 5):
+        assert client.post("/access/entries", json=sign_entry(folder, {"type": "revoke", "name": "fresh" + str(len(access.signed))})).status_code == 200
+    for _ in range(WASTED_ENTRY_BURST):
+        assert client.post("/access/entries", json={"entry": key_entry(), "signature": "AAAA"}).status_code == 403
+    assert client.post("/access/entries", json={"entry": key_entry(), "signature": "AAAA"}).status_code == 429
+    owner = TestClient(from_address(orchestrator_module.app, "198.51.100.8"))
+    assert owner.post("/access/entries", json=sign_entry(folder, key_entry())).status_code == 200
+
+
+def test_sending_a_good_entry_again_is_a_waste_like_any_other(owned):
+    from isharded.orchestrator import WASTED_ENTRY_BURST
+    from isharded.pool import sign_entry
+
+    folder, _, _, _ = owned
+    runtime = orchestrator_module.runtime
+    client = TestClient(from_address(orchestrator_module.app, "198.51.100.7"))
+    signed = sign_entry(folder, key_entry())
+    events = len(runtime.events)
+    for _ in range(WASTED_ENTRY_BURST + 1):
+        assert client.post("/access/entries", json=signed).status_code == 200
+    assert client.post("/access/entries", json=signed).status_code == 429
+    assert len(runtime.events) == events + 1  # one change, one line in the log
+
+
+@pytest.mark.parametrize("path", ["/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"])
+def test_no_description_of_the_api_is_served_to_strangers(path):
+    assert TestClient(orchestrator_module.app).get(path).status_code == 404
+    assert TestClient(worker_module.app).get(path).status_code in {401, 404}
+
+
+def test_the_worker_and_control_plane_routes_do_not_depend_on_the_schema():
+    for app in (orchestrator_module.app, worker_module.app):
+        assert app.docs_url is None and app.redoc_url is None and app.openapi_url is None
+
+
+def test_a_stranger_learns_no_model_from_the_ready_check(pool_with_authority):
+    pool_with_authority.model_id = "someone/private-model"
+    answer = TestClient(orchestrator_module.app).get("/ready")
+    assert answer.json() == {"ready": False}
+    assert "private-model" not in answer.text
+
+
+def test_the_public_certificate_comes_with_no_node_name(owned):
+    _, _, client, _ = owned
+    orchestrator_module.runtime.mesh = ControlMesh("secret-machine", "http://me:1", (), Clock())
+    answer = client.get("/join/authority")
+    assert list(answer.json()) == ["authority"]
+    assert "secret-machine" not in answer.text
+
+
+def handshake(server, client):
+    """Over memory, so antivirus cannot step in the way it does on loopback."""
+    import ssl
+
+    client_in, client_out, server_in, server_out = (ssl.MemoryBIO() for _ in range(4))
+    near = client.wrap_bio(client_in, client_out, server_hostname="10.0.0.1")
+    far = server.wrap_bio(server_in, server_out, server_side=True)
+    for _ in range(20):
+        finished = 0
+        for side in (near, far):
+            try:
+                side.do_handshake()
+                finished += 1
+            except ssl.SSLWantReadError:
+                pass
+        if client_out.pending:
+            server_in.write(client_out.read())
+        if server_out.pending:
+            client_in.write(server_out.read())
+        if finished == 2:
+            return near.version(), near.cipher()[0]
+    raise AssertionError("the handshake did not finish")
+
+
+@pytest.fixture
+def tls_contexts(ticket_pool, monkeypatch):
+    import ssl
+
+    from uvicorn.config import SSL_PROTOCOL_VERSION, create_ssl_context
+
+    from isharded.tls import server_options
+
+    monkeypatch.setenv("ISHARDED_TLS_CERT", str(ticket_pool / "node-a.pem"))
+    monkeypatch.setenv("ISHARDED_TLS_KEY", str(ticket_pool / "node-a.key"))
+    monkeypatch.setenv("ISHARDED_CA_FILE", str(ticket_pool / "ca.pem"))
+    options = server_options()
+    server = create_ssl_context(options["ssl_certfile"], options["ssl_keyfile"], None, SSL_PROTOCOL_VERSION, options["ssl_cert_reqs"], options["ssl_ca_certs"], options["ssl_ciphers"])
+    return server, lambda: ssl.create_default_context(cafile=str(ticket_pool / "ca.pem"))
+
+
+def test_a_node_speaks_tls_1_3(tls_contexts):
+    server, client = tls_contexts
+    assert handshake(server, client())[0] == "TLSv1.3"
+
+
+def test_tls_1_2_still_works_with_a_modern_cipher(tls_contexts):
+    import ssl
+
+    server, client = tls_contexts
+    older = client()
+    older.maximum_version = ssl.TLSVersion.TLSv1_2
+    version, cipher = handshake(server, older)
+    assert version == "TLSv1.2" and "GCM" in cipher
+
+
+def test_nothing_below_tls_1_2_is_accepted(tls_contexts):
+    import ssl
+    import warnings
+
+    server, client = tls_contexts
+    old = client()
+    old.check_hostname = False
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        old.minimum_version = ssl.TLSVersion.TLSv1
+        old.maximum_version = ssl.TLSVersion.TLSv1_1
+    old.set_ciphers("ALL:@SECLEVEL=0")
+    with pytest.raises(ssl.SSLError):
+        handshake(server, old)
+
+
+def test_no_anonymous_or_cbc_cipher_is_offered(tls_contexts):
+    server, _ = tls_contexts
+    names = [item["name"] for item in server.get_ciphers()]
+    assert names and not [name for name in names if name.startswith(("AECDH", "ADH")) or name.endswith("-SHA")]
+
+
+def test_a_node_reaches_itself_over_loopback_and_everyone_else_as_named(monkeypatch) -> None:
+    from isharded.tls import OWN_ADDRESS, stay_on_this_machine
+
+    def sent(url: str) -> httpx.Request:
+        request = httpx.Request("GET", url)
+        stay_on_this_machine(request)
+        return request
+
+    assert sent("https://203.0.113.5:9000/health").url.host == "203.0.113.5"  # unset: nothing changes
+    monkeypatch.setenv(OWN_ADDRESS, "203.0.113.5")
+    request = sent("https://203.0.113.5:9000/health")
+    assert (request.url.host, request.url.port, request.url.scheme) == ("127.0.0.1", 9000, "https")
+    assert request.headers["host"] == "203.0.113.5:9000"
+    assert sent("https://203.0.113.6:9000/health").url.host == "203.0.113.6"
+    monkeypatch.setenv(OWN_ADDRESS, "203.0.113.5:9000,203.0.113.5:9001")  # behind a relay, sharing its host
+    assert sent("https://203.0.113.5:9001/health").url.host == "127.0.0.1"
+    assert sent("https://203.0.113.5:9002/health").url.host == "203.0.113.5"

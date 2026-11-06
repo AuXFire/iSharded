@@ -33,7 +33,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from isharded.pool import LOOPBACK
-from isharded.serving import BodyLimit, NoDelayHTTPProtocol
+from isharded.serving import BodyLimit, keep_listening, NoDelayHTTPProtocol
 
 from .broker import PEER_PREFIX
 from .context import TurnNotFound
@@ -827,6 +827,7 @@ def run_serve(assistant: Any, args: argparse.Namespace) -> int:
     federation = getattr(assistant, "federation", None)
     if federation is not None:
         federation.listening_at(args.host, f"{scheme}://{args.host}:{args.port}")
+    keep_listening()
     uvicorn.run(create_app(assistant), host=args.host, port=args.port, http=NoDelayHTTPProtocol, access_log=False, log_level="warning", **options)
     return 0
 

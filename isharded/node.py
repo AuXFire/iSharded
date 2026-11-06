@@ -13,7 +13,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from .geo import country_code
 from .lanes import lane_port, lane_url, read_lanes
+from .tls import OWN_ADDRESS
 from .pool import check_exposure, load_token
 
 def is_remote_path(path: str | Path) -> bool:
@@ -74,6 +76,7 @@ def add_node_arguments(parser: argparse.ArgumentParser) -> None:
         help="the address other nodes reach this one on; auto prefers Tailscale, then the LAN",
     )
     parser.add_argument("--advertise-scheme", choices=["http", "https"], default="http", help="set to https for you by --tls-cert")
+    parser.add_argument("--location", type=country_code, default=None, help="two letter country code for the dashboard's flag, or none to show no flag; default is looked up from --advertise-host")
     parser.add_argument("--base-port", type=int, default=8200, help="first worker's port; later workers take the next ones")
     parser.add_argument(
         "--gpu-device",
@@ -236,6 +239,7 @@ def _worker_command(
         *(["--open"] if getattr(args, "open_pool", False) else []),
         *(["--trusted-network"] if getattr(args, "trusted_network", False) else []),
         *(["--host-models", args.host_models] if getattr(args, "host_models", "") else []),
+        *(["--location", args.location] if getattr(args, "location", None) else []),
         *extra,
     ]
 
@@ -509,6 +513,8 @@ def run_node(args: argparse.Namespace) -> int:
     specs = node_specs(args)
 
     env = os.environ.copy()
+    if args.bind_host in {"0.0.0.0", "::"}:  # loopback reaches this node's services only then
+        env.setdefault(OWN_ADDRESS, args.advertise_host)
     # When iSharded is launched directly from a checkout (including an RDP
     # redirected drive), the supervisor can import this package because its
     # launcher amended sys.path, but fresh ``python -m isharded.worker`` child

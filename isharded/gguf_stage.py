@@ -77,6 +77,9 @@ def build_stage_file(
     if target.is_file():
         return target
 
+    # A stage file is a second copy of its units, and a disk that held the units may not hold both.
+    paths = {cache.path(request.model_id, request.revision, unit) for unit in units}
+    cache.make_room(sum(path.stat().st_size for path in paths), paths)
     owners: dict[str, Path] = {}
     for unit in units:
         path = cache.path(request.model_id, request.revision, unit)

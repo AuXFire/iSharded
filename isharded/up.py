@@ -36,8 +36,12 @@ import psutil
 
 from .access import digest
 from .discovery import find_meshes
+from .geo import country_code
+from .inventory import ram
 from .node import add_node_arguments, detect_address, run_node
+from .tls import OWN_ADDRESS, stay_on_this_machine
 from .pool import _private_link, _write_private, add_node, approve_membership, home as pool_home, init_pool, request_membership, sign_entry
+from .statements import VERIFIER_LENGTH, key_verifier
 
 DEFAULT_PORT = 8209
 INVITE_PREFIX = "isi-"
@@ -102,8 +106,20 @@ def make_owner(home: Path, name: str, address: str) -> None:
     add_node(str(home), name, [address, "127.0.0.1"])
     key = "isk-" + secrets.token_urlsafe(32)
     _write_private(home / "admin.key", key.encode())
-    signed = sign_entry(str(home), {"type": "key", "name": "owner", "role": "admin", "sha256": digest(key), "requests_per_minute": 0})
+    signed = sign_entry(str(home), {"type": "key", "name": "owner", "role": "admin", "sha256": digest(key), "requests_per_minute": 0, "verifier": key_verifier(key)})
     (home / "access.json").write_text(json.dumps({"version": 1, "keys": [], "signed": [signed]}), encoding="utf-8")
+
+
+def give_owner_a_verifier(home: Path, client: httpx.Client, base: str, key: str) -> None:
+    """A mesh made before verifiers has an owner key that only commands the node it is
+    given to. The owner's machine holds that key and the authority, so it can fix this.
+    """
+    document = json.loads((home / "access.json").read_text(encoding="utf-8"))
+    entries = [held["entry"] for held in document.get("signed", [])]
+    mine = [entry for entry in entries if entry.get("type") == "key" and entry.get("sha256") == digest(key)]
+    if mine and not any(entry.get("verifier") for entry in mine):
+        kept = {field: mine[0][field] for field in ("type", "name", "role", "sha256", "requests_per_minute") if field in mine[0]}
+        client.post(base + "/access/entries", json=sign_entry(str(home), {**kept, "verifier": key_verifier(key)}))
 
 
 def authority_hash(pem: str) -> str:
@@ -143,16 +159,20 @@ def read_invite(code: str) -> dict[str, Any]:
         raise ValueError("this invite is damaged; copy the whole code") from exc
 
 
-def invite_proof(secret: str, request: str, key_hash: str) -> str:
-    """Ties the secret to one request, so seeing a proof pass by lets nobody reuse it."""
-    return hmac.new(secret.encode(), f"{request}\n{key_hash}".encode(), hashlib.sha256).hexdigest()
+def invite_proof(secret: str, request: str, key_hash: str, verifier: str = "") -> str:
+    """Ties the secret to one request, so seeing a proof pass by lets nobody reuse it.
+
+    A machine running older code sends no verifier, and its proof still has to pass.
+    """
+    message = f"{request}\n{key_hash}\n{verifier}" if verifier else f"{request}\n{key_hash}"
+    return hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
 
 
 def matching_invite(invites: list[dict[str, Any]], item: dict[str, Any], clock: Any = time.time) -> dict[str, Any] | None:
     for invite in invites:
         if invite["uses"] < 1 or invite["expires_at"] <= clock():
             continue
-        expected = invite_proof(invite["secret"], str(item.get("request", "")), str(item.get("key_sha256", "")))
+        expected = invite_proof(invite["secret"], str(item.get("request", "")), str(item.get("key_sha256", "")), str(item.get("key_verifier", "")))
         if hmac.compare_digest(expected, str(item.get("proof", ""))):
             return invite
     return None
@@ -160,7 +180,7 @@ def matching_invite(invites: list[dict[str, Any]], item: dict[str, Any], clock: 
 
 def client_for(settings: dict[str, Any], home: Path) -> httpx.Client:
     verify: Any = str(home / "ca.pem") if settings.get("tls") else True
-    return httpx.Client(timeout=30.0, trust_env=False, verify=verify)
+    return httpx.Client(event_hooks={"request": [stay_on_this_machine]}, timeout=30.0, trust_env=False, verify=verify)
 
 
 def local_url(settings: dict[str, Any]) -> str:
@@ -190,6 +210,9 @@ def approve_invited(home: Path, client: httpx.Client, base: str, key: str, clock
         key_hash = str(item.get("key_sha256", ""))
         if re.fullmatch(r"[0-9a-f]{64}", key_hash):
             entry = {"type": "key", "name": f"{name}-user", "role": "user", "sha256": key_hash, "requests_per_minute": 0}
+            verifier = str(item.get("key_verifier", ""))
+            if re.fullmatch(rf"[A-Za-z0-9_-]{{{VERIFIER_LENGTH}}}", verifier):
+                entry["verifier"] = verifier
             client.post(base + "/access/entries", json=sign_entry(str(home), entry))
         if invite is not None:
             invite["uses"] -= 1
@@ -213,7 +236,8 @@ def fetch_authority(invite: dict[str, Any]) -> tuple[str, str]:
     for url in invite["urls"]:
         try:
             # Nothing is trusted yet, so the connection proves nothing. The hash does.
-            answer = httpx.get(url + "/join/authority", timeout=15.0, verify=False, trust_env=False)
+            with httpx.Client(event_hooks={"request": [stay_on_this_machine]}, timeout=15.0, verify=False, trust_env=False) as client:
+                answer = client.get(url + "/join/authority")
             answer.raise_for_status()
             pem = answer.json()["authority"]
         except (httpx.HTTPError, ValueError, KeyError) as exc:
@@ -235,6 +259,16 @@ def certificate_matches_key(certificate: str, key_file: Path) -> bool:
     return public.public_bytes(*raw) == private.public_key().public_bytes(*raw)
 
 
+def ask_to_join(client: httpx.Client, url: str, asking: dict[str, str], deadline: float) -> httpx.Response:
+    """Machines behind one address share its limit, so a batch of them takes turns."""
+    while True:
+        answer = client.post(url + "/join/requests", json=asking)
+        wait = float(answer.headers.get("Retry-After", 30))
+        if answer.status_code != 429 or time.monotonic() + wait > deadline:
+            return answer
+        time.sleep(wait)
+
+
 def join_mesh(home: Path, invite: dict[str, Any], name: str, address: str) -> str:
     """Ask for a place in the mesh, with an invite's secret or for a person to approve.
 
@@ -246,13 +280,13 @@ def join_mesh(home: Path, invite: dict[str, Any], name: str, address: str) -> st
     verify: Any = str(home / "ca.pem") if url.startswith("https") else True
     key = "isk-" + secrets.token_urlsafe(32)
     request = request_membership(str(home), name, [address, "127.0.0.1"])
-    key_hash = digest(key)
+    key_hash, verifier = digest(key), key_verifier(key)
     secret = invite.get("secret")
-    asking = {"request": request, "key_sha256": key_hash}
+    asking = {"request": request, "key_sha256": key_hash, "key_verifier": verifier}
     if secret:
-        asking["proof"] = invite_proof(secret, request, key_hash)
-    with httpx.Client(timeout=30.0, trust_env=False, verify=verify) as client:
-        answer = client.post(url + "/join/requests", json=asking)
+        asking["proof"] = invite_proof(secret, request, key_hash, verifier)
+    with httpx.Client(event_hooks={"request": [stay_on_this_machine]}, timeout=30.0, trust_env=False, verify=verify) as client:
+        answer = ask_to_join(client, url, asking, time.monotonic() + APPROVAL_WAIT_SECONDS)
         if answer.status_code != 200:
             raise ValueError(answer.text[:200])
         state = answer.json().get("status")
@@ -282,7 +316,8 @@ def node_arguments(settings: dict[str, Any], home: Path) -> argparse.Namespace:
     arguments = [
         "--node-id", name,
         "--control-port", str(port),
-        "--base-port", str(port - 9),
+        "--base-port", str(settings.get("worker_port") or port - 9),
+        "--control-port", str(port),
         "--advertise-host", settings["address"],
         "--keys-file", str(home / "access.json"),
         "--weights-ram-gb", settings.get("ram_gb") or "auto",
@@ -305,6 +340,8 @@ def node_arguments(settings: dict[str, Any], home: Path) -> argparse.Namespace:
         arguments += ["--gpu-memory-gb", str(settings["gpu_gb"])]
     for folder in settings.get("gguf_dirs", []):
         arguments += ["--gguf-dir", folder]
+    if settings.get("location"):
+        arguments += ["--location", settings["location"]]
     parser = argparse.ArgumentParser()
     add_node_arguments(parser)
     return parser.parse_args(arguments)
@@ -404,6 +441,10 @@ def keep_watch(home: Path, settings: dict[str, Any], args: argparse.Namespace) -
             threading.Thread(target=load_first_model, args=(settings, home, key, args.model), daemon=True).start()
         if settings.get("ownerless") or not (home / "ca.key").is_file():
             return
+        try:
+            give_owner_a_verifier(home, client, base, key or "")
+        except (httpx.HTTPError, OSError, ValueError) as exc:
+            print(f"Could not update the owner's key: {exc}", flush=True)
         while True:
             time.sleep(APPROVAL_SECONDS)
             try:
@@ -440,7 +481,9 @@ def first_settings(args: argparse.Namespace, home: Path) -> dict[str, Any]:
     return {
         "name": args.name or machine_name(),
         "address": address,
+        "location": args.location,
         "port": args.port,
+        "worker_port": args.worker_port,
         "tls": tls and not args.ownerless,
         "trusted_network": args.trusted_network,
         "cpu_threads": args.cpu_threads or cpu_threads(),
@@ -467,6 +510,7 @@ def make_ownerless(home: Path, settings: dict[str, Any], joining: str, trust: li
 
 def become_member(home: Path, settings: dict[str, Any], invite: dict[str, Any]) -> None:
     settings["tls"] = any(url.startswith("https") for url in invite["urls"])
+    os.environ.setdefault(OWN_ADDRESS, settings["address"])  # a mesh reached through this machine's own address
     answered = join_mesh(home, invite, settings["name"], settings["address"])
     settings["join"] = list(dict.fromkeys([answered, *invite["urls"]]))
     write_settings(home, settings)
@@ -502,6 +546,9 @@ def run_up(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+    if args.location and args.location != settings.get("location"):  # a node that already exists can say where it is
+        settings["location"] = args.location
+        write_settings(home, settings)
     address = settings["address"]
     if not settings["tls"] and not _private_link(address) and not settings.get("trusted_network"):
         print(f"{address} is not an encrypted network, so this node needs TLS or --trusted-network.", file=sys.stderr)
@@ -599,7 +646,7 @@ def checks() -> list[tuple[bool, str, str]]:
     with socket.socket() as probe:
         free = probe.connect_ex(("127.0.0.1", DEFAULT_PORT)) != 0
     check(free, f"Port {DEFAULT_PORT} is free" if free else f"Port {DEFAULT_PORT} is in use", "Stop what uses it, or run isharded up --port with another port")
-    memory = psutil.virtual_memory()
+    memory = ram()
     check(memory.available > 2 * 1024**3, f"{memory.available / 1024**3:.1f} GiB of RAM free", "A node needs at least 2 GiB free")
     disk = shutil.disk_usage(str(Path.home()))
     check(disk.free > 10 * 1024**3, f"{disk.free / 1024**3:.0f} GiB of disk free", "Models need room. Free some disk first")
@@ -624,8 +671,10 @@ def add_arguments(subparsers: Any) -> None:
     up = subparsers.add_parser("up", help="start a node with everything worked out for you; the easy way in")
     up.add_argument("--invite", default=None, help="join a mesh, with a code from isharded invite")
     up.add_argument("--name", default=None, help="this node's name; default is the machine's name")
+    up.add_argument("--worker-port", type=int, default=None, help="this node's worker port, for clouds that hand out ports; default is nine below --port")
     up.add_argument("--port", type=int, default=DEFAULT_PORT, help="port for the chat page and API")
     up.add_argument("--address", default=None, help="the address other nodes reach this one on; found for you if not set")
+    up.add_argument("--location", type=country_code, default=None, help="two letter country code for the dashboard's flag, or none to show no flag, kept for next time; default is looked up from --address")
     up.add_argument("--tls", action="store_true", help="use TLS even on Tailscale")
     up.add_argument("--trusted-network", action="store_true", help="skip TLS, because nobody else can read this network")
     up.add_argument("--no-gpu", action="store_true", help="contribute CPU and RAM only")

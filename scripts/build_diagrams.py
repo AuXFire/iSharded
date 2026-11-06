@@ -238,7 +238,7 @@ for event, notice, action, reply, kind in rows:
     top += 72
 
 # ---------------------------------------------------------------- 6. joining
-f6 = Fig("f6", 960, 500, "A node asks through any member, the owner signs the answer offline, and neither private key ever crosses the network.")
+f6 = Fig("f6", 960, 500, "A node asks through any member, the owner's machine signs the answer, and neither private key ever crosses the network.")
 lanes = {"new": 110, "member": 370, "others": 610, "owner": 850}
 names = {"new": "New node", "member": "Any member", "others": "Other members", "owner": "Owner's machine"}
 for key, x in lanes.items():
@@ -251,7 +251,7 @@ f6.path([(lanes["member"], 164), (lanes["others"], 164)], "mesh")
 f6.text(490, 156, "gossip", "lbl halo")
 f6.path([(lanes["owner"], 200), (lanes["member"], 200)], "route")
 f6.text(730, 192, "lists who is waiting", "lbl halo")
-f6.box(lanes["owner"] - 96, 216, 192, 50, None, ["checks the fingerprint,", "signs with its key, offline"], "sign-note")
+f6.box(lanes["owner"] - 96, 216, 192, 50, None, ["checks the invite, or asks", "a person, then signs"], "sign-note")
 f6.path([(lanes["owner"], 292), (lanes["member"], 292)], "sign")
 f6.text(730, 284, "signed approval + certificate", "lbl halo")
 f6.path([(lanes["member"], 328), (lanes["others"], 328)], "sign")
@@ -277,7 +277,7 @@ for x0, title, tag, kind in ((16, "Owned", "built", "tag-built"), (492, "Ownerle
     f7.path([(a[0] + 110, a[1] + 8), (c[0], c[1] + 8)], "mesh", start=True)
     f7.box(x0 + 320, 56, 110, 44, "New node", (), "note")
 ox = 16 + 171
-f7.box(ox - 6, 70, 122, 52, "Owner", ["key stays offline"], "sign-box")
+f7.box(ox - 6, 70, 122, 52, "Owner", ["key never leaves"], "sign-box")
 f7.path([(ox + 20, 122), (16 + 77, 240)], "sign")
 f7.path([(ox + 55, 122), (ox + 55, 284)], "sign")
 f7.path([(ox + 90, 122), (16 + 375, 240)], "sign")
@@ -290,6 +290,53 @@ f7.text(px + 55, 101, "no owner", "sub")
 f7.path([(492 + 395, 100), (492 + 395, 240)], "route")
 f7.text(492 + 386, 150, "joins, or is", "lbl", "end")
 f7.text(492 + 386, 166, "vouched for", "lbl", "end")
+
+# ---------------------------------------------------------------- 8. several models
+f8 = Fig("f8", 960, 356, "Each node runs the main route's control plane and worker, and beside them a control plane and worker for each lane. A request names a model, and the front door passes it to that model's route.")
+xs8, ny8 = [20, 345, 670], 110
+f8.box(66, 14, 170, 52, "People and apps", ["name a model"])
+cells = [
+    ("Node A", "layers 0 to 31", "", "no layers here", "note"),
+    ("Node B", "layers 32 to 63", "", "no layers here", "note"),
+    ("Node C", "no layers here", "note", "the small model", "lead"),
+]
+for x, (name, main, main_kind, lane, lane_kind) in zip(xs8, cells):
+    f8.add(f'<rect x="{x}" y="{ny8}" width="270" height="236" rx="11" class="node"/>')
+    f8.box(x + 12, ny8 + 22, 110, 66, "Control plane", ["main, and the", "door to lanes"])
+    f8.box(x + 148, ny8 + 22, 110, 66, "Control plane", ["for the lane,", "ports +1000"])
+    f8.box(x + 12, ny8 + 118, 110, 54, "Worker", [main], main_kind)
+    f8.box(x + 148, ny8 + 118, 110, 54, "Worker", [lane], lane_kind)
+    f8.path([(x + 122, ny8 + 55), (x + 148, ny8 + 55)], "route")
+    f8.path([(x + 67, ny8 + 88), (x + 67, ny8 + 118)], "mesh", start=True)
+    f8.path([(x + 203, ny8 + 88), (x + 203, ny8 + 118)], "mesh", start=True)
+    f8.text(x + 12, ny8 + 220, name, "ttl", "start")
+f8.path([(151, 66), (151, ny8 - 6), (xs8[0] + 92, ny8 - 6), (xs8[0] + 92, ny8 + 22)], "route", start=True)
+f8.text(162, 90, "any node", "lbl", "start")
+f8.path([(xs8[0] + 40, ny8 + 22), (xs8[0] + 40, 76), (xs8[2] + 40, 76), (xs8[2] + 40, ny8 + 22)], "mesh", start=True)
+f8.path([(xs8[1] + 40, 76), (xs8[1] + 40, ny8 + 22)], "mesh")
+f8.text(590, 72, "main gossip", "lbl halo")
+f8.path([(xs8[0] + 230, ny8 + 22), (xs8[0] + 230, 92), (xs8[2] + 230, 92), (xs8[2] + 230, ny8 + 22)], "mesh", start=True)
+f8.path([(xs8[1] + 230, 92), (xs8[1] + 230, ny8 + 22)], "mesh")
+f8.text(760, 88, "lane gossip", "lbl halo")
+f8.path([(xs8[0] + 67, ny8 + 172), (xs8[0] + 67, ny8 + 194), (xs8[1] + 67, ny8 + 194), (xs8[1] + 67, ny8 + 172)], "route", start=True)
+f8.text(250, ny8 + 198, "main route: the big model", "lbl halo")
+f8.text(xs8[2] + 203, ny8 + 198, "lane route: one stage", "lbl halo")
+
+# ---------------------------------------------------------------- 9. checking answers
+f9 = Fig("f9", 960, 336, "The same questions go to three routes on separate nodes. Replies are compared in pairs, and the route out of line with the others is named along with its nodes.")
+f9.box(16, 128, 170, 80, "isharded audit", ["questions that read like chat,", "no randomness"])
+routes9 = [(30, "Main route", ["on node A"], ""), (128, "Lane one", ["on node B"], ""), (226, "Lane two", ["on node C, tampering"], "bad")]
+for y, title, lines, kind in routes9:
+    f9.box(260, y, 170, 60, title, lines, kind)
+    f9.path([(186, 168), (222, 168), (222, y + 30), (260, y + 30)], "route")
+    f9.path([(430, y + 30), (470, y + 30), (470, 168), (500, 168)], "route", end=(y == 128))
+f9.box(500, 128, 166, 80, "Compare each pair", ["how far replies", "run together"])
+f9.text(474, 92, "100%", "lbl halo", "start")
+f9.text(474, 262, "1%", "lbl halo", "start")
+verdicts = [(14, "All pairs agree", ["the routes agree"], "okay"), (112, "Two routes differ", ["something is wrong, and", "nobody can say where"], "bad"), (222, "One of three is out of line", ["it is named, with its nodes"], "bad")]
+for y, title, lines, kind in verdicts:
+    f9.box(722, y, 222, 92 if y == 112 else 84, title, lines, kind)
+    f9.path([(666, 168), (694, 168), (694, y + 44), (722, y + 44)], "ink")
 
 STYLE = """
 /* A signal schematic: one plate per mechanism, three line colors that mean the same thing everywhere. */
@@ -446,13 +493,13 @@ PAGE = f"""<title>How iSharded Works</title>
       <tr><td>Who lets a node in?</td><td>The owner approves it</td><td>Each node decides: anyone, or nodes vouched for by those it already accepts</td></tr>
       <tr><td>Who removes a node?</td><td>The owner, for everyone</td><td>Nobody can. Each node blocks whoever it chooses, for itself</td></tr>
       <tr><td>Who picks the models?</td><td>The owner, or anyone with an admin key</td><td>Anyone can propose one beside what runs. Each node chooses what it hosts, and users pick from what's running</td></tr>
-      <tr><td>What is still unsolved?</td><td>A member can read prompts and return wrong answers</td><td>The same, plus one person could run thousands of nodes</td></tr>
+      <tr><td>What is still unsolved?</td><td>A member can read prompts. Wrong answers can be caught, not prevented</td><td>The same, plus one person could run thousands of nodes</td></tr>
     </tbody>
   </table></div>
 </section>
 </main>
 """
-FIGURES = {"structure": f1, "reply": f2, "coordinating": f3, "loading": f4, "failures": f5, "joining": f6, "ownership": f7}
+FIGURES = {"structure": f1, "reply": f2, "coordinating": f3, "loading": f4, "failures": f5, "joining": f6, "ownership": f7, "lanes": f8, "checking": f9}
 
 
 def render() -> None:

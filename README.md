@@ -8,6 +8,13 @@ It works on a closed network, a LAN, across VLANs, over Tailscale, or between re
 
 This is execution sharding, not simulated work distribution: each token really crosses every machine in the route. It is built to grow to many nodes. So far it has been tested on two machines, and [Scaling to many nodes](#scaling-to-many-nodes) separates what is proven from what comes next. Its security has been reviewed by AI only, not by a person. [Current limits](#current-limits) says what that means for you.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/dashboard-dark.png">
+  <img alt="The dashboard, on simulated data: a model's layers across six machines, pool metrics, the route's stages, and what needs attention." src="docs/screenshots/dashboard-light.png">
+</picture>
+
+*The dashboard, showing simulated data. [More of the console](#chat-page-and-dashboard).*
+
 ## Contents
 
 - [What it does](#what-it-does)
@@ -299,7 +306,7 @@ A node makes its own key and asks to join through any member. The owner approves
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/joining-dark.png">
-  <img alt="A node asks through any member, the owner signs the answer offline, and neither private key ever crosses the network." src="docs/diagrams/joining-light.png">
+  <img alt="A node asks through any member, the owner's machine signs the answer, and neither private key ever crosses the network." src="docs/diagrams/joining-light.png">
 </picture>
 
 Asking grants nothing. The new node's private key never leaves it, and the owner's key never touches the network, so a compromised node can't add a key or revoke a peer. Tickets prove a node's name without TLS, so antivirus that intercepts TLS can't break them. The link still needs Tailscale or another private network, because tickets don't encrypt anything. [iSharded security](docs/SECURITY.md) has the commands.
@@ -318,7 +325,7 @@ An owned network runs without a central server, but one person decides who belon
 | Who lets a node in? | The owner approves it | Each node decides: anyone, or nodes vouched for by those it already accepts |
 | Who removes a node? | The owner, for everyone | Nobody can. Each node blocks whoever it chooses, for itself |
 | Who picks the models? | The owner, or anyone with an admin key | Anyone can propose one beside what runs. Each node chooses what it hosts, and users pick from what's running |
-| What is still unsolved? | A member can read prompts and return wrong answers | The same, plus one person could run thousands of nodes |
+| What is still unsolved? | A member can read prompts. Wrong answers can be [caught](#checking-answers), not prevented | The same, plus one person could run thousands of nodes |
 
 See [A network nobody owns](#a-network-nobody-owns) to run one. To redraw these diagrams, run `python scripts/build_diagrams.py`.
 
@@ -356,11 +363,6 @@ None of this has been measured past two machines, so the first milestone is a re
 Every node serves a chat page at `/chat` and a console at `/dashboard`. These screenshots show the real pages with simulated data, because no mesh this size has run yet. Each page shows what it does today, and none of these figures are measurements.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/dashboard-dark.png">
-  <img alt="The dashboard: the model's layers across machines, pool metrics, the route's stages, and what needs attention." src="docs/screenshots/dashboard-light.png">
-</picture>
-
-<picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/chat-dark.png">
   <img alt="The chat page: a reply with its speed, and the stages it ran on." src="docs/screenshots/chat-light.png">
 </picture>
@@ -378,6 +380,10 @@ Every node serves both, so any node's address works.
 | `/dashboard` | The active pipeline, each node's state and hardware, latency, throughput, memory, recoveries, and events. Click a stage or worker for detail. |
 
 If the node serving your chat dies mid-reply, the page asks before sending your key and conversation to another member, then restarts the reply there.
+
+The dashboard shows a flag beside each worker whose country is known, with the name on hover and in the worker's details. The country comes from a table in the package, so no outside service sees a node's address. Only a public address can be looked up. A private, loopback, or Tailscale address shows nothing, and so does a host name, because resolving it would tell a DNS server. A node on Tailscale or a LAN therefore needs `--location` to show a flag.
+
+The table records who holds an address, which is not always where the machine is. A cloud's address can name the cloud's home country, and a node behind a relay has the relay's address. `--location` corrects both, and `--location none` shows no flag at all. Where a node shows itself is its operator's choice.
 
 ### Calling the API
 
@@ -416,6 +422,7 @@ If the connection to a node drops, retry against another node. Replies survive a
 | A GGUF file in a repo | `owner/repo:file.gguf` | Each worker fetches only its share |
 | A local GGUF path | `D:\models\file.gguf` | That machine, then peers read from it |
 | A bare GGUF file name | `file.gguf` | Whichever node holds it, with no internet needed |
+| A split GGUF, by any part | `owner/repo:Q6_K/model-00001-of-00004.gguf` | Each worker fetches only its share, from whichever parts hold it |
 | A local safetensors folder | `D:\models\qwen3-8b` | That machine. In a secured pool it must be in `--model-dir` |
 
 Loading a model replaces the main one. To run another beside it, see [Several models at once](#several-models-at-once). To see where a model would go without moving anything, use `POST /admin/plan`, or the picker on the chat page.
@@ -423,6 +430,11 @@ Loading a model replaces the main one. To run another beside it, see [Several mo
 Gated models need `HF_TOKEN` set on each worker.
 
 ### Several models at once
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/lanes-dark.png">
+  <img alt="Each node runs the main route's control plane and worker, and beside them a control plane and worker for each lane. A request names a model, and the front door passes it to that model's route." src="docs/diagrams/lanes-light.png">
+</picture>
 
 Load another model beside the main one by giving it a lane:
 
@@ -510,6 +522,7 @@ With real processes, as three nodes on one machine started with `isharded node`,
 | `--cache-budget-gb` | Set it on a small disk | Evicts old models past this size |
 | `--ram-budget-gb` | 0 for GGUF hybrid models, a few GB otherwise | KV checkpoints speed up recovery where a model supports them. Hybrid Qwen models replay instead |
 | `--log-file` | Always | Nothing is kept otherwise |
+| `--location` | Set it on Tailscale, on a LAN, behind a relay, or in a cloud | The address cannot show the right country there |
 | `--gguf-dir` | Point it at LM Studio's or your own model folder | Files there are read locally, not downloaded |
 
 The entry node also carries the draft model, about 1.7 GiB of VRAM for the default one, and the planner does not reserve room for it. If you want it on a particular machine, pin that machine with `--entry`.
@@ -570,7 +583,9 @@ Starts a node with everything worked out, and is the easy way in. See [Quick sta
 | `--invite` | None | Join a mesh, with a code from `isharded invite` |
 | `--name` | This machine's name | This node's name |
 | `--port` | 8209 | Port for the chat page and API |
+| `--worker-port` | Nine below `--port` | This node's worker port, for clouds that hand out ports |
 | `--address` | Found for you | The address other nodes reach this one on |
+| `--location` | Looked up from `--address` | Two letter country code for the dashboard's flag, such as `DE`, or `none` to show no flag. Kept for next time, and a new one replaces it |
 | `--tls` | Off on Tailscale | Use TLS even on Tailscale |
 | `--trusted-network` | Off | Skip TLS, because nobody else can read this network |
 | `--no-gpu` | Off | Contribute CPU and RAM only |
@@ -637,6 +652,7 @@ Network:
 | `--bind-host` | `0.0.0.0` | Address to listen on |
 | `--advertise-host` | `auto` | Address other nodes reach this one on. `auto` prefers Tailscale, then the LAN |
 | `--advertise-scheme` | `http` | `http` or `https`. Set to `https` for you by `--tls-cert` |
+| `--location` | Looked up from `--advertise-host` | Two letter country code for the dashboard's flag, such as `DE`, or `none` to show no flag |
 | `--base-port` | 8200 | First worker's port. Later workers take the next ones |
 
 Security:
@@ -762,7 +778,7 @@ Hashes a model on a copy you trust, for `load --hashes`. It reads the whole mode
 
 ### isharded key
 
-`key create NAME` makes an API key and shows it once. `key remove NAME` removes one for good, and needs the authority.
+`key create NAME` makes an API key and shows it once. `key remove NAME` removes one for good, and needs the authority. An admin key made before this version acts only as `user` when another node passes its requests on, so [make a new one](docs/SECURITY.md#keys-made-before-verifiers) if you use it through more than one node.
 
 | Option | Applies to | Default | What it does |
 |---|---|---|---|
@@ -841,6 +857,7 @@ The state folder is `%LOCALAPPDATA%\iSharded` on Windows and `~/.cache/iSharded`
 | `--worker-id` | Computer name | Unique name. Use `node-gpu`, `node-cpu`, or `node-memory` so certificates match |
 | `--orchestrator-url` | `http://127.0.0.1:8000` | One or more control planes, comma separated. The rest are found from them |
 | `--advertise-url` | `http://127.0.0.1:PORT` | How other nodes reach this worker |
+| `--location` | Looked up from `--advertise-url` | Two letter country code to report |
 | `--device` | `auto` | `auto`, `cpu`, `cuda:0`, `mps`, or `xpu:0` |
 | `--roles` | `inference` | `inference`, or `kv-cache,checkpoint` for a memory worker |
 | `--dtype` | `auto` | `auto` is BF16. `float32` runs this worker at full precision |
@@ -875,8 +892,9 @@ A flag takes priority over its variable.
 | `ISHARDED_STATE_FILE` | `--state-file` |
 | `ISHARDED_AUDIT_FILE` | `--audit-file` |
 | `ISHARDED_HOST`, `ISHARDED_PORT` | `--host`, `--port` |
+| `ISHARDED_OWN_ADDRESS` | Set by a node for its own services, so a request for its public address goes over loopback. Many networks will not loop a machine's public address back to it. Behind a relay that other nodes share, set it to a list of `host:port` |
 | `ISHARDED_NODE_ID`, `ISHARDED_NODE_URL`, `ISHARDED_JOIN` | The control plane's `--node-id`, `--advertise-url`, `--join` |
-| `ISHARDED_WORKER_ID`, `ISHARDED_ORCHESTRATOR_URL`, `ISHARDED_ADVERTISE_URL` | The worker's `--worker-id`, `--orchestrator-url`, `--advertise-url` |
+| `ISHARDED_WORKER_ID`, `ISHARDED_ORCHESTRATOR_URL`, `ISHARDED_ADVERTISE_URL`, `ISHARDED_LOCATION` | The worker's `--worker-id`, `--orchestrator-url`, `--advertise-url`, `--location` |
 | `ISHARDED_DEVICE`, `ISHARDED_ROLES`, `ISHARDED_CPU_THREADS` | `--device`, `--roles`, `--cpu-threads` |
 | `ISHARDED_GPU_MEMORY_GB`, `ISHARDED_RAM_BUDGET_GB` | `--gpu-memory-gb`, `--ram-budget-gb` |
 | `ISHARDED_CACHE_DIR`, `ISHARDED_LLAMA_DIR` | `--cache-dir`, `--llama-dir` |
@@ -890,6 +908,7 @@ A flag takes priority over its variable.
 | `ISHARDED_HOST_ID` | Which physical machine a worker is on. Defaults to the computer name, so workers sharing a host do not count its RAM twice |
 | `ISHARDED_FETCH_CONCURRENCY` | Units a worker fetches at once. Default 4 |
 | `ISHARDED_ACCESS_LOG` | Set to `1` to log every request while debugging. Off by default, because nodes poll each other constantly |
+| `ISHARDED_MAX_CONNECTIONS` | Connections one process holds before it answers 503. Default 2048. Raise it for a pool of many nodes |
 | `ISHARDED_INSTALL_DIR`, `ISHARDED_SOURCE` | For the install scripts only: where to install, and the package to install in place of the one on GitHub |
 | `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` | Hugging Face token, for gated models. Needed on each worker |
 | `HF_ENDPOINT` | Another Hugging Face address, such as a mirror |
@@ -898,7 +917,7 @@ A worker's launcher also passes some flags through `ISHARDED_WEIGHTS_RAM_GB`, `I
 
 ## HTTP API
 
-Send `Authorization: Bearer KEY`, except where it says none. Requests are limited to 16 MiB. Each node serves all of this, and passes `/admin` requests to the coordinator for you.
+Send `Authorization: Bearer KEY`, except where it says none. Requests are limited to 16 MiB, or 16 KiB on routes that take a body with no credentials, which are also limited per address and answer 429 with `Retry-After`. Each node serves all of this, and passes `/admin` requests to the coordinator for you. In a pool with an authority your key stays on the node you gave it to, and that node [signs a statement](docs/SECURITY.md#when-one-node-passes-a-request-to-another) saying you asked. There is no `/docs` or `/openapi.json`, so this table is the reference.
 
 ### Endpoints
 
@@ -909,7 +928,7 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `POST` | `/v1/embeddings` | User key | Vectors for text, from an embedding model. See [Embeddings](#embeddings) |
 | `GET` | `/v1/models` | User key | Every running model, and what each is for |
 | `POST` | `/mcp` | User key | [MCP](#mcp) over Streamable HTTP. `GET` and `DELETE` answer 405, since there is no stream or session |
-| `GET` | `/admin/status` | User key | Workers, memory pools, route, epoch, mesh, lanes, load progress, and the last answer check |
+| `GET` | `/admin/status` | User key | Workers and their `country`, memory pools, route, epoch, mesh, lanes, load progress, and the last answer check |
 | `GET` | `/admin/catalog` | User key | Suggested models and supported architectures |
 | `POST` | `/admin/plan` | Admin key | Show where a model would run, without moving anything |
 | `POST` | `/admin/load` | Admin key | Load a model |
@@ -1201,7 +1220,7 @@ Past `--parallel`, replies queue at the entry worker, and past 32 waiting they a
 
 1. The coordinator reads the model's description: a GGUF header, or `config.json`, the tokenizer, and each safetensors header. This costs a few megabytes and pins one revision for every node.
 2. It plans which worker runs which layers, and which memory holds each unit.
-3. Each worker fetches only its units into a local cache, trying its own disk, then peers, then a holder of the file or the model host. Interrupted transfers retry and resume.
+3. Each worker fetches only its units into a local cache. Its own disk comes first. After that, every transfer is timed, and each unit goes to whichever source should finish it soonest: the model host, a node holding the unit, or a node holding the file. The model host wins a near tie, because a node's uplink may be carrying replies. A transfer that falls behind is given up for a faster source, so a slow neighbour costs seconds, and on a closed network with no model host the nodes supply everything. Interrupted transfers retry and resume.
 4. The current model keeps serving through all of this. Entry workers let replies finish, then stages load. A stage whose job did not change keeps its weights.
 5. The new route goes to every node by gossip.
 
@@ -1445,13 +1464,20 @@ Who can do what:
 | User | API key, role `user` | Chat, completions, read status |
 | Owner | The authority's private key | Add, remove, and revoke, in a pool with an authority |
 
+A node cannot pass on a role it cannot prove. When one node hands a request to another, it sends a statement signed with the person's key, and the other node takes the name and role from the signed key list. The key itself stays where it was given.
+
 Antivirus that scans HTTPS replaces certificates, which ends mutual TLS. Nodes refuse to trust it, so the failure is safe, and a node reports it plainly. Use Tailscale with tickets, which need no TLS at all, or exclude the pool's ports from scanning.
 
 ## Checking answers
 
 Any node in a route can return anything, and nothing in a reply proves otherwise. What can be measured is agreement: identical prompts, with no randomness, on routes built from different machines. They hold the same weights, so honest routes run together, and a broken or tampering one parts from them.
 
-Load the same model again on other machines, then ask:
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/checking-dark.png">
+  <img alt="The same questions go to three routes on separate nodes. Replies are compared in pairs, and the route out of line with the others is named along with its nodes." src="docs/diagrams/checking-light.png">
+</picture>
+
+The 100% and 1% on the picture are what was measured, as described below. Load the same model again on other machines, then ask:
 
 ```bash
 isharded load Qwen3-0.6B-Q8_0.gguf --lane check --lane-apart --url http://node-a:8209
@@ -1592,7 +1618,7 @@ python -m pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-The last full run on Windows passed 3,462 tests and skipped 23, with real models for text, embeddings, and vision. From a clean clone on Linux, with the current FastAPI, 3,443 passed and 38 skipped.
+The last full run on Windows passed 3,474 tests and skipped 21, with real models for text, embeddings, and vision. From a clean clone on Linux, with the current FastAPI, 3,451 passed and 40 skipped.
 
 Adapter tests compare every family with the reference `transformers` implementation, and skip families newer than the installed release, so run them under a current `transformers` as well. TLS tests skip on a machine where antivirus intercepts loopback. `tests/test_readme.py` fails if an option, setting, endpoint, or metric is missing from this file, and `tests/test_assistant_docs.py` does the same for the assistant's guide. `tests/test_mcp.py` also tries the official `mcp` package when `ISHARDED_TEST_MCP_PYTHON` names a Python that has it, and uses port 9531.
 
@@ -1604,6 +1630,8 @@ Adapter tests compare every family with the reference `transformers` implementat
 | `scripts/build_tiny_model.py` | Builds the offline test model |
 | `scripts/verify_model.py` | Compares a running checkpoint with an unsharded reference |
 | `scripts/build_diagrams.py` | Redraws the diagrams in this file |
+| `scripts/build_countries.py` | Rebuilds the country table from the registries' files |
+| `scripts/build_flags.py` | Rebuilds the dashboard's flags. Needs Node |
 | `scripts/ci_local.sh` | Runs the tests from a clean clone |
 | `scripts/install_node_task.ps1` | Starts a node at boot on Windows |
 
@@ -1630,7 +1658,7 @@ Adapter tests compare every family with the reference `transformers` implementat
 | `isharded/models/` | Each model family's forward pass, for safetensors models, and the GGUF model description |
 | `isharded/gguf.py`, `isharded/gguf_stage.py`, `isharded/llamacpp.py`, `isharded/llama_host.py` | GGUF parsing, stage files, the llama.cpp binding, and the stage process |
 | `isharded/weights.py` | Readers, the unit cache, and hash checks |
-| `isharded/access.py`, `isharded/pool.py`, `isharded/tickets.py`, `isharded/tls.py` | Keys, certificates, signed entries, tickets, and TLS |
+| `isharded/access.py`, `isharded/pool.py`, `isharded/tickets.py`, `isharded/tls.py`, `isharded/statements.py` | Keys, certificates, signed entries, tickets, TLS, and proving who asked when a request is passed on |
 | `isharded/chat.html`, `isharded/dashboard.html`, `isharded/ui.css` | The chat page and the dashboard |
 | `isharded/assistant/` | The assistant. [Its guide](docs/ASSISTANT.md) says which part does what |
 
@@ -1672,3 +1700,5 @@ Behavior:
 ## License
 
 iSharded is licensed under the [Apache License 2.0](LICENSE). Copyright 2026 AuXFire.
+
+The flags in `isharded/flags.svg` come from [country-flag-icons](https://gitlab.com/catamphetamine/country-flag-icons), under the MIT license, whose text is at the top of that file. The country table in `isharded/countries.bin` is built from the delegation files published by AFRINIC, APNIC, ARIN, LACNIC, and the RIPE NCC, as fetched on 6 November 2026.
