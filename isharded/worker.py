@@ -2346,7 +2346,9 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
         while produced < body.max_tokens and token not in stops:
             room = body.max_tokens - produced
             began = time.perf_counter()
-            ways = [PIPELINED, GUESSED, PLAIN] if runtime.ring_pipelines(following) else [GUESSED, PLAIN]
+            # Checking guesses in one pass runs several rows at once, which rounds a little
+            # differently. A pipeline and plain decoding run one row, so they agree exactly.
+            ways = [PIPELINED, PLAIN] if runtime.ring_pipelines(following) else [GUESSED, PLAIN]
             way = runtime.draft_choice.pick(ways)
             if way == PIPELINED:
                 if pipe is None:
