@@ -2230,7 +2230,9 @@ async def forward_to_coordinator(request: Request, call_next: Any) -> Any:
 
 
 def page(name: str) -> HTMLResponse:
-    content = Path(__file__).with_name(name).read_text(encoding="utf-8")
+    folder = Path(__file__).parent
+    styles = (folder / "ui.css").read_text(encoding="utf-8")
+    content = (folder / name).read_text(encoding="utf-8").replace("/* shardmesh:ui.css */", styles)
     return HTMLResponse(content, headers={"Cache-Control": "no-store"})
 
 

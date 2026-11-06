@@ -42,7 +42,7 @@ shardmesh-node = "shardmesh.node:main"
 include = ["shardmesh*"]
 
 [tool.setuptools.package-data]
-shardmesh = ["dashboard.html", "chat.html"]
+shardmesh = ["dashboard.html", "chat.html", "ui.css"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
