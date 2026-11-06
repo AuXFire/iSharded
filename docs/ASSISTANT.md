@@ -20,13 +20,13 @@ python -m pip install .
 shardmesh up --gguf-dir FOLDER --no-browser
 ```
 
-Give it about 10 seconds after it says it is up, then load a model by its file name, from the second terminal or from the chat page `up` printed. Point `SHARDMESH_POOL_TOKEN_FILE` at `admin.key` first, which keeps the key off the command line. In PowerShell that is `$env:SHARDMESH_POOL_TOKEN_FILE = "ADMIN_KEY_FILE"` on a line of its own.
+Once it says it is up, load a model by its file name, from the second terminal or from the chat page `up` printed. Point `SHARDMESH_POOL_TOKEN_FILE` at `admin.key` first, which keeps the key off the command line. In PowerShell that is `$env:SHARDMESH_POOL_TOKEN_FILE = "ADMIN_KEY_FILE"` on a line of its own.
 
 ```sh
 SHARDMESH_POOL_TOKEN_FILE=ADMIN_KEY_FILE shardmesh load Qwen3-0.6B-Q8_0.gguf --url http://127.0.0.1:8209
 ```
 
-`Load refused: no coordinator yet` means it was too soon, so run it again. `up` says it is up about 9 seconds before it can take a load. That is also why `up --model` does not work yet: it asks once at that moment, is refused, and does not ask again, so no model loads.
+`shardmesh up --model FILE` does this step for you and says when the model is ready.
 
 **3. Add it as a provider.** The assistant holds only the path to the key, never the key. The mesh's address is the one `up` printed.
 

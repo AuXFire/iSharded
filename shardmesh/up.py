@@ -46,6 +46,7 @@ APPROVAL_SECONDS = 3.0
 APPROVAL_WAIT_SECONDS = 180.0
 PERSON_WAIT_SECONDS = 1800.0  # someone has to come and click
 HEALTH_WAIT_SECONDS = 180.0
+SETTLE_WAIT_SECONDS = 60.0  # a node answers about 9 s before it can take a load
 
 
 def up_home() -> Path:
@@ -329,10 +330,56 @@ def wait_until_healthy(client: httpx.Client, base: str) -> bool:
     return False
 
 
-def load_first_model(client: httpx.Client, base: str, key: str | None, model: str) -> None:
+def can_load(answer: httpx.Response) -> bool:
+    """Whether a coordinator is known and a worker is there to load onto.
+
+    Only a node with no coordinator answers 503. A key too weak to read the status
+    still gets past that point, which is all it can show.
+    """
+    if answer.status_code != 200:
+        return answer.status_code != 503
+    return any(worker.get("live") for worker in answer.json().get("workers", {}).values())
+
+
+def wait_until_settled(client: httpx.Client, base: str, key: str | None) -> bool:
     headers = {"Authorization": f"Bearer {key}"} if key else {}
-    answer = client.post(base + "/admin/load", json={"model_id": model, "wait": False}, headers=headers)
-    print(f"Loading {model}." if answer.status_code < 400 else f"Could not load {model}: {answer.text[:200]}", flush=True)
+    deadline = time.monotonic() + SETTLE_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            if can_load(client.get(base + "/admin/status", headers=headers, timeout=5.0)):
+                return True
+        except (httpx.HTTPError, ValueError):
+            pass
+        time.sleep(1.0)
+    return False
+
+
+def load_first_model(settings: dict[str, Any], home: Path, key: str | None, model: str) -> None:
+    """Follows the load to its end, since a refused or failed model would otherwise say nothing."""
+    base = local_url(settings)
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    with client_for(settings, home) as client:
+        try:
+            answer = client.post(base + "/admin/load", json={"model_id": model, "wait": False}, headers=headers, timeout=30.0)
+        except httpx.HTTPError as exc:
+            print(f"Could not load {model}: {exc}", flush=True)
+            return
+        if answer.status_code >= 400:
+            print(f"Could not load {model}: {answer.text[:200]}", flush=True)
+            return
+        print(f"Loading {model}.", flush=True)
+        while True:
+            time.sleep(2.0)
+            try:
+                job = client.get(base + "/admin/status", headers=headers, timeout=30.0).json().get("load_job") or {}
+            except (httpx.HTTPError, ValueError):
+                continue  # a busy or changing coordinator is no reason to give up on the load
+            if job.get("phase") == "ready":
+                print(f"{model} is ready.", flush=True)
+                return
+            if job.get("phase") in {"failed", "cancelled"}:
+                print(f"Could not load {model}: {job.get('error')}", flush=True)
+                return
 
 
 def keep_watch(home: Path, settings: dict[str, Any], args: argparse.Namespace) -> None:
@@ -343,14 +390,18 @@ def keep_watch(home: Path, settings: dict[str, Any], args: argparse.Namespace) -
         if not wait_until_healthy(client, base):
             print(f"The node did not come up. Its log is {home / 'node.log'}.", flush=True)
             return
+        settled = wait_until_settled(client, base, key)
         page = f"{base}/chat"
         print(f"\nShardMesh is up as {settings['name']}.\n  Chat and dashboard: {page}", flush=True)
         if (home / "ca.key").is_file():
             print("  Add a machine:      shardmesh invite\n", flush=True)
+        if not settled:
+            print(f"It has no coordinator or worker yet, so it cannot load a model. Its log is {home / 'node.log'}.", flush=True)
         if key and not args.no_browser:
             webbrowser.open(f"{page}#key={key}")
-        if args.model:
-            load_first_model(client, base, key, args.model)
+        if args.model and settled:
+            # A big model takes minutes, and invited machines should not wait behind it.
+            threading.Thread(target=load_first_model, args=(settings, home, key, args.model), daemon=True).start()
         if settings.get("ownerless") or not (home / "ca.key").is_file():
             return
         while True:

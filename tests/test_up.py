@@ -209,3 +209,14 @@ def test_find_joins_the_only_mesh_and_refuses_to_guess_between_several() -> None
     assert up.choose_mesh([one], args) == one
     with pytest.raises(ValueError, match="use an invite"):
         up.choose_mesh([one, {**one, "authority": "b" * 64}], args)
+
+
+def test_up_waits_for_a_coordinator_and_a_worker_before_it_says_it_can_load() -> None:
+    def reply(status, body=None):
+        return httpx.Response(status, json=body or {})
+
+    assert not up.can_load(reply(503))  # nobody coordinates yet
+    assert not up.can_load(reply(200, {"workers": {}}))
+    assert not up.can_load(reply(200, {"workers": {"a-cpu": {"live": False}}}))
+    assert up.can_load(reply(200, {"workers": {"a-cpu": {"live": True}}}))
+    assert up.can_load(reply(401))  # a key is only checked once a coordinator is known
