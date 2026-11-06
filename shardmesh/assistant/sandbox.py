@@ -17,7 +17,7 @@ image has to be on the machine already.
 """
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 import functools
 import hashlib
@@ -313,6 +313,59 @@ class CappedReader:
         return text
 
 
+@dataclass(frozen=True)
+class TreeResult:
+    exit_code: int | None
+    stdout: str
+    stderr: str
+    timed_out: bool
+    stopped: bool
+
+
+def run_tree(
+    command: Sequence[str],
+    cwd: str | Path | None,
+    env: dict[str, str],
+    *,
+    timeout: float,
+    output_bytes: int = DEFAULT_OUTPUT_BYTES,
+    memory_mb: int | None = None,
+    stop: threading.Event | None = None,
+    abandon: Callable[[], Any] | None = None,
+) -> TreeResult:
+    """Run to the end, the time limit, or a stop, and leave nothing behind.
+
+    ``abandon`` runs before the kill when it did not finish by itself, for what the
+    tree cannot reach, such as a container whose client is about to die.
+    """
+    tree = ProcessTree(command, cwd, env, memory_mb=memory_mb)
+    stdout = CappedReader(tree.process.stdout, output_bytes)
+    stderr = CappedReader(tree.process.stderr, output_bytes)
+    try:
+        timed_out, stopped = wait_for_tree(tree, timeout, stop or threading.Event())
+        exit_code = None if timed_out or stopped else tree.process.returncode
+        if (timed_out or stopped) and abandon:
+            abandon()
+        tree.kill()  # leftovers too: nothing a command started outlives the command
+        return TreeResult(exit_code, stdout.text(), stderr.text(), timed_out, stopped)
+    finally:
+        tree.close()
+
+
+def wait_for_tree(tree: ProcessTree, timeout: float, stop: threading.Event) -> tuple[bool, bool]:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            tree.process.wait(timeout=POLL_SECONDS)
+            return False, False
+        except subprocess.TimeoutExpired:
+            pass
+        if stop.is_set():
+            return False, True
+        if time.monotonic() >= deadline:
+            return True, False
+
+
 def quiet(command: Sequence[str], timeout: float = PROBE_SECONDS) -> bool:
     try:
         return subprocess.run(list(command), capture_output=True, timeout=timeout).returncode == 0
@@ -476,27 +529,21 @@ class LocalSandbox:
     ) -> SandboxRun:
         name = f"shardmesh-{secrets.token_hex(6)}"
         argv, cwd, environment, memory = self._prepare(walls, name, words, folder, home, network, env)
-        try:
-            tree = ProcessTree(argv, cwd, environment, memory_mb=memory)
-        except OSError as error:
-            return self._not_run(127, f"Could not start {words[0]}: {error}", walls.level)
-        stdout = CappedReader(tree.process.stdout, self.output_bytes)
-        stderr = CappedReader(tree.process.stderr, self.output_bytes)
         stop = threading.Event()
+        # The client dying would leave the container running.
+        abandon = (lambda: quiet([walls.tool, "rm", "--force", name], DRAIN_SECONDS * 5)) if walls.level == "container" else None
         with self.lock:
             self.running[name] = (label, stop)
         try:
-            timed_out, stopped = self._wait(tree, timeout, stop)
-            exit_code = None if timed_out or stopped else tree.process.returncode
-            if (timed_out or stopped) and walls.level == "container":
-                quiet([walls.tool, "rm", "--force", name], DRAIN_SECONDS * 5)  # the client dying leaves the container
-            tree.kill()  # leftovers too: nothing a command started outlives the command
-            out, err = stdout.text(), stderr.text()
+            ran = run_tree(
+                argv, cwd, environment, timeout=timeout, output_bytes=self.output_bytes, memory_mb=memory, stop=stop, abandon=abandon
+            )
+        except OSError as error:
+            return self._not_run(127, f"Could not start {words[0]}: {error}", walls.level)
         finally:
             with self.lock:
                 self.running.pop(name, None)
-            tree.close()
-        return self._result(walls, exit_code, out, err, timed_out, stopped, network)
+        return self._result(walls, ran.exit_code, ran.stdout, ran.stderr, ran.timed_out, ran.stopped, network)
 
     def _prepare(
         self, walls: Walls, name: str, words: list[str], folder: str, home: str, network: bool, env: dict[str, str]
@@ -517,20 +564,6 @@ class LocalSandbox:
             argv = unshare_command(with_rlimits(words, self.memory_mb), network)
             return argv, folder, scrubbed_env(home, env), None
         return words, folder, scrubbed_env(home, env), self.memory_mb
-
-    @staticmethod
-    def _wait(tree: ProcessTree, timeout: float, stop: threading.Event) -> tuple[bool, bool]:
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                tree.process.wait(timeout=POLL_SECONDS)
-                return False, False
-            except subprocess.TimeoutExpired:
-                pass
-            if stop.is_set():
-                return False, True
-            if time.monotonic() >= deadline:
-                return True, False
 
     def _result(
         self, walls: Walls, exit_code: int | None, out: str, err: str, timed_out: bool, stopped: bool, network: bool
