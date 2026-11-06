@@ -129,6 +129,12 @@ def test_a_key_that_is_not_an_admins_does_not_sign_anyone_out():
         assert "admin: true" in call
 
 
+def test_a_flag_is_checked_first_and_names_its_country():
+    mark = re.search(r"const flagMark = .*", source("dashboard.html")).group(0)
+    assert mark.index("flagged(code)") < mark.index("#flag-${code}")  # a worker chooses this text
+    assert 'role="img"' in mark and "aria-label=" in mark and "data-tip=" in mark
+
+
 def test_chat_has_one_model_selector():
     text = source("chat.html")
     composer = text[text.index('id="composer"'):text.index("</form>", text.index('id="composer"'))]

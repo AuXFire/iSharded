@@ -37,6 +37,7 @@ from .memory import (
     discover_accelerators,
     live_free_bytes,
 )
+from .geo import country_code, node_country
 from .models import Adapter, GgufAdapter, create_adapter
 from .models.base import layer_unit
 from .protocol import (
@@ -283,6 +284,7 @@ class WorkerRuntime:
         self.control_urls: dict[str, ControlLink] = {url: ControlLink() for url in self.seed_urls}
         self.term = 0
         self.advertised_url = os.getenv("ISHARDED_ADVERTISE_URL", "http://127.0.0.1:8100").rstrip("/")
+        self.country = node_country(self.advertised_url, os.getenv("ISHARDED_LOCATION"))
         self.pool_token = load_token()
         self.requires_identity = bool(os.getenv("ISHARDED_CA_FILE"))
         self.authority = load_authority()
@@ -436,6 +438,7 @@ class WorkerRuntime:
             hardware=self.hardware,
             protocol_version=PROTOCOL_VERSION,
             code_version=__version__,
+            country=self.country,
         )
 
     async def _check_in(self, url: str, link: ControlLink) -> None:
@@ -1894,6 +1897,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="one or more control planes, comma separated; the rest are found from them",
     )
     parser.add_argument("--advertise-url", default=os.getenv("ISHARDED_ADVERTISE_URL"), help="how other nodes reach this worker")
+    parser.add_argument("--location", type=country_code, default=os.getenv("ISHARDED_LOCATION") or None, help="two letter country code to report; default is looked up from the advertised address")
     parser.add_argument("--device", default=os.getenv("ISHARDED_DEVICE", "auto"), help="auto, cpu, cuda:0, mps, or xpu:0")
     parser.add_argument("--roles", default=os.getenv("ISHARDED_ROLES", "inference"), help="inference, or kv-cache,checkpoint for a memory worker")
     parser.add_argument("--cpu-threads", type=int, default=int(os.getenv("ISHARDED_CPU_THREADS", "0")), help="CPU threads; 0 uses half the cores for a stage")
@@ -1925,6 +1929,7 @@ def main() -> None:
     os.environ["ISHARDED_WORKER_ID"] = args.worker_id
     os.environ["ISHARDED_ORCHESTRATOR_URL"] = args.orchestrator_url
     os.environ["ISHARDED_ADVERTISE_URL"] = args.advertise_url or f"http://127.0.0.1:{args.port}"
+    os.environ["ISHARDED_LOCATION"] = args.location or ""
     os.environ["ISHARDED_DEVICE"] = args.device
     os.environ["ISHARDED_ROLES"] = args.roles
     os.environ["ISHARDED_CPU_THREADS"] = str(args.cpu_threads)

@@ -163,6 +163,7 @@
 
   <div class="tip" id="tip" hidden></div>
   <div class="toast" id="toast" role="status"></div>
+  <!-- isharded:flags.svg -->
 
   <script>
     const $ = id => document.getElementById(id);
@@ -205,6 +206,12 @@
     };
 
     const esc = value => String(value ?? '').replace(/[&<>'"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[c]));
+    // A worker names its own country, so only a code with a drawn flag reaches the page.
+    const regions = Intl.DisplayNames ? new Intl.DisplayNames(['en'], { type: 'region' }) : null;
+    const flagged = code => /^[A-Z]{2}$/.test(code ?? '') && $(`flag-${code}`) !== null;
+    const countryName = code => flagged(code) ? regions?.of(code) || code : '';
+    // With room set, a worker with no country keeps the column, so names still line up.
+    const flagMark = (code, room) => flagged(code) ? `<svg class="flag" role="img" aria-label="${esc(countryName(code))}" data-tip="${esc(countryName(code))}"><use href="#flag-${code}"/></svg>` : room ? '<span class="flag-gap"></span>' : '';
     const num = (value, digits = 1) => value == null || Number.isNaN(Number(value)) ? '—' : Number(value).toFixed(digits).replace(/\.0+$/, '');
     const bytes = value => { if (!value) return '0 B'; const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']; const i = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1); return `${num(value / 1024 ** i, i > 2 ? 2 : 1)} ${units[i]}`; };
     const duration = seconds => { if (seconds == null) return '—'; const d = Math.floor(seconds / 86400), h = Math.floor(seconds % 86400 / 3600), m = Math.floor(seconds % 3600 / 60); return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`; };
@@ -469,10 +476,11 @@
       paint($('routeNote'), notes.join(', '));
       const keep = row => row.index === 0 || row.index === route.length - 1 || row === slowest || row.state !== 'active';
       const shown = state.allStages || route.length <= 8 ? rows : rows.filter(keep);
+      const room = rows.some(row => flagged(row.worker.country));
       const line = row => {
         const look = STATES[row.state] || STATES.offline, hw = row.worker.hardware || {};
         const problem = row.state === 'active' ? '' : ` problem ${look.tone}`;
-        return `<tr class="row${problem}" data-worker="${esc(row.stage.worker_id)}"><td class="num">${row.index + 1}</td><td class="name-cell"><button class="name-link" type="button" data-worker="${esc(row.stage.worker_id)}" data-key="s:${esc(row.stage.worker_id)}">${esc(row.stage.worker_id)}</button><span class="sub">${esc([stageRole(row.index, route.length).replace(/^Stage \d+$/, ''), (hw.backend || '').toUpperCase()].filter(Boolean).join(', '))}</span></td><td>${stageRange(row.stage)}</td><td>${esc(stageMemory(row.stage, data)) || '—'}</td><td class="right">${ms(row.compute)}${row === slowest ? ' <span class="tag">Slowest</span>' : ''}</td><td><span class="state-cell tone-${look.tone}"><i class="glyph ${look.glyph}"></i><span>${esc(look.label)}</span></span></td></tr>`;
+        return `<tr class="row${problem}" data-worker="${esc(row.stage.worker_id)}"><td class="num">${row.index + 1}</td><td class="name-cell"><div class="name-line">${flagMark(row.worker.country, room)}<button class="name-link" type="button" data-worker="${esc(row.stage.worker_id)}" data-key="s:${esc(row.stage.worker_id)}">${esc(row.stage.worker_id)}</button></div><span class="sub">${esc([stageRole(row.index, route.length).replace(/^Stage \d+$/, ''), (hw.backend || '').toUpperCase()].filter(Boolean).join(', '))}</span></td><td>${stageRange(row.stage)}</td><td>${esc(stageMemory(row.stage, data)) || '—'}</td><td class="right">${ms(row.compute)}${row === slowest ? ' <span class="tag">Slowest</span>' : ''}</td><td><span class="state-cell tone-${look.tone}"><i class="glyph ${look.glyph}"></i><span>${esc(look.label)}</span></span></td></tr>`;
       };
       const more = shown.length < rows.length || state.allStages && route.length > 8;
       const foot = more ? `<div class="table-foot"><span>Showing ${shown.length} of ${count(rows.length, 'stage')}</span><button class="link" type="button" data-action="stages" data-key="stages">${state.allStages ? 'Show key stages' : 'Show every stage'}</button></div>` : '';
@@ -579,7 +587,7 @@
       return {
         id, worker, state: workerState(id, worker, route), host: hw.host_id || 'Unknown machine', accelerator, backend: hw.backend || '', pools, budget, used, layers, position, isService,
         roles: (contribution.roles || []).join(', '), compute: telemetry.compute_ms_ema, rtt: worker.control_latency_ms, cordoned: (data.cordoned_nodes || []).includes(node), gpu: hottest,
-        search: [id, hw.host_id, hw.accelerator_name, hw.backend, STATES[workerState(id, worker, route)].label, (contribution.roles || []).join(' ')].join(' ').toLowerCase(),
+        search: [id, hw.host_id, hw.accelerator_name, hw.backend, countryName(worker.country), STATES[workerState(id, worker, route)].label, (contribution.roles || []).join(' ')].join(' ').toLowerCase(),
       };
     }
     const CHIPS = { all: 'All', attention: 'Needs attention', active: 'In route', standby: 'Idle', service: 'Cache service' };
@@ -595,7 +603,7 @@
       rtt: (a, b) => (a.rtt ?? -1) - (b.rtt ?? -1),
       gpu: (a, b) => (a.gpu?.temperature_c ?? -1) - (b.gpu?.temperature_c ?? -1),
     };
-    function workerLine(row, showGpu) {
+    function workerLine(row, showGpu, room) {
       const look = STATES[row.state];
       const problem = look.tone === 'idle' ? '' : ` problem ${look.tone}`;
       const route = state.data?.route || [];
@@ -605,7 +613,7 @@
       const memory = row.budget ? `<div class="meter" aria-hidden="true">${fills}</div>${bytes(row.used)} of ${bytes(row.budget)}` : '—';
       const gpu = showGpu ? `<td class="right" data-label="GPU">${row.gpu ? esc([row.gpu.temperature_c != null ? `${Math.round(row.gpu.temperature_c)}°C` : '', row.gpu.load_percent != null ? `${Math.round(row.gpu.load_percent)}%` : ''].filter(Boolean).join(', ')) : '—'}</td>` : '';
       const place = row.host !== row.id && row.host !== nodeOf(row.id) ? `${row.host}, ${row.accelerator}` : row.accelerator;
-      return `<tr class="row${problem}" data-worker="${esc(row.id)}"><td class="name-cell"><button class="name-link" type="button" data-worker="${esc(row.id)}" data-key="w:${esc(row.id)}">${esc(row.id)}</button><span class="sub">${esc(place)}</span></td><td class="state-td"><span class="state-cell tone-${look.tone}"><i class="glyph ${look.glyph}"></i><span>${esc(look.label)}</span></span>${row.cordoned ? ' <span class="tag">Cordoned</span>' : ''}</td><td class="work-td">${work}</td><td class="memory-cell">${memory}</td>${gpu}<td class="right" data-label="Compute">${row.isService ? '—' : ms(row.compute)}</td><td class="right" data-label="RTT">${ms(row.rtt)}</td></tr>`;
+      return `<tr class="row${problem}" data-worker="${esc(row.id)}"><td class="name-cell"><div class="name-line">${flagMark(row.worker.country, room)}<button class="name-link" type="button" data-worker="${esc(row.id)}" data-key="w:${esc(row.id)}">${esc(row.id)}</button></div><span class="sub">${esc(place)}</span></td><td class="state-td"><span class="state-cell tone-${look.tone}"><i class="glyph ${look.glyph}"></i><span>${esc(look.label)}</span></span>${row.cordoned ? ' <span class="tag">Cordoned</span>' : ''}</td><td class="work-td">${work}</td><td class="memory-cell">${memory}</td>${gpu}<td class="right" data-label="Compute">${row.isService ? '—' : ms(row.compute)}</td><td class="right" data-label="RTT">${ms(row.rtt)}</td></tr>`;
     }
     function renderMachines(data) {
       const all = Object.entries(data.workers || {}).map(([id, worker]) => describe(id, worker, data));
@@ -621,14 +629,14 @@
       if (!all.length) { paint($('nodeTable'), '<div class="empty"><b>No workers registered</b><span>Add a machine, and it will appear here.</span></div>'); return; }
       if (!rows.length) { paint($('nodeTable'), '<div class="empty"><b>No workers match</b><button class="link" type="button" data-action="clear" data-key="clear">Clear the search and filter</button></div>'); return; }
       const sorted = [...rows].sort((a, b) => SORTS[state.sortKey](a, b) * state.sortDir || byName(a.id, b.id));
-      const showGpu = all.some(row => row.gpu);
+      const showGpu = all.some(row => row.gpu), room = all.some(row => flagged(row.worker.country));
       const groups = new Map();
       for (const row of sorted) { const key = groupKey(row); if (!groups.has(key)) groups.set(key, []); groups.get(key).push(row); }
       const sortHead = (key, label, right) => `<th scope="col"${right ? ' class="right"' : ''}${state.sortKey === key ? ` aria-sort="${state.sortDir > 0 ? 'ascending' : 'descending'}"` : ''}><button type="button" data-sort="${key}" data-key="h:${key}">${label}</button></th>`;
       const head = `<thead><tr>${sortHead('name', 'Worker')}${sortHead('state', 'State')}<th scope="col">Work</th>${sortHead('memory', 'Memory')}${showGpu ? sortHead('gpu', 'GPU', true) : ''}${sortHead('compute', 'Compute', true)}${sortHead('rtt', 'Control RTT', true)}</tr></thead>`;
       const columns = showGpu ? 7 : 6;
       const body = [...groups.keys()].sort(groupOrder).map(key => {
-        const members = groups.get(key), lines = members.map(row => workerLine(row, showGpu)).join('');
+        const members = groups.get(key), lines = members.map(row => workerLine(row, showGpu, room)).join('');
         if (!key) return `<tbody>${lines}</tbody>`;
         const open = state.groupsOpen.has(key) ? state.groupsOpen.get(key) : !(state.group === 'state' && key === 'Idle' && all.length > 24);
         const label = state.group === 'machine' ? `${count(members.length, 'worker')} on this machine` : count(members.length, 'worker');
@@ -699,7 +707,7 @@
         <section class="detail"><h3>Live readings</h3>${readings(id)}</section>
         <section class="detail"><h3>Contribution</h3>${row('Roles', (contribution.roles || []).join(', ') || '—')}${row('CPU threads', contribution.cpu_threads ?? 0)}${row('RAM budget', bytes(contribution.ram_budget_bytes))}${row('Accelerator budget', bytes(contribution.accelerator_memory_budget_bytes))}${row('Standby', contribution.standby ? 'Yes' : 'No')}</section>
         <section class="detail"><h3>Memory for weights</h3>${(rt.memory_pools || hw.memory_pools || []).map(pool => row(`${TIERS[pool.kind]?.[0] || pool.kind} (${pool.pool_id})`, `${bytes(pool.used_bytes || 0)} of ${bytes(pool.budget_bytes)}, ${pool.dtype}, ${pool.bandwidth_gbps} GB/s`)).join('') || row('Pools', 'None')}</section>
-        <section class="detail"><h3>Placement</h3>${row('Layer range', a ? span(a.start_layer, a.end_layer) : 'Not on the active route')}${row('Pipeline epoch', rt.epoch ?? '—')}${row('Address', w.advertised_url)}</section>
+        <section class="detail"><h3>Placement</h3>${row('Layer range', a ? span(a.start_layer, a.end_layer) : 'Not on the active route')}${row('Pipeline epoch', rt.epoch ?? '—')}${row('Address', w.advertised_url)}${flagged(w.country) ? row('Country', countryName(w.country)) : ''}</section>
         <section class="detail"><h3>Hardware</h3>${row('Machine', hw.host_id || '—')}${row('Backend', (hw.backend || '—').toUpperCase())}${row('Runtime', hw.runtime_version || '—')}${row('Accelerator', hw.accelerator_name || 'None')}${row('Accelerator memory', bytes(hw.accelerator_memory_bytes))}${row('System memory', bytes(hw.ram_total_bytes))}${row('CPU cores', hw.cpu_cores ?? '—')}</section>
         <section class="detail"><h3>Telemetry</h3>${row('Control RTT', `${num(w.control_latency_ms)} ms`)}${row('Local compute', `${num(tel.compute_ms_ema)} ms`)}${row('Downstream', `${num(tel.downstream_ms_ema)} ms`)}${row('Tokens processed', tel.tokens_processed ?? 0)}${row('Activations sent', bytes(tel.activation_bytes_sent))}${row('KV snapshots sent', tel.kv_snapshots_sent ?? 0)}${row('KV restores', tel.kv_restores ?? 0)}${row('RAM cache used', bytes(cache.used_bytes))}${row('RAM cache budget', bytes(cache.budget_bytes))}</section>
       </div>`);

@@ -439,6 +439,10 @@ dialog::backdrop { background: var(--overlay); }
 .grid tr.problem.bad { --tone-line: var(--bad); }
 .grid .sub { display: block; color: var(--ink-2); font-size: var(--t-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .grid .name-cell { max-width: 260px; }
+.name-line { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.flag, .flag-gap { flex: none; width: 18px; height: 12px; }
+.flag { border-radius: 2px; box-shadow: 0 0 0 1px var(--edge); }
+.name-cell:has(.flag, .flag-gap) .sub { padding-left: 25px; }
 .state-cell { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
 .state-cell span { color: var(--ink); }
 .tag { display: inline-block; padding: 0 5px; border-radius: var(--r-mark); background: var(--plate-3); color: var(--ink); font-size: var(--t-xs); font-weight: 600; white-space: nowrap; }
@@ -712,5 +716,5 @@ details.event-group[open] > summary { background: var(--plate-2); }
 }
 
 @media (forced-colors: active) {
-  .cell i, .core-layer i, .meter i, .legend i, .tile, .glyph, .progress i { forced-color-adjust: none; }
+  .cell i, .core-layer i, .meter i, .legend i, .tile, .glyph, .progress i, .flag { forced-color-adjust: none; }
 }
