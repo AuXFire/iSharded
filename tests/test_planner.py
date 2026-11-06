@@ -1446,7 +1446,11 @@ def scattered(count: int, sizes: tuple[float, ...], seed: int) -> tuple[list[Can
     return workers, links
 
 
-@pytest.mark.parametrize("sizes", [(6, 12, 16, 24, 24, 48, 48, 80), (8,), (4, 6)], ids=["mixed", "small", "tiny"])
+@pytest.mark.parametrize(
+    "sizes",
+    [(6, 12, 16, 24, 24, 48, 48, 80), (8,), (4, 6), (3.5, 4)],
+    ids=["mixed", "small", "tiny", "more workers than a seed looks at"],
+)
 def test_two_hundred_workers_plan_in_time_and_hold_the_model_in_vram(sizes) -> None:
     workers, links = scattered(200, sizes, 1)
     started = time.perf_counter()
@@ -1470,13 +1474,84 @@ def test_a_loop_that_grew_uncrosses_itself() -> None:
 
 
 def test_a_short_hybrid_stage_does_not_rule_out_a_longer_one() -> None:
-    # One layer cannot stand alone here, and that is no reason to stop looking.
+    # Any card here could take all but one layer, and that one layer cannot stand
+    # alone. That is no reason to stop looking at longer stages for the next card.
     model = block_profile([2.72] * 16)
     model.layer_step = 1
     model.attention_interval = 4
-    route = plan_placement([card("a", 30, 800), card("b", 30, 800)], [], model)
-    assert sum(stage.end_layer - stage.start_layer for stage in route) == 16
+    route = plan_placement([card("a", 60, 900), card("b", 60, 850), card("c", 60, 800)], [], model)
+    assert len(route) == 3
     assert all(holds_both_kinds(stage.start_layer, stage.end_layer, 4) for stage in route)
+
+
+def test_a_compact_loop_counts_the_way_home_when_choosing_who_to_skip() -> None:
+    # With the entry pinned every order starts at "a". The first hop to "b" is the
+    # shortest there is, but the way back from it is far the longest.
+    links = {("a", "b"): 2, ("b", "a"): 400, ("a", "c"): 20, ("c", "a"): 20, ("b", "c"): 50, ("c", "b"): 50}
+    workers = [worker(name, pool("cuda:0", "vram", 3 * GIB, 500, f"{name}:vram")) for name in "abc"]
+    route = plan_placement(workers, [], profile(layers=8, dense=500 * MIB), spread=False, links=links, ring=True, entry_worker="a")
+    assert names_of(route) == ["a", "c"]
+
+
+def test_a_loop_turns_so_that_the_right_worker_holds_the_head() -> None:
+    # Only "b" can hold this head, and it is not next to where the loop was worked out
+    # from, so the shortest loop has to be turned to end there.
+    model = moe_profile()
+    head = raw_unit("head", "head", 45)
+    model.units = [head if item.name == "head" else item for item in model.units]
+    model.head = head
+    workers = [card(name, 80 if name == "b" else 40, speed) for name, speed in MESH_SPEEDS.items()]
+    route = plan_placement(workers, [], model, links=LINKS, ring=True)
+    assert names_of(route)[-1] == "b"
+    assert planner.route_network_ms(route, LINKS, ring=True) == 424 / 2 + 5 * planner.RING_HOP_MS
+
+
+def test_auto_moves_a_held_layout_out_of_ram_whatever_the_download() -> None:
+    # VRAM outranks what nodes hold: this model sits partly in RAM on one worker, and
+    # moving part of it costs far more than the estimate says it saves. Of the ways
+    # to get it all into VRAM, the one that keeps what can stay moves least.
+    model = moe_profile(amortize=planner.AMORTIZE_TOKENS)
+    workers = [card("a", 100, 800, 120), card("e1", 100, 800), card("e2", 100, 800)]
+    holding(workers, [("a", 0, MOE_LAYERS)])
+    route = plan_placement(workers, [], model, spread=None, links=LINKS, ring=True)
+    assert experts_in_ram(route) == 0
+    assert "a" in names_of(route) and len(route) == 2
+
+
+def test_a_long_loop_of_small_cards_plans_at_the_first_try(monkeypatch) -> None:
+    # Trying again is what makes these slow, so a grown loop allows for both ends.
+    real = planner._closest_subsets
+    asked = []
+
+    def counting(group, model, required, slack):
+        asked.append(slack)
+        return real(group, model, required, slack)
+
+    monkeypatch.setattr(planner, "_closest_subsets", counting)
+    workers, links = scattered(200, (4, 6), 1)
+    plan_placement(workers, [], moe_profile(), spread=None, links=links, ring=True)
+    assert asked == [0]
+
+
+def test_auto_asks_for_spare_room_if_a_tight_fit_does_not_plan(monkeypatch) -> None:
+    real = planner._closest_subsets
+    asked = []
+
+    def nothing_fits_at_first(group, model, required, slack):
+        asked.append(slack)
+        return real(group, model, required, slack) if slack else []
+
+    monkeypatch.setattr(planner, "_closest_subsets", nothing_fits_at_first)
+    workers = [card(name, 100, speed) for name, speed in MESH_SPEEDS.items()]
+    route = plan_placement(workers, [], moe_profile(), spread=None, links=LINKS, ring=True)
+    assert asked == [0, 2]
+    assert set(names_of(route)) == {"e1", "e2"}
+
+
+def test_less_ram_decides_between_plans_with_the_same_room_open() -> None:
+    # Ring off, so that every hop is the constant: two spread plans differ only in RAM.
+    route = plan_placement(moe_cards(), [], moe_profile(), ring=False)
+    assert experts_in_ram(route) == 3 * MOE_EXPERT_BYTES
 
 
 def test_auto_is_the_default_placement() -> None:

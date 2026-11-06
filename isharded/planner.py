@@ -1257,8 +1257,8 @@ def _closest_subsets(
             if sum(rooms[index] for index in members) >= need and sum(steps[index] for index in members) >= steps_needed:
                 scored.append((reads_ms(members) + lengths[spent], len(members), members))
     else:
-        # A long loop of small cards is the likeliest to fit only on paper, and each
-        # try at one is slow, so it leaves room for the two ends from the start.
+        # A long loop of small cards is the likeliest to fit only on paper, and trying
+        # again is slow, so it leaves room for the two ends of the model from the start.
         ends = -(-(profile.embed.nbytes + profile.head.nbytes + profile.entry_extra_bytes) // step) + 1
         for loop in _grown_loops(hops, rooms, steps, need, steps_needed + ends, indices):
             scored.append((reads_ms(sorted(loop)) + around(loop), len(loop), loop))  # kept in loop order
