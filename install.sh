@@ -10,9 +10,14 @@ if [ -z "$python" ] || ! "$python" -c 'import sys; sys.exit(sys.version_info < (
   echo "ShardMesh needs Python 3.10 or newer. Install it, then run this again." >&2
   exit 1
 fi
-if ! "$python" -m venv "$folder"; then
-  echo "Python could not make an environment. On Debian or Ubuntu: sudo apt-get install python3-venv" >&2
-  exit 1
+if ! "$python" -m venv "$folder" 2>/dev/null; then
+  # Debian and Ubuntu leave venv out of Python. The virtualenv zipapp needs nothing installed.
+  rm -rf "$folder"
+  mkdir -p "$(dirname "$folder")"
+  tool="$(dirname "$folder")/virtualenv.pyz"
+  curl -fsSL -o "$tool" https://bootstrap.pypa.io/virtualenv.pyz
+  "$python" "$tool" --quiet "$folder"
+  rm -f "$tool"
 fi
 "$folder/bin/python" -m pip install --quiet --upgrade pip
 
