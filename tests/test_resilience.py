@@ -1134,3 +1134,68 @@ def test_links_are_measured_from_each_end_and_a_dead_one_stays_on_record() -> No
     assert orchestrator.links == {("one", "two"): 42.5, ("two", "one"): module.UNREACHABLE_LINK_MS}
     assert sorted(asked) == ["one", "two"]  # still fresh the second time, so nothing is sent again
     done(orchestrator)
+
+
+def stage_answering(status, body):
+    """A middle stage whose next stage gives this answer."""
+    import torch
+    from types import SimpleNamespace
+
+    from isharded import worker as worker_module
+
+    class Client:
+        async def post(self, url, content, headers, timeout):
+            return httpx.Response(status, request=httpx.Request("POST", url), **body)
+
+    runtime = worker_module.WorkerRuntime.__new__(worker_module.WorkerRuntime)
+    runtime.assignment, runtime.model_id, runtime.epoch = object(), "m", 1
+    runtime.gguf, runtime.dtype_name, runtime.pool_token = None, "float32", None
+    runtime.merge_passes = False
+    runtime.activation_bytes_sent = 0
+    runtime.downstream_ms_ema = None
+    runtime.last_error = None
+    runtime.client = Client()
+    runtime._next_stage = lambda: SimpleNamespace(url="http://next:1", worker_id="next")
+    runtime._stages_after = lambda: 1
+    runtime._record = lambda *args: None
+    runtime.schedule_checkpoint = lambda request: None
+
+    async def alone(hidden, request, places=None):
+        return hidden
+
+    runtime._step_alone = alone
+    request = worker_module.InferRequest(session_id="s", epoch=1, input_ids=[1], reset=False, temperature=0.0)
+
+    async def go():
+        runtime.lock = asyncio.Lock()
+        await runtime.execute(torch.zeros(1, 1, 4), request)
+
+    return go
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "expected", "detail"),
+    [
+        (502, {"json": {"detail": {"failed_worker": "far", "message": "gone"}}}, 502, {"failed_worker": "far", "message": "gone"}),
+        (503, {"json": {"detail": {"retry": True, "message": "restarted"}}}, 503, {"retry": True, "message": "restarted"}),
+        (502, {"text": "bad gateway"}, 502, {"failed_worker": "next"}),
+        (504, {"json": {"detail": "slow"}}, 502, {"failed_worker": "next"}),
+    ],
+)
+def test_a_failure_further_down_the_route_reaches_the_entry_as_itself(status, body, expected, detail) -> None:
+    """Three stages or more: calling it a bad request would drop the reply instead of recovering."""
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(stage_answering(status, body)())
+    assert caught.value.status_code == expected
+    assert detail.items() <= caught.value.detail.items()
+
+
+def test_a_stage_that_refuses_a_request_still_blames_the_request() -> None:
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(stage_answering(500, {"json": {"detail": "boom"}})())
+    assert caught.value.status_code == 500
+    assert "stage_error" in caught.value.detail

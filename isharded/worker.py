@@ -156,6 +156,7 @@ DRAIN_LIMIT_SECONDS = 180.0
 # A control plane this worker only heard about, and that stays silent, is forgotten.
 CONTROL_LINK_FAILURES = 60
 CHECK_IN_SECONDS = 5.0
+UNAVAILABLE_STATUSES = {502, 503, 504}
 
 
 @dataclass(slots=True)
@@ -1221,10 +1222,10 @@ class WorkerRuntime:
                 headers=headers,
                 timeout=httpx.Timeout(pass_seconds(hidden.shape[1], self._stages_after()), connect=10.0),
             )
-            if response.status_code == 503:
-                detail = response.json().get("detail")
-                if isinstance(detail, dict) and detail.get("retry"):
-                    raise HTTPException(status_code=503, detail=detail)
+            report = failure_report(response)
+            if report is not None:
+                # Said further down the route. Only the stage that saw it knows who failed.
+                raise HTTPException(status_code=response.status_code, detail=report)
             response.raise_for_status()
             self.downstream_ms_ema = self._ema(
                 self.downstream_ms_ema,
@@ -1239,8 +1240,10 @@ class WorkerRuntime:
             if exc.response.status_code == 409:
                 # The route moved on. Nothing failed, and the reply can follow it.
                 raise HTTPException(status_code=409, detail=f"pipeline epoch mismatch; worker has {self.epoch}") from exc
-            # The next stage is up and refused this request, so blame the request.
             self.last_error = str(exc)
+            if exc.response.status_code in UNAVAILABLE_STATUSES:
+                raise HTTPException(status_code=502, detail={"failed_worker": next_stage.worker_id, "message": str(exc)}) from exc
+            # The next stage is up and refused this request, so blame the request.
             raise HTTPException(status_code=500, detail={"stage_error": str(exc)}) from exc
         except httpx.HTTPError as exc:
             self.last_error = str(exc)
@@ -1248,6 +1251,17 @@ class WorkerRuntime:
                 status_code=502,
                 detail={"failed_worker": next_stage.worker_id, "message": str(exc)},
             ) from exc
+
+
+def failure_report(response: httpx.Response) -> dict[str, Any] | None:
+    """What a stage further down says failed, so that it reaches the entry unchanged."""
+    if response.status_code not in UNAVAILABLE_STATUSES:
+        return None
+    try:
+        detail = response.json().get("detail")
+    except (ValueError, AttributeError):
+        return None
+    return detail if isinstance(detail, dict) and (detail.get("retry") or detail.get("failed_worker")) else None
 
 
 runtime = WorkerRuntime()
