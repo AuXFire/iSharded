@@ -777,3 +777,100 @@ def test_a_stage_built_with_hashes_does_not_reuse_an_older_file(tmp_path):
         build_stage_file(cache, request, None, ["unit"], 0, 4, True)
     assert not poisoned.exists()
     assert file_sha256(unit)
+
+
+@pytest.fixture
+def owned(signed_pool, tmp_path, monkeypatch):
+    folder, access = signed_pool
+    monkeypatch.setenv("SHARDMESH_CA_FILE", folder + "/ca.pem")
+    runtime = Orchestrator()
+    runtime.access = access
+    monkeypatch.setattr(orchestrator_module, "runtime", runtime)
+    return folder, access, TestClient(orchestrator_module.app), tmp_path / "new-node"
+
+
+def test_a_node_joins_by_asking_and_the_owner_approving(owned):
+    from shardmesh.pool import approve_membership, request_membership, sign_entry
+    from shardmesh.tickets import TicketChecker, TicketMaker
+
+    folder, access, client, home = owned
+    request = request_membership(str(home), "newcomer", ["10.0.0.9"])
+    asked = client.post("/join/requests", json={"request": request})
+    assert asked.json()["status"] == "waiting"
+    assert client.get("/join/certificate/newcomer").status_code == 404
+    held = access.join_requests["newcomer"]
+    assert held["addresses"] == ["10.0.0.9"] and held["fingerprint"] == asked.json()["fingerprint"]
+    certificate = approve_membership(folder, held["request"])
+    entry = sign_entry(folder, {"type": "member", "name": "newcomer", "certificate": certificate})
+    assert client.post("/access/entries", json=entry).status_code == 200
+    assert "newcomer" not in access.join_requests
+    issued = client.get("/join/certificate/newcomer").json()
+    (home / "newcomer.pem").write_text(issued["certificate"])
+    ticket = TicketMaker(str(home / "newcomer.pem"), str(home / "newcomer.key")).ticket("b:1")
+    assert TicketChecker(folder + "/ca.pem", {"b:1"}).name(ticket) == "newcomer"
+
+
+def test_asking_to_join_grants_nothing(owned):
+    from shardmesh.pool import request_membership
+
+    _, access, client, home = owned
+    client.post("/join/requests", json={"request": request_membership(str(home), "newcomer", ["10.0.0.9"])})
+    assert client.get("/internal/mesh").status_code == 401
+    assert client.get("/join/requests").status_code == 401
+    assert not access.certificates
+
+
+def test_a_forged_join_request_is_refused(owned):
+    _, _, client, _ = owned
+    assert client.post("/join/requests", json={"request": "not a request"}).status_code == 400
+    assert client.post("/join/requests", json={}).status_code == 400
+
+
+def test_a_revoked_name_cannot_ask_again(owned):
+    from shardmesh.pool import request_membership, sign_entry
+
+    folder, access, client, home = owned
+    access.add_signed(sign_entry(folder, {"type": "revoke", "name": "banned"}))
+    answer = client.post("/join/requests", json={"request": request_membership(str(home), "banned", ["10.0.0.9"])})
+    assert answer.json()["status"] == "refused"
+    assert "banned" not in access.join_requests
+
+
+def test_a_denied_key_stays_denied(owned):
+    from shardmesh.pool import request_membership, sign_entry
+
+    folder, access, client, home = owned
+    request = request_membership(str(home), "newcomer", ["10.0.0.9"])
+    fingerprint = client.post("/join/requests", json={"request": request}).json()["fingerprint"]
+    access.add_signed(sign_entry(folder, {"type": "deny", "name": "newcomer", "fingerprint": fingerprint}))
+    assert "newcomer" not in access.join_requests
+    assert client.post("/join/requests", json={"request": request}).json()["status"] == "refused"
+
+
+def test_only_the_owner_can_admit_a_node(owned, tmp_path):
+    from shardmesh.pool import approve_membership, init_pool, request_membership, sign_entry
+
+    folder, access, client, home = owned
+    other = init_pool(str(tmp_path / "other"))
+    request = request_membership(str(home), "newcomer", ["10.0.0.9"])
+    forged = sign_entry(str(other), {"type": "member", "name": "newcomer", "certificate": approve_membership(str(other), request)})
+    assert client.post("/access/entries", json=forged).status_code == 403
+    assert client.get("/join/certificate/newcomer").status_code == 404
+
+
+def test_join_requests_are_bounded_and_spread(owned):
+    from shardmesh.access import AccessControl, Authority, MAX_JOIN_REQUESTS
+    from shardmesh.pool import read_membership_request, request_membership
+
+    folder, access, _, home = owned
+    text = request_membership(str(home), "one", ["10.0.0.9"])
+    access.add_join_request(read_membership_request(text), text)
+    peer = AccessControl(identities=True, authority=Authority(folder + "/ca.pem"))
+    peer.merge(access.document())
+    assert "one" in peer.join_requests
+    peer.merge({"join_requests": [{"request": "forged"}]})
+    assert list(peer.join_requests) == ["one"]
+    for index in range(MAX_JOIN_REQUESTS):
+        access.join_requests[f"n{index}"] = {}
+    second = request_membership(str(home), "late", ["10.0.0.9"])
+    assert access.add_join_request(read_membership_request(second), second) == "busy"

@@ -200,6 +200,52 @@ def run_model_hash(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_membership(args: argparse.Namespace) -> int:
+    """Asking to join a pool, and answering."""
+    from .pool import approve_membership, read_membership_request, request_membership
+
+    url = args.url.rstrip("/")
+    if args.pool_command == "request-join":
+        request = request_membership(args.dir, args.name, args.address)
+        answer = httpx.post(url + "/join/requests", json={"request": request}, timeout=30, trust_env=False)
+        if answer.status_code != 200:
+            print(answer.json().get("detail", answer.text))
+            return 1
+        print(f"Asked to join as {args.name}: {answer.json()['status']}. Tell the owner this key fingerprint: {answer.json()['fingerprint']}")
+        while args.wait:
+            found = httpx.get(f"{url}/join/certificate/{args.name}", timeout=30, trust_env=False)
+            if found.status_code == 200:
+                folder = Path(args.dir)
+                (folder / f"{args.name}.pem").write_text(found.json()["certificate"], encoding="utf-8")
+                (folder / "ca.pem").write_text(found.json()["authority"], encoding="utf-8")
+                print(f"Approved. Start with --ca-file, --identity-cert, and --identity-key from {folder}.")
+                return 0
+            time.sleep(5)
+        return 0
+    headers = {"Authorization": f"Bearer {args.token}"}
+    waiting = httpx.get(url + "/join/requests", headers=headers, timeout=30, trust_env=False)
+    if waiting.status_code != 200:
+        print(waiting.text[:200])
+        return 1
+    requests = {item["name"]: item for item in waiting.json()["requests"]}
+    if args.pool_command == "requests":
+        for item in requests.values():
+            print(f"{item['name']}  key {item['fingerprint']}  from {', '.join(item['addresses'])}")
+        print(f"{len(requests)} waiting.")
+        return 0
+    held = requests.get(args.name)
+    if held is None:
+        print(f"{args.name} has not asked to join.")
+        return 1
+    if args.pool_command == "deny":
+        send_signed(args, {"type": "deny", "name": args.name, "fingerprint": read_membership_request(held["request"])["fingerprint"]})
+        print(f"Denied {args.name}.")
+        return 0
+    send_signed(args, {"type": "member", "name": args.name, "certificate": approve_membership(args.dir, held["request"])})
+    print(f"Approved {args.name}, key {held['fingerprint']}.")
+    return 0
+
+
 def run_cordon(args: argparse.Namespace) -> int:
     """Take a node out of service, or put it back. Replies finish first."""
     token = args.token or load_token()
@@ -233,6 +279,21 @@ def main() -> None:
     issue.add_argument("name")
     issue.add_argument("--dir", required=True)
     issue.add_argument("--address", action="append", required=True, help="an address peers use for this node; repeatable")
+    ask = pool_commands.add_parser("request-join", help="ask to join a pool; the owner decides")
+    ask.add_argument("name", help="this node's --node-id")
+    ask.add_argument("--dir", required=True, help="where to keep this node's key and certificate")
+    ask.add_argument("--address", action="append", required=True, help="an address peers use for this node; repeatable")
+    ask.add_argument("--url", required=True, help="any member's control address")
+    ask.add_argument("--wait", action="store_true", help="wait for the owner's answer")
+    listing = pool_commands.add_parser("requests", help="show who is asking to join")
+    listing.add_argument("--url", default="http://127.0.0.1:8000")
+    listing.add_argument("--token", required=True, help="an admin key")
+    for name, summary in (("approve", "let a node join"), ("deny", "turn down a node's request")):
+        answer = pool_commands.add_parser(name, help=summary)
+        answer.add_argument("name")
+        answer.add_argument("--dir", required=True)
+        answer.add_argument("--url", default="http://127.0.0.1:8000")
+        answer.add_argument("--token", required=True, help="an admin key, to read the request")
     revoke = pool_commands.add_parser("revoke", help="throw a node out for good, signed by the pool authority")
     revoke.add_argument("name")
     revoke.add_argument("--dir", required=True)
@@ -289,6 +350,8 @@ def main() -> None:
     if args.command == "pool":
         from .pool import add_node, init_pool
 
+        if args.pool_command in {"request-join", "requests", "approve", "deny"}:
+            raise SystemExit(run_membership(args))
         if args.pool_command == "revoke":
             send_signed(args, {"type": "revoke", "name": args.name})
             print(f"{args.name} is revoked.")

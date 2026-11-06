@@ -75,6 +75,8 @@ TORCH_DTYPES: dict[str, torch.dtype] = {
 # Enough of a GGUF to cover the start of its header.
 FINGERPRINT_BYTES = 1024 * 1024
 LOCAL_SCAN_SECONDS = 60.0
+RANGE_ATTEMPTS = 4
+RANGE_RETRY_SECONDS = 3.0
 SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 FP8 = torch.float8_e4m3fn
 FP8_SCALE_SUFFIX = "_scale_inv"
@@ -258,20 +260,27 @@ class PeerReader:
     def iter_range(self, name: str, start: int, end: int) -> Iterator[bytes]:
         """Stream a byte range, moving to the next holder if one fails part way."""
         cursor = start
-        for url in self.urls:
-            try:
-                params = {"name": name, "start": cursor, "end": end}
-                with self.client.stream("GET", url + "/internal/gguf/range", params=params) as response:
-                    if response.status_code != 200:
-                        continue
-                    for chunk in response.iter_bytes(CHUNK_BYTES):
-                        cursor += len(chunk)
-                        yield chunk
-                if cursor >= end:
-                    return
-            except httpx.HTTPError:
-                continue
-        raise WeightSourceError(f"{name}: no node could send bytes {cursor} to {end}")
+        reason = "no holders"
+        # Gigabytes over Wi-Fi will meet a dropped connection, and one must not end
+        # a load. Each try resumes where the last one stopped.
+        for attempt in range(RANGE_ATTEMPTS):
+            if attempt:
+                time.sleep(RANGE_RETRY_SECONDS * attempt)
+            for url in self.urls:
+                try:
+                    params = {"name": name, "start": cursor, "end": end}
+                    with self.client.stream("GET", url + "/internal/gguf/range", params=params) as response:
+                        if response.status_code != 200:
+                            reason = f"{url} answered {response.status_code}"
+                            continue
+                        for chunk in response.iter_bytes(CHUNK_BYTES):
+                            cursor += len(chunk)
+                            yield chunk
+                    if cursor >= end:
+                        return
+                except httpx.HTTPError as exc:
+                    reason = f"{url}: {type(exc).__name__}"
+        raise WeightSourceError(f"{name}: no node could send bytes {cursor} to {end} ({reason})")
 
     def close(self) -> None:
         self.client.close()

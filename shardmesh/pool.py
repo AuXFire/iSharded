@@ -135,6 +135,67 @@ def init_pool(folder: str) -> Path:
     return root
 
 
+def request_membership(folder: str, name: str, addresses: list[str]) -> str:
+    """Make a node's key, which never leaves it, and a request for the owner to sign."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    root = Path(folder)
+    root.mkdir(parents=True, exist_ok=True)
+    key_path = root / f"{name}.key"
+    if key_path.exists():
+        key = serialization.load_pem_private_key(key_path.read_bytes(), password=None)
+    else:
+        key = ec.generate_private_key(ec.SECP256R1())
+        _write_private(key_path, key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+    request = (
+        x509.CertificateSigningRequestBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)]))
+        .add_extension(x509.SubjectAlternativeName(_alternative_names(addresses)), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    return request.public_bytes(serialization.Encoding.PEM).decode()
+
+
+def read_membership_request(text: str) -> dict[str, Any]:
+    """What a request claims, once its own signature checks out. ValueError if it does not."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.x509.oid import ExtensionOID, NameOID
+
+    request = x509.load_pem_x509_csr(text.encode())
+    if not request.is_signature_valid:
+        raise ValueError("the request's signature is wrong")
+    names = request.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+    if len(names) != 1:
+        raise ValueError("a request names exactly one node")
+    try:
+        extension = request.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME).value
+    except x509.ExtensionNotFound:
+        raise ValueError("a request lists the node's addresses") from None
+    addresses = [str(value) for value in [*extension.get_values_for_type(x509.IPAddress), *extension.get_values_for_type(x509.DNSName)]]
+    public = request.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    digest = hashes.Hash(hashes.SHA256())
+    digest.update(public)
+    return {"name": str(names[0].value), "addresses": addresses, "fingerprint": digest.finalize().hex()[:16]}
+
+
+def approve_membership(folder: str, text: str) -> str:
+    """Issue a certificate for a request, keeping the name and key it asked for."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+
+    request = x509.load_pem_x509_csr(text.encode())
+    details = read_membership_request(text)
+    root = Path(folder)
+    authority = x509.load_pem_x509_certificate((root / "ca.pem").read_bytes())
+    signer = serialization.load_pem_private_key((root / "ca.key").read_bytes(), password=None)
+    certificate = _certificate(details["name"], details["addresses"], request.public_key(), authority, signer)
+    return certificate.public_bytes(serialization.Encoding.PEM).decode()
+
+
 def sign_entry(folder: str, entry: dict[str, Any]) -> dict[str, Any]:
     """Sign a change to the pool's access list. Only the authority's private key can."""
     from cryptography.hazmat.primitives import hashes, serialization
@@ -148,40 +209,53 @@ def sign_entry(folder: str, entry: dict[str, Any]) -> dict[str, Any]:
     return {"entry": entry, "signature": base64.b64encode(signature).decode()}
 
 
-def add_node(folder: str, name: str, addresses: list[str]) -> tuple[Path, Path]:
-    """Issue a node its certificate. It proves the node's name in both directions."""
+def _alternative_names(addresses: list[str]) -> list[Any]:
     from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import ec
-    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
-    root = Path(folder)
-    authority = x509.load_pem_x509_certificate((root / "ca.pem").read_bytes())
-    signer = serialization.load_pem_private_key((root / "ca.key").read_bytes(), password=None)
     names: list[x509.GeneralName] = []
     for address in addresses:
         try:
             names.append(x509.IPAddress(ipaddress.ip_address(address)))
         except ValueError:
             names.append(x509.DNSName(address))
-    key = ec.generate_private_key(ec.SECP256R1())
+    return names
+
+
+def _certificate(name: str, addresses: list[str], public_key: Any, authority: Any, signer: Any) -> Any:
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
     now = datetime.datetime.now(datetime.timezone.utc)
-    certificate = (
+    return (
         x509.CertificateBuilder()
         .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)]))
         .issuer_name(authority.subject)
-        .public_key(key.public_key())
+        .public_key(public_key)
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - datetime.timedelta(minutes=5))
         .not_valid_after(now + datetime.timedelta(days=CERTIFICATE_DAYS))
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         # Python 3.13 verifies strictly and refuses certificates without these.
-        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(public_key), critical=False)
         .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(signer.public_key()), critical=False)
-        .add_extension(x509.SubjectAlternativeName(names), critical=False)
+        .add_extension(x509.SubjectAlternativeName(_alternative_names(addresses)), critical=False)
         .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH]), critical=False)
         .sign(signer, hashes.SHA256())
     )
+
+
+def add_node(folder: str, name: str, addresses: list[str]) -> tuple[Path, Path]:
+    """Issue a node its certificate. It proves the node's name in both directions."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    root = Path(folder)
+    authority = x509.load_pem_x509_certificate((root / "ca.pem").read_bytes())
+    signer = serialization.load_pem_private_key((root / "ca.key").read_bytes(), password=None)
+    key = ec.generate_private_key(ec.SECP256R1())
+    certificate = _certificate(name, addresses, key.public_key(), authority, signer)
     certificate_path, key_path = root / f"{name}.pem", root / f"{name}.key"
     certificate_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
     _write_private(

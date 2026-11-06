@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import socket
 import time
 import uuid
@@ -45,7 +46,7 @@ from .protocol import (
     WorkerRegistration,
     auth_headers,
 )
-from .pool import check_exposure, home as pool_home, load_token
+from .pool import check_exposure, home as pool_home, load_token, read_membership_request
 from .serving import BodyLimit, serve, where_everything_is
 from .mesh import clean_url
 from .tickets import PREFIX as TICKET_PREFIX, NodeTickets, TicketChecker, TicketIdentity, client_auth, reply_audience
@@ -2040,6 +2041,7 @@ def verify_user(authorization: str | None) -> None:
 
 
 FORWARDED_PATHS = ("/v1/", "/admin/")
+SAFE_NODE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 FORWARD_MARK = "x-shardmesh-forwarded"
 BEHALF_HEADER = "x-shardmesh-on-behalf"
 # Connection details belong to each hop, and httpx sets the length itself.
@@ -2379,6 +2381,38 @@ async def revoke_node(name: str, authorization: str | None = Header(default=None
     runtime.add_event("security", "Node revoked", name)
     runtime.apply_revocations()
     return {"status": "revoked"}
+
+
+@app.post("/join/requests")
+async def request_to_join(body: dict[str, Any]) -> dict[str, str]:
+    """Anyone may ask. Asking grants nothing until the owner signs an answer."""
+    if runtime.access.authority is None:
+        raise HTTPException(status_code=404, detail="this pool has no owner to ask")
+    try:
+        details = read_membership_request(str(body["request"]))
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"bad request: {exc}") from exc
+    if not SAFE_NODE_NAME.fullmatch(details["name"]):
+        raise HTTPException(status_code=400, detail="node names are letters, digits, dots, dashes, and underscores")
+    state = runtime.access.add_join_request(details, str(body["request"]))
+    if state == "waiting":
+        runtime.add_event("security", "A node asked to join", f"{details['name']} from {details['addresses'][:2]}, key {details['fingerprint']}")
+    return {"status": state, "fingerprint": details["fingerprint"]}
+
+
+@app.get("/join/requests")
+async def join_requests(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    verify_admin(authorization)
+    return {"requests": list(runtime.access.join_requests.values())}
+
+
+@app.get("/join/certificate/{name}")
+async def join_certificate(name: str) -> dict[str, str]:
+    """A certificate is public. Only the node holding the matching key can use it."""
+    certificate = runtime.access.certificates.get(name)
+    if certificate is None:
+        raise HTTPException(status_code=404, detail="not approved yet")
+    return {"certificate": certificate, "authority": Path(os.environ["SHARDMESH_CA_FILE"]).read_text(encoding="utf-8")}
 
 
 @app.post("/access/entries")

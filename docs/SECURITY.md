@@ -63,6 +63,30 @@ Many antivirus products intercept TLS on every port, even on loopback, and repla
 - Exclude the pool's ports or `python.exe` from HTTPS scanning, and use mutual TLS.
 - On a private network, use tickets with `--trusted-network`, accepting that traffic is unencrypted.
 
+## Adding members
+
+An owner can issue a certificate directly with `shardmesh pool add-node`, or a node can ask. Asking keeps the node's private key on the node, and the owner's key off the network.
+
+```bash
+shardmesh pool request-join node-c --dir node-identity --address 100.64.0.9 --url http://10.0.0.5:8000 --wait
+```
+
+The node prints a key fingerprint. Any member passes the request on. The owner lists what is waiting, checks the fingerprint with whoever is asking, and answers:
+
+```bash
+shardmesh pool requests --url http://10.0.0.5:8000 --token <admin key>
+```
+
+```bash
+shardmesh pool approve node-c --dir pool-secrets --url http://10.0.0.5:8000 --token <admin key>
+```
+
+```bash
+shardmesh pool deny node-c --dir pool-secrets --url http://10.0.0.5:8000 --token <admin key>
+```
+
+Asking grants nothing. An approved node collects its certificate from any member and starts with `--ca-file`, `--identity-cert`, and `--identity-key`. A denied key stays denied, and a revoked name cannot ask again. Up to 64 requests wait at once. Check `ca.pem` against the owner's copy before trusting it, because the node that hands it over could be lying.
+
 ## Managing keys and nodes
 
 With a pool authority, keys and revocations are signed with `ca.key` and sent to any node, and gossip carries them to the rest. Nodes ignore anything unsigned, so a compromised node cannot add a key, remove one, or revoke a peer.

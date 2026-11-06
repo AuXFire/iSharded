@@ -41,6 +41,7 @@ ROLE_PEER = "peer"
 RANKS = {ROLE_PEER: 0, ROLE_USER: 1, ROLE_ADMIN: 2, ROLE_NODE: 3}
 WORKER_KINDS = {"gpu", "cpu", "memory"}
 AUDIT_ROTATE_BYTES = 64 * 1024 * 1024
+MAX_JOIN_REQUESTS = 64
 
 
 def node_of(worker_id: str) -> str:
@@ -114,6 +115,12 @@ class AccessControl:
     # valid signatures. Everything a pool with an authority shares.
     signed: dict[str, dict[str, Any]] = field(default_factory=dict)
     removed_names: set[str] = field(default_factory=set)
+    # Requests to join, by node name, until the owner answers. Carried by gossip
+    # unsigned: a request grants nothing, and the owner checks its fingerprint.
+    join_requests: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Certificates the owner issued, for new members to collect.
+    certificates: dict[str, str] = field(default_factory=dict)
+    denied: set[str] = field(default_factory=set)
 
     @classmethod
     def load(
@@ -161,7 +168,20 @@ class AccessControl:
             "removed_keys": sorted(self.removed),
             "cordoned_nodes": sorted(self.cordoned),
             "signed": [self.signed[held] for held in sorted(self.signed)],
+            "join_requests": [self.join_requests[name] for name in sorted(self.join_requests)],
         }
+
+    def _take_join_requests(self, document: dict[str, Any]) -> None:
+        for held in document.get("join_requests", [])[:MAX_JOIN_REQUESTS]:
+            if not isinstance(held, dict) or not isinstance(held.get("request"), str):
+                continue
+            try:
+                from .pool import read_membership_request
+
+                details = read_membership_request(held["request"])
+            except (ImportError, ValueError):
+                continue  # each node checks for itself, since gossip proves nothing
+            self.add_join_request(details, held["request"])
 
     def _take_signed(self, document: dict[str, Any]) -> bool:
         """Apply new signed entries from a document. Anything unsigned is ignored."""
@@ -198,8 +218,32 @@ class AccessControl:
             return True
         if kind == "revoke" and name:
             self.revoked.add(name)
+            self.join_requests.pop(name, None)
+            return True
+        if kind == "member" and name and isinstance(entry.get("certificate"), str):
+            self.certificates[name] = entry["certificate"]
+            self.join_requests.pop(name, None)
+            return True
+        if kind == "deny" and name:
+            # By the request, not the name: asking again with a new key is a new request.
+            self.denied.add(str(entry.get("fingerprint", "")))
+            held = self.join_requests.get(name)
+            if held and held.get("fingerprint") in self.denied:
+                del self.join_requests[name]
             return True
         return False
+
+    def add_join_request(self, details: dict[str, Any], request: str) -> str:
+        """Hold a request for the owner. Says what happened, for whoever asked."""
+        name = details["name"]
+        if name in self.revoked or details["fingerprint"] in self.denied:
+            return "refused"
+        if name in self.certificates:
+            return "approved"
+        if name not in self.join_requests and len(self.join_requests) >= MAX_JOIN_REQUESTS:
+            return "busy"
+        self.join_requests[name] = {**details, "request": request}
+        return "waiting"
 
     def add_signed(self, signed: Any) -> bool:
         """Take one signed entry from an operator. False if the signature is wrong."""
@@ -212,6 +256,7 @@ class AccessControl:
     def _merge_with_authority(self, document: dict[str, Any]) -> bool:
         mine = self.document()
         changed = self._take_signed(document)
+        self._take_join_requests(document)
         if self._rank(document) > self._rank(mine):
             cordoned = set(document.get("cordoned_nodes", []))
             changed = changed or cordoned != self.cordoned
@@ -246,6 +291,7 @@ class AccessControl:
             "removed_keys": sorted(removed),
             "cordoned_nodes": sorted(newest.get("cordoned_nodes", [])),
             "signed": mine["signed"],
+            "join_requests": mine["join_requests"],
         }
         if merged == mine:
             return False

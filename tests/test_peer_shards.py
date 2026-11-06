@@ -285,3 +285,40 @@ def test_model_hashes_cover_every_unit_and_the_description(held, tmp_path: Path)
         apply_model_hashes(altered, [copy], hashes)
     with pytest.raises(WeightSourceError, match="no entry"):
         apply_model_hashes(manifest, [copy], {MANIFEST_KEY: hashes[MANIFEST_KEY]})
+
+
+def test_a_dropped_connection_resumes_where_it_stopped(monkeypatch) -> None:
+    from shardmesh import weights
+    from shardmesh.weights import PeerReader
+
+    monkeypatch.setattr(weights, "RANGE_RETRY_SECONDS", 0.0)
+    data = bytes(range(200))
+    asked = []
+
+    class Dropping(httpx.SyncByteStream):
+        def __iter__(self):
+            yield data[:50]
+            raise httpx.ReadError("dropped")
+
+    def handler(request):
+        start, end = int(request.url.params["start"]), int(request.url.params["end"])
+        asked.append(start)
+        if len(asked) == 1:
+            return httpx.Response(200, stream=Dropping())
+        return httpx.Response(200, content=data[start:end])
+
+    reader = PeerReader(["http://peer"])
+    reader.client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert b"".join(reader.iter_range("m.gguf", 0, 200)) == data
+    assert len(asked) == 2
+
+
+def test_giving_up_on_a_range_says_why(monkeypatch) -> None:
+    from shardmesh import weights
+    from shardmesh.weights import PeerReader, WeightSourceError
+
+    monkeypatch.setattr(weights, "RANGE_RETRY_SECONDS", 0.0)
+    reader = PeerReader(["http://peer"])
+    reader.client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(401)))
+    with pytest.raises(WeightSourceError, match="answered 401"):
+        list(reader.iter_range("m.gguf", 0, 200))
