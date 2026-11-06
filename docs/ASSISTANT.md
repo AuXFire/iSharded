@@ -206,7 +206,7 @@ Reach defaults to `cloud`, the worst case, and to `pool` for a mesh. `machine` i
 
 The database holds the name of a variable or a file, never a key, and a key is read when it is used. Something that looks like a pasted key is refused. A bare UPPER_CASE name is a variable, and any other variable can be given as `env:name` once it is set. A key in an address is refused.
 
-The mesh's chat API takes plain strings and has no tool calling, so tools go in the system prompt, as short signatures with an example built from a real tool, and calls are read from the reply. [How that wording was chosen](#how-a-small-model-does) matters more than it looks. Thinking is on only for `planning`, `coding`, and `verification`. A reply from the mesh is always streamed, even when nobody is watching it, because only a stream can tell a slow pool from a lost link. Other servers use native `tools` where they accept them, falling back to the prompt if they refuse, with capability names mapped since a function name cannot contain a dot.
+The mesh's own API has tool calling, but the assistant does not use it yet. With a mesh, tools always go in the system prompt, whatever `--tools` says, as short signatures with an example built from a real tool, and calls are read from the reply. [How that wording was chosen](#how-a-small-model-does) matters more than it looks. Thinking is on only for `planning`, `coding`, and `verification`. A reply from the mesh is always streamed, even when nobody is watching it, because only a stream can tell a slow pool from a lost link. Other servers use native `tools` where they accept them, falling back to the prompt if they refuse, with capability names mapped since a function name cannot contain a dot.
 
 Models write tool calls in many shapes, and all of these are understood: a ` ```tool ` or ` ```json ` fence, `<tool_call>` tags, no fence at all, single quotes, trailing commas, and arguments as a string. Only tools that were offered count. Text in reasoning never counts, and neither does code. A call with no fence must end the reply. A call cut off by the token limit is never run, because a truncated argument is a different argument.
 
@@ -1175,7 +1175,7 @@ A tool that stores or sends text reads `CallContext.reach`, which says how far t
 
 - **Avatars.** There is a name, a style, and a voice name. There is no face, no animation, and nothing that draws one.
 - **A wake word.** Nothing listens. `voice` works on an audio file or a request someone chose to send.
-- **Vision on the mesh.** `vision` is a role the router knows, and that is all. No part sends an image, and the mesh's chat API takes plain strings. The `vision` route would need a provider that can see, and a part that sends it something.
+- **Vision in the assistant.** `vision` is a role the router knows, and that is all. No part of the assistant sends an image, although the mesh's chat API takes them on a model loaded with a projector. The `vision` route would need a provider that can see, and a part that sends it something.
 - **Home or robot control.** `physical` is an effect the broker enforces: such a capability can have no grant, and every action needs a person. No such capability exists. No plugin for one has been written, and no hardware has ever been moved by this.
 - **Running a skill by itself.** A skill's instructions reach the model on every turn it applies to, but `execute` is called by no command and no part.
 - **Reflecting by itself.** `skill reflect` is a person's command. Nothing watches for finished tasks.

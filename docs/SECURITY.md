@@ -8,9 +8,9 @@ A node in the route sees prompts and replies in plain text, as hidden states or 
 
 ## Who owns a pool
 
-iSharded is decentralized in how it runs, not in who owns it. No server is special, any node can coordinate, and losing any machine loses nothing but what it was running. But a pool has an owner: whoever holds the authority key, or the shared token in a pool without one. That person decides who joins, who is thrown out, and who may load models.
+An ordinary pool is decentralized in how it runs, not in who owns it. No server is special, any node can coordinate, and losing any machine loses nothing but what it was running. But it has an owner: whoever holds the authority key, or the shared token in a pool without one. That person decides who joins, who is thrown out, and who may load models.
 
-This suits a pool whose members trust each other. It is not a public mesh. A public mesh, where anyone can join, would need answers iSharded does not have today: a way to detect wrong results, a way to stop one person running thousands of nodes, and a clear warning that node operators can read prompts. The next section covers what is built for that, and what stays unanswered.
+This suits a pool whose members trust each other. It is not a public mesh. A public mesh, where anyone can join, would need answers iSharded does not have today: a way to detect wrong results that a careful node cannot dodge, a way to stop one person running thousands of nodes, and a clear warning that node operators can read prompts. [Checking answers](../README.md#checking-answers) catches a route that disagrees with others, and no more. [A network nobody owns](#a-network-nobody-owns) covers what is built for a public mesh, and what stays unanswered.
 
 ## Invites
 
@@ -52,8 +52,9 @@ What this does not give you:
 |---|---|---|
 | Node, with a pool authority | Certificate, over TLS or as a ticket | Node routes only: gossip, registration, stage traffic |
 | Node, without one | Pool token | Everything, including the node protocol |
-| Admin | API key, role `admin` | Load models, rebalance, cordon, manage keys, revoke nodes, read metrics, and all user actions |
+| Admin | API key, role `admin` | Load models, rebalance, cordon, read metrics, and all user actions. Manage keys and revoke nodes in a pool without an authority |
 | User | API key, role `user` | Chat, completions, read status |
+| Owner | The authority's private key | Add, remove, and revoke, in a pool with an authority |
 
 A node starts refusing to serve a network if it would be exposed:
 
@@ -70,7 +71,7 @@ isharded pool init --dir pool-secrets
 
 Copy `pool.token` to each node as `%LOCALAPPDATA%\iSharded\pool.token` (Windows) or `~/.isharded/pool.token`. Anyone holding it can act as any node.
 
-For machines you may need to throw out individually, or remotes across the internet, give each node a certificate. Every node then needs the `pool` extra (`pip install isharded[pool]`).
+For machines you may need to throw out individually, or remotes across the internet, give each node a certificate.
 
 ```bash
 isharded pool add-node --dir pool-secrets node-b --address 10.0.0.6
@@ -85,7 +86,7 @@ A node proves its name in one of two ways, using the same certificate:
 | Tickets | The link is already private, as on Tailscale, or antivirus intercepts TLS | `--ca-file ca.pem --identity-cert node-b.pem --identity-key node-b.key` |
 | Mutual TLS | The link needs encrypting, and nothing intercepts TLS | `--ca-file ca.pem --tls-cert node-b.pem --tls-key node-b.key` |
 
-A ticket is a short signed statement in an ordinary header. It names the node it is for and expires within five minutes, so a peer that receives one cannot use it elsewhere. Tickets encrypt nothing, so a node using them on an ordinary LAN refuses to start without `--trusted-network`. Clocks must agree to within a minute.
+A ticket is a short signed statement in an ordinary header. It names the node it is for and expires within two minutes, so a peer that receives one cannot use it elsewhere. Tickets encrypt nothing, so a node using them on an ordinary LAN refuses to start without `--trusted-network`. Clocks must agree to within a minute.
 
 With a pool authority the pool token counts for nothing, on control planes and workers alike, so do not copy it to nodes.
 
@@ -102,21 +103,21 @@ Many antivirus products intercept TLS on every port, even on loopback, and repla
 An owner can issue a certificate directly with `isharded pool add-node`, or a node can ask. Asking keeps the node's private key on the node, and the owner's key off the network.
 
 ```bash
-isharded pool request-join node-c --dir node-identity --address 100.64.0.9 --url http://10.0.0.5:8000 --wait
+isharded pool request-join node-c --dir node-identity --address 100.64.0.9 --url http://10.0.0.5:8209 --wait
 ```
 
 The node prints a key fingerprint. Any member passes the request on. The owner lists what is waiting, checks the fingerprint with whoever is asking, and answers:
 
 ```bash
-isharded pool requests --url http://10.0.0.5:8000 --token <admin key>
+isharded pool requests --url http://10.0.0.5:8209 --token <admin key>
 ```
 
 ```bash
-isharded pool approve node-c --dir pool-secrets --url http://10.0.0.5:8000 --token <admin key>
+isharded pool approve node-c --dir pool-secrets --url http://10.0.0.5:8209 --token <admin key>
 ```
 
 ```bash
-isharded pool deny node-c --dir pool-secrets --url http://10.0.0.5:8000 --token <admin key>
+isharded pool deny node-c --dir pool-secrets --url http://10.0.0.5:8209 --token <admin key>
 ```
 
 Asking grants nothing. An approved node collects its certificate from any member and starts with `--ca-file`, `--identity-cert`, and `--identity-key`. A denied key stays denied, and a revoked name cannot ask again. Up to 64 requests wait at once. Check `ca.pem` against the owner's copy before trusting it, because the node that hands it over could be lying.
@@ -126,15 +127,15 @@ Asking grants nothing. An approved node collects its certificate from any member
 With a pool authority, keys and revocations are signed with `ca.key` and sent to any node, and gossip carries them to the rest. Nodes ignore anything unsigned, so a compromised node cannot add a key, remove one, or revoke a peer.
 
 ```bash
-isharded key create alice --role user --requests-per-minute 60 --dir pool-secrets --url http://10.0.0.5:8000
+isharded key create alice --role user --requests-per-minute 60 --dir pool-secrets --url http://10.0.0.5:8209
 ```
 
 ```bash
-isharded key remove alice --dir pool-secrets --url http://10.0.0.5:8000
+isharded key remove alice --dir pool-secrets --url http://10.0.0.5:8209
 ```
 
 ```bash
-isharded pool revoke node-b --dir pool-secrets --url http://10.0.0.5:8000
+isharded pool revoke node-b --dir pool-secrets --url http://10.0.0.5:8209
 ```
 
 A key is shown once and stored as a SHA-256 hash. `/admin/keys` and `/admin/nodes/{name}/revoke` refuse these changes in such a pool, and say to use these commands.
@@ -191,7 +192,7 @@ Every node then checks every unit against that list, whether it came from a peer
 
 The code has had two security reviews, both by an AI model reading the source. The first found one critical and five high findings, and the second, of the signing, ticket, hashing, and merging code added after it, found four high. Those and most medium and low findings are fixed, with regression tests in `tests/test_security.py`. No human has reviewed or penetration tested it, and reviews like these do not show the code is free of other flaws.
 
-- A node in the route sees prompts and can return wrong results, and nothing detects it. Certificates limit who is in the pool. They do not make a hostile member safe.
+- A node in the route sees prompts and can return wrong results. Nothing detects it reading them. Comparing routes with `isharded audit` catches a route that disagrees with others, but not one that behaves whenever it might be watched. Certificates limit who is in the pool. They do not make a hostile member safe.
 - An unrevoked node can still claim leadership, publish a route, or cordon nodes through gossip, and a node that holds a verified identity can act for a caller it claims to have checked. It cannot add keys, revoke peers, or learn anyone's key, because in a pool with an authority a key never leaves the node it was given to.
 - Tickets can be replayed for up to two minutes by anyone who can read the link, which is why they need a private one.
 - The hash list covers weights and the model's description, not the tokenizer or chat template, and it reaches workers through the coordinator, so a dishonest coordinator could leave it out.

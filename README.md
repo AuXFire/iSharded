@@ -24,6 +24,7 @@ This is execution sharding, not simulated work distribution: each token really c
 - [Models](#models)
 - [Embeddings](#embeddings)
 - [Vision](#vision)
+- [The assistant](#the-assistant)
 - [Memory and placement](#memory-and-placement)
 - [Precision](#precision)
 - [Networks and security](#networks-and-security)
@@ -35,7 +36,7 @@ This is execution sharding, not simulated work distribution: each token really c
 - [Current limits](#current-limits)
 - [License](#license)
 
-More detail lives in [Operating iSharded](docs/OPERATIONS.md) and [iSharded security](docs/SECURITY.md).
+More detail lives in [Operating iSharded](docs/OPERATIONS.md), [iSharded security](docs/SECURITY.md), and [the assistant's guide](docs/ASSISTANT.md).
 
 ## What it does
 
@@ -46,8 +47,10 @@ More detail lives in [Operating iSharded](docs/OPERATIONS.md) and [iSharded secu
 - Runs GGUF models on stock llama.cpp, and safetensors models on its own PyTorch code. Qwen and GPT-2 families, including mixture-of-experts models.
 - Speeds up replies with a small draft model, reuses earlier conversation state, and lets conversations share a pass through each stage.
 - Runs several models at once on the same mesh, and users choose between them.
-- Serves OpenAI-shaped `/v1/chat/completions`, `/v1/completions`, and `/v1/models`, with streaming and tool calling, plus a chat page and a live dashboard on every node.
+- Serves OpenAI-shaped `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, and `/v1/models`, with streaming, tool calling, and image input, plus a chat page and a live dashboard on every node.
 - Speaks MCP both ways: MCP clients can use a mesh, and models on a mesh can use the tools of MCP servers.
+- Checks answers, by asking separate routes the same questions and comparing what comes back.
+- Comes with an assistant that each person runs for themselves, with a mesh as its model.
 - Keeps replies going through failures: a crashed stage, a dead node, a dead coordinator, a silent link, or a split network.
 - Moves weights only when it must, shares them between nodes, and works with no internet at all.
 - Runs as a network one person owns, or as one nobody owns, where each node decides who it accepts and what it hosts.
@@ -73,7 +76,7 @@ curl -fsSL https://raw.githubusercontent.com/AuXFire/iSharded/main/install.sh | 
 
 Then `isharded doctor` checks the machine, and says what to fix if anything is missing.
 
-The installers pick a CUDA build of PyTorch where they find an NVIDIA GPU, and otherwise a CPU build on Windows. A GPU PyTorch cannot see, such as an AMD card on Windows, still works for GGUF models: the node finds it through llama.cpp's Vulkan build. See [Any GPU](#any-gpu).
+The installers pick a CUDA build of PyTorch where they find an NVIDIA GPU. They pick a CPU build on Windows without one, and on Linux with no GPU tools at all. Anywhere else they take PyTorch's default build, which on Linux is not a ROCm one. A GPU PyTorch cannot see, such as an AMD card on Windows, still works for GGUF models: the node finds it through llama.cpp's Vulkan build. See [Any GPU](#any-gpu).
 
 ### By hand
 
@@ -84,7 +87,7 @@ git clone https://github.com/AuXFire/iSharded.git
 ```
 
 ```bash
-cd isharded
+cd iSharded
 ```
 
 ```bash
@@ -109,7 +112,9 @@ On the first machine:
 isharded up
 ```
 
-That is all it needs. It finds the hardware, picks an address, makes the mesh's certificates, and opens the chat page signed in as the owner, where you choose a model. Running it again starts the same node with the same settings.
+That is all it needs. It finds the hardware, picks an address, makes the mesh's certificates, and opens the chat page signed in as the owner, where you choose a model. Running it again starts the same node with the same settings, so only `--model` and `--no-browser` count after the first run.
+
+To load a model as well, run `isharded up --model NAME`. It says when the model is ready, or why it could not load. On a CPU-only node with Qwen3-0.6B, it said it was up at 17 s and the model was ready at 25 s, then answered a chat.
 
 ### Add a machine
 
@@ -422,21 +427,23 @@ Gated models need `HF_TOKEN` set on each worker.
 Load another model beside the main one by giving it a lane:
 
 ```bash
-isharded load Qwen3-0.6B-Q8_0.gguf --lane small --url http://node-a:8669
+isharded load Qwen3-0.6B-Q8_0.gguf --lane small --url http://node-a:8209
 ```
 
-Each node then starts a control plane and workers for that lane, on ports 1000 above its own for the first lane, 2000 for the second, and so on. Open those ports wherever a firewall sits between nodes. The lane gets only what each node has spare under the limits its owner set, and `--lane-gpu-gb` and `--lane-ram-gb` lower that. A node started with `--no-lanes` hosts only the main model.
+Each node then starts a control plane and a worker for that lane, on ports 1000 above its own for the first lane, 2000 for the second, and so on. A pool runs up to 7 lanes, and a lane's name is up to 32 lowercase letters, digits, and hyphens. Open those ports wherever a firewall sits between nodes. The lane gets only what each node has spare under the limits its owner set, and `--lane-gpu-gb` and `--lane-ram-gb` lower that. A node started with `--no-lanes` hosts only the main model.
+
+A lane costs memory before any weights load. Its control plane and worker each import PyTorch, at about 0.41 GB resident and 1.13 GB committed each, measured at import. A node running the main model and 2 lanes therefore holds 6 such processes.
 
 `GET /v1/models` lists every running model on every node, and a request goes to the model it names. The chat page shows a picker once two models run. A request that names no model goes to the main one. Keys stay with each node's main control plane, which checks the key and the rate limit before passing a request on.
 
 Lanes are separate on purpose: a failure in one stays there, and each has its own coordinator. See or stop them with:
 
 ```bash
-isharded lane list --url http://node-a:8669
+isharded lane list --url http://node-a:8209
 ```
 
 ```bash
-isharded lane remove small --url http://node-a:8669
+isharded lane remove small --url http://node-a:8209
 ```
 
 Removing a lane stops its processes on every node and frees their memory. Lanes come back after a restart, like the main model.
@@ -454,10 +461,12 @@ isharded net init --dir ./identity --joining vouched --trust n-1a2b3c4d5e6f70819
 Give your node's name to someone already in the network, and have them vouch for it:
 
 ```bash
-isharded net vouch n-9f8e7d6c5b4a39281706 --dir ./identity --url http://127.0.0.1:8009
+isharded net vouch n-9f8e7d6c5b4a39281706 --dir ./identity --url http://127.0.0.1:8209
 ```
 
-Start the node with `--ownerless ./identity`. Make yourself a key for your own node with `isharded key create me --role admin --file keys.json`, and pass `--keys-file keys.json`. That key is an admin of your node and means nothing anywhere else. Your users' keys live on your node too, and you set their limits.
+`isharded up --ownerless` is meant to do this for you, with the identity in `commons` in its folder, and `--join` naming a node already in the network. It has no `--trust`, so with `--joining vouched`, its default, it accepts only itself until you vouch for someone from that folder. This way in has not been run yet, so the steps here are the proven ones.
+
+Start the node with `isharded node --ownerless ./identity`. Make yourself a key for your own node with `isharded key create me --role admin --file keys.json`, and pass `--keys-file keys.json`. That key is an admin of your node and means nothing anywhere else. Your users' keys live on your node too, and you set their limits.
 
 What an operator can do on the rest of the network is propose:
 
@@ -473,6 +482,8 @@ What an operator can do on the rest of the network is propose:
 `--host-models` lists the models your node will host, as patterns such as `*Qwen3*`, in any kind of network. A worker refuses anything else, whatever a coordinator tells it.
 
 Nodes still pick a coordinator by lowest name, to keep a route in order. It can place work and hold a route up, but it cannot make a node host anything or change who that node accepts. Read [Current limits](#current-limits) before opening one to strangers.
+
+With real processes, as three nodes on one machine started with `isharded node`, 27 of 27 checks passed. They covered joining by vouch, proposing and removing a model, blocking, and what the table above says nobody can do.
 
 ## Recommended configuration
 
@@ -567,12 +578,12 @@ Starts a node with everything worked out, and is the easy way in. See [Quick sta
 | `--ram-gb` | A share of what is free | RAM to give for weights |
 | `--cpu-threads` | Half the cores | Threads to give |
 | `--gguf-dir` | LM Studio's folders | A folder of GGUF files. Repeatable |
-| `--model` | None | Load this model once the node is up |
+| `--model` | None | Load this model once the node is up, and say when it is ready or why it could not load. This needs an admin key, so it is refused on an invited machine |
 | `--no-browser` | Off | Do not open the chat page |
 | `--find` | Off | Ask to join the one mesh on this network, without asking you first |
 | `--new-mesh` | Off | Start a new mesh even if one is on this network |
 | `--no-discovery` | Off | Do not look for a mesh, and do not answer machines looking for this one |
-| `--ownerless` | Off | Make or join a [network nobody owns](#a-network-nobody-owns) |
+| `--ownerless` | Off | Make or join a [network nobody owns](#a-network-nobody-owns). It never adds TLS, so off Tailscale it needs `--trusted-network`. Not run yet |
 | `--joining` | `vouched` | With `--ownerless`: who this node accepts, `open` or `vouched` |
 | `--join` | None | With `--ownerless`: any node already in the network |
 
@@ -586,11 +597,11 @@ Makes a code that adds a machine to this mesh, on the machine that made it. `--u
 
 ### isharded doctor
 
-Checks this machine and says what to fix: Python, addresses, ports, memory, disk, and local models.
+Checks this machine and says what to fix: Python, the `cryptography` package, addresses, the port, memory, disk, local models, and on Linux the `libgomp` library. It exits with 1 if anything needs fixing.
 
 ### isharded service
 
-`isharded service install` starts this node when you log in, for this user only, and `isharded service remove` stops that. It uses a scheduled task on Windows, a systemd user unit on Linux, and a launch agent on macOS.
+`isharded service install` starts this node when you log in, for this user only, and `isharded service remove` stops that. It runs `isharded up --no-browser`, through a scheduled task on Windows, a systemd user unit on Linux, and a launch agent on macOS.
 
 ### isharded demo
 
@@ -643,7 +654,7 @@ Hardware and memory:
 
 | Option | Default | What it does |
 |---|---|---|
-| `--gpu-device` | `auto` | `auto` (every accelerator), `cuda:0`, `cuda:0,cuda:1`, `mps`, `xpu:0`, or `none`. ROCm uses PyTorch's cuda device names |
+| `--gpu-device` | `auto` | `auto` (every accelerator), `cuda:0`, `cuda:0,cuda:1`, `mps`, `xpu:0`, `vulkan`, or `none`. ROCm uses PyTorch's cuda device names. See [Any GPU](#any-gpu) |
 | `--gpu-memory-gb` | 0 (auto) | VRAM budget per accelerator. A hard limit on CUDA and ROCm |
 | `--dtype`, `--gpu-dtype` | `auto` | `auto` (BF16), `bfloat16`, `float32`, or `float16`, for this node's VRAM and RAM |
 | `--cpu-threads` | 0 | Threads for CPU work. With no GPU, setting this adds a CPU worker |
@@ -711,7 +722,7 @@ For a [network nobody owns](#a-network-nobody-owns).
 
 | Command | What it does |
 |---|---|
-| `isharded net init --dir DIR` | Make this node's identity. `--joining` is `open` or `vouched`, `--quorum` is the vouches a node needs, and `--trust NAME` accepts a node from the start |
+| `isharded net init --dir DIR` | Make this node's identity. `--joining` is `open`, the default here, or `vouched`. `--quorum` is the vouches a node needs, 1 by default, and `--trust NAME` accepts a node from the start |
 | `isharded net vouch NAME --dir DIR --url URL` | Say this node accepts another |
 | `isharded net show --url URL --token KEY` | This node's own view: who it accepts, blocks, and can see |
 | `isharded net block NAME --url URL --token KEY` | Stop this node dealing with another. Only this node is affected |
@@ -724,11 +735,11 @@ Asks every route serving a model the same questions, and compares the answers. S
 | Option | Default | What it does |
 |---|---|---|
 | `--model` | The main model | The model to check |
-| `--samples` | 8 | Questions to ask each route |
+| `--samples` | 8 | Questions to ask each route, up to 64 |
 | `--every` | Off | Keep checking, this many seconds apart |
 | `--url`, `--token` (`--pool-token`) | | As for `load` |
 
-It exits with 1 if routes disagree, so it can sit in a script.
+It exits with 1 if routes disagree, so it can sit in a script. With `--every` it keeps going through a disagreement, and stops only if a check is refused.
 
 ### isharded cordon and uncordon
 
@@ -774,7 +785,7 @@ Commands for a pool's credentials and members.
 | `pool deny NAME --dir DIR --token KEY --url URL` | Turns a node down. That key stays denied |
 | `pool revoke NAME --dir DIR --url URL` | Throws a node out for good. Bring a machine back under a new name |
 
-`--address` is one an address peers use for that node, and is repeatable. `--token` is an admin key.
+`--address` is an address peers use for that node, and is repeatable. `--token` is an admin key.
 
 ### isharded mcp
 
@@ -792,6 +803,10 @@ Commands for a pool's credentials and members.
 | `--max-tokens` | run | The API's default | Longest reply on each turn |
 | `--tool-timeout` | run | 60 | Seconds a tool may take |
 
+### isharded assistant
+
+Runs [the assistant](#the-assistant). [Its guide](docs/ASSISTANT.md) covers its commands and options.
+
 ### Running the pieces by hand
 
 `isharded node` starts these for you. Start them directly only for unusual layouts, such as a control plane on a machine with no workers.
@@ -808,6 +823,7 @@ Commands for a pool's credentials and members.
 | `--state-file` | `orchestrator-state.json` in the state folder | Where the running route is saved |
 | `--keys-file` | `access.json` in the iSharded folder | Where this node keeps the pool's API keys |
 | `--audit-file` | `audit.jsonl` in the state folder | Where to record who did what |
+| `--lane` | None | Run as this lane, beside a node's main control plane. `isharded node` sets this for you |
 | `--no-reuse-cached` | Off | Plan as if no worker held any shards |
 | `--no-peer-fetch` | Off | Always download from the model host |
 | `--open` | Off | Serve a network with no credentials |
@@ -839,6 +855,7 @@ The state folder is `%LOCALAPPDATA%\iSharded` on Windows and `~/.cache/iSharded`
 | `--no-peer-fetch` | Off | Always download from the model host |
 | `--no-peer-serve` | Off | Do not send shards to other workers |
 | `--standby` | Off | Only use this worker when a model does not fit without it |
+| `--host-models` | Any | Comma-separated patterns. Host only models that match |
 | `--open` | Off | Serve a network with no credentials |
 | `--trusted-network` | Off | Send credentials unencrypted, on a network nobody else can read |
 
@@ -872,10 +889,11 @@ A flag takes priority over its variable.
 | `ISHARDED_HOST_ID` | Which physical machine a worker is on. Defaults to the computer name, so workers sharing a host do not count its RAM twice |
 | `ISHARDED_FETCH_CONCURRENCY` | Units a worker fetches at once. Default 4 |
 | `ISHARDED_ACCESS_LOG` | Set to `1` to log every request while debugging. Off by default, because nodes poll each other constantly |
+| `ISHARDED_INSTALL_DIR`, `ISHARDED_SOURCE` | For the install scripts only: where to install, and the package to install in place of the one on GitHub |
 | `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` | Hugging Face token, for gated models. Needed on each worker |
 | `HF_ENDPOINT` | Another Hugging Face address, such as a mirror |
 
-A worker's launcher also passes some flags through `ISHARDED_WEIGHTS_RAM_GB`, `ISHARDED_WEIGHTS_DISK_GB`, `ISHARDED_CACHE_BUDGET_GB`, `ISHARDED_PEER_SERVE`, `ISHARDED_GGUF_DIRS`, `ISHARDED_DTYPE`, and `ISHARDED_STANDBY`. Use the flags for those, because they overwrite the variables. `ISHARDED_STAGE_KEY` is internal.
+A worker's launcher also passes some flags through `ISHARDED_WEIGHTS_RAM_GB`, `ISHARDED_WEIGHTS_DISK_GB`, `ISHARDED_CACHE_BUDGET_GB`, `ISHARDED_PEER_SERVE`, `ISHARDED_GGUF_DIRS`, `ISHARDED_DTYPE`, and `ISHARDED_STANDBY`. Use the flags for those, because they overwrite the variables. `ISHARDED_STAGE_KEY` is internal. The assistant's settings are in [its guide](docs/ASSISTANT.md).
 
 ## HTTP API
 
@@ -890,14 +908,14 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `POST` | `/v1/embeddings` | User key | Vectors for text, from an embedding model. See [Embeddings](#embeddings) |
 | `GET` | `/v1/models` | User key | Every running model, and what each is for |
 | `POST` | `/mcp` | User key | [MCP](#mcp) over Streamable HTTP. `GET` and `DELETE` answer 405, since there is no stream or session |
-| `GET` | `/admin/status` | User key | Workers, memory pools, route, epoch, mesh, and load progress |
+| `GET` | `/admin/status` | User key | Workers, memory pools, route, epoch, mesh, lanes, load progress, and the last answer check |
 | `GET` | `/admin/catalog` | User key | Suggested models and supported architectures |
 | `POST` | `/admin/plan` | Admin key | Show where a model would run, without moving anything |
 | `POST` | `/admin/load` | Admin key | Load a model |
 | `POST` | `/admin/load/cancel` | Admin key | Stop a load. Finished units stay cached |
 | `DELETE` | `/admin/lanes/{name}` | Admin key | Stop a lane and free its memory on every node |
 | `POST` | `/admin/join/{name}/{answer}` | Admin key | Answer a machine asking to join, with `approve` or `deny`, on the machine that made the mesh |
-| `POST` | `/admin/audit` | Admin key | Ask routes serving `model` the same `samples` questions, and compare. Each node runs this itself |
+| `POST` | `/admin/audit` | Admin key | Ask routes serving `model` the same `samples` questions, up to 64, and compare. Each node runs this itself |
 | `POST` | `/admin/invites` | Admin key | Make a code that adds a machine. Takes `uses` and `hours`, and only the machine that made the mesh can |
 | `GET` | `/join/authority` | None | The mesh's public certificate, for a new machine to check against its invite |
 | `GET` | `/admin/network` | User key | In a network nobody owns, this node's own view. `/admin/status` shows the coordinator's |
@@ -906,7 +924,7 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `POST` | `/admin/rebalance` | Admin key | Reconsider all live workers and apply a new layout |
 | `POST` | `/admin/nodes/{name}/cordon` | Admin key | Move a node's share elsewhere. `?force=true` allows a large transfer |
 | `POST` | `/admin/nodes/{name}/uncordon` | Admin key | Put a node back in service |
-| `POST` | `/admin/nodes/{name}/revoke` | Admin key | Throw a node out, in a pool without an authority |
+| `POST` | `/admin/nodes/{name}/revoke` | Admin key | Throw a node out, in a pool without an authority. In a network nobody owns, block it for this node only |
 | `GET`, `POST` | `/admin/keys` | Admin key | List or create keys, in a pool without an authority |
 | `DELETE` | `/admin/keys/{name}` | Admin key | Remove a key, in a pool without an authority |
 | `POST` | `/access/entries` | A valid signature | Apply a change signed by the pool authority |
@@ -926,7 +944,7 @@ Routes under `/internal` are for nodes only. `GET /internal/mesh` shows a node's
 |---|---|---|
 | `messages` | Required for chat | List of `role` and `content`. `content` is a string, or a list of `text` and `image_url` parts. See [Vision](#vision). An assistant message may carry `tool_calls` and no content, and a `tool` message answers one with `tool_call_id`. `name` is optional |
 | `prompt` | Required for completions | A string, or a list holding one string |
-| `model` | The running model | Must match it if given |
+| `model` | The main model | Any running model, in a lane or not. A name that is not running gets a 404 |
 | `max_tokens` | 32, or 4096 with tools in play | 1 to 32768 |
 | `max_completion_tokens` | None | Chat only: the same limit under OpenAI's newer name, and it wins if both are sent |
 | `temperature` | 0 | 0 to 5. 0 picks the most likely token |
@@ -984,6 +1002,7 @@ What comes back:
 - XML writes every value as text, so values are converted using the tool's schema. One that does not fit stays as written, for your own checks to catch.
 - A stream holds back text that might be a call until it is one or clearly is not, so markup never reaches a client as content. A call is sent once it has been read whole, as one delta with the id and name and one with the arguments, so arguments do not arrive token by token.
 - Replies with tools work through lanes, followers, and failover like any others.
+- One request can carry tools and [images](#vision) together, on a model that can see. This has run on a real model with one request: a tool, an image, and `tool_choice: "required"`, on Qwen3.5-0.8B with its projector, which gave a call.
 
 `tool_choice` sets what the model must do:
 
@@ -1041,7 +1060,7 @@ On two nodes on one machine, the same loop ran through the coordinator, a follow
 | `draft_model` | `auto` | A GGUF id, `auto`, or `none` |
 | `draft_tokens` | 6 | Most guesses per pass, 1 to 16 |
 | `merge_passes` | `true` | Let conversations share a pass |
-| `model_hashes` | None | The contents of a `isharded model hash` file |
+| `model_hashes` | None | The contents of an `isharded model hash` file |
 | `embedding` | `false` | This is an embedding model. See [Embeddings](#embeddings) |
 | `mmproj` | None | A projector GGUF for images. See [Vision](#vision) |
 | `reuse_cached`, `peer_fetch` | Pool default | Weigh cached shards, and copy from peers |
@@ -1061,8 +1080,10 @@ On two nodes on one machine, the same loop ran through the coordinator, a follow
 | 411 | The request has no length |
 | 413 | The request is too large |
 | 415 | A `/mcp` request that is not `application/json` |
+| 422 | A field is missing or out of range, or a lane's name is not allowed |
 | 426 | A node is on a different protocol version. Upgrade it |
 | 429 | A key's rate limit, or too many replies waiting. `Retry-After` says when |
+| 500 | A load failed in a way nothing expected. The message says how |
 | 502 | A stage could not process this request |
 | 503 | No coordinator yet, or a stage restarting. Try again shortly |
 | 507 | The model does not fit in the pool |
@@ -1096,7 +1117,7 @@ Each tool is a call to the node's own API with your key, so a reply reached this
 - `/mcp` replies are chunked, with no `Content-Length`. AVG's network filter corrupts any reply that has one to a request that looks like MCP, even on loopback, so that no client can read it.
 - Resources, prompts, and subscriptions are not offered.
 
-The official `mcp` Python package, version 2.3.0, has used this as a client in both eras, over both stdio and HTTP. In the current era that included a reply from a real model.
+The official `mcp` Python package, version 2.3.0, has used this as a client in both eras, over both stdio and HTTP. In the current era that included a reply from a real model. `chat` with an image and `embed` have each answered from a real model over HTTP, sent by a plain client in the older era.
 
 ### MCP tools for models on the mesh
 
@@ -1157,7 +1178,7 @@ The Windows ROCm release of llama.cpp leaves out `hipblas.dll`. iSharded finds i
 
 A trip through the pipeline costs nearly the same whether it carries one token or six, so the entry worker runs a small draft model that guesses ahead, and the real model checks every guess in one pass. Each pass yields the guesses that held, plus one more token.
 
-For `qwen35` models the draft is chosen automatically (`Qwen3.5-0.8B`, which shares their vocabulary). Name another with `--draft`, or turn this off with `--no-draft`. A named draft must have the same vocabulary as the model, and a draft that cannot load leaves the model running without one.
+For `qwen35` and `qwen35moe` models the draft is chosen automatically (`Qwen3.5-0.8B`, which shares their vocabulary). Name another with `--draft`, or turn this off with `--no-draft`. A named draft must have the same vocabulary as the model, and a draft that cannot load leaves the model running without one.
 
 The number of guesses adapts as a reply goes, up to `draft_tokens`, because code rewards long guesses and open-ended prose does not. Sampling keeps the model's distribution exactly: a guess `g` is accepted with probability `q(g)`, and a rejection draws from `q` with `g` removed. At temperature 0, batched arithmetic rounds slightly differently from single-token arithmetic, so output can differ from a run without a draft where two tokens are nearly tied.
 
@@ -1198,11 +1219,11 @@ To check every byte against a list you trust, see [Models in the security guide]
 `POST /v1/embeddings` takes OpenAI's request and runs a GGUF embedding model on llama.cpp, behind the same keys and rate limits as chat. Load one with `--embedding`, in a lane or as the main model:
 
 ```bash
-isharded load Qwen3-Embedding-0.6B-Q8_0.gguf --lane vectors --embedding --url http://node-a:8669
+isharded load Qwen3-Embedding-0.6B-Q8_0.gguf --lane vectors --embedding --url http://node-a:8209
 ```
 
 ```bash
-curl http://node-a:8669/v1/embeddings -H "Authorization: Bearer KEY" -H "Content-Type: application/json" \
+curl http://node-a:8209/v1/embeddings -H "Authorization: Bearer KEY" -H "Content-Type: application/json" \
   -d '{"model": "Qwen3-Embedding-0.6B-Q8_0.gguf", "input": ["first text", "second text"]}'
 ```
 
@@ -1224,6 +1245,7 @@ The reply holds one `embedding` per input, in order, and `usage` counts `prompt_
 - A chat model asked for embeddings, and an embedding model asked to chat, both get a 400 that says so.
 - `GET /v1/models` gives each model a `kind` of `chat` or `embedding`, and `dimensions` for an embedding model. The chat page leaves embedding models out of its picker.
 - On a stage with no GPU layers, embedding mode turns off llama.cpp's operation offload. Left on, it took 1.2 GiB of VRAM on a node given no GPU, at the default 4096 tokens of context.
+- MCP clients get the same vectors, one text at a time, from the [`embed` tool](#the-mesh-as-an-mcp-server).
 
 Measured with Qwen3-Embedding-0.6B Q8_0 on four CPU threads, on a machine busy with other jobs. The reference is `llama-server --embedding --pooling last --no-op-offload`, because the release has no `llama-embedding`.
 
@@ -1245,7 +1267,7 @@ An embedding model has not been run on a GPU stage, or anywhere but Windows. BER
 Load a model with its projector, and `/v1/chat/completions` takes images:
 
 ```bash
-isharded load Qwen3.5-0.8B-Q8_0.gguf --mmproj mmproj-Qwen3.5-0.8B-BF16.gguf --url http://node-a:8669
+isharded load Qwen3.5-0.8B-Q8_0.gguf --mmproj mmproj-Qwen3.5-0.8B-BF16.gguf --url http://node-a:8209
 ```
 
 Send OpenAI's `image_url` parts in a user message, as data URLs:
@@ -1266,6 +1288,7 @@ The chat page shows **Add image** when the chosen model can see, and `GET /v1/mo
 - An image counts for its rows, in `usage` and against `--context-tokens`: 256 rows at 512 by 512, and about 1,900 at 1600 by 1200. Too many rows for the context is a 400, before anything is encoded.
 - An image is part of the conversation's prefix. Its rows stand in the prompt as numbers taken from a SHA-256 of the file, so a different image can never reuse a saved state, and the same image is not read again.
 - A reply with images does not use a draft model, because a draft reads only text. Replies with no images still do.
+- A request with images can also offer [tools](#tool-calling), and MCP clients can send one image through the [`chat` tool](#the-mesh-as-an-mcp-server).
 
 | Limit | Value |
 |---|---|
@@ -1295,6 +1318,32 @@ Measured with Qwen3.5-0.8B Q8_0 and its BF16 projector on four CPU threads, on t
 How well a 0.8B model sees: with thinking off it says `red` and `3`, both right, and reads HELLO as `HLO`, which is wrong. `llama-mtmd-cli` gives the same three answers, so that is the model. Two images in one request were counted correctly. Treat it as a proof that the pipeline works, not as a model to rely on for reading text.
 
 A GPU has not encoded an image, vision has not crossed a real network, and it has run only on Windows. A file that really crashes the decoder has not been tried: the restart was tested by killing the process while idle, and the refusal with a fake one.
+
+## The assistant
+
+`isharded assistant` is a persistent assistant that each person runs for themselves. It remembers, searches folders you authorize, runs durable tasks, learns tested skills, and uses tools only under grants you give it. It can also work with another owner's install, by agreement.
+
+It is a separate process. A mesh is one of its model providers, reached through the OpenAI-shaped API, and any OpenAI-compatible server will do instead. So the mesh never depends on it, and a person's memories never live on the mesh.
+
+Add a mesh, and talk to it. The key file can be `admin.key` in the folder `isharded up` uses:
+
+```bash
+isharded assistant provider add mesh http://127.0.0.1:8209 --mesh --key-file ADMIN_KEY_FILE
+```
+
+```bash
+isharded assistant say "My name is Sam and I keep bees on my roof."
+```
+
+Until you grant something, it can only talk. A grant says who, what, and how far:
+
+```bash
+isharded assistant grant add files.read NOTES_FOLDER
+```
+
+`isharded assistant serve` runs its own web page and OpenAI-shaped API at `http://127.0.0.1:8470`, with a key for each person. It stays on loopback unless told otherwise.
+
+Treat it as early. No model larger than Qwen3-0.6B has been through it, and one that small cannot be trusted to use a tool, or to say when it did not: each time it skipped reading a file, it said it had read it and made up what was inside. The `used` line at the end of a reply shows which tools really ran. Federation has run only between two installs on one machine. [The assistant's guide](docs/ASSISTANT.md) is the full manual, and says what is not built or proven.
 
 ## Memory and placement
 
@@ -1373,7 +1422,7 @@ The full guide is [iSharded security](docs/SECURITY.md).
 |---|---|
 | Closed network, no internet | Put GGUF files on any node with `--gguf-dir` and load by file name. Give each node a llama.cpp build with `--llama-dir`, because automatic downloads need GitHub |
 | LAN | Use TLS, or pass `--trusted-network` if nobody else can read the network. Without either, a node refuses to start, because credentials would cross the LAN unencrypted |
-| VLANs | As for a LAN. Discovery does not use broadcast, so `--join` works across VLANs. Open the control port and worker ports between them |
+| VLANs | As for a LAN. `--join` names a node directly, so it works across VLANs. The search `isharded up` makes on a LAN is a broadcast, which stays on one, so use an invite there. Open the control port and worker ports between them |
 | Tailscale | Nothing special. Links are encrypted, and addresses work from anywhere on the tailnet. Restrict the ports to pool members with tailnet grants |
 | Remote machines over the internet | Use a pool authority and TLS on every node. Expect each extra stage to cost the round trip between those machines |
 
@@ -1407,7 +1456,11 @@ isharded audit --url http://node-a:8209
 
 With two routes, a disagreement says something is wrong without saying where. With three or more, the route out of line with the others is named, along with the machines it runs on. What you do about that is yours: cordon or revoke it in an owned network, or `isharded net block` it for your own node in one nobody owns.
 
+Agreement is how far two replies run together word by word, as a share of the shorter one, and the median across the questions. Under 50% counts as disagreeing, because hardware rounds differently and honest routes can part at a close call. The last result is in `/admin/status` as `last_audit`, and a disagreement also shows in the dashboard's events.
+
 The questions are made up and look like ordinary chat, so nobody's real words travel anywhere extra, and a node cannot easily tell it is being tested. This is a smoke alarm, not a proof. It catches a stage that is broken, or that tampers with what it handles. It does not catch one that behaves whenever it might be watched, or that only touches certain topics. It costs a second copy of the model, which a large mesh can spare and a small one may not.
+
+Measured on three nodes on one Linux machine, each route on its own node, with Qwen3-0.6B Q8_0 and 6 questions. Honest routes agreed 100%. With one node tampering with its logits, its route agreed 1% with the others, and it was named along with its node. All 13 checks of that run passed. Every route ran on the same machine, so this does not show how far honest routes part on different hardware.
 
 ## Running a pool
 
@@ -1431,6 +1484,8 @@ The full guide is [Operating iSharded](docs/OPERATIONS.md).
 | Node log | `--log-file` | Nothing is kept unless you set this |
 | Fetched shards | `--cache-dir` | Evicted past `--cache-budget-gb` |
 | Stage files | Inside the cache | Rebuilt from shards when a stage moves. Count double the node's share |
+
+A node started with `isharded up` keeps its route state, keys, and audit log in its own folder instead, along with its log, `node.log`.
 
 **Metrics.** `/metrics` serves Prometheus format on every node, to an admin key. All names start with `isharded_`.
 
@@ -1486,6 +1541,15 @@ The full guide is [Operating iSharded](docs/OPERATIONS.md).
 | A model answers without calling a tool | `auto` leaves that to the model | Send `tool_choice: "required"` |
 | `isharded mcp run` says `Refused`, with no question | There is no terminal to ask at | Name the tool with `--allow` |
 | An MCP server cannot find a key or setting | Servers see only a short list of environment variables | Pass it with `--pass-env` |
+| `isharded up --model` says `Could not load`, and `this needs the member role` | An invited machine holds a user key, and loading needs an admin key | Load it from the owner's machine |
+| `checking needs two routes` | `isharded audit` found one route for that model | Load another with `--lane NAME --lane-apart` |
+| Nodes on one Windows machine all lose contact at once | An antivirus network filter may be stalling loopback HTTP | See [below](#nodes-on-one-windows-machine-failing-together) |
+
+### Nodes on one Windows machine failing together
+
+An antivirus network filter can stall loopback HTTP when many local processes connect. Measured with AVG on Windows 11: an idle local server took up to 20 s to answer, on a 10 s grid, while CPU stayed under 80% and a 1 s timer never slipped past 1.4 s. Nodes on that machine all "lost contact" at once, and the same test on Linux showed no reply over 0.18 s.
+
+So several nodes on one Windows machine with such a filter can look like they are failing together. Between machines it was not seen.
 
 ## Measured performance
 
@@ -1521,7 +1585,9 @@ python -m pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-Adapter tests compare every family with the reference `transformers` implementation, and skip families newer than the installed release, so run them under a current `transformers` as well. TLS tests skip on a machine where antivirus intercepts loopback. `tests/test_readme.py` fails if an option, setting, endpoint, or metric is missing from this file. `tests/test_mcp.py` also tries the official `mcp` package when `ISHARDED_TEST_MCP_PYTHON` names a Python that has it, and uses port 9531.
+The last full run, on Windows, passed 3,461 tests and skipped 23, with real models for text, embeddings, and vision.
+
+Adapter tests compare every family with the reference `transformers` implementation, and skip families newer than the installed release, so run them under a current `transformers` as well. TLS tests skip on a machine where antivirus intercepts loopback. `tests/test_readme.py` fails if an option, setting, endpoint, or metric is missing from this file, and `tests/test_assistant_docs.py` does the same for the assistant's guide. `tests/test_mcp.py` also tries the official `mcp` package when `ISHARDED_TEST_MCP_PYTHON` names a Python that has it, and uses port 9531.
 
 `scripts/ci_local.sh` runs what CI runs from a clean clone, which catches anything only your machine has.
 
@@ -1536,6 +1602,7 @@ Adapter tests compare every family with the reference `transformers` implementat
 
 | Code | What it holds |
 |---|---|
+| `isharded/cli.py` | The `isharded` command |
 | `isharded/orchestrator.py` | The control plane: API, planning, repair, gossip handling |
 | `isharded/worker.py` | A worker: stages, the token loop, merged passes, fetching |
 | `isharded/up.py`, `isharded/discovery.py` | One-command setup: settings, invites, finding a mesh, `doctor`, and `service` |
@@ -1543,24 +1610,32 @@ Adapter tests compare every family with the reference `transformers` implementat
 | `isharded/lanes.py` | Several models at once: the front door and each node's lanes |
 | `isharded/toolcalls.py` | Tool calling: what a template offers, and finding calls in replies |
 | `isharded/mcp_server.py`, `isharded/mcp_client.py` | The mesh as an MCP server, and the agent loop for `isharded mcp run` |
+| `isharded/embedding.py` | Packing text into embedding passes, and turning pooled output into vectors |
+| `isharded/vision.py`, `isharded/mtmd.py` | Images in chat, and the binding to llama.cpp's `mtmd` library |
 | `isharded/commons.py` | A network nobody owns: self-made identities, vouches, and each node's view |
 | `isharded/inventory.py`, `isharded/gpu_probe.py` | What a node reports about itself, and how it finds GPUs PyTorch cannot see |
 | `isharded/audit.py` | Comparing routes that serve the same model |
 | `isharded/mesh.py` | Membership and leader election, as pure logic |
 | `isharded/planner.py`, `isharded/memory.py` | Placement, and memory pool discovery |
+| `isharded/protocol.py`, `isharded/slots.py` | What nodes and clients send, and who gets a place in a pipeline |
+| `isharded/tokenizer.py` | Tokenizing and chat templates |
+| `isharded/serving.py` | The HTTP server's limits and diagnostics |
+| `isharded/models/` | Each model family's forward pass, for safetensors models, and the GGUF model description |
 | `isharded/gguf.py`, `isharded/gguf_stage.py`, `isharded/llamacpp.py`, `isharded/llama_host.py` | GGUF parsing, stage files, the llama.cpp binding, and the stage process |
 | `isharded/weights.py` | Readers, the unit cache, and hash checks |
 | `isharded/access.py`, `isharded/pool.py`, `isharded/tickets.py`, `isharded/tls.py` | Keys, certificates, signed entries, tickets, and TLS |
+| `isharded/chat.html`, `isharded/dashboard.html`, `isharded/ui.css` | The chat page and the dashboard |
+| `isharded/assistant/` | The assistant. [Its guide](docs/ASSISTANT.md) says which part does what |
 
 ## Current limits
 
 Trust and status:
 
-- Two machines is the most this has run on, so everything about larger meshes is design, not measurement. See [Scaling to many nodes](#scaling-to-many-nodes). The longest test ran under an hour. No human has audited it, and reviews by AI do not show it is free of flaws.
-- A node in the route can read prompts. It can return wrong answers too: [checking answers](#checking-answers) catches a route that disagrees with others, but not one that only misbehaves when it is not being tested. Certificates limit who is in a pool. They do not make a hostile member safe.
+- Two machines is the most this has run on, so everything about larger meshes is design, not measurement. Runs of three nodes were all on one machine. See [Scaling to many nodes](#scaling-to-many-nodes). The longest test ran under an hour. No human has audited it, and reviews by AI do not show it is free of flaws.
+- A node in the route can read prompts. It can return wrong answers too: [checking answers](#checking-answers) catches a route that disagrees with others, but not one that only misbehaves when it is not being tested, and it has been measured only with every route on one machine. Certificates limit who is in a pool. They do not make a hostile member safe.
 - An owned network has an owner.
-- A network nobody owns has run on three processes on one machine, not between strangers. Identities are free, so `--joining open` lets one person run many nodes, and a low name can be ground out to win coordination. A coordinator can stall a route. Traffic is not encrypted, so run it over a network that is, such as Tailscale. Use `--joining vouched` with a quorum unless you accept all of that.
-- Several models run in lanes with fixed memory shares. The main model's planner does not see a lane's memory, so moving layers after a failure can run a node short. Workers started with `--no-control` do not join lanes.
+- A network nobody owns passed 27 of 27 checks on real processes, but as three nodes on one machine, not between strangers. Identities are free, so `--joining open` lets one person run many nodes, and a low name can be ground out to win coordination. A coordinator can stall a route. Traffic is not encrypted, so run it over a network that is, such as Tailscale. Use `--joining vouched` with a quorum unless you accept all of that.
+- Several models run in lanes with fixed memory shares, and each lane adds two processes to a node. The main model's planner does not see a lane's memory, so moving layers after a failure can run a node short. Workers started with `--no-control` do not join lanes.
 - GitHub Actions has not run yet, because the account's jobs do not start. The same steps pass locally on Linux and Windows.
 - Linux has run real nodes on CPU only, in WSL. A Linux GPU, and macOS, have not been run at all, although their builds are pinned and download by themselves.
 - Adding a machine with an invite needs the owner's machine running at that moment. The mesh keeps working without it.

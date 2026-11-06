@@ -38,7 +38,7 @@ A node will not start on a network without protection. See `docs/SECURITY.md` fo
 |---|---|
 | Closed network, no internet | Put GGUF files on any node with `--gguf-dir`, and load by file name: `isharded load Qwen3.6-27B-Q4_K_M.gguf`. Give each node a llama.cpp build with `--llama-dir`, because automatic downloads need GitHub. |
 | LAN | Use TLS, or pass `--trusted-network` if nobody else can read the network. Without either a node refuses to start, because the pool token would cross the LAN unencrypted. |
-| VLANs | As for a LAN. Peers must be able to route to each other's ports. Discovery does not use broadcast, so `--join` works across VLANs. Open the control port and worker ports between them. |
+| VLANs | As for a LAN. Peers must be able to route to each other's ports. `--join` names a node directly, so it works across VLANs. The search `isharded up` makes on a LAN is a broadcast, which stays on one, so use an invite there. Open the control port and worker ports between them. |
 | Tailscale | Nothing special. Links are encrypted, and addresses work from anywhere on the tailnet. Add certificates with tickets for per-node identity. This works with antivirus intercepting TLS. |
 | Remote machines over the internet | Use a pool authority and TLS on every node (`--tls-cert`, `--tls-key`, `--ca-file`). Expect each extra stage to cost the round trip between those machines. |
 
@@ -73,13 +73,13 @@ A reply is lost when the node a client is connected to dies, because that node h
 To take a node out of service:
 
 ```bash
-isharded cordon node-b --url http://10.0.0.5:8000
+isharded cordon node-b --url http://10.0.0.5:8209
 ```
 
 Replies in progress finish, then the node's layers move to the rest of the pool. The node stays in the mesh and can still serve the API. When it is safe to work on, nothing in the route depends on it.
 
 ```bash
-isharded uncordon node-b --url http://10.0.0.5:8000
+isharded uncordon node-b --url http://10.0.0.5:8209
 ```
 
 This puts it back, and stops a move still under way. A cordon is shared by every node and survives restarts.
@@ -111,7 +111,7 @@ Failures, repairs, and leadership changes also go to each node's output with tim
 
 ## Several models
 
-Each [lane](../README.md#several-models-at-once) is a full control plane and set of workers, so everything here applies to a lane as it does to the main route, with two differences. Its ports are 1000 per lane above the node's own, so a firewall between nodes must allow them. Cordons pass to every lane, but `load`, `plan`, and rebalancing act on one route at a time.
+Each [lane](../README.md#several-models-at-once) is a full control plane and a worker on each node, so everything here applies to a lane as it does to the main route, with two differences. Its ports are 1000 per lane above the node's own, so a firewall between nodes must allow them. Cordons pass to every lane, but `load`, `plan`, and rebalancing act on one route at a time.
 
 A lane's memory share is fixed when it starts, from what each node had spare. To change it, remove the lane and load it again.
 
@@ -161,9 +161,9 @@ Metrics worth alerting on:
 
 | What | Default | Notes |
 |---|---|---|
-| Route state | `%LOCALAPPDATA%\iSharded\orchestrator-state.json` | Copied to every node by gossip. |
-| Audit log | `%LOCALAPPDATA%\iSharded\audit.jsonl` | Rotates at 64 MiB, keeping one old file. |
-| Node log | `--log-file` | Nothing is kept unless you set this. |
+| Route state | `orchestrator-state.json` in `%LOCALAPPDATA%\iSharded`, or `~/.cache/iSharded` off Windows | Copied to every node by gossip. |
+| Audit log | `audit.jsonl` in the same folder | Rotates at 64 MiB, keeping one old file. |
+| Node log | `--log-file` | Nothing is kept unless you set this. `isharded up` sets it to `node.log` in its folder. |
 | Fetched shards | `--cache-dir` | Evicted by age past `--cache-budget-gb`. |
 | Stage files | Inside the cache | Rebuilt from shards when a stage moves. Count double the node's share. |
 
