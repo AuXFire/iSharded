@@ -16,6 +16,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Iterator
+import contextlib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -686,6 +687,7 @@ class WorkerRuntime:
             request.embedding,
             request.projector.file if request.projector and stage.start_layer == 0 else None,
             request.prompt_cache,
+            request.kv_type,
         )
 
     async def hold_gate(self, seconds: float) -> bool:
@@ -721,7 +723,7 @@ class WorkerRuntime:
         """Everything that decides what a stage's saved state means."""
         stage = request.assignment
         return stage_namespace(
-            PINNED_BUILD, request.model_id, request.revision, stage.start_layer, stage.end_layer, request.speculate_tokens
+            PINNED_BUILD, request.model_id, request.revision, stage.start_layer, stage.end_layer, request.speculate_tokens, request.kv_type
         )
 
     def cache_report(self) -> dict[str, Any]:
@@ -779,22 +781,24 @@ class WorkerRuntime:
             if self.index_epoch == epoch:
                 return
 
-            async def listing(stage: StageAssignment) -> dict[str, dict[str, Any]]:
+            async def listing(stage: StageAssignment) -> dict[str, tuple[int, str, bool]]:
                 try:
                     if stage.worker_id == self.worker_id:
-                        return await asyncio.wait_for(self.restorable(), INDEX_SECONDS)
-                    response = await self.client.get(
-                        stage.url.rstrip("/") + "/internal/state/index", headers=auth_headers(self.pool_token), timeout=INDEX_SECONDS
-                    )
-                    response.raise_for_status()
-                    return {item["key"]: item for item in response.json()["states"]}
-                except (httpx.HTTPError, ValueError, KeyError, asyncio.TimeoutError):
+                        items = list((await asyncio.wait_for(self.restorable(), INDEX_SECONDS)).values())
+                    else:
+                        response = await self.client.get(
+                            stage.url.rstrip("/") + "/internal/state/index", headers=auth_headers(self.pool_token), timeout=INDEX_SECONDS
+                        )
+                        response.raise_for_status()
+                        items = response.json()["states"]
+                    return {str(item["key"]): (int(item["length"]), str(item["kind"]), bool(item.get("elsewhere"))) for item in items}
+                except (httpx.HTTPError, ValueError, KeyError, TypeError, asyncio.TimeoutError):
                     return {}
 
             listings = await asyncio.gather(*(listing(stage) for stage in self.route))
             for key in set.intersection(*(set(item) for item in listings)) if listings else ():
-                item = listings[0][key]
-                self.prefix.add(key, item["length"], item["kind"], any(found[key].get("elsewhere") for found in listings))
+                length, kind, _ = listings[0][key]
+                self.prefix.add(key, length, kind, any(found[key][2] for found in listings))
             self.index_epoch = epoch
 
     async def ensure_state(self, key: str) -> bool:
@@ -814,7 +818,7 @@ class WorkerRuntime:
                         self.fetched.add(key)
                         self.copies_fetched += 1
                         return True
-        except LlamaError:
+        except (LlamaError, OSError):
             pass  # a stage that cannot answer has nothing to restore, and a reread needs no help
         return False
 
@@ -837,7 +841,7 @@ class WorkerRuntime:
                 )
                 response.raise_for_status()
                 return bool(response.json()["ready"])
-            except (httpx.HTTPError, ValueError, KeyError):
+            except (httpx.HTTPError, ValueError, KeyError, TypeError):
                 return False
 
         try:
@@ -1781,7 +1785,8 @@ async def receive_copy(
             async for chunk in request.stream():
                 await asyncio.to_thread(handle.write, chunk)
     except (OSError, ClientDisconnect) as exc:
-        partial.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            partial.unlink(missing_ok=True)
         raise HTTPException(status_code=507, detail="this copy could not be kept") from exc
     if not await asyncio.to_thread(runtime.held.adopt, name, partial):
         raise HTTPException(status_code=400, detail="this copy does not match its checksum")
@@ -2062,7 +2067,10 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             use_draft = runtime.draft is not None and runtime.speculate_tokens and not body.images
             caching = runtime.gguf is not None and runtime.prompt_cache
             if caching:
-                await runtime.sync_index()
+                try:
+                    await runtime.sync_index()
+                except Exception as exc:  # noqa: BLE001 - this only saves work, so it must never cost a reply
+                    runtime.last_error = f"could not learn what the stages hold: {exc}"
             rows: PromptRows | None = None
             answered = False
             failure: Any = None
@@ -2070,7 +2078,12 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
                 # The last attempt reads the whole prompt, which depends on no state at all.
                 plan = plan_prompt(runtime.prefix, body.input_ids, body.cut_token, body.checkpoint_at, caching and attempt < PLAN_ATTEMPTS - 1)
                 if plan.key in runtime.prefix.elsewhere:
-                    if not await runtime.prepare_state(plan.key):
+                    try:
+                        ready = await runtime.prepare_state(plan.key)
+                    except Exception as exc:  # noqa: BLE001 - as above: a reread needs none of this
+                        runtime.last_error = f"could not fetch a saved state: {exc}"
+                        ready = False
+                    if not ready:
                         runtime.prefix.drop(plan.key)
                         runtime.state_misses += 1
                         continue

@@ -105,13 +105,13 @@ def pass_ends(cuts: list[int], total: int) -> list[int]:
     return [end for end in ends if end < total]
 
 
-def stage_namespace(build: str, model_id: str, revision: str, start: int, end: int, rollback_tokens: int) -> str:
+def stage_namespace(build: str, model_id: str, revision: str, start: int, end: int, rollback_tokens: int, kv_type: str) -> str:
     """What a stage's states belong to. Anything that changes their meaning must be in here.
 
     A node works this out for any stage, which is how a copy finds its way to whoever
     takes over those layers. For a GGUF, the revision is a fingerprint of the file.
     """
-    parts = [FORMAT, build, model_id, revision, start, end, rollback_tokens]
+    parts = [FORMAT, PASS_ROWS, CUT_LEAST, build, model_id, revision, start, end, rollback_tokens, kv_type]
     return hashlib.sha256(json.dumps(parts).encode()).hexdigest()[:24]
 
 
@@ -136,12 +136,14 @@ class StateStore:
         self.ram_bytes = max(0, ram_bytes)
         self.disk_bytes = max(0, disk_bytes) if self.folder else 0
         self.entries: OrderedDict[str, Entry] = OrderedDict()
+        self.leftovers: set[Path] = set()
         self.lock = threading.RLock()
         self.saved = 0
         self.saved_bytes = 0
         self.evicted = 0
         self.refused = 0
         self.damaged = 0
+        self.write_failures = 0
         self.writes: queue.Queue[str | None] = queue.Queue()
         self.writer: threading.Thread | None = None
         if self.folder is not None:
@@ -155,13 +157,29 @@ class StateStore:
         assert self.folder is not None
         return self.folder / (key + SUFFIX)
 
+    def _remove(self, path: Path) -> None:
+        """Delete a file, now or later. This must never fail the reply that asked.
+
+        Windows will not delete a file another process has open, and a copy on its
+        way to another node keeps one open for as long as the link takes.
+        """
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            self.leftovers.add(path)
+
+    def _clear_leftovers(self) -> None:
+        for path in list(self.leftovers):
+            self.leftovers.discard(path)
+            self._remove(path)
+
     def _scan(self) -> None:
         """Pick up what an earlier process left, oldest first so age order survives."""
         assert self.folder is not None
         found: list[tuple[float, str, Entry]] = []
         for path in self.folder.iterdir():
             if path.suffix == PARTIAL:
-                path.unlink(missing_ok=True)  # that process stopped in the middle of writing it
+                self._remove(path)  # that process stopped in the middle of writing it
                 continue
             if path.suffix != SUFFIX:
                 continue
@@ -171,7 +189,7 @@ class StateStore:
                 found.append((path.stat().st_mtime, path.stem, Entry(header["length"], header["size"], header["kind"], on_disk=True)))
             except (OSError, ValueError, KeyError):
                 self.damaged += 1
-                path.unlink(missing_ok=True)
+                self._remove(path)
         for _, key, entry in sorted(found, key=lambda item: item[0]):
             self.entries[key] = entry
         self._shed_disk()
@@ -196,6 +214,8 @@ class StateStore:
                 if key is None:
                     return
                 self._write(key)
+            except Exception:  # noqa: BLE001 - this thread is all that writes, so it has to outlive one bad state
+                self.write_failures += 1
             finally:
                 self.writes.task_done()
 
@@ -215,12 +235,12 @@ class StateStore:
                 handle.write(memoryview(data))
             partial.replace(target)
         except OSError:
-            partial.unlink(missing_ok=True)
+            self._remove(partial)
             return  # still in RAM, and a full disk must not stop anything
         with self.lock:
             current = self.entries.get(key)
             if current is None:
-                target.unlink(missing_ok=True)  # dropped while it was being written
+                self._remove(target)  # dropped while it was being written
                 return
             current.on_disk = True
             self._shed_disk()
@@ -247,12 +267,13 @@ class StateStore:
     def _shed_disk(self) -> None:
         if self.folder is None:
             return
+        self._clear_leftovers()
         used = sum(entry.size for entry in self.entries.values() if entry.on_disk)
         for key, entry in list(self.entries.items()):
             if used <= self.disk_bytes:
                 return
             if entry.on_disk:
-                self._file(key).unlink(missing_ok=True)
+                self._remove(self._file(key))
                 entry.on_disk = False
                 used -= entry.size
                 if entry.data is None:
@@ -272,6 +293,7 @@ class StateStore:
             self.saved += 1
             self.saved_bytes += int(data.size)
             if self.folder is not None and data.size <= self.disk_bytes:
+                self.leftovers.discard(self._file(key))  # that name is about to mean this state
                 self.writes.put(key)
             self._shed_ram()
         return True
@@ -311,7 +333,7 @@ class StateStore:
     def adopt(self, key: str, path: Path) -> bool:
         """Take over a state file that arrived from another node. False if it is no good."""
         if self.folder is None:
-            path.unlink(missing_ok=True)
+            self._remove(path)
             return False
         try:
             with path.open("rb") as handle:
@@ -328,7 +350,7 @@ class StateStore:
             return True
         except (OSError, ValueError, KeyError, TypeError):
             self.damaged += 1
-            path.unlink(missing_ok=True)
+            self._remove(path)
             return False
 
     def file_of(self, key: str) -> Path | None:
@@ -345,7 +367,7 @@ class StateStore:
         with self.lock:
             entry = self.entries.pop(key, None)
             if entry is not None and entry.on_disk:
-                self._file(key).unlink(missing_ok=True)
+                self._remove(self._file(key))
 
     def wipe(self) -> None:
         """Forget everything, which is what a change of model calls for."""
@@ -371,6 +393,7 @@ class StateStore:
             "evicted": self.evicted,
             "refused": self.refused,
             "damaged": self.damaged,
+            "write_failures": self.write_failures,
         }
 
     def flush(self, seconds: float = FLUSH_SECONDS) -> bool:

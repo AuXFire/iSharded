@@ -88,6 +88,9 @@ class ModelParams(C.Structure):
 
 LOAD_READ = 0
 EVAL_CALLBACK = C.CFUNCTYPE(C.c_bool, C.c_void_p, C.c_bool, C.c_void_p)
+# What a stage can keep attention KV in: the ggml type, and bytes for 32 values.
+KV_TYPES = {"f16": (1, 64), "q8_0": (8, 34)}
+FLASH_ATTENTION_ON = 1
 
 
 class ContextParams(C.Structure):
@@ -527,6 +530,7 @@ class LlamaStage:
         unified_cache: bool = False,
         map_file: bool = True,
         embedding: bool = False,
+        kv_type: str = "f16",
     ) -> None:
         self.library = library
         self.last = last
@@ -569,6 +573,9 @@ class LlamaStage:
         context.n_threads_batch = threads
         context.no_perf = True
         context.kv_unified = unified_cache
+        context.type_k = context.type_v = KV_TYPES[kv_type][0]
+        if kv_type != "f16":
+            context.flash_attn_type = FLASH_ATTENTION_ON  # llama.cpp needs it for a quantized V
         if embedding:
             # A sequence split across micro-batches would pool only its last part,
             # so one micro-batch holds the longest input the context allows.

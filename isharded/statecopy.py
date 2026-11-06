@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
+import contextlib
 import logging
 from pathlib import Path
 import time
@@ -144,5 +145,6 @@ async def fetch_file(client: httpx.AsyncClient, url: str, target: Path, headers:
                     await asyncio.to_thread(handle.write, chunk)
         return True
     except (httpx.HTTPError, OSError):
-        target.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            target.unlink(missing_ok=True)
         return False

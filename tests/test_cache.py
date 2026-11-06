@@ -14,9 +14,9 @@ import pytest
 
 from isharded import worker
 from isharded.gguf_stage import plan_prompt
-from isharded.llamacpp import PINNED_BUILD, LlamaError, StageLost
+from isharded.llamacpp import KV_TYPES, PINNED_BUILD, LlamaError, StageLost
 from isharded.orchestrator import Orchestrator
-from isharded.protocol import GenerateRequest, InferRequest, SavePoint
+from isharded.protocol import GenerateRequest, InferRequest, LoadModelRequest, SavePoint
 from isharded.statestore import (
     CUT_LEAST,
     HISTORY,
@@ -342,6 +342,31 @@ def test_a_copy_nobody_can_fetch_costs_a_replay_and_not_the_reply(monkeypatch):
     assert runtime.state_misses == 1
 
 
+@pytest.mark.parametrize("failing", ["sync_index", "prepare_state"])
+def test_nothing_about_the_cache_can_cost_a_reply(monkeypatch, failing):
+    """Reuse only ever saves work. Whatever breaks in it, the prompt can still be read."""
+    prompt = chat(200, 100, 10)
+    key = prefix_key(prompt[:300])
+    runtime = fake_entry(monkeypatch, [{"token_id": 5}])
+    runtime.prefix.add(key, 300, HISTORY, elsewhere=True)
+
+    async def broken(*args):
+        raise RuntimeError("something nobody thought of")
+
+    setattr(runtime, failing, broken)
+    assert generate(prompt) == [{"token_id": 5}]
+    assert "something nobody thought of" in runtime.last_error
+
+
+def test_a_peer_answering_nonsense_is_treated_as_holding_nothing(tmp_path):
+    def handler(request):
+        return httpx.Response(200, json={"states": [{"no": "fields"}, 7]})
+
+    runtime = entry_runtime(tmp_path, handler, ["w1", "w2"], held=["both"])
+    asyncio.run(runtime.sync_index())
+    assert not runtime.prefix.entries
+
+
 def test_a_state_held_here_needs_no_fetching(monkeypatch):
     prompt = chat(200, 100, 10)
     runtime = fake_entry(monkeypatch, [{"token_id": 5}])
@@ -555,8 +580,8 @@ def test_nodes_that_are_down_keep_no_copies():
 def test_both_ends_agree_on_what_a_store_is_called():
     """A copy is found by this name, worked out separately by a control plane and a worker."""
     stage = SimpleNamespace(start_layer=14, end_layer=28)
-    request = SimpleNamespace(model_id="m", revision="r", speculate_tokens=2, assignment=stage)
-    assert worker.WorkerRuntime.state_namespace(request) == stage_namespace(PINNED_BUILD, "m", "r", 14, 28, 2)
+    request = SimpleNamespace(model_id="m", revision="r", speculate_tokens=2, assignment=stage, kv_type="q8_0")
+    assert worker.WorkerRuntime.state_namespace(request) == stage_namespace(PINNED_BUILD, "m", "r", 14, 28, 2, "q8_0")
 
 
 def test_prompt_rows_never_merge_with_other_conversations():
@@ -579,7 +604,7 @@ MODEL = os.environ.get("ISHARDED_TEST_GGUF", "")
 needs_real_model = pytest.mark.skipif(not (BUILD and MODEL), reason="set ISHARDED_TEST_LLAMA_DIR and ISHARDED_TEST_GGUF")
 
 
-def start_stage(folder=None, ram=1024**3, disk=0):
+def start_stage(folder=None, ram=1024**3, disk=0, kv_type="f16"):
     # A stage process of its own, because this test process has imported torch.
     from isharded.gguf import read_file_header
     from isharded.llama_host import StageHost
@@ -590,7 +615,7 @@ def start_stage(folder=None, ram=1024**3, disk=0):
     host = StageHost()
     host.call(
         "load", folder=BUILD, extra_paths=[], path=MODEL, last=True, context_tokens=2048, gpu_layers=0, threads=2, table=embed,
-        cpu_tensors=[], slots=3, state_dir=None if folder is None else str(folder), state_ram_bytes=ram, state_disk_bytes=disk,
+        cpu_tensors=[], slots=3, state_dir=None if folder is None else str(folder), state_ram_bytes=ram, state_disk_bytes=disk, kv_type=kv_type,
     )
     return host
 
@@ -727,9 +752,9 @@ def test_a_false_state_fails_cleanly_and_harms_nothing_else(tmp_path, seed):
         stage.close()
 
 
-def request_for(start=0, end=14, model="m", revision="r", speculate=0):
+def request_for(start=0, end=14, model="m", revision="r", speculate=0, kv_type="f16"):
     return SimpleNamespace(
-        model_id=model, revision=revision, speculate_tokens=speculate, assignment=SimpleNamespace(start_layer=start, end_layer=end)
+        model_id=model, revision=revision, speculate_tokens=speculate, kv_type=kv_type, assignment=SimpleNamespace(start_layer=start, end_layer=end)
     )
 
 
@@ -741,10 +766,34 @@ def request_for(start=0, end=14, model="m", revision="r", speculate=0):
         request_for(model="another"),
         request_for(revision="another"),
         request_for(speculate=4),
+        request_for(kv_type="q8_0"),
     ],
 )
 def test_a_state_is_tied_to_its_model_and_layers(other):
     assert worker.WorkerRuntime.state_namespace(request_for()) != worker.WorkerRuntime.state_namespace(other)
+
+
+def test_8_bit_kv_is_planned_at_what_it_really_takes():
+    """Bytes for 32 values, so the planner does not reserve memory it will never use."""
+    assert KV_TYPES["q8_0"][1] / KV_TYPES["f16"][1] == pytest.approx(0.53, abs=0.01)
+
+
+def test_a_kv_type_nobody_supports_is_refused_at_the_door():
+    with pytest.raises(ValueError):
+        LoadModelRequest(kv_type="q4_0")
+
+
+@needs_real_model
+def test_a_state_saved_in_8_bits_restores_in_8_bits(tmp_path):
+    stage = start_stage(kv_type="q8_0")
+    try:
+        tokens = tokens_for_test()
+        expected = run(stage, tokens, cuts=[700], saves=[save_at(700, "history")])
+        stage.call("clear", slot=0)
+        stage.call("restore", key="history", slot=1)
+        assert np.array_equal(run(stage, tokens, start=700, slot=1), expected)
+    finally:
+        stage.close()
 
 
 def test_the_same_stage_finds_its_states_again():

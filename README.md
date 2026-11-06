@@ -516,7 +516,7 @@ With real processes, as three nodes on one machine started with `isharded node`,
 | `--weights-disk-gb` | 0 unless a model truly cannot fit otherwise | Disk is far slower than RAM |
 | `--cache-dir` | A fast SSD with room for twice the node's share | Units and stage files both live there |
 | `--cache-budget-gb` | Set it on a small disk | Evicts old models past this size |
-| `--ram-budget-gb` | 0 for GGUF hybrid models, a few GB otherwise | KV checkpoints speed up recovery where a model supports them. Hybrid Qwen models replay instead |
+| `--ram-budget-gb` | 0 for GGUF models, a few GB otherwise | KV checkpoints speed up recovery for PyTorch models. GGUF stages keep their own saved states, and a node with this set is the first choice to hold copies of them, on its disk |
 | `--log-file` | Always | Nothing is kept otherwise |
 | `--gguf-dir` | Point it at LM Studio's or your own model folder | Files there are read locally, not downloaded |
 
@@ -716,6 +716,7 @@ Loads a model on a running pool and shows progress. `model` is any [model id](#l
 | `--no-draft` | Off | Turn speculative decoding off |
 | `--no-merge-passes` | Off | Make conversations take turns on each stage |
 | `--no-prompt-cache` | Off | Read every prompt in full instead of reusing saved states. See [Conversation reuse](#conversation-reuse) |
+| `--kv-type` | `f16` | How a GGUF model keeps attention KV. `q8_0` takes about half the memory. See [Conversation reuse](#conversation-reuse) |
 | `--hashes` | None | File from `isharded model hash`. Every node checks every unit against it |
 | `--no-reuse-cached` | Off | Plan as if no worker held any shards |
 | `--no-peer-fetch` | Off | Download every shard from the model host |
@@ -1081,6 +1082,7 @@ On two nodes on one machine, the same loop ran through the coordinator, a follow
 | `draft_tokens` | 6 | Most guesses per pass, 1 to 16 |
 | `merge_passes` | `true` | Let conversations share a pass |
 | `prompt_cache` | `true` | Reuse saved prompt states |
+| `kv_type` | `f16` | How a GGUF model keeps attention KV: `f16` or `q8_0` |
 | `model_hashes` | None | The contents of an `isharded model hash` file |
 | `embedding` | `false` | This is an embedding model. See [Embeddings](#embeddings) |
 | `mmproj` | None | A projector GGUF for images. See [Vision](#vision) |
@@ -1211,7 +1213,18 @@ A state holds attention and recurrent state alike, so this works on hybrid model
 
 Prompts are cut into passes at the same places whether or not anything is cached, because where a prompt is cut changes the arithmetic. A cut falls before each turn, at least 64 tokens after the last one. That is what makes a reply at temperature 0 the same with the cache on or off. Replies running at once share passes in whatever order they arrive, so this holds for replies one at a time. Two conversations that start together each compute what they share, since neither has saved it yet.
 
-`--no-prompt-cache` on a load turns this off.
+Each stage keeps its states in a bounded store: `--state-ram-gb` of RAM, then `--state-disk-gb` of disk, least recently used out first, for its own model and layers. Any sequence can take any state, so a conversation that was pushed out comes back from its state and does not reread its history. A state restored into a sequence is a copy, so this saves compute and not context memory.
+
+States also carry a conversation through failures, at the same places:
+
+- **A stage process crashes.** Its states are on disk, so the new process restores them. Only what came after the last saved place is read again.
+- **A node restarts.** The same, once it is back with its disk.
+- **A node is lost.** Each stage sends one copy of each state to one other machine, in the background, at `--state-copy-mb`. A spare that takes over those layers fetches the copy and carries on. Only that stage moves: the others stay as they are.
+- **The survivors have to split the layers differently.** A state is only good for the layers it came from, so no copy applies, and the prompt is read in full.
+
+Nothing waits for a copy. A newer turn replaces one still queued, so a slow link falls behind and does not back up. A copy that is missing, late, or damaged means reading the prompt, so the worst case is the cost of having no cache. Copies are full states, and sending less is not built. States under 256 tokens are not copied, because reading them again costs less.
+
+`--no-prompt-cache` on a load turns all of this off. `--kv-type q8_0` keeps attention KV in 8 bits.
 
 ### Several conversations at once
 
@@ -1694,7 +1707,12 @@ Behavior:
 - Outside embedding mode, llama.cpp's operation offload stays on, so a stage with no GPU layers may still use a GPU the build can reach for prompts of 32 tokens or more.
 - The planner uses measured memory bandwidth and a fixed cost per network hop, but not per-layer benchmarks or pairwise network telemetry. Its disk estimate assumes cold reads, so warm runs beat it.
 - Workers on one host split shared RAM evenly during planning, which can refuse a plan an uneven split would allow.
-- There is one active RAM checkpoint service per route. Snapshots are not yet replicated or compressed. If the store is behind when a stage fails, recovery replays the prompt.
+- There is one active RAM checkpoint service per route, for PyTorch models. Snapshots are not yet replicated or compressed. If the store is behind when a stage fails, recovery replays the prompt.
+- A saved state is only good for the layers it came from. If a node is lost with no spare, the survivors split the layers differently and the prompt is read in full, with or without copies.
+- A different split of the layers can change a near-tie at temperature 0, because rows round to BF16 at each stage boundary. So a reply is the same with the cache on or off for a given split, and not across splits.
+- A reply that recovers from a failure reads the tokens it already generated as prompt rows, which round differently from the first time. So the rest of a recovered reply can differ at a near-tie, with or without the cache.
+- Copies of saved states are sent whole on every turn, so a long conversation on a slow link falls behind. Recovery then uses an older state, or none.
+- Saved states are not deleted when a conversation ends, and are stored unencrypted. See [the security notes](docs/SECURITY.md#saved-conversations).
 - With two nodes, a split network leaves two coordinators until it heals. Nothing can be corrupted, but neither side can know it is the minority.
 - A reply is lost if the node its client is connected to dies.
 - Mesh membership is meant for tens of nodes: every worker checks in with every control plane.

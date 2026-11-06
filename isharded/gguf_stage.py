@@ -161,6 +161,7 @@ class GgufStage:
             "slots": request.slots,
             "map_file": needs_mapping(placements, pools),
             "embedding": request.embedding,
+            "kv_type": request.kv_type,
             "state_dir": None if state_folder is None else str(state_folder),
             "state_ram_bytes": state_ram_bytes,
             "state_disk_bytes": state_disk_bytes,

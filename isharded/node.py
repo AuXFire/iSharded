@@ -398,7 +398,8 @@ def node_specs(args: argparse.Namespace) -> list[tuple[str, list[str]]]:
                     port,
                     "cpu",
                     "kv-cache,checkpoint",
-                    ["--ram-budget-gb", str(args.ram_budget_gb)],
+                    # It keeps copies of saved states too, in the same places as any worker here.
+                    ["--ram-budget-gb", str(args.ram_budget_gb), *cache_flags],
                 ),
             )
         )

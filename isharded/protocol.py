@@ -141,6 +141,7 @@ ModelFile = Annotated[str, AfterValidator(_file_in_folder)]
 GgufFile = Annotated[str, AfterValidator(_gguf_file)]
 # torch and numpy refuse anything wider, and a refused seed must not look like a dead node.
 Seed = Annotated[int, Field(ge=0, lt=2**63)]
+KvType = Literal["f16", "q8_0"]
 # Below this, sampling overflows. Nobody can tell it from greedy anyway.
 Temperature = Annotated[float, Field(ge=0.0, le=5.0), AfterValidator(lambda value: 0.0 if value < 1e-3 else value)]
 
@@ -237,6 +238,7 @@ class ConfigureRequest(BaseModel):
     projector: DraftModel | None = None
     # Save and reuse prompt states. Off, prompts are cut the same way and read in full.
     prompt_cache: bool = True
+    kv_type: KvType = "f16"
     # The one other node that keeps a copy of this stage's states, and the nodes to
     # ask when taking over layers from a stage that was lost. See statecopy.py.
     copy_url: str | None = None
@@ -286,6 +288,8 @@ class LoadModelRequest(BaseModel):
     merge_passes: bool = True
     # Reuse saved prompt states. Replies are the same either way at temperature 0.
     prompt_cache: bool = True
+    # How a GGUF model keeps attention KV. q8_0 takes about half the memory.
+    kv_type: KvType = "f16"
     # From `isharded model hash`, run on a copy you trust. Every node then checks
     # every unit against it, so no peer or mirror has to be believed.
     model_hashes: dict[str, str] | None = None

@@ -28,7 +28,7 @@ from . import __version__
 from .access import INVITE_FIELDS, load_authority, NeedsAuthority, node_of, ROLE_ADMIN, ROLE_MEMBER, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, Caller
 from .embedding import POOLED_TYPES, dimensions_problem, encoded, inputs_problem, length_problem, passes, shaped, smallest_dimensions
 from .gguf import GgufHeader, parse_source, split_parts
-from .llamacpp import PINNED_BUILD
+from .llamacpp import KV_TYPES, PINNED_BUILD
 from .statestore import stage_namespace
 from . import audit
 from .discovery import start_beacon
@@ -278,6 +278,7 @@ def build_target(
     projector, image_marker = resolve_projector(request, adapter, sources, token)
     speculate_tokens = request.draft_tokens if draft else 0
     slots = request.parallel if isinstance(adapter, GgufAdapter) and not request.embedding else 1
+    kv_share = KV_TYPES[request.kv_type if isinstance(adapter, GgufAdapter) else "f16"][1]
     units = adapter.partition(manifest.tensors)
     if request.model_hashes:
         apply_model_hashes(manifest, units, request.model_hashes)
@@ -288,7 +289,7 @@ def build_target(
         units=units,
         num_layers=adapter.num_layers,
         expert_active_fraction=adapter.expert_active_fraction,
-        kv_bytes_per_token=[adapter.kv_bytes_per_token(i, 2) * slots for i in range(adapter.num_layers)],
+        kv_bytes_per_token=[adapter.kv_bytes_per_token(i, 2) * slots * kv_share // KV_TYPES["f16"][1] for i in range(adapter.num_layers)],
         # Rewinding needs a snapshot of recurrent state for each guess.
         state_bytes=[adapter.recurrent_state_bytes(i) * (1 + speculate_tokens) * slots for i in range(adapter.num_layers)],
         context_tokens=request.context_tokens,
@@ -1065,8 +1066,9 @@ class Orchestrator:
 
     async def _clear_old_copies(self, target: ModelTarget, route: list[StageAssignment]) -> None:
         """Copies for layers nothing runs any more are no use, on any node."""
+        kv_type = target.request.kv_type if target.request else "f16"
         wanted = [
-            stage_namespace(PINNED_BUILD, target.model_id, target.manifest.revision, stage.start_layer, stage.end_layer, target.speculate_tokens)
+            stage_namespace(PINNED_BUILD, target.model_id, target.manifest.revision, stage.start_layer, stage.end_layer, target.speculate_tokens, kv_type)
             for stage in route
         ]
 
@@ -1312,6 +1314,7 @@ class Orchestrator:
                 slots=target.slots,
                 merge_passes=target.merge_passes,
                 prompt_cache=target.request is None or target.request.prompt_cache,
+                kv_type=target.request.kv_type if target.request else "f16",
                 copy_url=holders.get(stage.worker_id),
                 state_peers=self.state_peers(stage.worker_id) if saved_states else [],
                 embedding=target.embedding,

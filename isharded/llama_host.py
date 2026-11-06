@@ -61,6 +61,7 @@ class _Host:
             sequences=meta.get("slots", 1),
             map_file=meta.get("map_file", True),
             embedding=meta.get("embedding", False),
+            kv_type=meta.get("kv_type", "f16"),
         )
         self.states = StateStore(meta.get("state_dir"), meta.get("state_ram_bytes", 0), meta.get("state_disk_bytes", 0))
         table = meta.get("table")

@@ -37,11 +37,19 @@ def test_keys_at_several_lengths_match_one_at_a_time():
 
 
 def test_namespaces_keep_models_and_layers_apart():
-    base = stage_namespace("b1", "model", "rev", 0, 14, 0)
-    assert base == stage_namespace("b1", "model", "rev", 0, 14, 0)
-    assert base != stage_namespace("b1", "model", "rev", 14, 28, 0)
-    assert base != stage_namespace("b1", "other", "rev", 0, 14, 0)
-    assert base != stage_namespace("b2", "model", "rev", 0, 14, 0), "another build may lay a state out differently"
+    base = stage_namespace("b1", "model", "rev", 0, 14, 0, "f16")
+    assert base == stage_namespace("b1", "model", "rev", 0, 14, 0, "f16")
+    assert base != stage_namespace("b1", "model", "rev", 14, 28, 0, "f16")
+    assert base != stage_namespace("b1", "other", "rev", 0, 14, 0, "f16")
+    assert base != stage_namespace("b2", "model", "rev", 0, 14, 0, "f16"), "another build may lay a state out differently"
+    assert base != stage_namespace("b1", "model", "rev", 0, 14, 0, "q8_0"), "a state in 8 bits cannot go in a 16-bit cache"
+
+
+def test_a_new_rule_for_cuts_retires_old_states(monkeypatch):
+    """They would still load, but no longer sit on cuts, and replies would quietly stop matching."""
+    base = stage_namespace("b1", "model", "rev", 0, 14, 0, "f16")
+    monkeypatch.setattr(statestore, "CUT_LEAST", statestore.CUT_LEAST * 2)
+    assert base != stage_namespace("b1", "model", "rev", 0, 14, 0, "f16")
 
 
 def test_a_state_comes_back_from_ram(tmp_path):
@@ -202,6 +210,58 @@ def test_dropping_removes_the_file_too(tmp_path):
     assert path.is_file()
     store.drop("a")
     assert not path.exists() and store.file_of("a") is None
+    store.close()
+
+
+def test_a_state_being_sent_can_still_be_replaced(tmp_path):
+    """A copy can take a while, and the next turn may replace that state meanwhile.
+
+    Windows will not delete a file another process has open, and that must never
+    reach the reply which is saving the new state.
+    """
+    store = filled(tmp_path)
+    store.put("old", blob(10), 1)
+    store.flush()
+    path = store.file_of("old")
+    with path.open("rb"):  # the copy going out
+        store.drop("old")
+        assert not store.has("old")
+    store.put("new", blob(10), 1)
+    store.flush()
+    assert not path.exists(), "it goes once nothing holds it any more"
+    store.close()
+
+
+def test_one_bad_write_does_not_stop_the_ones_after_it(tmp_path, monkeypatch):
+    store = filled(tmp_path)
+    real_write = store._write
+    calls = []
+
+    def fragile(key):
+        calls.append(key)
+        if len(calls) == 1:
+            raise RuntimeError("something nobody thought of")
+        real_write(key)
+
+    monkeypatch.setattr(store, "_write", fragile)
+    store.put("a", blob(10), 1)
+    store.put("b", blob(10), 1)
+    store.flush()
+    assert store.file_of("b") is not None
+    assert store.stats()["write_failures"] == 1
+    store.close()
+
+
+def test_a_state_being_sent_can_still_be_evicted(tmp_path):
+    store = filled(tmp_path, ram=10, disk=25)
+    store.put("old", blob(10), 1)
+    store.flush()
+    with store.file_of("old").open("rb"):
+        store.put("b", blob(10), 1)
+        store.flush()
+        store.put("c", blob(10), 1)
+        store.flush()
+    assert store.stats()["disk_bytes"] <= 25
     store.close()
 
 

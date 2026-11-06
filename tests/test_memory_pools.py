@@ -178,6 +178,14 @@ def test_kv_checkpoint_memory_stays_separate_from_weight_memory(monkeypatch) -> 
     assert flag(store, "--roles") == "kv-cache,checkpoint"
 
 
+def test_a_memory_worker_keeps_copies_where_its_node_was_told_to(monkeypatch) -> None:
+    """It is the first choice to hold copies of saved states, so its settings must reach it."""
+    _, store = launched(monkeypatch, weights_ram_gb="8", ram_budget_gb=2.0, cache_dir="states-here", state_disk_gb=3.0, state_copy_mb=4.0)
+    assert flag(store, "--cache-dir") == "states-here"
+    assert flag(store, "--state-disk-gb") == "3.0"
+    assert flag(store, "--state-copy-mb") == "4.0"
+
+
 def test_a_gpu_node_contributes_gpu_cpu_and_ram_as_one_worker(monkeypatch) -> None:
     monkeypatch.setattr("torch.cuda.is_available", lambda: True)  # CI machines have no GPU
     commands = launched(monkeypatch, gpu_device="auto", cpu_threads=8, weights_ram_gb="auto", gpu_memory_gb=16.0)
