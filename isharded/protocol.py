@@ -271,7 +271,7 @@ class LoadModelRequest(BaseModel):
     worker_model_ids: dict[str, str] = Field(default_factory=dict)
     revision: str = "main"
     # spread: use every preferred worker. compact: fewest stages that fit.
-    placement: Literal["spread", "compact"] = "spread"
+    placement: Literal["auto", "spread", "compact"] = "auto"
     context_tokens: int = Field(default=4096, ge=128, le=1_048_576)
     # Which machines hold the two ends. Left unset, the planner picks the fastest
     # order. The entry sees prompt tokens and the exit sees generated tokens.

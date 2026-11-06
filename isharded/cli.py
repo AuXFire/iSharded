@@ -481,7 +481,7 @@ def build_parser() -> argparse.ArgumentParser:
     load = subparsers.add_parser("load", help="load a model on a running pool")
     load.add_argument("model", help="owner/repo, owner/repo:file.gguf, a local path, or a file name another node holds")
     load.add_argument("--url", default="http://127.0.0.1:8000", help="any node's control address")
-    load.add_argument("--placement", choices=["spread", "compact"], default="spread", help="use every worker, or the fewest that fit")
+    load.add_argument("--placement", choices=["auto", "spread", "compact"], default="auto", help="the fewest close workers that hold the model in VRAM, every worker, or the fewest that fit")
     load.add_argument("--context-tokens", type=int, default=4096, help="tokens each reply can hold")
     load.add_argument("--entry", help="worker to hold the entry stage")
     load.add_argument("--exit", help="worker to hold the exit stage")
