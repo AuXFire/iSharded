@@ -531,6 +531,17 @@ class CapabilityBroker:
         rows = self.store.query(f"SELECT * FROM approvals {where} ORDER BY requested_at, id", parameters)
         return [{**dict(row), "arguments": json.loads(row["arguments"])} for row in rows]
 
+    def withdraw(self, approval_id: str, why: str) -> bool:
+        """The asker no longer needs this, so no person should be left deciding it."""
+        with self.store.transaction():
+            updated = self.store.connection.execute(
+                "UPDATE approvals SET status = 'withdrawn', reason = ? WHERE id = ? AND status IN ('pending', 'approved')",
+                (why, approval_id),
+            )
+            if updated.rowcount:
+                self.audit.record("broker", "approval.withdraw", approval_id, {"why": why})
+        return updated.rowcount == 1
+
     def decide(self, approval_id: str, approved: bool, by: str, user: str | None = None) -> bool:
         """A person's answer. Saying no also withdraws a yes that was not used yet."""
         if not is_person(by):
