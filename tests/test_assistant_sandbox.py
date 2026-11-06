@@ -363,11 +363,19 @@ def test_rlimits_wrap_the_command_without_a_shell_string():
     assert str(100 * 1024) in argv
 
 
-@pytest.mark.skipif(LocalSandbox().level != "namespace", reason="no namespace support on this machine")
+@pytest.mark.skipif(LocalSandbox(prefer="namespace").level != "namespace", reason="no namespace support on this machine")
 def test_a_namespace_really_blocks_the_network(tmp_path):
+    """Against a listener on this machine, so a broken wall still reaches nothing outside."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
     made = LocalSandbox(prefer="namespace")
-    script = "import socket; socket.create_connection(('1.1.1.1', 53), 3)"
-    result = made.run(python(script), tmp_path, network=False, timeout=30)
+    script = f"import socket; socket.create_connection(('127.0.0.1', {port}), 3)"
+    try:
+        result = made.run(python(script), tmp_path, network=False, timeout=30)
+    finally:
+        listener.close()
     assert result.level == "namespace" and result.network_blocked
     assert result.exit_code != 0
 
