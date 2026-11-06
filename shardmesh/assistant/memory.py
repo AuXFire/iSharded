@@ -336,6 +336,10 @@ class MemoryStore:
             raise MemoryNotFound(f"There is no memory {memory_id}")
         return row
 
+    def holds(self, user: str, text: str) -> bool:
+        """Whether this exact fact is already current."""
+        return self.store.one("SELECT id FROM memories WHERE user = ? AND text = ? AND superseded_by IS NULL", (user, text)) is not None
+
     def get(self, user: str, memory_id: str | int) -> dict[str, Any]:
         return dict(self._row(user, memory_id))
 
