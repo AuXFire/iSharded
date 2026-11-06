@@ -1072,13 +1072,17 @@ A node uses PyTorch to find GPUs. If PyTorch sees none, the node asks llama.cpp'
 
 Vulkan runs GGUF models only, because safetensors models run on PyTorch. The planner keeps those off such a node. It also cannot time the GPU's memory, so it assumes 300 GB/s when placing layers.
 
-On a 6 GB RTX 3060 with Qwen3-0.6B Q8_0, one reply at a time, all three gave the same text:
+Measured with small models, one reply at a time. Each pair gave the same text:
 
-| Backend | Tokens per second |
-|---|---|
-| CUDA | 104.1 |
-| Vulkan | 102.6 |
-| CPU, 4 threads | 21.9 |
+| GPU and model | Backend | Tokens per second |
+|---|---|---|
+| RX 7900 XT, Qwen3.5-0.8B Q8_0 | Vulkan | 185.1 |
+| RX 7900 XT, Qwen3.5-0.8B Q8_0 | ROCm | 161.9 |
+| RTX 3060 Laptop, Qwen3-0.6B Q8_0 | CUDA | 104.1 |
+| RTX 3060 Laptop, Qwen3-0.6B Q8_0 | Vulkan | 102.6 |
+| Laptop CPU, 4 threads, Qwen3-0.6B Q8_0 | CPU | 21.9 |
+
+So an AMD card needs no ROCm for GGUF models. These are small models, and a large one may differ.
 
 ## Precision
 
