@@ -77,7 +77,7 @@ from .toolcalls import (
     uses_tools,
 )
 from .vision import ImageRefused, chat_images, expand_prompt, image_id, projector_marker
-from .weights import apply_model_hashes, Manifest, WeightSourceError, build_manifest
+from .weights import apply_model_hashes, Manifest, WeightSourceError, build_manifest, has_model_host
 
 # Replans allowed when workers fail mid-load before the job gives up.
 MAX_DEPLOY_ATTEMPTS = 4
@@ -1177,7 +1177,7 @@ class Orchestrator:
                 units=units,
                 peers=self._peers_for(target, stage.worker_id, units),
                 file_sizes=target.file_sizes,
-                file_sources=target.file_sources,
+                file_sources=target.file_sources if target.peer_fetch or not has_model_host(target.source_for(stage.worker_id)) else [],
             )
             try:
                 response = await self.client.post(

@@ -71,6 +71,12 @@ def test_a_stated_location_wins_and_needs_no_table(fresh_table):
     assert geo._table.cache_info().misses == 0
 
 
+def test_an_operator_can_show_no_flag_at_all(fresh_table):
+    assert geo.country_code(" None ") == "none"
+    assert geo.node_country("http://8.8.8.8:8200", "none") is None
+    assert geo._table.cache_info().misses == 0
+
+
 def test_the_table_loads_once_and_quickly(fresh_table):
     began = time.perf_counter()
     assert geo.country_of("8.8.8.8") == "US"

@@ -36,13 +36,16 @@ COUNTRIES = frozenset("""
 """.split())
 
 logger = logging.getLogger(__name__)
+NO_LOCATION = "none"
 
 
 def country_code(text: str) -> str:
-    """Reads --location: two letters in either case, and a code that exists."""
+    """Reads --location: two letters in either case, a code that exists, or none for no flag."""
+    if text.strip().lower() == NO_LOCATION:
+        return NO_LOCATION
     code = text.strip().upper()
     if code not in COUNTRIES:
-        raise argparse.ArgumentTypeError(f"{text!r} is not a two letter country code, such as DE")
+        raise argparse.ArgumentTypeError(f"{text!r} is not a two letter country code, such as DE, or none")
     return code
 
 
@@ -91,4 +94,6 @@ def country_of(address: str) -> str | None:
 
 def node_country(url: str, location: str | None = None) -> str | None:
     """What a node reports: what its owner said, or else what its advertised address says."""
+    if location == NO_LOCATION:
+        return None
     return location or country_of(urlsplit(url).hostname or "")

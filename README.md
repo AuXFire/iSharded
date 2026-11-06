@@ -383,7 +383,7 @@ If the node serving your chat dies mid-reply, the page asks before sending your 
 
 The dashboard shows a flag beside each worker whose country is known, with the name on hover and in the worker's details. The country comes from a table in the package, so no outside service sees a node's address. Only a public address can be looked up. A private, loopback, or Tailscale address shows nothing, and so does a host name, because resolving it would tell a DNS server. A node on Tailscale or a LAN therefore needs `--location` to show a flag.
 
-The table records who holds an address, which is not always where the machine is. A cloud's address can name the cloud's home country, and a node behind a relay has the relay's address. `--location` corrects both.
+The table records who holds an address, which is not always where the machine is. A cloud's address can name the cloud's home country, and a node behind a relay has the relay's address. `--location` corrects both, and `--location none` shows no flag at all. Where a node shows itself is its operator's choice.
 
 ### Calling the API
 
@@ -585,7 +585,7 @@ Starts a node with everything worked out, and is the easy way in. See [Quick sta
 | `--port` | 8209 | Port for the chat page and API |
 | `--worker-port` | Nine below `--port` | This node's worker port, for clouds that hand out ports |
 | `--address` | Found for you | The address other nodes reach this one on |
-| `--location` | Looked up from `--address` | Two letter country code for the dashboard's flag, such as `DE`. Kept for next time, and a new one replaces it |
+| `--location` | Looked up from `--address` | Two letter country code for the dashboard's flag, such as `DE`, or `none` to show no flag. Kept for next time, and a new one replaces it |
 | `--tls` | Off on Tailscale | Use TLS even on Tailscale |
 | `--trusted-network` | Off | Skip TLS, because nobody else can read this network |
 | `--no-gpu` | Off | Contribute CPU and RAM only |
@@ -652,7 +652,7 @@ Network:
 | `--bind-host` | `0.0.0.0` | Address to listen on |
 | `--advertise-host` | `auto` | Address other nodes reach this one on. `auto` prefers Tailscale, then the LAN |
 | `--advertise-scheme` | `http` | `http` or `https`. Set to `https` for you by `--tls-cert` |
-| `--location` | Looked up from `--advertise-host` | Two letter country code for the dashboard's flag, such as `DE` |
+| `--location` | Looked up from `--advertise-host` | Two letter country code for the dashboard's flag, such as `DE`, or `none` to show no flag |
 | `--base-port` | 8200 | First worker's port. Later workers take the next ones |
 
 Security:
@@ -1220,7 +1220,7 @@ Past `--parallel`, replies queue at the entry worker, and past 32 waiting they a
 
 1. The coordinator reads the model's description: a GGUF header, or `config.json`, the tokenizer, and each safetensors header. This costs a few megabytes and pins one revision for every node.
 2. It plans which worker runs which layers, and which memory holds each unit.
-3. Each worker fetches only its units into a local cache, trying its own disk, then peers, then a holder of the file or the model host. Interrupted transfers retry and resume.
+3. Each worker fetches only its units into a local cache. Its own disk comes first. After that, every transfer is timed, and each unit goes to whichever source should finish it soonest: the model host, a node holding the unit, or a node holding the file. The model host wins a near tie, because a node's uplink may be carrying replies. A transfer that falls behind is given up for a faster source, so a slow neighbour costs seconds, and on a closed network with no model host the nodes supply everything. Interrupted transfers retry and resume.
 4. The current model keeps serving through all of this. Entry workers let replies finish, then stages load. A stage whose job did not change keeps its weights.
 5. The new route goes to every node by gossip.
 

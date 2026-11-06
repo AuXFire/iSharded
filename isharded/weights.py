@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import mmap
 import os
@@ -43,6 +44,9 @@ from .gguf import GgufError, GgufHeader, join_parts, parse_header, parse_source,
 from .protocol import auth_headers, TensorRef, WeightUnit
 from .tickets import client_auth
 from .tls import client_verify, stay_on_this_machine
+from .transfers import MODEL_HOST, SlowSource, SourcePicker
+
+logger = logging.getLogger(__name__)
 
 # Mapped weights are read-only by design, and nothing writes to them.
 warnings.filterwarnings("ignore", message="The given buffer is not writable")
@@ -54,6 +58,7 @@ SINGLE_FILE = "model.safetensors"
 COALESCE_GAP_BYTES = 256 * 1024
 CHUNK_BYTES = 1024 * 1024
 FETCH_RETRIES = 6
+HOST_CHECK_SECONDS = 5.0
 # Disk space a fetch must leave behind, so a download cannot fill the volume.
 DISK_RESERVE_BYTES = 2 * 1024**3
 
@@ -349,6 +354,29 @@ def read_gguf_header(reader: Reader, name: str) -> GgufHeader:
         return parse_header(read, reader.file_size(name))
     except GgufError as exc:
         raise WeightSourceError(f"{name}: {exc}") from exc
+
+
+def has_model_host(source: str) -> bool:
+    """Whether a model lives somewhere besides the pool. On a closed network it may not."""
+    located = parse_source(source)
+    return bool(located[0] if located else source)
+
+
+def model_host_answers(source: str, revision: str, name: str) -> bool:
+    """A closed network has no model host, and nothing should wait on one."""
+    try:
+        reader = open_reader(source, revision)
+    except WeightSourceError:
+        return False
+    try:
+        if isinstance(reader, HubReader):
+            reader.client.timeout = httpx.Timeout(HOST_CHECK_SECONDS)
+        reader.file_size(name)
+        return True
+    except (WeightSourceError, httpx.HTTPError, OSError):
+        return False
+    finally:
+        reader.close()
 
 
 def gguf_reader(source: str, revision: str, holders: list[str] | None, token: str | None) -> Reader:
@@ -692,6 +720,7 @@ class FetchProgress:
     bytes_done: int = 0
     bytes_reused: int = 0
     bytes_from_peers: int = 0
+    source_speeds: dict[str, float] = field(default_factory=dict)
     units_total: int = 0
     units_done: int = 0
     phase: str = "fetching"  # fetching | ready | failed
@@ -709,6 +738,7 @@ class FetchProgress:
             "bytes_done": self.bytes_done,
             "bytes_reused": self.bytes_reused,
             "bytes_from_peers": self.bytes_from_peers,
+            "source_speeds": dict(self.source_speeds),
             "units_total": self.units_total,
             "units_done": self.units_done,
             "bytes_per_second": self.bytes_done / elapsed if elapsed > 0 else 0.0,
@@ -975,6 +1005,28 @@ class UnitCache:
             self._discard(model_id, revision, unit)
             return False
 
+        picker = SourcePicker()
+        progress.source_speeds = picker.speeds
+        holders = list(file_sources or [])
+        host = has_model_host(source)
+        if missing and host and (holders or peers) and not model_host_answers(source, source_revision, missing[0].tensors[0].file):
+            picker.fail(MODEL_HOST)
+
+        def sources_for(unit: WeightUnit) -> list[str]:
+            """Everywhere this unit can come from, the host first so that it wins a tie."""
+            nodes = dict.fromkeys([*(peers or {}).get(unit.name, []), *holders])
+            return [MODEL_HOST, *nodes] if host or not nodes else list(nodes)
+
+        def deliver(origin: str, unit: WeightUnit, destination: Path, on_bytes: Callable[[int], None]) -> bool:
+            if origin in (peers or {}).get(unit.name, []):
+                return fetch_from_peer(origin, token, model_id, revision, unit, destination, on_bytes)
+            reader = open_reader(source, source_revision) if origin == MODEL_HOST else PeerReader([origin], token)
+            try:
+                fetch_unit(reader, unit, destination, on_bytes)
+            finally:
+                reader.close()
+            return True
+
         def fetch_one(unit: WeightUnit) -> None:
             destination = self.path(model_id, revision, unit.name)
             copy = local.get(unit.tensors[0].file)
@@ -985,23 +1037,40 @@ class UnitCache:
                     with lock:
                         progress.units_done += 1
                     return
-            for peer in (peers or {}).get(unit.name, []):
-                if fetch_from_peer(peer, token, model_id, revision, unit, destination, add_bytes) and accepted(unit):
-                    with lock:
-                        # A unit file is its tensors plus a small header.
-                        progress.bytes_done += unit.nbytes - destination.stat().st_size
-                        progress.bytes_from_peers += unit.nbytes
-                        progress.units_done += 1
-                    return
-            reader = gguf_reader(source, source_revision, file_sources, token)
-            try:
-                fetch_unit(reader, unit, self.path(model_id, revision, unit.name), add_bytes)
-            finally:
-                reader.close()
-            if not accepted(unit):
-                raise WeightSourceError(f"{unit.name} did not match its hash from any source")
-            with lock:
-                progress.units_done += 1
+            sources = sources_for(unit)
+            abandoned: set[str] = set()
+            failure: Exception | None = None
+            while sources:
+                origin = picker.pick(sources)
+                others = [item for item in sources if item != origin]
+                transfer = picker.transfer(origin, others, unit.nbytes, add_bytes, patient=origin in abandoned)
+                try:
+                    with transfer:
+                        delivered = deliver(origin, unit, destination, transfer)
+                    if delivered and accepted(unit):
+                        with lock:
+                            if origin != MODEL_HOST:
+                                progress.bytes_from_peers += unit.nbytes
+                            if origin in (peers or {}).get(unit.name, []):
+                                # A unit file is its tensors plus a small header.
+                                progress.bytes_done += unit.nbytes - destination.stat().st_size
+                            progress.units_done += 1
+                        return
+                    if delivered:
+                        failure = WeightSourceError(f"{unit.name} did not match its hash from any source")
+                except SlowSource as reason:
+                    logger.info("%s: moving on from %s", unit.name, reason)
+                    abandoned.add(origin)
+                    add_bytes(-transfer.arrived)
+                    continue
+                except (WeightSourceError, httpx.HTTPError, OSError, ValueError) as exc:
+                    if progress.cancelled:
+                        raise
+                    failure = exc
+                add_bytes(-transfer.arrived)  # the next source delivers these bytes instead
+                picker.fail(origin)
+                sources.remove(origin)
+            raise failure or WeightSourceError(f"no source could deliver {unit.name}")
 
         with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
             list(pool.map(fetch_one, missing))

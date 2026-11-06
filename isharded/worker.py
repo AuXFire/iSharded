@@ -79,7 +79,7 @@ from .inventory import inventory
 from .tickets import TicketIdentity, client_auth
 from .tls import client_verify, node_transport, PEER, stay_on_this_machine_async
 from .vision import PromptPart, PromptRows, lay_out
-from .weights import FetchProgress, LoadedUnit, UnitCache, WeightSourceError, gguf_reader, load_unit, map_unit
+from .weights import FetchProgress, LoadedUnit, UnitCache, WeightSourceError, gguf_reader, has_model_host, load_unit, map_unit
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "isharded" / "units"
 SUPPORTED_DTYPES = ["bfloat16", "float32", "float16"]
@@ -541,7 +541,7 @@ class WorkerRuntime:
                 request.peers if self.peer_fetch else None,
                 self.pool_token,
                 request.file_sizes,
-                request.file_sources,
+                request.file_sources if self.peer_fetch or not has_model_host(request.source) else None,
             )
             progress.phase = "ready"
         except (WeightSourceError, httpx.HTTPError, OSError, ValueError) as exc:
@@ -1905,7 +1905,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="one or more control planes, comma separated; the rest are found from them",
     )
     parser.add_argument("--advertise-url", default=os.getenv("ISHARDED_ADVERTISE_URL"), help="how other nodes reach this worker")
-    parser.add_argument("--location", type=country_code, default=os.getenv("ISHARDED_LOCATION") or None, help="two letter country code to report; default is looked up from the advertised address")
+    parser.add_argument("--location", type=country_code, default=os.getenv("ISHARDED_LOCATION") or None, help="two letter country code to report, or none to report no country; default is looked up from the advertised address")
     parser.add_argument("--device", default=os.getenv("ISHARDED_DEVICE", "auto"), help="auto, cpu, cuda:0, mps, or xpu:0")
     parser.add_argument("--roles", default=os.getenv("ISHARDED_ROLES", "inference"), help="inference, or kv-cache,checkpoint for a memory worker")
     parser.add_argument("--cpu-threads", type=int, default=int(os.getenv("ISHARDED_CPU_THREADS", "0")), help="CPU threads; 0 uses half the cores for a stage")

@@ -674,7 +674,7 @@ def add_arguments(subparsers: Any) -> None:
     up.add_argument("--worker-port", type=int, default=None, help="this node's worker port, for clouds that hand out ports; default is nine below --port")
     up.add_argument("--port", type=int, default=DEFAULT_PORT, help="port for the chat page and API")
     up.add_argument("--address", default=None, help="the address other nodes reach this one on; found for you if not set")
-    up.add_argument("--location", type=country_code, default=None, help="two letter country code for the dashboard's flag, kept for next time; default is looked up from --address")
+    up.add_argument("--location", type=country_code, default=None, help="two letter country code for the dashboard's flag, or none to show no flag, kept for next time; default is looked up from --address")
     up.add_argument("--tls", action="store_true", help="use TLS even on Tailscale")
     up.add_argument("--trusted-network", action="store_true", help="skip TLS, because nobody else can read this network")
     up.add_argument("--no-gpu", action="store_true", help="contribute CPU and RAM only")

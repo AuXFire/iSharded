@@ -95,7 +95,7 @@ def test_progress_matches_the_plan_when_a_peer_delivers(held, tmp_path: Path, mo
     monkeypatch.setattr("isharded.weights.fetch_from_peer", copy)
     cache = UnitCache(tmp_path / "cache")
     progress = FetchProgress("job")
-    cache.fetch("unused-source", "m", "r", [unit], progress, peers={"unit": ["http://peer"]})
+    cache.fetch("only-in-the-pool.gguf", "m", "r", [unit], progress, peers={"unit": ["http://peer"]})
     assert progress.bytes_done == unit.nbytes
     assert progress.bytes_from_peers == unit.nbytes
     assert progress.units_done == 1
@@ -242,6 +242,7 @@ def test_a_peer_serving_altered_weights_is_refused_for_the_real_source(held, tmp
         return True
 
     monkeypatch.setattr(weights, "fetch_from_peer", lying_peer)
+    monkeypatch.setattr(weights.SourcePicker, "pick", lambda self, sources: sources[-1])  # the peer, first
     cache.fetch(str(tmp_path / "model"), "m", "r", [unit], FetchProgress("j"), peers={"unit": ["http://peer"]})
     assert cache.path("m", "r", "unit").read_bytes() == file.read_bytes()
 
