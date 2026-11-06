@@ -1258,6 +1258,11 @@ class Orchestrator:
 
             await asyncio.gather(*(ask(stage, "/internal/ring/connect", connect(index)) for index, stage in enumerate(route)))
             await ask(route[0], "/internal/ring/go", {"epoch": epoch})
+        except httpx.HTTPStatusError as exc:
+            # A worker a step behind or ahead of this epoch is a route moving, not a fault.
+            if exc.response.status_code != 409:
+                self.add_event("mesh", "Direct links not up", f"Replies stay on HTTP for now: HTTP {exc.response.status_code}")
+            return
         except (httpx.HTTPError, KeyError, ValueError) as exc:
             self.add_event("mesh", "Direct links not up", f"Replies stay on HTTP for now: {str(exc) or type(exc).__name__}")
             return

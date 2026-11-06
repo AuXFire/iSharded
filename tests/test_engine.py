@@ -377,7 +377,7 @@ def test_a_draft_that_loses_is_set_aside_and_tried_again_later() -> None:
     while not choice.use_draft():
         choice.note(False, 1, 0.036)
         tokens += 1
-    assert DRAFT_TRIAL_TOKENS - 3 <= tokens <= DRAFT_TRIAL_TOKENS  # time for a trial
+    assert DRAFT_TRIAL_TOKENS - 8 <= tokens <= DRAFT_TRIAL_TOKENS  # time for a trial
     choice.note(True, 3, 0.15)
     assert choice.use_draft() is False  # it lost again, so back to the faster way
 
@@ -389,6 +389,16 @@ def test_a_draft_that_wins_is_kept_and_a_change_in_the_route_can_turn_it_around(
     assert choice.use_draft() is True
     for _ in range(20):
         choice.note(False, 1, 0.02)  # the slow link went away
+    assert choice.best() is False
+
+
+def test_lucky_passes_do_not_flatter_a_draft() -> None:
+    # Measured on one site: 2.3 tokens per 110 ms pass on average, against 36 ms per token.
+    choice = DraftChoice()
+    for tokens in [5, 1, 1, 5, 1, 1, 5, 1, 1, 2] * 4:
+        choice.note(True, tokens, 0.11)
+    for _ in range(40):
+        choice.note(False, 1, 0.036)
     assert choice.best() is False
 
 

@@ -25,7 +25,7 @@ FAST_POOLS = {"vram", "unified"}
 INITIAL_GUESSES = 3
 # How many tokens go by between trials of the slower way, and how fast its rate adapts.
 DRAFT_TRIAL_TOKENS = 96
-DRAFT_RATE_WEIGHT = 0.25
+DRAFT_MEMORY = 0.9
 FEWEST_GUESSES = 2
 
 
@@ -391,21 +391,26 @@ class DraftChoice:
     because a route or a reply can change which one wins.
     """
 
-    rates: dict[bool, float] = field(default_factory=lambda: {True: 0.0, False: 0.0})
+    # Recent tokens and seconds, kept apart. Averaging each pass's rate would overrate
+    # guessing, because the passes where every guess landed would count like the rest.
+    tokens: dict[bool, float] = field(default_factory=lambda: {True: 0.0, False: 0.0})
+    seconds: dict[bool, float] = field(default_factory=lambda: {True: 0.0, False: 0.0})
     since_trial: int = 0
 
+    def rate(self, drafted: bool) -> float:
+        return self.tokens[drafted] / self.seconds[drafted] if self.seconds[drafted] else 0.0
+
     def best(self) -> bool:
-        return self.rates[True] >= self.rates[False]
+        return self.rate(True) >= self.rate(False)
 
     def use_draft(self) -> bool:
-        if not self.rates[True] or not self.rates[False]:
-            return not self.rates[True]
+        if not self.seconds[True] or not self.seconds[False]:
+            return not self.seconds[True]
         return self.best() != (self.since_trial >= DRAFT_TRIAL_TOKENS)
 
     def note(self, drafted: bool, tokens: int, seconds: float) -> None:
-        sample = tokens / max(seconds, 1e-6)
-        known = self.rates[drafted]
-        self.rates[drafted] = known * (1 - DRAFT_RATE_WEIGHT) + sample * DRAFT_RATE_WEIGHT if known else sample
+        self.tokens[drafted] = self.tokens[drafted] * DRAFT_MEMORY + tokens
+        self.seconds[drafted] = self.seconds[drafted] * DRAFT_MEMORY + max(seconds, 1e-6)
         self.since_trial = 0 if drafted != self.best() else self.since_trial + tokens
 
 
