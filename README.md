@@ -6,6 +6,96 @@ It runs on a closed network, a LAN, across VLANs, over Tailscale, or across remo
 
 This is execution sharding, not simulated work distribution. In a two-worker run of the included offline test model, worker 1 owns layer 0 and worker 2 owns layer 1. Token generation crosses both processes on every target-model pass.
 
+## How it works
+
+Each machine holds some of the model's layers, and any machine can answer a request. No server is in charge. The diagrams use the same line colors throughout: solid blue-green for a reply's data, dashed violet for control messages, and pink for anything signed by the owner.
+
+The first six diagrams show what is built and tested on a two-machine pool. The right half of the last one is a proposal. A mesh runs one model at a time today.
+
+### Two networks in one
+
+Every node runs the same software. Control messages spread between all nodes, while a reply's data runs in a line through the stages.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/structure-dark.png">
+  <img alt="Three nodes. Control planes gossip with each other, while a reply's data runs in a line through the workers." src="docs/diagrams/structure-light.png">
+</picture>
+
+Layers are split by what each machine can hold, so one model can span a GPU on one node and RAM and disk on another. The test pool has two nodes: a laptop RTX 3060 with layers 0 to 7, and a desktop RX 7900 XT with layers 8 to 63, over Tailscale. Workers check in with every control plane, so any of them can take over.
+
+### One reply, from message to text
+
+The node you ask runs your reply itself. The coordinator isn't involved, so losing it doesn't interrupt anything.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/reply-dark.png">
+  <img alt="A reply goes from any control plane to the entry worker, then loops through the stages. The coordinator is not on this path." src="docs/diagrams/reply-light.png">
+</picture>
+
+Only hidden states and tokens cross the network during a reply, never weights. A small draft model guesses ahead so one pass can produce several tokens. Conversations sharing a stage also share a pass when they can, which took four conversations from 12 to 32 tok/s on one stage.
+
+### Any node can coordinate
+
+Nodes agree on a coordinator without voting: they all apply the same rule to the same member list.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/coordinating-dark.png">
+  <img alt="Every node runs the same code. Coordinating is a role that moves between them." src="docs/diagrams/coordinating-light.png">
+</picture>
+
+The term only goes up, and the higher term wins, so two coordinators from a split settle themselves when they reconnect. Workers obey only the highest term they have seen.
+
+### Loading a model
+
+Replies keep running through the old layout until the new one is ready, and only then do they switch.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/loading-dark.png">
+  <img alt="A model loads in the background while the old layout keeps serving, and weights move only when they must." src="docs/diagrams/loading-light.png">
+</picture>
+
+A closed network works the same way: a GGUF file on one node is enough, and the others read the parts they need from it. The 2 GiB limit applies to a node that is alive but failed to load. If a node has died, the pool replans whatever that moves.
+
+### What happens when something fails
+
+The rule is that a failure must not drop a reply, and weights move only when they must.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/failures-dark.png">
+  <img alt="Seven kinds of failure keep the reply going. Only losing the node you are connected to restarts it." src="docs/diagrams/failures-light.png">
+</picture>
+
+Times are measured on the two-machine pool, except the stage crash, measured on a small model. In the last soak test, 405 replies finished and none were lost while processes were killed on both machines for 21 minutes. [Operating ShardMesh](docs/OPERATIONS.md) has the details.
+
+### Joining an owned network
+
+A node makes its own key and asks to join through any member. The owner approves it from their own machine.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/joining-dark.png">
+  <img alt="A node asks through any member, the owner signs the answer offline, and neither private key ever crosses the network." src="docs/diagrams/joining-light.png">
+</picture>
+
+Asking grants nothing. The new node's private key never leaves it, and the owner's key never touches the network, so a compromised node can't add a key or revoke a peer. Tickets prove a node's name without TLS, so antivirus that intercepts TLS can't break them. The link still needs Tailscale or another private network, because tickets don't encrypt anything. [ShardMesh security](docs/SECURITY.md) has the commands.
+
+### Owned or ownerless
+
+An owned network runs without a central server, but one person decides who belongs. Removing the owner removes the signing arrows, and everything they did has to be done another way. Both kinds would work for private or public networks.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/ownership-dark.png">
+  <img alt="The difference between the two kinds of network is the owner and its signing arrows, which disappear in the ownerless version." src="docs/diagrams/ownership-light.png">
+</picture>
+
+| Question | Owned (built) | Ownerless (proposed, not built) |
+|---|---|---|
+| Who lets a node in? | The owner approves it | Open, or existing members vouch for it |
+| Who removes a node? | The owner, for everyone | Nobody can. Each node keeps its own blocklist |
+| Who picks the models? | The owner, or anyone with an admin key | Each node chooses what it hosts, and users pick from what's running |
+| What is still unsolved? | A member can read prompts and return wrong answers | The same, plus one person could run thousands of nodes |
+
+To redraw these diagrams, run `python scripts/build_diagrams.py`.
+
 ## What works
 
 - A streaming chat page at `/chat` that shows where each layer of the model is running.
