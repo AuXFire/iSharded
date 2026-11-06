@@ -478,9 +478,10 @@
       $('modelLabel').textContent = choosing ? 'Load a model' : busy ? `Loading ${modelName(status.load_job?.model)}` : status.model && ready ? modelName(status.model) : 'Choose a model';
     }
     function renderChoice(status) {
-      const running = [status.status === 'ready' ? status.model : null, ...(status.lanes || []).filter(lane => lane.ready).map(lane => lane.model)].filter(Boolean);
+      const running = [status.status === 'ready' && status.kind !== 'embedding' ? status.model : null, ...(status.lanes || []).filter(lane => lane.ready && lane.kind !== 'embedding').map(lane => lane.model)].filter(Boolean);
       const pick = $('modelChoice');
-      pick.hidden = running.length < 2;
+      // Embedding models cannot chat, so a lone chat model beside one has to be named.
+      pick.hidden = running.length < 2 && !(running.length === 1 && status.kind === 'embedding');
       if (pick.dataset.running === running.join('|')) return;
       const chosen = pick.value;
       pick.dataset.running = running.join('|');

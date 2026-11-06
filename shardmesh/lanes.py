@@ -251,6 +251,14 @@ class LaneDoor:
     def models(self) -> list[str]:
         return sorted({str(info["model"]) for info in self.seen.values() if info.get("ready") and info.get("model")})
 
+    def model_kinds(self) -> dict[str, dict[str, Any]]:
+        """What each running lane's model is for, as /v1/models reports it."""
+        kinds: dict[str, dict[str, Any]] = {}
+        for info in self.seen.values():
+            if info.get("ready") and info.get("model"):
+                kinds[str(info["model"])] = {key: info[key] for key in ("kind", "vision", "dimensions") if key in info}
+        return dict(sorted(kinds.items()))
+
     def _target(self, name: str) -> str:
         info = self.seen.get(name, {})
         target = self._sibling(name) if info.get("ready") else info.get("leader_url")
@@ -428,6 +436,8 @@ class LaneDoor:
                     "load_job": info.get("load_job"),
                     "error": self.problems.get(name),
                     "budgets": lane["budgets"],
+                    "kind": info.get("kind", "chat"),
+                    "vision": bool(info.get("vision")),
                 }
             )
         return rows

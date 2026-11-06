@@ -53,6 +53,7 @@ class _Host:
             rollback_tokens=meta.get("rollback_tokens", 0),
             sequences=meta.get("slots", 1),
             map_file=meta.get("map_file", True),
+            embedding=meta.get("embedding", False),
         )
         table = meta.get("table")
         if table:
@@ -66,6 +67,13 @@ class _Host:
         if self.embedding is None:
             raise LlamaError("this stage has no embedding table")
         return {}, self.embedding.rows(meta["tokens"]).tobytes()
+
+    def pool(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+        assert self.stage is not None and self.embedding is not None
+        inputs = meta["inputs"]
+        rows = self.embedding.rows([token for item in inputs for token in item])
+        pooled = self.stage.pool(rows, [len(item) for item in inputs])
+        return {"width": self.stage.output_width}, pooled.tobytes()
 
     def forward(self, meta: dict[str, Any], payload: bytes) -> tuple[dict[str, Any], bytes]:
         assert self.stage is not None

@@ -231,6 +231,8 @@ class ConfigureRequest(BaseModel):
     merge_passes: bool = True
     # What this stage's units must hash to, when the model was loaded with hashes.
     unit_hashes: dict[str, str] = Field(default_factory=dict)
+    # Run the stage in llama.cpp's embedding mode, for /v1/embeddings.
+    embedding: bool = False
 
 
 class CacheRestoreRequest(BaseModel):
@@ -277,6 +279,8 @@ class LoadModelRequest(BaseModel):
     # From `shardmesh model hash`, run on a copy you trust. Every node then checks
     # every unit against it, so no peer or mirror has to be believed.
     model_hashes: dict[str, str] | None = None
+    # An embedding model: one stage, answering /v1/embeddings and not chat.
+    embedding: bool = False
     # False returns as soon as the job starts; poll /admin/status for progress.
     wait: bool = True
 
@@ -329,6 +333,21 @@ class CompletionRequest(BaseModel):
     seed: Seed | None = None
     stream: bool = False
     stop: str | list[str] | None = None
+
+
+class EmbeddingRequest(BaseModel):
+    model: str | None = None
+    input: str | list[str]
+    encoding_format: Literal["float", "base64"] = "float"
+    dimensions: int | None = Field(default=None, ge=1)
+    user: str | None = None  # OpenAI clients send this. Nothing here uses it.
+
+
+class EmbedPass(BaseModel):
+    """Inputs for one embedding pass, tokenized and packed by the control plane."""
+
+    epoch: int
+    inputs: list[list[int]]
 
 
 class ChatMessage(BaseModel):

@@ -21,6 +21,7 @@ This is execution sharding, not simulated work distribution: each token really c
 - [Environment variables](#environment-variables)
 - [HTTP API](#http-api)
 - [Models](#models)
+- [Embeddings](#embeddings)
 - [Memory and placement](#memory-and-placement)
 - [Precision](#precision)
 - [Networks and security](#networks-and-security)
@@ -694,6 +695,7 @@ Loads a model on a running pool and shows progress. `model` is any [model id](#l
 | `--lane-gpu-gb` | What is spare | Most VRAM per node for this lane |
 | `--lane-ram-gb` | What is spare | Most RAM per node for this lane |
 | `--lane-apart` | Off | Keep this lane off every node another route uses, so routes can check each other |
+| `--embedding` | Off | This is an embedding model: one stage, for `/v1/embeddings` and not chat. See [Embeddings](#embeddings) |
 
 ### shardmesh lane
 
@@ -865,7 +867,8 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 |---|---|---|---|
 | `POST` | `/v1/chat/completions` | User key | Chat, streaming with `stream: true` |
 | `POST` | `/v1/completions` | User key | Text completion, one prompt per request |
-| `GET` | `/v1/models` | User key | The running model |
+| `POST` | `/v1/embeddings` | User key | Vectors for text, from an embedding model. See [Embeddings](#embeddings) |
+| `GET` | `/v1/models` | User key | Every running model, and what each is for |
 | `GET` | `/admin/status` | User key | Workers, memory pools, route, epoch, mesh, and load progress |
 | `GET` | `/admin/catalog` | User key | Suggested models and supported architectures |
 | `POST` | `/admin/plan` | Admin key | Show where a model would run, without moving anything |
@@ -935,6 +938,7 @@ Prompts longer than the loaded context are refused with a 400. A reply that woul
 | `draft_tokens` | 6 | Most guesses per pass, 1 to 16 |
 | `merge_passes` | `true` | Let conversations share a pass |
 | `model_hashes` | None | The contents of a `shardmesh model hash` file |
+| `embedding` | `false` | This is an embedding model. See [Embeddings](#embeddings) |
 | `reuse_cached`, `peer_fetch` | Pool default | Weigh cached shards, and copy from peers |
 | `wait` | `true` | `false` returns at once. Progress is in `/admin/status` |
 
@@ -1027,6 +1031,53 @@ Two behaviors keep transfers down, both on by default. Shards in place count, be
 | Serving shards to peers | | | `--no-peer-serve` |
 
 To check every byte against a list you trust, see [Models in the security guide](docs/SECURITY.md#models).
+
+## Embeddings
+
+`POST /v1/embeddings` takes OpenAI's request and runs a GGUF embedding model on llama.cpp, behind the same keys and rate limits as chat. Load one with `--embedding`, in a lane or as the main model:
+
+```bash
+shardmesh load Qwen3-Embedding-0.6B-Q8_0.gguf --lane vectors --embedding --url http://node-a:8669
+```
+
+```bash
+curl http://node-a:8669/v1/embeddings -H "Authorization: Bearer KEY" -H "Content-Type: application/json" \
+  -d '{"model": "Qwen3-Embedding-0.6B-Q8_0.gguf", "input": ["first text", "second text"]}'
+```
+
+| Field | Default | What it does |
+|---|---|---|
+| `input` | Required | A string, or a list of up to 2048 strings. Token arrays are not accepted |
+| `model` | The main model | Name a lane's model here |
+| `encoding_format` | `float` | `float`, or `base64` for little-endian float32 |
+| `dimensions` | The model's width | Shorter vectors, on models trained for it |
+| `user` | None | Accepted for OpenAI clients, and not used |
+
+The reply holds one `embedding` per input, in order, and `usage` counts `prompt_tokens` and `total_tokens`.
+
+- Vectors come from llama.cpp's embedding mode, with the pooling the GGUF declares, scaled to unit length. A GGUF that declares mean, CLS, or last-token pooling has to be loaded with `--embedding`, and one that declares none is refused with it.
+- An embedding model takes one stage on one worker, whatever `--placement` says, because pooling happens at the end of the model over whole sequences. If it would need more than one stage, the load is refused with a 507.
+- The control plane packs inputs into passes of up to 64 inputs and 1024 tokens. An input longer than that gets a pass of its own.
+- An input longer than `--context-tokens` is refused with a 400 that says which one. Nothing is cut silently, because a cut text gives a different vector.
+- `dimensions` keeps the leading values and scales again. A GGUF cannot say whether a model was trained for this, so it works for the Qwen3-Embedding family, down to 32, and any other model is refused unless the value is its full width.
+- A chat model asked for embeddings, and an embedding model asked to chat, both get a 400 that says so.
+- `GET /v1/models` gives each model a `kind` of `chat` or `embedding`, and `dimensions` for an embedding model. The chat page leaves embedding models out of its picker.
+- On a stage with no GPU layers, embedding mode turns off llama.cpp's operation offload. Left on, it took 1.2 GiB of VRAM on a node given no GPU, at the default 4096 tokens of context.
+
+Measured with Qwen3-Embedding-0.6B Q8_0 on four CPU threads, on a machine busy with other jobs. The reference is `llama-server --embedding --pooling last --no-op-offload`, because the release has no `llama-embedding`.
+
+| Measurement | Result |
+|---|---|
+| 64 texts one at a time, against llama-server | Cosine 1.0, largest difference in any value 1.5e-8 |
+| 64 texts in one request, against llama-server the same way | Cosine 0.9996 at worst |
+| llama-server batched, against itself one at a time | Cosine 0.9996 at worst, so batching alone moves vectors this much |
+| Three pairs of sentences meaning the same thing | Cosine 0.77 to 0.80 |
+| Most similar unrelated pair | Cosine 0.38 |
+| 256 short inputs, 3,884 tokens | 239 tokens/s, 15.8 inputs/s |
+| 8 long inputs, 4,496 tokens | 248 tokens/s |
+| llama-server, 64 short inputs on the same settings | About 270 tokens/s |
+
+An embedding model has not been run on a GPU stage. BERT-family GGUFs are refused, because only the architectures in [GGUF models](#gguf-models) can load.
 
 ## Memory and placement
 
@@ -1177,7 +1228,7 @@ The full guide is [Operating ShardMesh](docs/OPERATIONS.md).
 | `stage_errors_total` | Requests a stage refused. Nobody is quarantined for these, so a real fault shows here |
 | `stage_restarts_total`, `worker_stage_restarts_total` | Replays after a stage restart, and stage processes restarted |
 | `recoveries_total` | Pipeline repairs during a reply |
-| `requests_total`, `tokens_generated_total`, `replies_in_flight` | Traffic through this node |
+| `requests_total`, `tokens_generated_total`, `embedding_tokens_total`, `replies_in_flight` | Traffic through this node |
 | `token_latency_ms`, `worker_compute_ms` | Time per token, and compute per pass |
 | `worker_stages_kept_total` | Reconfigures that moved no weights |
 | `worker_draft_tokens_per_pass` | Tokens per speculative pass. Near 1 means the draft is not helping |

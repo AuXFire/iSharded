@@ -119,6 +119,7 @@ class GgufStage:
         self.first = assignment.start_layer == 0
         self.last = assignment.end_layer == adapter.num_layers
         self.width = adapter.header.hidden_size
+        self.embedding = request.embedding
         placements = assignment.placements
         units = [item.unit for item in placements if item.bytes]
         started = time.perf_counter()
@@ -151,6 +152,7 @@ class GgufStage:
             "rollback_tokens": request.speculate_tokens,
             "slots": request.slots,
             "map_file": needs_mapping(placements, pools),
+            "embedding": request.embedding,
         }
         self.host = self._start()
 
@@ -171,6 +173,11 @@ class GgufStage:
     def embed(self, tokens: list[int]) -> np.ndarray:
         _, data = self.host.call("embed", tokens=tokens)
         return np.frombuffer(data, dtype=np.float32).reshape(-1, self.width)
+
+    def pool(self, inputs: list[list[int]]) -> np.ndarray:
+        """One pooled vector per input, in one pass, as the model made them."""
+        answer, data = self.host.call("pool", inputs=inputs)
+        return np.frombuffer(data, dtype=np.float32).reshape(len(inputs), answer["width"])
 
     def forward(self, hidden: np.ndarray, position: int, slot: int = 0) -> np.ndarray:
         """Hidden states [tokens, width] in; hidden states out, or logits at the last stage."""

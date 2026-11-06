@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import gc
 import hmac
 import importlib.metadata
@@ -47,6 +48,7 @@ from .protocol import (
     ConfigureRequest,
     HardwareInfo,
     DraftModel as DraftSource,
+    EmbedPass,
     GenerateRequest,
     InferRequest,
     MemoryPool,
@@ -619,6 +621,7 @@ class WorkerRuntime:
             request.slots,
             request.draft.file if request.draft and stage.start_layer == 0 else None,
             tuple(sorted(request.unit_hashes.items())),
+            request.embedding,
         )
 
     async def hold_gate(self, seconds: float) -> bool:
@@ -1750,6 +1753,39 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             await runtime.gate.release(slot)
 
     return StreamingResponse(tokens(), media_type="application/x-ndjson")
+
+
+@app.post("/v1/embed")
+async def embed(body: EmbedPass, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """One pass of an embedding model. The control plane tokenizes and packs the inputs."""
+    verify_token(authorization)
+    if not body.inputs or not all(body.inputs):
+        raise HTTPException(status_code=400, detail="inputs cannot be empty")
+    if runtime.waiting >= MAX_WAITING_REPLIES:
+        raise HTTPException(status_code=429, detail="too many requests are waiting; try again shortly")
+    runtime.waiting += 1
+    try:
+        slot = await runtime.gate.acquire()
+    finally:
+        runtime.waiting -= 1
+    try:
+        if body.epoch != runtime.epoch:
+            raise HTTPException(status_code=409, detail=f"pipeline epoch mismatch; worker has {runtime.epoch}")
+        if runtime.gguf is None or not runtime.gguf.embedding:
+            raise HTTPException(status_code=409, detail="this worker is not running an embedding model")
+        started = time.perf_counter()
+        vectors = await asyncio.to_thread(runtime.gguf.pool, body.inputs)
+        runtime._record("compute", started)
+        runtime.inference_calls += 1
+        runtime.tokens_processed += sum(map(len, body.inputs))
+        return {"vectors": base64.b64encode(vectors.tobytes()).decode("ascii")}
+    except StageLost as exc:
+        raise await runtime.replace_stage(exc) from exc
+    except LlamaError as exc:
+        runtime.last_error = f"{type(exc).__name__}: {exc}"
+        raise HTTPException(status_code=500, detail=runtime.last_error) from exc
+    finally:
+        await runtime.gate.release(slot)
 
 
 @app.post("/internal/forward")
