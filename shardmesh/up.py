@@ -35,6 +35,7 @@ import httpx
 import psutil
 
 from .access import digest
+from .discovery import find_meshes
 from .node import add_node_arguments, detect_address, run_node
 from .pool import _private_link, _write_private, add_node, approve_membership, home as pool_home, init_pool, request_membership, sign_entry
 
@@ -43,6 +44,7 @@ INVITE_PREFIX = "smi-"
 INVITE_ADDRESSES = 4
 APPROVAL_SECONDS = 3.0
 APPROVAL_WAIT_SECONDS = 180.0
+PERSON_WAIT_SECONDS = 1800.0  # someone has to come and click
 HEALTH_WAIT_SECONDS = 180.0
 
 
@@ -166,7 +168,7 @@ def local_url(settings: dict[str, Any]) -> str:
 
 
 def approve_invited(home: Path, client: httpx.Client, base: str, key: str, clock: Any = time.time) -> list[str]:
-    """Sign in whoever holds a good invite. Runs only where the authority's key is."""
+    """Sign in whoever holds a good invite or was approved. Runs only where the authority's key is."""
     headers = {"Authorization": f"Bearer {key}"}
     response = client.get(base + "/join/requests", headers=headers)
     if response.status_code != 200:
@@ -175,19 +177,33 @@ def approve_invited(home: Path, client: httpx.Client, base: str, key: str, clock
     for item in response.json().get("requests", []):
         invites = read_invites(home)
         invite = matching_invite(invites, item, clock)
-        if invite is None:
-            continue
         name = str(item["name"])
+        if item.get("denied"):
+            client.post(base + "/access/entries", json=sign_entry(str(home), {"type": "deny", "name": name, "fingerprint": item["fingerprint"]}))
+            continue
+        if invite is None and not item.get("approved"):
+            announce_waiting(name, item)
+            continue
         certificate = approve_membership(str(home), str(item["request"]))
         client.post(base + "/access/entries", json=sign_entry(str(home), {"type": "member", "name": name, "certificate": certificate}))
         key_hash = str(item.get("key_sha256", ""))
         if re.fullmatch(r"[0-9a-f]{64}", key_hash):
             entry = {"type": "key", "name": f"{name}-user", "role": "user", "sha256": key_hash, "requests_per_minute": 0}
             client.post(base + "/access/entries", json=sign_entry(str(home), entry))
-        invite["uses"] -= 1
-        write_invites(home, invites)
+        if invite is not None:
+            invite["uses"] -= 1
+            write_invites(home, invites)
         added.append(name)
     return added
+
+
+ANNOUNCED: set[str] = set()
+
+
+def announce_waiting(name: str, item: dict[str, Any]) -> None:
+    if name not in ANNOUNCED:
+        ANNOUNCED.add(name)
+        print(f"{name} is asking to join, with key {item.get('fingerprint')}. Check that matches what it shows, then approve it on the dashboard or with: shardmesh approve {name}", flush=True)
 
 
 def fetch_authority(invite: dict[str, Any]) -> tuple[str, str]:
@@ -218,9 +234,11 @@ def certificate_matches_key(certificate: str, key_file: Path) -> bool:
     return public.public_bytes(*raw) == private.public_key().public_bytes(*raw)
 
 
-def join_mesh(home: Path, code: str, name: str, address: str) -> str:
-    """Ask for a place in the mesh with an invite. Returns the address that answered."""
-    invite = read_invite(code)
+def join_mesh(home: Path, invite: dict[str, Any], name: str, address: str) -> str:
+    """Ask for a place in the mesh, with an invite's secret or for a person to approve.
+
+    Returns the address that answered.
+    """
     url, pem = fetch_authority(invite)
     home.mkdir(parents=True, exist_ok=True)
     (home / "ca.pem").write_text(pem, encoding="utf-8")
@@ -228,18 +246,22 @@ def join_mesh(home: Path, code: str, name: str, address: str) -> str:
     key = "smk-" + secrets.token_urlsafe(32)
     request = request_membership(str(home), name, [address, "127.0.0.1"])
     key_hash = digest(key)
+    secret = invite.get("secret")
+    asking = {"request": request, "key_sha256": key_hash}
+    if secret:
+        asking["proof"] = invite_proof(secret, request, key_hash)
     with httpx.Client(timeout=30.0, trust_env=False, verify=verify) as client:
-        answer = client.post(
-            url + "/join/requests",
-            json={"request": request, "key_sha256": key_hash, "proof": invite_proof(invite["secret"], request, key_hash)},
-        )
+        answer = client.post(url + "/join/requests", json=asking)
         if answer.status_code != 200:
             raise ValueError(answer.text[:200])
         state = answer.json().get("status")
         if state in {"refused", "busy"}:
             raise ValueError("this mesh refused this machine" if state == "refused" else "too many machines are waiting; try again soon")
-        print(f"Asked to join as {name}. Waiting for the owner's machine to sign.", flush=True)
-        deadline = time.monotonic() + APPROVAL_WAIT_SECONDS
+        if secret:
+            print(f"Asked to join as {name}. Waiting for the owner's machine to sign.", flush=True)
+        else:
+            print(f"Asked to join as {name}. Approve it on the mesh's dashboard, checking the key shown there is {answer.json().get('fingerprint')}.", flush=True)
+        deadline = time.monotonic() + (APPROVAL_WAIT_SECONDS if secret else PERSON_WAIT_SECONDS)
         while time.monotonic() < deadline:
             found = client.get(f"{url}/join/certificate/{name}")
             if found.status_code == 200:
@@ -340,6 +362,27 @@ def keep_watch(home: Path, settings: dict[str, Any], args: argparse.Namespace) -
                 print(f"Could not check for new machines: {exc}", flush=True)
 
 
+def choose_mesh(found: list[dict[str, str]], args: argparse.Namespace) -> dict[str, str] | None:
+    """Whether to join a mesh this machine can see. Never without being asked to."""
+    if not found:
+        return None
+    if args.find:
+        if len(found) > 1:
+            raise ValueError(f"found {len(found)} meshes, so use an invite to choose one")
+        return found[0]
+    print("Found on this network:", flush=True)
+    for number, mesh in enumerate(found, 1):
+        print(f"  {number}. {mesh['name']} at {mesh['url']}, authority {mesh['authority'][:12]}", flush=True)
+    if not sys.stdin.isatty():
+        print("Starting a new mesh instead. Run shardmesh up --find to ask to join.", flush=True)
+        return None
+    answer = input(f"Join which? Enter a number, or n for a new mesh [{1}]: ").strip().lower()
+    if answer in {"n", "no"}:
+        return None
+    index = int(answer) - 1 if answer.isdigit() else 0
+    return found[index] if 0 <= index < len(found) else None
+
+
 def first_settings(args: argparse.Namespace, home: Path) -> dict[str, Any]:
     address = args.address or detect_address()
     tls = bool(args.tls) or needs_tls(address, args.trusted_network)
@@ -356,6 +399,7 @@ def first_settings(args: argparse.Namespace, home: Path) -> dict[str, Any]:
         "gguf_dirs": [*(args.gguf_dir or []), *model_folders()],
         "ownerless": bool(args.ownerless),
         "join": [args.join] if args.join else [],
+        "discoverable": not args.no_discovery and not args.ownerless,
     }
 
 
@@ -368,6 +412,13 @@ def make_ownerless(home: Path, settings: dict[str, Any], joining: str) -> None:
     settings["name"] = identity_name(home / "commons")
     key = create_key(str(home / "access.json"), "owner", "admin")
     _write_private(home / "admin.key", key.encode())
+
+
+def become_member(home: Path, settings: dict[str, Any], invite: dict[str, Any]) -> None:
+    settings["tls"] = any(url.startswith("https") for url in invite["urls"])
+    answered = join_mesh(home, invite, settings["name"], settings["address"])
+    settings["join"] = list(dict.fromkeys([answered, *invite["urls"]]))
+    write_settings(home, settings)
 
 
 def run_up(args: argparse.Namespace) -> int:
@@ -383,19 +434,19 @@ def run_up(args: argparse.Namespace) -> int:
                 print(f"This machine already belongs to a mesh, kept in {home}. Remove that folder to join another.", file=sys.stderr)
                 return 1
             settings = first_settings(args, home)
-            invite = read_invite(args.invite)
-            settings["tls"] = any(url.startswith("https") for url in invite["urls"])
-            answered = join_mesh(home, args.invite, settings["name"], settings["address"])
-            settings["join"] = list(dict.fromkeys([answered, *invite["urls"]]))
-            write_settings(home, settings)
+            become_member(home, settings, read_invite(args.invite))
         elif settings is None:
             settings = first_settings(args, home)
-            if settings["ownerless"]:
-                make_ownerless(home, settings, args.joining)
+            mesh = None if args.new_mesh or args.ownerless or args.no_discovery else choose_mesh(find_meshes(), args)
+            if mesh:
+                become_member(home, settings, {"urls": [mesh["url"]], "authority": mesh["authority"]})
             else:
-                make_owner(home, settings["name"], settings["address"])
-            write_settings(home, settings)
-            print(f"Made a new mesh in {home}. This machine owns it. Keep that folder safe.", flush=True)
+                if settings["ownerless"]:
+                    make_ownerless(home, settings, args.joining)
+                else:
+                    make_owner(home, settings["name"], settings["address"])
+                write_settings(home, settings)
+                print(f"Made a new mesh in {home}. This machine owns it. Keep that folder safe.", flush=True)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -405,6 +456,8 @@ def run_up(args: argparse.Namespace) -> int:
         return 1
     if settings["tls"]:
         print("Using TLS with this mesh's own certificate, so a browser will warn once. Tailscale avoids that.", flush=True)
+    if settings.get("discoverable"):
+        os.environ["SHARDMESH_DISCOVERABLE"] = "1"
     threading.Thread(target=keep_watch, args=(home, settings, args), daemon=True).start()
     return run_node(node_arguments(settings, home))
 
@@ -419,6 +472,19 @@ def run_invite(args: argparse.Namespace) -> int:
     invite = create_invite(home, [url], args.uses, args.hours)
     print(f"On the new machine, run:\n\n  {invite['command']}\n\nIt works {args.uses} time(s), for {args.hours:g} hours.")
     return 0
+
+
+def run_approve(args: argparse.Namespace) -> int:
+    home = up_home()
+    settings = read_settings(home)
+    key = sign_in_key(home)
+    if settings is None or key is None:
+        print("Run this on the machine that made the mesh.", file=sys.stderr)
+        return 1
+    with client_for(settings, home) as client:
+        answer = client.post(f"{local_url(settings)}/admin/join/{args.name}/{args.join_command}", headers={"Authorization": f"Bearer {key}"})
+    print(f"Done: {args.join_command} {args.name}." if answer.status_code < 400 else f"Refused: {answer.text[:200]}")
+    return 0 if answer.status_code < 400 else 1
 
 
 def service_definition(python: str, system: str, user_home: Path) -> tuple[Path | None, str]:
@@ -517,6 +583,9 @@ def add_arguments(subparsers: Any) -> None:
     up.add_argument("--gguf-dir", action="append", default=None, help="a folder of GGUF files; LM Studio's is found for you. Repeatable")
     up.add_argument("--model", default=None, help="load this model once the node is up")
     up.add_argument("--no-browser", action="store_true", help="do not open the chat page")
+    up.add_argument("--find", action="store_true", help="ask to join the one mesh on this network, without asking you first")
+    up.add_argument("--new-mesh", action="store_true", help="start a new mesh even if one is on this network")
+    up.add_argument("--no-discovery", action="store_true", help="do not look for a mesh, and do not answer machines looking for this one")
     up.add_argument("--ownerless", action="store_true", help="make or join a network nobody owns")
     up.add_argument("--joining", choices=["open", "vouched"], default="vouched", help="with --ownerless: who this node accepts")
     up.add_argument("--join", default=None, help="with --ownerless: any node already in the network")
@@ -525,6 +594,10 @@ def add_arguments(subparsers: Any) -> None:
     invite.add_argument("--uses", type=int, default=1, help="how many machines the code can add")
     invite.add_argument("--hours", type=float, default=24.0, help="how long the code lasts")
     invite.set_defaults(handler=run_invite)
+    for name, text in (("approve", "let a machine that asked into the mesh"), ("deny", "turn a machine down")):
+        change = subparsers.add_parser(name, help=text)
+        change.add_argument("name", help="the machine's name, as it asked")
+        change.set_defaults(handler=run_approve, join_command=name)
     doctor = subparsers.add_parser("doctor", help="check this machine, and say what to fix")
     doctor.set_defaults(handler=run_doctor)
     service = subparsers.add_parser("service", help="start this node when you log in")

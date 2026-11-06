@@ -877,6 +877,17 @@ def test_a_node_is_only_planned_for_models_its_owner_agreed_to_host():
     done(orchestrator)
 
 
+def test_a_vulkan_gpu_is_only_planned_for_gguf_models():
+    gpu, other = record("w1"), record("w2")
+    gpu.registration.hardware.backend = "vulkan"
+    orchestrator = pool(w1=gpu, w2=other)
+    orchestrator.planning_model = "Qwen/Qwen3-0.6B"
+    assert [item.worker_id for item in orchestrator.candidates()] == ["w2"]
+    orchestrator.planning_model = "owner/repo:model.gguf"
+    assert sorted(item.worker_id for item in orchestrator.candidates()) == ["w1", "w2"]
+    done(orchestrator)
+
+
 def test_a_returned_node_still_waits_for_replies_to_finish():
     orchestrator, calls = repairing_pool(w1=record("w1"), w2=record("w2"))
     orchestrator.lost_from_route = {"w2"}

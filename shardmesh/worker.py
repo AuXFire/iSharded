@@ -660,7 +660,8 @@ class WorkerRuntime:
         placements = [item for item in request.assignment.placements if item.bytes]
         self.materialize_total = len(placements)
         self.materialize_done = 0
-        folder = self.llama_dir or str(ensure_build(pick_build(self.requested_device)))
+        on_vulkan = any(pool.device.startswith("vulkan") for pool in self.pools.values())
+        folder = self.llama_dir or str(ensure_build(pick_build("vulkan" if on_vulkan else self.requested_device)))
         threads = self.cpu_threads or max((os.cpu_count() or 4) // 2, 1)
         self.gguf = GgufStage(folder, rocm_library_paths(), self.unit_cache, request, adapter, self.pools, threads)
         self._load_draft(request, folder, threads)

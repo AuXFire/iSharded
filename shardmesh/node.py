@@ -78,7 +78,7 @@ def add_node_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--gpu-device",
         default="auto",
-        help="auto (every accelerator), cuda:0, cuda:0,cuda:1, mps, xpu:0, or none. "
+        help="auto (every accelerator), cuda:0, cuda:0,cuda:1, mps, xpu:0, vulkan, or none. "
         "ROCm uses PyTorch's cuda device API",
     )
     parser.add_argument("--gpu-memory-gb", type=float, default=0, help="VRAM budget per accelerator; 0 means auto")
@@ -349,7 +349,9 @@ def node_specs(args: argparse.Namespace) -> list[tuple[str, list[str]]]:
 
         has_mps = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
         has_xpu = hasattr(torch, "xpu") and torch.xpu.is_available()
-        gpu_device = "auto" if torch.cuda.is_available() or has_mps or has_xpu else "none"
+        from .memory import vulkan_accelerators
+
+        gpu_device = "auto" if torch.cuda.is_available() or has_mps or has_xpu or vulkan_accelerators() else "none"
     # A worker with weights in several memory types executes all of them
     # itself: the CPU runs the RAM and disk tiers, the GPU the VRAM tier.
     spans_tiers = gpu_device != "none" and bool(weight_flags)

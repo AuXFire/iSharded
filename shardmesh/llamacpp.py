@@ -245,6 +245,8 @@ def pick_build(requested_device: str = "auto") -> str:
 
     if str(requested_device).startswith("cpu"):
         return "cpu"
+    if str(requested_device).startswith("vulkan"):
+        return "vulkan"
     if torch.version.hip:
         return "rocm"
     if torch.cuda.is_available():

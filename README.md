@@ -38,6 +38,7 @@ More detail lives in [Operating ShardMesh](docs/OPERATIONS.md) and [ShardMesh se
 - Starts with one command, and adds a machine with an invite code. Hardware, addresses, and certificates are worked out for you.
 - Splits a model's layers across machines, each holding only its share. Weights are never gathered on one machine.
 - Spans memory types: one node can hold layers in VRAM, RAM, and disk at once, and nodes do not have to match.
+- Uses any GPU with a Vulkan driver for GGUF models, so nodes need no CUDA or ROCm.
 - Runs GGUF models on stock llama.cpp, and safetensors models on its own PyTorch code. Qwen and GPT-2 families, including mixture-of-experts models.
 - Speeds up replies with a small draft model, reuses earlier conversation state, and lets conversations share a pass through each stage.
 - Runs several models at once on the same mesh, and users choose between them.
@@ -67,7 +68,7 @@ curl -fsSL https://raw.githubusercontent.com/AuXFire/shardmesh/main/install.sh |
 
 Then `shardmesh doctor` checks the machine, and says what to fix if anything is missing.
 
-The installers pick a CUDA build of PyTorch where they find an NVIDIA GPU, and otherwise a CPU build on Windows. An AMD GPU on Windows needs a ROCm build of PyTorch, which you install [by hand](#by-hand).
+The installers pick a CUDA build of PyTorch where they find an NVIDIA GPU, and otherwise a CPU build on Windows. A GPU PyTorch cannot see, such as an AMD card on Windows, still works for GGUF models: the node finds it through llama.cpp's Vulkan build. See [Any GPU](#any-gpu).
 
 ### By hand
 
@@ -116,6 +117,8 @@ shardmesh invite
 It prints one command to run on the new machine, with a code that works once and lasts 24 hours. The dashboard's "Add a machine" button does the same. The new machine makes its own key, proves it holds the code, and gets a certificate signed by the owner's machine, which has to be running at that moment. Nothing needs copying. Run `shardmesh up --invite CODE` on as many machines as you invite.
 
 The new machine gets its own key for the chat page, with the user role. The owner's key stays the only admin key.
+
+Or skip the code. A new machine running `shardmesh up` looks for a mesh on its LAN and its tailnet, and offers to join what it finds. The machine then waits for someone to approve it, on the dashboard or with `shardmesh approve NAME`, and both sides show the same key fingerprint to check. If a firewall blocks the search, which uses UDP port 8208 on a LAN, use an invite.
 
 ### What it works out
 
@@ -544,6 +547,9 @@ Starts a node with everything worked out, and is the easy way in. See [Quick sta
 | `--gguf-dir` | LM Studio's folders | A folder of GGUF files. Repeatable |
 | `--model` | None | Load this model once the node is up |
 | `--no-browser` | Off | Do not open the chat page |
+| `--find` | Off | Ask to join the one mesh on this network, without asking you first |
+| `--new-mesh` | Off | Start a new mesh even if one is on this network |
+| `--no-discovery` | Off | Do not look for a mesh, and do not answer machines looking for this one |
 | `--ownerless` | Off | Make or join a [network nobody owns](#a-network-nobody-owns) |
 | `--joining` | `vouched` | With `--ownerless`: who this node accepts, `open` or `vouched` |
 | `--join` | None | With `--ownerless`: any node already in the network |
@@ -551,6 +557,10 @@ Starts a node with everything worked out, and is the easy way in. See [Quick sta
 ### shardmesh invite
 
 Makes a code that adds a machine to this mesh, on the machine that made it. `--uses` sets how many machines it can add, 1 by default, and `--hours` how long it lasts, 24 by default.
+
+### shardmesh approve and deny
+
+`shardmesh approve NAME` lets in a machine that asked to join, and `shardmesh deny NAME` turns it down. Run them on the machine that made the mesh. The dashboard does the same.
 
 ### shardmesh doctor
 
@@ -801,6 +811,7 @@ A flag takes priority over its variable.
 | `SHARDMESH_LANE`, `SHARDMESH_LANES_FILE` | Set by `shardmesh node`: which lane a process is, and where a node keeps the lanes it should run |
 | `SHARDMESH_OWNERLESS` | `--ownerless` |
 | `SHARDMESH_UP_HOME` | Where `shardmesh up` keeps its settings and keys |
+| `SHARDMESH_DISCOVERABLE` | Set by `shardmesh up`: answer machines looking for a mesh |
 | `SHARDMESH_HOST_MODELS` | `--host-models` |
 | `SHARDMESH_MODEL_DIRS` | `--model-dir`, separated by the system's path separator |
 | `SHARDMESH_REUSE_CACHED`, `SHARDMESH_PEER_FETCH` | Set to `0` for the control plane's `--no-reuse-cached`, `--no-peer-fetch` |
@@ -829,6 +840,7 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `POST` | `/admin/load` | Admin key | Load a model |
 | `POST` | `/admin/load/cancel` | Admin key | Stop a load. Finished units stay cached |
 | `DELETE` | `/admin/lanes/{name}` | Admin key | Stop a lane and free its memory on every node |
+| `POST` | `/admin/join/{name}/{answer}` | Admin key | Answer a machine asking to join, with `approve` or `deny`, on the machine that made the mesh |
 | `POST` | `/admin/invites` | Admin key | Make a code that adds a machine. Takes `uses` and `hours`, and only the machine that made the mesh can |
 | `GET` | `/join/authority` | None | The mesh's public certificate, for a new machine to check against its invite |
 | `GET` | `/admin/network` | User key | In a network nobody owns, this node's own view. `/admin/status` shows the coordinator's |
@@ -1036,6 +1048,20 @@ Workers do not use NCCL, CUDA IPC, or remote device pointers. Each process loads
 
 Differences between backends can change sampling when logits are nearly tied. Bit-for-bit identity is not promised between different kernels.
 
+### Any GPU
+
+A node uses PyTorch to find GPUs. If PyTorch sees none, the node asks llama.cpp's Vulkan build instead, in a process of its own, so a GPU with a working Vulkan driver takes part whatever its maker. `--gpu-device vulkan` chooses this on purpose. It downloads a pinned build the first time, as other builds do.
+
+Vulkan runs GGUF models only, because safetensors models run on PyTorch. The planner keeps those off such a node. It also cannot time the GPU's memory, so it assumes 300 GB/s when placing layers.
+
+On a 6 GB RTX 3060 with Qwen3-0.6B Q8_0, one reply at a time, all three gave the same text:
+
+| Backend | Tokens per second |
+|---|---|
+| CUDA | 104.1 |
+| Vulkan | 102.6 |
+| CPU, 4 threads | 21.9 |
+
 ## Precision
 
 Workers run in BF16 by default. Add `--dtype float32` to a node to run its VRAM and RAM at full precision, which doubles the memory each layer takes. The planner accounts for that, so BF16 and FP32 nodes can share a route. Published Qwen checkpoints are BF16, so FP32 raises the precision of computation and not of the stored weights. The disk tier always runs in the checkpoint's own dtype.
@@ -1140,6 +1166,7 @@ The full guide is [Operating ShardMesh](docs/OPERATIONS.md).
 | `is not the mesh this invite is for` | The address in the invite answers with a different mesh | Stop, and ask the owner for a new code. Something else is at that address |
 | `another machine already uses the name` | Two machines have the same name | Run `shardmesh up --invite CODE --name another-name` |
 | `This machine already belongs to a mesh` | `shardmesh up` has settings from an earlier mesh | Remove the folder it names to join another |
+| A new machine does not find the mesh | A firewall blocks UDP port 8208, or the mesh was started with `--no-discovery` | Use `shardmesh invite` |
 | `only the machine that made this mesh can invite` | The authority's key is on the owner's machine | Run `shardmesh invite` or open the page there |
 | A lane stays on `starting` | A firewall blocks its ports, which are 1000 per lane above the node's own | Open them between nodes, then remove the lane and load it again |
 | `no node has memory left under the limits its owner set` | The main model uses all that owners gave | Give nodes more with `--gpu-memory-gb` or `--weights-ram-gb`, or load a smaller main model |
@@ -1198,11 +1225,11 @@ Adapter tests compare every family with the reference `transformers` implementat
 |---|---|
 | `shardmesh/orchestrator.py` | The control plane: API, planning, repair, gossip handling |
 | `shardmesh/worker.py` | A worker: stages, the token loop, merged passes, fetching |
-| `shardmesh/up.py` | One-command setup: settings, invites, `doctor`, and `service` |
+| `shardmesh/up.py`, `shardmesh/discovery.py` | One-command setup: settings, invites, finding a mesh, `doctor`, and `service` |
 | `shardmesh/node.py` | The launcher that supervises a node's services |
 | `shardmesh/lanes.py` | Several models at once: the front door and each node's lanes |
 | `shardmesh/commons.py` | A network nobody owns: self-made identities, vouches, and each node's view |
-| `shardmesh/inventory.py` | What a node reports about itself beyond memory budgets |
+| `shardmesh/inventory.py`, `shardmesh/gpu_probe.py` | What a node reports about itself, and how it finds GPUs PyTorch cannot see |
 | `shardmesh/formats.py` | Anthropic's, OpenAI Responses', and Ollama's request and reply shapes |
 | `shardmesh/mesh.py` | Membership and leader election, as pure logic |
 | `shardmesh/planner.py`, `shardmesh/memory.py` | Placement, and memory pool discovery |

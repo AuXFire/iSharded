@@ -6,7 +6,7 @@ list of pools and the planner works from that list. Four kinds exist.
 ========  ==================================  ================================
 kind      examples                            weights execute on
 ========  ==================================  ================================
-vram      NVIDIA, AMD ROCm, Intel XPU         that accelerator
+vram      NVIDIA, AMD ROCm, Intel XPU, Vulkan     that accelerator
 unified   Apple MPS, integrated GPUs          that accelerator, sharing RAM
 ram       system memory                       the CPU
 disk      NVMe or SSD, memory-mapped          the CPU, paged in by the OS
@@ -15,13 +15,20 @@ disk      NVMe or SSD, memory-mapped          the CPU, paged in by the OS
 
 from __future__ import annotations
 
+import ctypes.util
+import functools
+import json
 import os
 import platform
 import shutil
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+import httpx
 import psutil
 import torch
 
@@ -34,13 +41,15 @@ AUTO_RAM_SHARE = 0.6
 # Sequential NVMe read rate is not worth measuring at startup: the OS page
 # cache makes a quick probe report RAM speed rather than disk speed.
 DISK_BANDWIDTH_GBPS = 1.5
+VULKAN_PROBE_SECONDS = 30
+ASSUMED_VULKAN_GBPS = 300.0
 
 
 @dataclass(slots=True)
 class Accelerator:
     device: str
     kind: str  # vram | unified
-    backend: str  # cuda | rocm | mps | xpu
+    backend: str  # cuda | rocm | mps | xpu | vulkan
     name: str
     total_bytes: int
     free_bytes: int
@@ -99,6 +108,49 @@ def _has_mps() -> bool:
     return hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
 
 
+def vulkan_loader_present() -> bool:
+    """Whether this machine has a Vulkan driver at all, without starting one."""
+    if sys.platform == "darwin":
+        return False  # Macs get their GPU through PyTorch and Metal
+    return ctypes.util.find_library("vulkan-1" if os.name == "nt" else "vulkan") is not None
+
+
+def read_vulkan_devices(folder: Path, run: Any = subprocess.run) -> list[Accelerator]:
+    """What a Vulkan build sees, asked from a process of its own."""
+    try:
+        done = run([sys.executable, "-m", "shardmesh.gpu_probe", str(folder)], capture_output=True, text=True, timeout=VULKAN_PROBE_SECONDS)
+        reported = json.loads(done.stdout.strip().splitlines()[-1]) if done.returncode == 0 else []
+    except (IndexError, OSError, ValueError, subprocess.SubprocessError):
+        return []
+    found = []
+    for index, item in enumerate(item for item in reported if str(item.get("backend", "")).lower().startswith("vulkan")):
+        found.append(
+            Accelerator(
+                device=f"vulkan:{index}",
+                kind="unified" if item.get("integrated") else "vram",
+                backend="vulkan",
+                name=str(item.get("name", "Vulkan GPU")),
+                total_bytes=int(item.get("total_bytes", 0)),
+                free_bytes=int(item.get("free_bytes", 0)),
+                runtime_version=None,
+            )
+        )
+    return found
+
+
+@functools.lru_cache(maxsize=1)
+def vulkan_accelerators() -> tuple[Accelerator, ...]:
+    """GPUs PyTorch cannot see, such as an AMD card on Windows. For GGUF models only."""
+    from .llamacpp import LlamaError, ensure_build
+
+    if not vulkan_loader_present():
+        return ()
+    try:
+        return tuple(read_vulkan_devices(ensure_build("vulkan")))
+    except (LlamaError, OSError, ValueError, httpx.HTTPError):
+        return ()  # no way to fetch the build, as on a closed network
+
+
 def _all_accelerators() -> list[Accelerator]:
     found: list[Accelerator] = []
     if torch.cuda.is_available():
@@ -107,7 +159,7 @@ def _all_accelerators() -> list[Accelerator]:
         found.extend(_xpu_accelerator(index) for index in range(torch.xpu.device_count()))
     if _has_mps():
         found.append(_mps_accelerator())
-    return found
+    return found or list(vulkan_accelerators())
 
 
 def discover_accelerators(requested: str) -> list[Accelerator]:
@@ -119,12 +171,14 @@ def discover_accelerators(requested: str) -> list[Accelerator]:
     choice = requested.strip().lower()
     if choice in {"none", "cpu", ""}:
         return []
-    available = _all_accelerators()
+    available = list(vulkan_accelerators()) if choice.startswith("vulkan") else _all_accelerators()
+    if choice.startswith("vulkan") and not available:
+        raise ValueError("no Vulkan GPU found; check its driver, or that this machine can download llama.cpp's Vulkan build")
     if choice in {"auto", "all"}:
         return available
     selected: list[Accelerator] = []
     for name in (part.strip() for part in choice.split(",") if part.strip()):
-        name = {"cuda": "cuda:0", "xpu": "xpu:0"}.get(name, name)
+        name = {"cuda": "cuda:0", "xpu": "xpu:0", "vulkan": "vulkan:0"}.get(name, name)
         match = next((item for item in available if item.device == name), None)
         if match is None:
             known = ", ".join(item.device for item in available) or "none"
@@ -150,6 +204,8 @@ def measure_bandwidth(device: str, size_mib: int = 256, rounds: int = 16) -> flo
     copy has to be large and repeated: a short one mostly times launch overhead,
     and read a 7900 XT as slower than a laptop GPU.
     """
+    if device.startswith("vulkan"):
+        return ASSUMED_VULKAN_GBPS  # PyTorch cannot reach this GPU to time it
     target = torch.device(device)
     try:
         source = torch.empty(size_mib * 1024 * 1024 // 4, dtype=torch.float32, device=target)
