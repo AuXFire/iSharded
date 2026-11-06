@@ -1634,6 +1634,8 @@ A node started with `isharded up` keeps its route state, keys, and audit log in 
 | `token_latency_ms`, `worker_compute_ms` | Time per token, and compute per pass |
 | `worker_stages_kept_total` | Reconfigures that moved no weights |
 | `worker_draft_tokens_per_pass` | Tokens per speculative pass. Near 1 means the draft is not helping |
+| `worker_pipeline_tokens` | Tokens made with passes overlapping on the route |
+| `worker_pipeline_misses` | Guesses that sent a pipeline back |
 | `prompt_tokens_computed_total`, `prompt_tokens_reused_total` | Prompt tokens the route computed, and restored instead. This is the saving: the second over the sum of both. `metrics.cache` in `/admin/status` gives it as `saved_percent` |
 | `worker_prompt_tokens_computed_total` | Prompt tokens a stage computed |
 | `worker_tokens_reused_total` | Prompt tokens a stage restored instead of computing. `source` is `prefix` for a shared prefix or `history` for a conversation, then the tier it came from |
