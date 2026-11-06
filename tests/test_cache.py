@@ -3,6 +3,8 @@
 import asyncio
 import json
 import os
+import threading
+import time
 from types import SimpleNamespace
 
 from fastapi import HTTPException
@@ -313,8 +315,7 @@ MODEL = os.environ.get("ISHARDED_TEST_GGUF", "")
 needs_real_model = pytest.mark.skipif(not (BUILD and MODEL), reason="set ISHARDED_TEST_LLAMA_DIR and ISHARDED_TEST_GGUF")
 
 
-@pytest.fixture
-def stage():
+def start_stage(folder=None, ram=1024**3, disk=0):
     # A stage process of its own, because this test process has imported torch.
     from isharded.gguf import read_file_header
     from isharded.llama_host import StageHost
@@ -324,9 +325,15 @@ def stage():
     embed = {"path": MODEL, "offset": header.data_start + table.offset, "length": table.nbytes, "ggml_type": table.ggml_type}
     host = StageHost()
     host.call(
-        "load", folder=BUILD, extra_paths=[], path=MODEL, last=True, context_tokens=2048, gpu_layers=0,
-        threads=2, table=embed, cpu_tensors=[], slots=3, state_ram_bytes=1024**3,
+        "load", folder=BUILD, extra_paths=[], path=MODEL, last=True, context_tokens=2048, gpu_layers=0, threads=2, table=embed,
+        cpu_tensors=[], slots=3, state_dir=None if folder is None else str(folder), state_ram_bytes=ram, state_disk_bytes=disk,
     )
+    return host
+
+
+@pytest.fixture
+def stage():
+    host = start_stage()
     yield host
     host.close()
 
@@ -381,3 +388,79 @@ def test_one_state_serves_several_sequences(stage):
         stage.call("restore", key="shared", slot=slot)
         answers.append(run(stage, [*tokens[:200], *tokens[500:540]], start=200, slot=slot))
     assert np.array_equal(*answers)
+
+
+def wait_for_file(path, seconds=20.0):
+    deadline = time.monotonic() + seconds
+    while not path.is_file():
+        assert time.monotonic() < deadline, f"{path.name} was never written"
+        time.sleep(0.05)
+
+
+@needs_real_model
+def test_a_state_pushed_out_of_ram_comes_back_from_disk_exact(tmp_path):
+    stage = start_stage(tmp_path, ram=1, disk=1024**3)
+    try:
+        tokens = tokens_for_test()
+        expected = run(stage, tokens, cuts=[700], saves=[save_at(700, "history")])
+        wait_for_file(tmp_path / "history.state")
+        stage.call("clear", slot=0)
+        assert stage.call("restore", key="history", slot=1)[0]["tier"] == "disk"
+        assert np.array_equal(run(stage, tokens, start=700, slot=1), expected)
+    finally:
+        stage.close()
+
+
+@needs_real_model
+def test_a_state_outlives_the_stage_process_that_saved_it(tmp_path):
+    """Killed, not closed: nothing gets the chance to flush or tidy up."""
+    first = start_stage(tmp_path, disk=1024**3)
+    tokens = tokens_for_test()
+    expected = run(first, tokens, cuts=[700], saves=[save_at(700, "history")])
+    wait_for_file(tmp_path / "history.state")
+    first.process.kill()
+    first.close()
+    second = start_stage(tmp_path, disk=1024**3)
+    try:
+        assert second.call("restore", key="history", slot=1)[0]["tier"] == "disk"
+        assert np.array_equal(run(second, tokens, start=700, slot=1), expected)
+    finally:
+        second.close()
+
+
+def request_for(start=0, end=14, model="m", revision="r", speculate=0):
+    return SimpleNamespace(
+        model_id=model, revision=revision, speculate_tokens=speculate, assignment=SimpleNamespace(start_layer=start, end_layer=end)
+    )
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        request_for(start=14, end=28),
+        request_for(end=13),
+        request_for(model="another"),
+        request_for(revision="another"),
+        request_for(speculate=4),
+    ],
+)
+def test_a_state_is_tied_to_its_model_and_layers(other):
+    assert worker.WorkerRuntime.state_namespace(request_for()) != worker.WorkerRuntime.state_namespace(other)
+
+
+def test_the_same_stage_finds_its_states_again():
+    assert worker.WorkerRuntime.state_namespace(request_for()) == worker.WorkerRuntime.state_namespace(request_for())
+
+
+def test_a_busy_stage_is_not_waited_for():
+    """Health checks read the store's numbers, and a long prompt must not hold them up."""
+    from isharded.gguf_stage import GgufStage
+    from isharded.llama_host import StageHost
+
+    host = StageHost.__new__(StageHost)
+    host.lock = threading.Lock()
+    stage = GgufStage.__new__(GgufStage)
+    stage.host, stage.states = host, {"states": 1}
+    with host.lock:
+        stage.refresh_states()
+    assert stage.states == {"states": 1}

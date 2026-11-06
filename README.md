@@ -672,6 +672,8 @@ Hardware and memory:
 | `--weights-ram-gb` | None | System RAM for model weights, a size or `auto`. With a GPU, one worker spans both |
 | `--weights-disk-gb` | 0 | Disk for memory-mapped model weights |
 | `--ram-budget-gb` | 0 | RAM for KV-cache checkpoints, not weights. Adds a memory worker |
+| `--state-ram-gb` | 1 | RAM each stage keeps for saved prompt states, on top of its weights. The planner does not count it |
+| `--state-disk-gb` | 8 | Disk for saved prompt states, kept in `states` in `--cache-dir`. 0 keeps them in RAM only, and they then die with the stage process |
 
 Models and cache:
 
@@ -859,6 +861,7 @@ The state folder is `%LOCALAPPDATA%\iSharded` on Windows and `~/.cache/iSharded`
 | `--weights-ram-gb` | None | System RAM for model weights, or `auto` |
 | `--weights-disk-gb` | 0 | Disk for memory-mapped model weights |
 | `--ram-budget-gb` | 0 | RAM for KV checkpoints, not weights |
+| `--state-ram-gb`, `--state-disk-gb` | 1, 8 | RAM and disk for saved prompt states |
 | `--cache-dir` | `~/.cache/isharded/units` | Where fetched weights live |
 | `--cache-budget-gb` | 0 (no limit) | Evict old models past this size |
 | `--gguf-dir` | None | Folder holding GGUF files. Repeatable |
@@ -890,7 +893,7 @@ A flag takes priority over its variable.
 | `ISHARDED_WORKER_ID`, `ISHARDED_ORCHESTRATOR_URL`, `ISHARDED_ADVERTISE_URL` | The worker's `--worker-id`, `--orchestrator-url`, `--advertise-url` |
 | `ISHARDED_DEVICE`, `ISHARDED_ROLES`, `ISHARDED_CPU_THREADS` | `--device`, `--roles`, `--cpu-threads` |
 | `ISHARDED_GPU_MEMORY_GB`, `ISHARDED_RAM_BUDGET_GB` | `--gpu-memory-gb`, `--ram-budget-gb` |
-| `ISHARDED_STATE_RAM_GB` | RAM each stage keeps for saved prompt states. Default 1 |
+| `ISHARDED_STATE_RAM_GB`, `ISHARDED_STATE_DISK_GB` | `--state-ram-gb`, `--state-disk-gb` |
 | `ISHARDED_CACHE_DIR`, `ISHARDED_LLAMA_DIR` | `--cache-dir`, `--llama-dir` |
 | `ISHARDED_LANE`, `ISHARDED_LANES_FILE` | Set by `isharded node`: which lane a process is, and where a node keeps the lanes it should run |
 | `ISHARDED_OWNERLESS` | `--ownerless` |
@@ -1210,7 +1213,7 @@ Prompts are cut into passes at the same places whether or not anything is cached
 
 ### Several conversations at once
 
-`--parallel 3` gives every stage three independent sequences, each with its own context memory, which the planner counts. Replies from any node queue at the entry worker, and each conversation returns to the sequence holding its checkpoint. While one reply is away at the next stage, this stage works on another.
+`--parallel 3` gives every stage three independent sequences, each with its own context memory, which the planner counts. Replies from any node queue at the entry worker, and take the sequence idle longest. Any sequence can take any saved state, so conversations past `--parallel` wait their turn and do not reread their history. While one reply is away at the next stage, this stage works on another.
 
 Single-token steps from different conversations also share a pass through a stage, because reading the weights is what a pass costs. On one stage, four conversations went from 12 to 32 tokens per second. Across two stages the same load gained only 10%, from 34 to 37, because the stages stagger the conversations. Steps with speculative guesses do not merge, so a draft limits this. `--no-merge-passes` turns it off.
 
@@ -1513,6 +1516,7 @@ The full guide is [Operating iSharded](docs/OPERATIONS.md).
 | Node log | `--log-file` | Nothing is kept unless you set this |
 | Fetched shards | `--cache-dir` | Evicted past `--cache-budget-gb` |
 | Stage files | Inside the cache | Rebuilt from shards when a stage moves. Count double the node's share |
+| Saved prompt states | `states` inside the cache | People's conversations, unencrypted, readable only by the node's own user. Evicted past `--state-disk-gb`, and deleted when the model or the stage's layers change |
 
 A node started with `isharded up` keeps its route state, keys, and audit log in its own folder instead, along with its log, `node.log`.
 
@@ -1689,7 +1693,6 @@ Behavior:
 - There is one active RAM checkpoint service per route. Snapshots are not yet replicated or compressed. If the store is behind when a stage fails, recovery replays the prompt.
 - With two nodes, a split network leaves two coordinators until it heals. Nothing can be corrupted, but neither side can know it is the minority.
 - A reply is lost if the node its client is connected to dies.
-- Multi-turn reuse keeps one conversation per sequence, so more conversations than sequences push each other out and reread their history.
 - Mesh membership is meant for tens of nodes: every worker checks in with every control plane.
 - Tool arguments are not constrained to a schema, even for a forced call. Only the start of a call is forced, and a client should check what it receives.
 - A streamed tool call arrives once it is complete, not token by token.

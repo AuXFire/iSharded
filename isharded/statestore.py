@@ -46,6 +46,8 @@ SUFFIX = ".state"
 PARTIAL = ".part"
 # How long closing waits for writes still queued. A state not written is only a replay.
 FLUSH_SECONDS = 10.0
+# States waiting for a slow disk stay in RAM, past its budget, up to this much.
+WRITE_BACKLOG_BYTES = 1024**3
 PREFIX = "prefix"
 HISTORY = "history"
 # Rows in one pass. Every stage has to use the same number, as cuts depend on it.
@@ -103,9 +105,14 @@ def pass_ends(cuts: list[int], total: int) -> list[int]:
     return [end for end in ends if end < total]
 
 
-def namespace_of(*parts: Any) -> str:
-    """What a state belongs to. Anything that changes its meaning must be in here."""
-    return hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()[:24]
+def stage_namespace(build: str, model_id: str, revision: str, start: int, end: int, rollback_tokens: int) -> str:
+    """What a stage's states belong to. Anything that changes their meaning must be in here.
+
+    A node works this out for any stage, which is how a copy finds its way to whoever
+    takes over those layers. For a GGUF, the revision is a fingerprint of the file.
+    """
+    parts = [FORMAT, build, model_id, revision, start, end, rollback_tokens]
+    return hashlib.sha256(json.dumps(parts).encode()).hexdigest()[:24]
 
 
 @dataclass(slots=True)
@@ -220,17 +227,19 @@ class StateStore:
             self._shed_ram()
 
     def _shed_ram(self) -> None:
-        used = sum(entry.size for entry in self.entries.values() if entry.data is not None)
-        for key, entry in list(self.entries.items()):
+        held = [(key, entry) for key, entry in self.entries.items() if entry.data is not None]
+        used = sum(entry.size for _, entry in held)
+        waiting = sum(entry.size for _, entry in held if not entry.on_disk)
+        for key, entry in held:
             if used <= self.ram_bytes:
                 return
-            if entry.data is None:
-                continue
             if entry.on_disk:
                 entry.data = None
-            elif self.disk_bytes:
+            elif self.disk_bytes and (waiting <= WRITE_BACKLOG_BYTES or key == held[-1][0]):
                 continue  # its write is still queued, and then it can leave RAM
             else:
+                # With no disk, or one that cannot keep up, this state has nowhere to go.
+                waiting -= entry.size
                 del self.entries[key]
                 self.evicted += 1
             used -= entry.size
@@ -298,6 +307,29 @@ class StateStore:
         if data.size != entry.size or zlib.crc32(data) != header.get("crc"):
             return None
         return data
+
+    def adopt(self, key: str, path: Path) -> bool:
+        """Take over a state file that arrived from another node. False if it is no good."""
+        if self.folder is None:
+            path.unlink(missing_ok=True)
+            return False
+        try:
+            with path.open("rb") as handle:
+                header = self._read_header(handle)
+                data = np.fromfile(handle, dtype=np.uint8)
+            entry = Entry(int(header["length"]), int(header["size"]), str(header["kind"]), on_disk=True)
+            if data.size != entry.size or zlib.crc32(data) != header.get("crc"):
+                raise ValueError("a saved state that does not match its checksum")
+            with self.lock:
+                path.replace(self._file(key))
+                self.entries[key] = entry
+                self.entries.move_to_end(key)
+                self._shed_disk()
+            return True
+        except (OSError, ValueError, KeyError, TypeError):
+            self.damaged += 1
+            path.unlink(missing_ok=True)
+            return False
 
     def file_of(self, key: str) -> Path | None:
         """Where a state's file is, once it has been written."""
@@ -372,21 +404,26 @@ class PrefixIndex:
     def __init__(self) -> None:
         self.entries: OrderedDict[str, tuple[int, str]] = OrderedDict()
         self.seen: OrderedDict[str, None] = OrderedDict()
+        # States a stage may first have to fetch from whichever node holds its copy.
+        self.elsewhere: set[str] = set()
 
     def __contains__(self, key: str) -> bool:
         return key in self.entries
 
-    def add(self, key: str, length: int, kind: str) -> None:
+    def add(self, key: str, length: int, kind: str, elsewhere: bool = False) -> None:
         self.entries[key] = (length, kind)
         self.entries.move_to_end(key)
+        (self.elsewhere.add if elsewhere else self.elsewhere.discard)(key)
         while len(self.entries) > INDEX_LIMIT:
-            self.entries.popitem(last=False)
+            self.elsewhere.discard(self.entries.popitem(last=False)[0])
 
     def drop(self, key: str | None) -> None:
         self.entries.pop(key, None)
+        self.elsewhere.discard(key)
 
     def clear(self) -> None:
         self.entries.clear()
+        self.elsewhere.clear()
 
     def longest(self, prompt: list[int]) -> tuple[int, str, str] | None:
         """The longest state this prompt starts with. Something must be left to run."""
@@ -409,11 +446,11 @@ class PrefixIndex:
         return before
 
 
-def clear_other_stores(root: Path | str, keep: str) -> None:
+def clear_other_stores(root: Path | str, keep: set[str]) -> None:
     """Delete stores for other models or layers. They can never be used again."""
     root = Path(root)
     if not root.is_dir():
         return
     for path in root.iterdir():
-        if path.is_dir() and path.name != keep:
+        if path.is_dir() and path.name not in keep:
             shutil.rmtree(path, ignore_errors=True)

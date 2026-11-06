@@ -235,6 +235,15 @@ class GgufStage:
     def clear(self, slot: int = 0) -> None:
         self.host.call("clear", slot=slot)
 
+    def refresh_states(self) -> None:
+        """Bring the store's report up to date, unless that would mean waiting."""
+        try:
+            answer = self.host.ask_if_idle("state_stats")
+        except LlamaError:
+            return  # whatever is wrong, the next reply finds it and deals with it
+        if answer is not None:
+            self.states = answer["states"]
+
     def close(self) -> None:
         self.host.close()
 

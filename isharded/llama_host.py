@@ -126,6 +126,9 @@ class _Host:
         self.stage.restore_state(held[0], meta.get("slot", 0))
         return {"tier": held[1], "states": self.states.stats()}, b""
 
+    def state_stats(self, _: dict[str, Any], __: bytes) -> tuple[dict[str, Any], bytes]:
+        return {"states": self.states.stats()}, b""
+
     def commit(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
         assert self.stage is not None
         self.stage.decode_tokens(meta["tokens"], meta["position"], sequence_id=meta.get("slot", 0))
@@ -238,18 +241,30 @@ class StageHost:
             raise LlamaError(f"the stage process did not start (exit code {self.process.poll()})")
         return accepted[0]
 
-    def call(self, operation: str, payload: bytes = b"", **meta: Any) -> tuple[dict[str, Any], bytes]:
-        with self.lock:
-            try:
-                self.connection.send_bytes(json.dumps({"op": operation, **meta}).encode())
-                self.connection.send_bytes(payload)
-                answer = json.loads(self.connection.recv_bytes())
-                data = self.connection.recv_bytes()
-            except (EOFError, OSError) as exc:
-                raise StageLost(f"the stage process died (exit code {self.process.poll()})", self) from exc
+    def _exchange(self, operation: str, payload: bytes, meta: dict[str, Any]) -> tuple[dict[str, Any], bytes]:
+        try:
+            self.connection.send_bytes(json.dumps({"op": operation, **meta}).encode())
+            self.connection.send_bytes(payload)
+            answer = json.loads(self.connection.recv_bytes())
+            data = self.connection.recv_bytes()
+        except (EOFError, OSError) as exc:
+            raise StageLost(f"the stage process died (exit code {self.process.poll()})", self) from exc
         if not answer.pop("ok"):
             raise LlamaError(answer.get("error", "stage call failed"))
         return answer, data
+
+    def call(self, operation: str, payload: bytes = b"", **meta: Any) -> tuple[dict[str, Any], bytes]:
+        with self.lock:
+            return self._exchange(operation, payload, meta)
+
+    def ask_if_idle(self, operation: str, **meta: Any) -> dict[str, Any] | None:
+        """A quick question, or None if the stage is busy. For what must never wait on a pass."""
+        if not self.lock.acquire(blocking=False):
+            return None
+        try:
+            return self._exchange(operation, b"", meta)[0]
+        finally:
+            self.lock.release()
 
     def close(self) -> None:
         try:

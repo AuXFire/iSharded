@@ -2,11 +2,13 @@
 
 import subprocess
 import sys
+import threading
 
 import numpy as np
 import pytest
 
-from isharded.statestore import HISTORY, PREFIX, StateStore, clear_other_stores, keys_at, namespace_of, prefix_key
+from isharded import statestore
+from isharded.statestore import HISTORY, PREFIX, StateStore, clear_other_stores, keys_at, prefix_key, stage_namespace
 
 
 def blob(size, value=1):
@@ -35,10 +37,11 @@ def test_keys_at_several_lengths_match_one_at_a_time():
 
 
 def test_namespaces_keep_models_and_layers_apart():
-    base = namespace_of("model", "rev", 0, 14)
-    assert base == namespace_of("model", "rev", 0, 14)
-    assert base != namespace_of("model", "rev", 14, 28)
-    assert base != namespace_of("other", "rev", 0, 14)
+    base = stage_namespace("b1", "model", "rev", 0, 14, 0)
+    assert base == stage_namespace("b1", "model", "rev", 0, 14, 0)
+    assert base != stage_namespace("b1", "model", "rev", 14, 28, 0)
+    assert base != stage_namespace("b1", "other", "rev", 0, 14, 0)
+    assert base != stage_namespace("b2", "model", "rev", 0, 14, 0), "another build may lay a state out differently"
 
 
 def test_a_state_comes_back_from_ram(tmp_path):
@@ -79,6 +82,23 @@ def test_disk_stays_inside_its_budget(tmp_path):
     assert store.stats()["disk_bytes"] <= 100
     assert not store.has("a")
     assert sum(path.stat().st_size > 0 for path in (tmp_path / "store").iterdir()) <= 2
+    store.close()
+
+
+def test_a_disk_that_cannot_keep_up_does_not_fill_the_memory(tmp_path, monkeypatch):
+    monkeypatch.setattr(statestore, "WRITE_BACKLOG_BYTES", 100)
+    store = filled(tmp_path, ram=10, disk=10_000)
+    release = threading.Event()
+    real_write = store._write
+    monkeypatch.setattr(store, "_write", lambda key: (release.wait(10), real_write(key)))
+    for index in range(50):
+        store.put(f"s{index}", blob(40), 1)
+    held = store.stats()
+    release.set()
+    store.flush()
+    assert held["ram_bytes"] <= 100 + 40, "the backlog stays near its limit however much is saved"
+    assert held["evicted"] >= 40
+    assert store.has("s49"), "the newest state is the one most likely to be wanted"
     store.close()
 
 
@@ -218,8 +238,45 @@ def test_old_stores_are_cleared_when_the_model_or_layers_change(tmp_path):
     (tmp_path / "old").mkdir()
     (tmp_path / "old" / "a.state").write_bytes(b"x")
     (tmp_path / "current").mkdir()
-    clear_other_stores(tmp_path, "current")
+    clear_other_stores(tmp_path, {"current"})
     assert [path.name for path in tmp_path.iterdir()] == ["current"]
+
+
+def test_a_state_from_another_node_is_checked_before_it_is_kept(tmp_path):
+    source = filled(tmp_path / "a")
+    source.put("a", blob(50, 8), 12, PREFIX)
+    source.flush()
+    arrived = tmp_path / "arrived.part"
+    arrived.write_bytes(source.file_of("a").read_bytes())
+    holder = filled(tmp_path / "b")
+    assert holder.adopt("copy", arrived)
+    assert not arrived.exists()
+    assert holder.listing() == [{"key": "copy", "length": 12, "kind": PREFIX}]
+    assert holder.get("copy")[0].tolist() == [8] * 50
+    source.close()
+    holder.close()
+
+
+@pytest.mark.parametrize("content", [b"", b"not a state", b"ISHSTATE" + b"\x01" * 40])
+def test_a_bad_copy_is_refused_and_leaves_nothing_behind(tmp_path, content):
+    holder = filled(tmp_path)
+    arrived = tmp_path / "arrived.part"
+    arrived.write_bytes(content)
+    assert not holder.adopt("copy", arrived)
+    assert holder.listing() == [] and not arrived.exists()
+    holder.close()
+
+
+def test_a_copy_cut_short_on_the_way_is_refused(tmp_path):
+    source = filled(tmp_path / "a")
+    source.put("a", blob(50), 12)
+    source.flush()
+    arrived = tmp_path / "arrived.part"
+    arrived.write_bytes(source.file_of("a").read_bytes()[:-5])
+    holder = filled(tmp_path / "b")
+    assert not holder.adopt("copy", arrived)
+    source.close()
+    holder.close()
 
 
 def test_the_stage_process_can_use_this_without_torch():

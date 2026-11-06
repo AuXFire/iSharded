@@ -69,11 +69,11 @@ from .protocol import (
 from .gguf import parse_source
 from .gguf_stage import INITIAL_GUESSES, DraftModel, GgufStage, ImageEncoder, PromptPlan, next_guess_count, plan_prompt
 from . import __version__
-from .llamacpp import LlamaError, StageLost, ensure_build, pick_build, rocm_library_paths, step_random
+from .llamacpp import PINNED_BUILD, LlamaError, StageLost, ensure_build, pick_build, rocm_library_paths, step_random
 from .pool import check_exposure, load_token
 from .serving import MAX_STAGE_BYTES, BodyLimit, serve, where_everything_is
 from .slots import SlotGate
-from .statestore import HISTORY, PrefixIndex
+from .statestore import HISTORY, PrefixIndex, clear_other_stores, stage_namespace
 from .access import load_authority
 from .inventory import inventory
 from .tickets import TicketIdentity, client_auth
@@ -347,6 +347,7 @@ class WorkerRuntime:
         self.prefix = PrefixIndex()
         self.prompt_cache = True
         self.state_ram_bytes = int(float(os.getenv("ISHARDED_STATE_RAM_GB", "1")) * 1024**3)
+        self.state_disk_bytes = int(float(os.getenv("ISHARDED_STATE_DISK_GB", "8")) * 1024**3)
         self.prompt_tokens_computed = 0
         self.tokens_reused: dict[str, int] = {}
         self.state_misses = 0
@@ -689,6 +690,18 @@ class WorkerRuntime:
         """The sequence idle longest. A saved state can go on any of them."""
         return min(free, key=lambda slot: self.slot_used_at.get(slot, 0.0))
 
+    @property
+    def state_root(self) -> Path:
+        return self.cache_dir / "states"
+
+    @staticmethod
+    def state_namespace(request: ConfigureRequest) -> str:
+        """Everything that decides what a stage's saved state means."""
+        stage = request.assignment
+        return stage_namespace(
+            PINNED_BUILD, request.model_id, request.revision, stage.start_layer, stage.end_layer, request.speculate_tokens
+        )
+
     def cache_report(self) -> dict[str, Any]:
         """What the cache saved and holds. ``tokens_reused`` says where each came from."""
         held = self.gguf.states if self.gguf is not None else {}
@@ -714,8 +727,16 @@ class WorkerRuntime:
         on_vulkan = any(pool.device.startswith("vulkan") for pool in self.pools.values())
         folder = self.llama_dir or str(ensure_build(pick_build("vulkan" if on_vulkan else self.requested_device)))
         threads = self.cpu_threads or max((os.cpu_count() or 4) // 2, 1)
-        ram = 0 if request.embedding or not request.prompt_cache else self.state_ram_bytes
-        self.gguf = GgufStage(folder, rocm_library_paths(), self.unit_cache, request, adapter, self.pools, threads, None, ram, 0)
+        # A state means nothing to another model or other layers, so those go now.
+        namespace = self.state_namespace(request)
+        clear_other_stores(self.state_root, {namespace})
+        caching = request.prompt_cache and not request.embedding
+        self.gguf = GgufStage(
+            folder, rocm_library_paths(), self.unit_cache, request, adapter, self.pools, threads,
+            self.state_root / namespace if caching else None,
+            self.state_ram_bytes if caching else 0,
+            self.state_disk_bytes if caching else 0,
+        )
         self._load_draft(request, folder, threads)
         self._load_projector(request, adapter, folder, threads)
         used: dict[str, int] = {}
@@ -1319,6 +1340,8 @@ def verify_source(source: str) -> None:
 async def health(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     if not authorized(authorization):
         return {"status": "ok"}  # hardware and layout are nobody else's business
+    if runtime.gguf is not None:
+        await asyncio.to_thread(runtime.gguf.refresh_states)
     assignment = runtime.assignment.model_dump() if runtime.assignment else None
     return {
         "status": "ok",
@@ -1943,6 +1966,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--roles", default=os.getenv("ISHARDED_ROLES", "inference"), help="inference, or kv-cache,checkpoint for a memory worker")
     parser.add_argument("--cpu-threads", type=int, default=int(os.getenv("ISHARDED_CPU_THREADS", "0")), help="CPU threads; 0 uses half the cores for a stage")
     parser.add_argument("--ram-budget-gb", type=float, default=float(os.getenv("ISHARDED_RAM_BUDGET_GB", "0")), help="RAM for KV checkpoints, not weights")
+    parser.add_argument("--state-ram-gb", type=float, default=float(os.getenv("ISHARDED_STATE_RAM_GB", "1")), help="RAM for saved prompt states on each stage")
+    parser.add_argument("--state-disk-gb", type=float, default=float(os.getenv("ISHARDED_STATE_DISK_GB", "8")), help="disk for saved prompt states; 0 keeps them in RAM only")
     parser.add_argument("--gpu-memory-gb", type=float, default=float(os.getenv("ISHARDED_GPU_MEMORY_GB", "0")), help="VRAM budget per accelerator; 0 means auto")
     parser.add_argument("--weights-ram-gb", default=None, help="system RAM for model weights, or 'auto'")
     parser.add_argument("--weights-disk-gb", type=float, default=0, help="disk for memory-mapped model weights")
@@ -1974,6 +1999,8 @@ def main() -> None:
     os.environ["ISHARDED_ROLES"] = args.roles
     os.environ["ISHARDED_CPU_THREADS"] = str(args.cpu_threads)
     os.environ["ISHARDED_RAM_BUDGET_GB"] = str(args.ram_budget_gb)
+    os.environ["ISHARDED_STATE_RAM_GB"] = str(args.state_ram_gb)
+    os.environ["ISHARDED_STATE_DISK_GB"] = str(args.state_disk_gb)
     os.environ["ISHARDED_GPU_MEMORY_GB"] = str(args.gpu_memory_gb)
     os.environ["ISHARDED_WEIGHTS_RAM_GB"] = "" if args.weights_ram_gb is None else str(args.weights_ram_gb)
     os.environ["ISHARDED_WEIGHTS_DISK_GB"] = str(args.weights_disk_gb)

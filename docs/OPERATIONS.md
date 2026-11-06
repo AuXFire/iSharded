@@ -166,6 +166,7 @@ Metrics worth alerting on:
 | Node log | `--log-file` | Nothing is kept unless you set this. `isharded up` sets it to `node.log` in its folder. |
 | Fetched shards | `--cache-dir` | Evicted by age past `--cache-budget-gb`. |
 | Stage files | Inside the cache | Rebuilt from shards when a stage moves. Count double the node's share. |
+| Saved prompt states | `states` inside the cache | People's conversations, unencrypted, readable only by the node's own user. Evicted past `--state-disk-gb`, and deleted when the model or the stage's layers change. |
 
 The dashboard's "Memory for weights" counts weights only. Real use is higher: KV cache, compute buffers, a draft model, and each worker's own GPU context.
 
