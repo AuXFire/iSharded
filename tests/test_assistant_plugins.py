@@ -385,14 +385,23 @@ SERVER = """
     if "banner" in FLAGS:
         print("Starting up, please wait...", flush=True)
 
+    ready = False
     for line in sys.stdin:
         message = json.loads(line)
         method = message.get("method")
         log(message)
+        if method == "notifications/initialized":
+            ready = True
         if "id" not in message:
             continue
         ident = message["id"]
+        if "strict" in FLAGS and method == "tools/call" and not ready:
+            send({{"jsonrpc": "2.0", "id": ident, "error": {{"code": -32002, "message": "called before the handshake"}}}})
+            continue
         if method == "initialize":
+            if "strict" in FLAGS:
+                import time
+                time.sleep(0.4)  # long enough for an impatient caller to get in first
             send({{"jsonrpc": "2.0", "id": ident, "result": {{"protocolVersion": "2025-06-18", "capabilities": {{"tools": {{}}}}, "serverInfo": {{"name": "test", "version": "1"}}}}}})
         elif method == "tools/list":
             if "paged" in FLAGS and "cursor" not in message.get("params", {{}}):
@@ -570,7 +579,7 @@ def test_one_session_serves_many_calls(assistant, mcp):
 
 
 def test_calls_at_the_same_moment_all_wait_for_the_handshake(assistant, mcp):
-    (name,) = assistant.plugins.add(mcp.manifest(), effects=["read"])
+    (name,) = assistant.plugins.add(mcp.manifest(flags=["strict"]), effects=["read"])
     grant(assistant, name)
     results = []
 
