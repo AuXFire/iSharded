@@ -35,6 +35,7 @@ INSTRUCTIONS = "Runs language models across the machines of a ShardMesh pool."
 # The list changes only with the software, so a client may keep it for a while.
 TOOL_LIST_TTL_MS = 3_600_000
 CHAT_REPLY_TOKENS = 1024
+STOP_GRACE_SECONDS = 5.0
 
 PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
@@ -382,9 +383,13 @@ async def serve_stdio(client: httpx.AsyncClient, source: BinaryIO, output: Binar
         if identifier is not None:
             running[identifier] = task
             task.add_done_callback(lambda _, key=identifier: running.pop(key, None))
-    for task in list(running.values()):
+    # Closed input means stop soon, and a reply nearly done is still worth sending.
+    waiting = list(running.values())
+    if waiting:
+        await asyncio.wait(waiting, timeout=STOP_GRACE_SECONDS)
+    for task in waiting:
         task.cancel()
-    await asyncio.gather(*running.values(), return_exceptions=True)
+    await asyncio.gather(*waiting, return_exceptions=True)
 
 
 def mesh_client(url: str, token: str | None) -> httpx.AsyncClient:

@@ -176,6 +176,17 @@ class StageLost(LlamaError):
         self.host = host  # which process, since a reply can report one already replaced
 
 
+def step_random(seed: int | None, position: int) -> np.random.Generator:
+    """The random numbers for one position of a reply.
+
+    A replay must repeat its draws, so they follow from the seed and the position.
+    Adding the two would not do: seed 5 at position 9 would share a draw with seed
+    6 at position 8, and one unlucky draw would strike every reply with a nearby
+    seed, at a position a step earlier each time. Measured doing exactly that.
+    """
+    return np.random.default_rng(None if seed is None else [seed, position])
+
+
 def filtered_distribution(logits: np.ndarray, temperature: float, top_p: float, top_k: int) -> tuple[np.ndarray, np.ndarray]:
     """Token ids and probabilities after top-k, temperature, and top-p, in that order."""
     limit = top_k or (NUCLEUS_CANDIDATES if top_p < 1.0 else 0)
@@ -638,8 +649,7 @@ class LlamaStage:
         """Check guesses against this model and return the tokens that came out of it."""
         hidden = np.ascontiguousarray(hidden, dtype=np.float32)
         self._decode(hidden.shape[0], position, True, hidden=hidden, sequence_id=slot)
-        generator = np.random.default_rng(None if seed is None else seed + position)
-        return speculative_choice(self.logits_at, guesses, temperature, top_p, top_k, generator)
+        return speculative_choice(self.logits_at, guesses, temperature, top_p, top_k, step_random(seed, position))
 
     def guess(self, commit: list[int], position: int, count: int, slot: int = 0, scratch: int = 1) -> list[int]:
         """Extend a draft model's committed text, then guess ``count`` tokens after it.
