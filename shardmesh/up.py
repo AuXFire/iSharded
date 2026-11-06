@@ -373,6 +373,9 @@ def make_ownerless(home: Path, settings: dict[str, Any], joining: str) -> None:
 def run_up(args: argparse.Namespace) -> int:
     home = up_home()
     os.environ["SHARDMESH_UP_HOME"] = str(home)
+    # A mesh's records stay with it, so an earlier pool on this machine cannot leak in.
+    os.environ["SHARDMESH_STATE_FILE"] = str(home / "orchestrator-state.json")
+    os.environ["SHARDMESH_AUDIT_FILE"] = str(home / "audit.jsonl")
     settings = read_settings(home)
     try:
         if args.invite:

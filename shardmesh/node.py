@@ -181,7 +181,8 @@ def _control_command(args: argparse.Namespace) -> list[str]:
 
 
 def data_folder() -> Path:
-    return Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".cache") / "ShardMesh"
+    configured = os.getenv("SHARDMESH_UP_HOME")
+    return Path(configured) if configured else Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".cache") / "ShardMesh"
 
 
 def _lane_flags(args: argparse.Namespace) -> list[str]:
