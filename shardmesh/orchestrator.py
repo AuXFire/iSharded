@@ -18,6 +18,7 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from jinja2.exceptions import TemplateError
 from starlette.background import BackgroundTask
 
 from . import __version__
@@ -56,6 +57,18 @@ from .mesh import clean_url
 from .tickets import PREFIX as TICKET_PREFIX, NodeTickets, TicketChecker, TicketIdentity, client_auth, make_checker, reply_audience
 from .tls import BEHALF, BEHALF_HEADER, FORWARD_MARK, INTERCEPTED, intercepted, PEER, client_verify
 from .tokenizer import ChatTokenizer, IncrementalText, load_tokenizer
+from .toolcalls import (
+    MARKER_TOKENS,
+    ReplyScanner,
+    ToolRequestError,
+    forced_opening,
+    opens_in_thought,
+    plan_tools,
+    reply_limit,
+    template_messages,
+    tool_deltas,
+    uses_tools,
+)
 from .weights import apply_model_hashes, Manifest, WeightSourceError, build_manifest
 
 # Replans allowed when workers fail mid-load before the job gives up.
@@ -1792,11 +1805,13 @@ class Orchestrator:
         seed: int | None,
         stop: str | list[str] | None,
         history: str | None = None,
+        keep_markers: bool = False,
     ) -> AsyncIterator[dict[str, Any]]:
         """Yield text as it is generated, then one final summary.
 
         Text is held back while it could still be the start of a stop string,
-        or while it ends inside a multi-byte character.
+        or while it ends inside a multi-byte character. ``keep_markers`` keeps
+        the special tokens a tool call is written with.
         """
         if not self.tokenizer or not self.model_id:
             raise HTTPException(status_code=409, detail="no model loaded")
@@ -1818,7 +1833,8 @@ class Orchestrator:
         started = time.perf_counter()
         first_token_at: float | None = None
 
-        decoder = IncrementalText(tokenizer)
+        reader = tokenizer.keeping(MARKER_TOKENS) if keep_markers else tokenizer
+        decoder = IncrementalText(reader)
         self.replies_in_flight += 1
         try:
             source = self.token_stream(session, max_tokens, temperature, top_p, top_k, seed, boundary)
@@ -1849,7 +1865,7 @@ class Orchestrator:
             # awaiting here would be cancelled along with it.
             self.spawn(self.clear_session(session.session_id))
 
-        text = tokenizer.decode(generated)
+        text = reader.decode(generated)
         hits = [text.index(marker) for marker in markers if marker in text]
         if hits:
             text = text[: min(hits)]
@@ -2779,12 +2795,25 @@ async def event_stream(
     tokens: AsyncIterator[dict[str, Any]],
     envelope: dict[str, Any],
     to_choice: Any,
+    first_delta: dict[str, Any] | None = None,
 ) -> AsyncIterator[str]:
     """Wrap generated text in OpenAI-style server-sent events."""
+
+    def delta_event(delta: dict[str, Any]) -> str:
+        return server_sent({**envelope, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]})
+
+    calls = 0
     try:
+        if first_delta:
+            yield delta_event(first_delta)
         async for item in tokens:
             if "text" in item:
                 yield server_sent({**envelope, "choices": [to_choice(item["text"], None)]})
+                continue
+            if "tool_call" in item:
+                for delta in tool_deltas(item["tool_call"], calls):
+                    yield delta_event(delta)
+                calls += 1
                 continue
             usage = {
                 "prompt_tokens": item["prompt_tokens"],
@@ -2855,6 +2884,51 @@ async def completions(
     }
 
 
+def render_prompts(
+    tokenizer: Any, messages: list[dict[str, Any]], thinking: bool | None, tools: list[dict[str, Any]] | None
+) -> tuple[str, str]:
+    """The prompt, and the settled history inside it, through the model's own template."""
+    options = {"tools": tools} if tools else {}
+    try:
+        return (
+            tokenizer.render_chat(messages, thinking, **options),
+            tokenizer.render_chat(messages, thinking, add_generation_prompt=False, **options),
+        )
+    except (TemplateError, TypeError) as exc:
+        raise ToolRequestError(f"this conversation does not fit the model's chat template: {exc}") from exc
+
+
+async def scanned(tokens: AsyncIterator[dict[str, Any]], scanner: ReplyScanner) -> AsyncIterator[dict[str, Any]]:
+    """A reply with its tool calls taken out of the text."""
+    async with aclosing(tokens) as source:
+        async for item in source:
+            if "text" in item:
+                for found in scanner.feed(item["text"]):
+                    yield found
+                continue
+            for found in scanner.finish(item["finish_reason"] == "length"):
+                yield found
+            yield {**item, "finish_reason": "tool_calls"} if scanner.calls else item
+
+
+async def whole_reply(items: AsyncIterator[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The assistant message a reply comes to, and its summary."""
+    pieces: list[str] = []
+    calls: list[dict[str, Any]] = []
+    summary: dict[str, Any] = {}
+    async for item in items:
+        if "text" in item:
+            pieces.append(item["text"])
+        elif "tool_call" in item:
+            calls.append(item["tool_call"])
+        else:
+            summary = item
+    text = "".join(pieces)
+    if calls:
+        return {"role": "assistant", "content": text or None, "tool_calls": calls}, summary
+    return {"role": "assistant", "content": text}, summary
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(
     body: ChatCompletionRequest,
@@ -2865,28 +2939,43 @@ async def chat_completions(
     if lane:
         return await runtime.lanes.forward(lane, "/v1/chat/completions", body.model_dump(exclude_none=True), caller)
     await check_request(body.model)
-    messages = [message.model_dump() for message in body.messages]
     assert runtime.tokenizer is not None
-    prompt = await asyncio.to_thread(runtime.tokenizer.render_chat, messages, body.enable_thinking)
-    history = await asyncio.to_thread(runtime.tokenizer.render_chat, messages, body.enable_thinking, add_generation_prompt=False)
-    options = (body.max_tokens, body.temperature, body.top_p, body.top_k, body.seed, body.stop, history)
+    try:
+        plan = plan_tools(body.tools, body.tool_choice, body.parallel_tool_calls, runtime.tokenizer.tool_template)
+        messages = template_messages(body.messages)
+        prompt, history = await asyncio.to_thread(render_prompts, runtime.tokenizer, messages, body.enable_thinking, plan.tools if plan else None)
+    except ToolRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    limit = reply_limit(body.max_tokens, body.max_completion_tokens, uses_tools(body.tools, body.messages))
+    scanner = None
+    if plan:
+        opening = forced_opening(plan)
+        thinking = opens_in_thought(prompt)
+        # A forced call starts straight away, so reasoning that has begun is closed first.
+        prompt += ("\n</think>\n\n" if opening and thinking else "") + opening
+        scanner = ReplyScanner(plan, thinking and not opening, opening)
+    options = (limit, body.temperature, body.top_p, body.top_k, body.seed, body.stop, history)
+    items = runtime.stream_tokens(prompt, *options, keep_markers=scanner is not None)
+    if scanner:
+        items = scanned(items, scanner)
     identifier = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     if body.stream:
         envelope = {"id": identifier, "object": "chat.completion.chunk", "created": created, "model": runtime.model_id}
         return StreamingResponse(
             event_stream(
-                runtime.stream_tokens(prompt, *options),
+                items,
                 envelope,
                 lambda text, reason: {
                     "index": 0,
                     "delta": {"content": text} if text else {},
                     "finish_reason": reason,
                 },
+                {"role": "assistant"},
             ),
             media_type="text/event-stream",
         )
-    text, prompt_count, completion_count, finish_reason = await runtime.generate(prompt, *options)
+    message, summary = await whole_reply(items)
     return {
         "id": identifier,
         "object": "chat.completion",
@@ -2895,14 +2984,14 @@ async def chat_completions(
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": finish_reason,
+                "message": message,
+                "finish_reason": summary["finish_reason"],
             }
         ],
         "usage": {
-            "prompt_tokens": prompt_count,
-            "completion_tokens": completion_count,
-            "total_tokens": prompt_count + completion_count,
+            "prompt_tokens": summary["prompt_tokens"],
+            "completion_tokens": summary["completion_tokens"],
+            "total_tokens": summary["prompt_tokens"] + summary["completion_tokens"],
         },
     }
 

@@ -333,13 +333,19 @@ class CompletionRequest(BaseModel):
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    # A string or a list of text parts. An assistant message that only calls tools has none.
+    content: str | list[dict[str, Any]] | None = None
+    name: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_id: str | None = None
 
 
 class ChatCompletionRequest(BaseModel):
     model: str | None = None
     messages: list[ChatMessage]
-    max_tokens: int = Field(default=32, ge=1, le=32768)
+    # Left unset, the limit depends on whether tools are in play: see toolcalls.reply_limit.
+    max_tokens: int | None = Field(default=None, ge=1, le=32768)
+    max_completion_tokens: int | None = Field(default=None, ge=1, le=32768)
     temperature: Temperature = 0.0
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     top_k: int = Field(default=0, ge=0)
@@ -348,6 +354,9 @@ class ChatCompletionRequest(BaseModel):
     stop: str | list[str] | None = None
     # Passed to chat templates that support a thinking switch (Qwen3 onward).
     enable_thinking: bool | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
+    parallel_tool_calls: bool | None = None
 
 
 def pass_seconds(tokens: int, hops: int = 1) -> float:

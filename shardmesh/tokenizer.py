@@ -8,11 +8,13 @@ download, so they run in Jinja's sandbox.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 import json
 from datetime import datetime
 from typing import Any
 
 from jinja2.exceptions import TemplateError
+from jinja2.ext import loopcontrols
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from tokenizers import AddedToken, Regex, Tokenizer, decoders, normalizers, pre_tokenizers
 from tokenizers.models import BPE
@@ -63,6 +65,29 @@ def _parse_tokenizer(text: str) -> Tokenizer:
         return Tokenizer.from_str(json.dumps(data))
 
 
+class MarkerDecoder:
+    """Decodes as usual, but keeps the tokens a tool call is written with.
+
+    Some models write ``[TOOL_CALLS]`` as a special token. Decoding drops those,
+    and the call would then read as plain text.
+    """
+
+    def __init__(self, tokenizer: ChatTokenizer, keep: dict[int, str]) -> None:
+        self.tokenizer = tokenizer
+        self.keep = keep
+
+    def decode(self, ids: list[int]) -> str:
+        pieces: list[str] = []
+        run: list[int] = []
+        for token in ids:
+            if token in self.keep:
+                pieces += [self.tokenizer.decode(run), self.keep[token]]
+                run = []
+            else:
+                run.append(token)
+        return "".join(pieces) + self.tokenizer.decode(run)
+
+
 class ChatTokenizer:
     def __init__(
         self,
@@ -70,9 +95,12 @@ class ChatTokenizer:
         chat_template: str | None,
         stop_token_ids: set[int],
         special_tokens: dict[str, str],
+        tool_template: str | None = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.chat_template = chat_template
+        # Some models, Hermes among them, keep tools in a template of their own.
+        self.tool_template = tool_template or chat_template
         self.stop_token_ids = stop_token_ids
         self.special_tokens = special_tokens
 
@@ -82,16 +110,22 @@ class ChatTokenizer:
     def decode(self, ids: list[int]) -> str:
         return self.tokenizer.decode(ids, skip_special_tokens=True)
 
+    def keeping(self, markers: Iterable[str]) -> MarkerDecoder:
+        found = {marker: self.tokenizer.token_to_id(marker) for marker in markers}
+        return MarkerDecoder(self, {index: marker for marker, index in found.items() if index is not None})
+
     def render_chat(
         self,
         messages: list[dict[str, Any]],
         enable_thinking: bool | None = None,
         add_generation_prompt: bool = True,
+        tools: list[dict[str, Any]] | None = None,
     ) -> str:
-        if not self.chat_template:
+        template = self.tool_template if tools else self.chat_template
+        if not template:
             lines = [f"{item['role'].title()}: {item['content']}" for item in messages]
             return "\n".join(lines) + ("\nAssistant:" if add_generation_prompt else "\n")
-        environment = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
+        environment = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=[loopcontrols])
         environment.filters["tojson"] = template_json
 
         def raise_exception(message: str) -> None:
@@ -102,7 +136,9 @@ class ChatTokenizer:
         options: dict[str, Any] = {}
         if enable_thinking is not None:
             options["enable_thinking"] = enable_thinking
-        return environment.from_string(self.chat_template).render(
+        if tools:
+            options["tools"] = tools
+        return environment.from_string(template).render(
             messages=messages,
             add_generation_prompt=add_generation_prompt,
             **self.special_tokens,
@@ -110,9 +146,13 @@ class ChatTokenizer:
         )
 
 
-def template_json(value: Any, indent: int | None = None, ensure_ascii: bool = False, sort_keys: bool = False) -> str:
+def template_json(
+    value: Any, indent: int | None = None, ensure_ascii: bool = False, sort_keys: bool = False, separators: tuple[str, str] | None = None
+) -> str:
     """Chat templates come with the model. json.dumps runs ``default`` outside the sandbox."""
-    return json.dumps(value, indent=None if indent is None else int(indent), ensure_ascii=bool(ensure_ascii), sort_keys=bool(sort_keys))
+    return json.dumps(
+        value, indent=None if indent is None else int(indent), ensure_ascii=bool(ensure_ascii), sort_keys=bool(sort_keys), separators=separators
+    )
 
 
 class IncrementalText:
@@ -158,12 +198,14 @@ def tokenizer_from_gguf(header: GgufHeader) -> ChatTokenizer:
         ]
     )
     tokenizer.decoder = decoders.ByteLevel()
+    # add_special_tokens makes everything special whatever AddedToken says, and
+    # decoding drops special tokens. <think> and <tool_call> are text a reply is
+    # read by, so they go in as ordinary added tokens.
+    tokenizer.add_tokens(
+        [AddedToken(token, special=False, normalized=False) for token, kind in zip(tokens, kinds) if kind == GGUF_USER_TOKEN]
+    )
     tokenizer.add_special_tokens(
-        [
-            AddedToken(token, special=kind == GGUF_CONTROL_TOKEN, normalized=False)
-            for token, kind in zip(tokens, kinds)
-            if kind in {GGUF_CONTROL_TOKEN, GGUF_USER_TOKEN}
-        ]
+        [AddedToken(token, special=True, normalized=False) for token, kind in zip(tokens, kinds) if kind == GGUF_CONTROL_TOKEN]
     )
     stops = {
         int(header.get(key))
@@ -176,7 +218,7 @@ def tokenizer_from_gguf(header: GgufHeader) -> ChatTokenizer:
         label = {"padding": "pad", "unknown": "unk"}.get(name, name)
         if index is not None and int(index) < len(tokens):
             special[f"{label}_token"] = tokens[int(index)]
-    return ChatTokenizer(tokenizer, header.get("tokenizer.chat_template"), stops, special)
+    return ChatTokenizer(tokenizer, header.get("tokenizer.chat_template"), stops, special, header.get("tokenizer.chat_template.tool_use"))
 
 
 def load_tokenizer(
@@ -205,8 +247,10 @@ def load_tokenizer(
             template = separate.decode("utf-8") if separate else None
     finally:
         reader.close()
+    tool_template = None
     if isinstance(template, list):  # named templates; "default" is the chat one
-        template = next((item["template"] for item in template if item.get("name") == "default"), None)
+        named = {item.get("name"): item.get("template") for item in template}
+        template, tool_template = named.get("default"), named.get("tool_use")
     special = {
         name: _token_text(settings.get(name))
         for name in ("bos_token", "eos_token", "pad_token", "unk_token")
@@ -215,4 +259,4 @@ def load_tokenizer(
     eos_text = special["eos_token"]
     if eos_text and tokenizer.token_to_id(eos_text) is not None:
         stops.add(tokenizer.token_to_id(eos_text))
-    return ChatTokenizer(tokenizer, template, stops, special)
+    return ChatTokenizer(tokenizer, template, stops, special, tool_template)
