@@ -568,7 +568,7 @@ def main() -> None:
             print(f"Removed {args.name}.")
             return
         if args.dir:
-            key = "smk-" + secrets.token_urlsafe(32)
+            key = "isk-" + secrets.token_urlsafe(32)
             send_signed(args, {"type": "key", "name": args.name, "role": args.role, "sha256": digest(key), "requests_per_minute": args.requests_per_minute})
             print(f"Key for {args.name} ({args.role}). Save it now: it is stored only as a hash.")
             print(key)

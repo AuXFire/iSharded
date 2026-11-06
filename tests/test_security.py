@@ -372,7 +372,7 @@ def signed_pool(tmp_path):
     return str(folder), AccessControl(identities=True, authority=Authority(str(folder / "ca.pem")))
 
 
-def key_entry(name="alice", role="admin", key="smk-test"):
+def key_entry(name="alice", role="admin", key="isk-test"):
     from isharded.access import digest
 
     return {"type": "key", "name": name, "role": role, "sha256": digest(key)}
@@ -384,10 +384,10 @@ def test_a_signed_key_spreads_and_works(signed_pool):
 
     folder, access = signed_pool
     assert access.add_signed(sign_entry(folder, key_entry()))
-    assert access.permits(access.identify("Bearer smk-test"), ROLE_ADMIN)
+    assert access.permits(access.identify("Bearer isk-test"), ROLE_ADMIN)
     peer = AccessControl(identities=True, authority=Authority(folder + "/ca.pem"))
     assert peer.merge(access.document())
-    assert peer.permits(peer.identify("Bearer smk-test"), ROLE_ADMIN)
+    assert peer.permits(peer.identify("Bearer isk-test"), ROLE_ADMIN)
 
 
 def test_a_compromised_node_cannot_add_a_key_through_gossip(signed_pool):
@@ -411,7 +411,7 @@ def test_an_entry_signed_by_another_authority_is_ignored(signed_pool, tmp_path):
     _, access = signed_pool
     other = init_pool(str(tmp_path / "other"))
     assert not access.add_signed(sign_entry(str(other), key_entry()))
-    assert access.identify("Bearer smk-test") is None
+    assert access.identify("Bearer isk-test") is None
 
 
 def test_changing_a_signed_entry_breaks_it(signed_pool):
@@ -433,7 +433,7 @@ def test_a_signed_revocation_and_removal_stick(signed_pool):
     access.add_signed(sign_entry(folder, {"type": "revoke", "name": "bad"}))
     access.merge({**held, "version": 500})
     assert "bad" in access.revoked
-    assert access.identify("Bearer smk-test") is None
+    assert access.identify("Bearer isk-test") is None
     late = sign_entry(folder, key_entry(key="again"))
     access.add_signed(late)
     assert access.identify("Bearer again") is None, "a removed name stays removed"
@@ -449,7 +449,7 @@ def test_signed_entries_survive_a_restart(signed_pool, tmp_path):
     access = AccessControl.load(None, str(path), identities=True, authority=authority)
     access.add_signed(sign_entry(folder, key_entry()))
     again = AccessControl.load(None, str(path), identities=True, authority=authority)
-    assert again.permits(again.identify("Bearer smk-test"), ROLE_ADMIN)
+    assert again.permits(again.identify("Bearer isk-test"), ROLE_ADMIN)
 
 
 def test_with_an_authority_nodes_cannot_change_access_themselves(signed_pool):
@@ -471,7 +471,7 @@ def test_the_api_takes_signed_entries_and_refuses_the_rest(signed_pool, monkeypa
     client = TestClient(orchestrator_module.app)
     assert client.post("/access/entries", json={"entry": key_entry(), "signature": "AAAA"}).status_code == 403
     assert client.post("/access/entries", json=sign_entry(folder, key_entry())).status_code == 200
-    admin = {"Authorization": "Bearer smk-test"}
+    admin = {"Authorization": "Bearer isk-test"}
     assert client.post("/admin/keys", json={"name": "x"}, headers=admin).status_code == 409
     assert client.post("/admin/nodes/x/revoke", headers=admin).status_code == 409
 
@@ -686,7 +686,7 @@ def test_a_persons_key_never_leaves_the_node_they_gave_it_to(signed_pool, monkey
     monkeypatch.setattr(orchestrator_module, "runtime", runtime)
     client = TestClient(orchestrator_module.app)
     assert client.get("/admin/status").status_code == 401
-    assert client.get("/admin/status", headers={"Authorization": "Bearer smk-test"}).status_code == 200
+    assert client.get("/admin/status", headers={"Authorization": "Bearer isk-test"}).status_code == 200
     assert "authorization" not in seen
     assert seen["x-isharded-on-behalf"] == "admin:alice"
 

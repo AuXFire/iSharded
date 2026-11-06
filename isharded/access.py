@@ -77,7 +77,7 @@ class Authority:
         try:
             from cryptography import x509
         except ImportError as exc:
-            raise SystemExit("A pool with an authority needs the cryptography package: pip install isharded[pool]") from exc
+            raise SystemExit("A pool with an authority needs the cryptography package: pip install cryptography") from exc
         self.key = x509.load_pem_x509_certificate(Path(certificate_path).read_bytes()).public_key()
 
     def verified(self, signed: Any) -> dict[str, Any] | None:
@@ -359,7 +359,7 @@ class AccessControl:
             raise ValueError(f"role must be {ROLE_USER} or {ROLE_ADMIN}")
         if any(caller.name == name for caller in self.keys.values()):
             raise ValueError(f"a key named {name!r} already exists")
-        key = "smk-" + secrets.token_urlsafe(32)
+        key = "isk-" + secrets.token_urlsafe(32)
         self.keys[digest(key)] = Caller(name, role, requests_per_minute)
         self._changed()
         return key
@@ -450,7 +450,7 @@ def create_key(path: str, name: str, role: str, requests_per_minute: int = 0) ->
     data = json.loads(file.read_text(encoding="utf-8")) if file.is_file() else {"keys": []}
     if any(item["name"] == name for item in data["keys"]):
         raise ValueError(f"a key named {name!r} already exists")
-    key = "smk-" + secrets.token_urlsafe(32)
+    key = "isk-" + secrets.token_urlsafe(32)
     data["keys"].append({"name": name, "role": role, "sha256": digest(key), "requests_per_minute": requests_per_minute})
     file.parent.mkdir(parents=True, exist_ok=True)
     file.write_text(json.dumps(data, indent=2), encoding="utf-8")

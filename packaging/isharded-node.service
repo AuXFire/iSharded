@@ -1,7 +1,7 @@
 # Run an iSharded node at boot on Linux, restarting it if it stops.
 #
 #   sudo useradd --system --create-home --home-dir /var/lib/isharded isharded
-#   sudo python3 -m venv /opt/isharded && sudo /opt/isharded/bin/pip install 'isharded[pool]'
+#   sudo python3 -m venv /opt/isharded && sudo /opt/isharded/bin/pip install https://github.com/AuXFire/iSharded/archive/refs/heads/main.tar.gz
 #   sudo cp isharded-node.service /etc/systemd/system/
 #   sudo install -d -m 750 -o isharded /etc/isharded
 #   sudo cp isharded-node.env /etc/isharded/node.env   # then edit it

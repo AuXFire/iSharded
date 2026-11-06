@@ -41,7 +41,7 @@ def test_an_invite_survives_the_trip_and_says_what_it_can(tmp_path: Path) -> Non
     assert up.read_invites(home)[0]["uses"] == 2
 
 
-@pytest.mark.parametrize("code", ["nonsense", "smi-!!!!", "smi-e30"])
+@pytest.mark.parametrize("code", ["nonsense", "isi-!!!!", "isi-e30"])
 def test_a_damaged_invite_says_so(code: str) -> None:
     with pytest.raises(ValueError):
         up.read_invite(code)
@@ -154,7 +154,7 @@ def test_machine_names_are_safe_for_a_node(monkeypatch) -> None:
 def test_a_machine_in_a_mesh_refuses_to_join_another(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.setenv("ISHARDED_UP_HOME", str(tmp_path))
     up.write_settings(tmp_path, settings())
-    args = type("Args", (), {"invite": "smi-x"})()
+    args = type("Args", (), {"invite": "isi-x"})()
     assert up.run_up(args) == 1
     assert "already belongs" in capsys.readouterr().err
 

@@ -1183,7 +1183,7 @@ A tool that stores or sends text reads `CallContext.reach`, which says how far t
 
 ### How a small model does
 
-This is Qwen3-0.6B at Q8, on 2 CPU threads, on a mesh of one, with everything real from the assistant down. No larger model has been through the assistant, so how much better one does is not known.
+This is Qwen3-0.6B at Q8, on 2 CPU threads, on a mesh of one, with everything real from the assistant down. [A larger model does much better.](#how-a-large-model-does)
 
 | Tried | What happened |
 |---|---|
@@ -1203,6 +1203,22 @@ How tools are described matters a great deal. In an earlier run, shown each tool
 
 On a model with one slot, background work competes with you. A question asked straight after a turn showed its first text at 3.2 s, because memories were being proposed, and the same kind of question after a 15 s pause at 0.6 s.
 
+### How a large model does
+
+This is Qwen3.6-27B at Q4_K_M, split across two machines over Tailscale, with everything real from the assistant down, and tools going through the prompt as they do for the small model.
+
+| Tried | What happened |
+|---|---|
+| Recalling in a new session | 5 of 5 |
+| Reading a file, offered one tool | 10 of 10 read the right file and answered from it, at a median of 11 s |
+| Reading a file, offered two tools | 10 of 10 |
+| What it said when it did not read | Nothing to report: it read the file all 20 times |
+| Reading, then writing, in one request | 3 of 5 reached the write, and each waited for a person with the exact content and its hash on show, because a write after reading a file is tainted. One was then approved and resumed, and the file appeared with the right text |
+| The two that did not reach the write | One read the file six times and gave up, saying it had no file access. The other said "I have written this exact text" when no write had run. Its `used` line showed only `files.read` |
+| Reading a note saying where a spare key is, then copying it | 1 of 5 reached the write, and was held for a person. The last reply refused, calling the note sensitive. The other three replies were not kept, so why they stopped is not known |
+
+So a model this size can be trusted to read, but it can still claim a write it never made. Read the `used` line.
+
 **What the `process` sandbox cannot stop.** On Windows this is the only level, as there is no docker, podman, or bubblewrap here to use, and on any machine it is what is left when nothing stronger is present. It is a memory limit and a process tree that dies together, and it is not a wall:
 
 - It cannot block the network. `network: false` means nothing here, and each result says so in `network_blocked` and `notes`.
@@ -1212,7 +1228,7 @@ On a model with one slot, background work competes with you. A question asked st
 
 **Proven only at small scale.**
 
-- Tool calling through the mesh was run with one small model, Qwen3-0.6B, on CPU. [What it managed is written up above.](#how-a-small-model-does) No larger model has been tried through the assistant.
+- Tool calling through the assistant was run with two models: [Qwen3-0.6B on CPU](#how-a-small-model-does) and [Qwen3.6-27B across two machines](#how-a-large-model-does). No other model has been tried through it.
 - The mesh's reach is taken on trust: `pool` means text goes to your own nodes, and nothing here checks where a node really is.
 - Federation was run between two installs on one machine over loopback, and in tests. It has not crossed a real network between two real owners.
 - The `container` and `namespace` sandbox levels have only had their command lines checked in tests. Neither has ever run a command for real, as this was built on Windows with no container service running.

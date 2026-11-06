@@ -464,7 +464,7 @@ Give your node's name to someone already in the network, and have them vouch for
 isharded net vouch n-9f8e7d6c5b4a39281706 --dir ./identity --url http://127.0.0.1:8209
 ```
 
-`isharded up --ownerless` is meant to do this for you, with the identity in `commons` in its folder, and `--join` naming a node already in the network. It has no `--trust`, so with `--joining vouched`, its default, it accepts only itself until you vouch for someone from that folder. This way in has not been run yet, so the steps here are the proven ones.
+`isharded up --ownerless` does this for you, with the identity in `commons` in its folder, and `--join` naming a node already in the network. With `--joining vouched`, its default, it accepts only itself and the names you give with `--trust` until someone is vouched for from that folder. It has been run with `--joining open`: a founder and a second node on one machine, a model loaded and answering, and a second load refused. `--joining vouched` through `up` has not been run, so the steps here are the proven ones for that.
 
 Start the node with `isharded node --ownerless ./identity`. Make yourself a key for your own node with `isharded key create me --role admin --file keys.json`, and pass `--keys-file keys.json`. That key is an admin of your node and means nothing anywhere else. Your users' keys live on your node too, and you set their limits.
 
@@ -583,8 +583,9 @@ Starts a node with everything worked out, and is the easy way in. See [Quick sta
 | `--find` | Off | Ask to join the one mesh on this network, without asking you first |
 | `--new-mesh` | Off | Start a new mesh even if one is on this network |
 | `--no-discovery` | Off | Do not look for a mesh, and do not answer machines looking for this one |
-| `--ownerless` | Off | Make or join a [network nobody owns](#a-network-nobody-owns). It never adds TLS, so off Tailscale it needs `--trusted-network`. Not run yet |
+| `--ownerless` | Off | Make or join a [network nobody owns](#a-network-nobody-owns). It never adds TLS, so off Tailscale it needs `--trusted-network` |
 | `--joining` | `vouched` | With `--ownerless`: who this node accepts, `open` or `vouched` |
+| `--trust` | None | With `--ownerless`: a node to accept from the start. Repeatable |
 | `--join` | None | With `--ownerless`: any node already in the network |
 
 ### isharded invite
@@ -1023,13 +1024,15 @@ Small models were measured on a real node, on CPU with four threads, through the
 | Qwen3-0.6B Q8_0 | JSON | Sampled | 48 of 48 | 47 of 48 | 43 of 48 | 16 s |
 | Qwen3.5-0.8B Q8_0 | XML | Default | 48 of 48 | 48 of 48 | 46 of 48 | 3 s |
 | Qwen3.5-0.8B Q8_0 | XML | Sampled | 48 of 48 | 48 of 48 | 45 of 48 | 4 s |
+| Qwen3.6-27B Q4_K_M, across two machines | XML | Default, no thinking | 48 of 48 | 48 of 48 | 44 of 48 | 5 s |
 
 | Model | Full loops with `required` | Full loops with a named function |
 |---|---:|---:|
 | Qwen3-0.6B Q8_0 | 48 of 48 | 48 of 48 |
 | Qwen3.5-0.8B Q8_0 | 45 of 48 | 45 of 48 |
 
-- Neither model called a tool on any of its 16 prompts that needed none.
+- The 27B ran on the two-machine pool, split over a laptop and a desktop. All four of its misses were the test's own: it answered `10,000` and `9,401`, right but with a comma the check did not allow. With `required` and with a named function it did the same on the one prompt that hit this, and passed the rest of 8 each. It called no tool on 8 prompts that needed none.
+- Neither small model called a tool on any of its 16 prompts that needed none.
 - Forced calls named the right tool in all 192 runs. Full loops count both settings.
 - Nearly every failure came after a correct call. The model answered without using the result, called again, or, with Qwen3, never finished reasoning and gave no answer at all.
 - At default settings, whole and streamed replies were identical on every prompt.
@@ -1343,7 +1346,7 @@ isharded assistant grant add files.read NOTES_FOLDER
 
 `isharded assistant serve` runs its own web page and OpenAI-shaped API at `http://127.0.0.1:8470`, with a key for each person. It stays on loopback unless told otherwise.
 
-Treat it as early. No model larger than Qwen3-0.6B has been through it, and one that small cannot be trusted to use a tool, or to say when it did not: each time it skipped reading a file, it said it had read it and made up what was inside. The `used` line at the end of a reply shows which tools really ran. Federation has run only between two installs on one machine. [The assistant's guide](docs/ASSISTANT.md) is the full manual, and says what is not built or proven.
+Treat it as early. How far to trust it depends on the model. Qwen3-0.6B cannot be trusted with tools: each time it skipped reading a file, it said it had read it and made up what was inside. Qwen3.6-27B, split across two machines, read the file in 20 of 20 tries and invented nothing, and recalled a fact in a new session 5 of 5 times. Asked to read and then write, it reached the write 3 of 5 times, and each of those waited for a person, as a write after reading a file must. In one other try it said it had written the file when no write ran. So the `used` line at the end of a reply is the record of which tools really ran, on any model. Federation has run only between two installs on one machine. [The assistant's guide](docs/ASSISTANT.md) is the full manual, and says what is not built or proven.
 
 ## Memory and placement
 
@@ -1389,17 +1392,19 @@ A node uses PyTorch to find GPUs. If PyTorch sees none, the node asks llama.cpp'
 
 Vulkan runs GGUF models only, because safetensors models run on PyTorch. The planner keeps those off such a node. It also cannot time the GPU's memory, so it assumes 300 GB/s when placing layers.
 
-Measured with small models, one reply at a time. Each pair gave the same text:
+Measured one reply at a time. Each pair gave the same text:
 
 | GPU and model | Backend | Tokens per second |
 |---|---|---|
 | RX 7900 XT, Qwen3.5-0.8B Q8_0 | Vulkan | 185.1 |
 | RX 7900 XT, Qwen3.5-0.8B Q8_0 | ROCm | 161.9 |
+| RX 7900 XT, Qwen3.6-27B Q4_K_M | Vulkan | 24.3 |
+| RX 7900 XT, Qwen3.6-27B Q4_K_M | ROCm | 33.1 |
 | RTX 3060 Laptop, Qwen3-0.6B Q8_0 | CUDA | 104.1 |
 | RTX 3060 Laptop, Qwen3-0.6B Q8_0 | Vulkan | 102.6 |
 | Laptop CPU, 4 threads, Qwen3-0.6B Q8_0 | CPU | 21.9 |
 
-So an AMD card needs no ROCm for GGUF models. These are small models, and a large one may differ.
+So an AMD card needs no ROCm for GGUF models, and that is the reason to use Vulkan there. It won on a very small model and lost on a large one, where ROCm was 36% faster, so use ROCm where you have it.
 
 ## Precision
 

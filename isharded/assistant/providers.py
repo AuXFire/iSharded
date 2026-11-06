@@ -724,8 +724,8 @@ class ToolsNotSupported(Exception):
 class MeshProvider(OpenAICompatible):
     """The owner's own pool.
 
-    Its chat API takes plain strings and has no tool calling, so tools go in the
-    prompt. A reply is always streamed, even when nobody is watching it: a pool
+    Tools go in the prompt, which is what has been measured here, and not through
+    the mesh's own tool calling. A reply is always streamed, even when nobody is watching it: a pool
     can take minutes over a reply, and only a stream can tell that from silence.
     """
 

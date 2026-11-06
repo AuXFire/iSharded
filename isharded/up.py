@@ -40,7 +40,7 @@ from .node import add_node_arguments, detect_address, run_node
 from .pool import _private_link, _write_private, add_node, approve_membership, home as pool_home, init_pool, request_membership, sign_entry
 
 DEFAULT_PORT = 8209
-INVITE_PREFIX = "smi-"
+INVITE_PREFIX = "isi-"
 INVITE_ADDRESSES = 4
 APPROVAL_SECONDS = 3.0
 APPROVAL_WAIT_SECONDS = 180.0
@@ -100,7 +100,7 @@ def make_owner(home: Path, name: str, address: str) -> None:
     """A new mesh: its authority, this node's certificate, and the owner's key."""
     init_pool(str(home))
     add_node(str(home), name, [address, "127.0.0.1"])
-    key = "smk-" + secrets.token_urlsafe(32)
+    key = "isk-" + secrets.token_urlsafe(32)
     _write_private(home / "admin.key", key.encode())
     signed = sign_entry(str(home), {"type": "key", "name": "owner", "role": "admin", "sha256": digest(key), "requests_per_minute": 0})
     (home / "access.json").write_text(json.dumps({"version": 1, "keys": [], "signed": [signed]}), encoding="utf-8")
@@ -244,7 +244,7 @@ def join_mesh(home: Path, invite: dict[str, Any], name: str, address: str) -> st
     home.mkdir(parents=True, exist_ok=True)
     (home / "ca.pem").write_text(pem, encoding="utf-8")
     verify: Any = str(home / "ca.pem") if url.startswith("https") else True
-    key = "smk-" + secrets.token_urlsafe(32)
+    key = "isk-" + secrets.token_urlsafe(32)
     request = request_membership(str(home), name, [address, "127.0.0.1"])
     key_hash = digest(key)
     secret = invite.get("secret")
@@ -454,12 +454,12 @@ def first_settings(args: argparse.Namespace, home: Path) -> dict[str, Any]:
     }
 
 
-def make_ownerless(home: Path, settings: dict[str, Any], joining: str) -> None:
+def make_ownerless(home: Path, settings: dict[str, Any], joining: str, trust: list[str] | None = None) -> None:
     from .access import create_key
     from .commons import identity_name, make_identity, write_policy
 
     make_identity(home / "commons")
-    write_policy(home / "commons", joining)
+    write_policy(home / "commons", joining, trust=trust)
     settings["name"] = identity_name(home / "commons")
     key = create_key(str(home / "access.json"), "owner", "admin")
     _write_private(home / "admin.key", key.encode())
@@ -493,11 +493,12 @@ def run_up(args: argparse.Namespace) -> int:
                 become_member(home, settings, {"urls": [mesh["url"]], "authority": mesh["authority"]})
             else:
                 if settings["ownerless"]:
-                    make_ownerless(home, settings, args.joining)
+                    make_ownerless(home, settings, args.joining, args.trust)
                 else:
                     make_owner(home, settings["name"], settings["address"])
                 write_settings(home, settings)
-                print(f"Made a new mesh in {home}. This machine owns it. Keep that folder safe.", flush=True)
+                owns = "Nobody owns it, and this node is named " + settings["name"] if settings["ownerless"] else "This machine owns it"
+                print(f"Made a new mesh in {home}. {owns}. Keep that folder safe.", flush=True)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -589,7 +590,7 @@ def checks() -> list[tuple[bool, str, str]]:
 
         found.append((True, "cryptography is installed", ""))
     except ImportError:
-        found.append((False, "cryptography is missing", "pip install isharded[pool]"))
+        found.append((False, "cryptography is missing", "pip install cryptography"))
     address = detect_address()
     private = _private_link(address)
     found.append((True, f"This machine would advertise {address}" + (" (encrypted by Tailscale)" if private else ""), ""))
@@ -639,6 +640,7 @@ def add_arguments(subparsers: Any) -> None:
     up.add_argument("--no-discovery", action="store_true", help="do not look for a mesh, and do not answer machines looking for this one")
     up.add_argument("--ownerless", action="store_true", help="make or join a network nobody owns")
     up.add_argument("--joining", choices=["open", "vouched"], default="vouched", help="with --ownerless: who this node accepts")
+    up.add_argument("--trust", action="append", default=[], help="with --ownerless: a node to accept from the start; repeatable")
     up.add_argument("--join", default=None, help="with --ownerless: any node already in the network")
     up.set_defaults(handler=run_up)
     invite = subparsers.add_parser("invite", help="make a code that adds a machine to this mesh")
