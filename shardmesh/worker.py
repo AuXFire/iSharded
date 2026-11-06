@@ -50,6 +50,7 @@ from .protocol import (
     DraftModel as DraftSource,
     EmbedPass,
     GenerateRequest,
+    ImagesMeasure,
     InferRequest,
     MemoryPool,
     PrepareRequest,
@@ -57,15 +58,15 @@ from .protocol import (
     StageAssignment,
     WorkerRegistration,
     auth_headers,
-    decode_activation,
     decode_meta,
+    decode_pass,
     decode_tensors,
     encode_activation,
     encode_meta,
     encode_tensors,
 )
 from .gguf import parse_source
-from .gguf_stage import INITIAL_GUESSES, DraftModel, GgufStage, PromptPlan, next_guess_count, plan_prompt
+from .gguf_stage import INITIAL_GUESSES, DraftModel, GgufStage, ImageEncoder, PromptPlan, next_guess_count, plan_prompt
 from . import __version__
 from .llamacpp import LlamaError, StageLost, ensure_build, pick_build, rocm_library_paths
 from .pool import check_exposure, load_token
@@ -75,6 +76,7 @@ from .access import load_authority
 from .inventory import inventory
 from .tickets import TicketIdentity, client_auth
 from .tls import PEER, client_verify
+from .vision import PromptPart, PromptRows, lay_out
 from .weights import FetchProgress, LoadedUnit, UnitCache, WeightSourceError, gguf_reader, load_unit, map_unit
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "shardmesh" / "units"
@@ -326,6 +328,7 @@ class WorkerRuntime:
         self.merged_rows = 0
         self.gguf_choices: list[int] = []
         self.draft: DraftModel | None = None
+        self.encoder: ImageEncoder | None = None
         self.speculate_tokens = 0
         self.draft_passes = 0
         self.draft_accepted = 0
@@ -537,6 +540,9 @@ class WorkerRuntime:
         if self.draft is not None:
             self.draft.close()
             self.draft = None
+        if self.encoder is not None:
+            self.encoder.close()
+            self.encoder = None
         if self.gguf is not None:
             self.gguf.close()
             self.gguf = None
@@ -573,6 +579,27 @@ class WorkerRuntime:
             self.draft = DraftModel(folder, rocm_library_paths(), path, request.context_tokens, threads, request.slots)
         except (LlamaError, WeightSourceError, httpx.HTTPError, OSError, ValueError) as exc:
             self.last_error = f"draft model unavailable, running without it: {exc}"
+
+    def _load_projector(self, request: ConfigureRequest, adapter: GgufAdapter, folder: str, threads: int) -> None:
+        """Unlike a draft, a projector that fails fails the load: this model was asked to see."""
+        if request.projector is None or request.assignment.start_layer != 0:
+            return
+        assert self.gguf is not None
+        try:
+            path = self._draft_file(request.projector)
+        except (WeightSourceError, httpx.HTTPError) as exc:
+            raise RuntimeError(f"could not fetch the projector {request.projector.file}: {exc}") from exc
+        self.encoder = ImageEncoder(
+            folder, rocm_library_paths(), self.gguf.path, path, adapter.header.hidden_size, threads, self.gguf.uses_gpu
+        )
+
+    async def prompt_rows(self, tokens: list[int], images: list[str]) -> PromptRows:
+        """Encode a prompt's images and work out every row of it."""
+        if self.encoder is None:
+            raise HTTPException(status_code=409, detail="this worker has no projector")
+        encoder = self.encoder
+        encoded = [await asyncio.to_thread(encoder.encode, base64.b64decode(item)) for item in images]
+        return lay_out(tokens, encoded)
 
     async def replace_stage(self, lost: StageLost) -> HTTPException:
         """Start a new stage process in place of a dead one.
@@ -622,6 +649,7 @@ class WorkerRuntime:
             request.draft.file if request.draft and stage.start_layer == 0 else None,
             tuple(sorted(request.unit_hashes.items())),
             request.embedding,
+            request.projector.file if request.projector and stage.start_layer == 0 else None,
         )
 
     async def hold_gate(self, seconds: float) -> bool:
@@ -668,6 +696,7 @@ class WorkerRuntime:
         threads = self.cpu_threads or max((os.cpu_count() or 4) // 2, 1)
         self.gguf = GgufStage(folder, rocm_library_paths(), self.unit_cache, request, adapter, self.pools, threads)
         self._load_draft(request, folder, threads)
+        self._load_projector(request, adapter, folder, threads)
         used: dict[str, int] = {}
         for item in placements:
             used[item.pool_id] = used.get(item.pool_id, 0) + item.bytes
@@ -818,10 +847,18 @@ class WorkerRuntime:
             self.caches[request.session_id] = entry
         return entry
 
-    def _prepare_entry(self, request: InferRequest) -> torch.Tensor:
+    def _prepare_entry(self, request: InferRequest, part: PromptPart | None = None) -> torch.Tensor:
         if self.gguf is not None:
             self._session(request)
-            return torch.from_numpy(self.gguf.embed(request.input_ids).copy()).unsqueeze(0)
+            if part is None:
+                return torch.from_numpy(self.gguf.embed(request.input_ids).copy()).unsqueeze(0)
+            tokens = np.array(request.input_ids, dtype=np.int64)
+            rows = np.empty((tokens.size, self.gguf.width), dtype=np.float32)
+            text = tokens >= 0
+            if text.any():
+                rows[text] = self.gguf.embed(tokens[text].tolist())
+            rows[part.images] = part.vectors
+            return torch.from_numpy(rows).unsqueeze(0)
         if self.adapter is None or "embed" not in self.unit_weights:
             raise ValueError("this worker is not the entry stage")
         entry = self._session(request)
@@ -830,7 +867,7 @@ class WorkerRuntime:
         with torch.inference_mode():
             return self.adapter.embed(self.unit_weights["embed"], input_ids, positions.unsqueeze(0))
 
-    def _run_local(self, hidden: torch.Tensor, request: InferRequest) -> torch.Tensor:
+    def _run_local(self, hidden: torch.Tensor, request: InferRequest, places: np.ndarray | None = None) -> torch.Tensor:
         assert self.adapter is not None and self.assignment is not None
         started = time.perf_counter()
         # The entry stage already reset this session before embedding.
@@ -854,7 +891,7 @@ class WorkerRuntime:
                     slot=request.slot,
                 )
             else:
-                output = self.gguf.forward(rows, entry.length, request.slot)
+                output = self.gguf.forward(rows, entry.length, request.slot, places)
                 if self.gguf.last:
                     self.gguf_logits = torch.from_numpy(output.copy())
                 else:
@@ -874,7 +911,8 @@ class WorkerRuntime:
                 # GPU work is asynchronous. Without this, the time would surface
                 # later, in whatever first touches the result.
                 _synchronize(hidden.device)
-        entry.length += tokens
+        # An image's rows take fewer positions than rows, so the pass says where it ended.
+        entry.length = entry.length + tokens if request.next_position is None else request.next_position
         if request.save_checkpoint and self.gguf is not None:
             self.gguf.save(request.save_checkpoint, request.slot)
         self.inference_calls += 1
@@ -1016,13 +1054,15 @@ class WorkerRuntime:
         self.caches[request.session_id] = entry
         self.kv_restores += 1
 
-    async def _step_alone(self, hidden: torch.Tensor, request: InferRequest) -> torch.Tensor | dict[str, Any]:
+    async def _step_alone(
+        self, hidden: torch.Tensor, request: InferRequest, places: np.ndarray | None = None
+    ) -> torch.Tensor | dict[str, Any]:
         """This stage's share of one request. Hidden states, or the answer at the end."""
         next_stage = self._next_stage()
         # Compute runs off the event loop: a disk-tier token can take seconds,
         # and a blocked loop would stop heartbeats and look like a dead node.
         started = time.perf_counter()
-        hidden = await asyncio.to_thread(self._run_local, hidden, request)
+        hidden = await asyncio.to_thread(self._run_local, hidden, request, places)
         self._record("compute", started)
         if next_stage is None and request.verify:
             return {"token_ids": self.gguf_choices}
@@ -1044,6 +1084,7 @@ class WorkerRuntime:
             and hidden.shape[1] == 1
             and not (request.verify or request.reset or request.prefill_only or request.save_checkpoint)
             and request.restore_length is None
+            and request.next_position is None
         )
 
     async def _step_together(self, hidden: torch.Tensor, request: InferRequest) -> torch.Tensor | dict[str, Any]:
@@ -1129,7 +1170,7 @@ class WorkerRuntime:
         self.compute_ms_ema = self._ema(self.compute_ms_ema, (time.perf_counter() - started) * 1000)
         return [results[index] for index in range(len(steps))]
 
-    async def execute(self, hidden: torch.Tensor, request: InferRequest) -> dict[str, Any]:
+    async def execute(self, hidden: torch.Tensor, request: InferRequest, places: np.ndarray | None = None) -> dict[str, Any]:
         if self.assignment is None or self.model_id is None:
             raise HTTPException(status_code=409, detail="worker is not configured")
         if request.epoch != self.epoch:
@@ -1141,20 +1182,20 @@ class WorkerRuntime:
             # The lock covers this node's compute and nothing else. While one reply
             # is away at the next stage, this stage can work on another.
             async with self.lock:
-                outcome = await self._step_alone(hidden, request)
+                outcome = await self._step_alone(hidden, request, places)
         if isinstance(outcome, dict):
             return outcome
         hidden = outcome
 
         started = time.perf_counter()
         headers = auth_headers(self.pool_token)
-        headers[META_HEADER] = encode_meta(request.model_dump())
+        headers[META_HEADER] = encode_meta(request.model_dump(exclude={"images"}))
         headers["content-type"] = "application/x-safetensors"
         # A batch of FP32 rows outgrows a cold TCP window and costs extra round
         # trips. Single tokens stay exact; llama.cpp stages turn BF16 back to FP32.
         if self.gguf is not None and hidden.shape[1] > 1 and self.dtype_name != "float32":
             hidden = hidden.to(torch.bfloat16)
-        payload = encode_activation(hidden)
+        payload = encode_activation(hidden, None if places is None else torch.from_numpy(places))
         self._record("encode", started)
         self.activation_bytes_sent += len(payload)
         started = time.perf_counter()
@@ -1502,6 +1543,8 @@ async def configure(body: ConfigureRequest, authorization: str | None = Header(d
     verify_token(authorization)
     if body.draft is not None:
         verify_source(body.draft.source)
+    if body.projector is not None:
+        verify_source(body.projector.source)
     async with runtime.lock:
         try:
             await runtime.configure(body)
@@ -1590,10 +1633,16 @@ async def infer(body: InferRequest, authorization: str | None = Header(default=N
         raise HTTPException(status_code=400, detail="input_ids cannot be empty")
     try:
         arrived = time.perf_counter()
+        part = None
+        if body.images:
+            # A replay of a prompt with images in it. Later passes have no need of them.
+            rows = await runtime.prompt_rows(body.input_ids, body.images)
+            part = rows.part(0, len(body.input_ids))
+            body = body.model_copy(update={"images": [], "next_position": part.after})
         async with runtime.lock:
-            hidden = await asyncio.to_thread(runtime._prepare_entry, body)
+            hidden = await asyncio.to_thread(runtime._prepare_entry, body, part)
         runtime._record("embed", arrived)
-        result = await runtime.execute(hidden, body)
+        result = await runtime.execute(hidden, body, None if part is None else part.places)
         runtime._record("handler", arrived)
         return result
     except HTTPException:
@@ -1622,37 +1671,35 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
         raise HTTPException(status_code=429, detail="too many replies are waiting; try again shortly")
     stops = set(body.stop_token_ids)
 
-    async def step(request: InferRequest) -> dict[str, Any]:
+    async def step(request: InferRequest, part: PromptPart | None = None) -> dict[str, Any]:
         arrived = time.perf_counter()
         async with runtime.lock:
-            hidden = await asyncio.to_thread(runtime._prepare_entry, request)
+            hidden = await asyncio.to_thread(runtime._prepare_entry, request, part)
         runtime._record("embed", arrived)
-        result = await runtime.execute(hidden, request)
+        result = await runtime.execute(hidden, request, None if part is None else part.places)
         runtime._record("handler", arrived)
         return result
 
-    async def first_token(request: InferRequest, plan: PromptPlan) -> int:
+    async def first_token(request: InferRequest, plan: PromptPlan, rows: PromptRows | None = None) -> int:
         """Run what the stages have not seen, stopping to checkpoint if asked."""
         prompt, start = body.input_ids, plan.start
-        where = {"reset": not start, "restore_length": start or None, "checkpoint_key": plan.key}
+        restored = rows.position_at(start) if rows else start
+        where: dict[str, Any] = {"reset": not start, "restore_length": restored or None, "checkpoint_key": plan.key}
+
+        async def run(stop: int, **changes: Any) -> dict[str, Any]:
+            part = rows.part(start, stop) if rows else None
+            update = {**where, "input_ids": prompt[start:stop], "next_position": part.after if part else None, **changes}
+            return await step(request.model_copy(update=update), part)
+
         if plan.mark is not None:
-            await step(
-                request.model_copy(
-                    update={
-                        **where,
-                        "input_ids": prompt[start : plan.mark],
-                        "save_checkpoint": plan.new_key,
-                        "prefill_only": True,
-                    }
-                )
-            )
+            await run(plan.mark, save_checkpoint=plan.new_key, prefill_only=True)
             runtime.checkpoints[request.slot] = (plan.new_key, prompt[: plan.mark])
             start = plan.mark
             where = {"reset": False, "restore_length": None, "checkpoint_key": None}
-        return (await step(request.model_copy(update={**where, "input_ids": prompt[start:]})))["token_id"]
+        return (await run(len(prompt)))["token_id"]
 
-    async def plain(request: InferRequest, plan: PromptPlan) -> AsyncIterator[int]:
-        token = await first_token(request, plan)
+    async def plain(request: InferRequest, plan: PromptPlan, rows: PromptRows | None = None) -> AsyncIterator[int]:
+        token = await first_token(request, plan, rows)
         yield token
         for _ in range(body.max_tokens - 1):
             if token in stops:
@@ -1719,7 +1766,7 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             position += len(accepted)
 
     async def tokens() -> AsyncIterator[bytes]:
-        request = InferRequest(**body.model_dump(exclude={"max_tokens", "stop_token_ids", "checkpoint_at"}))
+        request = InferRequest(**body.model_dump(exclude={"max_tokens", "stop_token_ids", "checkpoint_at", "images"}))
         runtime.waiting += 1
         try:
             slot = await runtime.gate.acquire(lambda free: runtime.choose_slot(free, body.input_ids))
@@ -1732,9 +1779,11 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
                 return
             held = runtime.checkpoints.get(slot) if runtime.gguf is not None else None
             plan = plan_prompt(held, body.input_ids, body.checkpoint_at)
-            use_draft = runtime.draft is not None and runtime.speculate_tokens
-            source = speculative(request, plan) if use_draft else plain(request, plan)
+            # A draft reads text, so it cannot follow a prompt with images in it.
+            use_draft = runtime.draft is not None and runtime.speculate_tokens and not body.images
             try:
+                rows = await runtime.prompt_rows(body.input_ids, body.images) if body.images else None
+                source = speculative(request, plan) if use_draft else plain(request, plan, rows)
                 async for token in source:
                     yield json.dumps({"token_id": token}).encode() + b"\n"
                 return
@@ -1753,6 +1802,19 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             await runtime.gate.release(slot)
 
     return StreamingResponse(tokens(), media_type="application/x-ndjson")
+
+
+@app.post("/internal/images/measure")
+async def measure_images(body: ImagesMeasure, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """What images will cost, so a control plane can check them against the context."""
+    verify_token(authorization)
+    encoder = runtime.encoder
+    if encoder is None or body.epoch != runtime.epoch:
+        raise HTTPException(status_code=409, detail=f"pipeline epoch mismatch; worker has {runtime.epoch}")
+    try:
+        return {"images": [await asyncio.to_thread(encoder.measure, base64.b64decode(item)) for item in body.images]}
+    except LlamaError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/v1/embed")
@@ -1800,12 +1862,12 @@ async def forward(
     arrived = time.perf_counter()
     try:
         meta = InferRequest.model_validate(decode_meta(x_shardmesh_meta))
-        hidden = decode_activation(await request.body())
+        hidden, places = decode_pass(await request.body())
     except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     runtime._record("receive", arrived)
     try:
-        result = await runtime.execute(hidden, meta)
+        result = await runtime.execute(hidden, meta, None if places is None else places.numpy())
         runtime._record("handler", arrived)
         return result
     except HTTPException:

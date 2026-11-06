@@ -665,7 +665,7 @@ def test_forward_can_return_a_speculative_answer(monkeypatch):
         def _record(self, *args):
             pass
 
-        async def execute(self, hidden, request):
+        async def execute(self, hidden, request, places=None):
             assert request.verify and request.rollback_to == 5
             return {"token_ids": [1, 2, 3]}
 

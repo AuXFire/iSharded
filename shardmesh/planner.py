@@ -521,9 +521,10 @@ def plan_placement(
     pools = [pool for candidate in everyone for pool in candidate.pools]
     needed = min(sum(profile.size_in(unit, pool, profile.quantized(unit)) for unit in profile.units) for pool in pools)
     hint = "remove a pin, " if pinned else ""
+    extra = f" and {profile.entry_extra_bytes / 1024**3:.1f} GiB for a draft model or projector" if profile.entry_extra_bytes else ""
     raise PlacementError(
         f"This model needs {needed / 1024**3:.1f} GiB of weights plus "
-        f"{context / 1024**3:.2f} GiB of context state, but the pool offers "
+        f"{context / 1024**3:.2f} GiB of context state{extra}, but the pool offers "
         f"{sum(offered.values()) / 1024**3:.1f} GiB across {len(everyone)} worker(s); "
         f"{hint}add a worker, raise a RAM or disk budget, or lower the context length"
     )

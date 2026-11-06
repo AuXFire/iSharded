@@ -171,6 +171,8 @@ def run_load(args: argparse.Namespace) -> int:
         body["peer_fetch"] = False
     if args.embedding:
         body["embedding"] = True
+    if args.mmproj:
+        body["mmproj"] = args.mmproj
     if args.lane:
         body.update({"lane": args.lane, "lane_gpu_gb": args.lane_gpu_gb, "lane_ram_gb": args.lane_ram_gb, "lane_apart": args.lane_apart})
     response = httpx.post(base + "/admin/load", json=body, headers=headers, timeout=120.0)
@@ -448,6 +450,7 @@ def build_parser() -> argparse.ArgumentParser:
     load.add_argument("--lane-apart", action="store_true", help="keep this lane off every node another route uses, so routes can check each other")
     load.add_argument("--hashes", default=None, help="file from `shardmesh model hash`: every node checks every unit against it")
     load.add_argument("--embedding", action="store_true", help="this is an embedding model: one stage, for /v1/embeddings and not chat")
+    load.add_argument("--mmproj", default=None, help="projector GGUF for images, hosted on the entry stage; found by name like other GGUF files")
     load.set_defaults(handler=run_load)
     check = subparsers.add_parser("audit", help="ask routes serving a model the same questions, and compare their answers")
     check.add_argument("--model", default=None, help="the model to check; default is the main one")

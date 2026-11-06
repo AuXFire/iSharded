@@ -615,9 +615,12 @@ class LlamaStage:
         hidden: np.ndarray | None = None,
         tokens: np.ndarray | None = None,
         sequence_id: int = 0,
+        places: np.ndarray | None = None,
     ) -> None:
         steps = np.arange(position, position + count, dtype=np.int32)
-        if tokens is None:
+        if places is not None:
+            positions = np.ascontiguousarray(places, dtype=np.int32).reshape(-1)
+        elif tokens is None:
             # Embedding input reads every position section itself.
             positions = np.concatenate([steps, steps, steps, np.zeros(count, dtype=np.int32)])
         else:
@@ -691,14 +694,19 @@ class LlamaStage:
             lib.llama_memory_seq_rm(self.memory, scratch, -1, -1)
         return guesses
 
-    def forward(self, hidden: np.ndarray, position: int, slot: int = 0) -> np.ndarray:
-        """Run hidden states [tokens, width]. Returns hidden states, or the last row's logits."""
+    def forward(self, hidden: np.ndarray, position: int, slot: int = 0, places: np.ndarray | None = None) -> np.ndarray:
+        """Run hidden states [tokens, width]. Returns hidden states, or the last row's logits.
+
+        ``places`` gives every row's position by section, for rows that do not simply
+        follow ``position``, as an image's do not.
+        """
         hidden = np.ascontiguousarray(hidden, dtype=np.float32)
         pieces = []
         for start in range(0, hidden.shape[0], self.batch_tokens):
             chunk = hidden[start : start + self.batch_tokens]
+            part = None if places is None else places[:, start : start + self.batch_tokens]
             self._captured = None
-            self._decode(chunk.shape[0], position + start, not self.last, hidden=chunk, sequence_id=slot)
+            self._decode(chunk.shape[0], position + start, not self.last, hidden=chunk, sequence_id=slot, places=part)
             if not self.last:
                 if self._captured is None:
                     raise LlamaError("the stage output tensor was never produced")

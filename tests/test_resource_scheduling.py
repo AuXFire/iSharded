@@ -71,6 +71,7 @@ def test_gpu_is_preferred_cpu_is_standby_and_memory_is_service() -> None:
 
 def test_worker_model_sources_can_differ_from_logical_model_id() -> None:
     target = ModelTarget.__new__(ModelTarget)
+    target.embedding = False
     target.model_id = "distilbert/distilgpt2"
     target.worker_model_ids = {"local-gpu": r"D:\models\distilgpt2"}
 
@@ -95,6 +96,7 @@ def test_a_lost_pinned_worker_is_dropped_so_recovery_can_continue() -> None:
             record.hardware.memory_pools = [pool]
             orchestrator.register(record)
         target = ModelTarget.__new__(ModelTarget)
+        target.embedding = False
         unit = WeightUnit(
             name="x",
             kind="embed",

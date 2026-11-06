@@ -22,6 +22,7 @@ This is execution sharding, not simulated work distribution: each token really c
 - [HTTP API](#http-api)
 - [Models](#models)
 - [Embeddings](#embeddings)
+- [Vision](#vision)
 - [Memory and placement](#memory-and-placement)
 - [Precision](#precision)
 - [Networks and security](#networks-and-security)
@@ -696,6 +697,7 @@ Loads a model on a running pool and shows progress. `model` is any [model id](#l
 | `--lane-ram-gb` | What is spare | Most RAM per node for this lane |
 | `--lane-apart` | Off | Keep this lane off every node another route uses, so routes can check each other |
 | `--embedding` | Off | This is an embedding model: one stage, for `/v1/embeddings` and not chat. See [Embeddings](#embeddings) |
+| `--mmproj` | None | Projector GGUF for images, hosted on the entry stage and found by name like other GGUF files. See [Vision](#vision) |
 
 ### shardmesh lane
 
@@ -903,7 +905,7 @@ Routes under `/internal` are for nodes only. `GET /internal/mesh` shows a node's
 
 | Field | Default | What it does |
 |---|---|---|
-| `messages` | Required for chat | List of `role` and `content` |
+| `messages` | Required for chat | List of `role` and `content`. `content` is a string, or a list of `text` and `image_url` parts. See [Vision](#vision) |
 | `prompt` | Required for completions | A string, or a list holding one string |
 | `model` | The running model | Must match it if given |
 | `max_tokens` | 32 | 1 to 32768 |
@@ -939,6 +941,7 @@ Prompts longer than the loaded context are refused with a 400. A reply that woul
 | `merge_passes` | `true` | Let conversations share a pass |
 | `model_hashes` | None | The contents of a `shardmesh model hash` file |
 | `embedding` | `false` | This is an embedding model. See [Embeddings](#embeddings) |
+| `mmproj` | None | A projector GGUF for images. See [Vision](#vision) |
 | `reuse_cached`, `peer_fetch` | Pool default | Weigh cached shards, and copy from peers |
 | `wait` | `true` | `false` returns at once. Progress is in `/admin/status` |
 
@@ -973,7 +976,7 @@ Prompts longer than the loaded context are refused with a 400. A reply that woul
 | Qwen3.5, 3.6, 3.8 | `qwen3_5` | `Qwen/Qwen3.5-4B`, `Qwen/Qwen3.8-27B` | Hybrid Gated DeltaNet and attention |
 | Qwen3.5, 3.6 MoE | `qwen3_5_moe` | `Qwen/Qwen3.6-35B-A3B` | Hybrid, with fused experts |
 
-Multimodal releases load as text models: the vision tower and multi-token-prediction head are skipped and never downloaded. Block-scaled FP8 releases work too, such as `Qwen/Qwen3.8-27B-FP8`. Not supported yet: AWQ, GPTQ, Qwen3-Next, and the experimental `qwen4_exp`. An unsupported model is refused with the reason before anything downloads.
+Multimodal safetensors releases load as text models: the vision tower and multi-token-prediction head are skipped and never downloaded. GGUF models can see through a projector, as [Vision](#vision) explains. Block-scaled FP8 releases work too, such as `Qwen/Qwen3.8-27B-FP8`. Not supported yet: AWQ, GPTQ, Qwen3-Next, and the experimental `qwen4_exp`. An unsupported model is refused with the reason before anything downloads.
 
 Workers run these with their own forward pass instead of `transformers` classes, so a node's library versions do not limit which models it can run. Each adapter is tested against the reference `transformers` implementation.
 
@@ -1077,7 +1080,63 @@ Measured with Qwen3-Embedding-0.6B Q8_0 on four CPU threads, on a machine busy w
 | 8 long inputs, 4,496 tokens | 248 tokens/s |
 | llama-server, 64 short inputs on the same settings | About 270 tokens/s |
 
-An embedding model has not been run on a GPU stage. BERT-family GGUFs are refused, because only the architectures in [GGUF models](#gguf-models) can load.
+An embedding model has not been run on a GPU stage, or anywhere but Windows. BERT-family GGUFs are refused, because only the architectures in [GGUF models](#gguf-models) can load.
+
+## Vision
+
+Load a model with its projector, and `/v1/chat/completions` takes images:
+
+```bash
+shardmesh load Qwen3.5-0.8B-Q8_0.gguf --mmproj mmproj-Qwen3.5-0.8B-BF16.gguf --url http://node-a:8669
+```
+
+Send OpenAI's `image_url` parts in a user message, as data URLs:
+
+```json
+{"messages": [{"role": "user", "content": [
+  {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo..."}},
+  {"type": "text", "text": "What color is the square?"}
+]}]}
+```
+
+The chat page shows **Add image** when the chosen model can see, and `GET /v1/models` gives every model a `vision` flag. A model with no projector refuses an image with a 400, and never answers as if it had seen it.
+
+- The entry worker turns an image into embedding rows with llama.cpp's `mtmd` library, and they join the hidden-state stream where the template's image marker stood. Later stages run those rows like any others.
+- Later stages need no projector, but they do need positions, because every stage applies M-RoPE in its own attention layers. A pass holding image rows carries each row's position beside the hidden states. Under M-RoPE a 16 by 16 image takes 256 rows and moves the sequence on by 16, and `mtmd` reports both.
+- The projector is found by name like other GGUF files, and only the entry worker loads it. If that worker has no copy it reads one from a node that does. Placement adds the file's size and 768 MiB to the entry stage. The process peaked at 887 MiB with a 198 MiB projector.
+- The projector runs in a process of its own beside the entry stage, because native code decodes images that strangers send. Width and height are read from the file's header first, so a small file cannot unpack into gigabytes. A process that dies is started again, and an image that stops it gets a 400.
+- An image counts for its rows, in `usage` and against `--context-tokens`: 256 rows at 512 by 512, and about 1,900 at 1600 by 1200. Too many rows for the context is a 400, before anything is encoded.
+- An image is part of the conversation's prefix. Its rows stand in the prompt as numbers taken from a SHA-256 of the file, so a different image can never reuse a saved state, and the same image is not read again.
+- A reply with images does not use a draft model, because a draft reads only text. Replies with no images still do.
+
+| Limit | Value |
+|---|---|
+| Sources | Base64 data URLs only. `http` and `https` URLs are refused, because fetching one would let a caller make a node request any address. There is no setting to allow them |
+| Formats | PNG, JPEG, GIF, and BMP. WebP needs an ffmpeg build of `mtmd` |
+| All images in a request | 10 MiB, which also bounds a conversation, since every turn resends its images |
+| Images in a request | 16 |
+| One image | 40 million pixels |
+| Where | User messages only |
+
+Only `qwen3vl_merger` projectors load, which are the ones for `qwen35` and `qwen35moe` models. Any other type is refused at load, and so are deepstack projectors, whose rows feed several layers, and any that need non-causal attention. Audio and video are not supported.
+
+Measured with Qwen3.5-0.8B Q8_0 and its BF16 projector on four CPU threads, on three images made to be checked: a large red square, the word HELLO, and three circles. "Two nodes" means two node processes on one machine, with layers 0 to 19 on one and 20 to 23 on the other.
+
+| Measurement | Result |
+|---|---|
+| Encoding a 512 by 512 image | About 1.1 s |
+| 48 tokens against `llama-mtmd-cli`, on one node | 2 of 3 images identical, character for character |
+| The same, on two nodes | 3 of 3 identical |
+| The one that differed | A near-tie: 0.006 logits apart. Stopping to save a checkpoint moves it, and reproducing that stop gives the same word |
+| 7 replies on two nodes against one node | 6 identical, and the seventh is that near-tie |
+| Same image on the next turn, on one node and on two | 29 of 320 rows run, and the right answer |
+| A different image with the same text | Every row run again, and the right answer |
+| A later stage killed in the middle of a reply | The reply finished, identical to one left alone |
+| Three image replies and a text reply at once, `--parallel 3` | 64 merged passes. The text reply and 2 of 3 image replies were identical to running alone, and the third is the near-tie |
+
+How well a 0.8B model sees: with thinking off it says `red` and `3`, both right, and reads HELLO as `HLO`, which is wrong. `llama-mtmd-cli` gives the same three answers, so that is the model. Two images in one request were counted correctly. Treat it as a proof that the pipeline works, not as a model to rely on for reading text.
+
+A GPU has not encoded an image, vision has not crossed a real network, and it has run only on Windows. A file that really crashes the decoder has not been tried: the restart was tested by killing the process while idle, and the refusal with a fake one.
 
 ## Memory and placement
 
@@ -1351,6 +1410,7 @@ Behavior:
 - Multi-token batches cross between GGUF stages as BF16, and single tokens as FP32. A node set to `--dtype float32` keeps everything in FP32.
 - A stage file duplicates that node's cached units on disk.
 - GGUF files are parsed by native code in the stage process, so load them only from sources you trust.
+- Outside embedding mode, llama.cpp's operation offload stays on, so a stage with no GPU layers may still use a GPU the build can reach for prompts of 32 tokens or more.
 - The planner uses measured memory bandwidth and a fixed cost per network hop, but not per-layer benchmarks or pairwise network telemetry. Its disk estimate assumes cold reads, so warm runs beat it.
 - Workers on one host split shared RAM evenly during planning, which can refuse a plan an uneven split would allow.
 - There is one active RAM checkpoint service per route. Snapshots are not yet replicated or compressed. If the store is behind when a stage fails, recovery replays the prompt.
