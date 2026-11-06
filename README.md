@@ -61,7 +61,7 @@ The `pool` extra adds `cryptography`, which you need to create a pool's credenti
 
 This installs `shardmesh`, `shardmesh-node`, `shardmesh-orchestrator`, and `shardmesh-worker`. From a checkout with the dependencies in place, `python -m shardmesh` works the same way without installing.
 
-For GGUF models, Windows nodes download a pinned, hash-checked llama.cpp build for their hardware to `%LOCALAPPDATA%\ShardMesh\llama`. Linux and macOS nodes need `--llama-dir` pointing at a build you supply. A closed network needs it everywhere.
+For GGUF models, nodes download a pinned, hash-checked llama.cpp build for their hardware to `%LOCALAPPDATA%\ShardMesh\llama` on Windows or `~/.cache/shardmesh/llama` elsewhere. On a minimal Linux install, add the one system library it needs with `sudo apt-get install libgomp1`. On a closed network, give each node a build with `--llama-dir`.
 
 On a machine where antivirus intercepts HTTPS, `pip` may fail with a certificate error. Add `--use-feature=truststore` so it uses the system's trusted certificates.
 
@@ -441,7 +441,7 @@ Models and cache:
 |---|---|---|
 | `--gguf-dir` | None | Folder to search for GGUF files already here, such as LM Studio's. Repeatable |
 | `--model-dir` | None | A folder of local models peers may ask this node to load. Repeatable |
-| `--llama-dir` | Downloaded on Windows | A llama.cpp build for GGUF models. Needed on Linux, macOS, and closed networks |
+| `--llama-dir` | Downloaded | A llama.cpp build for GGUF models. Needed on closed networks |
 | `--cache-dir` | `~/.cache/shardmesh/units` | Where fetched weights are kept. Put it on a fast disk |
 | `--cache-budget-gb` | 0 (no limit) | Evict old models past this size |
 | `--no-peer-fetch` | Off | Always download from the model host |
@@ -564,7 +564,7 @@ The state folder is `%LOCALAPPDATA%\ShardMesh` on Windows and `~/.cache/ShardMes
 | `--cache-dir` | `~/.cache/shardmesh/units` | Where fetched weights live |
 | `--cache-budget-gb` | 0 (no limit) | Evict old models past this size |
 | `--gguf-dir` | None | Folder holding GGUF files. Repeatable |
-| `--llama-dir` | Downloaded on Windows | A llama.cpp build for GGUF models |
+| `--llama-dir` | Downloaded | A llama.cpp build for GGUF models |
 | `--no-peer-fetch` | Off | Always download from the model host |
 | `--no-peer-serve` | Off | Do not send shards to other workers |
 | `--standby` | Off | Only use this worker when a model does not fit without it |

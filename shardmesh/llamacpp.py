@@ -15,8 +15,10 @@ import hashlib
 import importlib.util
 import os
 from pathlib import Path
+import platform
 import shutil
 import sys
+import tarfile
 import threading
 from typing import Any
 import zipfile
@@ -26,16 +28,33 @@ import numpy as np
 
 PINNED_BUILD = "b12119"
 RELEASE_URL = f"https://github.com/ggml-org/llama.cpp/releases/download/{PINNED_BUILD}/"
-# Windows release files for each backend, with their published SHA-256.
-BUILDS: dict[str, list[tuple[str, str]]] = {
-    "cuda": [
-        (f"llama-{PINNED_BUILD}-bin-win-cuda-12.4-x64.zip", "944fea366abc778026d73213277ea104a7e2413b265f42193fcf2da1f5cdd60f"),
-        ("cudart-llama-bin-win-cuda-12.4-x64.zip", "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6"),
-    ],
-    "rocm": [(f"llama-{PINNED_BUILD}-bin-win-rocm-10.0-x64.zip", "f09d7639c4c401e4c715c56ad8ed1c734e0116a9cb3fd6f381aebf8149cf29f8")],
-    "vulkan": [(f"llama-{PINNED_BUILD}-bin-win-vulkan-x64.zip", "da6f3e49f5b2383bc79dd9bfcb17205e69df4aaa8ccf72d3db02da72cdb5e89a")],
-    "cpu": [(f"llama-{PINNED_BUILD}-bin-win-cpu-x64.zip", "37a6c6c9eae5b7baa2619cba513781fad15ca0f63f7d07362ec83a294cf96f86")],
+# Release files for each platform and backend, with their published SHA-256.
+BUILDS: dict[str, dict[str, list[tuple[str, str]]]] = {
+    "windows-x64": {
+        "cuda": [
+            (f"llama-{PINNED_BUILD}-bin-win-cuda-12.4-x64.zip", "944fea366abc778026d73213277ea104a7e2413b265f42193fcf2da1f5cdd60f"),
+            ("cudart-llama-bin-win-cuda-12.4-x64.zip", "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6"),
+        ],
+        "rocm": [(f"llama-{PINNED_BUILD}-bin-win-rocm-10.0-x64.zip", "f09d7639c4c401e4c715c56ad8ed1c734e0116a9cb3fd6f381aebf8149cf29f8")],
+        "vulkan": [(f"llama-{PINNED_BUILD}-bin-win-vulkan-x64.zip", "da6f3e49f5b2383bc79dd9bfcb17205e69df4aaa8ccf72d3db02da72cdb5e89a")],
+        "cpu": [(f"llama-{PINNED_BUILD}-bin-win-cpu-x64.zip", "37a6c6c9eae5b7baa2619cba513781fad15ca0f63f7d07362ec83a294cf96f86")],
+    },
+    "linux-x64": {
+        "cpu": [(f"llama-{PINNED_BUILD}-bin-ubuntu-x64.tar.gz", "b766529b1a5082c65b9dc5a5f1a78092c6e107344dc383c53a00b83da47c16a6")],
+        "vulkan": [(f"llama-{PINNED_BUILD}-bin-ubuntu-vulkan-x64.tar.gz", "6d4f7e69257f57f0897a6a562d2b31d11055c55748672d8f0955476174e0bc11")],
+        "rocm": [(f"llama-{PINNED_BUILD}-bin-ubuntu-rocm-10.0-x64.tar.gz", "42751a517b335aaaacf0ef171bd50af619e02d9d5200d937fdcb46aab708be12")],
+        "cuda": [
+            (f"llama-{PINNED_BUILD}-bin-ubuntu-cuda-12.8-x64.tar.gz", "d61b6c35f56f3cf74ca8a0ec5bdd8c8dd1b5c304f9e001bf9ddb29f8d4d2a409"),
+            (f"cudart-llama-{PINNED_BUILD}-bin-ubuntu-cuda-12.8-x64.tar.gz", "40ddc5e887003a5ac19f1baf0681d9bedb52bf7cf57b9fa896dbaf6439e53b7c"),
+        ],
+    },
+    "linux-arm64": {"cpu": [(f"llama-{PINNED_BUILD}-bin-ubuntu-arm64.tar.gz", "c8329d08022d6d7a029d6babb6479dd8d5a606f0073fae3648d045d7c33c908a")]},
+    # The Mac builds carry Metal, so one build serves CPU and GPU there.
+    "macos-arm64": {"cpu": [(f"llama-{PINNED_BUILD}-bin-macos-arm64.tar.gz", "51fc160bc6f6a6b53fef3c50d12b27314cfaf8fc37766fc605e0bd30d87a79b8")]},
+    "macos-x64": {"cpu": [(f"llama-{PINNED_BUILD}-bin-macos-x64.tar.gz", "79cdaf30cfd10d6ebbb39f65ae95d542bf526730292698056f39443d9d3f7f29")]},
 }
+# What a machine has to provide itself, and the package that does on Debian and Ubuntu.
+SYSTEM_LIBRARIES = {"libgomp": "libgomp1", "libvulkan": "libvulkan1", "libstdc++": "libstdc++6"}
 
 
 class TensorOverride(C.Structure):
@@ -253,27 +272,68 @@ def _download(url: str, destination: Path, expected: str, tls: Any) -> None:
     partial.replace(destination)
 
 
+def this_platform() -> str:
+    system = "windows" if os.name == "nt" else "macos" if sys.platform == "darwin" else "linux"
+    arm = platform.machine().lower() in {"arm64", "aarch64"}
+    return f"{system}-{'arm64' if arm else 'x64'}"
+
+
+def library_file(name: str) -> str:
+    """A native library's file name here: llama.dll, libllama.so, or libllama.dylib."""
+    if os.name == "nt":
+        return f"{name}.dll"
+    return f"lib{name}{'.dylib' if sys.platform == 'darwin' else '.so'}"
+
+
+def build_folder(folder: Path) -> Path | None:
+    """Where a build keeps its libraries. Release archives nest them a level down."""
+    return next((item.parent for item in sorted(folder.rglob(library_file("llama")))), None) if folder.is_dir() else None
+
+
+def unpack(archive: Path, folder: Path) -> None:
+    if archive.name.endswith(".zip"):
+        with zipfile.ZipFile(archive) as bundle:
+            bundle.extractall(folder)
+        return
+    with tarfile.open(archive) as bundle:
+        bundle.extractall(folder, **({"filter": "data"} if hasattr(tarfile, "data_filter") else {}))
+
+
 def ensure_build(kind: str, root: Path | None = None) -> Path:
     """Return a folder holding this backend's build, downloading it if needed."""
     from .weights import tls_context
 
-    if os.name != "nt":
-        raise LlamaError("automatic llama.cpp downloads are Windows only for now; set --llama-dir to a build")
+    choices = BUILDS.get(this_platform())
+    if not choices or kind not in choices:
+        offered = ", ".join(choices or ()) or "nothing"
+        raise LlamaError(f"no {kind} build of llama.cpp for {this_platform()} (it offers {offered}); set --llama-dir to a build")
     folder = (root or default_build_root()) / kind
-    if (folder / "llama.dll").is_file():
-        return folder
+    found = build_folder(folder)
+    if found:
+        return found
     folder.mkdir(parents=True, exist_ok=True)
-    for name, expected in BUILDS[kind]:
+    for name, expected in choices[kind]:
         archive = folder.parent / name
         if not archive.is_file() or hashlib.sha256(archive.read_bytes()).hexdigest() != expected:
             print(f"Downloading {name}", flush=True)
             _download(RELEASE_URL + name, archive, expected, tls_context())
-        with zipfile.ZipFile(archive) as bundle:
-            bundle.extractall(folder)
-    if not (folder / "llama.dll").is_file():
+        unpack(archive, folder)
+    found = build_folder(folder)
+    if not found:
         shutil.rmtree(folder, ignore_errors=True)
-        raise LlamaError(f"the {kind} build has no llama.dll")
-    return folder
+        raise LlamaError(f"the {kind} build has no {library_file('llama')}")
+    return found
+
+
+def load_native(path: Path) -> C.CDLL:
+    """Load a library, saying which package to install if the machine lacks one."""
+    try:
+        return C.CDLL(str(path))
+    except OSError as error:
+        text = str(error)
+        package = next((package for library, package in SYSTEM_LIBRARIES.items() if library in text), None)
+        advice = f" On Debian or Ubuntu, install it with: sudo apt-get install {package}" if package else ""
+        raise LlamaError(f"could not load {path.name}: {text}.{advice}") from error
 
 
 def rocm_library_paths() -> tuple[str, ...]:
@@ -297,11 +357,9 @@ class LlamaLibrary:
         if hasattr(os, "add_dll_directory"):
             for entry in search:
                 os.add_dll_directory(entry)
-        suffix = ".dll" if os.name == "nt" else ".dylib" if sys.platform == "darwin" else ".so"
-        prefix = "" if os.name == "nt" else "lib"
-        self.ggml_base = C.CDLL(str(Path(self.folder) / f"{prefix}ggml-base{suffix}"))
-        self.ggml = C.CDLL(str(Path(self.folder) / f"{prefix}ggml{suffix}"))
-        self.llama = C.CDLL(str(Path(self.folder) / f"{prefix}llama{suffix}"))
+        self.ggml_base = load_native(Path(self.folder) / library_file("ggml-base"))
+        self.ggml = load_native(Path(self.folder) / library_file("ggml"))
+        self.llama = load_native(Path(self.folder) / library_file("llama"))
         self._bind()
         self._check_binding()
         self._log = LOG_CALLBACK(self._on_log)

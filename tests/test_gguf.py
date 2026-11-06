@@ -920,3 +920,55 @@ def test_only_disk_tier_stages_map_their_file():
     assert not needs_mapping(fast, pools)
     assert needs_mapping([*fast, UnitPlacement(unit="c", pool_id="disk", bytes=5)], pools)
     assert not needs_mapping([UnitPlacement(unit="c", pool_id="disk", bytes=0)], pools)
+
+
+
+def test_every_platform_has_a_cpu_build_with_a_full_hash() -> None:
+    from shardmesh.llamacpp import BUILDS
+
+    for platform_name, kinds in BUILDS.items():
+        assert "cpu" in kinds, platform_name
+        for files in kinds.values():
+            assert all(len(digest) == 64 for _, digest in files)
+
+
+def test_release_archives_nest_their_libraries(tmp_path, monkeypatch) -> None:
+    import io
+    import tarfile
+
+    from shardmesh import llamacpp
+
+    monkeypatch.setattr(llamacpp.os, "name", "posix")
+    monkeypatch.setattr(llamacpp.sys, "platform", "linux")
+    archive = tmp_path / "build.tar.gz"
+    with tarfile.open(archive, "w:gz") as bundle:
+        entry = tarfile.TarInfo("llama-b1/libllama.so")
+        entry.size = 4
+        bundle.addfile(entry, io.BytesIO(b"none"))
+    folder = tmp_path / "cpu"
+    assert llamacpp.build_folder(folder) is None
+    llamacpp.unpack(archive, folder)
+    assert llamacpp.build_folder(folder) == folder / "llama-b1"
+
+
+def test_a_missing_system_library_names_its_package(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    from shardmesh import llamacpp
+
+    def refuse(_):
+        raise OSError("libgomp.so.1: cannot open shared object file: No such file or directory")
+
+    monkeypatch.setattr(llamacpp.C, "CDLL", refuse)
+    with pytest.raises(llamacpp.LlamaError, match="sudo apt-get install libgomp1"):
+        llamacpp.load_native(tmp_path / "libggml-base.so")
+
+
+def test_a_platform_without_that_build_says_what_it_offers(monkeypatch) -> None:
+    import pytest
+
+    from shardmesh import llamacpp
+
+    monkeypatch.setattr(llamacpp, "this_platform", lambda: "macos-arm64")
+    with pytest.raises(llamacpp.LlamaError, match="it offers cpu"):
+        llamacpp.ensure_build("cuda")
