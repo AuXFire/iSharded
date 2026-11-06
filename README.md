@@ -1,5 +1,7 @@
 # ShardMesh
 
+> ShardMesh is an active project, changing quickly. Commands and the network protocol can change between versions, so upgrade all of a mesh's nodes together. Nothing here should be treated as finished or production-proven yet.
+
 ShardMesh runs language models across a mesh of many computers, using whatever memory each one has: VRAM, unified memory, system RAM, or disk. A model too big for any one of them can run across all of them. There is no central server. Every node runs the same software, the nodes elect one of themselves to coordinate, and any node can serve the API.
 
 It works on a closed network, a LAN, across VLANs, over Tailscale, or between remote machines with TLS. The API follows OpenAI's, so existing clients only need a new URL and key.
@@ -44,7 +46,25 @@ More detail lives in [Operating ShardMesh](docs/OPERATIONS.md) and [ShardMesh se
 
 ## Install
 
-You need Python 3.10 or newer, and PyTorch built for your hardware. Install PyTorch first, because the default package may not match your GPU. See [pytorch.org](https://pytorch.org/get-started/locally/) for CUDA, ROCm, and CPU builds.
+You need Python 3.10 or newer. These install ShardMesh for your user only, and pick a PyTorch build for your hardware.
+
+On Windows, in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/AuXFire/shardmesh/main/install.ps1 | iex
+```
+
+On Linux or macOS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AuXFire/shardmesh/main/install.sh | sh
+```
+
+Then `shardmesh doctor` checks the machine, and says what to fix if anything is missing.
+
+### By hand
+
+You need PyTorch built for your hardware. Install PyTorch first, because the default package may not match your GPU. See [pytorch.org](https://pytorch.org/get-started/locally/) for CUDA, ROCm, and CPU builds.
 
 ```bash
 git clone https://github.com/AuXFire/shardmesh.git
@@ -55,10 +75,10 @@ cd shardmesh
 ```
 
 ```bash
-python -m pip install -e ".[pool]"
+python -m pip install -e .
 ```
 
-The `pool` extra adds `cryptography`, which you need to create a pool's credentials, and on every node in a pool that uses certificates. Other extras: `test` for the test suite.
+The `test` extra adds what the test suite needs.
 
 This installs `shardmesh`, `shardmesh-node`, `shardmesh-orchestrator`, and `shardmesh-worker`. From a checkout with the dependencies in place, `python -m shardmesh` works the same way without installing.
 
@@ -67,6 +87,42 @@ For GGUF models, nodes download a pinned, hash-checked llama.cpp build for their
 On a machine where antivirus intercepts HTTPS, `pip` may fail with a certificate error. Add `--use-feature=truststore` so it uses the system's trusted certificates.
 
 ## Quick start
+
+### Start a mesh
+
+On the first machine:
+
+```bash
+shardmesh up
+```
+
+That is all it needs. It finds the hardware, picks an address, makes the mesh's certificates, and opens the chat page signed in as the owner, where you choose a model. Running it again starts the same node with the same settings.
+
+### Add a machine
+
+On the machine that made the mesh:
+
+```bash
+shardmesh invite
+```
+
+It prints one command to run on the new machine, with a code that works once and lasts 24 hours. The dashboard's "Add a machine" button does the same. The new machine makes its own key, proves it holds the code, and gets a certificate signed by the owner's machine, which has to be running at that moment. Nothing needs copying. Run `shardmesh up --invite CODE` on as many machines as you invite.
+
+The new machine gets its own key for the chat page, with the user role. The owner's key stays the only admin key.
+
+### What it works out
+
+| Setting | How `shardmesh up` decides |
+|---|---|
+| Address | Tailscale if this machine has it, otherwise the LAN |
+| Encryption | None added on Tailscale, which encrypts already. Otherwise TLS with the mesh's own certificate, so a browser warns once. `--trusted-network` skips it |
+| GPU, RAM, CPU | Every accelerator, a share of free RAM, and half the cores |
+| Models on disk | LM Studio's folders and `~/models`, so nothing downloads twice |
+| Name | This machine's name |
+
+Everything it decides is in `settings.json` in its folder, `%LOCALAPPDATA%\ShardMesh\up` on Windows or `~/.shardmesh/up` elsewhere. That folder also holds the mesh's authority key on the owner's machine, so keep it safe. To start a node at login, run `shardmesh service install`.
+
+The rest of this section sets things up by hand, which gives you every option in the [command reference](#command-reference).
 
 ### One machine
 
@@ -462,6 +518,41 @@ A third node and every one after it joins the same way, with `--join` naming any
 
 Every `--url` takes any node's control address. Commands default to `http://127.0.0.1:8000`, which is the demo's port. A node's control port is `--base-port` plus 9, so 8209 unless you change it.
 
+### shardmesh up
+
+Starts a node with everything worked out, and is the easy way in. See [Quick start](#quick-start).
+
+| Option | Default | What it does |
+|---|---|---|
+| `--invite` | None | Join a mesh, with a code from `shardmesh invite` |
+| `--name` | This machine's name | This node's name |
+| `--port` | 8209 | Port for the chat page and API |
+| `--address` | Found for you | The address other nodes reach this one on |
+| `--tls` | Off on Tailscale | Use TLS even on Tailscale |
+| `--trusted-network` | Off | Skip TLS, because nobody else can read this network |
+| `--no-gpu` | Off | Contribute CPU and RAM only |
+| `--gpu-gb` | A share of what is free | VRAM to give |
+| `--ram-gb` | A share of what is free | RAM to give for weights |
+| `--cpu-threads` | Half the cores | Threads to give |
+| `--gguf-dir` | LM Studio's folders | A folder of GGUF files. Repeatable |
+| `--model` | None | Load this model once the node is up |
+| `--no-browser` | Off | Do not open the chat page |
+| `--ownerless` | Off | Make or join a [network nobody owns](#a-network-nobody-owns) |
+| `--joining` | `vouched` | With `--ownerless`: who this node accepts, `open` or `vouched` |
+| `--join` | None | With `--ownerless`: any node already in the network |
+
+### shardmesh invite
+
+Makes a code that adds a machine to this mesh, on the machine that made it. `--uses` sets how many machines it can add, 1 by default, and `--hours` how long it lasts, 24 by default.
+
+### shardmesh doctor
+
+Checks this machine and says what to fix: Python, addresses, ports, memory, disk, and local models.
+
+### shardmesh service
+
+`shardmesh service install` starts this node when you log in, for this user only, and `shardmesh service remove` stops that. It uses a scheduled task on Windows, a systemd user unit on Linux, and a launch agent on macOS.
+
 ### shardmesh demo
 
 Starts a control plane and workers on this machine, and loads a model.
@@ -701,6 +792,7 @@ A flag takes priority over its variable.
 | `SHARDMESH_CACHE_DIR`, `SHARDMESH_LLAMA_DIR` | `--cache-dir`, `--llama-dir` |
 | `SHARDMESH_LANE`, `SHARDMESH_LANES_FILE` | Set by `shardmesh node`: which lane a process is, and where a node keeps the lanes it should run |
 | `SHARDMESH_OWNERLESS` | `--ownerless` |
+| `SHARDMESH_UP_HOME` | Where `shardmesh up` keeps its settings and keys |
 | `SHARDMESH_HOST_MODELS` | `--host-models` |
 | `SHARDMESH_MODEL_DIRS` | `--model-dir`, separated by the system's path separator |
 | `SHARDMESH_REUSE_CACHED`, `SHARDMESH_PEER_FETCH` | Set to `0` for the control plane's `--no-reuse-cached`, `--no-peer-fetch` |
@@ -729,6 +821,8 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `POST` | `/admin/load` | Admin key | Load a model |
 | `POST` | `/admin/load/cancel` | Admin key | Stop a load. Finished units stay cached |
 | `DELETE` | `/admin/lanes/{name}` | Admin key | Stop a lane and free its memory on every node |
+| `POST` | `/admin/invites` | Admin key | Make a code that adds a machine. Takes `uses` and `hours`, and only the machine that made the mesh can |
+| `GET` | `/join/authority` | None | The mesh's public certificate, for a new machine to check against its invite |
 | `GET` | `/admin/inventory` | User key | Each node's system, disks, GPU temperature and power, load, battery, and round trip from this node, where the machine reports them |
 | `DELETE` | `/admin/nodes/{name}/revoke` | Admin key | In a network nobody owns, undo this node's block on another |
 | `POST` | `/admin/rebalance` | Admin key | Reconsider all live workers and apply a new layout |

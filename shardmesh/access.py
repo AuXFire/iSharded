@@ -46,6 +46,9 @@ WORKER_KINDS = {"gpu", "cpu", "memory"}
 AUDIT_ROTATE_BYTES = 64 * 1024 * 1024
 MAX_JOIN_REQUESTS = 64
 MAX_SIGNED_ENTRIES = 8192
+# What an invited node adds to its request. They grant nothing: the owner's machine
+# checks the proof against an invite it made, over this exact request.
+INVITE_FIELDS = ("proof", "key_sha256")
 
 
 def node_of(worker_id: str) -> str:
@@ -207,7 +210,7 @@ class AccessControl:
                 details = read_membership_request(held["request"])
             except (ImportError, ValueError):
                 continue  # each node checks for itself, since gossip proves nothing
-            self.add_join_request(details, held["request"])
+            self.add_join_request(details, held["request"], {key: held[key] for key in INVITE_FIELDS if isinstance(held.get(key), str)})
 
     def _take_signed(self, document: dict[str, Any]) -> bool:
         """Apply new signed entries from a document. Anything unsigned is ignored."""
@@ -261,7 +264,7 @@ class AccessControl:
             return True
         return False
 
-    def add_join_request(self, details: dict[str, Any], request: str) -> str:
+    def add_join_request(self, details: dict[str, Any], request: str, invite: dict[str, str] | None = None) -> str:
         """Hold a request for the owner. Says what happened, for whoever asked."""
         name = details["name"]
         if name in self.revoked or details["fingerprint"] in self.denied:
@@ -270,7 +273,7 @@ class AccessControl:
             return "approved"
         if name not in self.join_requests and len(self.join_requests) >= MAX_JOIN_REQUESTS:
             return "busy"
-        self.join_requests[name] = {**details, "request": request}
+        self.join_requests[name] = {**details, "request": request, **(invite or {})}
         return "waiting"
 
     def add_signed(self, signed: Any) -> bool:

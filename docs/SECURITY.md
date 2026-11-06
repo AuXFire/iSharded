@@ -12,6 +12,17 @@ ShardMesh is decentralized in how it runs, not in who owns it. No server is spec
 
 This suits a pool whose members trust each other. It is not a public mesh. A public mesh, where anyone can join, would need answers ShardMesh does not have today: a way to detect wrong results, a way to stop one person running thousands of nodes, and a clear warning that node operators can read prompts. The next section covers what is built for that, and what stays unanswered.
 
+## Invites
+
+`shardmesh up` makes an owned network without anyone handling certificates. It does not weaken anything: the authority's key stays on the owner's machine, and only the process there can sign.
+
+- A code carries the mesh's addresses, a hash of its authority, and a secret. It works a set number of times, one by default, for a set time, 24 hours by default.
+- A new machine fetches the authority and checks it against the hash, so a stranger cannot pose as the mesh. Its key never leaves it.
+- It proves it holds the secret with an HMAC over its exact request and key hash. The proof travels by gossip, so a member who sees it pass cannot reuse it on another request.
+- The owner's machine checks the proof, signs a certificate, and signs a user key for the new machine. Nothing else in the mesh can admit anyone, so if that machine is off, an invite waits.
+- Anyone holding a live code can join until it is used. Treat it like a password, and keep the time short.
+- `invites.json` on the owner's machine holds live secrets beside `ca.key`, and has the same protection.
+
 ## A network nobody owns
 
 In this kind of network there is no pool authority and no owner. [The README shows how to run one](../README.md#a-network-nobody-owns). What changes:

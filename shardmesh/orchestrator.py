@@ -21,7 +21,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from starlette.background import BackgroundTask
 
 from . import __version__
-from .access import load_authority, NeedsAuthority, node_of, ROLE_ADMIN, ROLE_MEMBER, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, Caller
+from .access import INVITE_FIELDS, load_authority, NeedsAuthority, node_of, ROLE_ADMIN, ROLE_MEMBER, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, Caller
 from .gguf import parse_source
 from .lanes import LaneDoor
 from .mesh import GOSSIP_SECONDS, ControlMesh
@@ -2163,7 +2163,7 @@ async def forward_to_coordinator(request: Request, call_next: Any) -> Any:
         # httpx would resolve these, turning a forwarded path into any other.
         return JSONResponse(status_code=400, content={"detail": "bad path"})
     serves_locally = path.startswith("/v1/") and bool(runtime.route)
-    own_choice = runtime.access.ownerless and (path.startswith("/admin/keys") or path.endswith("/revoke"))
+    own_choice = path == "/admin/invites" or (runtime.access.ownerless and (path.startswith("/admin/keys") or path.endswith("/revoke")))
     if mesh is None or mesh.is_leader or serves_locally or own_choice or not path.startswith(FORWARDED_PATHS):
         return await call_next(request)
     target = mesh.leader_url
@@ -2505,7 +2505,8 @@ async def request_to_join(body: dict[str, Any]) -> dict[str, str]:
         raise HTTPException(status_code=400, detail=f"bad request: {exc}") from exc
     if not SAFE_NODE_NAME.fullmatch(details["name"]):
         raise HTTPException(status_code=400, detail="node names are letters, digits, dots, dashes, and underscores")
-    state = runtime.access.add_join_request(details, str(body["request"]))
+    invite = {key: str(body[key])[:128] for key in INVITE_FIELDS if key in body}
+    state = runtime.access.add_join_request(details, str(body["request"]), invite)
     if state == "waiting":
         runtime.add_event("security", "A node asked to join", f"{details['name']} from {details['addresses'][:2]}, key {details['fingerprint']}")
     return {"status": state, "fingerprint": details["fingerprint"]}
@@ -2515,6 +2516,28 @@ async def request_to_join(body: dict[str, Any]) -> dict[str, str]:
 async def join_requests(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     verify_admin(authorization)
     return {"requests": list(runtime.access.join_requests.values())}
+
+
+@app.get("/join/authority")
+async def join_authority() -> dict[str, str]:
+    """The mesh's public certificate, for a new machine to check against its invite."""
+    if runtime.access.authority is None or runtime.access.ownerless:
+        raise HTTPException(status_code=404, detail="this pool has no authority")
+    return {"authority": Path(os.environ["SHARDMESH_CA_FILE"]).read_text(encoding="utf-8")}
+
+
+@app.post("/admin/invites")
+async def make_invite(body: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """A code that adds a machine. Only the machine holding the authority can honor one."""
+    verify_admin(authorization)
+    home = os.getenv("SHARDMESH_UP_HOME")
+    if not home or not Path(home, "ca.key").is_file():
+        raise HTTPException(status_code=409, detail="only the machine that made this mesh can invite; open this page there")
+    from .up import create_invite
+
+    assert runtime.mesh is not None
+    urls = [runtime.mesh.url, *sorted(peer.url for peer in runtime.mesh.peers.values())]
+    return create_invite(Path(home), urls, int(body.get("uses", 1)), float(body.get("hours", 24)))
 
 
 @app.get("/join/certificate/{name}")
@@ -2697,7 +2720,7 @@ async def completions(
     authorization: str | None = Header(default=None),
 ) -> Any:
     caller = verify_user(authorization)
-    lane = runtime.lanes.serving(body.model)
+    lane = await runtime.lanes.locate(body.model)
     if lane:
         return await runtime.lanes.forward(lane, "/v1/completions", body.model_dump(exclude_none=True), caller)
     await check_request(body.model)
@@ -2741,7 +2764,7 @@ async def chat_completions(
     authorization: str | None = Header(default=None),
 ) -> Any:
     caller = verify_user(authorization)
-    lane = runtime.lanes.serving(body.model)
+    lane = await runtime.lanes.locate(body.model)
     if lane:
         return await runtime.lanes.forward(lane, "/v1/chat/completions", body.model_dump(exclude_none=True), caller)
     await check_request(body.model)

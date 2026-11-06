@@ -14,6 +14,7 @@ dependencies = [
   "jinja2>=3.1.6,<4",
   "pydantic>=2.8,<3",
   "psutil>=5.9,<7",
+  "cryptography>=42",
   "safetensors>=0.4,<1",
   # httpcore imports this on every request. Newer anyio no longer brings it, and
   # a missing module is searched for again on every attempt.
@@ -26,8 +27,9 @@ dependencies = [
 [project.optional-dependencies]
 # transformers is only the reference that adapters are tested against.
 test = ["pytest>=8", "pytest-asyncio>=0.23", "transformers>=4.42", "cryptography>=42"]
+# Kept so older install commands still work: cryptography is now always installed.
 # For any node in a pool with an authority, and the machine that issues certificates.
-pool = ["cryptography>=42"]
+pool = []
 
 [project.scripts]
 shardmesh = "shardmesh.cli:main"

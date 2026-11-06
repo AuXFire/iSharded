@@ -18,6 +18,7 @@ import httpx
 from .pool import load_token
 from .assistant.cli import add_arguments as add_assistant_arguments, run as run_assistant
 from .node import add_node_arguments, run_node
+from .up import add_arguments as add_up_arguments
 
 
 def wait_for(url: str, timeout: float = 60.0) -> None:
@@ -441,6 +442,7 @@ def build_parser() -> argparse.ArgumentParser:
     node = subparsers.add_parser("node", help="contribute CPU, RAM, GPU, or any combination")
     add_node_arguments(node)
     node.set_defaults(handler=run_node)
+    add_up_arguments(subparsers)
     assistant = subparsers.add_parser("assistant", help="a persistent assistant that uses the mesh; see docs/ASSISTANT.md")
     add_assistant_arguments(assistant)
     assistant.set_defaults(handler=run_assistant)

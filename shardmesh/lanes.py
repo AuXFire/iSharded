@@ -231,6 +231,14 @@ class LaneDoor:
             return None
         return next((name for name, info in self.seen.items() if info.get("ready")), None)
 
+    async def locate(self, model: str | None) -> str | None:
+        """The lane for a request. A lane may have just finished loading, and this view can be seconds old."""
+        lane = self.serving(model)
+        if lane is None and model and self.active and model != self.runtime.model_id:
+            await asyncio.gather(*(self._look(name) for name in clean_lanes(self.runtime.mesh.lanes)))
+            lane = self.serving(model)
+        return lane
+
     def models(self) -> list[str]:
         return sorted({str(info["model"]) for info in self.seen.values() if info.get("ready") and info.get("model")})
 
