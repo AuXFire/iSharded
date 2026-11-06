@@ -1250,6 +1250,34 @@ def test_a_small_move_does_not_wait(monkeypatch) -> None:
     monkeypatch.setattr(orchestrator, "_review_quarantine", lambda: pytest.fail("it should not have waited"))
     asyncio.run(orchestrator._await_lost_workers())
     done(orchestrator)
+
+
+def test_a_coordinator_waits_for_the_repair_of_a_restarted_stage(monkeypatch):
+    """A stream can restore a saved state and the slow way cannot, so a short wait saves a reread."""
+    monkeypatch.setattr(orchestrator_module, "RESTART_WAIT_SECONDS", 2.0)
+    orchestrator = pool()
+    orchestrator.epoch = 4
+
+    async def scenario():
+        async def repair():
+            await asyncio.sleep(0.3)
+            orchestrator.epoch = 5
+
+        asyncio.ensure_future(repair())
+        return await orchestrator._recover_stream("w1", "epoch", 4)
+
+    assert asyncio.run(scenario()), "the reply goes on through a new stream"
+    done(orchestrator)
+
+
+def test_a_coordinator_stops_waiting_when_no_repair_comes(monkeypatch):
+    monkeypatch.setattr(orchestrator_module, "RESTART_WAIT_SECONDS", 0.05)
+    orchestrator = pool()
+    orchestrator.epoch = 4
+    assert not asyncio.run(orchestrator._recover_stream("w1", "epoch", 4)), "the slow way still gets it there"
+    done(orchestrator)
+
+
 # A repair with a spare keeps the layers where they are.
 
 

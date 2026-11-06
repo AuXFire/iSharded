@@ -57,9 +57,10 @@ The rule is that a failure or a pool change must not drop a reply, and that weig
 | Event | What happens | Effect on a reply in progress | Measured |
 |---|---|---|---|
 | The coordinator dies | The lowest-named live node takes over and adopts the running route | None: replies go straight to the entry worker | Longest pause 0.22 s; new coordinator in 16 s; no weights moved |
-| A stage process crashes | The worker starts a new one in place. The worker is not penalized | Pauses, replays the prompt, carries on | 10 s on CPU with a small model; text identical |
-| A worker process or whole node restarts | The node's services restart, and the coordinator gives it its stage back. Stages elsewhere stay loaded | Pauses, replays, carries on | Back in 25 s with cached shards, same layout, 27B model |
-| A whole node dies | After 30 s away, the coordinator replans on the survivors | Pauses for as long as moving those layers takes | 22 s when survivors had the layers |
+| A stage process crashes | The worker starts a new one in place, which finds its saved states on disk. The worker is not penalized | Pauses, restores, reads only what came after the last saved state, carries on | 2.6 s on CPU with a small model, reading 149 tokens where it used to read 1,414; text identical |
+| A worker process or whole node restarts | The node's services restart, and the coordinator gives it its stage back. Stages elsewhere stay loaded, and the node restores from its own disk | Pauses, restores, carries on | 11 s on CPU with a small model; back in 25 s with cached shards on a 27B model |
+| A whole node dies, and a spare can take its layers | A spare takes those layers and nothing else moves. It fetches the copy of the lost stage's states | Pauses for as long as loading those layers takes, then restores | 23 s on CPU with a small model, reading 149 tokens; text identical |
+| A whole node dies, with no spare | After 30 s away, the coordinator replans on the survivors, and the layers change, so no saved state applies | Pauses for as long as moving those layers takes, and reads the prompt | 36 s on CPU with a small model; 22 s when survivors had the layers |
 | A node blips for under 30 s | Nothing moves | Waits, or replays if a request failed | Not measured on real hardware |
 | A quarantined node recovers | It returns after three healthy checks, more if it keeps failing, and the coordinator takes it back while idle | None | Not measured on real hardware |
 | A model loads or the layout changes | Nodes fetch in the background while the old layout serves. Entry workers let replies finish first. Stages whose job did not change stay loaded | Finishes first, up to 45 s | An unchanged layout re-applies in 3 s |
@@ -67,6 +68,28 @@ The rule is that a failure or a pool change must not drop a reply, and that weig
 | Every node restarts | Each node saved the route, so the coordinator loads the model again by itself | Reply lost; new requests wait | Observed; about a minute with cached shards |
 
 A reply is lost when the node a client is connected to dies, because that node holds the connection. The chat page restarts the reply through another mesh node when that happens, and says so. API clients should do the same.
+
+## Saved prompt states
+
+Stages save what they computed for a prompt, at the end of a chat's system prompt and at the end of its settled history. [Conversation reuse](../README.md#conversation-reuse) says what that does. This is how to run it.
+
+**Reading the saving.** `metrics.cache` in `/admin/status` has `saved_percent`, and `/metrics` has `prompt_tokens_computed_total` and `prompt_tokens_reused_total`. `worker_tokens_reused_total` says where each token came from: `prefix` or `history`, then `ram`, `disk`, or `copy`. A `copy` means a stage took over from one that was lost.
+
+**Sizing it.** A state holds every token up to where it was saved, for one stage's layers:
+
+| Model | Per token | Fixed | State at 4,000 tokens, all stages |
+|---|---|---|---|
+| Qwen3-0.6B, measured | 114,700 bytes | None | 459 MB |
+| Qwen3.5-0.8B, measured | 12,312 bytes | 20 MB | 69 MB |
+| Qwen3.8-27B, worked out from its file, not measured | 65,536 bytes | 157 MB | 419 MB |
+
+A conversation keeps about one state, as each turn replaces the last, and a system prompt shared by many conversations is one more. `--state-ram-gb` and `--state-disk-gb` are per worker. A node also keeps up to `--state-disk-gb` of copies for other stages, so count that twice. States leave 2 GiB of a disk free, as a model's cache does, and past that they stay in RAM only.
+
+**What a copy costs.** Each turn that saves a state sends all of it to one other node, at up to `--state-copy-mb`. Sending only what changed is not built. At the default 10 MB per second, a stage's share of a 400 MB state takes about 20 s, so turns faster than that fall behind: a newer state replaces a queued one, and recovery uses whatever arrived. Lower the rate if a link is shared with tokens. `--state-copy-mb 0` sends none, and a lost node then costs a full reread. Copy traffic is `worker_state_copy_bytes_total`.
+
+**When a copy does not help.** A stage only fetches a copy when it took over the same layers, so that needs a spare: a node outside the route that can hold them. With no spare, the survivors split the layers differently, and the prompt is read in full. On a slow link, fetching a copy can also take longer than reading the prompt on a fast GPU. A reply waits up to 30 s for a fetch and then reads the prompt instead.
+
+**What gets deleted.** Stages delete states when the model or their layers change, and copies go when no stage runs those layers. Nothing deletes a conversation's states when it ends. See [Saved conversations](SECURITY.md#saved-conversations).
 
 ## Planned maintenance
 
@@ -92,7 +115,7 @@ On the test pool, cordoning the laptop during a reply with Qwen3.6-27B: the repl
 
 If the network splits, each side elects a coordinator and carries on with the workers it can reach. With two nodes there is no majority to tell which side should stop, so this favors staying up. It cannot corrupt anything: a worker obeys only the highest leadership term it has seen, and stale requests fail its epoch check. When the sides reconnect, the higher term wins and the other coordinator steps down. Keys and revocations made on either side are merged, so neither side loses its changes.
 
-A lost link usually gives no error: packets just stop. A stage that gets no answer gives up after 30 s plus 1 s per token, and each hop waits longer than the one after it, so the right stage takes the blame. A reply waiting on an entry worker ends once that worker stops checking in. Either way the reply replays on what is left.
+A lost link usually gives no error: packets just stop. A stage that gets no answer gives up after 30 s plus 1 s per token, and each hop waits longer than the one after it, so the right stage takes the blame. A reply waiting on an entry worker ends once that worker stops checking in. Either way the reply carries on with what is left, from a saved state if the stages can reach one.
 
 Measured with real processes, a small model that fits on either side, and links that went silent rather than resetting:
 

@@ -637,6 +637,55 @@ def test_both_ends_agree_on_what_a_store_is_called():
     assert worker.WorkerRuntime.state_namespace(request) == stage_namespace(PINNED_BUILD, "m", "r", 14, 28, 2, "q8_0")
 
 
+def what_crosses_to_the_next_stage(rows, **fields):
+    """The dtype that rows of a pass leave this stage in."""
+    import torch
+
+    from isharded.protocol import decode_pass
+
+    sent = {}
+
+    class Client:
+        async def post(self, url, content, headers, timeout):
+            sent["body"] = content
+            return httpx.Response(200, json={"token_id": 3}, request=httpx.Request("POST", url))
+
+    runtime = worker.WorkerRuntime.__new__(worker.WorkerRuntime)
+    runtime.assignment, runtime.model_id, runtime.epoch = object(), "m", 1
+    runtime.gguf, runtime.dtype_name, runtime.pool_token = object(), "bfloat16", None
+    runtime.merge_passes, runtime.activation_bytes_sent, runtime.downstream_ms_ema, runtime.last_error = False, 0, None, None
+    runtime.client = Client()
+    runtime._next_stage = lambda: SimpleNamespace(url="http://next:1")
+    runtime._stages_after = lambda: 1
+    runtime._record = lambda *args: None
+    runtime.schedule_checkpoint = lambda request: None
+
+    async def alone(hidden, request, places=None):
+        return hidden
+
+    runtime._step_alone = alone
+
+    async def go():
+        runtime.lock = asyncio.Lock()
+        await runtime.execute(torch.zeros(1, rows, 4), InferRequest(session_id="s", epoch=1, input_ids=[1] * rows, **fields))
+
+    asyncio.run(go())
+    return decode_pass(sent["body"])[0].dtype
+
+
+def test_one_prompt_row_crosses_stages_as_a_whole_prompt_does():
+    """Otherwise a state that left one row to run would not match reading the whole prompt."""
+    import torch
+
+    assert what_crosses_to_the_next_stage(1, prompt_rows=True) == what_crosses_to_the_next_stage(9, prompt_rows=True) == torch.bfloat16
+
+
+def test_a_generated_token_still_crosses_exactly():
+    import torch
+
+    assert what_crosses_to_the_next_stage(1) == torch.float32
+
+
 def test_prompt_rows_never_merge_with_other_conversations():
     import torch
 

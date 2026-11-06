@@ -133,6 +133,8 @@ REPAIR_GRACE_SECONDS = 30.0
 # a pool change waits for the reply in progress before going ahead anyway.
 ROUTE_WAIT_SECONDS = 120.0
 COORDINATOR_WAIT_SECONDS = 3.0
+# How long a reply waits for the repair of a stage that restarted, before going the slow way.
+RESTART_WAIT_SECONDS = 30.0
 MAX_ROUTE_MOVES = 8
 # New streams a reply may open while recovering, before going one token at a time.
 STREAM_ATTEMPTS = 6
@@ -1695,8 +1697,8 @@ class Orchestrator:
             )
         return restored
 
-    async def _await_route_change(self, epoch: int) -> None:
-        patience = COORDINATOR_WAIT_SECONDS if self.coordinating else ROUTE_WAIT_SECONDS
+    async def _await_route_change(self, epoch: int, patience: float | None = None) -> None:
+        patience = patience or (COORDINATOR_WAIT_SECONDS if self.coordinating else ROUTE_WAIT_SECONDS)
         deadline = time.monotonic() + patience
         while self.epoch == epoch and time.monotonic() < deadline:
             await asyncio.sleep(0.25)
@@ -2002,7 +2004,10 @@ class Orchestrator:
             return True
         if failure == "epoch" or (isinstance(failure, str) and "epoch mismatch" in failure):
             if self.coordinating and self.epoch == epoch:
-                return False  # the coordinator sets the epoch, so waiting would be for itself
+                # A stage restarted empty, and the next repair gives it back its layers.
+                # Only a stream can restore a saved state, so it is worth waiting for that.
+                await self._await_route_change(epoch, RESTART_WAIT_SECONDS)
+                return self.epoch != epoch
             await self._await_route_change(epoch)
             return True
         if isinstance(failure, dict) and failure.get("failed_worker"):
