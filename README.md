@@ -4,7 +4,7 @@
 
 ShardMesh runs language models across a mesh of many computers, using whatever memory each one has: VRAM, unified memory, system RAM, or disk. A model too big for any one of them can run across all of them. There is no central server. Every node runs the same software, the nodes elect one of themselves to coordinate, and any node can serve the API.
 
-It works on a closed network, a LAN, across VLANs, over Tailscale, or between remote machines with TLS. The API follows OpenAI's, Anthropic's, and Ollama's, so existing clients only need a new URL and key.
+It works on a closed network, a LAN, across VLANs, over Tailscale, or between remote machines with TLS. The API follows OpenAI's, so existing clients only need a new URL and key.
 
 This is execution sharding, not simulated work distribution: each token really crosses every machine in the route. It is built to grow to many nodes. So far it has been tested on two machines, and [Scaling to many nodes](#scaling-to-many-nodes) separates what is proven from what comes next. Its security has been reviewed by AI only, not by a person. [Current limits](#current-limits) says what that means for you.
 
@@ -43,7 +43,7 @@ More detail lives in [Operating ShardMesh](docs/OPERATIONS.md) and [ShardMesh se
 - Runs GGUF models on stock llama.cpp, and safetensors models on its own PyTorch code. Qwen and GPT-2 families, including mixture-of-experts models.
 - Speeds up replies with a small draft model, reuses earlier conversation state, and lets conversations share a pass through each stage.
 - Runs several models at once on the same mesh, and users choose between them.
-- Speaks four API shapes: OpenAI's Chat Completions and Responses, Anthropic's Messages, and Ollama's, with streaming, plus a chat page and a live dashboard on every node.
+- Serves OpenAI-shaped `/v1/chat/completions`, `/v1/completions`, and `/v1/models`, with streaming, plus a chat page and a live dashboard on every node.
 - Keeps replies going through failures: a crashed stage, a dead node, a dead coordinator, a silent link, or a split network.
 - Moves weights only when it must, shares them between nodes, and works with no internet at all.
 - Runs as a network one person owns, or as one nobody owns, where each node decides who it accepts and what it hosts.
@@ -860,9 +860,6 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `POST` | `/admin/invites` | Admin key | Make a code that adds a machine. Takes `uses` and `hours`, and only the machine that made the mesh can |
 | `GET` | `/join/authority` | None | The mesh's public certificate, for a new machine to check against its invite |
 | `GET` | `/admin/network` | User key | In a network nobody owns, this node's own view. `/admin/status` shows the coordinator's |
-| `POST` | `/v1/messages`, `/v1/responses`, `/api/chat`, `/api/generate` | User key | The same replies in [other clients' shapes](#other-clients) |
-| `GET` | `/api/tags` | User key | Running models, as Ollama lists them |
-| `GET` | `/api/version` | None | The version, for Ollama clients |
 | `GET` | `/admin/inventory` | User key | Each node's system, disks, GPU temperature and power, load, battery, and round trip from this node, where the machine reports them |
 | `DELETE` | `/admin/nodes/{name}/revoke` | Admin key | In a network nobody owns, undo this node's block on another |
 | `POST` | `/admin/rebalance` | Admin key | Reconsider all live workers and apply a new layout |
@@ -881,19 +878,6 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `GET` | `/chat`, `/dashboard` | None | The pages. They ask for a key themselves |
 
 Routes under `/internal` are for nodes only. `GET /internal/mesh` shows a node's own view of the mesh, and `GET /internal/diag/tasks` shows where everything in a process is waiting, which is the place to look when a reply stalls.
-
-### Other clients
-
-The same replies are available in three more shapes, so most existing clients work with a new URL and key. Each runs through the normal path, so failover, lanes, keys, and rate limits all apply.
-
-| Client | Point it at | Notes |
-|---|---|---|
-| OpenAI Chat Completions | `/v1/chat/completions` | The native shape |
-| OpenAI Responses | `/v1/responses` | Send the whole history in `input`. `previous_response_id` is refused, because nothing is stored |
-| Anthropic Messages | `/v1/messages` | The key goes in `x-api-key` or `Authorization` |
-| Ollama | `/api/chat`, `/api/generate`, `/api/tags`, `/api/version` | Send the key as a bearer token. Ollama's own clients need a way to add that header |
-
-All of them are text only. A request with tools or images is refused with a 400, because a reply that ignored them would look like it worked.
 
 ### Chat and completion requests
 
@@ -1266,7 +1250,6 @@ Adapter tests compare every family with the reference `transformers` implementat
 | `shardmesh/commons.py` | A network nobody owns: self-made identities, vouches, and each node's view |
 | `shardmesh/inventory.py`, `shardmesh/gpu_probe.py` | What a node reports about itself, and how it finds GPUs PyTorch cannot see |
 | `shardmesh/audit.py` | Comparing routes that serve the same model |
-| `shardmesh/formats.py` | Anthropic's, OpenAI Responses', and Ollama's request and reply shapes |
 | `shardmesh/mesh.py` | Membership and leader election, as pure logic |
 | `shardmesh/planner.py`, `shardmesh/memory.py` | Placement, and memory pool discovery |
 | `shardmesh/gguf.py`, `shardmesh/gguf_stage.py`, `shardmesh/llamacpp.py`, `shardmesh/llama_host.py` | GGUF parsing, stage files, the llama.cpp binding, and the stage process |

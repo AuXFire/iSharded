@@ -23,7 +23,7 @@ from starlette.background import BackgroundTask
 from . import __version__
 from .access import INVITE_FIELDS, load_authority, NeedsAuthority, node_of, ROLE_ADMIN, ROLE_MEMBER, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, Caller
 from .gguf import parse_source
-from . import audit, formats
+from . import audit
 from .discovery import start_beacon
 from .lanes import LaneDoor
 from .mesh import GOSSIP_SECONDS, ControlMesh
@@ -2104,11 +2104,6 @@ def require(authorization: str | None, role: str) -> Caller:
     return caller
 
 
-def credentials(authorization: str | None, api_key: str | None) -> str | None:
-    """Anthropic's clients send a key in x-api-key, not as a bearer token."""
-    return authorization or (f"Bearer {api_key}" if api_key else None)
-
-
 def network_caller(authorization: str | None) -> Caller:
     """Whoever asks, as the network sees them.
 
@@ -2160,7 +2155,7 @@ def verify_user(authorization: str | None) -> Caller:
     return caller
 
 
-FORWARDED_PATHS = ("/v1/", "/api/", "/admin/")
+FORWARDED_PATHS = ("/v1/", "/admin/")
 SAFE_NODE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 # Connection details belong to each hop, and httpx sets the length itself.
 HOP_HEADERS = {"host", "content-length", "connection", "transfer-encoding", "keep-alive", "content-encoding"}
@@ -2191,7 +2186,7 @@ async def forward_to_coordinator(request: Request, call_next: Any) -> Any:
     if any(part in {".", ".."} for part in path.replace("\\", "/").split("/")):
         # httpx would resolve these, turning a forwarded path into any other.
         return JSONResponse(status_code=400, content={"detail": "bad path"})
-    serves_locally = path.startswith(("/v1/", "/api/")) and bool(runtime.route)
+    serves_locally = path.startswith("/v1/") and bool(runtime.route)
     own_choice = path in {"/admin/invites", "/admin/network", "/admin/audit"} or path.startswith("/admin/join/") or (runtime.access.ownerless and (path.startswith("/admin/keys") or path.endswith("/revoke")))
     if mesh is None or mesh.is_leader or serves_locally or own_choice or not path.startswith(FORWARDED_PATHS):
         return await call_next(request)
@@ -2204,7 +2199,7 @@ async def forward_to_coordinator(request: Request, call_next: Any) -> Any:
     if runtime.access.authority is not None:
         # Anyone can claim to coordinate, so a person's key never leaves the node
         # they gave it to. It is checked here, and only the result travels.
-        caller = runtime.access.identify(credentials(request.headers.get("authorization"), request.headers.get("x-api-key")), None)
+        caller = runtime.access.identify(request.headers.get("authorization"), None)
         if caller is None:
             return JSONResponse(status_code=401, content={"detail": "a valid key is required"})
         wait = runtime.access.spend(caller)
@@ -2761,16 +2756,11 @@ async def node_inventory(authorization: str | None = Header(default=None)) -> di
 
 
 @app.get("/v1/models")
-async def models(authorization: str | None = Header(default=None), x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
-    verify_user(credentials(authorization, x_api_key))
-    # Both OpenAI's and Anthropic's clients read this, so each entry suits either.
-    data = [{"id": name, "object": "model", "type": "model", "display_name": name, "owned_by": "shardmesh"} for name in running_models()]
-    return {"object": "list", "data": data, "has_more": False}
-
-
-def running_models() -> list[str]:
+async def models(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    verify_user(authorization)
     names = [runtime.model_id] if runtime.model_id else []
-    return names + [name for name in runtime.lanes.models() if name not in names]
+    names += [name for name in runtime.lanes.models() if name not in names]
+    return {"object": "list", "data": [{"id": name, "object": "model", "owned_by": "shardmesh"} for name in names]}
 
 
 async def check_request(model: str | None) -> None:
@@ -2915,86 +2905,6 @@ async def chat_completions(
             "total_tokens": prompt_count + completion_count,
         },
     }
-
-
-async def read_format(request: Request, translate: Any) -> tuple[dict[str, Any], ChatCompletionRequest]:
-    """A request in another client's shape, as a chat request."""
-    try:
-        body = await request.json()
-        return body, translate(body)
-    except formats.Unsupported as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except (AttributeError, KeyError, TypeError, ValueError) as exc:
-        raise HTTPException(status_code=422, detail=f"could not read this request: {exc}") from exc
-
-
-async def reply_pieces(chat: ChatCompletionRequest, authorization: str | None) -> AsyncIterator[dict[str, Any]]:
-    """Run a chat request the normal way, so failover, lanes, keys, and limits all apply."""
-    response = await chat_completions(chat, authorization)
-    if response.status_code >= 400:
-        content = b"".join([piece if isinstance(piece, bytes) else piece.encode() async for piece in response.body_iterator])
-        raise HTTPException(status_code=response.status_code, detail=content.decode("utf-8", "replace")[:300])
-    return formats.pieces(response.body_iterator)
-
-
-async def whole_reply(chat: ChatCompletionRequest, authorization: str | None) -> dict[str, Any]:
-    try:
-        return await formats.gather(await reply_pieces(chat, authorization))
-    except formats.StreamFailed as exc:
-        raise HTTPException(status_code=exc.code, detail=str(exc)) from exc
-
-
-def model_named(chat: ChatCompletionRequest) -> str:
-    return chat.model or runtime.model_id or "unknown"
-
-
-@app.post("/v1/messages")
-async def anthropic_messages(request: Request, authorization: str | None = Header(default=None), x_api_key: str | None = Header(default=None)) -> Any:
-    body, chat = await read_format(request, formats.from_anthropic)
-    key = credentials(authorization, x_api_key)
-    if body.get("stream"):
-        stream = formats.anthropic_stream(await reply_pieces(chat, key), model_named(chat))
-        return StreamingResponse(stream, media_type="text/event-stream")
-    return formats.anthropic_message(await whole_reply(chat, key), model_named(chat))
-
-
-@app.post("/v1/responses")
-async def openai_responses(request: Request, authorization: str | None = Header(default=None)) -> Any:
-    body, chat = await read_format(request, formats.from_responses)
-    if body.get("stream"):
-        stream = formats.responses_stream(await reply_pieces(chat, authorization), model_named(chat))
-        return StreamingResponse(stream, media_type="text/event-stream")
-    return formats.responses_object(await whole_reply(chat, authorization), model_named(chat))
-
-
-async def ollama_answer(request: Request, translate: Any, is_chat: bool, authorization: str | None) -> Any:
-    started = time.monotonic()
-    body, chat = await read_format(request, translate)
-    if body.get("stream", True):  # Ollama streams unless told not to
-        stream = formats.ollama_stream(await reply_pieces(chat, authorization), model_named(chat), is_chat, started)
-        return StreamingResponse(stream, media_type="application/x-ndjson")
-    return formats.ollama_reply(await whole_reply(chat, authorization), model_named(chat), is_chat, started)
-
-
-@app.post("/api/chat")
-async def ollama_chat(request: Request, authorization: str | None = Header(default=None)) -> Any:
-    return await ollama_answer(request, formats.from_ollama_chat, True, authorization)
-
-
-@app.post("/api/generate")
-async def ollama_generate(request: Request, authorization: str | None = Header(default=None)) -> Any:
-    return await ollama_answer(request, formats.from_ollama_generate, False, authorization)
-
-
-@app.get("/api/tags")
-async def ollama_models(authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    verify_user(authorization)
-    return formats.ollama_tags(running_models())
-
-
-@app.get("/api/version")
-async def ollama_version() -> dict[str, str]:
-    return {"version": app.version}
 
 
 def build_parser() -> argparse.ArgumentParser:
