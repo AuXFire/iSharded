@@ -527,14 +527,14 @@ def test_shrinking_slots_forgets_the_ones_gone():
     asyncio.run(scenario())
 
 
-def test_a_conversation_returns_to_the_sequence_that_holds_it():
+def test_a_reply_takes_the_sequence_idle_longest():
+    """A saved state can go on any sequence, so nothing ties a conversation to one."""
     from isharded import worker
 
     runtime = worker.WorkerRuntime.__new__(worker.WorkerRuntime)
-    runtime.checkpoints = {0: ("a", [1, 2]), 1: ("b", [7, 8, 9])}
     runtime.slot_used_at = {0: 5.0, 1: 9.0, 2: 1.0}
-    assert runtime.choose_slot({0, 1, 2}, [7, 8, 9, 10]) == 1
-    assert runtime.choose_slot({0, 1, 2}, [5, 5]) == 2, "otherwise the one idle longest"
+    assert runtime.choose_slot({0, 1, 2}) == 2
+    assert runtime.choose_slot({0, 1}) == 0
 
 
 def test_repairs_are_rate_limited():
@@ -990,7 +990,7 @@ def test_merged_passes_stay_off_unless_asked_for():
 
     from isharded.worker import WorkerRuntime
 
-    step = SimpleNamespace(verify=False, reset=False, prefill_only=False, save_checkpoint=None, restore_length=None, next_position=None)
+    step = SimpleNamespace(verify=False, reset=False, prompt_rows=False, restore_length=None, next_position=None)
     hidden = torch.zeros(1, 1, 4)
     held = SimpleNamespace(merge_passes=False, gguf=object())
     assert not WorkerRuntime._can_merge(held, hidden, step)
@@ -1250,3 +1250,215 @@ def test_a_small_move_does_not_wait(monkeypatch) -> None:
     monkeypatch.setattr(orchestrator, "_review_quarantine", lambda: pytest.fail("it should not have waited"))
     asyncio.run(orchestrator._await_lost_workers())
     done(orchestrator)
+# A repair with a spare keeps the layers where they are.
+
+
+def planning_pool(monkeypatch, *, preferred, standby=(), fits_without_standby=True):
+    from types import SimpleNamespace
+
+    orchestrator = Orchestrator()
+    target = SimpleNamespace(profile=object(), spread=True, embedding=False, entry_worker=None, exit_worker=None)
+    orchestrator.active = target
+    orchestrator.route = [stage("a", 0, 1), stage("b", 1, 2)]
+    candidates = lambda names: [SimpleNamespace(worker_id=name) for name in names]  # noqa: E731
+    monkeypatch.setattr(orchestrator, "candidate_groups", lambda: (candidates(preferred), candidates(standby)))
+    monkeypatch.setattr(orchestrator, "_with_holdings", lambda group, target: group)
+    asked = []
+
+    def keeping(route, chosen, spare, profile):
+        asked.append(sorted(item.worker_id for item in [*chosen, *spare]))
+        wanted = {"a", "c"} <= {item.worker_id for item in [*chosen, *spare]}
+        return ["kept"] if wanted else None
+
+    def replanning(chosen, spare, profile, **options):
+        if not spare and not fits_without_standby:
+            raise orchestrator_module.PlacementError("does not fit")
+        return ["replanned"]
+
+    monkeypatch.setattr(orchestrator_module, "keep_layers", keeping)
+    monkeypatch.setattr(orchestrator_module, "plan_placement", replanning)
+    return orchestrator, target, asked
+
+
+def test_a_lost_stage_goes_to_a_spare_and_nothing_else_moves(monkeypatch):
+    orchestrator, target, _ = planning_pool(monkeypatch, preferred=["a", "c"])
+    assert orchestrator.plan(target) == ["kept"]
+    done(orchestrator)
+
+
+def test_a_standby_worker_stays_out_when_the_rest_can_hold_the_model(monkeypatch):
+    """--standby is a promise to its owner, and a repair does not get to break it."""
+    orchestrator, target, _ = planning_pool(monkeypatch, preferred=["a"], standby=["c"], fits_without_standby=True)
+    assert orchestrator.plan(target) == ["replanned"]
+    done(orchestrator)
+
+
+def test_a_standby_worker_takes_only_the_lost_layers_when_it_is_needed(monkeypatch):
+    orchestrator, target, _ = planning_pool(monkeypatch, preferred=["a"], standby=["c"], fits_without_standby=False)
+    assert orchestrator.plan(target) == ["kept"]
+    done(orchestrator)
+
+
+def test_with_nothing_lost_a_plan_starts_fresh(monkeypatch):
+    orchestrator, target, asked = planning_pool(monkeypatch, preferred=["a", "b", "c"])
+    assert orchestrator.plan(target) == ["replanned"]
+    assert not asked
+    done(orchestrator)
+
+
+def test_a_new_model_is_planned_from_scratch(monkeypatch):
+    from types import SimpleNamespace
+
+    orchestrator, _, asked = planning_pool(monkeypatch, preferred=["a", "c"])
+    other = SimpleNamespace(profile=object(), spread=True, embedding=False, entry_worker=None, exit_worker=None)
+    assert orchestrator.plan(other) == ["replanned"]
+    assert not asked
+    done(orchestrator)
+
+
+def test_with_no_way_to_keep_the_layers_it_replans(monkeypatch):
+    orchestrator, target, _ = planning_pool(monkeypatch, preferred=["a"])
+    assert orchestrator.plan(target) == ["replanned"]
+    done(orchestrator)
+
+
+# Saved states on a link that has gone silent. A real socket that takes the connection
+# and never answers, because a lost link gives no error, and a stub cannot show a timeout firing.
+
+
+async def silent_peer():
+    held = []
+
+    async def swallow(reader, writer):
+        held.append(writer)
+        while await reader.read(65536):
+            pass
+
+    for port in range(9690, 9700):
+        try:
+            server = await asyncio.start_server(swallow, "127.0.0.1", port)
+            return server, f"http://127.0.0.1:{port}", held
+        except OSError:
+            continue
+    raise RuntimeError("no free port for a silent peer")
+
+
+def stage_on_a_silent_link(tmp_path, url, host=None):
+    from types import SimpleNamespace
+
+    from isharded import worker
+
+    class Host:
+        def call(self, operation, **meta):
+            return ({"states": []} if operation == "state_list" else {"held": False}), b""
+
+    runtime = worker.WorkerRuntime.__new__(worker.WorkerRuntime)
+    runtime.gguf = SimpleNamespace(host=host or Host())
+    runtime.namespace, runtime.state_peers, runtime.fetched, runtime.copies_fetched = "space", [url], set(), 0
+    runtime.pool_token, runtime.cache_dir, runtime.worker_id = None, tmp_path, "w1"
+    (runtime.state_root / "space").mkdir(parents=True)
+    runtime.client = httpx.AsyncClient(trust_env=False)
+    return runtime
+
+
+def timed_against_a_silent_peer(work):
+    async def scenario():
+        server, url, held = await silent_peer()
+        began = time.monotonic()
+        try:
+            result = await asyncio.wait_for(work(url), 10)
+            return result, time.monotonic() - began
+        finally:
+            for writer in held:
+                writer.close()
+            server.close()
+
+    return asyncio.run(scenario())
+
+
+def test_a_silent_holder_costs_a_listing_only_its_timeout(tmp_path, monkeypatch):
+    from isharded import worker
+
+    monkeypatch.setattr(worker, "PEER_SECONDS", 0.2)
+
+    async def work(url):
+        return await stage_on_a_silent_link(tmp_path, url).restorable()
+
+    found, spent = timed_against_a_silent_peer(work)
+    assert found == {} and spent < 3
+
+
+def test_fetching_from_a_silent_holder_gives_up_and_leaves_nothing(tmp_path, monkeypatch):
+    from isharded import statecopy
+
+    monkeypatch.setattr(statecopy, "FETCH_SILENCE_SECONDS", 0.2)
+
+    async def work(url):
+        return await stage_on_a_silent_link(tmp_path, url).ensure_state("abc")
+
+    ready, spent = timed_against_a_silent_peer(work)
+    assert not ready and spent < 3
+    assert not list(tmp_path.rglob("*.part"))
+
+
+def test_a_copy_to_a_silent_holder_gives_up_and_costs_nothing_else(tmp_path, monkeypatch):
+    from isharded import statecopy
+    from isharded.protocol import SavePoint
+    from isharded.statecopy import CopySender
+    from isharded.statestore import HISTORY, SUFFIX
+
+    monkeypatch.setattr(statecopy, "SILENCE_SECONDS", 0.2)
+    (tmp_path / ("abc" + SUFFIX)).write_bytes(b"x" * 1000)
+
+    async def work(url):
+        async with httpx.AsyncClient(trust_env=False) as client:
+            sender = CopySender(client, dict, 10**9)
+            sender.aim(url, tmp_path, "space")
+            handed_over = time.perf_counter()
+            sender.add([SavePoint(at=300, length=300, key="abc", kind=HISTORY)])
+            handed_over = time.perf_counter() - handed_over
+            await sender.task
+            return handed_over, sender.report()
+
+    (handed_over, report), spent = timed_against_a_silent_peer(work)
+    assert handed_over < 0.01, "the reply that saved this state does not wait for the link"
+    assert report["copies_failed"] == 1 and spent < 3
+
+
+def test_a_silent_stage_only_costs_the_index_its_timeout(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from isharded import worker
+    from isharded.statestore import PrefixIndex
+
+    monkeypatch.setattr(worker, "INDEX_SECONDS", 0.2)
+
+    async def work(url):
+        runtime = stage_on_a_silent_link(tmp_path, url)
+        runtime.state_peers = []
+        runtime.worker_id, runtime.epoch, runtime.index_epoch = "w1", 3, 1
+        runtime.prompt_cache, runtime.prefix, runtime.index_lock = True, PrefixIndex(), asyncio.Lock()
+        runtime.route = [SimpleNamespace(worker_id="w1", url="http://unused:1"), SimpleNamespace(worker_id="w2", url=url)]
+        await runtime.sync_index()
+        return runtime.prefix.entries, runtime.index_epoch
+
+    (entries, seen), spent = timed_against_a_silent_peer(work)
+    assert not entries and seen == 3 and spent < 3, "and a reply goes on to read the prompt"
+
+
+def test_a_stage_gone_silent_is_not_waited_on_for_a_state(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from isharded import worker
+
+    monkeypatch.setattr(worker, "FETCH_SECONDS", 0.3)
+
+    async def work(url):
+        runtime = stage_on_a_silent_link(tmp_path, url)
+        runtime.state_peers = []
+        runtime.worker_id = "w1"
+        runtime.route = [SimpleNamespace(worker_id="w2", url=url)]
+        return await runtime.prepare_state("abc")
+
+    ready, spent = timed_against_a_silent_peer(work)
+    assert not ready and spent < 3

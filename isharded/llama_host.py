@@ -24,12 +24,15 @@ from typing import Any
 import numpy as np
 
 from .llamacpp import LlamaError, LlamaLibrary, LlamaStage, StageLost, TokenEmbedding
+from .statestore import HISTORY, PARTIAL, StateStore
 
 KEY_VARIABLE = "ISHARDED_STAGE_KEY"
 CONNECT_SECONDS = 60.0
 EXIT_SECONDS = 15.0
 # Encoded images kept for the next turn. A conversation resends its images every time.
 ENCODED_IMAGE_BYTES = 128 * 1024 * 1024
+# States a draft model keeps. It is small, and a draft that loses one just reads more.
+DRAFT_STATE_BYTES = 256 * 1024 * 1024
 
 
 class _Host:
@@ -39,8 +42,7 @@ class _Host:
         self.embedding: TokenEmbedding | None = None
         self.table: mmap.mmap | None = None
         self.table_view: memoryview | None = None
-        # One saved conversation per sequence.
-        self.checkpoints: dict[int, tuple[str, np.ndarray]] = {}
+        self.states = StateStore(None, 0, 0)
         self.scratch = 1
         self.projector: Any = None
         self.encoded: OrderedDict[str, tuple[dict[str, Any], bytes]] = OrderedDict()
@@ -59,7 +61,9 @@ class _Host:
             sequences=meta.get("slots", 1),
             map_file=meta.get("map_file", True),
             embedding=meta.get("embedding", False),
+            kv_type=meta.get("kv_type", "f16"),
         )
+        self.states = StateStore(meta.get("state_dir"), meta.get("state_ram_bytes", 0), meta.get("state_disk_bytes", 0))
         table = meta.get("table")
         if table:
             with open(table["path"], "rb") as handle:
@@ -85,7 +89,21 @@ class _Host:
         hidden = np.frombuffer(payload, dtype=np.float32).reshape(-1, self.stage.hidden_size)
         places = meta.get("places")
         places = None if places is None else np.array(places, dtype=np.int32)
-        return {}, self.stage.forward(hidden, meta["position"], meta.get("slot", 0), places).tobytes()
+        slot = meta.get("slot", 0)
+        saves = {item["at"]: item for item in meta.get("saves", [])}
+
+        def reached(row: int) -> None:
+            if row in saves:
+                self._keep(saves[row], slot)
+
+        output = self.stage.forward(hidden, meta["position"], slot, places, meta.get("cuts", ()), reached if saves else None)
+        return ({"states": self.states.stats()} if saves else {}), output.tobytes()
+
+    def _keep(self, save: dict[str, Any], slot: int) -> None:
+        assert self.stage is not None
+        kept = self.states.put(save["key"], self.stage.save_state(slot), save["length"], save.get("kind", HISTORY))
+        if kept and save.get("replaces"):
+            self.states.drop(save["replaces"])
 
     def forward_many(self, meta: dict[str, Any], payload: bytes) -> tuple[dict[str, Any], bytes]:
         assert self.stage is not None
@@ -98,19 +116,32 @@ class _Host:
         return {}, b""
 
     def save(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
-        assert self.stage is not None
-        slot = meta.get("slot", 0)
-        self.checkpoints[slot] = (meta["key"], self.stage.save_state(slot))
-        return {"bytes": int(self.checkpoints[slot][1].size)}, b""
+        self._keep(meta, meta.get("slot", 0))
+        return {"states": self.states.stats()}, b""
 
     def restore(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
         assert self.stage is not None
-        slot = meta.get("slot", 0)
-        held = self.checkpoints.get(slot)
-        if held is None or held[0] != meta["key"]:
-            raise LlamaError(f"no checkpoint {meta['key']} here")
-        self.stage.restore_state(held[1], slot)
-        return {}, b""
+        held = self.states.get(meta["key"])
+        if held is None:
+            raise LlamaError(f"no saved state {meta['key']} here")
+        self.stage.restore_state(held[0], meta.get("slot", 0))
+        return {"tier": held[1], "states": self.states.stats()}, b""
+
+    def state_stats(self, _: dict[str, Any], __: bytes) -> tuple[dict[str, Any], bytes]:
+        return {"states": self.states.stats()}, b""
+
+    def state_list(self, _: dict[str, Any], __: bytes) -> tuple[dict[str, Any], bytes]:
+        return {"states": self.states.listing()}, b""
+
+    def state_has(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+        return {"held": self.states.has(meta["key"])}, b""
+
+    def state_adopt(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+        """Take a state the worker fetched into this store's folder from another node."""
+        folder = self.states.folder
+        if folder is None:
+            return {"adopted": False}, b""
+        return {"adopted": self.states.adopt(meta["key"], folder / (meta["key"] + PARTIAL))}, b""
 
     def commit(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
         assert self.stage is not None
@@ -143,6 +174,7 @@ class _Host:
             map_file=False,
         )
         self.scratch = meta.get("slots", 1)
+        self.states = StateStore(None, DRAFT_STATE_BYTES, 0)
         return {}, b""
 
     def load_projector(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
@@ -183,6 +215,7 @@ def run(address: Any, key: bytes) -> None:
             return  # the worker went away, so this stage has no purpose left
         operation = meta.pop("op")
         if operation == "close":
+            host.states.close()
             connection.send_bytes(b'{"ok":true}')
             connection.send_bytes(b"")
             return
@@ -222,18 +255,30 @@ class StageHost:
             raise LlamaError(f"the stage process did not start (exit code {self.process.poll()})")
         return accepted[0]
 
-    def call(self, operation: str, payload: bytes = b"", **meta: Any) -> tuple[dict[str, Any], bytes]:
-        with self.lock:
-            try:
-                self.connection.send_bytes(json.dumps({"op": operation, **meta}).encode())
-                self.connection.send_bytes(payload)
-                answer = json.loads(self.connection.recv_bytes())
-                data = self.connection.recv_bytes()
-            except (EOFError, OSError) as exc:
-                raise StageLost(f"the stage process died (exit code {self.process.poll()})", self) from exc
+    def _exchange(self, operation: str, payload: bytes, meta: dict[str, Any]) -> tuple[dict[str, Any], bytes]:
+        try:
+            self.connection.send_bytes(json.dumps({"op": operation, **meta}).encode())
+            self.connection.send_bytes(payload)
+            answer = json.loads(self.connection.recv_bytes())
+            data = self.connection.recv_bytes()
+        except (EOFError, OSError) as exc:
+            raise StageLost(f"the stage process died (exit code {self.process.poll()})", self) from exc
         if not answer.pop("ok"):
             raise LlamaError(answer.get("error", "stage call failed"))
         return answer, data
+
+    def call(self, operation: str, payload: bytes = b"", **meta: Any) -> tuple[dict[str, Any], bytes]:
+        with self.lock:
+            return self._exchange(operation, payload, meta)
+
+    def ask_if_idle(self, operation: str, **meta: Any) -> dict[str, Any] | None:
+        """A quick question, or None if the stage is busy. For what must never wait on a pass."""
+        if not self.lock.acquire(blocking=False):
+            return None
+        try:
+            return self._exchange(operation, b"", meta)[0]
+        finally:
+            self.lock.release()
 
     def close(self) -> None:
         try:

@@ -23,7 +23,7 @@ EXPERT_TENSOR = re.compile(r"^ffn_(gate|up|down|gate_up)_exps\.")
 
 
 class GgufAdapter(Adapter):
-    supports_kv_snapshots = False  # state lives inside llama.cpp, so recovery replays
+    supports_kv_snapshots = False  # state lives inside llama.cpp: recovery uses statestore.py instead
 
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__(config)

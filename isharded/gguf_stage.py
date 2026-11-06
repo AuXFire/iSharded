@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 from pathlib import Path
@@ -16,7 +16,8 @@ from .gguf import GgufHeader, TensorInfo, plan_stage, write_stage
 from .llama_host import StageHost
 from .llamacpp import LlamaError, StageLost
 from .models.gguf import GgufAdapter
-from .protocol import ConfigureRequest, MemoryPool, UnitPlacement
+from .protocol import ConfigureRequest, MemoryPool, SavePoint, UnitPlacement
+from .statestore import HISTORY, PREFIX, PrefixIndex, cut_points, keys_at, pass_ends
 from .vision import SECTIONS, EncodedImage, image_id
 from .weights import file_sha256, UnitCache, _read_unit_header, iter_unit_tensor, unit_tensor_span
 
@@ -119,6 +120,9 @@ class GgufStage:
         adapter: GgufAdapter,
         pools: dict[str, MemoryPool],
         threads: int,
+        state_folder: Path | None = None,
+        state_ram_bytes: int = 0,
+        state_disk_bytes: int = 0,
     ) -> None:
         assignment = request.assignment
         self.first = assignment.start_layer == 0
@@ -160,7 +164,13 @@ class GgufStage:
             "slots": request.slots,
             "map_file": needs_mapping(placements, pools),
             "embedding": request.embedding,
+            "kv_type": request.kv_type,
+            "state_dir": None if state_folder is None else str(state_folder),
+            "state_ram_bytes": state_ram_bytes,
+            "state_disk_bytes": state_disk_bytes,
         }
+        # The store's last report. Asking would wait behind whatever the stage is running.
+        self.states: dict[str, int] = {}
         self.host = self._start()
 
     def _start(self) -> StageHost:
@@ -186,11 +196,24 @@ class GgufStage:
         answer, data = self.host.call("pool", inputs=inputs)
         return np.frombuffer(data, dtype=np.float32).reshape(len(inputs), answer["width"])
 
-    def forward(self, hidden: np.ndarray, position: int, slot: int = 0, places: np.ndarray | None = None) -> np.ndarray:
+    def forward(
+        self,
+        hidden: np.ndarray,
+        position: int,
+        slot: int = 0,
+        places: np.ndarray | None = None,
+        cuts: list[int] | None = None,
+        saves: list[SavePoint] | None = None,
+    ) -> np.ndarray:
         """Hidden states [tokens, width] in; hidden states out, or logits at the last stage."""
         payload = np.ascontiguousarray(hidden, dtype=np.float32).tobytes()
-        where = {} if places is None else {"places": places.tolist()}
-        _, data = self.host.call("forward", payload, position=position, slot=slot, **where)
+        where: dict[str, Any] = {} if places is None else {"places": places.tolist()}
+        if cuts:
+            where["cuts"] = cuts
+        if saves:
+            where["saves"] = [save.model_dump() for save in saves]
+        answer, data = self.host.call("forward", payload, position=position, slot=slot, **where)
+        self.states = answer.get("states", self.states)
         output = np.frombuffer(data, dtype=np.float32)
         return output if self.last else output.reshape(-1, self.width)
 
@@ -207,14 +230,23 @@ class GgufStage:
     def truncate(self, keep: int, slot: int = 0) -> None:
         self.host.call("truncate", keep=keep, slot=slot)
 
-    def save(self, key: str, slot: int = 0) -> None:
-        self.host.call("save", key=key, slot=slot)
-
-    def restore(self, key: str, slot: int = 0) -> None:
-        self.host.call("restore", key=key, slot=slot)
+    def restore(self, key: str, slot: int = 0) -> str:
+        """Put a saved state on a sequence, and say which tier it came from."""
+        answer, _ = self.host.call("restore", key=key, slot=slot)
+        self.states = answer.get("states", self.states)
+        return answer["tier"]
 
     def clear(self, slot: int = 0) -> None:
         self.host.call("clear", slot=slot)
+
+    def refresh_states(self) -> None:
+        """Bring the store's report up to date, unless that would mean waiting."""
+        try:
+            answer = self.host.ask_if_idle("state_stats")
+        except LlamaError:
+            return  # whatever is wrong, the next reply finds it and deals with it
+        if answer is not None:
+            self.states = answer["states"]
 
     def close(self) -> None:
         self.host.close()
@@ -283,26 +315,53 @@ class ImageEncoder:
         self.host.close()
 
 
-def checkpoint_key(tokens: list[int]) -> str:
-    return hashlib.sha1(json.dumps(tokens, separators=(",", ":")).encode()).hexdigest()[:20]
-
-
 @dataclass(slots=True)
 class PromptPlan:
-    """What of a prompt can be restored, and where to save for next time."""
+    """What of a prompt can be restored, where it is cut, and what to save for next time.
+
+    ``cuts`` and each save's ``at`` count rows from ``start``, as a pass does.
+    """
 
     start: int = 0
     key: str | None = None
-    mark: int | None = None
-    new_key: str | None = None
+    kind: str | None = None
+    cuts: list[int] = field(default_factory=list)
+    saves: list[SavePoint] = field(default_factory=list)
 
 
-def plan_prompt(held: tuple[str, list[int]] | None, prompt: list[int], mark: int | None) -> PromptPlan:
+def plan_prompt(
+    index: PrefixIndex, prompt: list[int], cut_token: int | None, settled: int | None, caching: bool = True
+) -> PromptPlan:
+    """Decide what a prompt reuses and saves. Its cuts are the same in any case.
+
+    Three places are worth a state. The first cut is where a chat's system prompt
+    and tool list end, which other conversations are likely to share. The last cut
+    in the settled history is where this conversation picks up next turn. Without a
+    chat template to go by, a place an earlier prompt also reached is shared text.
+    """
+    cuts = cut_points(prompt, cut_token)
     plan = PromptPlan()
-    if held is not None and len(held[1]) < len(prompt) and prompt[: len(held[1])] == held[1]:
-        plan.start, plan.key = len(held[1]), held[0]
-    if mark is not None and mark > plan.start:
-        plan.mark, plan.new_key = mark, checkpoint_key(prompt[:mark])
+    found = index.longest(prompt) if caching else None
+    if found is not None:
+        plan.start, plan.key, plan.kind = found
+    plan.cuts = [cut - plan.start for cut in cuts if cut > plan.start]
+    if not caching:
+        return plan
+    ends = pass_ends(cuts, len(prompt))
+    keys = keys_at(prompt, ends)
+    wanted: dict[int, str] = {}
+    history = [cut for cut in cuts if settled is not None and cut <= settled]
+    if history:
+        wanted[history[-1]] = HISTORY
+    shared = [end for end in ends if index.repeated(keys[end])]
+    if shared:
+        wanted[shared[-1]] = PREFIX
+    if cuts:
+        wanted[cuts[0]] = PREFIX
+    for at, kind in sorted(wanted.items()):
+        if at > plan.start and keys[at] not in index:
+            replaces = plan.key if kind == HISTORY and plan.kind == HISTORY else None
+            plan.saves.append(SavePoint(at=at - plan.start, length=at, key=keys[at], kind=kind, replaces=replaces))
     return plan
 
 
@@ -360,9 +419,10 @@ class DraftModel:
             pass  # this one is only a guesser: it can read the whole prompt instead
         if not self.committed[slot]:
             self.host.call("clear", slot=slot)
-        if plan.mark is not None and plan.mark > self.committed[slot]:
-            self._commit(prompt[self.committed[slot] : plan.mark], slot)
-            self.host.call("save", key=plan.new_key, slot=slot)
+        for save in plan.saves:
+            if save.length > self.committed[slot]:
+                self._commit(prompt[self.committed[slot] : save.length], slot)
+                self.host.call("save", slot=slot, **save.model_dump())
         self._commit(prompt[self.committed[slot] :], slot)
 
     def guess(self, history: list[int], count: int, slot: int = 0) -> list[int]:

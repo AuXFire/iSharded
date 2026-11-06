@@ -28,13 +28,15 @@ from . import __version__
 from .access import INVITE_FIELDS, load_authority, NeedsAuthority, node_of, ROLE_ADMIN, ROLE_MEMBER, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, Caller
 from .embedding import POOLED_TYPES, dimensions_problem, encoded, inputs_problem, length_problem, passes, shaped, smallest_dimensions
 from .gguf import GgufHeader, parse_source, split_parts
+from .llamacpp import KV_TYPES, PINNED_BUILD
+from .statestore import stage_namespace
 from . import audit
 from .discovery import start_beacon
 from .lanes import LaneDoor
 from .mcp_server import INVALID_REQUEST, McpHandler, MeshTools, RpcError, answer_http
 from .mesh import GOSSIP_SECONDS, ControlMesh
 from .models import Adapter, GgufAdapter, SUPPORTED_TYPES, UnsupportedModel, create_adapter
-from .planner import AMORTIZE_TOKENS, HOP_MS, Candidate, ModelProfile, PlacementError, memory_report, plan_placement
+from .planner import AMORTIZE_TOKENS, HOP_MS, Candidate, ModelProfile, PlacementError, keep_layers, memory_report, plan_placement
 from .protocol import (
     hosts_model,
     pass_seconds,
@@ -150,6 +152,8 @@ JOINS_PER_MINUTE = 1.0
 # address. This is for entries that cost a signature check and changed nothing.
 WASTED_ENTRY_BURST = 20
 WASTED_ENTRIES_PER_MINUTE = 6.0
+# Nodes a stage asks for copies of saved states. Each answers with a short list.
+MAX_STATE_PEERS = 16
 CATALOG = [
     {"id": "Qwen/Qwen2.5-0.5B-Instruct", "family": "Qwen2.5", "kind": "dense", "size": "1 GB"},
     {"id": "Qwen/Qwen3-0.6B", "family": "Qwen3", "kind": "dense", "size": "1.5 GB"},
@@ -295,6 +299,7 @@ def build_target(
     projector, image_marker = resolve_projector(request, adapter, sources, token)
     speculate_tokens = request.draft_tokens if draft else 0
     slots = request.parallel if isinstance(adapter, GgufAdapter) and not request.embedding else 1
+    kv_share = KV_TYPES[request.kv_type if isinstance(adapter, GgufAdapter) else "f16"][1]
     units = adapter.partition(manifest.tensors)
     if request.model_hashes:
         apply_model_hashes(manifest, units, request.model_hashes)
@@ -305,7 +310,7 @@ def build_target(
         units=units,
         num_layers=adapter.num_layers,
         expert_active_fraction=adapter.expert_active_fraction,
-        kv_bytes_per_token=[adapter.kv_bytes_per_token(i, 2) * slots for i in range(adapter.num_layers)],
+        kv_bytes_per_token=[adapter.kv_bytes_per_token(i, 2) * slots * kv_share // KV_TYPES["f16"][1] for i in range(adapter.num_layers)],
         # Rewinding needs a snapshot of recurrent state for each guess.
         state_bytes=[adapter.recurrent_state_bytes(i) * (1 + speculate_tokens) * slots for i in range(adapter.num_layers)],
         context_tokens=request.context_tokens,
@@ -1067,6 +1072,60 @@ class Orchestrator:
         )
         return str(record.registration.advertised_url).rstrip("/")
 
+    def copy_holders(self, route: list[StageAssignment]) -> dict[str, str]:
+        """One node to keep a copy of each stage's saved states.
+
+        A stage's KV is for its own layers, so one copy on one other machine is enough
+        to survive losing this one. A node offering memory for this comes first, then
+        the next stage along the route, which already sees what this stage sees.
+        """
+        live = {name: record for name, record in self.workers.items() if record.live and not record.quarantined}
+        offered = [name for name, record in live.items() if "kv-cache" in record.registration.hardware.contribution.roles]
+        order = [stage.worker_id for stage in route]
+        holders: dict[str, str] = {}
+        for index, stage in enumerate(route):
+            record = live.get(stage.worker_id)
+            if record is None:
+                continue
+            own_machine = record.registration.hardware.host_id
+            others = [name for name in live if name not in order]
+            for name in [*offered, *order[index + 1 :], *order[:index], *others]:
+                holder = live.get(name)
+                if holder is not None and holder.registration.hardware.host_id != own_machine:
+                    holders[stage.worker_id] = str(holder.registration.advertised_url).rstrip("/")
+                    break
+        return holders
+
+    def state_peers(self, worker_id: str) -> list[str]:
+        """Who to ask for a copy, which may be any node, as the holder may have changed."""
+        urls = [
+            str(record.registration.advertised_url).rstrip("/")
+            for name, record in self.workers.items()
+            if record.live and not record.quarantined and name != worker_id
+        ]
+        return urls[:MAX_STATE_PEERS]
+
+    async def _clear_old_copies(self, target: ModelTarget, route: list[StageAssignment]) -> None:
+        """Copies for layers nothing runs any more are no use, on any node."""
+        kv_type = target.request.kv_type if target.request else "f16"
+        wanted = [
+            stage_namespace(PINNED_BUILD, target.model_id, target.manifest.revision, stage.start_layer, stage.end_layer, target.speculate_tokens, kv_type)
+            for stage in route
+        ]
+
+        async def tell(record: WorkerRecord) -> None:
+            try:
+                await self.client.post(
+                    str(record.registration.advertised_url).rstrip("/") + "/internal/state/keep",
+                    json={"namespaces": wanted},
+                    headers=auth_headers(self.pool_token),
+                    timeout=5.0,
+                )
+            except httpx.HTTPError:
+                pass  # eviction gets to them in the end
+
+        await asyncio.gather(*(tell(record) for record in self.workers.values() if record.live))
+
     async def refresh_holdings(self, target: ModelTarget) -> None:
         """Ask every worker which of this model's units are on its disk."""
 
@@ -1197,18 +1256,33 @@ class Orchestrator:
                 if worker_id and worker_id not in available:
                     self.add_event("failure", f"{worker_id} is unavailable", f"Planning without its {role} pin")
                     pins[role] = None
-        route = plan_placement(
-            self._with_holdings(preferred, target),
-            self._with_holdings(standby, target),
-            target.profile,
-            spread=target.spread,
-            **pins,
-        )
+        preferred, standby = self._with_holdings(preferred, target), self._with_holdings(standby, target)
+        kept = None if honor_pins_strictly else self._keep_stages(target, preferred, standby, available, pins)
+        route = kept or plan_placement(preferred, standby, target.profile, spread=target.spread, **pins)
         if target.embedding and len(route) > 1:
             # Pooling happens at the end of the model, in llama.cpp, for whole
             # sequences, so a stage boundary has nothing correct to pass along.
             raise PlacementError(f"{target.model_id} would take {len(route)} stages here, and an embedding model cannot be split; it needs one worker that can hold it all")
         return route
+
+    def _keep_stages(
+        self, target: ModelTarget, preferred: list[Candidate], standby: list[Candidate], available: set[str], pins: dict[str, str | None]
+    ) -> list[StageAssignment] | None:
+        """Replace only what was lost, if something can take its layers.
+
+        A standby worker is only for when a model does not fit without it, so it steps
+        in only if the workers still running could not hold the model between them.
+        """
+        if target is not self.active or all(stage.worker_id in available for stage in self.route):
+            return None
+        route = keep_layers(self.route, preferred, [], target.profile)
+        if route is not None or not standby:
+            return route
+        try:
+            plan_placement(preferred, [], target.profile, spread=target.spread, **pins)
+            return None
+        except PlacementError:
+            return keep_layers(self.route, preferred, standby, target.profile)
 
     def _quarantine(self, worker_id: str, reason: str) -> None:
         record = self.workers.get(worker_id)
@@ -1312,6 +1386,8 @@ class Orchestrator:
         # KV checkpoints append to a snapshot. Recurrent state changes whole
         # every token, so hybrid models recover by replaying the prompt.
         cache_url = self.choose_cache_url(route) if target.adapter.supports_kv_snapshots else None
+        saved_states = isinstance(target.adapter, GgufAdapter)  # see statecopy.py
+        holders = self.copy_holders(route) if saved_states else {}
         new_epoch = self.epoch + 1
         await self._drain_entries(route)
         self.route = []  # nothing may run while weights are moving
@@ -1331,6 +1407,10 @@ class Orchestrator:
                 term=self.mesh.term if self.mesh else 0,
                 slots=target.slots,
                 merge_passes=target.merge_passes,
+                prompt_cache=target.request is None or target.request.prompt_cache,
+                kv_type=target.request.kv_type if target.request else "f16",
+                copy_url=holders.get(stage.worker_id),
+                state_peers=self.state_peers(stage.worker_id) if saved_states else [],
                 embedding=target.embedding,
                 projector=target.projector,
                 unit_hashes={
@@ -1367,6 +1447,8 @@ class Orchestrator:
         self.installed_epoch = new_epoch
         self.saved_state = None
         self.save_state(target)
+        if saved_states:
+            self.spawn(self._clear_old_copies(target, route))
         if self.mesh is not None:
             self.spawn(self._gossip_round())  # peers should not wait for the next tick
         summary = " → ".join(f"{stage.worker_id} L{stage.start_layer}–{stage.end_layer - 1}" for stage in route)
@@ -1728,6 +1810,7 @@ class Orchestrator:
                 top_k=top_k,
                 seed=seed,
                 images=session.images if must_replay else [],
+                prompt_rows=must_replay,
             )
             entry = self.route[0]
             try:
@@ -1806,6 +1889,8 @@ class Orchestrator:
         """
         produced = 0
         stops = self.tokenizer.stop_token_ids if self.tokenizer else set()
+        # Whatever opens the reply opens every other turn too, so it marks the cuts.
+        cut_token = None if boundary is None else session.tokens[boundary]
         for _ in range(STREAM_ATTEMPTS):
             if not self.route:
                 break
@@ -1823,6 +1908,7 @@ class Orchestrator:
                 max_tokens=max_tokens - produced,
                 stop_token_ids=sorted(stops),
                 checkpoint_at=None if produced else boundary,
+                cut_token=cut_token,
                 images=session.images,
             )
             started = time.perf_counter()
@@ -2001,6 +2087,27 @@ class Orchestrator:
             self.embedding_tokens += sum(map(len, pack))
         return vectors, sum(lengths)
 
+    def cache_summary(self) -> dict[str, Any]:
+        """What reuse is saving. Every stage runs the same rows, so the entry speaks for the route.
+
+        Adding the stages up would count each token once per stage. Bytes are real on
+        each node, so those do add up. RAM and disk are mostly the same states twice.
+        """
+        caches = {name: ((record.health or {}).get("telemetry") or {}).get("cache") or {} for name, record in self.workers.items()}
+        entry = caches.get(self.route[0].worker_id, {}) if self.route else {}
+        computed = entry.get("prompt_tokens_computed", 0)
+        sources = entry.get("tokens_reused") or {}
+        reused = sum(sources.values())
+        return {
+            "prompt_tokens_computed": computed,
+            "prompt_tokens_reused": reused,
+            "tokens_reused": sources,
+            "saved_percent": round(100 * reused / (computed + reused), 1) if computed + reused else None,
+            "ram_bytes": sum(item.get("ram_bytes", 0) for item in caches.values()),
+            "disk_bytes": sum(item.get("disk_bytes", 0) for item in caches.values()),
+            "held_bytes": sum(item.get("held_bytes", 0) for item in caches.values()),
+        }
+
     def metrics_text(self) -> str:
         """This node's numbers in Prometheus format. Every node reports for itself."""
         lines: list[str] = []
@@ -2015,6 +2122,9 @@ class Orchestrator:
         add("requests_total", self.requests_total, "Replies started on this node", "counter")
         add("tokens_generated_total", self.tokens_generated, "Tokens produced for this node's clients", "counter")
         add("embedding_tokens_total", self.embedding_tokens, "Tokens embedded for this node's clients", "counter")
+        saving = self.cache_summary()
+        add("prompt_tokens_computed_total", saving["prompt_tokens_computed"], "Prompt tokens the route computed", "counter")
+        add("prompt_tokens_reused_total", saving["prompt_tokens_reused"], "Prompt tokens the route restored instead of computing", "counter")
         add("stream_fallbacks_total", self.stream_fallbacks, "Replies that fell back to replay; should stay near zero", "counter")
         add("stage_errors_total", self.stage_errors, "Requests a stage refused; nobody is quarantined for these", "counter")
         add("recoveries_total", self.recoveries_total, "Pipeline repairs during a reply", "counter")
@@ -2038,6 +2148,16 @@ class Orchestrator:
             add("worker_stages_kept_total", telemetry.get("stages_kept"), "Reconfigures that moved no weights", "counter", worker=worker_id)
             if telemetry.get("draft_tokens_per_pass") is not None:
                 add("worker_draft_tokens_per_pass", telemetry["draft_tokens_per_pass"], "Tokens per speculative pass", worker=worker_id)
+            cache = telemetry.get("cache") or {}
+            add("worker_prompt_tokens_computed_total", cache.get("prompt_tokens_computed"), "Prompt tokens this stage computed", "counter", worker=worker_id)
+            for source, count in (cache.get("tokens_reused") or {}).items():
+                add("worker_tokens_reused_total", count, "Prompt tokens this stage restored instead of computing", "counter", worker=worker_id, source=source)
+            add("worker_state_misses_total", cache.get("state_misses"), "Saved states a stage did not hold when asked", "counter", worker=worker_id)
+            for tier in ("ram", "disk", "held"):
+                add("worker_cache_bytes", cache.get(f"{tier}_bytes"), "Bytes of saved state held", worker=worker_id, tier=tier)
+            add("worker_state_copy_bytes_total", cache.get("copy_bytes_sent"), "Bytes of state copied to another node", "counter", worker=worker_id)
+            add("worker_state_copies_failed_total", cache.get("copies_failed"), "State copies that did not arrive", "counter", worker=worker_id)
+            add("worker_state_copies_dropped_total", cache.get("copies_dropped"), "State copies dropped behind a newer one or a full queue", "counter", worker=worker_id)
         return "\n".join(lines) + "\n"
 
     def _fit_context(self, prompt_tokens: int, max_tokens: int) -> int:
@@ -2326,6 +2446,7 @@ class Orchestrator:
                 "tokens_per_second_ema": (
                     1000 / self.token_latency_ms_ema if self.token_latency_ms_ema else None
                 ),
+                "cache": self.cache_summary(),
             },
             "virtual_hardware": {
                 "workers": sum(record.live for record in self.workers.values()),

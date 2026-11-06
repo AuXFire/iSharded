@@ -156,6 +156,8 @@ Metrics worth alerting on:
 | `isharded_serving` at zero | This node cannot serve replies. |
 | `isharded_worker_draft_tokens_per_pass` near 1 | The draft is not helping. |
 | `isharded_stage_errors_total` rising | Stages are refusing requests. Nobody is quarantined for this, so a real fault in a stage shows up here and in failed replies. |
+| `isharded_worker_state_misses_total` rising | Stages are evicting states the entry worker still counts on. Each one costs a reread and nothing else, so raise `--state-ram-gb` or `--state-disk-gb` if it keeps climbing. |
+| `isharded_worker_state_copies_failed_total` rising | Copies of saved states are not arriving. Replies are fine, but a lost node would cost a full reread. |
 
 ## Files each node keeps
 
@@ -166,6 +168,7 @@ Metrics worth alerting on:
 | Node log | `--log-file` | Nothing is kept unless you set this. `isharded up` sets it to `node.log` in its folder. |
 | Fetched shards | `--cache-dir` | Evicted by age past `--cache-budget-gb`. |
 | Stage files | Inside the cache | Rebuilt from shards when a stage moves. Count double the node's share. |
+| Saved prompt states | `states` inside the cache | People's conversations, unencrypted, readable only by the node's own user. Evicted past `--state-disk-gb`, and deleted when the model or the stage's layers change. |
 
 The dashboard's "Memory for weights" counts weights only. Real use is higher: KV cache, compute buffers, a draft model, and each worker's own GPU context.
 

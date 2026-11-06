@@ -22,7 +22,8 @@ import torch
 from isharded import orchestrator as orchestrator_module
 from isharded import worker as worker_module
 from isharded.gguf import GgufHeader, KeyValue, T_ARRAY, T_BOOL, T_STRING, T_UINT32
-from isharded.gguf_stage import ImageEncoder, checkpoint_key, plan_prompt
+from isharded.gguf_stage import ImageEncoder, plan_prompt
+from isharded.statestore import HISTORY, PrefixIndex, prefix_key
 from isharded.llamacpp import LlamaError, StageLost
 from isharded.models import GgufAdapter, UnsupportedModel
 from isharded.mtmd import BitmapWrapper, ContextParams, DecoderPosition, InputText, VideoParams
@@ -286,10 +287,11 @@ def test_rows_that_do_not_match_the_images_sent_are_an_error(tokens, images):
 def test_a_different_image_can_never_reuse_a_saved_state():
     red, blue = image_id(b"red"), image_id(b"blue")
     held_tokens = [1, *[red] * 4, 2]
-    held = (checkpoint_key(held_tokens), held_tokens)
-    assert plan_prompt(held, [*held_tokens, 3], None).start == len(held_tokens)
-    assert plan_prompt(held, [1, *[blue] * 4, 2, 3], None).start == 0
-    assert checkpoint_key(held_tokens) != checkpoint_key([1, *[blue] * 4, 2])
+    index = PrefixIndex()
+    index.add(prefix_key(held_tokens), len(held_tokens), HISTORY)
+    assert plan_prompt(index, [*held_tokens, 3], None, None).start == len(held_tokens)
+    assert plan_prompt(index, [1, *[blue] * 4, 2, 3], None, None).start == 0
+    assert prefix_key(held_tokens) != prefix_key([1, *[blue] * 4, 2])
 
 
 def test_a_later_stage_gets_positions_with_the_rows():
@@ -399,7 +401,7 @@ class FakeStage:
     def __init__(self):
         self.seen = []
 
-    def forward(self, rows, position, slot, places=None):
+    def forward(self, rows, position, slot, places=None, cuts=None, saves=None):
         self.seen.append((position, None if places is None else places.tolist()))
         return rows
 

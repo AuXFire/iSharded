@@ -20,7 +20,7 @@ from safetensors.torch import save as save_safetensors
 META_HEADER = "x-isharded-meta"
 # Raised whenever workers and the orchestrator stop being able to talk safely.
 # A node on another version is refused at the door, not found out mid-request.
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 
 
 class ResourceContribution(BaseModel):
@@ -143,6 +143,7 @@ ModelFile = Annotated[str, AfterValidator(_file_in_folder)]
 GgufFile = Annotated[str, AfterValidator(_gguf_file)]
 # torch and numpy refuse anything wider, and a refused seed must not look like a dead node.
 Seed = Annotated[int, Field(ge=0, lt=2**63)]
+KvType = Literal["f16", "q8_0"]
 # Below this, sampling overflows. Nobody can tell it from greedy anyway.
 Temperature = Annotated[float, Field(ge=0.0, le=5.0), AfterValidator(lambda value: 0.0 if value < 1e-3 else value)]
 
@@ -237,6 +238,13 @@ class ConfigureRequest(BaseModel):
     embedding: bool = False
     # The image projector, which only the entry worker loads.
     projector: DraftModel | None = None
+    # Save and reuse prompt states. Off, prompts are cut the same way and read in full.
+    prompt_cache: bool = True
+    kv_type: KvType = "f16"
+    # The one other node that keeps a copy of this stage's states, and the nodes to
+    # ask when taking over layers from a stage that was lost. See statecopy.py.
+    copy_url: str | None = None
+    state_peers: list[str] = Field(default_factory=list)
 
 
 class CacheRestoreRequest(BaseModel):
@@ -280,6 +288,10 @@ class LoadModelRequest(BaseModel):
     # Replies the pipeline runs at once. Each costs its own context memory.
     parallel: int = Field(default=1, ge=1, le=32)
     merge_passes: bool = True
+    # Reuse saved prompt states. Replies are the same either way at temperature 0.
+    prompt_cache: bool = True
+    # How a GGUF model keeps attention KV. q8_0 takes about half the memory.
+    kv_type: KvType = "f16"
     # From `isharded model hash`, run on a copy you trust. Every node then checks
     # every unit against it, so no peer or mirror has to be believed.
     model_hashes: dict[str, str] | None = None
@@ -289,6 +301,17 @@ class LoadModelRequest(BaseModel):
     mmproj: str | None = None
     # False returns as soon as the job starts; poll /admin/status for progress.
     wait: bool = True
+
+
+class SavePoint(BaseModel):
+    """Where in a pass to save a sequence's state, and what to call it."""
+
+    at: int  # rows into this pass
+    length: int  # rows of the prompt the state holds
+    key: str
+    kind: str
+    # A state this one makes useless, an earlier turn of the same conversation.
+    replaces: str | None = None
 
 
 class InferRequest(BaseModel):
@@ -304,16 +327,23 @@ class InferRequest(BaseModel):
     # choice after every input token instead of one sampled token.
     rollback_to: int | None = None
     verify: bool = False
-    # Conversation reuse: restore the checkpoint named by ``checkpoint_key``, save
-    # one under the key in ``save_checkpoint``, or process without producing a
-    # token. The key is a digest of the tokens, so two conversations of the same
-    # length can never be confused.
+    # Reuse: restore the state named by ``checkpoint_key``, which leaves the sequence
+    # at ``restore_length``. The key is a digest of the tokens, so two conversations
+    # of the same length can never be confused. ``reused_rows`` and ``restore_kind``
+    # are only for each stage's counters.
     restore_length: int | None = None
     checkpoint_key: str | None = None
+    reused_rows: int = 0
+    restore_kind: str | None = None
     # Which of a stage's sequences this reply uses, given out by the entry worker.
     slot: int = 0
-    save_checkpoint: str | None = None
-    prefill_only: bool = False
+    # This pass is rows of a prompt, which cross between stages the same way however
+    # many of them a restored state left to run.
+    prompt_rows: bool = False
+    # Rows into this pass where every stage must stop and start a new piece. See
+    # statestore.py for why these must not depend on what is cached.
+    cuts: list[int] = Field(default_factory=list)
+    saves: list[SavePoint] = Field(default_factory=list)
     # Images in this prompt, in base64, for the entry worker alone. Their rows are in
     # ``input_ids`` as negative numbers. See vision.py.
     images: list[str] = Field(default_factory=list)
@@ -324,14 +354,16 @@ class InferRequest(BaseModel):
 class GenerateRequest(InferRequest):
     """Generate on the entry worker, so that tokens need no orchestrator round trip.
 
-    ``input_ids`` is always the whole prompt, and ``checkpoint_at`` is where to save
-    for the next turn. The entry worker works out what it can reuse by itself, so
-    it does not matter which node's control plane is asking.
+    ``input_ids`` is always the whole prompt, ``checkpoint_at`` is where its settled
+    history ends, and ``cut_token`` is the token that opens a turn, which says where
+    to cut it. The entry worker works out what it can reuse by itself, so it does not
+    matter which node's control plane is asking.
     """
 
     max_tokens: int = Field(default=32, ge=1)
     stop_token_ids: list[int] = Field(default_factory=list)
     checkpoint_at: int | None = None
+    cut_token: int | None = None
 
 
 class CompletionRequest(BaseModel):

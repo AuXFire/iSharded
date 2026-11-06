@@ -520,7 +520,7 @@ With real processes, as three nodes on one machine started with `isharded node`,
 | `--weights-disk-gb` | 0 unless a model truly cannot fit otherwise | Disk is far slower than RAM |
 | `--cache-dir` | A fast SSD with room for twice the node's share | Units and stage files both live there |
 | `--cache-budget-gb` | Set it on a small disk | Evicts old models past this size |
-| `--ram-budget-gb` | 0 for GGUF hybrid models, a few GB otherwise | KV checkpoints speed up recovery where a model supports them. Hybrid Qwen models replay instead |
+| `--ram-budget-gb` | 0 for GGUF models, a few GB otherwise | KV checkpoints speed up recovery for PyTorch models. GGUF stages keep their own saved states, and a node with this set is the first choice to hold copies of them, on its disk |
 | `--log-file` | Always | Nothing is kept otherwise |
 | `--location` | Set it on Tailscale, on a LAN, behind a relay, or in a cloud | The address cannot show the right country there |
 | `--gguf-dir` | Point it at LM Studio's or your own model folder | Files there are read locally, not downloaded |
@@ -679,6 +679,9 @@ Hardware and memory:
 | `--weights-ram-gb` | None | System RAM for model weights, a size or `auto`. With a GPU, one worker spans both |
 | `--weights-disk-gb` | 0 | Disk for memory-mapped model weights |
 | `--ram-budget-gb` | 0 | RAM for KV-cache checkpoints, not weights. Adds a memory worker |
+| `--state-ram-gb` | 1 | RAM each stage keeps for saved prompt states, on top of its weights. The planner does not count it |
+| `--state-disk-gb` | 8 | Disk for saved prompt states, kept in `states` in `--cache-dir`. 0 keeps them in RAM only, and they then die with the stage process |
+| `--state-copy-mb` | 10 | MB per second for sending copies of saved states to another node. 0 sends none |
 
 Models and cache:
 
@@ -719,6 +722,8 @@ Loads a model on a running pool and shows progress. `model` is any [model id](#l
 | `--draft` | Chosen automatically | Small GGUF for speculative decoding |
 | `--no-draft` | Off | Turn speculative decoding off |
 | `--no-merge-passes` | Off | Make conversations take turns on each stage |
+| `--no-prompt-cache` | Off | Read every prompt in full instead of reusing saved states. See [Conversation reuse](#conversation-reuse) |
+| `--kv-type` | `f16` | How a GGUF model keeps attention KV. `q8_0` takes about half the memory. See [Conversation reuse](#conversation-reuse) |
 | `--hashes` | None | File from `isharded model hash`. Every node checks every unit against it |
 | `--no-reuse-cached` | Off | Plan as if no worker held any shards |
 | `--no-peer-fetch` | Off | Download every shard from the model host |
@@ -866,6 +871,8 @@ The state folder is `%LOCALAPPDATA%\iSharded` on Windows and `~/.cache/iSharded`
 | `--weights-ram-gb` | None | System RAM for model weights, or `auto` |
 | `--weights-disk-gb` | 0 | Disk for memory-mapped model weights |
 | `--ram-budget-gb` | 0 | RAM for KV checkpoints, not weights |
+| `--state-ram-gb`, `--state-disk-gb` | 1, 8 | RAM and disk for saved prompt states |
+| `--state-copy-mb` | 10 | MB per second for copies of saved states to another node |
 | `--cache-dir` | `~/.cache/isharded/units` | Where fetched weights live |
 | `--cache-budget-gb` | 0 (no limit) | Evict old models past this size |
 | `--gguf-dir` | None | Folder holding GGUF files. Repeatable |
@@ -897,6 +904,7 @@ A flag takes priority over its variable.
 | `ISHARDED_WORKER_ID`, `ISHARDED_ORCHESTRATOR_URL`, `ISHARDED_ADVERTISE_URL`, `ISHARDED_LOCATION` | The worker's `--worker-id`, `--orchestrator-url`, `--advertise-url`, `--location` |
 | `ISHARDED_DEVICE`, `ISHARDED_ROLES`, `ISHARDED_CPU_THREADS` | `--device`, `--roles`, `--cpu-threads` |
 | `ISHARDED_GPU_MEMORY_GB`, `ISHARDED_RAM_BUDGET_GB` | `--gpu-memory-gb`, `--ram-budget-gb` |
+| `ISHARDED_STATE_RAM_GB`, `ISHARDED_STATE_DISK_GB`, `ISHARDED_STATE_COPY_MB` | `--state-ram-gb`, `--state-disk-gb`, `--state-copy-mb` |
 | `ISHARDED_CACHE_DIR`, `ISHARDED_LLAMA_DIR` | `--cache-dir`, `--llama-dir` |
 | `ISHARDED_LANE`, `ISHARDED_LANES_FILE` | Set by `isharded node`: which lane a process is, and where a node keeps the lanes it should run |
 | `ISHARDED_OWNERLESS` | `--ownerless` |
@@ -1082,6 +1090,8 @@ On two nodes on one machine, the same loop ran through the coordinator, a follow
 | `draft_model` | `auto` | A GGUF id, `auto`, or `none` |
 | `draft_tokens` | 6 | Most guesses per pass, 1 to 16 |
 | `merge_passes` | `true` | Let conversations share a pass |
+| `prompt_cache` | `true` | Reuse saved prompt states |
+| `kv_type` | `f16` | How a GGUF model keeps attention KV: `f16` or `q8_0` |
 | `model_hashes` | None | The contents of an `isharded model hash` file |
 | `embedding` | `false` | This is an embedding model. See [Embeddings](#embeddings) |
 | `mmproj` | None | A projector GGUF for images. See [Vision](#vision) |
@@ -1206,11 +1216,28 @@ The number of guesses adapts as a reply goes, up to `draft_tokens`, because code
 
 ### Conversation reuse
 
-Every stage saves its state where a chat's settled history ends. If the next prompt starts with exactly those tokens, stages restore the checkpoint and process only the new text, so a long conversation stops costing more with every turn. Anything else, such as an edited history or a new route, falls back to reading the whole prompt. This covers GGUF chat.
+The same tokens are computed once per stage and reused. Every stage saves its state in two places: where a chat's system prompt and tool list end, which other conversations share, and where its settled history ends, which is where the conversation picks up next turn. If a prompt starts with exactly those tokens, stages restore the state and process only what is new. Anything else, such as an edited history, reads the whole prompt. This covers GGUF models.
+
+A state holds attention and recurrent state alike, so this works on hybrid models. A hybrid model can only resume where a state was saved, because recurrent state cannot be cut back to an earlier token. llama.cpp's own sequence copy is not used: copying part of a sequence aborts a stage process, and on a shared cache it leaves a hybrid model with the wrong recurrent state and no error.
+
+Prompts are cut into passes at the same places whether or not anything is cached, because where a prompt is cut changes the arithmetic. A cut falls before each turn, at least 64 tokens after the last one. That is what makes a reply at temperature 0 the same with the cache on or off. Replies running at once share passes in whatever order they arrive, so this holds for replies one at a time. Two conversations that start together each compute what they share, since neither has saved it yet.
+
+Each stage keeps its states in a bounded store: `--state-ram-gb` of RAM, then `--state-disk-gb` of disk, least recently used out first, for its own model and layers. Any sequence can take any state, so a conversation that was pushed out comes back from its state and does not reread its history. A state restored into a sequence is a copy, so this saves compute and not context memory.
+
+States also carry a conversation through failures, at the same places:
+
+- **A stage process crashes.** Its states are on disk, so the new process restores them. Only what came after the last saved place is read again.
+- **A node restarts.** The same, once it is back with its disk.
+- **A node is lost.** Each stage sends one copy of each state to one other machine, in the background, at `--state-copy-mb`. A spare that takes over those layers fetches the copy and carries on. Only that stage moves: the others stay as they are.
+- **The survivors have to split the layers differently.** A state is only good for the layers it came from, so no copy applies, and the prompt is read in full.
+
+Nothing waits for a copy. A newer turn replaces one still queued, so a slow link falls behind and does not back up. A copy that is missing, late, or damaged means reading the prompt, so the worst case is the cost of having no cache. Copies are full states, and sending less is not built. States under 256 tokens are not copied, because reading them again costs less.
+
+`--no-prompt-cache` on a load turns all of this off. `--kv-type q8_0` keeps attention KV in 8 bits.
 
 ### Several conversations at once
 
-`--parallel 3` gives every stage three independent sequences, each with its own context memory, which the planner counts. Replies from any node queue at the entry worker, and each conversation returns to the sequence holding its checkpoint. While one reply is away at the next stage, this stage works on another.
+`--parallel 3` gives every stage three independent sequences, each with its own context memory, which the planner counts. Replies from any node queue at the entry worker, and take the sequence idle longest. Any sequence can take any saved state, so conversations past `--parallel` wait their turn and do not reread their history. While one reply is away at the next stage, this stage works on another.
 
 Single-token steps from different conversations also share a pass through a stage, because reading the weights is what a pass costs. On one stage, four conversations went from 12 to 32 tokens per second. Across two stages the same load gained only 10%, from 34 to 37, because the stages stagger the conversations. Steps with speculative guesses do not merge, so a draft limits this. `--no-merge-passes` turns it off.
 
@@ -1517,6 +1544,7 @@ The full guide is [Operating iSharded](docs/OPERATIONS.md).
 | Node log | `--log-file` | Nothing is kept unless you set this |
 | Fetched shards | `--cache-dir` | Evicted past `--cache-budget-gb` |
 | Stage files | Inside the cache | Rebuilt from shards when a stage moves. Count double the node's share |
+| Saved prompt states | `states` inside the cache | People's conversations, unencrypted, readable only by the node's own user. Evicted past `--state-disk-gb`, and deleted when the model or the stage's layers change |
 
 A node started with `isharded up` keeps its route state, keys, and audit log in its own folder instead, along with its log, `node.log`.
 
@@ -1537,6 +1565,13 @@ A node started with `isharded up` keeps its route state, keys, and audit log in 
 | `token_latency_ms`, `worker_compute_ms` | Time per token, and compute per pass |
 | `worker_stages_kept_total` | Reconfigures that moved no weights |
 | `worker_draft_tokens_per_pass` | Tokens per speculative pass. Near 1 means the draft is not helping |
+| `prompt_tokens_computed_total`, `prompt_tokens_reused_total` | Prompt tokens the route computed, and restored instead. This is the saving: the second over the sum of both. `metrics.cache` in `/admin/status` gives it as `saved_percent` |
+| `worker_prompt_tokens_computed_total` | Prompt tokens a stage computed |
+| `worker_tokens_reused_total` | Prompt tokens a stage restored instead of computing. `source` is `prefix` for a shared prefix or `history` for a conversation, then the tier it came from |
+| `worker_state_misses_total` | Saved states a stage did not hold when asked. Each costs a reread, and nothing else |
+| `worker_cache_bytes` | Bytes of saved state a stage holds, by `tier`: `ram`, `disk`, or `held` for copies kept for other stages |
+| `worker_state_copy_bytes_total` | Bytes of state copied to another node |
+| `worker_state_copies_failed_total`, `worker_state_copies_dropped_total` | Copies that did not arrive, and copies dropped behind a newer one or a full queue. Neither touches a reply. They mean recovery may reread more |
 
 ## Troubleshooting
 
@@ -1688,10 +1723,14 @@ Behavior:
 - Outside embedding mode, llama.cpp's operation offload stays on, so a stage with no GPU layers may still use a GPU the build can reach for prompts of 32 tokens or more.
 - The planner uses measured memory bandwidth and a fixed cost per network hop, but not per-layer benchmarks or pairwise network telemetry. Its disk estimate assumes cold reads, so warm runs beat it.
 - Workers on one host split shared RAM evenly during planning, which can refuse a plan an uneven split would allow.
-- There is one active RAM checkpoint service per route. Snapshots are not yet replicated or compressed. If the store is behind when a stage fails, recovery replays the prompt.
+- There is one active RAM checkpoint service per route, for PyTorch models. Snapshots are not yet replicated or compressed. If the store is behind when a stage fails, recovery replays the prompt.
+- A saved state is only good for the layers it came from. If a node is lost with no spare, the survivors split the layers differently and the prompt is read in full, with or without copies.
+- A different split of the layers can change a near-tie at temperature 0, because rows round to BF16 at each stage boundary. So a reply is the same with the cache on or off for a given split, and not across splits.
+- A reply that recovers from a failure reads the tokens it already generated as prompt rows, which round differently from the first time. So the rest of a recovered reply can differ at a near-tie, with or without the cache.
+- Copies of saved states are sent whole on every turn, so a long conversation on a slow link falls behind. Recovery then uses an older state, or none.
+- Saved states are not deleted when a conversation ends, and are stored unencrypted. See [the security notes](docs/SECURITY.md#saved-conversations).
 - With two nodes, a split network leaves two coordinators until it heals. Nothing can be corrupted, but neither side can know it is the minority.
 - A reply is lost if the node its client is connected to dies.
-- Multi-turn reuse keeps one conversation per sequence, so more conversations than sequences push each other out and reread their history.
 - Mesh membership is meant for tens of nodes: every worker checks in with every control plane.
 - Tool arguments are not constrained to a schema, even for a forced call. Only the start of a call is forced, and a client should check what it receives.
 - A streamed tool call arrives once it is complete, not token by token.

@@ -159,6 +159,8 @@ MAX_STAGE_BYTES = 1024 * 1024 * 1024
 # What anyone may send with no credentials. A certificate or a signing request takes a
 # kilobyte or two, however many addresses it lists.
 MAX_STRANGER_BYTES = 16 * 1024
+# A saved state goes straight to disk as it arrives, so this bounds disk and not memory.
+MAX_STATE_BYTES = 64 * 1024 * 1024 * 1024
 
 
 class BodyLimit:

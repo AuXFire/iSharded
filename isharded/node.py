@@ -104,6 +104,9 @@ def add_node_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cache-dir", default=None, help="where fetched weights are kept; put it on a fast disk")
     parser.add_argument("--cache-budget-gb", type=float, default=0, help="evict old models past this size; 0 is no limit")
     parser.add_argument("--ram-budget-gb", type=float, default=0, help="RAM for KV-cache checkpoints, not weights")
+    parser.add_argument("--state-ram-gb", type=float, default=None, help="RAM for saved prompt states on each stage; default 1")
+    parser.add_argument("--state-disk-gb", type=float, default=None, help="disk for saved prompt states; default 8, and 0 keeps them in RAM only")
+    parser.add_argument("--state-copy-mb", type=float, default=None, help="MB per second for copies of saved states to another node; default 10, and 0 sends none")
     parser.add_argument("--no-peer-fetch", action="store_true", help="always download from the model host")
     parser.add_argument("--no-peer-serve", action="store_true", help="do not send shards to other workers")
     parser.add_argument("--no-local-copy", action="store_true", help="run workers from a network path as it is")
@@ -262,6 +265,9 @@ def _cache_flags(args: argparse.Namespace) -> list[str]:
         flags += ["--cache-dir", args.cache_dir]
     if getattr(args, "cache_budget_gb", 0):
         flags += ["--cache-budget-gb", str(args.cache_budget_gb)]
+    for name in ("state_ram_gb", "state_disk_gb", "state_copy_mb"):
+        if getattr(args, name, None) is not None:
+            flags += ["--" + name.replace("_", "-"), str(getattr(args, name))]
     if getattr(args, "no_peer_fetch", False):
         flags.append("--no-peer-fetch")
     if getattr(args, "no_peer_serve", False):
@@ -395,7 +401,8 @@ def node_specs(args: argparse.Namespace) -> list[tuple[str, list[str]]]:
                     port,
                     "cpu",
                     "kv-cache,checkpoint",
-                    ["--ram-budget-gb", str(args.ram_budget_gb)],
+                    # It keeps copies of saved states too, in the same places as any worker here.
+                    ["--ram-budget-gb", str(args.ram_budget_gb), *cache_flags],
                 ),
             )
         )

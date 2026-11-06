@@ -201,7 +201,7 @@ Antivirus web shields can intercept TLS even on loopback, replacing the node's c
 
 ## Limits
 
-Requests above 16 MiB are refused from their headers before any of the body is read, and bodies must declare a length. Stage traffic may reach 1 GiB, and only `/internal/forward` and the bandwidth probe accept that much.
+Requests above 16 MiB are refused from their headers before any of the body is read, and bodies must declare a length. Stage traffic may reach 1 GiB, and only `/internal/forward` and the bandwidth probe accept that much. A copy of a saved state may be larger. Only `/internal/state/copy` accepts one, it checks the sender before reading any of it, and it writes to disk as the bytes arrive, up to the node's `--state-disk-gb`.
 
 The two routes that take a body with no credentials, `POST /join/requests` and `POST /access/entries`, take 16 KiB. Every real request fits in a few. An entry that is badly signed, or that changes nothing, counts against the sender's address: 20 at once, then 6 a minute. A good entry is never limited, so strangers cannot lock out the owner.
 
@@ -212,6 +212,18 @@ The pages that describe the API, `/docs`, `/redoc`, and `/openapi.json`, are off
 A request whose content a stage cannot process fails with an error and costs nobody their place in the route. Only losing contact with a stage can quarantine it, so a user cannot empty the pool one request at a time.
 
 Peers name model sources, so a worker in a secured pool only loads local models from its `--gguf-dir` folders, its cache, and any `--model-dir`. File names from peers cannot leave a model's folder, and a draft model can only be a `.gguf`.
+
+## Saved conversations
+
+A saved prompt state is what a stage worked out from someone's conversation. Treat it as the conversation itself: nobody should assume the text cannot be recovered from it.
+
+- Each stage keeps states in RAM, and writes them to `states` in its `--cache-dir`, unencrypted. On Linux and macOS the folder and files are readable only by the node's own user. On Windows the permission calls do little, so the files have whatever the folder gives them. Keep the cache somewhere private, and on an encrypted disk if the machine could be stolen.
+- States stay on disk after a reply ends, until they are evicted or the model or the stage's layers change. Nothing deletes a conversation's states on request.
+- One other node keeps a copy of each state, for its own stage's layers only. That is the next stage along the route, which already sees what this stage sees, unless a node offers `--ram-budget-gb` for this. A node like that may be outside the route, and it then holds text it would otherwise never see.
+- Only pool members can send or fetch a state. A copy is checked for damage, but a pool member could send a false one, in the same way a stage can return false results. llama.cpp parses a state in the stage process, so a bad one costs that process and nothing else.
+- Stages share states between conversations by their exact tokens. A person who can guess the whole start of someone else's prompt can tell from timing whether it was sent recently.
+
+`--state-disk-gb 0` keeps states in RAM only, `--state-copy-mb 0` keeps them on their own node, and `--no-prompt-cache` on a load saves none at all.
 
 ## Audit log
 
