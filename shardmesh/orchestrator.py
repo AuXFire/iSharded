@@ -14,6 +14,7 @@ from contextlib import aclosing, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -27,6 +28,7 @@ from .gguf import parse_source
 from . import audit
 from .discovery import start_beacon
 from .lanes import LaneDoor
+from .mcp_server import INVALID_REQUEST, McpHandler, MeshTools, RpcError, answer_http
 from .mesh import GOSSIP_SECONDS, ControlMesh
 from .models import Adapter, GgufAdapter, SUPPORTED_TYPES, UnsupportedModel, create_adapter
 from .planner import AMORTIZE_TOKENS, HOP_MS, Candidate, ModelProfile, PlacementError, plan_placement
@@ -51,8 +53,8 @@ from .protocol import (
     WorkerRegistration,
     auth_headers,
 )
-from .pool import check_exposure, home as pool_home, load_token, read_membership_request
-from .serving import BodyLimit, serve, where_everything_is
+from .pool import LOOPBACK, check_exposure, home as pool_home, load_token, read_membership_request
+from .serving import BodyLimit, ChunkedResponses, serve, where_everything_is
 from .mesh import clean_url
 from .tickets import PREFIX as TICKET_PREFIX, NodeTickets, TicketChecker, TicketIdentity, client_auth, make_checker, reply_audience
 from .tls import BEHALF, BEHALF_HEADER, FORWARD_MARK, INTERCEPTED, intercepted, PEER, client_verify
@@ -2291,6 +2293,7 @@ async def audit_requests(request: Request, call_next: Any) -> Any:
 # Added last, so it runs first: nothing oversized is read, forwarded or parsed.
 app.add_middleware(TicketIdentity)
 app.add_middleware(BodyLimit)
+app.add_middleware(ChunkedResponses, path="/mcp")
 
 
 @app.get("/ready")
@@ -2994,6 +2997,58 @@ async def chat_completions(
             "total_tokens": summary["prompt_tokens"] + summary["completion_tokens"],
         },
     }
+
+
+def origin_is_ours(origin: str | None) -> bool:
+    """Whether a browser page may reach /mcp. No Origin means no browser.
+
+    Matching the Host header would prove nothing: under DNS rebinding the
+    attacker's page and its Host are the same name.
+    """
+    if origin is None:
+        return True
+    name = urlsplit(origin).hostname
+    return name in LOOPBACK or (runtime.mesh is not None and origin.rstrip("/") in runtime.mesh.known_urls())
+
+
+def own_api(request: Request, authorization: str | None) -> httpx.AsyncClient:
+    """This node's own API, as the caller reaches it.
+
+    Going back in at the top means MCP inherits everything /v1 does for lanes,
+    followers, keys, limits, and the audit log, and cannot drift from it.
+    """
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False, client=(request.client.host, request.client.port) if request.client else ("unknown", 0))
+    headers = {"Authorization": authorization} if authorization else {}
+    return httpx.AsyncClient(transport=transport, base_url="http://this-node", headers=headers, timeout=None)
+
+
+@app.post("/mcp")
+async def mcp_endpoint(request: Request, authorization: str | None = Header(default=None)) -> Response:
+    """MCP over Streamable HTTP. Stateless: each request stands alone, on any node."""
+    if not origin_is_ours(request.headers.get("origin")):
+        return JSONResponse(status_code=403, content=RpcError(INVALID_REQUEST, "This Origin may not use this endpoint").body(None))
+    try:
+        require(authorization, ROLE_USER)
+    except HTTPException as exc:
+        if exc.status_code == 401:
+            raise HTTPException(status_code=401, detail=exc.detail, headers={"WWW-Authenticate": "Bearer"}) from exc
+        raise
+
+    def charge(method: str) -> None:
+        # tools/call pays when it reaches /v1, which is enough.
+        if method != "tools/call":
+            verify_user(authorization)
+
+    async with own_api(request, authorization) as client:
+        status, reply = await answer_http(McpHandler(MeshTools(client), stateless=True), request.headers, await request.body(), charge)
+    return Response(status_code=status) if reply is None else JSONResponse(status_code=status, content=reply)
+
+
+@app.get("/mcp")
+@app.delete("/mcp")
+async def mcp_elsewhere() -> Response:
+    """There is no stream to open and no session to end."""
+    return Response(status_code=405, headers={"Allow": "POST"})
 
 
 def build_parser() -> argparse.ArgumentParser:
