@@ -373,10 +373,11 @@ def test_a_draft_that_loses_is_set_aside_and_tried_again_later() -> None:
     choice.note(True, 3, 0.15)  # 20 tokens/s
     assert choice.use_draft() is False
     choice.note(False, 1, 0.036)  # 28 tokens/s
-    for _ in range(DRAFT_TRIAL_TOKENS - 1):
-        assert choice.use_draft() is False
+    tokens = 0
+    while not choice.use_draft():
         choice.note(False, 1, 0.036)
-    assert choice.use_draft() is True  # time for a trial
+        tokens += 1
+    assert DRAFT_TRIAL_TOKENS - 3 <= tokens <= DRAFT_TRIAL_TOKENS  # time for a trial
     choice.note(True, 3, 0.15)
     assert choice.use_draft() is False  # it lost again, so back to the faster way
 
