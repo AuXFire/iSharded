@@ -2233,6 +2233,10 @@ class Orchestrator:
             add("worker_compute_ms", telemetry.get("compute_ms_ema"), "Moving average of compute per pass", worker=worker_id)
             add("worker_stage_restarts_total", telemetry.get("stage_restarts"), "Stage processes restarted", "counter", worker=worker_id)
             add("worker_stages_kept_total", telemetry.get("stages_kept"), "Reconfigures that moved no weights", "counter", worker=worker_id)
+            pipeline = telemetry.get("pipeline") or {}
+            if pipeline.get("tokens"):
+                add("worker_pipeline_tokens", pipeline["tokens"], "Tokens made with passes overlapping on the route", kind="counter")
+                add("worker_pipeline_misses", pipeline["misses"], "Guesses that sent a pipeline back", kind="counter")
             if telemetry.get("draft_tokens_per_pass") is not None:
                 add("worker_draft_tokens_per_pass", telemetry["draft_tokens_per_pass"], "Tokens per speculative pass", worker=worker_id)
             cache = telemetry.get("cache") or {}

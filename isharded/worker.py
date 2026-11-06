@@ -1612,11 +1612,11 @@ class WorkerRuntime:
                 running.append(asyncio.ensure_future(step(part)))
                 if index + 1 < len(pieces):
                     here = asyncio.ensure_future(self.await_part(part, index, pass_seconds(len(whole.input_ids), 1)))
-                    await asyncio.wait({here, running[-1]}, return_when=asyncio.FIRST_COMPLETED)
-                    if running[-1].done():
+                    try:
+                        await asyncio.wait({here, running[-1]}, return_when=asyncio.FIRST_COMPLETED)
+                        (here if here.done() else running[-1]).result()
+                    finally:
                         here.cancel()
-                        running[-1].result()
-                    await here
             return (await asyncio.gather(*running))[-1]
         except BaseException:
             for task in running:
@@ -1805,7 +1805,7 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
             "stages_kept": runtime.stages_kept,
             "draft_passes": runtime.draft_passes,
             "draft_tokens_per_pass": round(runtime.draft_accepted / runtime.draft_passes, 2) if runtime.draft_passes else None,
-            "pipeline": {"tokens": runtime.pipeline_tokens, "misses": runtime.pipeline_misses, "depth": runtime.pipeline_depth, "rewinds": runtime.rewinds, "ring_live": runtime.ring_live, "stages": len(runtime.route)},
+            "pipeline": {"tokens": runtime.pipeline_tokens, "misses": runtime.pipeline_misses, "depth": runtime.pipeline_depth},
             "draft_ways": {way: round(runtime.draft_choice.rate(way), 2) for way in runtime.draft_choice.seconds},
             "checkpoints_dropped": runtime.checkpoints_dropped,
             "cache": runtime.cache_report(),

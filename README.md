@@ -265,7 +265,21 @@ The node you ask runs your reply itself. The coordinator isn't involved, so losi
   <img alt="A reply goes from any control plane to the entry worker, then loops through the stages. The coordinator is not on this path." src="docs/diagrams/reply-light.png">
 </picture>
 
-Only hidden states and tokens cross the network during a reply, never weights. A small draft model guesses ahead so one pass can produce several tokens. Conversations sharing a stage also share a pass when they can, which took four conversations from 12 to 32 tok/s on one stage.
+Only hidden states and tokens cross the network during a reply, never weights. A token has to cross every stage in turn, so one reply alone would leave all but one stage idle. A small draft model keeps them busy by guessing ahead, and a long prompt goes out in parts so every stage reads at once. Conversations sharing a stage also share a pass when they can, which took four conversations from 12 to 32 tok/s on one stage.
+
+With the [native engine](#the-native-engine), a pass moves from stage to stage over direct links without touching Python.
+
+### The native engine
+
+The engine is a Rust library loaded into each stage process. It runs the passes that happen for every token: a stage hands a pass on without waiting, and the last stage sends the answer straight back to the entry over a closing link. Links use TLS 1.3 with certificates pinned through the control plane, and a key for each route.
+
+Build it with [Rust](https://rustup.rs) installed. It lands in `isharded/native`, where the package finds it:
+
+```bash
+python scripts/build_engine.py
+```
+
+iSharded runs without it, over the slower Python path, and any failure on a direct link falls back to the recovery the Python path already has. Prompts, restored states, and images stay on the Python path. On the laptop test, three stages of Qwen3-0.6B went from 47.5 to 128.6 tokens/s with identical replies.
 
 ### Any node can coordinate
 
@@ -358,29 +372,34 @@ None of this has been measured past seven machines. If you have spare machines, 
 
 ### Measured across data centers
 
-Seven machines ran Qwen3-235B-A22B Instruct at Q6_K, 180 GiB and 94 layers, over TLS. Five were rented GPUs in the United States, Canada, Sweden, and Romania: three A40s, an RTX PRO 4000, and a 24 GB slice of an RTX PRO 6000. Two were at home behind relays: a laptop RTX 3060 and a desktop RX 7900 XT. That mixed CUDA on Linux and Windows with ROCm on Windows, and the final plan held every layer in VRAM.
+Qwen3-235B-A22B Instruct at Q5_K_M, 155 GiB and 94 layers, ran on four rented A40s in one data center in Sweden, over TLS, with the native engine and a 0.6B draft. A fifth GPU in Romania, about 40 ms away, joined for the two-country rows.
 
 | What | Result |
 |---|---|
-| One reply | 1.26 tokens/s, 794 ms a token, of which 81 ms was compute |
-| One reply with a 0.6B draft | 1.9 to 2.4 tokens/s |
-| Four replies at once, `--parallel 4` | 5.37 tokens/s in all, against 1.03 at `--parallel 1`. Each reply ran at about 1.8 |
-| First token, prompt seen before | 0.8 to 1.0 s |
-| First token, new short prompt | 5 to 8 s |
-| First token, new prompt of about 3,400 tokens | 25 s |
-| Reloading a model already on every disk | 64 s |
-| A node choosing where to fetch from | 192 MB/s from a neighbour against 29 MB/s from the model host. Another went from 16 to 103 MB/s by using both |
-| A stage's engine killed mid-reply | The reply paused 10 s and finished correctly |
-| A stage frozen silently for 45 s mid-reply | The reply paused 48 s and finished correctly |
-| A worker process killed mid-reply | The reply paused 76 s and finished correctly, on the same layout |
+| One reply, plain decoding | 27.6 tokens/s, 36 ms a token |
+| One reply with stages overlapping | 40 tokens/s, 25 ms a token |
+| The same with very predictable text, counting to 150 | 82 tokens/s |
+| One reply across two countries, plain | 11.6 tokens/s |
+| One reply across two countries, stages overlapping | 23 tokens/s |
+| Eight replies at `--parallel 4` | 62 tokens/s in all |
+| First token, new short prompt | 0.4 s in one data center, 1.1 s across two countries |
+| First token, new prompt of about 3,400 tokens | 2.8 s, against 7.5 s with the prompt sent whole |
+| First token, a prompt seen before | 0.4 s |
+| A stage's engine killed mid-reply | The reply paused 7.5 s and finished with the same text, on the same layout |
+| A worker process killed mid-reply | The reply paused 41 s and finished with the same text, on the same layout |
+| A stage's engine killed while reading a long prompt | First token after 13 s, with the same text |
 
-Across cities, speed comes from the links. Each hop cost its full round trip plus about 10 ms, because a stage waits for the next stage's answer, so the 794 ms above was almost all network. That has three consequences:
+The four stages take about 33 ms a token between them, so one machine holding the whole model and decoding plainly would reach about 30 tokens/s. That figure comes from the stages' measured compute, since no single A40 can hold this model. Overlapping stages beats it, because a route has four GPUs working and one machine has one. See [Speculative decoding](#speculative-decoding) for how they overlap.
 
-- A draft pays for itself, because a pass costs the same whether it carries one token or several.
-- `--parallel` is the biggest lever for a shared mesh, because replies fill the stages that would otherwise wait.
-- Route order matters more than any GPU. The route in this run was chosen without measured links. Planning now uses them, and that has been tested only in code, not on a real mesh.
+Replies came out identical to a load with no draft: 12 of 12 across greedy and seeded sampling at temperatures 0.8 and 1.0.
 
-Two limits showed here. Why a new short prompt takes 5 to 8 s has not been explained: it did not improve when RAM spill was removed, and one suspect is TCP starting slowly on idle long-distance links. The mesh also ran for only about two hours, in rented cloud GPUs, and its largest stage failures were one at a time.
+Three limits showed here:
+
+- The draft costs about 11 ms a guess on the entry's GPU, and that now sets the pace. A wrong guess costs a full trip along the route, and about 4 guesses in 10 were wrong on open-ended prose.
+- A kill during a reply replays what was already written as one batched pass, which rounds slightly differently. So after a failure the last words of a reply can differ from an unbroken run, where two tokens are nearly tied. Nothing is lost and nothing already sent changes.
+- Moving a layer boundary changes where prompt rows round to BF16, so two different layouts can give different replies at near-ties. The same layout repeats exactly.
+
+An earlier mesh of seven machines on the Python path, in four countries and two homes behind relays, ran the Q6_K build at 1.26 tokens/s. Its hops cost a full round trip plus about 10 ms, because each stage waited on the next. Stages no longer wait, but a relay still adds its own latency, so the planner keeps slow links out of the route when the model fits without them.
 
 ## Using a pool
 
@@ -559,11 +578,11 @@ The entry node also carries the draft model, about 1.7 GiB of VRAM for the defau
 |---|---|---|
 | `--context-tokens` | The smallest that fits your use. 8192 is a good chat default | Each reply's context costs memory on every stage |
 | `--parallel` | Your expected concurrent conversations, up to about 4 | Each one costs its own context memory |
-| Draft model | Keep it for one or two users. Use `--no-draft` for three or more | See the table below |
+| Draft model | Keep it. On a model with recurrent layers, keep it for one or two users and use `--no-draft` for three or more | A busy route stops guessing by itself, except on recurrent models. See the table below |
 | `--placement` | Leave at `auto` | `auto` takes the fastest, steadiest route through the fewest close workers that hold the model in VRAM. `spread` forces every worker in, however far away |
 | `--hashes` | Use it when any node or mirror is less than fully trusted | Every node then checks every unit |
 
-Measured on the test pool with Qwen3.6-27B Q4_K_M, total tokens per second across all conversations, at `--parallel 4`:
+Measured on the test pool with Qwen3.6-27B Q4_K_M, a model with recurrent layers, total tokens per second across all conversations, at `--parallel 4`:
 
 | Conversations at once | No draft, merged passes | With a draft |
 |---:|---:|---:|
@@ -942,6 +961,7 @@ A flag takes priority over its variable.
 | `ISHARDED_ENGINE` | Set to `0` to run without the native engine, on the Python path |
 | `ISHARDED_ENGINE_LIB` | The native engine's library, if it is not in `isharded/native` |
 | `ISHARDED_RING` | Set to `0` on the coordinator to keep replies off the direct links between stages |
+| `ISHARDED_PROMPT_PARTS` | Set to `0` on the entry worker to send each prompt whole instead of in parts |
 | `ISHARDED_DATA_PORT` | The port for direct links between stages. It must be reachable from the other stages. Default: any free port |
 | `ISHARDED_HOST_ID` | Which physical machine a worker is on. Defaults to the computer name, so workers sharing a host do not count its RAM twice |
 | `ISHARDED_FETCH_CONCURRENCY` | Units a worker fetches at once. Default 4 |
@@ -1118,7 +1138,7 @@ On two nodes on one machine, the same loop ran through the coordinator, a follow
 | `parallel` | 1 | 1 to 32 |
 | `entry_worker`, `exit_worker` | None | Pin the ends of the route |
 | `draft_model` | `auto` | A GGUF id, `auto`, or `none` |
-| `draft_tokens` | 6 | Most guesses per pass, 1 to 16 |
+| `draft_tokens` | 6 | Most guesses out at once, 1 to 16 |
 | `merge_passes` | `true` | Let conversations share a pass |
 | `prompt_cache` | `true` | Reuse saved prompt states |
 | `kv_type` | `f16` | How a GGUF model keeps attention KV: `f16` or `q8_0` |
@@ -1238,11 +1258,17 @@ The Windows ROCm release of llama.cpp leaves out `hipblas.dll`. iSharded finds i
 
 ### Speculative decoding
 
-A trip through the pipeline costs nearly the same whether it carries one token or six, so the entry worker runs a small draft model that guesses ahead, and the real model checks every guess in one pass. Each pass yields the guesses that held, plus one more token.
+A token has to cross every stage in turn, so a reply on its own would leave all but one stage idle. The entry worker runs a small draft model to fill them, the way a processor fills its pipeline. A pass goes out before the one ahead of it has come back, carrying the draft's guess at what that pass will answer. The last stage samples exactly as it does for a plain pass. If its answer is the guess, the pass behind was already right and already on its way. If not, what followed is thrown away, the stages rewind, and the reply goes on from the model's own token.
 
-For `qwen35` and `qwen35moe` models the draft is chosen automatically (`Qwen3.5-0.8B`, which shares their vocabulary). Name another with `--draft`, or turn this off with `--no-draft`. A named draft must have the same vocabulary as the model, and a draft that cannot load leaves the model running without one.
+So a guess can only save time. Each pass is one row at its own position, which is what plain decoding runs, so every token is the one plain decoding gives, seed and all. It needs the [native engine](#the-native-engine) and at least two stages.
 
-The number of guesses adapts as a reply goes, up to `draft_tokens`, because code rewards long guesses and open-ended prose does not. Sampling keeps the model's distribution exactly: a guess `g` is accepted with probability `q(g)`, and a rejection draws from `q` with `g` removed. At temperature 0, batched arithmetic rounds slightly differently from single-token arithmetic, so output can differ from a run without a draft where two tokens are nearly tied.
+The entry keeps just enough passes out to fill the route, up to `draft_tokens`, and fewer when guesses are landing badly. Other replies fill a route too, so a busy route gets no guesses at all.
+
+Models with recurrent layers cannot rewind past a finished pass, so they check guesses another way: several guesses go out as rows of one pass, and the real model checks them together. The number of guesses adapts as a reply goes, up to `draft_tokens`. Sampling keeps the model's distribution exactly: a guess `g` is accepted with probability `q(g)`, and a rejection draws from `q` with `g` removed. At temperature 0, batched arithmetic rounds slightly differently from single-token arithmetic, so output can differ from a run without a draft where two tokens are nearly tied.
+
+Guessing does not always pay, so the entry measures. It keeps whichever way has been fastest lately, by total tokens over total time, and gives the others a short trial now and then, because a route or a reply can change which one wins.
+
+For `qwen3`, `qwen3moe`, `qwen35`, and `qwen35moe` models the draft is chosen automatically (`Qwen3-0.6B` or `Qwen3.5-0.8B`, which share their vocabulary). Name another with `--draft`, or turn this off with `--no-draft`. A named draft must have the same vocabulary as the model, and a draft that cannot load leaves the model running without one.
 
 ### Conversation reuse
 

@@ -252,6 +252,54 @@ def test_a_guess_that_lands_after_a_miss_is_not_sent() -> None:
     assert made == plain([2, 3], model([2, 3]), 41)[1:]
 
 
+def test_a_guess_for_a_place_already_answered_is_thrown_away() -> None:
+    async def run() -> tuple[list[int], int, Route]:
+        prompt = [4, 4]
+        history = [*prompt, model(prompt)]
+        route = Route(history[:-1], length=1)
+        draft = Draft(1.0)  # always right, and slower than the route
+        slow = draft.guess
+
+        async def guess(text: list[int]) -> int:
+            for _ in range(12):
+                await asyncio.sleep(0)
+            return await slow(text)
+
+        async def wait(answer: asyncio.Future[list[int]]) -> int:
+            return (await answer)[0]
+
+        pipe = Pipeline(history, 30, (), 4, 6, route.send, wait, guess, draft.rewind)
+        made = [token async for token in pipe.tokens(30)]
+        await pipe.close()
+        return made, pipe.misses, route
+
+    made, misses, _ = asyncio.run(run())
+    assert made == plain([4, 4], model([4, 4]), 31)[1:]
+    assert misses == 0  # a right guess that came late is not a wrong one
+
+
+def test_a_pass_that_never_comes_back_ends_the_wait() -> None:
+    async def run() -> None:
+        history = [1, 2, 3]
+        draft = Draft(1.0)
+
+        def send(*_: object) -> asyncio.Future[list[int]]:
+            return asyncio.get_running_loop().create_future()
+
+        async def wait(answer: asyncio.Future[list[int]]) -> int:
+            return (await asyncio.wait_for(answer, 0.05))[0]
+
+        pipe = Pipeline(history, 30, (), 4, 2, send, wait, draft.guess, draft.rewind)
+        try:
+            async for _ in pipe.tokens(30):
+                pass
+        finally:
+            await pipe.close()
+
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(asyncio.wait_for(run(), 5))
+
+
 def test_landing_leaves_the_reply_ready_to_go_on_another_way() -> None:
     async def run() -> tuple[list[int], Draft, Route]:
         prompt = [5, 6]
@@ -339,6 +387,24 @@ def test_a_part_leaves_before_the_one_ahead_has_crossed_the_route() -> None:
     parts.delays = {0: 1000}  # the first part is still away along the route
     asyncio.run(parts.runtime.run_in_parts(whole_prompt(), PIECES, parts.step))
     assert [part.part_index for part in parts.seen] == [0, 1, 2]
+
+
+def test_a_part_that_is_through_before_anyone_looked_is_no_failure() -> None:
+    async def run() -> dict[str, int]:
+        parts = Parts()
+
+        async def step(part: InferRequest) -> dict[str, int]:
+            parts.seen.append(part)
+            return {"token_id": part.part_index}  # says nothing on this stage, as a test can
+
+        async def noted(part: InferRequest) -> dict[str, int]:
+            answer = await step(part)
+            parts.runtime.parts_run[part.slot] = (part.part_of, part.part_index)
+            return answer
+
+        return await parts.runtime.run_in_parts(whole_prompt(), PIECES, noted)
+
+    assert asyncio.run(run()) == {"token_id": 2}
 
 
 def test_a_failed_part_fails_the_prompt_and_stops_the_rest() -> None:

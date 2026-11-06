@@ -83,8 +83,8 @@ class Pipeline:
         # The guess being made. It runs beside everything else, because a wrong guess must
         # be answered the moment it shows, not when the draft next looks up.
         self.guessing: asyncio.Task[int] | None = None
-        # Which guess that is for. Anything it was built on may be gone by the time it lands.
-        self.guessing_after = -1
+        # What that guess was built on, which may be gone by the time it lands.
+        self.guessing_for = (-1, -1)
         # The draft expects the reply to end here, so there is nothing to send past it.
         self.ending = False
         self.tokens_made = 0
@@ -121,28 +121,32 @@ class Pipeline:
     def _guess_on(self) -> None:
         """Starts the next guess, if the route has room for one."""
         if self.guessing is None and not self.ending and len(self.flights) < min(self.depth(), self.room):
-            self.guessing_after = self.misses
+            self.guessing_for = (self.misses, self.flights[-1].position)
             self.guessing = asyncio.ensure_future(self._next_guess(self._text()))
 
     def _take_guess(self) -> None:
         assert self.guessing is not None
         guess = self.guessing.result()
         self.guessing = None
-        if self.guessing_after != self.misses:
-            return  # built on a guess that has since failed
+        if self.guessing_for != (self.misses, self.flights[-1].position):
+            return  # the reply moved on while it was being made
         if guess in self.stops:
             self.ending = True
         else:
             self._launch(guess, self.flights[-1].position + 1)
 
     async def _answer(self, flight: Flight) -> int:
-        """Keeps guessing until the oldest pass is back."""
-        while not flight.answer.done():
-            self._guess_on()
-            await asyncio.wait({flight.answer} if self.guessing is None else {flight.answer, self.guessing}, return_when=asyncio.FIRST_COMPLETED)
-            if self.guessing is not None and self.guessing.done():
-                self._take_guess()
-        return await self.wait(flight.answer)
+        """Keeps guessing until the oldest pass is back, or ``wait`` gives up on it."""
+        answer = asyncio.ensure_future(self.wait(flight.answer))
+        try:
+            while not answer.done():
+                self._guess_on()
+                await asyncio.wait({answer} if self.guessing is None else {answer, self.guessing}, return_when=asyncio.FIRST_COMPLETED)
+                if self.guessing is not None and self.guessing.done():
+                    self._take_guess()
+            return answer.result()
+        finally:
+            answer.cancel()
 
     def _timed(self, flight: Flight) -> None:
         now = time.perf_counter()
