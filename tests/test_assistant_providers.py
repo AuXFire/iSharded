@@ -236,7 +236,7 @@ def test_with_no_tools_only_reasoning_is_hidden():
 
 def test_the_mesh_receives_only_what_its_real_schema_accepts():
     with FakeModelServer(mesh_shape=True) as server:
-        provider = MeshProvider("mesh", server.url)
+        provider = MeshProvider("mesh", server.url, tool_mode="prompt")
         tools_request = ModelRequest(
             role="conversation",
             messages=[
@@ -259,9 +259,9 @@ def test_the_mesh_receives_only_what_its_real_schema_accepts():
     assert [message["role"] for message in body["messages"]] == ["system", "user", "user"]
 
 
-def test_tools_are_offered_to_the_mesh_in_the_system_prompt():
+def test_tools_can_be_offered_to_the_mesh_in_the_system_prompt():
     with FakeModelServer(mesh_shape=True) as server:
-        MeshProvider("mesh", server.url).complete(request(tools=OFFERED), "fake-model")
+        MeshProvider("mesh", server.url, tool_mode="prompt").complete(request(tools=OFFERED), "fake-model")
     system = server.requests[0]["body"]["messages"][0]["content"]
     assert system.startswith("Be kind.") and "files.read" in system and "mail.send" in system and "<tool_call>" in system
     assert server.requests[0]["body"]["messages"].count({"role": "system", "content": system}) == 1
@@ -666,3 +666,37 @@ def test_commands_add_list_remove(tmp_path, capsys):
 def test_an_explicit_reach_is_respected_even_for_a_mesh(tmp_path, capsys):
     assert run_cli(tmp_path, "provider", "add", "pool", "http://127.0.0.1:9000", "--mesh", "--reach", "cloud") == 0
     assert "reach cloud" in capsys.readouterr().out
+
+
+def test_a_mesh_reads_tool_calls_from_the_stream_and_falls_back_when_it_has_none(monkeypatch) -> None:
+    import httpx
+
+    from isharded.assistant import providers
+    from isharded.assistant.contracts import Capability, ModelRequest  # noqa: F401
+
+    pieces = [
+        {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "files__read", "arguments": '{"pa'}}]}}]},
+        {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": 'th": "a.txt"}'}}]}, "finish_reason": "tool_calls"}]},
+    ]
+    stream = "".join(f"data: {__import__('json').dumps(piece)}\n\n" for piece in pieces) + "data: [DONE]\n\n"
+    seen = []
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        body = __import__("json").loads(request.content)
+        seen.append("tools" in body)
+        if "tools" in body and refuse["now"]:
+            return httpx.Response(400, json={"detail": "no tool calling here"})
+        return httpx.Response(200, text=stream if "tools" in body else 'data: {"choices":[{"delta":{"content":"plain"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+
+    refuse = {"now": False}
+    mesh = providers.MeshProvider("mesh", "http://mesh/v1", None)
+    monkeypatch.setattr(mesh, "_client", lambda read: httpx.Client(transport=httpx.MockTransport(serve), timeout=5))
+    tool = type("Tool", (), {"name": "files.read", "summary": "Read a file", "input_schema": {"type": "object"}})()
+    request = type("Request", (), {"tools": (tool,), "messages": [{"role": "user", "content": "go"}], "max_tokens": 8, "temperature": 0, "stop": (), "role": "conversation"})()
+
+    reply = mesh.complete(request, "m")
+    assert [(call.capability, call.arguments) for call in reply.tool_calls] == [("files.read", {"path": "a.txt"})]
+
+    refuse["now"] = True
+    reply = mesh.complete(request, "m")  # this model has no tool calling, so the prompt takes over
+    assert reply.text == "plain" and mesh.tool_mode == "prompt"

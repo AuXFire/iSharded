@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .lanes import lane_port, lane_url, read_lanes
+from .tls import OWN_ADDRESS
 from .pool import check_exposure, load_token
 
 def is_remote_path(path: str | Path) -> bool:
@@ -509,6 +510,8 @@ def run_node(args: argparse.Namespace) -> int:
     specs = node_specs(args)
 
     env = os.environ.copy()
+    if args.bind_host in {"0.0.0.0", "::"}:  # loopback reaches this node's services only then
+        env[OWN_ADDRESS] = args.advertise_host
     # When iSharded is launched directly from a checkout (including an RDP
     # redirected drive), the supervisor can import this package because its
     # launcher amended sys.path, but fresh ``python -m isharded.worker`` child

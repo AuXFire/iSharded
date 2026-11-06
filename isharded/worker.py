@@ -27,6 +27,7 @@ import torch
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 
+from .inventory import ram
 from .memory import (
     AUTO_RAM_SHARE,
     Accelerator,
@@ -75,7 +76,7 @@ from .slots import SlotGate
 from .access import load_authority
 from .inventory import inventory
 from .tickets import TicketIdentity, client_auth
-from .tls import PEER, client_verify
+from .tls import client_verify, PEER, stay_on_this_machine_async
 from .vision import PromptPart, PromptRows, lay_out
 from .weights import FetchProgress, LoadedUnit, UnitCache, WeightSourceError, gguf_reader, load_unit, map_unit
 
@@ -106,7 +107,7 @@ def parse_ram_budget(value: str) -> int | None:
     if not value:
         return None
     if value == "auto":
-        return int(psutil.virtual_memory().available * AUTO_RAM_SHARE)
+        return int(ram().available * AUTO_RAM_SHARE)
     return int(float(value) * 1024**3)
 
 
@@ -129,7 +130,7 @@ def hardware_info(
         runtime_version=primary.runtime_version if primary else platform.python_version(),
         supported_dtypes=SUPPORTED_DTYPES,
         cpu_cores=os.cpu_count() or 1,
-        ram_total_bytes=psutil.virtual_memory().total,
+        ram_total_bytes=ram().total,
         accelerator_name=" + ".join(item.name for item in accelerators) or None,
         accelerator_memory_bytes=accelerator_memory,
         contribution=ResourceContribution(
@@ -362,7 +363,7 @@ class WorkerRuntime:
         self.caches: dict[str, CacheEntry] = {}
         self.lock = asyncio.Lock()
         # A disk-tier prompt can take minutes, and a slow hop is not a failure.
-        self.client = httpx.AsyncClient(timeout=httpx.Timeout(1800.0, connect=10.0), verify=client_verify(), auth=client_auth())
+        self.client = httpx.AsyncClient(event_hooks={"request": [stay_on_this_machine_async]}, timeout=httpx.Timeout(1800.0, connect=10.0), verify=client_verify(), auth=client_auth())
         self.registration_task: asyncio.Task[None] | None = None
         self.inference_calls = 0
         self.tokens_processed = 0

@@ -43,6 +43,62 @@ class NoDelayHTTPProtocol(AutoHTTPProtocol):  # type: ignore[misc, valid-type]
             self.app = with_identity
 
 
+ACCEPT_RETRY_SECONDS = 0.05
+
+
+def steady_accept(accept: Any) -> Any:
+    """IocpProactor.accept, except that one failed accept stays one failed accept.
+
+    If a client drops as it connects, Windows fails the accept with WinError 64, and
+    asyncio's Proactor loop answers by closing the listening socket for good. The
+    process lives on and its outgoing gossip still works, so nothing restarts it and
+    nothing notices. A live node sat deaf like that, with its port closed, until it
+    was found by hand. So a failure here is retried while the socket is still open.
+    """
+
+    def steady(self: Any, listener: Any) -> Any:
+        answer = self._loop.create_future()
+
+        def attempt() -> None:
+            if answer.done():
+                return
+            try:
+                inner = accept(self, listener)
+            except OSError as exc:
+                answer.set_exception(exc)
+                return
+            answer.add_done_callback(lambda _: inner.cancel() if answer.cancelled() else None)
+            inner.add_done_callback(settle)
+
+        def settle(inner: Any) -> None:
+            if answer.done():
+                return
+            if inner.cancelled():
+                answer.cancel()
+            elif inner.exception() is None:
+                answer.set_result(inner.result())
+            elif isinstance(inner.exception(), OSError) and listener.fileno() != -1:
+                self._loop.call_later(ACCEPT_RETRY_SECONDS, attempt)
+            else:
+                answer.set_exception(inner.exception())
+
+        attempt()
+        return answer
+
+    return steady
+
+
+def keep_listening() -> None:
+    if sys.platform != "win32":
+        return  # the selector loops elsewhere do not close a socket over one failed accept
+    from asyncio import windows_events
+
+    proactor = windows_events.IocpProactor
+    if not getattr(proactor, "keeps_listening", False):
+        proactor.accept = steady_accept(proactor.accept)
+        proactor.keeps_listening = True
+
+
 # Generous for any prompt, and far short of what could exhaust a node.
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 # Hidden states for a long prompt on a wide model, in FP32.
@@ -124,6 +180,7 @@ def where_everything_is() -> dict[str, Any]:
 
 
 def serve(app: Any, host: str, port: int) -> None:
+    keep_listening()
     # Redirected output defaults to the system code page on Windows, which cannot
     # write every model name or event.
     for stream in (sys.stdout, sys.stderr):

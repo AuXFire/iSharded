@@ -36,6 +36,7 @@ import psutil
 
 from .access import digest
 from .discovery import find_meshes
+from .inventory import ram
 from .node import add_node_arguments, detect_address, run_node
 from .pool import _private_link, _write_private, add_node, approve_membership, home as pool_home, init_pool, request_membership, sign_entry
 
@@ -282,7 +283,8 @@ def node_arguments(settings: dict[str, Any], home: Path) -> argparse.Namespace:
     arguments = [
         "--node-id", name,
         "--control-port", str(port),
-        "--base-port", str(port - 9),
+        "--base-port", str(settings.get("worker_port") or port - 9),
+        "--control-port", str(port),
         "--advertise-host", settings["address"],
         "--keys-file", str(home / "access.json"),
         "--weights-ram-gb", settings.get("ram_gb") or "auto",
@@ -441,6 +443,7 @@ def first_settings(args: argparse.Namespace, home: Path) -> dict[str, Any]:
         "name": args.name or machine_name(),
         "address": address,
         "port": args.port,
+        "worker_port": args.worker_port,
         "tls": tls and not args.ownerless,
         "trusted_network": args.trusted_network,
         "cpu_threads": args.cpu_threads or cpu_threads(),
@@ -599,7 +602,7 @@ def checks() -> list[tuple[bool, str, str]]:
     with socket.socket() as probe:
         free = probe.connect_ex(("127.0.0.1", DEFAULT_PORT)) != 0
     check(free, f"Port {DEFAULT_PORT} is free" if free else f"Port {DEFAULT_PORT} is in use", "Stop what uses it, or run isharded up --port with another port")
-    memory = psutil.virtual_memory()
+    memory = ram()
     check(memory.available > 2 * 1024**3, f"{memory.available / 1024**3:.1f} GiB of RAM free", "A node needs at least 2 GiB free")
     disk = shutil.disk_usage(str(Path.home()))
     check(disk.free > 10 * 1024**3, f"{disk.free / 1024**3:.0f} GiB of disk free", "Models need room. Free some disk first")
@@ -624,6 +627,7 @@ def add_arguments(subparsers: Any) -> None:
     up = subparsers.add_parser("up", help="start a node with everything worked out for you; the easy way in")
     up.add_argument("--invite", default=None, help="join a mesh, with a code from isharded invite")
     up.add_argument("--name", default=None, help="this node's name; default is the machine's name")
+    up.add_argument("--worker-port", type=int, default=None, help="this node's worker port, for clouds that hand out ports; default is nine below --port")
     up.add_argument("--port", type=int, default=DEFAULT_PORT, help="port for the chat page and API")
     up.add_argument("--address", default=None, help="the address other nodes reach this one on; found for you if not set")
     up.add_argument("--tls", action="store_true", help="use TLS even on Tailscale")

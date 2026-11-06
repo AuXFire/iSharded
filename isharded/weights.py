@@ -39,10 +39,10 @@ import httpx
 import torch
 from safetensors import safe_open
 
-from .gguf import GgufError, GgufHeader, parse_header, parse_source
+from .gguf import GgufError, GgufHeader, join_parts, parse_header, parse_source, split_parts
 from .protocol import auth_headers, TensorRef, WeightUnit
 from .tickets import client_auth
-from .tls import client_verify
+from .tls import client_verify, stay_on_this_machine
 
 # Mapped weights are read-only by design, and nothing writes to them.
 warnings.filterwarnings("ignore", message="The given buffer is not writable")
@@ -235,6 +235,7 @@ class PeerReader:
     def __init__(self, urls: list[str], token: str | None = None) -> None:
         self.urls = [url.rstrip("/") for url in urls]
         self.client = httpx.Client(
+            event_hooks={"request": [stay_on_this_machine]},
             headers=auth_headers(token),
             timeout=httpx.Timeout(60.0, connect=5.0),
             trust_env=False,
@@ -359,32 +360,43 @@ def build_gguf_manifest(
     source: str, name: str, revision: str, holders: list[str] | None = None, token: str | None = None
 ) -> Manifest:
     """Read a GGUF header. Costs megabytes, however large the model is."""
-    if re.search(r"-\d{5}-of-\d{5}\.gguf$", name, re.IGNORECASE):
-        raise WeightSourceError(f"{name} is one part of a split GGUF, which is not supported yet")
+    names = split_parts(name)
     reader = gguf_reader(source, revision, holders, token)
     try:
-        header = read_gguf_header(reader, name)
-        pinned = reader.resolve_revision(revision) if isinstance(reader, HubReader) else file_fingerprint(reader, name, header.file_size)
+        parts = {part: read_gguf_header(reader, part) for part in names}
+        if isinstance(reader, HubReader):
+            pinned = reader.resolve_revision(revision)
+        else:
+            prints = [file_fingerprint(reader, part, header.file_size) for part, header in parts.items()]
+            pinned = prints[0] if len(prints) == 1 else "gguf-" + hashlib.sha1("".join(prints).encode()).hexdigest()[:16]
+    except GgufError as exc:
+        raise WeightSourceError(f"{name}: {exc}") from exc
     finally:
         reader.close()
     tensors = {
         tensor.name: TensorRef(
             name=tensor.name,
-            file=name,
+            file=part,
             dtype="U8",
             shape=[tensor.nbytes],
             start=header.data_start + tensor.offset,
             end=header.data_start + tensor.offset + tensor.nbytes,
         )
+        for part, header in parts.items()
         for tensor in header.tensors.values()
     }
+    try:
+        header = join_parts(list(parts.values()))
+    except GgufError as exc:
+        raise WeightSourceError(f"{name}: {exc}") from exc
     tokens = header.keys.get("tokenizer.ggml.tokens")
     config = {
         "model_type": "gguf",
         "gguf": header.skeleton(),
         "gguf_vocabulary": hashlib.sha1(tokens.raw).hexdigest() if tokens else "",
-        "gguf_file": name,
-        "gguf_file_size": header.file_size,
+        "gguf_file": names[0],
+        "gguf_file_size": parts[names[0]].file_size,
+        "gguf_parts": {part: parts[part].file_size for part in names},
     }
     return Manifest(source=source, revision=pinned, config=config, tensors=tensors)
 
@@ -766,7 +778,7 @@ def fetch_from_peer(
     expected = len(prefix) + unit.nbytes
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_name(f"{destination.name}.{os.getpid()}.{threading.get_ident()}.peer.part")
-    owned = client or httpx.Client(timeout=httpx.Timeout(60.0, connect=5.0), verify=client_verify(), auth=client_auth())
+    owned = client or httpx.Client(event_hooks={"request": [stay_on_this_machine]}, timeout=httpx.Timeout(60.0, connect=5.0), verify=client_verify(), auth=client_auth())
     headers = auth_headers(token)
     params = {"model_id": model_id, "revision": revision, "unit": unit.name}
     received = 0

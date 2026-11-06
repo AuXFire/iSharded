@@ -874,3 +874,19 @@ def test_join_requests_are_bounded_and_spread(owned):
         access.join_requests[f"n{index}"] = {}
     second = request_membership(str(home), "late", ["10.0.0.9"])
     assert access.add_join_request(read_membership_request(second), second) == "busy"
+
+
+def test_a_node_reaches_itself_over_loopback_and_everyone_else_as_named(monkeypatch) -> None:
+    from isharded.tls import OWN_ADDRESS, stay_on_this_machine
+
+    def sent(url: str) -> httpx.Request:
+        request = httpx.Request("GET", url)
+        stay_on_this_machine(request)
+        return request
+
+    assert sent("https://203.0.113.5:9000/health").url.host == "203.0.113.5"  # unset: nothing changes
+    monkeypatch.setenv(OWN_ADDRESS, "203.0.113.5")
+    request = sent("https://203.0.113.5:9000/health")
+    assert (request.url.host, request.url.port, request.url.scheme) == ("127.0.0.1", 9000, "https")
+    assert request.headers["host"] == "203.0.113.5:9000"
+    assert sent("https://203.0.113.6:9000/health").url.host == "203.0.113.6"

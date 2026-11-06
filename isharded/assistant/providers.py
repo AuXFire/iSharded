@@ -465,6 +465,7 @@ class OpenAICompatible:
     """Any server with the OpenAI chat API."""
 
     kind = "openai"
+    streams_tool_calls = False  # a whole reply is the safe way to read most servers' calls
 
     def __init__(
         self,
@@ -601,7 +602,7 @@ class OpenAICompatible:
                 raise ProviderError(f"{self.name} went silent while answering") from None
             except httpx.HTTPError as error:
                 raise self._unreachable(error) from None
-        if native and self.tool_mode == "auto" and response.status_code in (400, 404, 422, 501):
+        if native and self.tool_mode == "auto" and response.status_code in NO_TOOLS_STATUSES:
             raise ToolsNotSupported
         if response.status_code != 200:
             raise self._failed(response)
@@ -631,7 +632,8 @@ class OpenAICompatible:
 
     def stream(self, request: ModelRequest, model: str) -> Iterator[str | ModelReply]:
         """Text as it comes, then the finished ModelReply last."""
-        if self._native(request):
+        native = self._native(request)
+        if native and not self.streams_tool_calls:
             # Native calls arrive in pieces. Only the finished reply can be parsed safely.
             reply = self.complete(request, model)
             if reply.text:
@@ -639,40 +641,55 @@ class OpenAICompatible:
             yield reply
             return
         started = time.perf_counter()
-        body = self._body(request, model, True, False)
+        body = self._body(request, model, True, native)
         parts: list[str] = []
+        streamed: dict[int, dict[str, str]] = {}
+        refused = False
         usage: dict[str, Any] = {}
         answered_by = model
         finished = False
         with self._client(self.read_seconds) as client:
             try:
                 with client.stream("POST", f"{self.base_url}/chat/completions", json=body, headers=self._headers()) as response:
-                    if response.status_code != 200:
+                    refused = native and self.tool_mode == "auto" and response.status_code in NO_TOOLS_STATUSES
+                    if response.status_code != 200 and not refused:
                         response.read()
                         raise self._failed(response)
-                    for event in self._events(response):
+                    for event in () if refused else self._events(response):
                         if event is None:
                             finished = True
                             break
                         answered_by = event.get("model") or answered_by
                         usage = event.get("usage") or usage
                         for choice in event.get("choices") or []:
-                            piece = (choice.get("delta") or {}).get("content")
+                            delta = choice.get("delta") or {}
+                            piece = delta.get("content")
                             if piece:
                                 parts.append(piece)
                                 yield piece
+                            for call in delta.get("tool_calls") or []:
+                                held = streamed.setdefault(int(call.get("index") or 0), {"id": "", "name": "", "arguments": ""})
+                                function = call.get("function") or {}
+                                held["id"] = call.get("id") or held["id"]
+                                held["name"] = function.get("name") or held["name"]
+                                held["arguments"] += function.get("arguments") or ""
                             finished = finished or bool(choice.get("finish_reason"))
             except httpx.TimeoutException:
                 raise ProviderError(f"{self.name} went silent for {self.read_seconds:.0f} s") from None
             except httpx.HTTPError as error:
                 raise self._unreachable(error, "dropped the connection") from None
+        if refused:
+            self.tool_mode = "prompt"  # this model has no tool calling of its own
+            yield from self.stream(request, model)
+            return
         if not finished:
             raise ProviderError(f"{self.name} stopped before finishing its reply")
         raw = "".join(parts)
         text, calls = parse_tool_calls(raw, request.tools)
+        native_calls = as_calls([streamed[index] for index in sorted(streamed)], frozenset(tool.name for tool in request.tools))
         yield ModelReply(
             text=text,
-            tool_calls=calls,
+            tool_calls=tuple(native_calls) or calls,
             model=str(answered_by),
             provider=self.name,
             prompt_tokens=int(usage.get("prompt_tokens") or sum(estimate_tokens(item["content"]) for item in body["messages"])),
@@ -717,6 +734,9 @@ class OpenAICompatible:
             raise ProviderError(f"{self.name} sent embeddings that could not be read") from None
 
 
+NO_TOOLS_STATUSES = (400, 404, 422, 501)
+
+
 class ToolsNotSupported(Exception):
     pass
 
@@ -724,19 +744,20 @@ class ToolsNotSupported(Exception):
 class MeshProvider(OpenAICompatible):
     """The owner's own pool.
 
-    Tools go in the prompt, which is what has been measured here, and not through
-    the mesh's own tool calling. A reply is always streamed, even when nobody is watching it: a pool
-    can take minutes over a reply, and only a stream can tell that from silence.
+    A reply is always streamed, even when nobody is watching it: a pool can take
+    minutes over a reply, and only a stream can tell that from silence. So tool calls
+    are read from the stream too.
     """
 
     kind = "mesh"
+    streams_tool_calls = True
 
     def __init__(self, name: str, base_url: str, key_env_or_file: str | None = None, reach: Reach = Reach.POOL, **options: Any) -> None:
-        options["tool_mode"] = "prompt"
+        options.setdefault("tool_mode", "auto")
         super().__init__(name, base_url, key_env_or_file, reach, **options)
 
     def _body(self, request: ModelRequest, model: str, stream: bool, native: bool) -> dict[str, Any]:
-        body = super()._body(request, model, stream, False)
+        body = super()._body(request, model, stream, native)
         body["enable_thinking"] = request.role in THINKING_ROLES
         return body
 
@@ -798,7 +819,7 @@ class Providers:
                 "INSERT INTO providers (name, kind, base_url, key_reference, reach, tool_mode, daily_tokens, read_seconds, model, added_at, added_by) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    name, "mesh" if mesh else "openai", root, key_reference(key), int(limit), "prompt" if mesh else tool_mode,
+                    name, "mesh" if mesh else "openai", root, key_reference(key), int(limit), tool_mode,
                     daily_tokens, read_seconds, model, self.assistant.clock(), by,
                 ),
             )
@@ -823,9 +844,7 @@ class Providers:
         if held and held[0] == fingerprint:
             return held[1]
         kind = MeshProvider if row["kind"] == "mesh" else OpenAICompatible
-        options = {"daily_tokens": row["daily_tokens"], "read_seconds": row["read_seconds"], "model": row["model"]}
-        if row["kind"] != "mesh":
-            options["tool_mode"] = row["tool_mode"]
+        options = {"daily_tokens": row["daily_tokens"], "read_seconds": row["read_seconds"], "model": row["model"], "tool_mode": row["tool_mode"]}
         provider = kind(row["name"], row["base_url"], row["key_reference"], Reach(row["reach"]), **options)
         self.cache[row["name"]] = (fingerprint, provider)
         return provider

@@ -8,6 +8,13 @@ It works on a closed network, a LAN, across VLANs, over Tailscale, or between re
 
 This is execution sharding, not simulated work distribution: each token really crosses every machine in the route. It is built to grow to many nodes. So far it has been tested on two machines, and [Scaling to many nodes](#scaling-to-many-nodes) separates what is proven from what comes next. Its security has been reviewed by AI only, not by a person. [Current limits](#current-limits) says what that means for you.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/dashboard-dark.png">
+  <img alt="The dashboard, on simulated data: a model's layers across six machines, pool metrics, the route's stages, and what needs attention." src="docs/screenshots/dashboard-light.png">
+</picture>
+
+*The dashboard, showing simulated data. [More of the console](#chat-page-and-dashboard).*
+
 ## Contents
 
 - [What it does](#what-it-does)
@@ -299,7 +306,7 @@ A node makes its own key and asks to join through any member. The owner approves
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/joining-dark.png">
-  <img alt="A node asks through any member, the owner signs the answer offline, and neither private key ever crosses the network." src="docs/diagrams/joining-light.png">
+  <img alt="A node asks through any member, the owner's machine signs the answer, and neither private key ever crosses the network." src="docs/diagrams/joining-light.png">
 </picture>
 
 Asking grants nothing. The new node's private key never leaves it, and the owner's key never touches the network, so a compromised node can't add a key or revoke a peer. Tickets prove a node's name without TLS, so antivirus that intercepts TLS can't break them. The link still needs Tailscale or another private network, because tickets don't encrypt anything. [iSharded security](docs/SECURITY.md) has the commands.
@@ -318,7 +325,7 @@ An owned network runs without a central server, but one person decides who belon
 | Who lets a node in? | The owner approves it | Each node decides: anyone, or nodes vouched for by those it already accepts |
 | Who removes a node? | The owner, for everyone | Nobody can. Each node blocks whoever it chooses, for itself |
 | Who picks the models? | The owner, or anyone with an admin key | Anyone can propose one beside what runs. Each node chooses what it hosts, and users pick from what's running |
-| What is still unsolved? | A member can read prompts and return wrong answers | The same, plus one person could run thousands of nodes |
+| What is still unsolved? | A member can read prompts. Wrong answers can be [caught](#checking-answers), not prevented | The same, plus one person could run thousands of nodes |
 
 See [A network nobody owns](#a-network-nobody-owns) to run one. To redraw these diagrams, run `python scripts/build_diagrams.py`.
 
@@ -354,11 +361,6 @@ None of this has been measured past two machines, so the first milestone is a re
 ### Chat page and dashboard
 
 Every node serves a chat page at `/chat` and a console at `/dashboard`. These screenshots show the real pages with simulated data, because no mesh this size has run yet. Each page shows what it does today, and none of these figures are measurements.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/dashboard-dark.png">
-  <img alt="The dashboard: the model's layers across machines, pool metrics, the route's stages, and what needs attention." src="docs/screenshots/dashboard-light.png">
-</picture>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/chat-dark.png">
@@ -416,6 +418,7 @@ If the connection to a node drops, retry against another node. Replies survive a
 | A GGUF file in a repo | `owner/repo:file.gguf` | Each worker fetches only its share |
 | A local GGUF path | `D:\models\file.gguf` | That machine, then peers read from it |
 | A bare GGUF file name | `file.gguf` | Whichever node holds it, with no internet needed |
+| A split GGUF, by any part | `owner/repo:Q6_K/model-00001-of-00004.gguf` | Each worker fetches only its share, from whichever parts hold it |
 | A local safetensors folder | `D:\models\qwen3-8b` | That machine. In a secured pool it must be in `--model-dir` |
 
 Loading a model replaces the main one. To run another beside it, see [Several models at once](#several-models-at-once). To see where a model would go without moving anything, use `POST /admin/plan`, or the picker on the chat page.
@@ -423,6 +426,11 @@ Loading a model replaces the main one. To run another beside it, see [Several mo
 Gated models need `HF_TOKEN` set on each worker.
 
 ### Several models at once
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/lanes-dark.png">
+  <img alt="Each node runs the main route's control plane and worker, and beside them a control plane and worker for each lane. A request names a model, and the front door passes it to that model's route." src="docs/diagrams/lanes-light.png">
+</picture>
 
 Load another model beside the main one by giving it a lane:
 
@@ -570,6 +578,7 @@ Starts a node with everything worked out, and is the easy way in. See [Quick sta
 | `--invite` | None | Join a mesh, with a code from `isharded invite` |
 | `--name` | This machine's name | This node's name |
 | `--port` | 8209 | Port for the chat page and API |
+| `--worker-port` | Nine below `--port` | This node's worker port, for clouds that hand out ports |
 | `--address` | Found for you | The address other nodes reach this one on |
 | `--tls` | Off on Tailscale | Use TLS even on Tailscale |
 | `--trusted-network` | Off | Skip TLS, because nobody else can read this network |
@@ -875,6 +884,7 @@ A flag takes priority over its variable.
 | `ISHARDED_STATE_FILE` | `--state-file` |
 | `ISHARDED_AUDIT_FILE` | `--audit-file` |
 | `ISHARDED_HOST`, `ISHARDED_PORT` | `--host`, `--port` |
+| `ISHARDED_OWN_ADDRESS` | Set by a node for its own services, so a request for its public address goes over loopback. Many networks will not loop a machine's public address back to it |
 | `ISHARDED_NODE_ID`, `ISHARDED_NODE_URL`, `ISHARDED_JOIN` | The control plane's `--node-id`, `--advertise-url`, `--join` |
 | `ISHARDED_WORKER_ID`, `ISHARDED_ORCHESTRATOR_URL`, `ISHARDED_ADVERTISE_URL` | The worker's `--worker-id`, `--orchestrator-url`, `--advertise-url` |
 | `ISHARDED_DEVICE`, `ISHARDED_ROLES`, `ISHARDED_CPU_THREADS` | `--device`, `--roles`, `--cpu-threads` |
@@ -1449,7 +1459,12 @@ Antivirus that scans HTTPS replaces certificates, which ends mutual TLS. Nodes r
 
 Any node in a route can return anything, and nothing in a reply proves otherwise. What can be measured is agreement: identical prompts, with no randomness, on routes built from different machines. They hold the same weights, so honest routes run together, and a broken or tampering one parts from them.
 
-Load the same model again on other machines, then ask:
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/checking-dark.png">
+  <img alt="The same questions go to three routes on separate nodes. Replies are compared in pairs, and the route out of line with the others is named along with its nodes." src="docs/diagrams/checking-light.png">
+</picture>
+
+The 100% and 1% on the picture are what was measured, as described below. Load the same model again on other machines, then ask:
 
 ```bash
 isharded load Qwen3-0.6B-Q8_0.gguf --lane check --lane-apart --url http://node-a:8209

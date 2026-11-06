@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .inventory import ram
+
 import httpx
 import psutil
 import torch
@@ -88,7 +90,7 @@ def _xpu_accelerator(index: int) -> Accelerator:
 
 
 def _mps_accelerator() -> Accelerator:
-    memory = psutil.virtual_memory()
+    memory = ram()
     return Accelerator(
         device="mps",
         kind="unified",
@@ -229,7 +231,7 @@ def live_free_bytes(pool: MemoryPool, cache_dir: Path) -> int:
     if pool.kind == "disk":
         return shutil.disk_usage(cache_dir).free
     if pool.kind == "ram" or pool.device == "mps":
-        return psutil.virtual_memory().available
+        return ram().available
     if pool.device.startswith("cuda:"):
         return torch.cuda.mem_get_info(int(pool.device.split(":", 1)[1]))[0]
     return pool.free_bytes
@@ -274,7 +276,7 @@ def build_pools(
             )
         )
 
-    memory = psutil.virtual_memory()
+    memory = ram()
     if ram_budget_bytes is None:
         ram_budget_bytes = 0 if accelerators else int(memory.available * AUTO_RAM_SHARE)
     if ram_budget_bytes > 0:

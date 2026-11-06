@@ -27,7 +27,7 @@ from starlette.background import BackgroundTask
 from . import __version__
 from .access import INVITE_FIELDS, load_authority, NeedsAuthority, node_of, ROLE_ADMIN, ROLE_MEMBER, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, Caller
 from .embedding import POOLED_TYPES, dimensions_problem, encoded, inputs_problem, length_problem, passes, shaped, smallest_dimensions
-from .gguf import GgufHeader, parse_source
+from .gguf import GgufHeader, parse_source, split_parts
 from . import audit
 from .discovery import start_beacon
 from .lanes import LaneDoor
@@ -61,7 +61,7 @@ from .pool import LOOPBACK, check_exposure, home as pool_home, load_token, read_
 from .serving import BodyLimit, ChunkedResponses, serve, where_everything_is
 from .mesh import clean_url
 from .tickets import PREFIX as TICKET_PREFIX, NodeTickets, TicketChecker, TicketIdentity, client_auth, make_checker, reply_audience
-from .tls import BEHALF, BEHALF_HEADER, FORWARD_MARK, INTERCEPTED, intercepted, PEER, client_verify
+from .tls import BEHALF, BEHALF_HEADER, FORWARD_MARK, INTERCEPTED, intercepted, PEER, client_verify, stay_on_this_machine_async
 from .tokenizer import ChatTokenizer, IncrementalText, load_tokenizer
 from .toolcalls import (
     MARKER_TOKENS,
@@ -209,7 +209,7 @@ class ModelTarget:
     @property
     def file_sizes(self) -> dict[str, int]:
         config = self.manifest.config
-        return {config["gguf_file"]: config["gguf_file_size"]} if "gguf_file" in config else {}
+        return config.get("gguf_parts") or ({config["gguf_file"]: config["gguf_file_size"]} if "gguf_file" in config else {})
 
     def source_for(self, worker_id: str) -> str:
         return self.worker_model_ids.get(worker_id, self.model_id)
@@ -339,7 +339,11 @@ def check_pooling(request: LoadModelRequest, adapter: Adapter) -> None:
 
 def holders_of(sources: dict[str, list[str]], model: str) -> list[str]:
     located = parse_source(model)
-    return sources.get(located[1], []) if located else []
+    if not located:
+        return []
+    # A node holding only some parts of a split file cannot serve the rest.
+    parts = split_parts(located[1])
+    return [holder for holder in sources.get(parts[0], []) if all(holder in sources.get(part, []) for part in parts)]
 
 
 def resolve_draft(
@@ -464,7 +468,7 @@ class Orchestrator:
         self.active_cache_url: str | None = None
         self.epoch = 0
         self.job: LoadJob | None = None
-        self.client = httpx.AsyncClient(timeout=httpx.Timeout(3600.0, connect=10.0), verify=client_verify(), auth=client_auth())
+        self.client = httpx.AsyncClient(event_hooks={"request": [stay_on_this_machine_async]}, timeout=httpx.Timeout(3600.0, connect=10.0), verify=client_verify(), auth=client_auth())
         authority = load_authority()
         self.access = AccessControl.load(
             self.pool_token,

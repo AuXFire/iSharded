@@ -1,11 +1,14 @@
 import asyncio
 import socket
+import sys
 import threading
 import time
 
 import httpx
+import pytest
 import uvicorn
 
+from isharded import serving
 from isharded.serving import NoDelayHTTPProtocol, set_nodelay
 
 
@@ -83,3 +86,53 @@ def test_a_body_limit_refuses_from_the_headers_alone():
         yield b"x"
 
     assert client.post("/small", content=chunks()).status_code == 411
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the Proactor loop is Windows only")
+@pytest.mark.parametrize("steady", [False, True])
+def test_a_failed_accept_does_not_close_the_listening_socket(steady) -> None:
+    """Without the fix this fails the way a live node did: alive, and deaf for good."""
+    import asyncio
+    from asyncio import windows_events
+    import socket as sockets
+
+    real = windows_events.IocpProactor.accept
+    failures = [OSError(64, "The specified network name is no longer available")]
+
+    def failing(self, listener):
+        if failures:
+            future = self._loop.create_future()
+            future.set_exception(failures.pop())
+            return future
+        return real(self, listener)
+
+    async def talk(port: int) -> bytes:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        answer = await asyncio.wait_for(reader.read(2), 5)
+        writer.close()
+        return answer
+
+    async def run() -> bytes | None:
+        async def greet(reader, writer):
+            writer.write(b"ok")
+            await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(greet, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            return await talk(port)
+        except (OSError, asyncio.TimeoutError):
+            return None
+        finally:
+            server.close()
+
+    windows_events.IocpProactor.accept = serving.steady_accept(failing) if steady else failing
+    loop = windows_events.ProactorEventLoop()
+    loop.set_exception_handler(lambda *_: None)
+    try:
+        answer = loop.run_until_complete(run())
+    finally:
+        windows_events.IocpProactor.accept = real
+        loop.close()
+    assert answer == (b"ok" if steady else None)

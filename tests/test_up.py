@@ -220,3 +220,11 @@ def test_up_waits_for_a_coordinator_and_a_worker_before_it_says_it_can_load() ->
     assert not up.can_load(reply(200, {"workers": {"a-cpu": {"live": False}}}))
     assert up.can_load(reply(200, {"workers": {"a-cpu": {"live": True}}}))
     assert up.can_load(reply(401))  # a key is only checked once a coordinator is known
+
+
+def test_a_node_behind_mapped_ports_can_name_both_of_them(tmp_path: Path) -> None:
+    settings = {"name": "a", "address": "203.0.113.5", "port": 22184, "worker_port": 22185, "tls": False, "trusted_network": True, "cpu_threads": 2, "no_gpu": True, "gpu_gb": None, "ram_gb": None, "gguf_dirs": [], "ownerless": False, "join": [], "discoverable": False}
+    arguments = up.node_arguments(settings, tmp_path)
+    assert (arguments.base_port, arguments.control_port) == (22185, 22184)
+    settings["worker_port"] = None
+    assert up.node_arguments(settings, tmp_path).base_port == 22175

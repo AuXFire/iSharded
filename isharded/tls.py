@@ -24,6 +24,25 @@ FORWARD_MARK = "x-isharded-forwarded"
 BEHALF_HEADER = "x-isharded-on-behalf"
 
 
+OWN_ADDRESS = "ISHARDED_OWN_ADDRESS"
+
+
+def stay_on_this_machine(request: Any) -> None:
+    """Send a request for this node's own public address over loopback.
+
+    Most NAT, cloud networks and home routers included, will not loop a machine's
+    public address back to it, so a worker could never reach the control plane
+    beside it. Certificates cover 127.0.0.1, and the Host header stays as it was.
+    """
+    own = os.getenv(OWN_ADDRESS)
+    if own and request.url.host == own:
+        request.url = request.url.copy_with(host="127.0.0.1")
+
+
+async def stay_on_this_machine_async(request: Any) -> None:
+    stay_on_this_machine(request)
+
+
 def client_verify() -> Any:
     """What internal clients trust, and who they say they are."""
     authority = os.getenv("ISHARDED_CA_FILE")
