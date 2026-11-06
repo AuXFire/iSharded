@@ -9,6 +9,7 @@ This module must not import torch, directly or through other ShardMesh modules.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import json
 from multiprocessing.connection import Client, Connection, Listener
 import mmap
@@ -27,6 +28,8 @@ from .llamacpp import LlamaError, LlamaLibrary, LlamaStage, StageLost, TokenEmbe
 KEY_VARIABLE = "SHARDMESH_STAGE_KEY"
 CONNECT_SECONDS = 60.0
 EXIT_SECONDS = 15.0
+# Encoded images kept for the next turn. A conversation resends its images every time.
+ENCODED_IMAGE_BYTES = 128 * 1024 * 1024
 
 
 class _Host:
@@ -39,6 +42,8 @@ class _Host:
         # One saved conversation per sequence.
         self.checkpoints: dict[int, tuple[str, np.ndarray]] = {}
         self.scratch = 1
+        self.projector: Any = None
+        self.encoded: OrderedDict[str, tuple[dict[str, Any], bytes]] = OrderedDict()
 
     def load(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
         self.library = LlamaLibrary.load(meta["folder"], tuple(meta["extra_paths"]))
@@ -53,6 +58,7 @@ class _Host:
             rollback_tokens=meta.get("rollback_tokens", 0),
             sequences=meta.get("slots", 1),
             map_file=meta.get("map_file", True),
+            embedding=meta.get("embedding", False),
         )
         table = meta.get("table")
         if table:
@@ -67,10 +73,19 @@ class _Host:
             raise LlamaError("this stage has no embedding table")
         return {}, self.embedding.rows(meta["tokens"]).tobytes()
 
+    def pool(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+        assert self.stage is not None and self.embedding is not None
+        inputs = meta["inputs"]
+        rows = self.embedding.rows([token for item in inputs for token in item])
+        pooled = self.stage.pool(rows, [len(item) for item in inputs])
+        return {"width": self.stage.output_width}, pooled.tobytes()
+
     def forward(self, meta: dict[str, Any], payload: bytes) -> tuple[dict[str, Any], bytes]:
         assert self.stage is not None
         hidden = np.frombuffer(payload, dtype=np.float32).reshape(-1, self.stage.hidden_size)
-        return {}, self.stage.forward(hidden, meta["position"], meta.get("slot", 0)).tobytes()
+        places = meta.get("places")
+        places = None if places is None else np.array(places, dtype=np.int32)
+        return {}, self.stage.forward(hidden, meta["position"], meta.get("slot", 0), places).tobytes()
 
     def forward_many(self, meta: dict[str, Any], payload: bytes) -> tuple[dict[str, Any], bytes]:
         assert self.stage is not None
@@ -129,6 +144,27 @@ class _Host:
         )
         self.scratch = meta.get("slots", 1)
         return {}, b""
+
+    def load_projector(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+        from .mtmd import Projector
+
+        self.library = LlamaLibrary.load(meta["folder"], tuple(meta["extra_paths"]))
+        self.projector = Projector(self.library, meta["projector"], meta["stage"], meta["width"], meta["threads"], meta["use_gpu"])
+        return {}, b""
+
+    def measure_image(self, _: dict[str, Any], payload: bytes) -> tuple[dict[str, Any], bytes]:
+        shape = self.projector.measure(payload)
+        return {"rows": shape.rows, "span": shape.span}, b""
+
+    def encode_image(self, meta: dict[str, Any], payload: bytes) -> tuple[dict[str, Any], bytes]:
+        digest = meta["digest"]
+        if digest not in self.encoded:
+            shape, rows = self.projector.encode(payload)
+            self.encoded[digest] = {"rows": shape.rows, "span": shape.span}, shape.places.tobytes() + rows.tobytes()
+        self.encoded.move_to_end(digest)
+        while len(self.encoded) > 1 and sum(len(data) for _, data in self.encoded.values()) > ENCODED_IMAGE_BYTES:
+            self.encoded.popitem(last=False)
+        return self.encoded[digest]
 
     def guess(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
         assert self.stage is not None

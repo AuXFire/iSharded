@@ -38,6 +38,11 @@ class GgufAdapter(Adapter):
         used = int(self.header.arch_key("expert_used_count") or 0)
         self.expert_active_fraction = used / self.num_experts if self.num_experts else 1.0
 
+    @property
+    def output_width(self) -> int:
+        """What an embedding model's vectors measure, which can differ from its hidden size."""
+        return int(self.header.arch_key("embedding_length_out") or self.header.hidden_size)
+
     def classify(self, name: str) -> tuple[str, int | None] | None:
         if name == "token_embd.weight":
             return "embed", None

@@ -231,6 +231,10 @@ class ConfigureRequest(BaseModel):
     merge_passes: bool = True
     # What this stage's units must hash to, when the model was loaded with hashes.
     unit_hashes: dict[str, str] = Field(default_factory=dict)
+    # Run the stage in llama.cpp's embedding mode, for /v1/embeddings.
+    embedding: bool = False
+    # The image projector, which only the entry worker loads.
+    projector: DraftModel | None = None
 
 
 class CacheRestoreRequest(BaseModel):
@@ -277,6 +281,10 @@ class LoadModelRequest(BaseModel):
     # From `shardmesh model hash`, run on a copy you trust. Every node then checks
     # every unit against it, so no peer or mirror has to be believed.
     model_hashes: dict[str, str] | None = None
+    # An embedding model: one stage, answering /v1/embeddings and not chat.
+    embedding: bool = False
+    # A projector GGUF for images, hosted on the entry stage.
+    mmproj: str | None = None
     # False returns as soon as the job starts; poll /admin/status for progress.
     wait: bool = True
 
@@ -304,6 +312,11 @@ class InferRequest(BaseModel):
     slot: int = 0
     save_checkpoint: str | None = None
     prefill_only: bool = False
+    # Images in this prompt, in base64, for the entry worker alone. Their rows are in
+    # ``input_ids`` as negative numbers. See vision.py.
+    images: list[str] = Field(default_factory=list)
+    # Where the sequence stands after this pass, for a pass holding image rows.
+    next_position: int | None = None
 
 
 class GenerateRequest(InferRequest):
@@ -331,9 +344,31 @@ class CompletionRequest(BaseModel):
     stop: str | list[str] | None = None
 
 
+class EmbeddingRequest(BaseModel):
+    model: str | None = None
+    input: str | list[str]
+    encoding_format: Literal["float", "base64"] = "float"
+    dimensions: int | None = Field(default=None, ge=1)
+    user: str | None = None  # OpenAI clients send this. Nothing here uses it.
+
+
+class EmbedPass(BaseModel):
+    """Inputs for one embedding pass, tokenized and packed by the control plane."""
+
+    epoch: int
+    inputs: list[list[int]]
+
+
+class ImagesMeasure(BaseModel):
+    """Ask the entry worker what images will cost, before they go in a prompt."""
+
+    epoch: int
+    images: list[str]
+
+
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: str | list[dict[str, Any]]
 
 
 class ChatCompletionRequest(BaseModel):
@@ -376,9 +411,12 @@ def decode_meta(value: str) -> dict[str, Any]:
     return json.loads(base64.urlsafe_b64decode(value.encode("ascii")))
 
 
-def encode_activation(tensor: torch.Tensor) -> bytes:
+def encode_activation(tensor: torch.Tensor, places: torch.Tensor | None = None) -> bytes:
     # Safetensors avoids accepting executable pickle data from another node.
-    return save_safetensors({"hidden": tensor.detach().contiguous().cpu()})
+    tensors = {"hidden": tensor.detach().contiguous().cpu()}
+    if places is not None:
+        tensors["places"] = places.contiguous()
+    return save_safetensors(tensors)
 
 
 def decode_activation(payload: bytes) -> torch.Tensor:
@@ -386,6 +424,18 @@ def decode_activation(payload: bytes) -> torch.Tensor:
     if set(tensors) != {"hidden"}:
         raise ValueError("activation payload must contain exactly one 'hidden' tensor")
     return tensors["hidden"]
+
+
+def decode_pass(payload: bytes) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """A stage's input, with the positions of a pass holding image rows.
+
+    Every stage applies M-RoPE in its own attention layers, so positions have to
+    travel with the rows. In the body, because a header could not hold many images.
+    """
+    tensors = load_safetensors(payload)
+    if not {"hidden"} <= set(tensors) <= {"hidden", "places"}:
+        raise ValueError("activation payload must hold a 'hidden' tensor and at most 'places' besides")
+    return tensors["hidden"], tensors.get("places")
 
 
 def encode_tensors(tensors: dict[str, torch.Tensor]) -> bytes:
@@ -404,4 +454,5 @@ class SessionState:
     epoch: int
     needs_reset: bool = True
     session_id: str = dataclass_field(default_factory=lambda: uuid.uuid4().hex)
+    images: list[str] = dataclass_field(default_factory=list)
 

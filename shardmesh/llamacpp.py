@@ -26,6 +26,8 @@ import zipfile
 import httpx
 import numpy as np
 
+from .embedding import PASS_SEQUENCES
+
 PINNED_BUILD = "b12119"
 RELEASE_URL = f"https://github.com/ggml-org/llama.cpp/releases/download/{PINNED_BUILD}/"
 # Release files for each platform and backend, with their published SHA-256.
@@ -174,6 +176,17 @@ class StageLost(LlamaError):
     def __init__(self, message: str, host: Any = None) -> None:
         super().__init__(message)
         self.host = host  # which process, since a reply can report one already replaced
+
+
+def sequence_pointers(owners: list[int]) -> tuple[Any, Any]:
+    """llama_batch wants a pointer per token. Keep both results alive through the pass."""
+    count = len(owners)
+    held = (C.c_int32 * count)(*owners)
+    width = C.sizeof(C.c_int32)
+    pointers = (C.POINTER(C.c_int32) * count)(
+        *[C.cast(C.addressof(held) + width * index, C.POINTER(C.c_int32)) for index in range(count)]
+    )
+    return held, pointers
 
 
 def filtered_distribution(logits: np.ndarray, temperature: float, top_p: float, top_k: int) -> tuple[np.ndarray, np.ndarray]:
@@ -442,8 +455,12 @@ class LlamaLibrary:
         lib.llama_state_seq_get_data.restype = C.c_size_t
         lib.llama_state_seq_set_data.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t, C.c_int32]
         lib.llama_state_seq_set_data.restype = C.c_size_t
+        lib.llama_get_embeddings_seq.argtypes = [C.c_void_p, C.c_int32]
+        lib.llama_get_embeddings_seq.restype = C.POINTER(C.c_float)
         lib.llama_model_n_embd.argtypes = [C.c_void_p]
         lib.llama_model_n_embd.restype = C.c_int32
+        lib.llama_model_n_embd_out.argtypes = [C.c_void_p]
+        lib.llama_model_n_embd_out.restype = C.c_int32
         lib.llama_model_n_layer.argtypes = [C.c_void_p]
         lib.llama_model_n_layer.restype = C.c_int32
         lib.llama_model_get_vocab.argtypes = [C.c_void_p]
@@ -490,6 +507,7 @@ class LlamaStage:
         sequences: int = 1,
         unified_cache: bool = False,
         map_file: bool = True,
+        embedding: bool = False,
     ) -> None:
         self.library = library
         self.last = last
@@ -532,6 +550,16 @@ class LlamaStage:
         context.n_threads_batch = threads
         context.no_perf = True
         context.kv_unified = unified_cache
+        if embedding:
+            # A sequence split across micro-batches would pool only its last part,
+            # so one micro-batch holds the longest input the context allows.
+            context.n_ctx = context.n_batch = context.n_ubatch = context_tokens
+            context.n_seq_max = PASS_SEQUENCES
+            context.kv_unified = True
+            context.embeddings = True
+            # Offloading would borrow the GPU for any pass of 32 rows or more, over
+            # 1 GiB of it at this batch size, on a node that gave this stage none.
+            context.op_offload = gpu_layers != 0
         if not last:
             context.cb_eval = C.cast(self._callback, C.c_void_p).value
         self.context = lib.llama_init_from_model(self.model, context)
@@ -539,6 +567,7 @@ class LlamaStage:
             lib.llama_model_free(self.model)
             raise LlamaError("llama.cpp could not create a context")
         self.memory = lib.llama_get_memory(self.context)
+        self.output_width = lib.llama_model_n_embd_out(self.model)
 
     def _on_eval(self, tensor: int, ask: bool, _: Any) -> bool:
         base = self.library.ggml_base
@@ -586,9 +615,12 @@ class LlamaStage:
         hidden: np.ndarray | None = None,
         tokens: np.ndarray | None = None,
         sequence_id: int = 0,
+        places: np.ndarray | None = None,
     ) -> None:
         steps = np.arange(position, position + count, dtype=np.int32)
-        if tokens is None:
+        if places is not None:
+            positions = np.ascontiguousarray(places, dtype=np.int32).reshape(-1)
+        elif tokens is None:
             # Embedding input reads every position section itself.
             positions = np.concatenate([steps, steps, steps, np.zeros(count, dtype=np.int32)])
         else:
@@ -662,14 +694,19 @@ class LlamaStage:
             lib.llama_memory_seq_rm(self.memory, scratch, -1, -1)
         return guesses
 
-    def forward(self, hidden: np.ndarray, position: int, slot: int = 0) -> np.ndarray:
-        """Run hidden states [tokens, width]. Returns hidden states, or the last row's logits."""
+    def forward(self, hidden: np.ndarray, position: int, slot: int = 0, places: np.ndarray | None = None) -> np.ndarray:
+        """Run hidden states [tokens, width]. Returns hidden states, or the last row's logits.
+
+        ``places`` gives every row's position by section, for rows that do not simply
+        follow ``position``, as an image's do not.
+        """
         hidden = np.ascontiguousarray(hidden, dtype=np.float32)
         pieces = []
         for start in range(0, hidden.shape[0], self.batch_tokens):
             chunk = hidden[start : start + self.batch_tokens]
+            part = None if places is None else places[:, start : start + self.batch_tokens]
             self._captured = None
-            self._decode(chunk.shape[0], position + start, not self.last, hidden=chunk, sequence_id=slot)
+            self._decode(chunk.shape[0], position + start, not self.last, hidden=chunk, sequence_id=slot, places=part)
             if not self.last:
                 if self._captured is None:
                     raise LlamaError("the stage output tensor was never produced")
@@ -690,11 +727,7 @@ class LlamaStage:
         steps = np.array(positions, dtype=np.int32)
         places = np.concatenate([steps, steps, steps, np.zeros(count, dtype=np.int32)])
         sequence_counts = np.ones(count, dtype=np.int32)
-        owners = (C.c_int32 * count)(*slots)
-        width = C.sizeof(C.c_int32)
-        sequence_ids = (C.POINTER(C.c_int32) * count)(
-            *[C.cast(C.addressof(owners) + width * index, C.POINTER(C.c_int32)) for index in range(count)]
-        )
+        owners, sequence_ids = sequence_pointers(slots)
         outputs = np.ones(count, dtype=np.int8)
         batch = Batch(
             n_tokens=count,
@@ -719,6 +752,41 @@ class LlamaStage:
         if rows.size != count * self.hidden_size:
             raise LlamaError("a merged pass did not produce one row per conversation")
         return rows.reshape(count, self.hidden_size)
+
+    def pool(self, hidden: np.ndarray, lengths: list[int]) -> np.ndarray:
+        """Pooled output for several inputs in one pass, each its own sequence.
+
+        Rows are the inputs laid end to end, and ``lengths`` says where each stops.
+        Pooling is what the GGUF declares, and nothing here normalizes it.
+        """
+        lib = self.library.llama
+        count = hidden.shape[0]
+        hidden = np.ascontiguousarray(hidden, dtype=np.float32)
+        steps = np.concatenate([np.arange(length, dtype=np.int32) for length in lengths])
+        places = np.concatenate([steps, steps, steps, np.zeros(count, dtype=np.int32)])
+        sequence_counts = np.ones(count, dtype=np.int32)
+        owners, sequence_ids = sequence_pointers(np.repeat(np.arange(len(lengths)), lengths).tolist())
+        outputs = np.ones(count, dtype=np.int8)
+        batch = Batch(
+            n_tokens=count,
+            token=None,
+            embd=hidden.ctypes.data,
+            pos=places.ctypes.data,
+            n_seq_id=sequence_counts.ctypes.data,
+            seq_id=C.cast(sequence_ids, C.c_void_p).value,
+            logits=outputs.ctypes.data,
+        )
+        lib.llama_memory_clear(self.memory, True)
+        status = lib.llama_decode(self.context, batch)
+        if status != 0:
+            raise LlamaError(f"llama_decode failed with status {status}")
+        pooled = np.empty((len(lengths), self.output_width), dtype=np.float32)
+        for sequence in range(len(lengths)):
+            pointer = lib.llama_get_embeddings_seq(self.context, sequence)
+            if not pointer:
+                raise LlamaError("llama.cpp produced no pooled output; this model may declare no pooling")
+            pooled[sequence] = np.ctypeslib.as_array(pointer, shape=(self.output_width,))
+        return pooled
 
     def close(self) -> None:
         lib = self.library.llama

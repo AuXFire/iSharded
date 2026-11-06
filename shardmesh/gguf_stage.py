@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
+import threading
 import time
 from typing import Any, Iterable
 
@@ -16,6 +17,7 @@ from .llama_host import StageHost
 from .llamacpp import LlamaError, StageLost
 from .models.gguf import GgufAdapter
 from .protocol import ConfigureRequest, MemoryPool, UnitPlacement
+from .vision import SECTIONS, EncodedImage, image_id
 from .weights import file_sha256, UnitCache, _read_unit_header, iter_unit_tensor, unit_tensor_span
 
 FAST_POOLS = {"vram", "unified"}
@@ -119,6 +121,7 @@ class GgufStage:
         self.first = assignment.start_layer == 0
         self.last = assignment.end_layer == adapter.num_layers
         self.width = adapter.header.hidden_size
+        self.embedding = request.embedding
         placements = assignment.placements
         units = [item.unit for item in placements if item.bytes]
         started = time.perf_counter()
@@ -127,6 +130,8 @@ class GgufStage:
         )
         self.assemble_seconds = time.perf_counter() - started
         uses_gpu = any(pools[item.pool_id].kind in FAST_POOLS for item in placements if item.pool_id in pools)
+        self.path = path
+        self.uses_gpu = uses_gpu
         table = None
         if self.first:
             holder = "embed" if "embed" in units else "head"
@@ -151,6 +156,7 @@ class GgufStage:
             "rollback_tokens": request.speculate_tokens,
             "slots": request.slots,
             "map_file": needs_mapping(placements, pools),
+            "embedding": request.embedding,
         }
         self.host = self._start()
 
@@ -172,10 +178,16 @@ class GgufStage:
         _, data = self.host.call("embed", tokens=tokens)
         return np.frombuffer(data, dtype=np.float32).reshape(-1, self.width)
 
-    def forward(self, hidden: np.ndarray, position: int, slot: int = 0) -> np.ndarray:
+    def pool(self, inputs: list[list[int]]) -> np.ndarray:
+        """One pooled vector per input, in one pass, as the model made them."""
+        answer, data = self.host.call("pool", inputs=inputs)
+        return np.frombuffer(data, dtype=np.float32).reshape(len(inputs), answer["width"])
+
+    def forward(self, hidden: np.ndarray, position: int, slot: int = 0, places: np.ndarray | None = None) -> np.ndarray:
         """Hidden states [tokens, width] in; hidden states out, or logits at the last stage."""
         payload = np.ascontiguousarray(hidden, dtype=np.float32).tobytes()
-        _, data = self.host.call("forward", payload, position=position, slot=slot)
+        where = {} if places is None else {"places": places.tolist()}
+        _, data = self.host.call("forward", payload, position=position, slot=slot, **where)
         output = np.frombuffer(data, dtype=np.float32)
         return output if self.last else output.reshape(-1, self.width)
 
@@ -200,6 +212,69 @@ class GgufStage:
 
     def clear(self, slot: int = 0) -> None:
         self.host.call("clear", slot=slot)
+
+    def close(self) -> None:
+        self.host.close()
+
+
+class ImageEncoder:
+    """A projector on the entry worker, in a process of its own.
+
+    An encode takes seconds, and the stage has other replies to serve meanwhile.
+    Images also come from strangers and native code decodes them, so one that
+    stops the decoder costs this process and nothing else.
+    """
+
+    def __init__(
+        self, folder: str, extra_paths: tuple[str, ...], stage: Path, projector: Path, width: int, threads: int, use_gpu: bool
+    ) -> None:
+        self.width = width
+        self._settings = {
+            "folder": folder,
+            "extra_paths": list(extra_paths),
+            "stage": str(stage),
+            "projector": str(projector),
+            "width": width,
+            "threads": threads,
+            "use_gpu": use_gpu,
+        }
+        self.lock = threading.Lock()
+        self.host = self._start()
+
+    def _start(self) -> StageHost:
+        host = StageHost()
+        try:
+            host.call("load_projector", **self._settings)
+        except LlamaError:
+            host.close()
+            raise
+        return host
+
+    def _restart(self) -> None:
+        self.host.close()
+        self.host = self._start()
+
+    def _ask(self, operation: str, image: bytes) -> tuple[dict[str, Any], bytes]:
+        with self.lock:
+            if self.host.process.poll() is not None:
+                self._restart()  # it was gone before this image arrived, so this one is not to blame
+            try:
+                return self.host.call(operation, image, digest=hashlib.sha256(image).hexdigest())
+            except StageLost as exc:
+                self._restart()
+                raise LlamaError("this image could not be read; it stopped the decoder") from exc
+
+    def measure(self, image: bytes) -> dict[str, int]:
+        """The rows and positions an image will take, without encoding it."""
+        return self._ask("measure_image", image)[0]
+
+    def encode(self, image: bytes) -> EncodedImage:
+        answer, data = self._ask("encode_image", image)
+        rows = answer["rows"]
+        split = rows * SECTIONS * 4
+        places = np.frombuffer(data[:split], dtype=np.int32).reshape(SECTIONS, rows)
+        vectors = np.frombuffer(data[split:], dtype=np.float32).reshape(rows, self.width)
+        return EncodedImage(image_id(image), answer["span"], places, vectors)
 
     def close(self) -> None:
         self.host.close()

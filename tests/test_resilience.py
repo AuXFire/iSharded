@@ -622,6 +622,7 @@ def test_corrupt_saved_state_is_survived(tmp_path, monkeypatch):
 class Target:
     model_id = "m"
     tokenizer = "tokenizer"
+    projector = None
 
 
 def adopting(monkeypatch, orchestrator):
@@ -989,7 +990,7 @@ def test_merged_passes_stay_off_unless_asked_for():
 
     from shardmesh.worker import WorkerRuntime
 
-    step = SimpleNamespace(verify=False, reset=False, prefill_only=False, save_checkpoint=None, restore_length=None)
+    step = SimpleNamespace(verify=False, reset=False, prefill_only=False, save_checkpoint=None, restore_length=None, next_position=None)
     hidden = torch.zeros(1, 1, 4)
     held = SimpleNamespace(merge_passes=False, gguf=object())
     assert not WorkerRuntime._can_merge(held, hidden, step)

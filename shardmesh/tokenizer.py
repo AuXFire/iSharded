@@ -70,14 +70,21 @@ class ChatTokenizer:
         chat_template: str | None,
         stop_token_ids: set[int],
         special_tokens: dict[str, str],
+        marks: tuple[list[int], list[int]] = ([], []),
     ) -> None:
         self.tokenizer = tokenizer
         self.chat_template = chat_template
         self.stop_token_ids = stop_token_ids
         self.special_tokens = special_tokens
+        self.marks = marks
 
     def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text, add_special_tokens=False).ids
+
+    def encode_input(self, text: str) -> list[int]:
+        """Tokens for an embedding model, with the marks its GGUF asks for around them."""
+        before, after = self.marks
+        return [*before, *self.encode(text), *after]
 
     def decode(self, ids: list[int]) -> str:
         return self.tokenizer.decode(ids, skip_special_tokens=True)
@@ -176,7 +183,17 @@ def tokenizer_from_gguf(header: GgufHeader) -> ChatTokenizer:
         label = {"padding": "pad", "unknown": "unk"}.get(name, name)
         if index is not None and int(index) < len(tokens):
             special[f"{label}_token"] = tokens[int(index)]
-    return ChatTokenizer(tokenizer, header.get("tokenizer.chat_template"), stops, special)
+    return ChatTokenizer(tokenizer, header.get("tokenizer.chat_template"), stops, special, gguf_marks(header))
+
+
+def gguf_marks(header: GgufHeader) -> tuple[list[int], list[int]]:
+    """What a GGUF asks to have around a text. Models that pool the last token need this."""
+
+    def mark(name: str) -> list[int]:
+        index = header.get(f"tokenizer.ggml.{name}_token_id")
+        return [int(index)] if header.get(f"tokenizer.ggml.add_{name}_token") and index is not None else []
+
+    return mark("bos"), mark("eos")
 
 
 def load_tokenizer(

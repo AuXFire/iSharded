@@ -33,9 +33,13 @@
       <div class="log" id="log" role="log" tabindex="0" aria-label="Conversation"><div class="column" id="turns"></div></div>
       <form class="composer" id="composer">
         <div class="column box">
+          <div class="attachments" id="attachments" hidden></div>
+          <p class="attach-note" id="attachNote" role="status" hidden></p>
           <label class="sr-only" for="prompt">Message</label>
           <textarea id="prompt" rows="1" placeholder="Message the model"></textarea>
           <div class="controls">
+            <button class="btn quiet small" id="attach" type="button" title="Attach an image for the model to look at" hidden>Add image</button>
+            <input class="sr-only" id="imageFile" type="file" accept="image/png,image/jpeg,image/gif,image/bmp" multiple tabindex="-1" aria-hidden="true" hidden>
             <label class="switch" title="Lets the model reason before it answers, on models that support it"><input type="checkbox" id="thinking"><i></i>Thinking</label>
             <label>Temperature <input class="num-input" type="number" id="temperature" min="0" max="2" step="0.1" value="0.7"></label>
             <label>Max tokens <input class="num-input" type="number" id="maxTokens" min="1" max="32768" step="1" value="1024"></label>
@@ -112,7 +116,9 @@
       set: (key, value) => { try { localStorage.setItem(key, value); } catch {} },
       drop: key => { try { localStorage.removeItem(key); } catch {} },
     };
-    const state = { approved: new Set(), token: store.get('shardmesh-token') || '', status: null, turns: [], streaming: false, abort: null, link: null, selected: '', previewTimer: null, previewId: 0, lastPulse: 0, failures: 0, signedOut: false, members: {}, catalog: null, catalogFailed: false };
+    // What one request can carry. A conversation resends its images on every turn.
+    const MOST_IMAGE_BYTES = 10 * 1024 * 1024;
+    const state = { attachments: [], approved: new Set(), token: store.get('shardmesh-token') || '', status: null, turns: [], streaming: false, abort: null, link: null, selected: '', previewTimer: null, previewId: 0, lastPulse: 0, failures: 0, signedOut: false, members: {}, catalog: null, catalogFailed: false };
     const TIER = { vram: 'VRAM', unified: 'Unified', ram: 'RAM', disk: 'Disk' };
     const TIER_ORDER = ['vram', 'unified', 'ram', 'disk'];
     const PHASE = { resolving: 'Reading the model\'s tensor list', fetching: 'Downloading each worker\'s shards', loading: 'Moving weights into memory' };
@@ -268,7 +274,7 @@
         return;
       }
       painted.delete(root);
-      root.innerHTML = state.turns.map(turn => turn.role === 'user' ? `<div class="turn user"><div>${esc(turn.text)}</div></div>` : `<div class="turn">${renderAnswer(turn)}</div>`).join('');
+      root.innerHTML = state.turns.map(turn => turn.role === 'user' ? `<div class="turn user"><div>${(turn.images || []).map(url => `<img class="turn-image" src="${esc(url)}" alt="An attached image">`).join('')}${esc(turn.text)}</div></div>` : `<div class="turn">${renderAnswer(turn)}</div>`).join('');
     }
     // While a reply streams, only its own block changes, so earlier turns keep any selection.
     function renderLastTurn(turn) {
@@ -297,10 +303,13 @@
       return new Promise(resolve => { $('move').addEventListener('close', () => resolve($('move').returnValue === 'yes'), { once: true }); });
     }
 
+    const messageContent = turn => turn.images?.length ? [...turn.images.map(url => ({ type: 'image_url', image_url: { url } })), ...(turn.text ? [{ type: 'text', text: turn.text }] : [])] : turn.text;
     async function send(text) {
-      const history = state.turns.filter(turn => !turn.error).map(turn => ({ role: turn.role, content: turn.role === 'assistant' ? splitReasoning(turn.text).answer : turn.text }));
-      history.push({ role: 'user', content: text });
-      state.turns.push({ role: 'user', text });
+      const images = state.attachments.map(item => item.url);
+      state.attachments = []; renderAttachments();
+      const history = state.turns.filter(turn => !turn.error).map(turn => ({ role: turn.role, content: turn.role === 'assistant' ? splitReasoning(turn.text).answer : messageContent(turn) }));
+      history.push({ role: 'user', content: messageContent({ text, images }) });
+      state.turns.push({ role: 'user', text, images });
       const turn = { role: 'assistant', text: '', pending: true };
       state.turns.push(turn);
       state.streaming = true; state.abort = new AbortController();
@@ -382,6 +391,44 @@
       button.classList.toggle('primary', !state.streaming);
       button.disabled = !state.streaming && !ready;
       $('prompt').placeholder = ready ? 'Message the model' : state.signedOut ? 'Sign in to start chatting' : 'Load a model to start chatting';
+      const sees = ready && chatSees();
+      $('attach').hidden = !sees;
+      if (!sees && state.attachments.length) { state.attachments = []; renderAttachments(); }
+    }
+    function chatSees() {
+      const status = state.status, pick = $('modelChoice');
+      const name = pick.hidden ? status?.model : pick.value;
+      return Boolean(name === status?.model ? status?.vision : (status?.lanes || []).find(lane => lane.model === name)?.vision);
+    }
+    function renderAttachments(note = '') {
+      const box = $('attachments');
+      box.hidden = !state.attachments.length;
+      box.innerHTML = state.attachments.map((item, index) => `<span class="attachment"><img src="${esc(item.url)}" alt="${esc(item.name)}"><button type="button" data-index="${index}" aria-label="Remove ${esc(item.name)}">&times;</button></span>`).join('');
+      $('attachNote').textContent = note;
+      $('attachNote').hidden = !note;
+    }
+    // A data URL is base64, which holds three bytes in every four characters.
+    const imageBytes = url => Math.floor(url.length * 3 / 4);
+    const imagesHeld = () => [...state.turns.flatMap(turn => turn.images || []), ...state.attachments.map(item => item.url)].reduce((total, url) => total + imageBytes(url), 0);
+    function readImage(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve({ name: file.name, url: reader.result });
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+      });
+    }
+    async function addImages(files) {
+      let note = '';
+      for (const file of files) {
+        if (!$('imageFile').accept.split(',').includes(file.type)) { note = `${file.name} is not a PNG, JPEG, GIF, or BMP.`; continue; }
+        try {
+          const item = await readImage(file);
+          if (imagesHeld() + imageBytes(item.url) > MOST_IMAGE_BYTES) { note = 'A conversation can hold 10 MiB of images, so this one was left out.'; continue; }
+          state.attachments.push(item);
+        } catch { note = `${file.name} could not be read.`; }
+      }
+      renderAttachments(note);
     }
 
     function tierOf(status, workerId, poolId) {
@@ -478,9 +525,10 @@
       $('modelLabel').textContent = choosing ? 'Load a model' : busy ? `Loading ${modelName(status.load_job?.model)}` : status.model && ready ? modelName(status.model) : 'Choose a model';
     }
     function renderChoice(status) {
-      const running = [status.status === 'ready' ? status.model : null, ...(status.lanes || []).filter(lane => lane.ready).map(lane => lane.model)].filter(Boolean);
+      const running = [status.status === 'ready' && status.kind !== 'embedding' ? status.model : null, ...(status.lanes || []).filter(lane => lane.ready && lane.kind !== 'embedding').map(lane => lane.model)].filter(Boolean);
       const pick = $('modelChoice');
-      pick.hidden = running.length < 2;
+      // Embedding models cannot chat, so a lone chat model beside one has to be named.
+      pick.hidden = running.length < 2 && !(running.length === 1 && status.kind === 'embedding');
       if (pick.dataset.running === running.join('|')) return;
       const chosen = pick.value;
       pick.dataset.running = running.join('|');
@@ -645,7 +693,7 @@
     $('picker').addEventListener('click', event => { if (event.target === $('picker')) $('picker').close(); });
     $('auth').addEventListener('close', () => { if (state.signedOut) renderTurns(); });
     $('railToggle').onclick = () => { const open = $('rail').classList.toggle('open'); $('railToggle').setAttribute('aria-expanded', String(open)); };
-    $('modelChoice').onchange = () => { if (state.status) renderRail(state.status); };
+    $('modelChoice').onchange = () => { if (state.status) { renderRail(state.status); syncComposer(); } };
     $('modelButton').onclick = () => openPicker();
     $('closePicker').onclick = () => $('picker').close();
     $('catalogSearch').oninput = renderCatalog;
@@ -660,7 +708,7 @@
         $('picker').close(); poll();
       } catch (error) { $('preview').innerHTML = `<span class="error">${esc(error.message)}</span>`; }
     };
-    $('newChat').onclick = () => { if (state.abort) state.abort.abort(); state.turns = []; renderTurns(); $('prompt').focus(); };
+    $('newChat').onclick = () => { if (state.abort) state.abort.abort(); state.turns = []; state.attachments = []; renderAttachments(); renderTurns(); $('prompt').focus(); };
     $('authForm').onsubmit = event => {
       event.preventDefault();
       const key = $('tokenInput').value.trim();
@@ -679,9 +727,15 @@
       event.preventDefault();
       if (state.streaming) { state.abort.abort(); return; }
       const text = $('prompt').value.trim();
-      if (!text || state.status?.status !== 'ready') return;
+      if ((!text && !state.attachments.length) || state.status?.status !== 'ready') return;
       $('prompt').value = ''; $('prompt').style.height = '';
       send(text);
+    };
+    $('attach').onclick = () => $('imageFile').click();
+    $('imageFile').onchange = event => { addImages([...event.target.files]); event.target.value = ''; };
+    $('attachments').onclick = event => {
+      const button = event.target.closest('button');
+      if (button) { state.attachments.splice(Number(button.dataset.index), 1); renderAttachments(); }
     };
     $('prompt').onkeydown = event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); $('composer').requestSubmit(); } };
     $('prompt').oninput = event => { const box = event.target; box.style.height = 'auto'; box.style.height = `${box.scrollHeight}px`; };

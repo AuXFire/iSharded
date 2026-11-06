@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import os
 import re
@@ -16,13 +17,15 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import numpy as np
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 from . import __version__
 from .access import INVITE_FIELDS, load_authority, NeedsAuthority, node_of, ROLE_ADMIN, ROLE_MEMBER, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, Caller
-from .gguf import parse_source
+from .embedding import POOLED_TYPES, dimensions_problem, encoded, inputs_problem, length_problem, passes, shaped, smallest_dimensions
+from .gguf import GgufHeader, parse_source
 from . import audit
 from .discovery import start_beacon
 from .lanes import LaneDoor
@@ -38,6 +41,7 @@ from .protocol import (
     ConfigureRequest,
     PROTOCOL_VERSION,
     DraftModel,
+    EmbeddingRequest,
     GenerateRequest,
     Heartbeat,
     InferRequest,
@@ -56,6 +60,7 @@ from .mesh import clean_url
 from .tickets import PREFIX as TICKET_PREFIX, NodeTickets, TicketChecker, TicketIdentity, client_auth, make_checker, reply_audience
 from .tls import BEHALF, BEHALF_HEADER, FORWARD_MARK, INTERCEPTED, intercepted, PEER, client_verify
 from .tokenizer import ChatTokenizer, IncrementalText, load_tokenizer
+from .vision import ImageRefused, chat_images, expand_prompt, image_id, projector_marker
 from .weights import apply_model_hashes, Manifest, WeightSourceError, build_manifest
 
 # Replans allowed when workers fail mid-load before the job gives up.
@@ -74,6 +79,11 @@ AUTO_DRAFTS = {
 # llama.cpp's compute buffers on a GPU, on top of weights and context.
 GGUF_STAGE_WORKSPACE_BYTES = 768 * 1024**2
 DRAFT_WORKSPACE_BYTES = 512 * 1024**2
+# The image encoder's process and buffers, beside its weights. With a 198 MiB
+# projector, it peaked at 887 MiB in all on a 3000 by 3000 image.
+PROJECTOR_WORKSPACE_BYTES = 768 * 1024**2
+# How long to wait for an entry worker to read a request's images.
+IMAGE_SECONDS = 120.0
 # How often the orchestrator looks at the pool when nothing is asking it to.
 MAINTENANCE_SECONDS = 10.0
 LOGGED_EVENTS = {"failure", "recovery", "mesh", "rebalance", "security"}
@@ -177,6 +187,9 @@ class ModelTarget:
     file_sources: list[str] = field(default_factory=list)
     slots: int = 1
     merge_passes: bool = True
+    embedding: bool = False
+    projector: DraftModel | None = None
+    image_marker: str | None = None
 
     @property
     def file_sizes(self) -> dict[str, int]:
@@ -241,9 +254,11 @@ def build_target(
     holders = holders_of(sources, control_source)
     manifest = build_manifest(control_source, request.revision, holders, token)
     adapter = create_adapter(manifest.config)
+    check_pooling(request, adapter)
     draft = resolve_draft(request, manifest, adapter, sources, token)
+    projector, image_marker = resolve_projector(request, adapter, sources, token)
     speculate_tokens = request.draft_tokens if draft else 0
-    slots = request.parallel if isinstance(adapter, GgufAdapter) else 1
+    slots = request.parallel if isinstance(adapter, GgufAdapter) and not request.embedding else 1
     units = adapter.partition(manifest.tensors)
     if request.model_hashes:
         apply_model_hashes(manifest, units, request.model_hashes)
@@ -263,7 +278,8 @@ def build_target(
         tied_embeddings=len(embedding) == 1 and embedding[0].name in head_tensors,
         amortize_tokens=AMORTIZE_TOKENS if reuse_cached else 0,
         stage_workspace_bytes=GGUF_STAGE_WORKSPACE_BYTES if isinstance(adapter, GgufAdapter) else 0,
-        entry_extra_bytes=draft.file_size + DRAFT_WORKSPACE_BYTES if draft else 0,
+        entry_extra_bytes=(draft.file_size + DRAFT_WORKSPACE_BYTES if draft else 0)
+        + (projector.file_size + PROJECTOR_WORKSPACE_BYTES if projector else 0),
         layer_step=max(getattr(adapter, "interval", 1), 1),
     )
     hosted_copy = manifest.revision.startswith("local-") and control_source != request.model_id
@@ -273,7 +289,7 @@ def build_target(
         adapter=adapter,
         units={unit.name: unit for unit in units},
         profile=profile,
-        spread=request.placement == "spread",
+        spread=request.placement == "spread" and not request.embedding,
         source_revision=request.revision if hosted_copy else manifest.revision,
         worker_model_ids=dict(request.worker_model_ids),
         entry_worker=request.entry_worker,
@@ -286,7 +302,24 @@ def build_target(
         file_sources=holders,
         slots=slots,
         merge_passes=request.merge_passes,
+        embedding=request.embedding,
+        projector=projector,
+        image_marker=image_marker,
     )
+
+
+def check_pooling(request: LoadModelRequest, adapter: Adapter) -> None:
+    """An embedding model has to be loaded as one, and nothing else can be.
+
+    A GGUF says how it pools. Left to chat, an embedding model only makes noise.
+    """
+    pooling = adapter.header.arch_key("pooling_type") if isinstance(adapter, GgufAdapter) else None
+    if request.embedding and not isinstance(adapter, GgufAdapter):
+        raise UnsupportedModel("embedding models run from GGUF files, and this is not one")
+    if request.embedding and pooling not in POOLED_TYPES:
+        raise UnsupportedModel(f"{request.model_id} declares no pooling, so it is not an embedding model; load it without --embedding")
+    if not request.embedding and pooling in POOLED_TYPES:
+        raise UnsupportedModel(f"{request.model_id} is an embedding model; load it with --embedding")
 
 
 def holders_of(sources: dict[str, list[str]], model: str) -> list[str]:
@@ -303,7 +336,9 @@ def resolve_draft(
 ) -> DraftModel | None:
     """Pick a draft model, or None. "auto" never fails a load; a named draft can."""
     named = request.draft_model not in {"auto", "none"}
-    if request.draft_model == "none" or not isinstance(adapter, GgufAdapter):
+    if request.embedding and named:
+        raise UnsupportedModel("an embedding model generates nothing, so it cannot use a draft model")
+    if request.draft_model == "none" or request.embedding or not isinstance(adapter, GgufAdapter):
         if named:
             raise UnsupportedModel("speculative decoding needs a GGUF model")
         return None
@@ -332,6 +367,44 @@ def resolve_draft(
     )
 
 
+def resolve_projector(
+    request: LoadModelRequest,
+    adapter: Adapter,
+    sources: dict[str, list[str]] | None = None,
+    token: str | None = None,
+) -> tuple[DraftModel | None, str | None]:
+    """The projector a load names, with the marker its chat template writes for an image."""
+    if not request.mmproj:
+        return None, None
+    if request.embedding or not isinstance(adapter, GgufAdapter):
+        raise UnsupportedModel("a projector goes with a GGUF chat model")
+    located = parse_source(request.mmproj)
+    if located is None:
+        raise UnsupportedModel(f"{request.mmproj} is not a GGUF file")
+    holders = holders_of(sources or {}, request.mmproj)
+    manifest = build_manifest(request.mmproj, "main", holders, token)
+    try:
+        marker = projector_marker(GgufHeader.from_skeleton(manifest.config["gguf"]), adapter.header.hidden_size, located[1])
+    except ImageRefused as exc:
+        raise UnsupportedModel(str(exc)) from exc
+    projector = DraftModel(
+        source=request.mmproj,
+        file=located[1],
+        file_size=manifest.config["gguf_file_size"],
+        revision=manifest.revision,
+        file_sources=holders,
+    )
+    return projector, marker
+
+
+def check_image_marker(target: ModelTarget) -> None:
+    """A template that never writes the marker would leave images with nowhere to go."""
+    tokenizer, marker = target.tokenizer, target.image_marker
+    assert tokenizer is not None and marker is not None
+    if marker not in (tokenizer.chat_template or "") or len(tokenizer.encode(marker)) != 1:
+        raise UnsupportedModel(f"this model's chat template has no {marker} for images, so {target.projector.file} cannot be used with it")
+
+
 def describe_plan(target: ModelTarget, route: list[StageAssignment]) -> dict[str, Any]:
     """Summarize a plan for people: what goes where, and what it will cost."""
     # Bandwidth alone flatters small active sets, such as a MoE's: every layer still
@@ -352,6 +425,8 @@ def describe_plan(target: ModelTarget, route: list[StageAssignment]) -> dict[str
         "experts": getattr(target.adapter, "num_experts", 0),
         "model_bytes": target.profile.total_bytes,
         "draft_model": target.draft.source if target.draft else None,
+        "embedding": target.embedding,
+        "mmproj": target.projector.source if target.projector else None,
         "download_bytes": download,
         "route": [stage.model_dump() for stage in route],
         "entry_worker": route[0].worker_id,
@@ -422,6 +497,7 @@ class Orchestrator:
         self.started_at = time.time()
         self.requests_total = 0
         self.tokens_generated = 0
+        self.embedding_tokens = 0
         self.recoveries_total = 0
         self.token_latency_ms_ema: float | None = None
         self.events: deque[dict[str, Any]] = deque(maxlen=40)
@@ -642,6 +718,8 @@ class Orchestrator:
         target.tokenizer = await asyncio.to_thread(
             load_tokenizer, source, request.revision, holders_of(sources, source), self.pool_token
         )
+        if target.projector is not None:
+            check_image_marker(target)
         return target
 
     async def _install(self, state: dict[str, Any]) -> None:
@@ -1006,13 +1084,18 @@ class Orchestrator:
                 if worker_id and worker_id not in available:
                     self.add_event("failure", f"{worker_id} is unavailable", f"Planning without its {role} pin")
                     pins[role] = None
-        return plan_placement(
+        route = plan_placement(
             self._with_holdings(preferred, target),
             self._with_holdings(standby, target),
             target.profile,
             spread=target.spread,
             **pins,
         )
+        if target.embedding and len(route) > 1:
+            # Pooling happens at the end of the model, in llama.cpp, for whole
+            # sequences, so a stage boundary has nothing correct to pass along.
+            raise PlacementError(f"{target.model_id} would take {len(route)} stages here, and an embedding model cannot be split; it needs one worker that can hold it all")
+        return route
 
     def _quarantine(self, worker_id: str, reason: str) -> None:
         record = self.workers.get(worker_id)
@@ -1135,6 +1218,8 @@ class Orchestrator:
                 term=self.mesh.term if self.mesh else 0,
                 slots=target.slots,
                 merge_passes=target.merge_passes,
+                embedding=target.embedding,
+                projector=target.projector,
                 unit_hashes={
                     item.unit: target.request.model_hashes[item.unit]
                     for item in stage.placements
@@ -1506,6 +1591,7 @@ class Orchestrator:
                 top_p=top_p,
                 top_k=top_k,
                 seed=seed,
+                images=session.images if must_replay else [],
             )
             entry = self.route[0]
             try:
@@ -1601,6 +1687,7 @@ class Orchestrator:
                 max_tokens=max_tokens - produced,
                 stop_token_ids=sorted(stops),
                 checkpoint_at=None if produced else boundary,
+                images=session.images,
             )
             started = time.perf_counter()
             failure: Any = None
@@ -1709,6 +1796,75 @@ class Orchestrator:
             return True
         return False
 
+    def model_kind(self) -> dict[str, Any]:
+        """What the model on this route is for, as /v1/models reports it."""
+        active = self.active
+        if active is not None and active.embedding:
+            assert isinstance(active.adapter, GgufAdapter)
+            return {"kind": "embedding", "vision": False, "dimensions": active.adapter.output_width}
+        return {"kind": "chat", "vision": bool(active and active.projector)}
+
+    async def ask_entry(self, path: str, payload: dict[str, Any], seconds: float) -> dict[str, Any]:
+        """One request to the entry worker, following the route through any failure.
+
+        The epoch goes in on each try, because a retry can land on a new route.
+        """
+        problem: Any = "no entry worker answered"
+        for _ in range(STREAM_ATTEMPTS):
+            await self.wait_for_route()
+            if not self.route:
+                raise HTTPException(status_code=409, detail="no active model pipeline")
+            entry, epoch = self.route[0], self.epoch
+            try:
+                response = await self.client.post(
+                    entry.url.rstrip("/") + path,
+                    json={**payload, "epoch": epoch},
+                    headers=auth_headers(self.pool_token),
+                    timeout=httpx.Timeout(seconds, connect=10.0),
+                )
+            except httpx.HTTPError as exc:
+                problem = {"failed_worker": entry.worker_id, "message": str(exc)}
+            else:
+                if response.is_success:
+                    return response.json()
+                if response.status_code in {400, 429}:
+                    raise HTTPException(status_code=response.status_code, detail=reply_detail(response))
+                problem = "epoch" if response.status_code == 409 else reply_detail(response)
+            if not await self._recover_stream(entry.worker_id, problem, epoch):
+                break
+        raise HTTPException(status_code=502, detail=f"the entry worker could not answer: {problem}")
+
+    async def place_images(self, tokens: list[int], boundary: int | None, images: list[bytes]) -> tuple[list[int], int | None]:
+        """Give each image in a prompt its rows, which only the entry worker can count."""
+        assert self.active is not None and self.active.image_marker is not None and self.tokenizer is not None
+        marker = self.tokenizer.encode(self.active.image_marker)[0]
+        if tokens.count(marker) != len(images):
+            raise HTTPException(status_code=400, detail=f"this prompt holds {tokens.count(marker)} image markers for {len(images)} images; take {self.active.image_marker} out of the text")
+        encoded = [base64.b64encode(data).decode("ascii") for data in images]
+        answer = await self.ask_entry("/internal/images/measure", {"images": encoded}, IMAGE_SECONDS)
+        sizes = [(image_id(data), int(item["rows"])) for data, item in zip(images, answer["images"])]
+        return expand_prompt(tokens, boundary, marker, sizes)
+
+    async def embed(self, texts: list[str], dimensions: int | None) -> tuple[list[np.ndarray], int]:
+        """A unit vector for each text, in order, and the tokens they cost."""
+        assert self.active is not None and self.tokenizer is not None
+        tokenizer = self.tokenizer
+        inputs = await asyncio.to_thread(lambda: [tokenizer.encode_input(text) for text in texts])
+        lengths = [len(tokens) for tokens in inputs]
+        problem = length_problem(lengths, self.active.profile.context_tokens)
+        if problem:
+            raise HTTPException(status_code=400, detail=problem)
+        self.requests_total += 1
+        vectors: list[np.ndarray] = [np.empty(0)] * len(inputs)
+        for group in passes(lengths):
+            pack = [inputs[index] for index in group]
+            answer = await self.ask_entry("/v1/embed", {"inputs": pack}, pass_seconds(sum(map(len, pack))))
+            rows = np.frombuffer(base64.b64decode(answer["vectors"]), dtype=np.float32).reshape(len(group), -1)
+            for index, row in zip(group, rows):
+                vectors[index] = shaped(row, dimensions)
+            self.embedding_tokens += sum(map(len, pack))
+        return vectors, sum(lengths)
+
     def metrics_text(self) -> str:
         """This node's numbers in Prometheus format. Every node reports for itself."""
         lines: list[str] = []
@@ -1722,6 +1878,7 @@ class Orchestrator:
 
         add("requests_total", self.requests_total, "Replies started on this node", "counter")
         add("tokens_generated_total", self.tokens_generated, "Tokens produced for this node's clients", "counter")
+        add("embedding_tokens_total", self.embedding_tokens, "Tokens embedded for this node's clients", "counter")
         add("stream_fallbacks_total", self.stream_fallbacks, "Replies that fell back to replay; should stay near zero", "counter")
         add("stage_errors_total", self.stage_errors, "Requests a stage refused; nobody is quarantined for these", "counter")
         add("recoveries_total", self.recoveries_total, "Pipeline repairs during a reply", "counter")
@@ -1792,6 +1949,7 @@ class Orchestrator:
         seed: int | None,
         stop: str | list[str] | None,
         history: str | None = None,
+        images: list[bytes] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Yield text as it is generated, then one final summary.
 
@@ -1807,9 +1965,12 @@ class Orchestrator:
             if not tokenizer.stop_token_ids:
                 raise HTTPException(status_code=400, detail="prompt must not be empty")
             prompt_tokens = [min(tokenizer.stop_token_ids)]
+        boundary = await asyncio.to_thread(self._history_boundary, prompt_tokens, history)
+        if images:
+            prompt_tokens, boundary = await self.place_images(prompt_tokens, boundary, images)
         max_tokens = self._fit_context(len(prompt_tokens), max_tokens)
         session = SessionState(tokens=list(prompt_tokens), epoch=self.epoch, needs_reset=True)
-        boundary = await asyncio.to_thread(self._history_boundary, prompt_tokens, history)
+        session.images = [base64.b64encode(data).decode("ascii") for data in images or []]
         markers = [marker for marker in ([stop] if isinstance(stop, str) else (stop or [])) if marker]
         holdback = max((len(marker) for marker in markers), default=1) - 1
         generated: list[int] = []
@@ -1877,10 +2038,11 @@ class Orchestrator:
         seed: int | None,
         stop: str | list[str] | None,
         history: str | None = None,
+        images: list[bytes] | None = None,
     ) -> tuple[str, int, int, str]:
         pieces: list[str] = []
         summary: dict[str, Any] = {}
-        async for item in self.stream_tokens(prompt, max_tokens, temperature, top_p, top_k, seed, stop, history):
+        async for item in self.stream_tokens(prompt, max_tokens, temperature, top_p, top_k, seed, stop, history, images):
             if "text" in item:
                 pieces.append(item["text"])
             else:
@@ -1999,6 +2161,7 @@ class Orchestrator:
             "ownerless": self.network_view(),
             "last_audit": self.last_audit,
             "model": self.model_id,
+            **self.model_kind(),
             "load_job": self.job.snapshot() if self.job else None,
             "active_plan": describe_plan(self.active, self.route) if self.active and self.route else None,
             "model_profile": (
@@ -2678,6 +2841,7 @@ async def lane_status(authorization: str | None = Header(default=None)) -> dict[
         "workers": sum(1 for record in runtime.workers.values() if record.live),
         "route": [{key: stage[key] for key in ("worker_id", "start_layer", "end_layer")} for stage in route],
         "load_job": runtime.job.snapshot() if runtime.job else None,
+        **runtime.model_kind(),
     }
 
 
@@ -2758,17 +2922,32 @@ async def node_inventory(authorization: str | None = Header(default=None)) -> di
 @app.get("/v1/models")
 async def models(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     verify_user(authorization)
-    names = [runtime.model_id] if runtime.model_id else []
-    names += [name for name in runtime.lanes.models() if name not in names]
-    return {"object": "list", "data": [{"id": name, "object": "model", "owned_by": "shardmesh"} for name in names]}
+    rows = {runtime.model_id: runtime.model_kind()} if runtime.model_id else {}
+    rows |= {name: kind for name, kind in runtime.lanes.model_kinds().items() if name not in rows}
+    return {"object": "list", "data": [{"id": name, "object": "model", "owned_by": "shardmesh", **kind} for name, kind in rows.items()]}
 
 
-async def check_request(model: str | None) -> None:
+async def check_request(model: str | None, embedding: bool = False) -> None:
     if model and runtime.model_id and model != runtime.model_id:
         raise HTTPException(status_code=404, detail=f"model {model!r} is not loaded")
     await runtime.wait_for_route()
     if not runtime.tokenizer or not runtime.route:
         raise HTTPException(status_code=409, detail="no model is ready; load one first")
+    runs_embeddings = bool(runtime.active and runtime.active.embedding)
+    if runs_embeddings and not embedding:
+        raise HTTPException(status_code=400, detail=f"{runtime.model_id} is an embedding model and cannot chat; send text to POST /v1/embeddings")
+    if embedding and not runs_embeddings:
+        others = [name for name, kind in runtime.lanes.model_kinds().items() if kind["kind"] == "embedding"]
+        hint = f"name one of these in model: {', '.join(others)}" if others else "load one with --embedding"
+        raise HTTPException(status_code=400, detail=f"{runtime.model_id} is a chat model and gives no embeddings; {hint}")
+
+
+def reply_detail(response: httpx.Response) -> Any:
+    """What a worker said went wrong, which may not be JSON if something between us answered."""
+    try:
+        return response.json().get("detail")
+    except (ValueError, AttributeError):
+        return f"HTTP {response.status_code}"
 
 
 def server_sent(payload: dict[str, Any] | str) -> str:
@@ -2809,6 +2988,36 @@ async def event_stream(
         # Headers are long gone, so the failure has to travel in the stream.
         yield server_sent({"error": {"message": str(exc.detail), "code": exc.status_code}})
     yield server_sent("[DONE]")
+
+
+@app.post("/v1/embeddings")
+async def embeddings(
+    body: EmbeddingRequest,
+    authorization: str | None = Header(default=None),
+) -> Any:
+    caller = verify_user(authorization)
+    lane = await runtime.lanes.locate(body.model)
+    if lane:
+        return await runtime.lanes.forward(lane, "/v1/embeddings", body.model_dump(exclude_none=True), caller)
+    await check_request(body.model, embedding=True)
+    assert runtime.active is not None
+    adapter = runtime.active.adapter
+    assert isinstance(adapter, GgufAdapter)
+    texts = [body.input] if isinstance(body.input, str) else body.input
+    names = (runtime.model_id, adapter.header.get("general.basename"), adapter.header.get("general.name"))
+    problem = inputs_problem(texts) or dimensions_problem(body.dimensions, adapter.output_width, smallest_dimensions(filter(None, names)))
+    if problem:
+        raise HTTPException(status_code=400, detail=problem)
+    vectors, tokens = await runtime.embed(texts, body.dimensions)
+    return {
+        "object": "list",
+        "data": [
+            {"object": "embedding", "index": index, "embedding": encoded(vector, body.encoding_format)}
+            for index, vector in enumerate(vectors)
+        ],
+        "model": runtime.model_id,
+        "usage": {"prompt_tokens": tokens, "total_tokens": tokens},
+    }
 
 
 @app.post("/v1/completions")
@@ -2865,11 +3074,16 @@ async def chat_completions(
     if lane:
         return await runtime.lanes.forward(lane, "/v1/chat/completions", body.model_dump(exclude_none=True), caller)
     await check_request(body.model)
-    messages = [message.model_dump() for message in body.messages]
+    try:
+        messages, images = chat_images([message.model_dump() for message in body.messages])
+    except ImageRefused as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if images and not (runtime.active and runtime.active.projector):
+        raise HTTPException(status_code=400, detail=f"{runtime.model_id} has no image projector, so it cannot see images; load it with --mmproj FILE")
     assert runtime.tokenizer is not None
     prompt = await asyncio.to_thread(runtime.tokenizer.render_chat, messages, body.enable_thinking)
     history = await asyncio.to_thread(runtime.tokenizer.render_chat, messages, body.enable_thinking, add_generation_prompt=False)
-    options = (body.max_tokens, body.temperature, body.top_p, body.top_k, body.seed, body.stop, history)
+    options = (body.max_tokens, body.temperature, body.top_p, body.top_k, body.seed, body.stop, history, images)
     identifier = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     if body.stream:
