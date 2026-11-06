@@ -323,6 +323,7 @@ def build_target(
         tied_embeddings=len(embedding) == 1 and embedding[0].name in head_tensors,
         amortize_tokens=AMORTIZE_TOKENS if reuse_cached else 0,
         stage_workspace_bytes=GGUF_STAGE_WORKSPACE_BYTES if isinstance(adapter, GgufAdapter) else 0,
+        ring=isinstance(adapter, GgufAdapter) and os.getenv("ISHARDED_RING", "1") != "0",
         entry_extra_bytes=(draft.file_size + DRAFT_WORKSPACE_BYTES if draft else 0)
         + (projector.file_size + PROJECTOR_WORKSPACE_BYTES if projector else 0),
         attention_interval=getattr(adapter, "interval", 0),
