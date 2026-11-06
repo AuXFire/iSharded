@@ -242,6 +242,8 @@ class EngineClient:
         self.reader = reader
         self.writer = writer
         self.waiting: dict[int, asyncio.Future[list[int]]] = {}
+        # What each slot has out. A pipeline can walk away from a pass, and a stage cannot.
+        self.out: dict[int, set[asyncio.Future[list[int]]]] = {}
         self.next_id = 1
         self.alive = True
         self.task: asyncio.Task[None] | None = None
@@ -307,19 +309,36 @@ class EngineClient:
             self.waiting.clear()
             self.writer.close()
 
-    async def run(self, deadline: float, **fields: Any) -> list[int]:
-        """Sends a pass and waits for its answer."""
+    def send(self, **fields: Any) -> asyncio.Future[list[int]]:
+        """Sends a pass and does not wait. The answer lands in the future, wanted or not."""
         if not self.alive:
             raise EngineRefusal(REFUSE_RETRY, 0, "the link to the engine closed")
         identity = self.next_id
         self.next_id += 1
         future: asyncio.Future[list[int]] = asyncio.get_running_loop().create_future()
         self.waiting[identity] = future
+        out = self.out.setdefault(fields["slot"], set())
+        out.add(future)
+        future.add_done_callback(lambda done: self._landed(out, done))
         self.writer.write(pass_frame(identity, **fields))
-        try:
-            return await asyncio.wait_for(future, deadline)
-        finally:
-            self.waiting.pop(identity, None)
+        return future
+
+    @staticmethod
+    def _landed(out: set[asyncio.Future[list[int]]], future: asyncio.Future[list[int]]) -> None:
+        out.discard(future)
+        if not future.cancelled():
+            future.exception()  # nobody may be waiting, and that is fine
+
+    async def run(self, deadline: float, **fields: Any) -> list[int]:
+        """Sends a pass and waits for its answer."""
+        return await asyncio.wait_for(self.send(**fields), deadline)
+
+    async def settled(self, slot: int, seconds: float) -> bool:
+        """Waits until nothing of this slot's is out, and says whether that happened."""
+        out = self.out.get(slot)
+        if out:
+            await asyncio.wait(set(out), timeout=seconds)
+        return not out
 
     def close(self) -> None:
         self.alive = False

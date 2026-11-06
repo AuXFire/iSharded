@@ -226,6 +226,8 @@ class ConfigureRequest(BaseModel):
     context_tokens: int = 4096
     # Guesses checked per pass, which every stage must be able to rewind.
     speculate_tokens: int = 0
+    # Whether stages can rewind past a pass that has finished. Recurrent state cannot.
+    rewinds: bool = False
     draft: DraftModel | None = None
     # Leadership generation. Workers refuse orders older than the newest they saw.
     term: int = 0

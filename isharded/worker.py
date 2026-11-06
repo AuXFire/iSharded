@@ -73,7 +73,21 @@ from .protocol import (
     encode_tensors,
 )
 from .gguf import parse_source
-from .gguf_stage import INITIAL_GUESSES, DraftChoice, DraftModel, GgufStage, ImageEncoder, PromptPlan, next_guess_count, plan_prompt
+from .gguf_stage import (
+    GUESSED,
+    INITIAL_GUESSES,
+    PIPELINE_STRETCH,
+    PIPELINED,
+    PLAIN,
+    DraftChoice,
+    DraftModel,
+    GgufStage,
+    ImageEncoder,
+    PromptPlan,
+    next_guess_count,
+    plan_prompt,
+)
+from .pipeline import Pipeline
 from . import __version__
 from .llamacpp import PINNED_BUILD, LlamaError, StageLost, ensure_build, pick_build, rocm_library_paths, step_random
 from .pool import check_exposure, load_token
@@ -362,8 +376,12 @@ class WorkerRuntime:
         self.draft: DraftModel | None = None
         self.encoder: ImageEncoder | None = None
         self.speculate_tokens = 0
+        self.rewinds = False
         self.draft_passes = 0
         self.draft_accepted = 0
+        self.pipeline_tokens = 0
+        self.pipeline_misses = 0
+        self.pipeline_depth = 0
         self.stage_restarts = 0
         self.draft_request: tuple[ConfigureRequest, str, int] | None = None
         # One conversation at a time per stage process. Requests from any node
@@ -631,6 +649,7 @@ class WorkerRuntime:
     def _load_draft(self, request: ConfigureRequest, folder: str, threads: int) -> None:
         """Speculation only speeds things up, so a draft that fails must not stop the load."""
         self.speculate_tokens = request.speculate_tokens
+        self.rewinds = request.rewinds
         if request.draft is None or request.assignment.start_layer != 0:
             return
         self.draft_request = (request, folder, threads)
@@ -1089,6 +1108,56 @@ class WorkerRuntime:
             and request.restore_length is None
             and request.next_position is None
         )
+
+    def ring_pipelines(self, request: InferRequest) -> bool:
+        """Whether this reply can keep several passes on the route.
+
+        A wrong guess is undone by rewinding past passes that have finished, which recurrent
+        state cannot do, and one stage has nothing to overlap with.
+        """
+        return self.rewinds and len(self.route) > 1 and self.ring_ready(request)
+
+    def ring_send(self, request: InferRequest, token: int, position: int, rollback_to: int | None) -> asyncio.Future[list[int]]:
+        """One pass along the ring, not waited for. Passes run in the order they are sent."""
+        assert self.ring_client is not None
+        entry = self.caches.get(request.session_id)
+        if entry is None or entry.epoch != request.epoch:
+            raise HTTPException(status_code=503, detail={"retry": True, "message": "this session's state is gone"})
+        entry.ring = True
+        entry.length = position + 1
+        self.inference_calls += 1
+        self.tokens_processed += 1
+        try:
+            return self.ring_client.send(
+                epoch=request.epoch,
+                slot=request.slot,
+                position=position,
+                rollback_to=rollback_to,
+                tokens=[token],
+                guesses=[],
+                verify=False,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                top_k=request.top_k,
+                seed=request.seed,
+            )
+        except EngineRefusal as refused:
+            raise self.ring_refused(refused) from refused
+
+    async def ring_answer(self, answer: asyncio.Future[list[int]]) -> int:
+        try:
+            return (await asyncio.wait_for(answer, pass_seconds(1, len(self.route))))[0]
+        except EngineRefusal as refused:
+            raise self.ring_refused(refused) from refused
+        except asyncio.TimeoutError as exc:
+            self.ring_live = False
+            raise HTTPException(status_code=503, detail={"retry": True, "message": "a pass did not come back"}) from exc
+
+    async def ring_settle(self, slot: int) -> None:
+        """Waits for a slot's passes, so none reaches a stage after the next reply has begun."""
+        client = self.ring_client
+        if client is not None and not await client.settled(slot, pass_seconds(1, len(self.route))):
+            self.ring_live = False
 
     def ring_refused(self, refused: EngineRefusal) -> HTTPException:
         """The error the HTTP path would have raised, so recovery is the same."""
@@ -1672,6 +1741,8 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
             "stages_kept": runtime.stages_kept,
             "draft_passes": runtime.draft_passes,
             "draft_tokens_per_pass": round(runtime.draft_accepted / runtime.draft_passes, 2) if runtime.draft_passes else None,
+            "pipeline": {"tokens": runtime.pipeline_tokens, "misses": runtime.pipeline_misses, "depth": runtime.pipeline_depth},
+            "draft_ways": {way: round(runtime.draft_choice.rate(way), 2) for way in runtime.draft_choice.seconds},
             "checkpoints_dropped": runtime.checkpoints_dropped,
             "cache": runtime.cache_report(),
             "phases_ms": runtime.phases,
@@ -2184,21 +2255,66 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             await runtime.replace_draft(exc)
             raise RuntimeError("the draft model was lost; replaying without it") from exc
         history = [*body.input_ids, token]
-        position = len(body.input_ids)
         produced = 1
         ahead = min(INITIAL_GUESSES, runtime.speculate_tokens)
+        following = request.model_copy(update={"reset": False, "restore_length": None, "checkpoint_key": None})
+
+        async def draft_guesses(text: list[int], count: int) -> list[int]:
+            started = time.perf_counter()
+            try:
+                guesses = await asyncio.to_thread(draft.guess, text, count, request.slot)
+            except LlamaError as exc:
+                await runtime.replace_draft(exc)
+                raise RuntimeError("the draft model was lost; replaying without it") from exc
+            runtime._record("draft", started)
+            return guesses
+
+        async def next_guess(text: list[int]) -> int:
+            return (await draft_guesses(text, 1))[0]
+
+        async def rewind_draft(keep: int) -> None:
+            try:
+                await asyncio.to_thread(draft.rewind, keep, request.slot)
+            except LlamaError as exc:
+                await runtime.replace_draft(exc)
+                raise RuntimeError("the draft model was lost; replaying without it") from exc
+
+        pipe: Pipeline | None = None
         while produced < body.max_tokens and token not in stops:
             room = body.max_tokens - produced
             began = time.perf_counter()
-            drafting = runtime.draft_choice.use_draft()
+            ways = [PIPELINED, GUESSED, PLAIN] if runtime.ring_pipelines(following) else [GUESSED, PLAIN]
+            way = runtime.draft_choice.pick(ways)
+            if way == PIPELINED:
+                if pipe is None:
+                    pipe = Pipeline(
+                        history,
+                        room,
+                        stops,
+                        len(runtime.route),
+                        runtime.speculate_tokens,
+                        send=lambda item, place, rollback: runtime.ring_send(following, item, place, rollback),
+                        wait=runtime.ring_answer,
+                        guess=next_guess,
+                        rewind=rewind_draft,
+                        sharing=lambda: runtime.gate.size - len(runtime.gate.free),
+                    )
+                made, misses = pipe.tokens_made, pipe.misses
+                async for token in pipe.tokens(PIPELINE_STRETCH):
+                    produced += 1
+                    yield token
+                runtime.pipeline_tokens += pipe.tokens_made - made
+                runtime.pipeline_misses += pipe.misses - misses
+                runtime.pipeline_depth = pipe.depth()
+                runtime.draft_choice.note(way, pipe.tokens_made - made, time.perf_counter() - began)
+                continue
+            if pipe is not None:
+                await pipe.land()
+                pipe = None
+            drafting = way == GUESSED
             if drafting:
-                started = time.perf_counter()
-                try:
-                    guesses = await asyncio.to_thread(draft.guess, history, min(ahead, room), request.slot)
-                except LlamaError as exc:
-                    await runtime.replace_draft(exc)
-                    raise RuntimeError("the draft model was lost; replaying without it") from exc
-                runtime._record("draft", started)
+                guesses = await draft_guesses(history, min(ahead, room))
+            position = len(history) - 1
             result = await step(
                 request.model_copy(
                     update={
@@ -2216,14 +2332,13 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
                 runtime.draft_passes += 1
                 runtime.draft_accepted += len(accepted)
                 ahead = next_guess_count(ahead, len(accepted) - 1, runtime.speculate_tokens)
-            runtime.draft_choice.note(drafting, len(accepted), time.perf_counter() - began)
+            runtime.draft_choice.note(way, len(accepted), time.perf_counter() - began)
             for token in accepted[:room]:
                 yield token
                 produced += 1
                 if token in stops:
                     return
             history.extend(accepted)
-            position += len(accepted)
 
     async def tokens() -> AsyncIterator[bytes]:
         request = InferRequest(**body.model_dump(exclude={"max_tokens", "stop_token_ids", "checkpoint_at", "cut_token", "images"}))
@@ -2285,8 +2400,11 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
                 runtime.state_misses += 1
             yield json.dumps({"error": failure}).encode() + b"\n"
         finally:
-            runtime.slot_used_at[slot] = time.monotonic()
-            await runtime.gate.release(slot)
+            try:
+                await runtime.ring_settle(slot)
+            finally:
+                runtime.slot_used_at[slot] = time.monotonic()
+                await runtime.gate.release(slot)
 
     return StreamingResponse(tokens(), media_type="application/x-ndjson")
 

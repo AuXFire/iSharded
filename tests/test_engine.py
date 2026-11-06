@@ -17,7 +17,7 @@ import pytest
 from isharded import engine as native
 from isharded import worker as worker_module
 from isharded.engine import EngineClient, EngineRefusal, find_library, library_name, pass_frame
-from isharded.gguf_stage import DRAFT_TRIAL_TOKENS, DraftChoice
+from isharded.gguf_stage import DRAFT_TRIAL_TOKENS, GUESSED, PIPELINED, PLAIN, DraftChoice
 from isharded.orchestrator import Orchestrator
 from isharded.protocol import InferRequest, StageAssignment
 
@@ -332,6 +332,32 @@ def test_a_refused_pass_raises_and_the_link_stays_up() -> None:
     assert asyncio.run(with_door(lambda identity: refusal(identity, native.REFUSE_STAGE_ERROR), use))
 
 
+def test_a_pass_nobody_waits_for_still_counts_until_it_lands() -> None:
+    held = asyncio.Event()
+
+    def answers(identity):
+        return answer(identity, [identity])
+
+    async def use(client):
+        first = client.send(**FIELDS)
+        second = client.send(**FIELDS)
+        assert await first == [1]
+        settled = await client.settled(0, 5)
+        held.set()
+        return settled, second.done(), client.out[0]
+
+    assert asyncio.run(with_door(answers, use)) == (True, True, set())
+    assert held.is_set()
+
+
+def test_settling_says_so_when_a_pass_never_lands() -> None:
+    async def use(client):
+        client.send(**FIELDS)
+        return await client.settled(0, 0.05), await client.settled(1, 0.05)
+
+    assert asyncio.run(with_door(lambda identity: b"", use)) == (False, True)
+
+
 def test_a_lost_link_fails_every_pass_in_flight_at_once() -> None:
     async def use(client):
         got = await asyncio.gather(*(client.run(5, **FIELDS) for _ in range(3)), return_exceptions=True)
@@ -369,37 +395,62 @@ def test_a_real_engine_refuses_a_stale_library_version_check(monkeypatch) -> Non
 
 def test_a_draft_that_loses_is_set_aside_and_tried_again_later() -> None:
     choice = DraftChoice()
-    assert choice.use_draft() is True  # each way gets a turn first
-    choice.note(True, 3, 0.15)  # 20 tokens/s
-    assert choice.use_draft() is False
-    choice.note(False, 1, 0.036)  # 28 tokens/s
+    ways = [GUESSED, PLAIN]
+    assert choice.pick(ways) == GUESSED  # each way gets a turn first
+    choice.note(GUESSED, 3, 0.15)  # 20 tokens/s
+    assert choice.pick(ways) == PLAIN
+    choice.note(PLAIN, 1, 0.036)  # 28 tokens/s
     tokens = 0
-    while not choice.use_draft():
-        choice.note(False, 1, 0.036)
+    while choice.pick(ways) == PLAIN:
+        choice.note(PLAIN, 1, 0.036)
         tokens += 1
     assert DRAFT_TRIAL_TOKENS - 8 <= tokens <= DRAFT_TRIAL_TOKENS  # time for a trial
-    choice.note(True, 3, 0.15)
-    assert choice.use_draft() is False  # it lost again, so back to the faster way
+    choice.note(GUESSED, 3, 0.15)
+    assert choice.pick(ways) == PLAIN  # it lost again, so back to the faster way
 
 
 def test_a_draft_that_wins_is_kept_and_a_change_in_the_route_can_turn_it_around() -> None:
     choice = DraftChoice()
-    choice.note(True, 3, 0.24)  # 12.5 tokens/s across countries
-    choice.note(False, 1, 0.102)  # 9.8 tokens/s
-    assert choice.use_draft() is True
+    ways = [GUESSED, PLAIN]
+    choice.note(GUESSED, 3, 0.24)  # 12.5 tokens/s across countries
+    choice.note(PLAIN, 1, 0.102)  # 9.8 tokens/s
+    assert choice.pick(ways) == GUESSED
     for _ in range(20):
-        choice.note(False, 1, 0.02)  # the slow link went away
-    assert choice.best() is False
+        choice.note(PLAIN, 1, 0.02)  # the slow link went away
+    assert choice.best(ways) == PLAIN
 
 
 def test_lucky_passes_do_not_flatter_a_draft() -> None:
     # Measured on one site: 2.3 tokens per 110 ms pass on average, against 36 ms per token.
     choice = DraftChoice()
     for tokens in [5, 1, 1, 5, 1, 1, 5, 1, 1, 2] * 4:
-        choice.note(True, tokens, 0.11)
+        choice.note(GUESSED, tokens, 0.11)
     for _ in range(40):
-        choice.note(False, 1, 0.036)
-    assert choice.best() is False
+        choice.note(PLAIN, 1, 0.036)
+    assert choice.best([GUESSED, PLAIN]) == PLAIN
+
+
+def test_trials_go_round_every_way_that_is_losing() -> None:
+    choice = DraftChoice()
+    ways = [PIPELINED, GUESSED, PLAIN]
+    choice.note(PIPELINED, 24, 0.5)
+    choice.note(GUESSED, 3, 0.15)
+    choice.note(PLAIN, 1, 0.036)
+    tried = []
+    for _ in range(2):
+        while (way := choice.pick(ways)) == PIPELINED:
+            choice.note(PIPELINED, 24, 0.5)
+        tried.append(way)
+        choice.note(way, 1, 0.1)
+    assert sorted(tried) == sorted([GUESSED, PLAIN])
+
+
+def test_a_way_that_cannot_run_is_never_picked() -> None:
+    choice = DraftChoice()
+    choice.note(PIPELINED, 24, 0.1)
+    choice.note(GUESSED, 3, 0.15)
+    choice.note(PLAIN, 1, 0.036)
+    assert choice.pick([GUESSED, PLAIN]) == PLAIN  # the ring went down
 
 
 def test_a_steady_link_costs_less_than_a_jittery_one_of_the_same_median() -> None:

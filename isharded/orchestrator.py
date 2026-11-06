@@ -226,6 +226,7 @@ class ModelTarget:
     serving: set[str] = field(default_factory=set)
     draft: DraftModel | None = None
     speculate_tokens: int = 0
+    rewinds: bool = False
     request: LoadModelRequest | None = None
     # Workers that hold the whole GGUF, for a pool that cannot reach a model host.
     file_sources: list[str] = field(default_factory=list)
@@ -344,6 +345,7 @@ def build_target(
         peer_fetch=peer_fetch,
         draft=draft,
         speculate_tokens=speculate_tokens,
+        rewinds=not any(adapter.recurrent_state_bytes(index) for index in range(adapter.num_layers)),
         request=request,
         file_sources=holders,
         slots=slots,
@@ -1483,6 +1485,7 @@ class Orchestrator:
                 cache_url=cache_url,
                 context_tokens=target.profile.context_tokens,
                 speculate_tokens=target.speculate_tokens,
+                rewinds=target.rewinds,
                 draft=target.draft,
                 term=self.mesh.term if self.mesh else 0,
                 slots=target.slots,

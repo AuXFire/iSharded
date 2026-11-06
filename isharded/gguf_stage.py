@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import threading
 import time
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 import numpy as np
 
@@ -23,6 +23,10 @@ from .weights import file_sha256, UnitCache, _read_unit_header, iter_unit_tensor
 
 FAST_POOLS = {"vram", "unified"}
 INITIAL_GUESSES = 3
+# Ways of making tokens once a draft is loaded. See DraftChoice.
+PIPELINED, GUESSED, PLAIN = "pipelined", "guessed", "plain"
+# How many tokens a pipeline runs before the choice is looked at again.
+PIPELINE_STRETCH = 24
 # How many tokens go by between trials of the slower way, and how fast its rate adapts.
 DRAFT_TRIAL_TOKENS = 96
 DRAFT_MEMORY = 0.9
@@ -387,31 +391,40 @@ class DraftChoice:
     Guessing is not always a win. On a mixture of experts each extra row reads more experts,
     so inside one site 4 rows cost about 3.4 times one row, and a draft ran at 70% of plain
     decoding. Across countries the network dominates, and the same draft ran 26% faster. So
-    this is measured and not configured, and the other way gets a short trial now and then,
+    this is measured and not configured, and the other ways get a short trial now and then,
     because a route or a reply can change which one wins.
     """
 
     # Recent tokens and seconds, kept apart. Averaging each pass's rate would overrate
     # guessing, because the passes where every guess landed would count like the rest.
-    tokens: dict[bool, float] = field(default_factory=lambda: {True: 0.0, False: 0.0})
-    seconds: dict[bool, float] = field(default_factory=lambda: {True: 0.0, False: 0.0})
+    tokens: dict[str, float] = field(default_factory=dict)
+    seconds: dict[str, float] = field(default_factory=dict)
+    # When each way last had a turn, so trials go round.
+    turns: dict[str, int] = field(default_factory=dict)
     since_trial: int = 0
 
-    def rate(self, drafted: bool) -> float:
-        return self.tokens[drafted] / self.seconds[drafted] if self.seconds[drafted] else 0.0
+    def rate(self, way: str) -> float:
+        return self.tokens[way] / self.seconds[way] if self.seconds.get(way) else 0.0
 
-    def best(self) -> bool:
-        return self.rate(True) >= self.rate(False)
+    def best(self, ways: Sequence[str]) -> str:
+        return max(ways, key=self.rate)
 
-    def use_draft(self) -> bool:
-        if not self.seconds[True] or not self.seconds[False]:
-            return not self.seconds[True]
-        return self.best() != (self.since_trial >= DRAFT_TRIAL_TOKENS)
+    def pick(self, ways: Sequence[str]) -> str:
+        """The way to make the next tokens. ``ways`` are what can run now, the likeliest first."""
+        for way in ways:
+            if not self.seconds.get(way):
+                return way
+        best = self.best(ways)
+        others = [way for way in ways if way != best]
+        if self.since_trial < DRAFT_TRIAL_TOKENS or not others:
+            return best
+        return min(others, key=lambda way: self.turns.get(way, 0))
 
-    def note(self, drafted: bool, tokens: int, seconds: float) -> None:
-        self.tokens[drafted] = self.tokens[drafted] * DRAFT_MEMORY + tokens
-        self.seconds[drafted] = self.seconds[drafted] * DRAFT_MEMORY + max(seconds, 1e-6)
-        self.since_trial = 0 if drafted != self.best() else self.since_trial + tokens
+    def note(self, way: str, tokens: int, seconds: float) -> None:
+        self.tokens[way] = self.tokens.get(way, 0.0) * DRAFT_MEMORY + tokens
+        self.seconds[way] = self.seconds.get(way, 0.0) * DRAFT_MEMORY + max(seconds, 1e-6)
+        self.turns[way] = max(self.turns.values(), default=0) + 1
+        self.since_trial = 0 if way != self.best(list(self.seconds)) else self.since_trial + tokens
 
 
 def next_guess_count(current: int, right: int, limit: int) -> int:
@@ -473,6 +486,20 @@ class DraftModel:
                 self._commit(prompt[self.committed[slot] : save.length], slot)
                 self.host.call("save", slot=slot, **save.model_dump())
         self._commit(prompt[self.committed[slot] :], slot)
+
+    def rewind(self, keep: int, slot: int = 0) -> None:
+        """Forget text from ``keep`` on, because the guesses it held did not land."""
+        if self.committed[slot] <= keep:
+            return
+        try:
+            self.host.call("truncate", keep=keep, slot=slot)
+            self.committed[slot] = keep
+        except StageLost:
+            raise
+        except LlamaError:
+            # A recurrent draft cannot go back. It reads the text again instead.
+            self.host.call("clear", slot=slot)
+            self.committed[slot] = 0
 
     def guess(self, history: list[int], count: int, slot: int = 0) -> list[int]:
         """Guess what follows ``history``, feeding it only the tokens it has not seen."""
