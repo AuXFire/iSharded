@@ -38,6 +38,7 @@ from .access import digest
 from .discovery import find_meshes
 from .inventory import ram
 from .node import add_node_arguments, detect_address, run_node
+from .tls import OWN_ADDRESS, stay_on_this_machine
 from .pool import _private_link, _write_private, add_node, approve_membership, home as pool_home, init_pool, request_membership, sign_entry
 
 DEFAULT_PORT = 8209
@@ -161,7 +162,7 @@ def matching_invite(invites: list[dict[str, Any]], item: dict[str, Any], clock: 
 
 def client_for(settings: dict[str, Any], home: Path) -> httpx.Client:
     verify: Any = str(home / "ca.pem") if settings.get("tls") else True
-    return httpx.Client(timeout=30.0, trust_env=False, verify=verify)
+    return httpx.Client(event_hooks={"request": [stay_on_this_machine]}, timeout=30.0, trust_env=False, verify=verify)
 
 
 def local_url(settings: dict[str, Any]) -> str:
@@ -214,7 +215,8 @@ def fetch_authority(invite: dict[str, Any]) -> tuple[str, str]:
     for url in invite["urls"]:
         try:
             # Nothing is trusted yet, so the connection proves nothing. The hash does.
-            answer = httpx.get(url + "/join/authority", timeout=15.0, verify=False, trust_env=False)
+            with httpx.Client(event_hooks={"request": [stay_on_this_machine]}, timeout=15.0, verify=False, trust_env=False) as client:
+                answer = client.get(url + "/join/authority")
             answer.raise_for_status()
             pem = answer.json()["authority"]
         except (httpx.HTTPError, ValueError, KeyError) as exc:
@@ -252,7 +254,7 @@ def join_mesh(home: Path, invite: dict[str, Any], name: str, address: str) -> st
     asking = {"request": request, "key_sha256": key_hash}
     if secret:
         asking["proof"] = invite_proof(secret, request, key_hash)
-    with httpx.Client(timeout=30.0, trust_env=False, verify=verify) as client:
+    with httpx.Client(event_hooks={"request": [stay_on_this_machine]}, timeout=30.0, trust_env=False, verify=verify) as client:
         answer = client.post(url + "/join/requests", json=asking)
         if answer.status_code != 200:
             raise ValueError(answer.text[:200])
@@ -470,6 +472,7 @@ def make_ownerless(home: Path, settings: dict[str, Any], joining: str, trust: li
 
 def become_member(home: Path, settings: dict[str, Any], invite: dict[str, Any]) -> None:
     settings["tls"] = any(url.startswith("https") for url in invite["urls"])
+    os.environ[OWN_ADDRESS] = settings["address"]  # a mesh reached through this machine's own address
     answered = join_mesh(home, invite, settings["name"], settings["address"])
     settings["join"] = list(dict.fromkeys([answered, *invite["urls"]]))
     write_settings(home, settings)

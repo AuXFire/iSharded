@@ -1605,7 +1605,7 @@ python -m pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-The last full run on Windows passed 3,462 tests and skipped 23, with real models for text, embeddings, and vision. From a clean clone on Linux, with the current FastAPI, 3,443 passed and 38 skipped.
+The last full run on Windows passed 3,474 tests and skipped 21, with real models for text, embeddings, and vision. From a clean clone on Linux, with the current FastAPI, 3,451 passed and 40 skipped.
 
 Adapter tests compare every family with the reference `transformers` implementation, and skip families newer than the installed release, so run them under a current `transformers` as well. TLS tests skip on a machine where antivirus intercepts loopback. `tests/test_readme.py` fails if an option, setting, endpoint, or metric is missing from this file, and `tests/test_assistant_docs.py` does the same for the assistant's guide. `tests/test_mcp.py` also tries the official `mcp` package when `ISHARDED_TEST_MCP_PYTHON` names a Python that has it, and uses port 9531.
 
