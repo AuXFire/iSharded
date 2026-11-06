@@ -214,6 +214,10 @@ class Commands:
     def grant_peer(self, name: str, capability: str) -> None:
         self.assistant.broker.allowed.add((self.federation.named(name).actor, capability))
 
+    def end_peer_grant(self, name: str, capability: str) -> None:
+        """As if the peer's grant had ended, leaving the offer in place."""
+        self.assistant.broker.allowed.discard((self.federation.named(name).actor, capability))
+
     def owner_decides(self, approval: str) -> None:
         self.assistant.broker.approved.add(self.assistant.broker.waiting[approval])
 
@@ -721,7 +725,7 @@ def test_a_peer_whose_grant_was_ended_is_stopped_by_the_broker(world):
     alice, bob, _ = world
     bob.grant("owner", "peer.send")
     alice.offer("bob", "plain.lookup")
-    alice.assistant.broker.allowed.clear()
+    alice.end_peer_grant("bob", "plain.lookup")
     alice.grant("owner", "plain.lookup")  # the owner's own grant must not cover the peer
     result = bob.ask("alice", "plain.lookup", {"query": "x"})
     assert result["data"]["status"] == "refused"
@@ -1331,7 +1335,7 @@ def test_the_commands_pair_two_real_installs(tmp_path):
 
         offer = shardmesh(one, "peer", "offer", "two", "models.complete", "--per-day", "5")
         assert offer.returncode == 0 and "models.complete (5/day)" in offer.stdout
-        assert "An offer is not a grant" in offer.stdout
+        assert "Granted to their user here" in offer.stdout and "to nobody else" in offer.stdout
         assert shardmesh(one, "peer", "offer", "two", "memory.search").returncode == 1
 
         ask = shardmesh(two, "peer", "ask", "one", "models.complete", "--text", "hello")

@@ -886,5 +886,9 @@ def test_a_command_tells_the_owner_what_to_do(tmp_path, capsys):
         assert run_command(bare, "skill", "evaluate", version.id) == 1
         assert "needs the router part" in capsys.readouterr().out
         assert run_command(bare, "skill", "reflect", "t") == 1
+        assert "There is no task t" in capsys.readouterr().out
+        engine, bare.tasks = bare.tasks, None
+        assert run_command(bare, "skill", "reflect", "t") == 1
         assert "needs the tasks part" in capsys.readouterr().out
+        bare.tasks = engine  # closing stops it
 
