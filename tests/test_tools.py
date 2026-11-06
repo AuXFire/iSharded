@@ -116,6 +116,7 @@ def mesh(monkeypatch):
         rendered = real_render(self, messages, *args, **options)
         if options.get("add_generation_prompt", True):
             state.prompt = rendered
+            state.thinking = args[0] if args else None
         return rendered
 
     node.token_stream = token_stream
@@ -503,6 +504,13 @@ def test_a_required_call_the_model_ruins_is_reported():
     assert calls == [] and "required a tool call" in words
 
 
+def test_a_named_choice_is_exactly_one_call_even_if_the_model_repeats_it():
+    choice = {"type": "function", "function": {"name": "get_weather"}}
+    twice = '<tool_call>{"name": "get_weather", "arguments": {"city": "A"}}</tool_call>\n<tool_call>{"name": "get_weather", "arguments": {"city": "A"}}</tool_call>'
+    assert scan("hermes", twice, choice=choice)[1] == [("get_weather", {"city": "A"})]
+    assert len(scan("hermes", twice, choice="required")[1]) == 2
+
+
 def test_named_choice_will_not_accept_another_tool():
     choice = {"type": "function", "function": {"name": "get_time"}}
     words, calls = scan("hermes", '<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>', tools=[WEATHER, OTHER], choice=choice)
@@ -692,6 +700,29 @@ def test_a_forced_call_is_written_after_the_template_prompt(mesh):
     assert choice["finish_reason"] == "tool_calls"
     assert tokens_before[0].endswith("<think>\n\n</think>\n\n<tool_call>\n<function=get_weather>\n")
     assert json.loads(choice["message"]["tool_calls"][0]["function"]["arguments"]) == {"city": "Paris"}
+
+
+@pytest.mark.parametrize("choice, expected", [("required", False), ({"type": "function", "function": {"name": "get_weather"}}, False), ("auto", True), (None, True)])
+def test_a_forced_call_tells_the_template_reasoning_is_over(mesh, choice, expected):
+    mesh.use(QWEN3, "ok")
+    ask(mesh, tools=[WEATHER], tool_choice=choice, enable_thinking=True)
+    assert mesh.thinking is expected
+
+
+def test_a_template_that_always_opens_reasoning_has_it_closed_for_a_forced_call(mesh):
+    template = "{% for tool in tools %}{{ tool | tojson }}{% endfor %}<tool_call>{% for m in messages %}{{ m.content }}{% endfor %}<assistant>{{ '<think>\\n' }}"
+    openings = []
+
+    async def spy(prompt, *args, **options):
+        openings.append(prompt)
+        yield {"text": ' {"city": "Paris"}}\n</tool_call>'}
+        yield {"finish_reason": "stop", "prompt_tokens": 1, "completion_tokens": 1, "time_to_first_token_ms": 1, "tokens_per_second": 1}
+
+    mesh.use(template)
+    mesh.node.stream_tokens = spy
+    choice = ask(mesh, tools=[WEATHER], tool_choice="required").json()["choices"][0]
+    assert openings[0].endswith('<think>\n\n</think>\n\n<tool_call>\n{"name": "get_weather", "arguments":')
+    assert choice["finish_reason"] == "tool_calls"
 
 
 def test_the_official_client_reads_both_kinds_of_reply(mesh):

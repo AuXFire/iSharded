@@ -2946,17 +2946,20 @@ async def chat_completions(
     try:
         plan = plan_tools(body.tools, body.tool_choice, body.parallel_tool_calls, runtime.tokenizer.tool_template)
         messages = template_messages(body.messages)
-        prompt, history = await asyncio.to_thread(render_prompts, runtime.tokenizer, messages, body.enable_thinking, plan.tools if plan else None)
+        # A forced call starts straight away. Told nothing, Qwen3 took one for its
+        # reasoning, closed that, and wrote the call a second time.
+        thinking = False if plan and plan.forced is not None else body.enable_thinking
+        prompt, history = await asyncio.to_thread(render_prompts, runtime.tokenizer, messages, thinking, plan.tools if plan else None)
     except ToolRequestError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     limit = reply_limit(body.max_tokens, body.max_completion_tokens, uses_tools(body.tools, body.messages))
     scanner = None
     if plan:
         opening = forced_opening(plan)
-        thinking = opens_in_thought(prompt)
-        # A forced call starts straight away, so reasoning that has begun is closed first.
-        prompt += ("\n</think>\n\n" if opening and thinking else "") + opening
-        scanner = ReplyScanner(plan, thinking and not opening, opening)
+        in_thought = opens_in_thought(prompt)
+        # Some templates open reasoning whatever they are told.
+        prompt += ("\n</think>\n\n" if opening and in_thought else "") + opening
+        scanner = ReplyScanner(plan, in_thought and not opening, opening)
     options = (limit, body.temperature, body.top_p, body.top_k, body.seed, body.stop, history)
     items = runtime.stream_tokens(prompt, *options, keep_markers=scanner is not None)
     if scanner:

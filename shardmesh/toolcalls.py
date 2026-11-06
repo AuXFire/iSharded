@@ -184,7 +184,8 @@ def plan_tools(
         schemas=schemas,
         required=tool_choice == "required",
         named=named,
-        single=parallel is False,
+        # OpenAI's named choice means exactly one call, and small models repeat a forced one.
+        single=parallel is False or named is not None,
         new_style="[ARGS]" in (template or ""),
         offered={named} if named else set(schemas),
     )
