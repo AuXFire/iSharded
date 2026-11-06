@@ -167,18 +167,21 @@ class LaneDoor:
         lane = clean_lanes(self.runtime.mesh.lanes).get(name)
         return lane_url(self.runtime.mesh.url, lane["slot"]) if lane else None
 
-    def _headers(self, caller: Any = None) -> dict[str, str]:
-        """Node to node, carrying who is asking the way forwarding does."""
+    def _sending(self, caller: Any, path: str, target: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """A POST from node to node, proving who is asking the way forwarding does.
+
+        The bytes are made here because the statement covers exactly those.
+        """
         from .tls import BEHALF_HEADER, FORWARD_MARK
 
         runtime = self.runtime
-        headers = {FORWARD_MARK: runtime.mesh.node_id}
+        content = b"" if payload is None else json.dumps(payload).encode()
+        headers = {FORWARD_MARK: runtime.mesh.node_id, "content-type": "application/json"}
         if runtime.access.authority is not None:
-            if caller is not None:
-                headers[BEHALF_HEADER] = f"{caller.role}:{caller.name}"
+            headers[BEHALF_HEADER] = runtime.speak_for(caller, target, "POST", path, content)
         elif runtime.pool_token:
             headers["Authorization"] = f"Bearer {runtime.pool_token}"
-        return headers
+        return {"content": content, "headers": headers}
 
     async def _look(self, name: str) -> None:
         url = self._sibling(name)
@@ -217,6 +220,16 @@ class LaneDoor:
         except httpx.HTTPError:
             pass
 
+    def _behind(self, name: str) -> bool:
+        """A new lane starts with an empty list, and cannot check anyone until it has one."""
+        return int(self.seen.get(name, {}).get("entries_held", 0)) < self.runtime.access.entries_held
+
+    async def _tell_lanes(self, names: list[str]) -> None:
+        document = json.dumps(self.runtime.access.document(), sort_keys=True, default=str)
+        changed = document != self.pushed_access
+        await asyncio.gather(*(self._share_access(name) for name in names if changed or self._behind(name)))
+        self.pushed_access = document
+
     async def run(self) -> None:
         while True:
             await asyncio.sleep(LANE_REFRESH_SECONDS)
@@ -226,10 +239,7 @@ class LaneDoor:
                 for gone in set(self.seen) - set(names):
                     self.seen.pop(gone, None)
                 await asyncio.gather(*(self._look(name) for name in names))
-                document = json.dumps(self.runtime.access.document(), sort_keys=True, default=str)
-                if document != self.pushed_access:
-                    await asyncio.gather(*(self._share_access(name) for name in names))
-                    self.pushed_access = document
+                await self._tell_lanes(names)
             except Exception as exc:  # noqa: BLE001 - lanes must not stop the main route's upkeep
                 self.runtime.add_event("failure", "Lane upkeep failed", str(exc)[:200])
 
@@ -263,14 +273,15 @@ class LaneDoor:
                 kinds[str(info["model"])] = {key: info[key] for key in ("kind", "vision", "dimensions") if key in info}
         return dict(sorted(kinds.items()))
 
-    def _target(self, name: str) -> str:
+    def _target(self, name: str) -> tuple[str, str]:
+        """Where to send a lane's work, and how a statement names that control plane."""
         info = self.seen.get(name, {})
         target = self._sibling(name) if info.get("ready") else info.get("leader_url")
         if not target:
             from fastapi import HTTPException
 
             raise HTTPException(status_code=503, detail=f"lane {name} has no coordinator yet; try again in a few seconds")
-        return str(target).rstrip("/")
+        return str(target).rstrip("/"), f"{self.runtime.mesh.node_id if info.get('ready') else info.get('leader')}/{name}"
 
     async def forward(self, name: str, path: str, payload: dict[str, Any], caller: Any) -> Any:
         """Relay a reply, streamed or not, exactly as the lane sends it."""
@@ -279,7 +290,8 @@ class LaneDoor:
         from starlette.responses import StreamingResponse
 
         client = self.runtime.client
-        request = client.build_request("POST", self._target(name) + path, json=payload, headers=self._headers(caller))
+        url, target = self._target(name)
+        request = client.build_request("POST", url + path, **self._sending(caller, path, target, payload))
         try:
             response = await client.send(request, stream=True)
         except httpx.HTTPError as exc:
@@ -307,8 +319,9 @@ class LaneDoor:
 
         for attempt in range(LANE_ASK_ATTEMPTS):
             try:
-                url = self._target(name) + "/v1/chat/completions"
-                response = await self.runtime.client.post(url, json=payload, headers=self._headers(caller), timeout=300.0)
+                url, target = self._target(name)
+                path = "/v1/chat/completions"
+                response = await self.runtime.client.post(url + path, timeout=300.0, **self._sending(caller, path, target, payload))
                 if response.status_code != 503:
                     response.raise_for_status()
                     return str(response.json()["choices"][0]["message"]["content"])
@@ -373,8 +386,9 @@ class LaneDoor:
                     break
                 raise RuntimeError(f"lane {name} started no workers in {LANE_WORKERS_WAIT_SECONDS:.0f} s")
             await asyncio.sleep(1.0)
-        url = str(self.seen[name]["leader_url"]).rstrip("/") + "/admin/load"
-        response = await self.runtime.client.post(url, json=payload, headers=self._headers(caller), timeout=60.0)
+        info = self.seen[name]
+        url = str(info["leader_url"]).rstrip("/") + "/admin/load"
+        response = await self.runtime.client.post(url, timeout=60.0, **self._sending(caller, "/admin/load", f"{info.get('leader')}/{name}", payload))
         if response.status_code >= 400:
             raise RuntimeError(response.text[:300])
 
@@ -420,7 +434,7 @@ class LaneDoor:
             if not target:
                 continue
             try:
-                await self.runtime.client.post(str(target).rstrip("/") + path, headers=self._headers(caller), timeout=30.0)
+                await self.runtime.client.post(str(target).rstrip("/") + path, timeout=30.0, **self._sending(caller, path, f"{info.get('leader')}/{name}"))
             except httpx.HTTPError as exc:
                 self.runtime.add_event("failure", "Lane did not take a change", f"{name}: {exc}")
 

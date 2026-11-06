@@ -20,6 +20,8 @@ from .assistant.cli import add_arguments as add_assistant_arguments, run as run_
 from .node import add_node_arguments, run_node
 from .up import add_arguments as add_up_arguments
 
+ASK_AGAIN_SECONDS = 600.0
+
 
 def wait_for(url: str, timeout: float = 60.0) -> None:
     deadline = time.monotonic() + timeout
@@ -318,6 +320,7 @@ def run_membership(args: argparse.Namespace) -> int:
             print("This pool has refused this node." if state == "refused" else "Too many nodes are waiting. Try again later.")
             return 1
         print(f"Asked to join as {args.name}. Tell the owner this key fingerprint: {answer.json()['fingerprint']}")
+        asked_at = time.monotonic()
         while args.wait:
             found = httpx.get(f"{url}/join/certificate/{args.name}", timeout=30, trust_env=False)
             if found.status_code == 200:
@@ -326,6 +329,9 @@ def run_membership(args: argparse.Namespace) -> int:
                 (folder / "ca.pem").write_text(found.json()["authority"], encoding="utf-8")
                 print(f"Approved. Start with --ca-file, --identity-cert, and --identity-key from {folder}.")
                 return 0
+            if time.monotonic() - asked_at > ASK_AGAIN_SECONDS:  # a request nobody answers expires
+                httpx.post(url + "/join/requests", json={"request": request}, timeout=30, trust_env=False)
+                asked_at = time.monotonic()
             time.sleep(5)
         return 0
     headers = {"Authorization": f"Bearer {args.token}"}
@@ -562,6 +568,7 @@ def main() -> None:
         return
     if args.command == "key":
         from .access import create_key, digest
+        from .statements import key_verifier
 
         if args.key_command == "remove":
             send_signed(args, {"type": "remove_key", "name": args.name})
@@ -569,7 +576,7 @@ def main() -> None:
             return
         if args.dir:
             key = "isk-" + secrets.token_urlsafe(32)
-            send_signed(args, {"type": "key", "name": args.name, "role": args.role, "sha256": digest(key), "requests_per_minute": args.requests_per_minute})
+            send_signed(args, {"type": "key", "name": args.name, "role": args.role, "sha256": digest(key), "requests_per_minute": args.requests_per_minute, "verifier": key_verifier(key)})
             print(f"Key for {args.name} ({args.role}). Save it now: it is stored only as a hash.")
             print(key)
             return

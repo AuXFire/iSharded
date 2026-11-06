@@ -1252,11 +1252,11 @@ async def lifespan(_: FastAPI):
         await runtime.close()
 
 
-app = FastAPI(title="iSharded worker", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="iSharded worker", version="0.2.0", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(TicketIdentity)
 app.add_middleware(
     BodyLimit,
-    large={"/internal/forward": MAX_STAGE_BYTES, "/internal/diag/echo": MAX_STAGE_BYTES},
+    paths={"/internal/forward": MAX_STAGE_BYTES, "/internal/diag/echo": MAX_STAGE_BYTES},
 )
 
 
