@@ -116,6 +116,10 @@ LINK_PROBE_SECONDS = 30.0
 UNREACHABLE_LINK_MS = 10_000.0
 # Replanning around a worker that is alive but failed may move this much at most.
 REPLAN_MOVE_LIMIT_BYTES = 2 * 1024**3
+# A restarted worker is back in seconds with its weights on disk, while moving them
+# takes minutes. Replacing a lost worker waits this long, if replacing it would move much.
+WORKER_RETURN_SECONDS = 75.0
+WORKER_RETURN_CHECK_SECONDS = 5.0
 # Healthy checks before a quarantined worker may return, doubling per offense.
 PROBATION_PASSES = 3
 MAX_PROBATION_PASSES = 48
@@ -1533,11 +1537,33 @@ class Orchestrator:
                 if record.live:
                     record.quarantined = False
                     record.quarantine_reason = None
+        else:
+            await self._await_lost_workers()
         self.job = LoadJob(job_id=uuid.uuid4().hex, model_id=self.active.model_id)
         return await self.run_job(
             self.job,
             self.deploy(self.active, self.job, generation_lock_held=generation_lock_held),
         )
+
+    async def _await_lost_workers(self) -> None:
+        """Give a lost worker time to come back, when replacing it would move many weights.
+
+        Nothing is lost by waiting, since the replies on this route would wait for the
+        move anyway. A worker that does not return is replaced as before.
+        """
+        deadline = time.monotonic() + WORKER_RETURN_SECONDS
+        assert self.active is not None
+        while self._absent_from_route() and time.monotonic() < deadline:
+            await self.refresh_holdings(self.active)
+            try:
+                moved = describe_plan(self.active, self.plan(self.active))["download_bytes"]
+            except PlacementError:
+                moved = None  # nothing could take the model without it
+            if moved is not None and moved <= REPLAN_MOVE_LIMIT_BYTES:
+                return
+            await asyncio.sleep(WORKER_RETURN_CHECK_SECONDS)
+            await self.refresh_worker_metrics()
+            self._review_quarantine()
 
     async def restore_session_from_cache(
         self,

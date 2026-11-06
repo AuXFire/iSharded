@@ -1199,3 +1199,54 @@ def test_a_stage_that_refuses_a_request_still_blames_the_request() -> None:
         asyncio.run(stage_answering(500, {"json": {"detail": "boom"}})())
     assert caught.value.status_code == 500
     assert "stage_error" in caught.value.detail
+
+
+def waiting_pool(monkeypatch, moved):
+    """A route with one worker lost, where replacing it would move this many bytes."""
+    from types import SimpleNamespace
+
+    from isharded import orchestrator as module
+
+    orchestrator = pool(one=record("one"), two=record("two", quarantined=True))
+    orchestrator.route = [SimpleNamespace(worker_id="one"), SimpleNamespace(worker_id="two")]
+    orchestrator.active = object()
+    monkeypatch.setattr(module, "WORKER_RETURN_CHECK_SECONDS", 0.01)
+    monkeypatch.setattr(module, "describe_plan", lambda target, route: {"download_bytes": moved})
+    monkeypatch.setattr(orchestrator, "plan", lambda target: [])
+
+    async def nothing(*args):
+        return None
+
+    monkeypatch.setattr(orchestrator, "refresh_holdings", nothing)
+    monkeypatch.setattr(orchestrator, "refresh_worker_metrics", nothing)
+    return orchestrator, module
+
+
+def test_a_big_move_waits_for_a_lost_worker_to_return(monkeypatch) -> None:
+    orchestrator, module = waiting_pool(monkeypatch, 40 * 1024**3)
+    checks = []
+
+    def review():
+        checks.append(1)
+        if len(checks) == 3:
+            orchestrator.workers["two"].quarantined = False
+
+    monkeypatch.setattr(orchestrator, "_review_quarantine", review)
+    asyncio.run(orchestrator._await_lost_workers())
+    assert len(checks) == 3
+    done(orchestrator)
+
+
+def test_a_worker_that_never_returns_is_replaced_after_a_while(monkeypatch) -> None:
+    orchestrator, module = waiting_pool(monkeypatch, 40 * 1024**3)
+    monkeypatch.setattr(module, "WORKER_RETURN_SECONDS", 0.05)
+    asyncio.run(orchestrator._await_lost_workers())
+    assert orchestrator.workers["two"].quarantined
+    done(orchestrator)
+
+
+def test_a_small_move_does_not_wait(monkeypatch) -> None:
+    orchestrator, module = waiting_pool(monkeypatch, 1024)
+    monkeypatch.setattr(orchestrator, "_review_quarantine", lambda: pytest.fail("it should not have waited"))
+    asyncio.run(orchestrator._await_lost_workers())
+    done(orchestrator)
