@@ -1447,7 +1447,7 @@ class FederationServer:
         import uvicorn
 
         app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-        app.include_router(routes(assistant))
+        app.router.routes.extend(routes(assistant).routes)
         self.server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning", access_log=False))
         self.thread = threading.Thread(target=self.server.run, name="federation-server", daemon=True)
         self.host = host

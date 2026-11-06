@@ -812,7 +812,9 @@ def failing_repository(folder: Path) -> Path:
     git(folder, "commit", "-m", "First")
     # A hook is code from the repository, and this one would run generated code outside the sandbox.
     marker = (folder / "hook-ran.txt").as_posix()
-    (folder / ".git" / "hooks" / "pre-commit").write_text(f"#!/bin/sh\necho ran > '{marker}'\n", encoding="utf-8", newline="\n")
+    hook = folder / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\necho ran > '{marker}'\n", encoding="utf-8", newline="\n")
+    hook.chmod(0o755)  # git skips a hook it cannot run
     return folder
 
 

@@ -165,7 +165,7 @@ def test_the_memory_limit_is_real(tmp_path):
 
 def test_a_program_that_is_missing_is_a_result_not_a_crash(sandbox, tmp_path):
     result = sandbox.run(["no-such-program-anywhere"], tmp_path)
-    assert result.exit_code == 127
+    assert result.exit_code in {126, 127}  # 126 if a folder on PATH cannot be read, as under WSL
     assert "no-such-program-anywhere" in result.stderr
 
 

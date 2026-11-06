@@ -278,7 +278,7 @@ def _has_make_tests(root: Path) -> bool:
 def detect_test_command(files: Sequence[str], root: Path) -> tuple[str, ...] | None:
     names = set(files)
     if names & {"pytest.ini", "tox.ini", "pyproject.toml", "setup.py", "setup.cfg"} or any(re.search(r"(^|/)test_[^/]+\.py$", path) for path in files):
-        return ("python", "-m", "pytest", "-q")
+        return ("python" if shutil.which("python") else "python3", "-m", "pytest", "-q")
     if "package.json" in names and _has_npm_tests(root):
         return ("npm", "test", "--silent")
     if "Cargo.toml" in names:

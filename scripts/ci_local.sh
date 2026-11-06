@@ -17,5 +17,6 @@ $pip install --quiet --upgrade pip
 $pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
 $pip install --quiet -e "$work/repo[test]"
 cd "$work/repo"
+export PATH="$work/venv/bin:$PATH"  # tests run python by name, as the assistant's coder does
 "$work/venv/bin/python" --version
 "$work/venv/bin/python" -m pytest tests -q --no-header --tb=short

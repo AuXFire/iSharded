@@ -484,6 +484,8 @@ class Plugins:
             raise PluginFailure(f"it would not start: {error}") from None
         if ran.timed_out:
             raise PluginFailure(f"it took longer than {spec['timeout']:g} seconds")
+        if ran.exit_code in {126, 127} and not ran.stdout:
+            raise PluginFailure(f"it would not start: the command could not be run, code {ran.exit_code}")
         try:
             reply = json.loads(ran.stdout)
         except ValueError:

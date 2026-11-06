@@ -992,7 +992,7 @@ The coder never deploys or restarts anything. That stays a person's decision.
 | `code push ID [--remote R]` | Pushes the run's branch. `--remote` is `origin` by default |
 | `code reject ID [--reason R]` | Discards the work |
 
-Test commands are detected from `pyproject.toml`, `pytest.ini`, `tox.ini`, `setup.py`, `setup.cfg`, or `test_*.py` files (`python -m pytest -q`), a real `test` script in `package.json` (`npm test --silent`), `Cargo.toml` (`cargo test --quiet`), `go.mod` (`go test ./...`), and a `test` target in a `Makefile` (`make test`).
+Test commands are detected from `pyproject.toml`, `pytest.ini`, `tox.ini`, `setup.py`, `setup.cfg`, or `test_*.py` files (`python -m pytest -q`, or `python3` where there is no `python`), a real `test` script in `package.json` (`npm test --silent`), `Cargo.toml` (`cargo test --quiet`), `go.mod` (`go test ./...`), and a `test` target in a `Makefile` (`make test`).
 
 ## Voice
 

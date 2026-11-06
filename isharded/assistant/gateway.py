@@ -584,7 +584,7 @@ def create_app(assistant: Any) -> FastAPI:
     def model_stats() -> dict[str, Any]:
         return {"stats": assistant.router.stats(), "routes": assistant.router.routes()}
 
-    app.include_router(api)
+    add_routes(app, api)
     include_parts(app, assistant)
 
     @app.exception_handler(MemoryNotFound)
@@ -630,6 +630,15 @@ def plain_error(status: int, error: Exception) -> JSONResponse:
     return JSONResponse({"detail": str(detail)}, status_code=status)
 
 
+def add_routes(app: Any, router: Any) -> None:
+    """Keep every path on the app itself.
+
+    Newer FastAPI holds an included router whole, so app.routes would stop listing its
+    paths, and include_parts could no longer see which are taken.
+    """
+    app.router.routes.extend(router.routes)
+
+
 def include_parts(app: Any, assistant: Any) -> None:
     """Add every part's routes. A path already taken keeps its first owner."""
     taken = {(path, method) for route in app.routes for path in [getattr(route, "path", "")] for method in getattr(route, "methods", None) or ()}
@@ -644,7 +653,7 @@ def include_parts(app: Any, assistant: Any) -> None:
             if clash:
                 router.routes.remove(route)
                 assistant.audit.record("gateway", "gateway.route_shadowed", route.path, {"part": name})
-        app.include_router(router)
+        add_routes(app, router)
 
 
 def page_response() -> HTMLResponse:

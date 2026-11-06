@@ -27,7 +27,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # transformers is only the reference that adapters are tested against.
-test = ["pytest>=8", "pytest-asyncio>=0.23", "transformers>=4.42", "cryptography>=42"]
+test = ["pytest>=8", "pytest-asyncio>=0.23", "transformers>=4.42", "cryptography>=42", "pypdf>=4"]
 # Kept so older install commands still work: cryptography is now always installed.
 
 [project.scripts]
