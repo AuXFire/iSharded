@@ -1,0 +1,527 @@
+//! Links between stages: one long-lived connection each way along the route.
+//!
+//! Each node makes a fresh key and certificate when it starts, and the coordinator tells
+//! the neighbours its fingerprint over the control plane, which is already authenticated.
+//! So a link needs no certificate authority, works in every pool mode, and is encrypted
+//! even on a network where the control plane is not. Once TLS is up, both ends prove they
+//! hold the route's key, so a stranger who reaches the port gets nothing.
+
+use std::io::{self, Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use parking_lot::Mutex;
+use ring::digest;
+use ring::hmac;
+use ring::rand::{SecureRandom, SystemRandom};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{ring as provider, verify_tls12_signature, verify_tls13_signature, WebPkiSupportedAlgorithms};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::{ClientConfig, ClientConnection, Connection, DigitallySignedStruct, ServerConfig, ServerConnection, SignatureScheme};
+
+use crate::wire::{self, Hello, Kind, Role, HEADER_BYTES, MAC_BYTES, NONCE_BYTES};
+
+/// How long a handshake may take. A peer that goes quiet in the middle holds nothing for long.
+const HANDSHAKE_SECONDS: u64 = 10;
+/// A frame's write must finish in this long, or the link is treated as dead.
+const WRITE_SECONDS: u64 = 15;
+/// The most a peer may send before proving it holds the key.
+const STRANGER_BYTES: usize = 256;
+const SERVER_LABEL: &[u8] = b"isharded link accept";
+const CLIENT_LABEL: &[u8] = b"isharded link dial";
+
+#[derive(Debug)]
+pub enum LinkError {
+    Closed,
+    Io(io::Error),
+    Tls(rustls::Error),
+    Wire(wire::WireError),
+    Refused(&'static str),
+}
+
+impl std::fmt::Display for LinkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LinkError::Closed => write!(f, "the link closed"),
+            LinkError::Io(error) => write!(f, "{error}"),
+            LinkError::Tls(error) => write!(f, "TLS: {error}"),
+            LinkError::Wire(error) => write!(f, "{error}"),
+            LinkError::Refused(why) => write!(f, "{why}"),
+        }
+    }
+}
+
+impl std::error::Error for LinkError {}
+
+impl From<io::Error> for LinkError {
+    fn from(error: io::Error) -> LinkError {
+        LinkError::Io(error)
+    }
+}
+
+impl From<rustls::Error> for LinkError {
+    fn from(error: rustls::Error) -> LinkError {
+        LinkError::Tls(error)
+    }
+}
+
+impl From<wire::WireError> for LinkError {
+    fn from(error: wire::WireError) -> LinkError {
+        LinkError::Wire(error)
+    }
+}
+
+pub fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut bytes = [0; N];
+    SystemRandom::new().fill(&mut bytes).expect("the system's random source works");
+    bytes
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// This process's key and certificate.
+pub struct Identity {
+    pub fingerprint: String,
+    server: Arc<ServerConfig>,
+}
+
+impl Identity {
+    pub fn generate() -> Result<Identity, String> {
+        let made = rcgen::generate_simple_self_signed(vec!["isharded".to_string()]).map_err(|error| error.to_string())?;
+        let certificate: CertificateDer<'static> = made.cert.der().clone();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(made.key_pair.serialize_der()));
+        let fingerprint = hex(digest::digest(&digest::SHA256, certificate.as_ref()).as_ref());
+        let server = ServerConfig::builder_with_provider(Arc::new(provider::default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|error| error.to_string())?
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate], key)
+            .map_err(|error| error.to_string())?;
+        Ok(Identity { fingerprint, server: Arc::new(server) })
+    }
+}
+
+/// Accepts exactly the certificate the coordinator named.
+#[derive(Debug)]
+struct Pinned {
+    fingerprint: String,
+    algorithms: WebPkiSupportedAlgorithms,
+}
+
+impl ServerCertVerifier for Pinned {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let seen = hex(digest::digest(&digest::SHA256, end_entity.as_ref()).as_ref());
+        if seen == self.fingerprint {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General("this is not the certificate the coordinator named".into()))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(message, certificate, signature, &self.algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(message, certificate, signature, &self.algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.algorithms.supported_schemes()
+    }
+}
+
+fn client_config(fingerprint: &str) -> Result<Arc<ClientConfig>, LinkError> {
+    let crypto = provider::default_provider();
+    let algorithms = crypto.signature_verification_algorithms;
+    let config = ClientConfig::builder_with_provider(Arc::new(crypto))
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(Pinned { fingerprint: fingerprint.to_string(), algorithms }))
+        .with_no_client_auth();
+    Ok(Arc::new(config))
+}
+
+/// One open, authenticated connection. Any thread may send; one thread reads.
+pub struct Link {
+    socket: TcpStream,
+    tls: Option<Mutex<Connection>>,
+    sending: Mutex<()>,
+    closed: AtomicBool,
+}
+
+impl Link {
+    fn new(socket: TcpStream, tls: Option<Connection>) -> Arc<Link> {
+        Arc::new(Link { socket, tls: tls.map(Mutex::new), sending: Mutex::new(()), closed: AtomicBool::new(false) })
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Stops the link and wakes whatever is reading from it.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        let _ = self.socket.shutdown(Shutdown::Both);
+    }
+
+    pub fn send(&self, frame: &[u8]) -> Result<(), LinkError> {
+        if self.is_closed() {
+            return Err(LinkError::Closed);
+        }
+        let _whole = self.sending.lock();
+        match &self.tls {
+            None => (&self.socket).write_all(frame)?,
+            Some(connection) => {
+                // Held while writing to the socket, so a stalled peer stalls this sender
+                // and nobody else. The write timeout turns that into a dead link.
+                let mut connection = connection.lock();
+                connection.writer().write_all(frame)?;
+                while connection.wants_write() {
+                    connection.write_tls(&mut &self.socket)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn reader(self: &Arc<Self>, limit: usize) -> Frames {
+        Frames { link: self.clone(), plain: Vec::with_capacity(1 << 16), start: 0, raw: vec![0; 1 << 16].into_boxed_slice(), limit }
+    }
+}
+
+/// Reads whole frames from a link.
+pub struct Frames {
+    link: Arc<Link>,
+    plain: Vec<u8>,
+    start: usize,
+    raw: Box<[u8]>,
+    limit: usize,
+}
+
+impl Frames {
+    pub fn set_limit(&mut self, limit: usize) {
+        self.limit = limit;
+    }
+
+    fn take_frame(&mut self) -> Result<Option<(Kind, Vec<u8>)>, LinkError> {
+        let have = self.plain.len() - self.start;
+        if have < HEADER_BYTES {
+            return Ok(None);
+        }
+        let mut header = [0; HEADER_BYTES];
+        header.copy_from_slice(&self.plain[self.start..self.start + HEADER_BYTES]);
+        let (kind, length) = wire::parse_header(&header)?;
+        if length > self.limit {
+            return Err(LinkError::Refused("a frame is larger than this link allows"));
+        }
+        if have < HEADER_BYTES + length {
+            return Ok(None);
+        }
+        let begin = self.start + HEADER_BYTES;
+        let body = self.plain[begin..begin + length].to_vec();
+        self.start = begin + length;
+        if self.start == self.plain.len() {
+            self.plain.clear();
+            self.start = 0;
+        } else if self.start > 1 << 20 {
+            self.plain.drain(..self.start);
+            self.start = 0;
+        }
+        Ok(Some((kind, body)))
+    }
+
+    /// Moves what TLS already holds into this reader. Data can arrive with the handshake's
+    /// last message, and then no socket read would ever announce it.
+    fn pull_held(&mut self) -> Result<bool, LinkError> {
+        let Some(connection) = &self.link.tls else {
+            return Ok(false);
+        };
+        let mut connection = connection.lock();
+        let ready = connection.process_new_packets()?.plaintext_bytes_to_read();
+        if ready > 0 {
+            let end = self.plain.len();
+            self.plain.resize(end + ready, 0);
+            connection.reader().read_exact(&mut self.plain[end..])?;
+        }
+        Ok(ready > 0)
+    }
+
+    /// Blocks until a whole frame has arrived.
+    pub fn next(&mut self) -> Result<(Kind, Vec<u8>), LinkError> {
+        loop {
+            if let Some(frame) = self.take_frame()? {
+                return Ok(frame);
+            }
+            if self.pull_held()? {
+                continue;
+            }
+            let count = (&self.link.socket).read(&mut self.raw)?;
+            if count == 0 {
+                return Err(LinkError::Closed);
+            }
+            match &self.link.tls {
+                None => self.plain.extend_from_slice(&self.raw[..count]),
+                Some(connection) => {
+                    let mut connection = connection.lock();
+                    let mut left = &self.raw[..count];
+                    while !left.is_empty() {
+                        connection.read_tls(&mut left)?;
+                        let state = connection.process_new_packets()?;
+                        let ready = state.plaintext_bytes_to_read();
+                        if ready > 0 {
+                            let end = self.plain.len();
+                            self.plain.resize(end + ready, 0);
+                            connection.reader().read_exact(&mut self.plain[end..])?;
+                        }
+                        if state.peer_has_closed() {
+                            return Err(LinkError::Closed);
+                        }
+                    }
+                    while connection.wants_write() {
+                        connection.write_tls(&mut &self.link.socket)?;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn proof(key: &[u8], label: &[u8], hello: &Hello, nonce: &[u8; NONCE_BYTES], fingerprint: &str) -> [u8; MAC_BYTES] {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, key);
+    let mut context = hmac::Context::with_key(&key);
+    context.update(label);
+    context.update(&[hello.role as u8]);
+    context.update(&hello.epoch.to_le_bytes());
+    context.update(&hello.nonce);
+    context.update(nonce);
+    // Tying the proof to the certificate stops a relay passing it on over another channel.
+    context.update(fingerprint.as_bytes());
+    let mut mac = [0; MAC_BYTES];
+    mac.copy_from_slice(context.sign().as_ref());
+    mac
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len() && left.iter().zip(right).fold(0u8, |sum, (a, b)| sum | (a ^ b)) == 0
+}
+
+fn prepare(socket: &TcpStream) -> Result<(), LinkError> {
+    socket.set_nodelay(true)?;
+    socket.set_write_timeout(Some(Duration::from_secs(WRITE_SECONDS)))?;
+    socket.set_read_timeout(Some(Duration::from_secs(HANDSHAKE_SECONDS)))?;
+    Ok(())
+}
+
+fn resolve(address: &str) -> Result<SocketAddr, LinkError> {
+    address.to_socket_addrs()?.next().ok_or(LinkError::Refused("the address resolved to nothing"))
+}
+
+/// Opens a link to another node, proving this end holds `key`.
+pub fn dial(address: &str, fingerprint: Option<&str>, key: &[u8], role: Role, epoch: u64, timeout: Duration) -> Result<Arc<Link>, LinkError> {
+    let mut socket = TcpStream::connect_timeout(&resolve(address)?, timeout)?;
+    prepare(&socket)?;
+    let tls = match fingerprint {
+        None => None,
+        Some(fingerprint) => {
+            let name = ServerName::try_from("isharded").map_err(|_| LinkError::Refused("bad server name"))?;
+            let mut connection = ClientConnection::new(client_config(fingerprint)?, name)?;
+            while connection.is_handshaking() {
+                connection.complete_io(&mut socket)?;
+            }
+            Some(Connection::Client(connection))
+        }
+    };
+    let link = Link::new(socket, tls);
+    let hello = Hello { role, epoch, nonce: random_bytes() };
+    link.send(&hello.encode())?;
+    let mut frames = link.reader(STRANGER_BYTES);
+    let (kind, body) = frames.next()?;
+    if kind != Kind::HelloOk {
+        return Err(LinkError::Refused("the other node did not greet this one"));
+    }
+    let (nonce, mac) = wire::read_hello_ok(&body)?;
+    let pin = fingerprint.unwrap_or("");
+    if !same(&mac, &proof(key, SERVER_LABEL, &hello, &nonce, pin)) {
+        return Err(LinkError::Refused("the other node does not hold this route's key"));
+    }
+    link.send(&wire::auth(&proof(key, CLIENT_LABEL, &hello, &nonce, pin)))?;
+    link.socket.set_read_timeout(None)?;
+    Ok(link)
+}
+
+/// Takes a connection someone made to this node. `key_for` says which key a role and epoch need.
+pub fn accept(
+    mut socket: TcpStream,
+    identity: Option<&Identity>,
+    key_for: impl Fn(Role, u64) -> Option<Vec<u8>>,
+) -> Result<(Arc<Link>, Frames, Hello), LinkError> {
+    prepare(&socket)?;
+    let tls = match identity {
+        None => None,
+        Some(identity) => {
+            let mut connection = ServerConnection::new(identity.server.clone())?;
+            while connection.is_handshaking() {
+                connection.complete_io(&mut socket)?;
+            }
+            Some(Connection::Server(connection))
+        }
+    };
+    let link = Link::new(socket, tls);
+    let mut frames = link.reader(STRANGER_BYTES);
+    let (kind, body) = frames.next()?;
+    if kind != Kind::Hello {
+        return Err(LinkError::Refused("a link must open with a greeting"));
+    }
+    let hello = Hello::decode(&body)?;
+    let key = key_for(hello.role, hello.epoch).ok_or(LinkError::Refused("no route here for that greeting"))?;
+    let nonce: [u8; NONCE_BYTES] = random_bytes();
+    let pin = identity.map_or("", |item| item.fingerprint.as_str());
+    link.send(&wire::hello_ok(&nonce, &proof(&key, SERVER_LABEL, &hello, &nonce, pin)))?;
+    let (kind, body) = frames.next()?;
+    if kind != Kind::Auth || !same(&body, &proof(&key, CLIENT_LABEL, &hello, &nonce, pin)) {
+        return Err(LinkError::Refused("the other node does not hold this route's key"));
+    }
+    link.socket.set_read_timeout(None)?;
+    frames.set_limit(wire::MAX_BODY_BYTES);
+    Ok((link, frames, hello))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire::Ack;
+    use std::net::TcpListener;
+    use std::thread;
+
+    const KEY: &[u8] = b"route key";
+
+    fn serve(identity: Arc<Identity>, key: &'static [u8]) -> (String, thread::JoinHandle<Result<u64, LinkError>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let handle = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let (link, mut frames, hello) = accept(socket, Some(&identity), |_, _| Some(key.to_vec()))?;
+            let (kind, body) = frames.next()?;
+            assert_eq!(kind, Kind::Ack);
+            link.send(&Ack { id: 2 }.encode())?;
+            Ok(hello.epoch + Ack::decode(&body)?.id)
+        });
+        (address, handle)
+    }
+
+    #[test]
+    fn two_nodes_with_the_key_talk_both_ways() {
+        let identity = Arc::new(Identity::generate().unwrap());
+        let pin = identity.fingerprint.clone();
+        let (address, server) = serve(identity, KEY);
+        let link = dial(&address, Some(&pin), KEY, Role::Hop, 40, Duration::from_secs(5)).unwrap();
+        link.send(&Ack { id: 2 }.encode()).unwrap();
+        let (kind, body) = link.reader(1024).next().unwrap();
+        assert_eq!((kind, Ack::decode(&body).unwrap().id), (Kind::Ack, 2));
+        assert_eq!(server.join().unwrap().unwrap(), 42);
+    }
+
+    #[test]
+    fn the_wrong_certificate_is_refused() {
+        let identity = Arc::new(Identity::generate().unwrap());
+        let (address, _server) = serve(identity, KEY);
+        let wrong = "0".repeat(64);
+        assert!(matches!(dial(&address, Some(&wrong), KEY, Role::Hop, 1, Duration::from_secs(5)), Err(LinkError::Tls(_) | LinkError::Io(_))));
+    }
+
+    #[test]
+    fn a_dialler_without_the_key_is_refused_by_both_ends() {
+        let identity = Arc::new(Identity::generate().unwrap());
+        let pin = identity.fingerprint.clone();
+        let (address, server) = serve(identity, KEY);
+        let got = dial(&address, Some(&pin), b"another key", Role::Hop, 1, Duration::from_secs(5));
+        assert!(matches!(got, Err(LinkError::Refused(_))));
+        assert!(server.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn a_stranger_cannot_send_a_large_frame_before_proving_anything() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            accept(socket, None, |_, _| Some(KEY.to_vec())).map(|_| ())
+        });
+        let mut stranger = TcpStream::connect(address).unwrap();
+        let frame = crate::wire::Pass {
+            id: 1,
+            epoch: 1,
+            slot: 0,
+            position: 0,
+            rollback_to: None,
+            flags: 0,
+            sampling: crate::wire::Sampling::GREEDY,
+            guesses: vec![],
+            tokens: vec![],
+            rows: 1,
+            width: 1024,
+            data: vec![0; 4096],
+        };
+        stranger.write_all(&frame.encode()).unwrap();
+        assert!(matches!(handle.join().unwrap(), Err(LinkError::Refused(_))));
+    }
+
+    #[test]
+    fn frames_arrive_whole_in_order_from_several_senders() {
+        let identity = Arc::new(Identity::generate().unwrap());
+        let pin = identity.fingerprint.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let (_link, mut frames, _) = accept(socket, Some(&identity), |_, _| Some(KEY.to_vec())).unwrap();
+            let mut seen = vec![];
+            for _ in 0..4000 {
+                let (_, body) = frames.next().unwrap();
+                seen.push(Ack::decode(&body).unwrap().id);
+            }
+            seen
+        });
+        let link = dial(&address, Some(&pin), KEY, Role::Hop, 1, Duration::from_secs(5)).unwrap();
+        let senders: Vec<_> = (0..4u64)
+            .map(|sender| {
+                let link = link.clone();
+                thread::spawn(move || {
+                    for index in 0..1000 {
+                        link.send(&Ack { id: sender * 1000 + index }.encode()).unwrap();
+                    }
+                })
+            })
+            .collect();
+        senders.into_iter().for_each(|item| item.join().unwrap());
+        let mut seen = server.join().unwrap();
+        for sender in 0..4 {
+            let mine: Vec<_> = seen.iter().filter(|id| **id / 1000 == sender).collect();
+            assert!(mine.windows(2).all(|pair| pair[0] < pair[1]));
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, (0..4000).collect::<Vec<_>>());
+    }
+}

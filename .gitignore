@@ -27,3 +27,6 @@ orchestrator-state*.json
 *.safetensors
 *.log
 /.claude/
+
+# The Rust engine
+engine/target/
