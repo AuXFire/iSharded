@@ -109,21 +109,22 @@ Failures, repairs, and leadership changes also go to each node's output with tim
 
 ## Soak test
 
-46 minutes on the two-machine pool with Qwen3.6-27B, two conversations running continuously, and a fault every two to three minutes: stage processes, workers, and control planes killed on both machines, cordons, and malformed or oversized requests.
+The last run: 21 minutes on the two-machine pool with Qwen3.6-27B, four conversations running continuously with merged passes on, and a fault every two to three minutes. Faults were stage processes, workers, and control planes killed on both machines, cordons, and malformed or oversized requests.
 
 | | |
 |---|---|
-| Replies finished | 463 |
+| Replies finished | 405 |
 | Replies lost for good | 0 |
-| Replies that needed the client to retry | 9, mostly because the node they were connected to had just been killed |
-| Longest wait for a token, median reply | 1.0 s |
-| Longest wait for a token, 99th percentile | 32 s |
-| Longest wait for a token, worst | 81 s, which includes waiting for a first token during a move |
-| Laptop memory, start of run to end | No growth seen: about 1.48 GB with no stage there |
+| Replies that needed the client to retry | 11, because the node they were connected to had been killed or was restarting |
+| Longest wait for a token, median reply | 0.6 s |
+| Longest wait for a token, 99th percentile | 12.5 s |
+| Longest wait for a token, worst | 24.5 s |
 
-At temperature 0, about a quarter of replies were not word-for-word the same as an earlier reply to the same question. In a separate test, the two differences inspected were sensible rewordings partway through a reply, which fits small numeric differences between batch shapes, though that cause was not proven. Do not rely on exact repeats under load.
+Three earlier runs each found stalls of about 3 minutes, which turned out to be four bugs: drained workers never released, route changes reported as stage errors, a dead stage restarted twice, and replies turned away during a move. Those are fixed. `GET /internal/diag/tasks` shows where everything in a process is waiting, for any future stall.
 
-One run on two machines is not long-term evidence. Leaks that take days to show would not appear here.
+At temperature 0, some replies were not word-for-word the same as an earlier reply to the same question. In a separate test, the two differences inspected were sensible rewordings partway through a reply, which fits small numeric differences between batch shapes, though that cause was not proven. Do not rely on exact repeats under load.
+
+These runs total under two hours on two machines. Leaks that take days to show would not appear here.
 
 ## What to watch
 

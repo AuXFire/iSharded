@@ -211,7 +211,11 @@ def run_membership(args: argparse.Namespace) -> int:
         if answer.status_code != 200:
             print(answer.json().get("detail", answer.text))
             return 1
-        print(f"Asked to join as {args.name}: {answer.json()['status']}. Tell the owner this key fingerprint: {answer.json()['fingerprint']}")
+        state = answer.json()["status"]
+        if state in {"refused", "busy"}:
+            print("This pool has refused this node." if state == "refused" else "Too many nodes are waiting. Try again later.")
+            return 1
+        print(f"Asked to join as {args.name}. Tell the owner this key fingerprint: {answer.json()['fingerprint']}")
         while args.wait:
             found = httpx.get(f"{url}/join/certificate/{args.name}", timeout=30, trust_env=False)
             if found.status_code == 200:

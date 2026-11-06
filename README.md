@@ -30,6 +30,8 @@ This is execution sharding, not simulated work distribution. In a two-worker run
 - Safe node joins: a worker registers as standby until `POST /admin/rebalance` activates a new epoch.
 - Nodes refuse to start exposed. Certificates or a pool token for nodes, named API keys with roles and rate limits for people, per-node revocation, TLS, and an audit log.
 - Planned maintenance: cordon a node and its share moves elsewhere while replies finish.
+- An owner can approve or deny nodes that ask to join, without their private keys or the owner's ever crossing the network.
+- Optional hash checks on every weight unit, from any source.
 - Prometheus metrics and readiness checks on every node.
 - OpenAI-shaped `/v1/completions`, `/v1/chat/completions`, and `/v1/models` endpoints, with streaming.
 - LAN, Tailscale IP, MagicDNS, or Tailscale Serve URLs.
