@@ -744,6 +744,20 @@ def test_a_stage_that_left_its_pool_is_left_out_of_the_report() -> None:
     assert "a" not in {stage["worker_id"] for stage in report["stages"]}
 
 
+def test_a_route_gone_stale_does_not_break_the_report() -> None:
+    # Status reads this on every poll, and a route can outlive what it was planned
+    # on: a worker can lose a pool, or have no pools left at all.
+    workers = six_cards(ram_gib=8)
+    model = block_profile()
+    route = plan_placement(workers, [], model)
+    workers[0].pools = []
+    workers[1].pools = workers[1].pools[1:]
+    route[2].placements = []
+    report = memory_report(route, workers, model)
+    assert len(report["stages"]) == len(route) - 1
+    assert report["spilled_bytes"] >= 0
+
+
 # Qwen3-235B-A22B at Q6_K, which has no block rule: 94 layers of about 1.9 GiB, 180
 # GiB in all. The budgets are what a pool of seven cards really offered, of which
 # the first card is the smallest, and two cards offered RAM as well. It planned as

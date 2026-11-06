@@ -975,14 +975,16 @@ def memory_report(route: list[StageAssignment], candidates: list[Candidate], pro
     stages: list[dict[str, Any]] = []
     for stage in route:
         candidate = workers.get(stage.worker_id)
-        if candidate is None:
+        if candidate is None or not candidate.pools:
             continue  # a worker that left while this route still runs
         by_id = {pool.pool_id: pool for pool in candidate.pools}
         best = min(MEMORY_TIERS[pool.kind] for pool in candidate.pools)
         placed = {item.unit: item for item in stage.placements}
         for item in _stage_items(profile, stage.start_layer, stage.end_layer):
-            placement = placed[item.unit.name]
-            pool = by_id[placement.pool_id]
+            placement = placed.get(item.unit.name)
+            pool = by_id.get(placement.pool_id) if placement else None
+            if placement is None or pool is None:
+                continue  # status reads this on every poll, so a stale route must not break it
             row = rows[pool.capacity_group]
             row["used_bytes"] += placement.bytes + _state_bytes(item, pool)
             if MEMORY_TIERS[pool.kind] > best:
