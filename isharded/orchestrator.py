@@ -1036,7 +1036,9 @@ class Orchestrator:
                 response.raise_for_status()
                 body = response.json()
             except (httpx.HTTPError, ValueError):
-                return worker_id, set(), False
+                # A worker that is slow to answer has not lost its shards, and
+                # planning as if it had would move them all.
+                return worker_id, target.held.get(worker_id, set()), worker_id in target.serving
             # A smaller file than the unit's data cannot be a finished copy.
             finished = {
                 name
@@ -1084,6 +1086,19 @@ class Orchestrator:
                 )
             )
         return updated
+
+    def plan_memory(self, target: ModelTarget, route: list[StageAssignment]) -> dict[str, Any]:
+        """A route's use of the memory on offer, with what each stage spills.
+
+        A running route can sit on a worker that planning would now pass over,
+        such as a cordoned one, and its spill still needs showing.
+        """
+        preferred, standby = self.candidate_groups()
+        candidates = preferred + standby
+        offered = {candidate.worker_id for candidate in candidates}
+        running = {stage.worker_id for stage in route} - offered
+        candidates += [self._candidate(name, self.workers[name]) for name in sorted(running) if name in self.workers]
+        return memory_report(route, candidates, target.profile)
 
     def plan(self, target: ModelTarget, *, honor_pins_strictly: bool = False) -> list[StageAssignment]:
         """Plan a route. A pin on a lost worker is dropped, not fatal.
@@ -2181,7 +2196,11 @@ class Orchestrator:
             "model": self.model_id,
             **self.model_kind(),
             "load_job": self.job.snapshot() if self.job else None,
-            "active_plan": describe_plan(self.active, self.route) if self.active and self.route else None,
+            "active_plan": (
+                {**describe_plan(self.active, self.route), "memory": self.plan_memory(self.active, self.route)}
+                if self.active and self.route
+                else None
+            ),
             "model_profile": (
                 "protocol-test"
                 if self.model_id and Path(self.model_id).name.lower() == ".smoke-model"
@@ -2638,8 +2657,7 @@ async def preview_plan(body: LoadModelRequest, authorization: str | None = Heade
         route = runtime.plan(target, honor_pins_strictly=True)
     except PlacementError as exc:
         raise HTTPException(status_code=507, detail=str(exc)) from exc
-    preferred, standby = runtime.candidate_groups()
-    return {**describe_plan(target, route), "memory": memory_report(route, preferred + standby, target.profile)}
+    return {**describe_plan(target, route), "memory": runtime.plan_memory(target, route)}
 
 
 @app.get("/admin/keys")
