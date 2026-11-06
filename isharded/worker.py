@@ -655,7 +655,6 @@ class WorkerRuntime:
     def _load_draft(self, request: ConfigureRequest, folder: str, threads: int) -> None:
         """Speculation only speeds things up, so a draft that fails must not stop the load."""
         self.speculate_tokens = request.speculate_tokens
-        self.rewinds = request.rewinds
         if request.draft is None or request.assignment.start_layer != 0:
             return
         self.draft_request = (request, folder, threads)
@@ -1032,6 +1031,7 @@ class WorkerRuntime:
         self.epoch = request.epoch
         self.assignment = request.assignment
         self.route = request.route
+        self.rewinds = request.rewinds  # here, because a kept stage loads nothing
         self.cache_url = request.cache_url.rstrip("/") if request.cache_url else None
         self.caches.clear()
         self.prefix.clear()  # the stages behind this one may have changed
