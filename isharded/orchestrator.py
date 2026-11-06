@@ -28,13 +28,15 @@ from . import __version__
 from .access import INVITE_FIELDS, load_authority, NeedsAuthority, node_of, ROLE_ADMIN, ROLE_MEMBER, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, Caller
 from .embedding import POOLED_TYPES, dimensions_problem, encoded, inputs_problem, length_problem, passes, shaped, smallest_dimensions
 from .gguf import GgufHeader, parse_source, split_parts
+from .llamacpp import PINNED_BUILD
+from .statestore import stage_namespace
 from . import audit
 from .discovery import start_beacon
 from .lanes import LaneDoor
 from .mcp_server import INVALID_REQUEST, McpHandler, MeshTools, RpcError, answer_http
 from .mesh import GOSSIP_SECONDS, ControlMesh
 from .models import Adapter, GgufAdapter, SUPPORTED_TYPES, UnsupportedModel, create_adapter
-from .planner import AMORTIZE_TOKENS, HOP_MS, Candidate, ModelProfile, PlacementError, plan_placement
+from .planner import AMORTIZE_TOKENS, HOP_MS, Candidate, ModelProfile, PlacementError, keep_layers, plan_placement
 from .protocol import (
     hosts_model,
     pass_seconds,
@@ -129,6 +131,8 @@ MOVE_WAIT_SECONDS = 90.0
 STREAM_CHECK_SECONDS = 5.0
 # How long workers get to come back before a saved route is rebuilt from scratch.
 ADOPTION_GRACE_SECONDS = 60.0
+# Nodes a stage asks for copies of saved states. Each answers with a short list.
+MAX_STATE_PEERS = 16
 CATALOG = [
     {"id": "Qwen/Qwen2.5-0.5B-Instruct", "family": "Qwen2.5", "kind": "dense", "size": "1 GB"},
     {"id": "Qwen/Qwen3-0.6B", "family": "Qwen3", "kind": "dense", "size": "1.5 GB"},
@@ -1026,6 +1030,59 @@ class Orchestrator:
         )
         return str(record.registration.advertised_url).rstrip("/")
 
+    def copy_holders(self, route: list[StageAssignment]) -> dict[str, str]:
+        """One node to keep a copy of each stage's saved states.
+
+        A stage's KV is for its own layers, so one copy on one other machine is enough
+        to survive losing this one. A node offering memory for this comes first, then
+        the next stage along the route, which already sees what this stage sees.
+        """
+        live = {name: record for name, record in self.workers.items() if record.live and not record.quarantined}
+        offered = [name for name, record in live.items() if "kv-cache" in record.registration.hardware.contribution.roles]
+        order = [stage.worker_id for stage in route]
+        holders: dict[str, str] = {}
+        for index, stage in enumerate(route):
+            record = live.get(stage.worker_id)
+            if record is None:
+                continue
+            own_machine = record.registration.hardware.host_id
+            others = [name for name in live if name not in order]
+            for name in [*offered, *order[index + 1 :], *order[:index], *others]:
+                holder = live.get(name)
+                if holder is not None and holder.registration.hardware.host_id != own_machine:
+                    holders[stage.worker_id] = str(holder.registration.advertised_url).rstrip("/")
+                    break
+        return holders
+
+    def state_peers(self, worker_id: str) -> list[str]:
+        """Who to ask for a copy, which may be any node, as the holder may have changed."""
+        urls = [
+            str(record.registration.advertised_url).rstrip("/")
+            for name, record in self.workers.items()
+            if record.live and not record.quarantined and name != worker_id
+        ]
+        return urls[:MAX_STATE_PEERS]
+
+    async def _clear_old_copies(self, target: ModelTarget, route: list[StageAssignment]) -> None:
+        """Copies for layers nothing runs any more are no use, on any node."""
+        wanted = [
+            stage_namespace(PINNED_BUILD, target.model_id, target.manifest.revision, stage.start_layer, stage.end_layer, target.speculate_tokens)
+            for stage in route
+        ]
+
+        async def tell(record: WorkerRecord) -> None:
+            try:
+                await self.client.post(
+                    str(record.registration.advertised_url).rstrip("/") + "/internal/state/keep",
+                    json={"namespaces": wanted},
+                    headers=auth_headers(self.pool_token),
+                    timeout=5.0,
+                )
+            except httpx.HTTPError:
+                pass  # eviction gets to them in the end
+
+        await asyncio.gather(*(tell(record) for record in self.workers.values() if record.live))
+
     async def refresh_holdings(self, target: ModelTarget) -> None:
         """Ask every worker which of this model's units are on its disk."""
 
@@ -1103,18 +1160,33 @@ class Orchestrator:
                 if worker_id and worker_id not in available:
                     self.add_event("failure", f"{worker_id} is unavailable", f"Planning without its {role} pin")
                     pins[role] = None
-        route = plan_placement(
-            self._with_holdings(preferred, target),
-            self._with_holdings(standby, target),
-            target.profile,
-            spread=target.spread,
-            **pins,
-        )
+        preferred, standby = self._with_holdings(preferred, target), self._with_holdings(standby, target)
+        kept = None if honor_pins_strictly else self._keep_stages(target, preferred, standby, available, pins)
+        route = kept or plan_placement(preferred, standby, target.profile, spread=target.spread, **pins)
         if target.embedding and len(route) > 1:
             # Pooling happens at the end of the model, in llama.cpp, for whole
             # sequences, so a stage boundary has nothing correct to pass along.
             raise PlacementError(f"{target.model_id} would take {len(route)} stages here, and an embedding model cannot be split; it needs one worker that can hold it all")
         return route
+
+    def _keep_stages(
+        self, target: ModelTarget, preferred: list[Candidate], standby: list[Candidate], available: set[str], pins: dict[str, str | None]
+    ) -> list[StageAssignment] | None:
+        """Replace only what was lost, if something can take its layers.
+
+        A standby worker is only for when a model does not fit without it, so it steps
+        in only if the workers still running could not hold the model between them.
+        """
+        if target is not self.active or all(stage.worker_id in available for stage in self.route):
+            return None
+        route = keep_layers(self.route, preferred, [], target.profile)
+        if route is not None or not standby:
+            return route
+        try:
+            plan_placement(preferred, [], target.profile, spread=target.spread, **pins)
+            return None
+        except PlacementError:
+            return keep_layers(self.route, preferred, standby, target.profile)
 
     def _quarantine(self, worker_id: str, reason: str) -> None:
         record = self.workers.get(worker_id)
@@ -1218,6 +1290,8 @@ class Orchestrator:
         # KV checkpoints append to a snapshot. Recurrent state changes whole
         # every token, so hybrid models recover by replaying the prompt.
         cache_url = self.choose_cache_url(route) if target.adapter.supports_kv_snapshots else None
+        saved_states = isinstance(target.adapter, GgufAdapter)  # see statecopy.py
+        holders = self.copy_holders(route) if saved_states else {}
         new_epoch = self.epoch + 1
         await self._drain_entries(route)
         self.route = []  # nothing may run while weights are moving
@@ -1238,6 +1312,8 @@ class Orchestrator:
                 slots=target.slots,
                 merge_passes=target.merge_passes,
                 prompt_cache=target.request is None or target.request.prompt_cache,
+                copy_url=holders.get(stage.worker_id),
+                state_peers=self.state_peers(stage.worker_id) if saved_states else [],
                 embedding=target.embedding,
                 projector=target.projector,
                 unit_hashes={
@@ -1274,6 +1350,8 @@ class Orchestrator:
         self.installed_epoch = new_epoch
         self.saved_state = None
         self.save_state(target)
+        if saved_states:
+            self.spawn(self._clear_old_copies(target, route))
         if self.mesh is not None:
             self.spawn(self._gossip_round())  # peers should not wait for the next tick
         summary = " → ".join(f"{stage.worker_id} L{stage.start_layer}–{stage.end_layer - 1}" for stage in route)
@@ -1931,8 +2009,11 @@ class Orchestrator:
             for source, count in (cache.get("tokens_reused") or {}).items():
                 add("worker_tokens_reused_total", count, "Prompt tokens this stage restored instead of computing", "counter", worker=worker_id, source=source)
             add("worker_state_misses_total", cache.get("state_misses"), "Saved states a stage did not hold when asked", "counter", worker=worker_id)
-            for tier in ("ram", "disk"):
+            for tier in ("ram", "disk", "held"):
                 add("worker_cache_bytes", cache.get(f"{tier}_bytes"), "Bytes of saved state held", worker=worker_id, tier=tier)
+            add("worker_state_copy_bytes_total", cache.get("copy_bytes_sent"), "Bytes of state copied to another node", "counter", worker=worker_id)
+            add("worker_state_copies_failed_total", cache.get("copies_failed"), "State copies that did not arrive", "counter", worker=worker_id)
+            add("worker_state_copies_dropped_total", cache.get("copies_dropped"), "State copies dropped behind a newer one or a full queue", "counter", worker=worker_id)
         return "\n".join(lines) + "\n"
 
     def _fit_context(self, prompt_tokens: int, max_tokens: int) -> int:

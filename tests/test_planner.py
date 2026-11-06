@@ -1,6 +1,6 @@
 import pytest
 
-from isharded.planner import Candidate, ModelProfile, PlacementError, plan_placement, stored_bytes
+from isharded.planner import Candidate, ModelProfile, PlacementError, keep_layers, plan_placement, stored_bytes
 from isharded.protocol import MemoryPool, TensorRef, WeightUnit
 
 MIB = 1024**2
@@ -313,3 +313,75 @@ def test_tied_embedding_is_stored_once_when_one_worker_holds_both_ends() -> None
 def test_a_model_that_cannot_fit_is_explained() -> None:
     with pytest.raises(PlacementError, match="GiB"):
         plan_placement([worker("gpu", pool("cuda:0", "vram", 100 * MIB, 300))], [], profile())
+
+
+def ram_worker(name: str, budget: int = 2 * GIB, speed: float = 30) -> Candidate:
+    return worker(name, pool(f"{name}-ram", "ram", budget, speed))
+
+
+def layout(route) -> list[tuple[str, int, int]]:
+    return [(stage.worker_id, stage.start_layer, stage.end_layer) for stage in route]
+
+
+def running(*workers: Candidate):
+    return plan_placement(list(workers), [], profile())
+
+
+def test_a_spare_takes_exactly_what_was_lost() -> None:
+    a, b, c = ram_worker("a"), ram_worker("b"), ram_worker("c")
+    current = running(a, b)
+    route = keep_layers(current, [a, c], [], profile())
+    assert [item[1:] for item in layout(route)] == [item[1:] for item in layout(current)]
+    assert [stage.worker_id for stage in route] == [stage.worker_id.replace("b", "c") for stage in current]
+
+
+def test_stages_that_lost_nothing_are_left_exactly_as_they_were() -> None:
+    a, b, c = ram_worker("a"), ram_worker("b"), ram_worker("c")
+    current = running(a, b)
+    route = keep_layers(current, [a, c], [], profile())
+    kept = next(stage for stage in current if stage.worker_id == "a")
+    assert next(stage for stage in route if stage.worker_id == "a").placements == kept.placements
+
+
+def test_a_lost_stage_at_either_end_keeps_its_place() -> None:
+    a, b, c, d = ram_worker("a"), ram_worker("b"), ram_worker("c"), ram_worker("d")
+    current = running(a, b, c)
+    for lost in (current[0].worker_id, current[-1].worker_id):
+        left = [item for item in (a, b, c) if item.worker_id != lost]
+        route = keep_layers(current, [*left, d], [], profile())
+        assert [stage.worker_id for stage in route] == [stage.worker_id.replace(lost, "d") for stage in current]
+
+
+def test_several_stages_can_be_replaced_at_once() -> None:
+    a, b, c, d, e = (ram_worker(name) for name in "abcde")
+    current = running(a, b, c)
+    route = keep_layers(current, [current_worker for current_worker in (a, d, e) if current_worker], [], profile())
+    assert [item[1:] for item in layout(route)] == [item[1:] for item in layout(current)]
+    assert len({stage.worker_id for stage in route}) == 3
+
+
+def test_with_no_spare_there_is_nothing_to_keep() -> None:
+    a, b = ram_worker("a"), ram_worker("b")
+    assert keep_layers(running(a, b), [a], [], profile()) is None
+
+
+def test_a_spare_too_small_for_the_layers_is_passed_over() -> None:
+    a, b = ram_worker("a"), ram_worker("b")
+    current = running(a, b)
+    small, big = ram_worker("small", 50 * MIB), ram_worker("big")
+    route = keep_layers(current, [a, small, big], [], profile())
+    assert {stage.worker_id for stage in route} == {"a", "big"}
+    assert keep_layers(current, [a, small], [], profile()) is None
+
+
+def test_a_worker_already_running_a_stage_is_not_a_spare() -> None:
+    a, b, c = ram_worker("a"), ram_worker("b"), ram_worker("c")
+    assert keep_layers(running(a, b, c), [a, c], [], profile()) is None
+
+
+def test_keeping_layers_works_for_a_model_with_tied_embeddings() -> None:
+    tied = profile(tied=True)
+    a, b, c = ram_worker("a"), ram_worker("b"), ram_worker("c")
+    current = plan_placement([a, b], [], tied)
+    route = keep_layers(current, [a, c], [], tied)
+    assert [item[1:] for item in layout(route)] == [item[1:] for item in layout(current)]

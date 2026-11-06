@@ -674,6 +674,7 @@ Hardware and memory:
 | `--ram-budget-gb` | 0 | RAM for KV-cache checkpoints, not weights. Adds a memory worker |
 | `--state-ram-gb` | 1 | RAM each stage keeps for saved prompt states, on top of its weights. The planner does not count it |
 | `--state-disk-gb` | 8 | Disk for saved prompt states, kept in `states` in `--cache-dir`. 0 keeps them in RAM only, and they then die with the stage process |
+| `--state-copy-mb` | 10 | MB per second for sending copies of saved states to another node. 0 sends none |
 
 Models and cache:
 
@@ -862,6 +863,7 @@ The state folder is `%LOCALAPPDATA%\iSharded` on Windows and `~/.cache/iSharded`
 | `--weights-disk-gb` | 0 | Disk for memory-mapped model weights |
 | `--ram-budget-gb` | 0 | RAM for KV checkpoints, not weights |
 | `--state-ram-gb`, `--state-disk-gb` | 1, 8 | RAM and disk for saved prompt states |
+| `--state-copy-mb` | 10 | MB per second for copies of saved states to another node |
 | `--cache-dir` | `~/.cache/isharded/units` | Where fetched weights live |
 | `--cache-budget-gb` | 0 (no limit) | Evict old models past this size |
 | `--gguf-dir` | None | Folder holding GGUF files. Repeatable |
@@ -893,7 +895,7 @@ A flag takes priority over its variable.
 | `ISHARDED_WORKER_ID`, `ISHARDED_ORCHESTRATOR_URL`, `ISHARDED_ADVERTISE_URL` | The worker's `--worker-id`, `--orchestrator-url`, `--advertise-url` |
 | `ISHARDED_DEVICE`, `ISHARDED_ROLES`, `ISHARDED_CPU_THREADS` | `--device`, `--roles`, `--cpu-threads` |
 | `ISHARDED_GPU_MEMORY_GB`, `ISHARDED_RAM_BUDGET_GB` | `--gpu-memory-gb`, `--ram-budget-gb` |
-| `ISHARDED_STATE_RAM_GB`, `ISHARDED_STATE_DISK_GB` | `--state-ram-gb`, `--state-disk-gb` |
+| `ISHARDED_STATE_RAM_GB`, `ISHARDED_STATE_DISK_GB`, `ISHARDED_STATE_COPY_MB` | `--state-ram-gb`, `--state-disk-gb`, `--state-copy-mb` |
 | `ISHARDED_CACHE_DIR`, `ISHARDED_LLAMA_DIR` | `--cache-dir`, `--llama-dir` |
 | `ISHARDED_LANE`, `ISHARDED_LANES_FILE` | Set by `isharded node`: which lane a process is, and where a node keeps the lanes it should run |
 | `ISHARDED_OWNERLESS` | `--ownerless` |
@@ -1540,7 +1542,9 @@ A node started with `isharded up` keeps its route state, keys, and audit log in 
 | `worker_prompt_tokens_computed_total` | Prompt tokens a stage computed |
 | `worker_tokens_reused_total` | Prompt tokens a stage restored instead of computing. `source` is `prefix` for a shared prefix or `history` for a conversation, then the tier it came from |
 | `worker_state_misses_total` | Saved states a stage did not hold when asked. Each costs a reread, and nothing else |
-| `worker_cache_bytes` | Bytes of saved state a stage holds, by `tier` |
+| `worker_cache_bytes` | Bytes of saved state a stage holds, by `tier`: `ram`, `disk`, or `held` for copies kept for other stages |
+| `worker_state_copy_bytes_total` | Bytes of state copied to another node |
+| `worker_state_copies_failed_total`, `worker_state_copies_dropped_total` | Copies that did not arrive, and copies dropped behind a newer one or a full queue. Neither touches a reply. They mean recovery may reread more |
 
 ## Troubleshooting
 

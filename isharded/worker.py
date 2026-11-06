@@ -9,6 +9,7 @@ import importlib.metadata
 import json
 import os
 import platform
+import re
 import socket
 import sys
 import threading
@@ -26,6 +27,7 @@ import psutil
 import torch
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
+from starlette.requests import ClientDisconnect
 
 from .inventory import ram
 from .memory import (
@@ -71,9 +73,10 @@ from .gguf_stage import INITIAL_GUESSES, DraftModel, GgufStage, ImageEncoder, Pr
 from . import __version__
 from .llamacpp import PINNED_BUILD, LlamaError, StageLost, ensure_build, pick_build, rocm_library_paths, step_random
 from .pool import check_exposure, load_token
-from .serving import MAX_STAGE_BYTES, BodyLimit, serve, where_everything_is
+from .serving import MAX_STAGE_BYTES, MAX_STATE_BYTES, BodyLimit, serve, where_everything_is
 from .slots import SlotGate
-from .statestore import HISTORY, PrefixIndex, clear_other_stores, stage_namespace
+from .statecopy import CopySender, fetch_file
+from .statestore import HISTORY, PARTIAL, PrefixIndex, StateStore, clear_other_stores, stage_namespace
 from .access import load_authority
 from .inventory import inventory
 from .tickets import TicketIdentity, client_auth
@@ -88,6 +91,14 @@ SUPPORTED_DTYPES = ["bfloat16", "float32", "float16"]
 MAX_PENDING_CHECKPOINTS = 32
 # Times a reply plans again after a stage turns out not to hold a state.
 PLAN_ATTEMPTS = 3
+# Where a node keeps copies of other stages' states, beside its own store.
+HELD_FOLDER = "held"
+# After a route change, how long a reply waits to hear what the stages can restore.
+INDEX_SECONDS = 3.0
+PEER_SECONDS = 2.0
+# How long a reply waits for a stage to fetch a copy, before reading the prompt instead.
+FETCH_SECONDS = 30.0
+NAME = re.compile(r"[0-9a-f]{1,64}")
 
 
 def choose_dtype_name(requested: str) -> str:
@@ -351,6 +362,14 @@ class WorkerRuntime:
         self.prompt_tokens_computed = 0
         self.tokens_reused: dict[str, int] = {}
         self.state_misses = 0
+        # Copies this node keeps for stages elsewhere, opened in setup().
+        self.held = StateStore(None, 0, 0)
+        self.namespace: str | None = None
+        self.state_peers: list[str] = []
+        self.fetched: set[str] = set()
+        self.copies_fetched = 0
+        self.index_epoch = -1
+        self.index_lock = asyncio.Lock()
         self.slot_used_at: dict[int, float] = {}
         self.gguf_signature: tuple[Any, ...] | None = None
         self.stages_kept = 0
@@ -373,6 +392,8 @@ class WorkerRuntime:
         self.lock = asyncio.Lock()
         # A disk-tier prompt can take minutes, and a slow hop is not a failure.
         self.client = httpx.AsyncClient(transport=node_transport(), event_hooks={"request": [stay_on_this_machine_async]}, timeout=httpx.Timeout(1800.0, connect=10.0), verify=client_verify(), auth=client_auth())
+        rate = int(float(os.getenv("ISHARDED_STATE_COPY_MB", "10")) * 1024**2)
+        self.copies = CopySender(self.client, lambda: auth_headers(self.pool_token), rate)
         self.registration_task: asyncio.Task[None] | None = None
         self.inference_calls = 0
         self.tokens_processed = 0
@@ -394,6 +415,7 @@ class WorkerRuntime:
         """Probe hardware. Separate from ``__init__`` so importing stays cheap."""
         if self.hardware is not None:
             return
+        self.held = StateStore(self.state_root / HELD_FOLDER, 0, self.state_disk_bytes)
         if self.cpu_threads:
             torch.set_num_threads(self.cpu_threads)
         computes = "inference" in self.roles
@@ -714,7 +736,114 @@ class WorkerRuntime:
             "disk_bytes": held.get("disk_bytes", 0),
             "saved_bytes": held.get("saved_bytes", 0),
             "evicted": held.get("evicted", 0),
+            "held_bytes": self.held.stats()["disk_bytes"],
+            "copies_fetched": self.copies_fetched,
+            **self.copies.report(),
         }
+
+    async def restorable(self) -> dict[str, dict[str, Any]]:
+        """What this stage can restore: what it holds, then what others keep for these layers."""
+        if self.gguf is None or self.namespace is None:
+            return {}
+        try:
+            answer, _ = await asyncio.to_thread(self.gguf.host.call, "state_list")
+        except LlamaError:
+            return {}
+        found = {item["key"]: {**item, "elsewhere": False} for item in answer["states"]}
+
+        async def ask(url: str) -> list[dict[str, Any]]:
+            try:
+                response = await self.client.get(
+                    f"{url}/internal/state/held/{self.namespace}", headers=auth_headers(self.pool_token), timeout=PEER_SECONDS
+                )
+                response.raise_for_status()
+                return response.json()["states"]
+            except (httpx.HTTPError, ValueError, KeyError):
+                return []  # gone or silent, and this reply is not going to wait for it
+
+        for listing in await asyncio.gather(*(ask(url) for url in self.state_peers)):
+            for item in listing:
+                found.setdefault(item["key"], {**item, "elsewhere": True})
+        return found
+
+    async def sync_index(self) -> None:
+        """Learn what every stage can restore, once per route.
+
+        An entry worker new to this route knows nothing, and even one that stayed
+        cannot know what came back or moved. Only what all stages can reach is any use.
+        """
+        if self.index_epoch == self.epoch or self.gguf is None or not self.prompt_cache:
+            return
+        async with self.index_lock:
+            epoch = self.epoch
+            if self.index_epoch == epoch:
+                return
+
+            async def listing(stage: StageAssignment) -> dict[str, dict[str, Any]]:
+                try:
+                    if stage.worker_id == self.worker_id:
+                        return await asyncio.wait_for(self.restorable(), INDEX_SECONDS)
+                    response = await self.client.get(
+                        stage.url.rstrip("/") + "/internal/state/index", headers=auth_headers(self.pool_token), timeout=INDEX_SECONDS
+                    )
+                    response.raise_for_status()
+                    return {item["key"]: item for item in response.json()["states"]}
+                except (httpx.HTTPError, ValueError, KeyError, asyncio.TimeoutError):
+                    return {}
+
+            listings = await asyncio.gather(*(listing(stage) for stage in self.route))
+            for key in set.intersection(*(set(item) for item in listings)) if listings else ():
+                item = listings[0][key]
+                self.prefix.add(key, item["length"], item["kind"], any(found[key].get("elsewhere") for found in listings))
+            self.index_epoch = epoch
+
+    async def ensure_state(self, key: str) -> bool:
+        """Have this state here, fetching a copy if this stage took over from a lost one."""
+        if self.gguf is None or self.namespace is None:
+            return False
+        try:
+            answer, _ = await asyncio.to_thread(self.gguf.host.call, "state_has", key=key)
+            if answer["held"]:
+                return True
+            target = self.state_root / self.namespace / (key + PARTIAL)
+            for url in self.state_peers:
+                source = f"{url}/internal/state/held/{self.namespace}/{key}"
+                if await fetch_file(self.client, source, target, auth_headers(self.pool_token)):
+                    answer, _ = await asyncio.to_thread(self.gguf.host.call, "state_adopt", key=key)
+                    if answer["adopted"]:
+                        self.fetched.add(key)
+                        self.copies_fetched += 1
+                        return True
+        except LlamaError:
+            pass  # a stage that cannot answer has nothing to restore, and a reread needs no help
+        return False
+
+    async def prepare_state(self, key: str) -> bool:
+        """Get a state onto every stage before a reply counts on it.
+
+        This runs before the pass, so a slow fetch never holds a stage's lock. A
+        stage that cannot get it in time means reading the prompt instead.
+        """
+
+        async def ready(stage: StageAssignment) -> bool:
+            if stage.worker_id == self.worker_id:
+                return await self.ensure_state(key)
+            try:
+                response = await self.client.post(
+                    stage.url.rstrip("/") + "/internal/state/prepare",
+                    json={"key": key},
+                    headers=auth_headers(self.pool_token),
+                    timeout=httpx.Timeout(FETCH_SECONDS, connect=PEER_SECONDS),
+                )
+                response.raise_for_status()
+                return bool(response.json()["ready"])
+            except (httpx.HTTPError, ValueError, KeyError):
+                return False
+
+        try:
+            return all(await asyncio.wait_for(asyncio.gather(*(ready(stage) for stage in self.route)), FETCH_SECONDS))
+        except asyncio.TimeoutError:
+            return False
 
     def _materialize_gguf(self, request: ConfigureRequest, adapter: GgufAdapter) -> None:
         """Assemble this stage's file from cached units and load it into llama.cpp."""
@@ -729,7 +858,7 @@ class WorkerRuntime:
         threads = self.cpu_threads or max((os.cpu_count() or 4) // 2, 1)
         # A state means nothing to another model or other layers, so those go now.
         namespace = self.state_namespace(request)
-        clear_other_stores(self.state_root, {namespace})
+        clear_other_stores(self.state_root, {namespace, HELD_FOLDER})
         caching = request.prompt_cache and not request.embedding
         self.gguf = GgufStage(
             folder, rocm_library_paths(), self.unit_cache, request, adapter, self.pools, threads,
@@ -850,6 +979,10 @@ class WorkerRuntime:
         self.caches.clear()
         self.prefix.clear()  # the stages behind this one may have changed
         self.prompt_cache = request.prompt_cache
+        self.namespace = self.state_namespace(request) if self.gguf is not None and request.prompt_cache and not request.embedding else None
+        self.state_peers = [url.rstrip("/") for url in request.state_peers]
+        folder = None if self.namespace is None or not self.state_disk_bytes else self.state_root / self.namespace
+        self.copies.aim(request.copy_url, folder, self.namespace or "")
         self.merge_passes = request.merge_passes
         if self.gate.size != request.slots:
             self.gate.resize(request.slots)
@@ -884,6 +1017,9 @@ class WorkerRuntime:
                         detail = {"retry": True, "missing": request.checkpoint_key, "message": str(exc)}
                         raise HTTPException(status_code=503, detail=detail) from exc
                     entry.length = request.restore_length
+                    if request.checkpoint_key in self.fetched:
+                        self.fetched.discard(request.checkpoint_key)
+                        tier = "copy"
                     source = f"{request.restore_kind or HISTORY}_{tier}"
                     self.tokens_reused[source] = self.tokens_reused.get(source, 0) + request.reused_rows
                 else:
@@ -1227,6 +1363,8 @@ class WorkerRuntime:
             # is away at the next stage, this stage can work on another.
             async with self.lock:
                 outcome = await self._step_alone(hidden, request, places)
+        if request.saves:
+            self.copies.add(request.saves)
         if isinstance(outcome, dict):
             return outcome
         hidden = outcome
@@ -1298,7 +1436,7 @@ app = FastAPI(title="iSharded worker", version="0.2.0", lifespan=lifespan)
 app.add_middleware(TicketIdentity)
 app.add_middleware(
     BodyLimit,
-    large={"/internal/forward": MAX_STAGE_BYTES, "/internal/diag/echo": MAX_STAGE_BYTES},
+    large={"/internal/forward": MAX_STAGE_BYTES, "/internal/diag/echo": MAX_STAGE_BYTES, "/internal/state/copy": MAX_STATE_BYTES},
 )
 
 
@@ -1617,6 +1755,82 @@ async def clear_session(session_id: str, authorization: str | None = Header(defa
     return {"status": "cleared"}
 
 
+@app.put("/internal/state/copy")
+async def receive_copy(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_isharded_meta: str | None = Header(default=None),
+) -> dict[str, str]:
+    """Keep a copy of another stage's state, straight to disk as it arrives."""
+    verify_token(authorization)
+    if runtime.held.folder is None:
+        raise HTTPException(status_code=409, detail="this node keeps no saved states on disk")
+    try:
+        meta = decode_meta(x_isharded_meta or "")
+        namespace, key, replaces = meta["namespace"], meta["key"], meta.get("replaces")
+    except (ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=f"bad {META_HEADER} header") from exc
+    if not NAME.fullmatch(str(namespace)) or not NAME.fullmatch(str(key)) or (replaces and not NAME.fullmatch(str(replaces))):
+        raise HTTPException(status_code=400, detail="a state is named by a digest")
+    if int(request.headers.get("content-length", 0)) > runtime.held.disk_bytes:
+        raise HTTPException(status_code=413, detail="this state is larger than this node keeps")
+    name = f"{namespace}.{key}"
+    partial = runtime.held.folder / (name + PARTIAL)
+    try:
+        with partial.open("wb") as handle:
+            async for chunk in request.stream():
+                await asyncio.to_thread(handle.write, chunk)
+    except (OSError, ClientDisconnect) as exc:
+        partial.unlink(missing_ok=True)
+        raise HTTPException(status_code=507, detail="this copy could not be kept") from exc
+    if not await asyncio.to_thread(runtime.held.adopt, name, partial):
+        raise HTTPException(status_code=400, detail="this copy does not match its checksum")
+    if replaces:
+        runtime.held.drop(f"{namespace}.{replaces}")
+    return {"status": "kept"}
+
+
+@app.get("/internal/state/held/{namespace}")
+async def held_states(namespace: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    verify_token(authorization)
+    start = namespace + "."
+    states = [{**item, "key": item["key"][len(start) :]} for item in runtime.held.listing() if item["key"].startswith(start)]
+    return {"states": states}
+
+
+@app.get("/internal/state/held/{namespace}/{key}")
+async def held_state(namespace: str, key: str, authorization: str | None = Header(default=None)) -> Response:
+    verify_token(authorization)
+    path = runtime.held.file_of(f"{namespace}.{key}") if NAME.fullmatch(namespace) and NAME.fullmatch(key) else None
+    if path is None:
+        raise HTTPException(status_code=404, detail="no copy of that state here")
+    return FileResponse(path, media_type="application/octet-stream")
+
+
+@app.get("/internal/state/index")
+async def state_index(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    verify_token(authorization)
+    return {"states": list((await runtime.restorable()).values())}
+
+
+@app.post("/internal/state/prepare")
+async def prepare_state(body: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, bool]:
+    verify_token(authorization)
+    key = str(body.get("key"))
+    return {"ready": bool(NAME.fullmatch(key)) and await runtime.ensure_state(key)}
+
+
+@app.post("/internal/state/keep")
+async def keep_states(body: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, str]:
+    """Forget copies for anything no stage is running any more."""
+    verify_token(authorization)
+    wanted = set(body.get("namespaces", []))
+    for item in runtime.held.listing():
+        if item["key"].split(".", 1)[0] not in wanted:
+            runtime.held.drop(item["key"])
+    return {"status": "kept"}
+
+
 @app.put("/internal/cache/kv")
 async def store_kv(
     request: Request,
@@ -1783,7 +1997,12 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
         assert draft is not None
         # The draft reads the prompt while the real model does.
         prepared = asyncio.create_task(asyncio.to_thread(draft.prepare, body.input_ids, plan, request.slot))
-        token = await first_token(request, plan)
+        try:
+            token = await first_token(request, plan)
+        except Exception:
+            # A reply may plan again now, and two of these on one sequence would tangle it.
+            await asyncio.gather(prepared, return_exceptions=True)
+            raise
         yield token
         try:
             await prepared
@@ -1842,11 +2061,20 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             # A draft reads text, so it cannot follow a prompt with images in it.
             use_draft = runtime.draft is not None and runtime.speculate_tokens and not body.images
             caching = runtime.gguf is not None and runtime.prompt_cache
+            if caching:
+                await runtime.sync_index()
             rows: PromptRows | None = None
             answered = False
             failure: Any = None
-            for _ in range(PLAN_ATTEMPTS):
-                plan = plan_prompt(runtime.prefix, body.input_ids, body.cut_token, body.checkpoint_at, caching)
+            for attempt in range(PLAN_ATTEMPTS):
+                # The last attempt reads the whole prompt, which depends on no state at all.
+                plan = plan_prompt(runtime.prefix, body.input_ids, body.cut_token, body.checkpoint_at, caching and attempt < PLAN_ATTEMPTS - 1)
+                if plan.key in runtime.prefix.elsewhere:
+                    if not await runtime.prepare_state(plan.key):
+                        runtime.prefix.drop(plan.key)
+                        runtime.state_misses += 1
+                        continue
+                    runtime.prefix.elsewhere.discard(plan.key)
                 try:
                     if body.images and rows is None:
                         rows = await runtime.prompt_rows(body.input_ids, body.images)
@@ -1968,6 +2196,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ram-budget-gb", type=float, default=float(os.getenv("ISHARDED_RAM_BUDGET_GB", "0")), help="RAM for KV checkpoints, not weights")
     parser.add_argument("--state-ram-gb", type=float, default=float(os.getenv("ISHARDED_STATE_RAM_GB", "1")), help="RAM for saved prompt states on each stage")
     parser.add_argument("--state-disk-gb", type=float, default=float(os.getenv("ISHARDED_STATE_DISK_GB", "8")), help="disk for saved prompt states; 0 keeps them in RAM only")
+    parser.add_argument("--state-copy-mb", type=float, default=float(os.getenv("ISHARDED_STATE_COPY_MB", "10")), help="MB per second for copies of saved states to another node; 0 sends none")
     parser.add_argument("--gpu-memory-gb", type=float, default=float(os.getenv("ISHARDED_GPU_MEMORY_GB", "0")), help="VRAM budget per accelerator; 0 means auto")
     parser.add_argument("--weights-ram-gb", default=None, help="system RAM for model weights, or 'auto'")
     parser.add_argument("--weights-disk-gb", type=float, default=0, help="disk for memory-mapped model weights")
@@ -2001,6 +2230,7 @@ def main() -> None:
     os.environ["ISHARDED_RAM_BUDGET_GB"] = str(args.ram_budget_gb)
     os.environ["ISHARDED_STATE_RAM_GB"] = str(args.state_ram_gb)
     os.environ["ISHARDED_STATE_DISK_GB"] = str(args.state_disk_gb)
+    os.environ["ISHARDED_STATE_COPY_MB"] = str(args.state_copy_mb)
     os.environ["ISHARDED_GPU_MEMORY_GB"] = str(args.gpu_memory_gb)
     os.environ["ISHARDED_WEIGHTS_RAM_GB"] = "" if args.weights_ram_gb is None else str(args.weights_ram_gb)
     os.environ["ISHARDED_WEIGHTS_DISK_GB"] = str(args.weights_disk_gb)

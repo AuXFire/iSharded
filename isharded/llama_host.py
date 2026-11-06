@@ -24,7 +24,7 @@ from typing import Any
 import numpy as np
 
 from .llamacpp import LlamaError, LlamaLibrary, LlamaStage, StageLost, TokenEmbedding
-from .statestore import HISTORY, StateStore
+from .statestore import HISTORY, PARTIAL, StateStore
 
 KEY_VARIABLE = "ISHARDED_STAGE_KEY"
 CONNECT_SECONDS = 60.0
@@ -128,6 +128,19 @@ class _Host:
 
     def state_stats(self, _: dict[str, Any], __: bytes) -> tuple[dict[str, Any], bytes]:
         return {"states": self.states.stats()}, b""
+
+    def state_list(self, _: dict[str, Any], __: bytes) -> tuple[dict[str, Any], bytes]:
+        return {"states": self.states.listing()}, b""
+
+    def state_has(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+        return {"held": self.states.has(meta["key"])}, b""
+
+    def state_adopt(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+        """Take a state the worker fetched into this store's folder from another node."""
+        folder = self.states.folder
+        if folder is None:
+            return {"adopted": False}, b""
+        return {"adopted": self.states.adopt(meta["key"], folder / (meta["key"] + PARTIAL))}, b""
 
     def commit(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
         assert self.stage is not None

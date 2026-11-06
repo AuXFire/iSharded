@@ -237,6 +237,10 @@ class ConfigureRequest(BaseModel):
     projector: DraftModel | None = None
     # Save and reuse prompt states. Off, prompts are cut the same way and read in full.
     prompt_cache: bool = True
+    # The one other node that keeps a copy of this stage's states, and the nodes to
+    # ask when taking over layers from a stage that was lost. See statecopy.py.
+    copy_url: str | None = None
+    state_peers: list[str] = Field(default_factory=list)
 
 
 class CacheRestoreRequest(BaseModel):

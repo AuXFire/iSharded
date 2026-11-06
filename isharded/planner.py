@@ -463,6 +463,42 @@ def _build_route(
     return route
 
 
+def keep_layers(
+    current: list[StageAssignment],
+    preferred: list[Candidate],
+    standby: list[Candidate],
+    profile: ModelProfile,
+) -> list[StageAssignment] | None:
+    """The same stages, with a spare standing in for each worker that is gone.
+
+    Planning from scratch can move every stage to get a slightly better split. That
+    moves weights that could have stayed, and a saved state is only good for the
+    layers it came from, so the lost stage's copy would be wasted too. None if there
+    are not enough spares, or one that fits.
+    """
+    everyone = {candidate.worker_id: candidate for candidate in [*preferred, *standby] if candidate.pools}
+    staying = {stage.worker_id for stage in current if stage.worker_id in everyone}
+    spares = [candidate for name, candidate in everyone.items() if name not in staying]
+    for shrink in PACKING_RETRIES:
+        free = list(spares)
+        ranges: list[tuple[Candidate, int, int]] = []
+        for stage in current:
+            candidate = everyone.get(stage.worker_id)
+            if candidate is None:
+                items = _stage_items(profile, stage.start_layer, stage.end_layer)
+                room = _capacities(free, shrink, profile.stage_workspace_bytes)
+                candidate = next((spare for spare in free if _fill(profile, items, spare.pools, room[spare.worker_id])), None)
+                if candidate is None:
+                    return None
+                free.remove(candidate)
+            ranges.append((candidate, stage.start_layer, stage.end_layer))
+        capacities = _capacities([candidate for candidate, _, _ in ranges], shrink, profile.stage_workspace_bytes)
+        route = _build_route(ranges, profile, capacities)
+        if route is not None:
+            return route
+    return None
+
+
 def plan_placement(
     preferred: list[Candidate],
     standby: list[Candidate],

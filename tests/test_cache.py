@@ -8,14 +8,27 @@ import time
 from types import SimpleNamespace
 
 from fastapi import HTTPException
+import httpx
 import numpy as np
 import pytest
 
 from isharded import worker
 from isharded.gguf_stage import plan_prompt
-from isharded.llamacpp import LlamaError
+from isharded.llamacpp import PINNED_BUILD, LlamaError, StageLost
+from isharded.orchestrator import Orchestrator
 from isharded.protocol import GenerateRequest, InferRequest, SavePoint
-from isharded.statestore import CUT_LEAST, HISTORY, PASS_ROWS, PREFIX, PrefixIndex, cut_points, keys_at, pass_ends, prefix_key
+from isharded.statestore import (
+    CUT_LEAST,
+    HISTORY,
+    PASS_ROWS,
+    PREFIX,
+    PrefixIndex,
+    cut_points,
+    keys_at,
+    pass_ends,
+    prefix_key,
+    stage_namespace,
+)
 
 TURN = 7  # stands for the token that opens a turn
 
@@ -188,8 +201,15 @@ def fake_entry(monkeypatch, results):
     runtime = SimpleNamespace(
         assignment=SimpleNamespace(start_layer=0), waiting=0, gate=Gate(), epoch=1, gguf=object(), draft=None, speculate_tokens=0,
         prompt_cache=True, prefix=PrefixIndex(), slot_used_at={}, state_misses=0, last_error=None, lock=asyncio.Lock(),
-        choose_slot=min, _record=lambda *args: None, _prepare_entry=lambda request, part: request, passes=[],
+        choose_slot=min, _record=lambda *args: None, _prepare_entry=lambda request, part: request, passes=[], prepared=[], can_fetch=True,
     )
+
+    async def sync_index():
+        pass
+
+    async def prepare_state(key):
+        runtime.prepared.append(key)
+        return runtime.can_fetch
 
     async def execute(hidden, request, places):
         runtime.passes.append(request)
@@ -198,7 +218,7 @@ def fake_entry(monkeypatch, results):
             raise result
         return result
 
-    runtime.execute = execute
+    runtime.execute, runtime.sync_index, runtime.prepare_state = execute, sync_index, prepare_state
     monkeypatch.setattr(worker, "runtime", runtime)
     monkeypatch.setattr(worker, "verify_token", lambda authorization: None)
     return runtime
@@ -275,7 +295,7 @@ def test_a_stage_that_lost_a_state_says_which_one(monkeypatch):
             raise LlamaError("no saved state")
 
     runtime = worker.WorkerRuntime.__new__(worker.WorkerRuntime)
-    runtime.gguf, runtime.caches, runtime.tokens_reused = Stage(), {}, {}
+    runtime.gguf, runtime.caches, runtime.tokens_reused, runtime.fetched = Stage(), {}, {}, set()
     request = InferRequest(session_id="s", epoch=1, input_ids=[1], restore_length=10, checkpoint_key="k")
     with pytest.raises(HTTPException) as caught:
         runtime._session(request)
@@ -289,10 +309,254 @@ def test_restored_tokens_are_counted_by_where_they_came_from():
             return "disk"
 
     runtime = worker.WorkerRuntime.__new__(worker.WorkerRuntime)
-    runtime.gguf, runtime.caches, runtime.tokens_reused = Stage(), {}, {}
+    runtime.gguf, runtime.caches, runtime.tokens_reused, runtime.fetched = Stage(), {}, {}, set()
     request = InferRequest(session_id="s", epoch=1, input_ids=[1], restore_length=10, reused_rows=10, checkpoint_key="k", restore_kind=PREFIX)
     assert runtime._session(request).length == 10
     assert runtime.tokens_reused == {"prefix_disk": 10}
+
+    runtime.fetched.add("k")
+    runtime._session(request)
+    assert runtime.tokens_reused == {"prefix_disk": 10, "prefix_copy": 10}, "a copy from another node counts as one, once"
+    assert not runtime.fetched
+
+
+def test_a_state_on_another_node_is_fetched_before_the_pass(monkeypatch):
+    prompt = chat(200, 100, 10)
+    key = prefix_key(prompt[:300])
+    runtime = fake_entry(monkeypatch, [{"token_id": 5}])
+    runtime.prefix.add(key, 300, HISTORY, elsewhere=True)
+    assert generate(prompt) == [{"token_id": 5}]
+    assert runtime.prepared == [key]
+    assert runtime.passes[0].checkpoint_key == key
+    assert key not in runtime.prefix.elsewhere, "only the first reply has to ask"
+
+
+def test_a_copy_nobody_can_fetch_costs_a_replay_and_not_the_reply(monkeypatch):
+    prompt = chat(200, 100, 10)
+    key = prefix_key(prompt[:300])
+    runtime = fake_entry(monkeypatch, [{"token_id": 5}])
+    runtime.can_fetch = False
+    runtime.prefix.add(key, 300, HISTORY, elsewhere=True)
+    assert generate(prompt) == [{"token_id": 5}]
+    assert runtime.passes[0].checkpoint_key is None and runtime.passes[0].input_ids == prompt
+    assert runtime.state_misses == 1
+
+
+def test_a_state_held_here_needs_no_fetching(monkeypatch):
+    prompt = chat(200, 100, 10)
+    runtime = fake_entry(monkeypatch, [{"token_id": 5}])
+    runtime.prefix.add(prefix_key(prompt[:300]), 300, HISTORY)
+    generate(prompt)
+    assert runtime.prepared == []
+
+
+def test_however_many_states_go_missing_the_last_attempt_needs_none(monkeypatch):
+    prompt = chat(200, 100, 100, 100, 10)
+    keys = [prefix_key(prompt[:length]) for length in (200, 300, 400, 500)]
+    runtime = fake_entry(monkeypatch, [{"token_id": 5}])
+    runtime.can_fetch = False
+    for key, length in zip(keys, (200, 300, 400, 500)):
+        runtime.prefix.add(key, length, HISTORY, elsewhere=True)
+    assert generate(prompt) == [{"token_id": 5}]
+    assert runtime.passes[-1].input_ids == prompt and runtime.passes[-1].reset
+
+
+# What a stage does when a reply needs a state it does not have.
+
+
+class Host:
+    """A stage process's side of holding states."""
+
+    def __init__(self, held=()):
+        self.held = set(held)
+        self.adopted = []
+
+    def call(self, operation, **meta):
+        if operation == "state_has":
+            return {"held": meta["key"] in self.held}, b""
+        if operation == "state_adopt":
+            self.adopted.append(meta["key"])
+            return {"adopted": True}, b""
+        if operation == "state_list":
+            return {"states": [{"key": key, "length": 300, "kind": HISTORY} for key in self.held]}, b""
+        raise AssertionError(operation)
+
+
+def stage_runtime(tmp_path, handler, held=(), peers=("http://peer:1",)):
+    runtime = worker.WorkerRuntime.__new__(worker.WorkerRuntime)
+    runtime.gguf = SimpleNamespace(host=Host(held))
+    runtime.namespace, runtime.state_peers, runtime.fetched, runtime.copies_fetched = "space", list(peers), set(), 0
+    runtime.pool_token, runtime.cache_dir = None, tmp_path
+    (tmp_path / "states" / "space").mkdir(parents=True)
+    runtime.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return runtime
+
+
+def test_a_stage_holding_a_state_fetches_nothing(tmp_path):
+    def handler(request):
+        raise AssertionError("no need to ask anyone")
+
+    assert asyncio.run(stage_runtime(tmp_path, handler, held=["abc"]).ensure_state("abc"))
+
+
+def test_a_stage_taking_over_fetches_its_copy(tmp_path):
+    runtime = stage_runtime(tmp_path, lambda request: httpx.Response(200, content=b"a state"))
+    assert asyncio.run(runtime.ensure_state("abc"))
+    assert runtime.gguf.host.adopted == ["abc"]
+    assert "abc" in runtime.fetched and runtime.copies_fetched == 1
+    assert (tmp_path / "states" / "space" / "abc.part").read_bytes() == b"a state"
+
+
+def test_a_stage_tries_each_node_for_a_copy(tmp_path):
+    def handler(request):
+        return httpx.Response(200 if request.url.host == "second" else 404, content=b"a state")
+
+    runtime = stage_runtime(tmp_path, handler, peers=("http://first:1", "http://second:1"))
+    assert asyncio.run(runtime.ensure_state("abc"))
+
+
+def test_with_no_copy_anywhere_a_stage_says_so(tmp_path):
+    assert not asyncio.run(stage_runtime(tmp_path, lambda request: httpx.Response(404)).ensure_state("abc"))
+
+
+def test_a_silent_holder_only_costs_a_listing_its_timeout(tmp_path):
+    def handler(request):
+        raise httpx.ReadTimeout("silent")
+
+    runtime = stage_runtime(tmp_path, handler, held=["own"])
+    assert list(asyncio.run(runtime.restorable())) == ["own"]
+
+
+def test_what_others_hold_for_these_layers_is_marked_as_elsewhere(tmp_path):
+    def handler(request):
+        assert request.url.path == "/internal/state/held/space"
+        states = [{"key": "own", "length": 300, "kind": HISTORY}, {"key": "theirs", "length": 900, "kind": HISTORY}]
+        return httpx.Response(200, json={"states": states})
+
+    found = asyncio.run(stage_runtime(tmp_path, handler, held=["own"]).restorable())
+    assert not found["own"]["elsewhere"] and found["theirs"]["elsewhere"]
+
+
+def entry_runtime(tmp_path, handler, stages, held=()):
+    runtime = stage_runtime(tmp_path, handler, held=held, peers=())
+    runtime.worker_id, runtime.epoch, runtime.index_epoch = "w1", 3, 1
+    runtime.prompt_cache, runtime.prefix, runtime.index_lock = True, PrefixIndex(), asyncio.Lock()
+    runtime.route = [SimpleNamespace(worker_id=name, url=f"http://{name}:1") for name in stages]
+    return runtime
+
+
+def test_a_new_entry_worker_learns_only_what_every_stage_can_restore(tmp_path):
+    def handler(request):
+        states = [{"key": "both", "length": 300, "kind": HISTORY, "elsewhere": True}, {"key": "theirs", "length": 900, "kind": HISTORY, "elsewhere": False}]
+        return httpx.Response(200, json={"states": states})
+
+    runtime = entry_runtime(tmp_path, handler, ["w1", "w2"], held=["both", "mine"])
+    asyncio.run(runtime.sync_index())
+    assert list(runtime.prefix.entries) == ["both"]
+    assert runtime.prefix.elsewhere == {"both"}, "any stage needing a fetch means asking them all first"
+
+
+def test_a_stage_that_will_not_answer_leaves_nothing_to_reuse(tmp_path):
+    def handler(request):
+        raise httpx.ConnectError("gone")
+
+    runtime = entry_runtime(tmp_path, handler, ["w1", "w2"], held=["both"])
+    asyncio.run(runtime.sync_index())
+    assert not runtime.prefix.entries
+
+
+def test_the_stages_are_only_asked_once_per_route(tmp_path):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json={"states": []})
+
+    runtime = entry_runtime(tmp_path, handler, ["w1", "w2"])
+    asyncio.run(runtime.sync_index())
+    asyncio.run(runtime.sync_index())
+    assert len(calls) == 1
+    runtime.epoch = 4
+    asyncio.run(runtime.sync_index())
+    assert len(calls) == 2
+
+
+def test_every_stage_must_have_a_state_before_a_reply_counts_on_it(tmp_path):
+    answers = {"w2": True, "w3": False}
+
+    def handler(request):
+        return httpx.Response(200, json={"ready": answers[request.url.host]})
+
+    runtime = entry_runtime(tmp_path, handler, ["w1", "w2", "w3"], held=["abc"])
+    assert not asyncio.run(runtime.prepare_state("abc"))
+    answers["w3"] = True
+    assert asyncio.run(runtime.prepare_state("abc"))
+
+
+def test_a_stage_that_stops_answering_is_not_waited_on_for_a_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(worker, "FETCH_SECONDS", 0.05)
+
+    async def handler(request):
+        await asyncio.sleep(30)
+
+    runtime = entry_runtime(tmp_path, handler, ["w1", "w2"], held=["abc"])
+    began = time.monotonic()
+    assert not asyncio.run(runtime.prepare_state("abc"))
+    assert time.monotonic() - began < 5
+
+
+# Who keeps the copy.
+
+
+def registered(name, machine, roles=("inference",)):
+    hardware = SimpleNamespace(host_id=machine, contribution=SimpleNamespace(roles=list(roles)))
+    registration = SimpleNamespace(hardware=hardware, advertised_url=f"http://{name}:1/")
+    return SimpleNamespace(registration=registration, live=True, quarantined=False)
+
+
+def holders(workers, order):
+    plane = Orchestrator.__new__(Orchestrator)
+    plane.workers = workers
+    return plane.copy_holders([SimpleNamespace(worker_id=name) for name in order])
+
+
+def test_each_stage_copies_to_exactly_one_other_machine():
+    found = holders({"a": registered("a", "m1"), "b": registered("b", "m2"), "c": registered("c", "m3")}, ["a", "b", "c"])
+    assert found == {"a": "http://b:1", "b": "http://c:1", "c": "http://a:1"}
+
+
+def test_a_copy_on_the_same_machine_is_no_copy():
+    found = holders({"a": registered("a", "m1"), "b": registered("b", "m1"), "c": registered("c", "m2")}, ["a", "b", "c"])
+    assert found == {"a": "http://c:1", "b": "http://c:1", "c": "http://a:1"}
+
+
+def test_a_node_offering_memory_for_this_goes_first():
+    memory = registered("m", "m9", ("kv-cache", "checkpoint"))
+    found = holders({"a": registered("a", "m1"), "b": registered("b", "m2"), "m": memory}, ["a", "b"])
+    assert set(found.values()) == {"http://m:1"}
+
+
+def test_a_lone_stage_uses_any_other_node():
+    assert holders({"a": registered("a", "m1"), "b": registered("b", "m2")}, ["a"]) == {"a": "http://b:1"}
+
+
+def test_with_nowhere_else_to_go_a_state_stays_local():
+    assert holders({"a": registered("a", "m1")}, ["a"]) == {}
+
+
+def test_nodes_that_are_down_keep_no_copies():
+    gone = registered("b", "m2")
+    gone.live = False
+    held = registered("c", "m3")
+    held.quarantined = True
+    assert holders({"a": registered("a", "m1"), "b": gone, "c": held}, ["a"]) == {}
+
+
+def test_both_ends_agree_on_what_a_store_is_called():
+    """A copy is found by this name, worked out separately by a control plane and a worker."""
+    stage = SimpleNamespace(start_layer=14, end_layer=28)
+    request = SimpleNamespace(model_id="m", revision="r", speculate_tokens=2, assignment=stage)
+    assert worker.WorkerRuntime.state_namespace(request) == stage_namespace(PINNED_BUILD, "m", "r", 14, 28, 2)
 
 
 def test_prompt_rows_never_merge_with_other_conversations():
@@ -426,6 +690,41 @@ def test_a_state_outlives_the_stage_process_that_saved_it(tmp_path):
         assert np.array_equal(run(second, tokens, start=700, slot=1), expected)
     finally:
         second.close()
+
+
+@needs_real_model
+@pytest.mark.parametrize("seed", range(4))
+def test_a_false_state_fails_cleanly_and_harms_nothing_else(tmp_path, seed):
+    """A checksum shows damage, not honesty: a pool member could send anything that passes."""
+    from isharded.statestore import StateStore
+
+    real = start_stage(tmp_path, disk=1024**3)
+    tokens = tokens_for_test()
+    expected = run(real, tokens, cuts=[700], saves=[save_at(700, "good")])
+    wait_for_file(tmp_path / "good.state")
+    genuine = np.fromfile(tmp_path / "good.state", dtype=np.uint8)
+    real.close()
+
+    rng = np.random.default_rng(seed)
+    forged = {
+        0: rng.integers(0, 256, size=100_000, dtype=np.uint8),  # nothing like a state
+        1: genuine[-200_000:].copy(),  # the tail of a real one
+        2: genuine[1000:].copy(),  # a real one, with the start missing
+        3: genuine[300:].copy(),
+    }[seed]
+    store = StateStore(tmp_path, 1024**3, 1024**3)
+    store.put("forged", forged, 700)
+    store.close()
+
+    stage = start_stage(tmp_path, disk=1024**3)
+    try:
+        with pytest.raises(LlamaError) as refused:
+            stage.call("restore", key="forged", slot=1)
+        assert not isinstance(refused.value, StageLost), "llama.cpp refused it, and the process lives"
+        stage.call("restore", key="good", slot=1)
+        assert np.array_equal(run(stage, tokens, start=700, slot=1), expected), "the stage still answers correctly"
+    finally:
+        stage.close()
 
 
 def request_for(start=0, end=14, model="m", revision="r", speculate=0):
