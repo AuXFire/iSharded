@@ -46,6 +46,7 @@ MAX_STEPS = 50
 DEFAULT_STEPS = 8
 DEFAULT_SECONDS = 300.0
 RECORD_LIMIT = 8000
+JSON_ATTEMPTS = 64  # bounded, so a reply of nested braces costs little
 # A control answer no real test should accept. A test that passes on either of these proves nothing.
 CONTROL_ANSWERS = ("", "zzqx control answer")
 
@@ -255,9 +256,11 @@ def _clean_rules(rules: dict[str, Any] | None, task_type: str) -> dict[str, Any]
 def _json_object(text: str) -> dict[str, Any] | None:
     """The first JSON object in a model's reply, fenced or not."""
     start = text.find("{")
-    while start != -1:
+    for _ in range(JSON_ATTEMPTS):
+        if start == -1:
+            break
         try:
-            value, _ = json.JSONDecoder().raw_decode(text[start:])
+            value, _ = json.JSONDecoder().raw_decode(text, start)
         except (RecursionError, ValueError):
             start = text.find("{", start + 1)
             continue
