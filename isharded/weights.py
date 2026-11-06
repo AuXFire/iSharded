@@ -59,6 +59,7 @@ COALESCE_GAP_BYTES = 256 * 1024
 CHUNK_BYTES = 1024 * 1024
 FETCH_RETRIES = 6
 HOST_CHECK_SECONDS = 5.0
+STALE_PART_SECONDS = 600.0  # a live transfer writes far more often than this
 # Disk space a fetch must leave behind, so a download cannot fill the volume.
 DISK_RESERVE_BYTES = 2 * 1024**3
 
@@ -935,6 +936,16 @@ class UnitCache:
     def used_bytes(self) -> int:
         return sum(path.stat().st_size for path in self._files())
 
+    def _clear_leftovers(self) -> None:
+        """A process that dies mid-transfer leaves its partial files, and nothing else would remove them."""
+        stale = time.time() - STALE_PART_SECONDS
+        for path in self.root.rglob("*.part"):
+            try:
+                if path.stat().st_mtime < stale:
+                    path.unlink()
+            except OSError:
+                pass  # another process may be finishing with it
+
     def make_room(self, needed: int, protected: set[Path]) -> None:
         """Evict least recently used units until ``needed`` bytes fit."""
         files = sorted(
@@ -978,6 +989,7 @@ class UnitCache:
     ) -> None:
         """Bring every unit into the cache, skipping any already present."""
         self.root.mkdir(parents=True, exist_ok=True)  # it may have been cleared by hand
+        self._clear_leftovers()
         for unit in units:
             # What is already on disk gets no more trust than what arrives.
             if unit.sha256 and self.has(model_id, revision, unit) and not self._intact(model_id, revision, unit):

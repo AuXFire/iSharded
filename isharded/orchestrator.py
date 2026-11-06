@@ -89,6 +89,8 @@ MAX_MISSED_POLLS = 6
 LAYER_FLOOR_MS = 0.5
 # Small models that share a vocabulary with a family, for speculative decoding.
 AUTO_DRAFTS = {
+    "qwen3": "unsloth/Qwen3-0.6B-GGUF:Qwen3-0.6B-Q8_0.gguf",
+    "qwen3moe": "unsloth/Qwen3-0.6B-GGUF:Qwen3-0.6B-Q8_0.gguf",
     "qwen35": "lmstudio-community/Qwen3.5-0.8B-GGUF:Qwen3.5-0.8B-Q8_0.gguf",
     "qwen35moe": "lmstudio-community/Qwen3.5-0.8B-GGUF:Qwen3.5-0.8B-Q8_0.gguf",
 }

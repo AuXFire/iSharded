@@ -258,6 +258,22 @@ def test_a_source_with_altered_weights_stops_the_load(held, tmp_path: Path) -> N
     assert not cache.path("m", "r", "unit").exists()
 
 
+def test_partial_files_from_a_dead_process_are_cleared(held, tmp_path: Path) -> None:
+    import os
+
+    unit, _ = held
+    cache = UnitCache(tmp_path / "cache")
+    folder = cache.path("m", "r", "unit").parent
+    folder.mkdir(parents=True)
+    dead, live = folder / "unit.1.2.part", folder / "unit.3.4.part"
+    dead.write_bytes(b"x")
+    live.write_bytes(b"x")
+    os.utime(dead, (1, 1))
+    cache.fetch(str(tmp_path / "model"), "m", "r", [unit], FetchProgress("j"))
+    assert not dead.exists()
+    assert live.exists()
+
+
 def test_weights_altered_on_disk_are_fetched_again(held, tmp_path: Path) -> None:
     unit, file = held
     unit = hashed(unit, file)
