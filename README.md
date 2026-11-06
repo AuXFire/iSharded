@@ -939,6 +939,10 @@ A flag takes priority over its variable.
 | `ISHARDED_HOST_MODELS` | `--host-models` |
 | `ISHARDED_MODEL_DIRS` | `--model-dir`, separated by the system's path separator |
 | `ISHARDED_REUSE_CACHED`, `ISHARDED_PEER_FETCH` | Set to `0` for the control plane's `--no-reuse-cached`, `--no-peer-fetch` |
+| `ISHARDED_ENGINE` | Set to `0` to run without the native engine, on the Python path |
+| `ISHARDED_ENGINE_LIB` | The native engine's library, if it is not in `isharded/native` |
+| `ISHARDED_RING` | Set to `0` on the coordinator to keep replies off the direct links between stages |
+| `ISHARDED_DATA_PORT` | The port for direct links between stages. It must be reachable from the other stages. Default: any free port |
 | `ISHARDED_HOST_ID` | Which physical machine a worker is on. Defaults to the computer name, so workers sharing a host do not count its RAM twice |
 | `ISHARDED_FETCH_CONCURRENCY` | Units a worker fetches at once. Default 4 |
 | `ISHARDED_ACCESS_LOG` | Set to `1` to log every request while debugging. Off by default, because nodes poll each other constantly |
