@@ -416,6 +416,32 @@ def test_an_approval_is_not_for_another_actor_or_task_or_user(broker):
         assert broker.check(the_call, other).verdict is Verdict.ASK
 
 
+def test_moving_a_link_after_an_approval_makes_it_a_different_action(broker, tmp_path):
+    allowed, elsewhere = tmp_path / "allowed", tmp_path / "elsewhere"
+    allowed.mkdir()
+    elsewhere.mkdir()
+    link = allowed / "out"
+    link_directory(link, allowed)
+    calls = make(broker, "demo.put", effects=(Effect.WRITE_LOCAL,), scope_field="path")
+    broker.add_grant("ann", "demo.put", str(allowed), "ann")
+    the_call = call("demo.put", path=str(link / "note.txt"))
+    approved(broker, broker.check(the_call, context(tainted=True)))
+    os.rmdir(link) if sys.platform == "win32" else os.unlink(link)
+    link_directory(link, elsewhere)
+    assert not broker.invoke(the_call, context(tainted=True)).ok
+    assert calls == [], "a yes given for one place was spent on another"
+
+
+def test_a_person_is_shown_where_a_path_really_leads(broker, tmp_path):
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    make(broker, "demo.put", effects=(Effect.WRITE_LOCAL,), scope_field="path")
+    broker.add_grant("ann", "demo.put", str(allowed), "ann")
+    written = os.path.join(str(allowed), "sub", "..", "note.txt")
+    decision = broker.check(call("demo.put", path=written), context(tainted=True))
+    assert broker.approval(decision.approval_id)["arguments"]["path"] == os.path.realpath(allowed / "note.txt")
+
+
 def test_asking_twice_is_one_question(broker):
     make(broker, "demo.act", effects=(Effect.EXECUTE,))
     broker.add_grant("ann", "demo.act", None, "ann")

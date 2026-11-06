@@ -26,7 +26,7 @@ Nothing runs until a grant covers this user, this capability, and this scope. An
 
 `*` covers everything in any kind, and you must say it on purpose. A capability with no `scope_field` takes no scope. A list argument needs every item covered.
 
-**An approval** covers one exact action, by the SHA-256 of its canonical arguments. It is bound to the user, capability, actor, and task, it works once, and changed arguments need a new one. Saying no withdraws a yes that was not used yet. Only a person can grant or approve: names starting `skill:`, `peer:`, `task:`, `model:`, `plugin:`, or `conversation` are refused.
+**An approval** covers one exact action, by the SHA-256 of its canonical arguments, with a path counted as where it really leads. So a person is shown the real place, and moving a link after they said yes makes it a different action. It is bound to the user, capability, actor, and task, it works once, and changed arguments need a new one. Saying no withdraws a yes that was not used yet. Only a person can grant or approve: names starting `skill:`, `peer:`, `task:`, `model:`, `plugin:`, or `conversation` are refused.
 
 Every decision is audited, refusals included, with the argument hash and never the values. A result is trust EXTERNAL unless a tool proved otherwise, and only `verified` counts as proof.
 

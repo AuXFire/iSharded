@@ -253,18 +253,18 @@ class CapabilityBroker:
         arguments = self._resolved(capability, call.arguments)
         physical = Effect.PHYSICAL in capability.effects
         grant = None if physical else self._grant(capability, context.user, call.arguments)
-        approval = self._approved(call, context)
+        approval = self._approved(call, context, arguments)
         if context.actor.startswith(SKILL_PREFIX) and grant is None:
             return self._denied(capability, context, "A skill gets only what a grant already covers."), {}
         if physical:
-            return (self._by_approval(approval, spend) if approval else self._ask(call, context, "physical")), arguments
+            return (self._by_approval(approval, spend) if approval else self._ask(call, context, "physical", arguments)), arguments
         tainted = context.tainted or context.actor.startswith(PEER_PREFIX)
         if capability.consequential and tainted:
             if approval:
                 return self._by_approval(approval, spend), arguments
             if grant is None:
                 return self._denied(capability, context, "Nothing covers this, and it came from a tainted context."), {}
-            return self._ask(call, context, "tainted"), arguments
+            return self._ask(call, context, "tainted", arguments), arguments
         if approval:
             return self._by_approval(approval, spend), arguments
         if grant is None:
@@ -329,13 +329,13 @@ class CapabilityBroker:
                 return Decision(Verdict.DENY, "That approval was already used.", approval_id=approval["id"])
         return Decision(Verdict.ALLOW, "A person approved this exact action.", approval_id=approval["id"])
 
-    def _ask(self, call: ToolCall, context: CallContext, why: str) -> Decision:
+    def _ask(self, call: ToolCall, context: CallContext, why: str, arguments: dict[str, Any]) -> Decision:
         reason = {
             "physical": f"{call.capability} moves or powers real hardware, so a person approves every action.",
             "tainted": f"{call.capability} has consequences and untrusted text could have steered this call, "
             "so a standing grant does not apply. A person must approve this exact action.",
         }[why]
-        approval_id = self.request_approval(context.user, call.capability, call.arguments, context.actor, context.task_id, reason)
+        approval_id = self.request_approval(context.user, call.capability, arguments, context.actor, context.task_id, reason)
         return Decision(Verdict.ASK, f"{reason} Run: shardmesh assistant approvals approve {approval_id}", approval_id=approval_id)
 
     def _record(self, stage: str, call: ToolCall, context: CallContext, decision: Decision) -> None:
@@ -480,12 +480,17 @@ class CapabilityBroker:
 
     # Approvals.
 
-    def _approved(self, call: ToolCall, context: CallContext) -> Any | None:
-        """Bound to who asked as well, so another actor cannot spend someone else's yes."""
+    def _approved(self, call: ToolCall, context: CallContext, arguments: dict[str, Any]) -> Any | None:
+        """Bound to who asked, so another actor cannot spend someone else's yes.
+
+        And to where a path really leads, not how it was written, so moving a link
+        after a person said yes makes it a different action, and shows them the real
+        place when they are asked.
+        """
         return self.store.one(
             "SELECT * FROM approvals WHERE user = ? AND capability = ? AND args_hash = ? AND actor = ? AND task_id IS ? "
             "AND status = 'approved' ORDER BY requested_at, id LIMIT 1",
-            (context.user, call.capability, argument_hash(call.arguments), context.actor, context.task_id),
+            (context.user, call.capability, argument_hash(arguments), context.actor, context.task_id),
         )
 
     def request_approval(
