@@ -266,16 +266,19 @@ class Toolbox:
 
 
 def ask_at_terminal(name: str, arguments: dict[str, Any]) -> bool:
-    """Is a person there, and do they agree? Without a terminal, the answer is no."""
-    if not sys.stdin.isatty():
-        print(f"Refused {name}: it is not marked read-only, and there is no terminal to ask at. Use --allow {name} to permit it.", file=sys.stderr)
+    """Is a person there, and do they agree? Without a terminal, the answer is no.
+
+    Stdout is for the answer alone. Windows calls NUL a terminal, so an empty read counts as none too.
+    """
+    answer = ""
+    if sys.stdin.isatty():
+        # json.dumps escapes control characters, so a tool cannot rewrite this question.
+        print(f"Run the tool {json.dumps(name)} with {json.dumps(arguments)}?\nAllow? [y/N] ", end="", file=sys.stderr, flush=True)
+        answer = sys.stdin.readline()
+    if not answer:
+        print(f"Refused {json.dumps(name)}: it is not marked read-only, and there is no terminal to ask at. Use --allow to permit it.", file=sys.stderr)
         return False
-    # json.dumps escapes control characters, so a tool cannot rewrite this question.
-    print(f"Run the tool {json.dumps(name)} with {json.dumps(arguments)}?", file=sys.stderr)
-    try:
-        return input("Allow? [y/N] ").strip().lower() in {"y", "yes"}
-    except EOFError:
-        return False
+    return answer.strip().lower() in {"y", "yes"}
 
 
 def run_call(toolbox: Toolbox, call: dict[str, Any], allowed: set[str], timeout: float, ask: Callable[[str, dict[str, Any]], bool]) -> str:

@@ -889,27 +889,38 @@ def test_annotations_other_than_true_do_not_count(started):
     assert not toolbox.read_only("add")
 
 
+class Terminal(io.StringIO):
+    def isatty(self):
+        return True
+
+
 def test_with_no_terminal_nobody_can_say_yes(monkeypatch, capsys):
     monkeypatch.setattr("sys.stdin", io.StringIO("y\n"))
     assert ask_at_terminal("write_note", {"text": "x"}) is False
-    assert "--allow write_note" in capsys.readouterr().err
+    assert "--allow" in capsys.readouterr().err
+
+
+def test_a_device_that_only_claims_to_be_a_terminal_is_refused_with_the_reason(monkeypatch, capsys):
+    # Windows' NUL says it is a terminal, and then reads as empty.
+    monkeypatch.setattr("sys.stdin", Terminal(""))
+    assert ask_at_terminal("write_note", {"text": "x"}) is False
+    assert "--allow" in capsys.readouterr().err
 
 
 def test_at_a_terminal_the_answer_decides(monkeypatch, capsys):
-    class Terminal(io.StringIO):
-        def isatty(self):
-            return True
-
-    for typed, expected in (("y\n", True), ("YES\n", True), ("n\n", False), ("\n", False), ("", False)):
+    for typed, expected in (("y\n", True), ("YES\n", True), ("n\n", False), ("\n", False)):
         monkeypatch.setattr("sys.stdin", Terminal(typed))
         assert ask_at_terminal("write_note", {"text": "x"}) is expected
 
 
-def test_a_tool_cannot_rewrite_the_question_with_control_characters(monkeypatch, capsys):
-    class Terminal(io.StringIO):
-        def isatty(self):
-            return True
+def test_the_question_stays_off_stdout(monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin", Terminal("y\n"))
+    ask_at_terminal("write_note", {"text": "x"})
+    captured = capsys.readouterr()
+    assert captured.out == "" and "Allow?" in captured.err
 
+
+def test_a_tool_cannot_rewrite_the_question_with_control_characters(monkeypatch, capsys):
     monkeypatch.setattr("sys.stdin", Terminal("n\n"))
     ask_at_terminal("evil\x1b[2K", {"text": "\x1b[1A\rAllow? harmless"})
     assert "\x1b" not in capsys.readouterr().err
