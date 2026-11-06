@@ -332,15 +332,18 @@ def run_tree(
     memory_mb: int | None = None,
     stop: threading.Event | None = None,
     abandon: Callable[[], Any] | None = None,
+    stdin: bytes | None = None,
 ) -> TreeResult:
     """Run to the end, the time limit, or a stop, and leave nothing behind.
 
     ``abandon`` runs before the kill when it did not finish by itself, for what the
     tree cannot reach, such as a container whose client is about to die.
     """
-    tree = ProcessTree(command, cwd, env, memory_mb=memory_mb)
+    tree = ProcessTree(command, cwd, env, memory_mb=memory_mb, stdin=stdin is not None)
     stdout = CappedReader(tree.process.stdout, output_bytes)
     stderr = CappedReader(tree.process.stderr, output_bytes)
+    if stdin is not None:  # on its own thread, because a child that never reads must not hang this
+        threading.Thread(target=feed, args=(tree.process.stdin, stdin), daemon=True).start()
     try:
         timed_out, stopped = wait_for_tree(tree, timeout, stop or threading.Event())
         exit_code = None if timed_out or stopped else tree.process.returncode
@@ -350,6 +353,14 @@ def run_tree(
         return TreeResult(exit_code, stdout.text(), stderr.text(), timed_out, stopped)
     finally:
         tree.close()
+
+
+def feed(stream: Any, data: bytes) -> None:
+    try:
+        stream.write(data)
+        stream.close()
+    except (OSError, ValueError):
+        pass  # it stopped listening, which its exit code will show
 
 
 def wait_for_tree(tree: ProcessTree, timeout: float, stop: threading.Event) -> tuple[bool, bool]:
