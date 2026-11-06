@@ -207,12 +207,16 @@ def forced_opening(plan: ToolPlan) -> str:
     A model cannot decline a call it has already begun, so this is real control
     over the part that matters most, on any route, with no change to the workers.
     The arguments are still the model's own: nothing here constrains them to the schema.
+
+    An opening must end where the tokenizer would end a token, or the model is
+    left after a token it has never seen there. ``=get`` is one token, so stopping
+    at ``<function=`` broke 4 of 8 calls that the same model wrote well unforced.
     """
     name = plan.forced
     if name is None:
         return ""
     if plan.format == "xml":
-        return f"<tool_call>\n<function={name}>\n" if name else "<tool_call>\n<function="
+        return f"<tool_call>\n<function={name}>\n" if name else "<tool_call>\n<function"
     if plan.format == "mistral":
         if plan.new_style:
             return f"[TOOL_CALLS]{name}[ARGS]" if name else "[TOOL_CALLS]"

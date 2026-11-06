@@ -456,7 +456,7 @@ def test_ids_are_what_each_family_will_take_back():
         (QWEN3, {"type": "function", "function": {"name": "get_time"}}, '<tool_call>\n{"name": "get_time", "arguments":'),
         (QWEN3, "required", '<tool_call>\n{"name": "'),
         (QWEN35, {"type": "function", "function": {"name": "get_time"}}, "<tool_call>\n<function=get_time>\n"),
-        (QWEN35, "required", "<tool_call>\n<function="),
+        (QWEN35, "required", "<tool_call>\n<function"),
         (LLAMA3 + "tool_call", {"type": "function", "function": {"name": "get_time"}}, '{"name": "get_time", "parameters":'),
         (MISTRAL, {"type": "function", "function": {"name": "get_time"}}, '[TOOL_CALLS] [{"name": "get_time", "arguments":'),
         (MISTRAL + "[ARGS]", {"type": "function", "function": {"name": "get_time"}}, "[TOOL_CALLS]get_time[ARGS]"),
@@ -488,6 +488,13 @@ def test_a_forced_call_the_model_ruins_is_reported_and_never_invented():
     assert calls == []
     assert "required a call to get_weather" in words and "no tool was called" in words
     assert words.endswith("I would rather not.") and "<tool_call>" not in words
+
+
+def test_the_model_finishes_a_required_call_from_where_the_opening_stops():
+    opening = forced_opening(plan_tools([WEATHER, OTHER], "required", None, QWEN35))
+    text = "=get_time>\n</function>\n</tool_call>"
+    for step in (None, 1, 4):
+        assert scan("xml", text, step, tools=[WEATHER, OTHER], choice="required", opening=opening) == ("", [("get_time", {})])
 
 
 def test_a_required_call_the_model_ruins_is_reported():
@@ -818,3 +825,18 @@ def test_a_real_gguf_keeps_tool_markers_and_renders_tools():
     )
     prompt = chat.render_chat(messages, tools=[WEATHER])
     assert "get_weather" in prompt and "Paris" in prompt and "<tool_response>" in prompt
+
+
+@needs_real_model
+@pytest.mark.parametrize("choice", ["required", {"type": "function", "function": {"name": "get_time"}}])
+def test_a_forced_opening_ends_where_a_real_token_ends(choice):
+    from shardmesh.tokenizer import load_tokenizer
+
+    chat = load_tokenizer(MODEL)
+    plan = plan_tools([WEATHER, OTHER], choice, None, chat.tool_template)
+    whole = {
+        "xml": "<tool_call>\n<function=get_time>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>",
+        "hermes": '<tool_call>\n{"name": "get_time", "arguments": {"city": "Oslo"}}\n</tool_call>',
+    }[plan.format]
+    opening = chat.encode(forced_opening(plan))
+    assert chat.encode(whole)[: len(opening)] == opening
