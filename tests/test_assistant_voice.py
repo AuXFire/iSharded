@@ -540,7 +540,7 @@ def test_bad_bodies_are_refused(assistant):
 
 
 def test_too_much_audio_is_refused_before_it_is_kept(assistant, monkeypatch):
-    monkeypatch.setattr("shardmesh.assistant.voice.MAX_AUDIO_BYTES", 1000)
+    monkeypatch.setattr("shardmesh.assistant.voice_http.MAX_AUDIO_BYTES", 1000)
     with Server(assistant) as url:
         response = post(f"{url}/assistant/voice/transcribe", content=b"x" * 2000, headers={"Content-Type": "audio/wav"})
     assert response.status_code == 413

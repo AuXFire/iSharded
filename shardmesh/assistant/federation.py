@@ -6,13 +6,12 @@ Both owners agree before anything works, each install applies its own policy and
 keeps its own record, and either can walk away at once and carry on alone.
 
 Every message is signed by its sender and sealed to its recipient, so the network
-in between only carries bytes. The protocol is in docs/assistant-parts/growth.md.
+in between only carries bytes. The protocol is in docs/ASSISTANT.md.
 """
 from __future__ import annotations
 
-import argparse
 import base64
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 import hashlib
 import hmac
@@ -28,9 +27,6 @@ import time
 from typing import Any
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, FastAPI, Request
-from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse
 import httpx
 
 from .contracts import (
@@ -77,6 +73,10 @@ REQUEST, RESULT, NOTICE, NOTICE_REPLY = "request", "result", "notice", "notice-r
 OFFERS, COLLECT = "federation.offers", "federation.collect"
 MODELS = "models.complete"
 PEER_SEND = "peer.send"
+# A peer has no key here. Every message proves itself, so a gateway leaves exactly these open.
+PUBLIC_ROUTES = frozenset(
+    {("GET", "/federation/identity"), ("POST", "/federation/pair"), ("POST", "/federation/request"), ("POST", "/federation/notice")}
+)
 # A peer may never relay through this install, or reach what the owner keeps private.
 NEVER_OFFERED = ("peer.", "federation.", "memory.", "identity.", "skills.")
 PRIVATE_READS = frozenset({"memory", "memories", "identity", "users", "grants"})
@@ -451,6 +451,12 @@ class Federation:
             (_check_address(value),),
         )
 
+    def listening_at(self, host: str, url: str) -> None:
+        """Remember where peers can reach this install, keeping an address the owner chose."""
+        stored = urlsplit(self.address).hostname
+        if host not in WILDCARD and (stored is None or stored in LOOPBACK):
+            self.address = url
+
     def broker(self) -> Any:
         """Whichever broker is present, told what federation provides."""
         broker = getattr(self.assistant, "broker", None)
@@ -549,7 +555,8 @@ class Federation:
         try:
             response = self._post(f"{address}/federation/pair", message, CONNECT_SECONDS + 10.0)
         except httpx.HTTPError as error:
-            raise FederationError(f"Could not reach {address}: {error}. Check that their install is serving and try again.") from error
+            # Their side may have used the code up before the answer was lost, so a retry can be refused.
+            raise FederationError(f"Could not reach {address}: {error}. Check that their install is serving and try again, with a new code if this one is refused.") from error
         reply = self._json(response)
         if response.status_code != 200:
             raise FederationError(f"They turned this down: {reply.get('refused', response.status_code)}.")
@@ -706,7 +713,12 @@ class Federation:
 
     # What this install lets a peer call.
 
-    def offer(self, name: str, capability: str, per_day: int | None = None) -> None:
+    def offer(self, name: str, capability: str, per_day: int | None = None, scope: str | None = None) -> None:
+        """One act by the owner: the offer, and the grant the peer's own user needs to use it.
+
+        Kept as one so the two cannot drift. A peer is its own user, so without this an
+        offer would do nothing, and owners would have to grant to a fingerprint by hand.
+        """
         peer = self.named(name)
         if peer.state == REVOKED:
             raise FederationError(f"{peer.name} was revoked. Nothing can be offered to them.")
@@ -714,12 +726,32 @@ class Federation:
         if limit < 1:
             raise FederationError("--per-day must be at least 1. To stop offering something, use --withdraw.")
         self._check_offerable(capability)
-        self.store.execute(
-            "INSERT INTO federation_offers (fingerprint, capability, per_day, created_at) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(fingerprint, capability) DO UPDATE SET per_day = excluded.per_day",
-            (peer.fingerprint, capability, limit, self.clock()),
-        )
-        self.audit.record(self.owner, "federation.offered", peer.name, {"peer": peer.fingerprint, "capability": capability, "per_day": limit})
+        with self.store.transaction():
+            self.store.execute(
+                "INSERT INTO federation_offers (fingerprint, capability, per_day, created_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(fingerprint, capability) DO UPDATE SET per_day = excluded.per_day",
+                (peer.fingerprint, capability, limit, self.clock()),
+            )
+            self._grant_to_peer(peer, capability, scope)
+            self.audit.record(self.owner, "federation.offered", peer.name, {"peer": peer.fingerprint, "capability": capability, "per_day": limit})
+
+    def _grant_to_peer(self, peer: Peer, capability: str, scope: str | None) -> None:
+        broker = self.broker()
+        if broker is None:
+            return
+        self._end_grants(peer, capability)  # offering again replaces the old scope
+        try:
+            broker.add_grant(peer.actor, capability, scope, self.owner)
+        except ValueError as error:
+            raise FederationError(f"{capability} cannot be offered yet: {error} Give the scope with --scope.") from None
+
+    def _end_grants(self, peer: Peer, capability: str | None = None) -> None:
+        broker = self.broker()
+        if broker is None:
+            return
+        for row in broker.grants(peer.actor):
+            if capability in (None, row["capability"]):
+                broker.revoke_grant(row["id"], self.owner)
 
     def _check_offerable(self, capability: str) -> None:
         if not CAPABILITY_NAME.fullmatch(capability):
@@ -733,8 +765,10 @@ class Federation:
 
     def withdraw(self, name: str, capability: str) -> None:
         peer = self.named(name)
-        self.store.execute("DELETE FROM federation_offers WHERE fingerprint = ? AND capability = ?", (peer.fingerprint, capability))
-        self.audit.record(self.owner, "federation.withdrawn", peer.name, {"peer": peer.fingerprint, "capability": capability})
+        with self.store.transaction():
+            self.store.execute("DELETE FROM federation_offers WHERE fingerprint = ? AND capability = ?", (peer.fingerprint, capability))
+            self._end_grants(peer, capability)
+            self.audit.record(self.owner, "federation.withdrawn", peer.name, {"peer": peer.fingerprint, "capability": capability})
 
     def offers_to(self, peer: Peer) -> list[dict[str, Any]]:
         rows = self.store.query(
@@ -758,6 +792,7 @@ class Federation:
             self.store.execute("DELETE FROM federation_offers WHERE fingerprint = ?", (peer.fingerprint,))
             self.store.execute("DELETE FROM federation_inbound WHERE fingerprint = ?", (peer.fingerprint,))
             self.store.execute("UPDATE federation_peers SET their_offers = '[]' WHERE fingerprint = ?", (peer.fingerprint,))
+            self._end_grants(peer)
             self.audit.record(actor or self.owner, action, peer.name, {"peer": peer.fingerprint})
 
     # Sending.
@@ -817,6 +852,9 @@ class Federation:
         """Runs only with the broker's say-so, and checks disclosure again: arguments can come from a model."""
         peer = self.named(arguments.get("peer"))
         items = arguments.get("items") or []
+        if context.reach < Reach.PEER:
+            self.audit.record(context.actor, "federation.disclosure_refused", peer.name, {"capability": arguments.get("capability"), "reach": context.reach.name.lower()})
+            raise FederationError(f"Text in this turn may go no further than {context.reach.name.lower()}, so nothing was sent to a peer.")
         if not isinstance(items, list) or any(not isinstance(item, dict) or _too_near(item.get("reach")) for item in items):
             self.audit.record(context.actor, "federation.disclosure_refused", peer.name, {"capability": arguments.get("capability")})
             raise FederationError("An item without permission to reach a peer was in this send, so nothing was sent.")
@@ -1154,7 +1192,15 @@ class Federation:
             self._offer(peer, row["capability"])
         except Refused as refusal:
             return self._finish(row["request_hash"], {"status": "refused", "reason": str(refusal)})
+        if self._owner_said_no(row["approval_id"]):
+            # Asking the broker again would put a fresh question, so a peer could wear a "no" down.
+            return self._finish(row["request_hash"], {"status": "refused", "reason": "the owner of this install said no"})
         return self._dispatch(peer, row["capability"], json.loads(row["arguments"]), row["request_hash"])
+
+    def _owner_said_no(self, approval_id: str | None) -> bool:
+        lookup = getattr(self.broker(), "approval", None)
+        decided = lookup(approval_id) if lookup and approval_id else None
+        return bool(decided) and decided["status"] == "denied"
 
     def _record_received(self, peer: Peer, body: dict[str, Any], request_hash: str, outcome: dict[str, Any]) -> None:
         capability = body.get("capability")
@@ -1301,6 +1347,22 @@ class Federation:
             return {}
         return reply if isinstance(reply, dict) else {}
 
+    def answers(self, peer: Peer) -> str | None:
+        """Why this peer cannot be used right now, or None if it is there and is who it should be."""
+        if peer.state != PAIRED:
+            return f"{peer.name} is {peer.state}"
+        if not peer.address:
+            return f"{peer.name} has no address"
+        verify = ssl.create_default_context() if peer.address.startswith("https:") else False
+        try:
+            with httpx.Client(timeout=CONNECT_SECONDS, trust_env=False, verify=verify) as client:
+                response = client.get(f"{peer.address}/federation/identity")
+        except httpx.HTTPError as error:
+            return f"{peer.name} cannot be reached: {type(error).__name__}"
+        if self._json(response).get("fingerprint") != peer.fingerprint:
+            return f"The install at {peer.address} is not {peer.name}"
+        return None
+
     # A peer's models, for the router.
 
     def sync_providers(self) -> list[str]:
@@ -1320,6 +1382,7 @@ class Federation:
 class PeerProvider:
     """A peer's models at reach PEER. It holds no authority and adds no tools."""
 
+    kind = "peer"
     reach = Reach.PEER
 
     def __init__(self, federation: Federation, peer: str) -> None:
@@ -1327,7 +1390,22 @@ class PeerProvider:
         self.peer = peer
         self.name = f"peer:{peer}"
 
-    def complete(self, request: ModelRequest) -> ModelReply:
+    def current_model(self) -> str:
+        """Which model answers is the peer's business, and each reply says what it was."""
+        return MODELS
+
+    def health(self) -> dict[str, Any]:
+        started = time.monotonic()
+        problem = self.federation.answers(self.federation.named(self.peer))
+        return {"up": problem is None, "models": [] if problem else [MODELS], "error": problem, "seconds": time.monotonic() - started}
+
+    def stream(self, request: ModelRequest, model: str = MODELS) -> Iterator[str | ModelReply]:
+        """A peer answers whole, so this comes as one piece."""
+        reply = self.complete(request, model)
+        yield reply.text
+        yield reply
+
+    def complete(self, request: ModelRequest, model: str = MODELS) -> ModelReply:
         if request.reach < Reach.PEER:
             raise FederationError(f"This prompt may not leave for a peer (reach {request.reach.name}), so {self.name} cannot take it.")
         started = time.monotonic()
@@ -1354,56 +1432,18 @@ class PeerProvider:
         )
 
 
-async def _read_body(request: Request) -> Any:
-    """Bounded before anyone is identified."""
-    if int(request.headers.get("content-length") or 0) > MAX_MESSAGE_BYTES:
-        raise Refused("this message is too large")
-    body = b""
-    async for chunk in request.stream():
-        body += chunk
-        if len(body) > MAX_MESSAGE_BYTES:
-            raise Refused("this message is too large")
-    try:
-        return json.loads(body)
-    except (RecursionError, ValueError) as error:
-        raise Refused("this message could not be opened") from error
+def routes(assistant: Any) -> Any:
+    """The HTTP half is kept apart, because every shardmesh command imports this module."""
+    from . import federation_http
 
-
-def routes(assistant: Any) -> APIRouter:
-    """Only what a stranger may reach. Messages prove themselves, so a gateway must not ask them for a key."""
-    router = APIRouter(prefix="/federation")
-    federation = assistant.federation
-
-    async def answer(request: Request, handler: Callable[[Any], tuple[int, dict[str, Any]]]) -> JSONResponse:
-        try:
-            status, reply = await run_in_threadpool(handler, await _read_body(request))
-        except Refused as refusal:
-            return JSONResponse({"refused": str(refusal)}, status_code=403)
-        return JSONResponse(reply, status_code=status)
-
-    @router.get("/identity")
-    async def identity() -> dict[str, Any]:
-        return {"fingerprint": federation.identity.fingerprint, "protocol": PROTOCOL}
-
-    @router.post("/pair")
-    async def pair(request: Request) -> JSONResponse:
-        return await answer(request, federation.pair)
-
-    @router.post("/request")
-    async def incoming(request: Request) -> JSONResponse:
-        return await answer(request, federation.receive)
-
-    @router.post("/notice")
-    async def notice(request: Request) -> JSONResponse:
-        return await answer(request, federation.receive_notice)
-
-    return router
+    return federation_http.routes(assistant)
 
 
 class FederationServer:
     """The federation routes on their own, for installs without the gateway, and for tests."""
 
     def __init__(self, assistant: Any, host: str = "127.0.0.1", port: int = 0) -> None:
+        from fastapi import FastAPI
         import uvicorn
 
         app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -1477,10 +1517,12 @@ def run_offer(assistant: Any, args: Any) -> int:
     if args.capability and args.withdraw:
         federation.withdraw(args.name, args.capability)
     elif args.capability:
-        federation.offer(args.name, args.capability, args.per_day)
+        federation.offer(args.name, args.capability, args.per_day, args.scope)
     print(_show(federation.named(args.name), federation))
     if args.capability and not args.withdraw:
-        print(f"An offer is not a grant. The broker must also allow user peer:{federation.named(args.name).fingerprint} to use it.")
+        declared = assistant.broker.capability(args.capability)
+        waits = " Each call has consequences, so each one waits for your approval: `approvals list`." if declared.consequential else ""
+        print(f"Granted to their user here, peer:{federation.named(args.name).fingerprint}, and to nobody else.{waits}")
     return 0
 
 
@@ -1525,11 +1567,10 @@ def run_offers(assistant: Any, args: Any) -> int:
 
 def _advertise(federation: Federation, args: Any, url: str) -> None:
     """Keep an address the owner chose, unless they give a new one."""
-    stored = urlsplit(federation.address).hostname
     if args.address:
         federation.address = args.address
-    elif args.host not in WILDCARD and (stored is None or stored in LOOPBACK):
-        federation.address = url
+    else:
+        federation.listening_at(args.host, url)
 
 
 def run_serve(assistant: Any, args: Any) -> int:
@@ -1587,7 +1628,8 @@ def add_commands(commands: Any) -> None:
     offer.add_argument("name", help="the peer's name here")
     offer.add_argument("capability", nargs="?", default=None, help="such as models.complete, which shares models and no memory")
     offer.add_argument("--per-day", type=int, default=None, help=f"calls allowed in any 24 hours; default {DEFAULT_PER_DAY}")
-    offer.add_argument("--withdraw", action="store_true", help="stop offering it")
+    offer.add_argument("--scope", default=None, help="a folder, host, or glob, for a capability that has a scope; * allows everything, on purpose")
+    offer.add_argument("--withdraw", action="store_true", help="stop offering it, and end the grant that came with it")
     offer.set_defaults(run=_guarded(run_offer))
 
     revoke = actions.add_parser("revoke", help="end a pairing at once, and tell them if they can be reached")

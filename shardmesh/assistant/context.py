@@ -191,7 +191,7 @@ class Context:
         if lookup is None:
             return []
         try:
-            found = lookup(user, query, SKILL_RESULTS)
+            found = lookup(user, query, limit=SKILL_RESULTS)
         except Exception as error:
             self.assistant.audit.record("context", "context.skills_failed", f"user:{user}", {"error": type(error).__name__})
             return []

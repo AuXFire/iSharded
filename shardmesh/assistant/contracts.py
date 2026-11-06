@@ -6,7 +6,7 @@ allowed: the assistant's store, broker, and task engine do that.
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -90,6 +90,7 @@ class CallContext:
     actor: str  # conversation, task:<id>, skill:<id>, peer:<id>
     tainted: bool = False  # EXTERNAL text was in the context that produced this call
     task_id: str | None = None
+    reach: Reach = Reach.CLOUD  # the furthest the text behind this call may go; a tool that stores or sends text keeps to it
 
 
 @dataclass(frozen=True)
@@ -125,12 +126,31 @@ Handler = Callable[[dict[str, Any], CallContext], ToolResult]
 
 
 class Broker(Protocol):
-    """The only way anything uses a tool. Denies whatever is not granted."""
+    """The only way anything uses a tool. Denies whatever is not granted.
+
+    ``check`` can be repeated. It spends no use and no approval. It does write to the
+    audit trail, and when the answer is ASK it puts the question to a person: asking
+    again about the same exact action while that is unanswered returns the same
+    approval, and asking after a person said no puts a new question.
+
+    Only a person's name can be given as ``by``. Peers, skills, tasks, and models are refused.
+    """
 
     def register(self, capability: Capability, handler: Handler) -> None: ...
     def capabilities(self) -> list[Capability]: ...
     def check(self, call: ToolCall, context: CallContext) -> Decision: ...
     def invoke(self, call: ToolCall, context: CallContext) -> ToolResult: ...
+    def covers(self, user: str, capability: str, arguments: dict[str, Any]) -> bool: ...
+    def add_grant(
+        self, user: str, capability: str, scope: str | None, by: str, expires_at: float | None = None, uses: int | None = None
+    ) -> str: ...
+    def revoke_grant(self, grant_id: str, by: str) -> bool: ...
+    def grants(self, user: str | None = None, include_ended: bool = False) -> list[dict[str, Any]]: ...
+    def approval(self, approval_id: str) -> dict[str, Any] | None: ...
+    def approvals(self, user: str | None = None, status: str | None = "pending") -> list[dict[str, Any]]: ...
+    def decide(self, approval_id: str, approved: bool, by: str, user: str | None = None) -> bool:
+        """A person's answer. False means it was not waiting, so nothing changed."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -153,6 +173,21 @@ class ModelReply:
     prompt_tokens: int
     completion_tokens: int
     seconds: float
+
+
+class Provider(Protocol):
+    """Where a model runs. The router picks one, and holds it to its reach."""
+
+    name: str
+    kind: str  # mesh, openai, or peer
+    reach: Reach  # the furthest text sent here travels
+
+    def complete(self, request: ModelRequest, model: str) -> ModelReply: ...
+    def stream(self, request: ModelRequest, model: str) -> Iterator[str | ModelReply]: ...
+    def current_model(self) -> str | None: ...
+    def health(self) -> dict[str, Any]:
+        """``up``, ``models``, ``error``, and ``seconds``."""
+        ...
 
 
 class Router(Protocol):
@@ -188,9 +223,23 @@ class Sandbox(Protocol):
 
 
 class TaskEngine(Protocol):
+    """Runs plans. Whoever hosts the assistant calls ``start``, or nothing runs them.
+
+    ``status`` has ``id``, ``user``, ``title``, ``status``, ``tainted`` as a bool that
+    covers every step, and ``steps``, each with ``id``, ``kind``, ``status``, ``capability``,
+    ``tainted``, ``error``, and ``approval_id``.
+    """
+
     def submit(self, user: str, plan: dict[str, Any]) -> str: ...
-    def status(self, task_id: str) -> dict[str, Any]: ...
+    def status(self, task_id: str, user: str | None = None) -> dict[str, Any]: ...
     def cancel(self, task_id: str, by: str) -> None: ...
+    def start(self) -> None: ...
+    def stop(self, wait_seconds: float = 5.0) -> None: ...
+    def runner(self) -> dict[str, Any] | None:
+        """The live process running tasks, or None, so a task can say it is only queued."""
+        ...
+
+    def list_tasks(self, user: str | None = None, limit: int = 50, active_only: bool = False) -> list[dict[str, Any]]: ...
 
 
 def lowest_reach(items: Iterable[ContextItem]) -> Reach:

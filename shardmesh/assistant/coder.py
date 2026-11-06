@@ -859,7 +859,9 @@ Nothing here changes stored data unless the diff says so, so read it for new mig
         known = (declared[capability].input_schema.get("properties") or {}) if capability in declared else {}
         if not known:
             return values
-        return {next((alias for alias in aliases[key] if alias in known), key): value for key, value in values.items()}
+        # A tool that does not take a value refuses the whole call if it is sent one.
+        named = {key: next((alias for alias in aliases[key] if alias in known), None) for key in values}
+        return {name: values[key] for key, name in named.items() if name is not None}
 
     def _through_broker(self, run: Run, call: ToolCall, context: CallContext) -> Any:
         broker = getattr(self.assistant, "broker", None)
@@ -919,6 +921,7 @@ Nothing here changes stored data unless the diff says so, so read it for new mig
 def attach(assistant: Any) -> None:
     assistant.store.migrate("coder", SCHEMA)
     assistant.coder = Coder(assistant)
+    assistant.open_folders.append(assistant.coder.home)  # git.commit has to reach the worktrees
 
 
 def _print_run(run: Run) -> None:

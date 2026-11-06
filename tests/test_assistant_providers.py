@@ -175,7 +175,8 @@ def test_a_long_reply_of_code_is_scanned_quickly():
 def stream_through(text: str, size: int, offered=OFFERED) -> str:
     visible = VisibleText(offered)
     pieces = [visible.feed(text[start : start + size]) for start in range(0, len(text), size)]
-    return "".join(pieces) + visible.flush()
+    tail = visible.flush()
+    return "".join(pieces) + ("" if parse_tool_calls(text, offered)[1] else tail)  # as the router does
 
 
 @pytest.mark.parametrize("size", [1, 2, 3, 5, 7, 16, 1000])
@@ -191,10 +192,32 @@ def stream_through(text: str, size: int, offered=OFFERED) -> str:
         ("A < b and c > d, with `code`.", "A < b and c > d, with `code`."),
         ("<think>never ends", ""),
         ("Unfinished ```python\nprint(1)", "Unfinished ```python\nprint(1)"),
+        # A call with no fence, which is what a real small model wrote.
+        ('{"name": "files.read", "arguments": {"path": "a.txt"}}', ""),
+        ('Reading it. {"name": "files.read", "arguments": {}}', "Reading it. "),
+        ('{"name": "files.read", "arguments": {}}\n{"name": "files.read", "arguments": {}}', ""),
+        ('{"name": "files.read", "arguments": {}} is how you would call it.', '{"name": "files.read", "arguments": {}} is how you would call it.'),
+        ('{"name": "something.else", "arguments": {}}', '{"name": "something.else", "arguments": {}}'),
+        ('A set {1, 2} and a call {"name": "files.read", "arguments": {}}', "A set {1, 2} and a call "),
+        ("A set {1, 2} and more.", "A set {1, 2} and more."),
+        ("An open { that never closes.", "An open { that never closes."),
+        ('Cut off: {"name": "files.read", "arguments": {"pa', 'Cut off: {"name": "files.read", "arguments": {"pa'),
+        ('Shown as `{"name": "files.read", "arguments": {}}`', 'Shown as `{"name": "files.read", "arguments": {}}`'),
     ],
 )
 def test_a_stream_hides_the_same_things_however_it_is_split(text, shown, size):
     assert stream_through(text, size) == shown
+
+
+def test_what_is_not_a_call_is_released_as_soon_as_that_is_known():
+    visible = VisibleText(OFFERED)
+    assert visible.feed("A set {1, 2}") == "A set {1, 2}"
+    assert visible.feed(" and more words.") == " and more words."
+
+
+@pytest.mark.parametrize("text", ['{"name": "files.read", "arguments": {}}', 'I will read it. {"name": "files.read", "arguments": {"path": "a.txt"}}'])
+def test_a_stream_and_the_final_reply_agree_on_what_a_person_sees(text):
+    assert stream_through(text, 3).strip() == parse_tool_calls(text, OFFERED)[0]
 
 
 def test_ordinary_code_is_not_held_until_the_end():
@@ -240,7 +263,7 @@ def test_tools_are_offered_to_the_mesh_in_the_system_prompt():
     with FakeModelServer(mesh_shape=True) as server:
         MeshProvider("mesh", server.url).complete(request(tools=OFFERED), "fake-model")
     system = server.requests[0]["body"]["messages"][0]["content"]
-    assert system.startswith("Be kind.") and "files.read" in system and "mail.send" in system and "```tool" in system
+    assert system.startswith("Be kind.") and "files.read" in system and "mail.send" in system and "<tool_call>" in system
     assert server.requests[0]["body"]["messages"].count({"role": "system", "content": system}) == 1
 
 
@@ -431,7 +454,7 @@ def test_native_tools_are_sent_with_names_the_api_allows():
     assert [tool["function"]["name"] for tool in tools] == ["files__read", "mail__send"]
     assert tools[0]["function"]["parameters"]["properties"]["path"] == {"type": "string"}
     assert reply.tool_calls == (ToolCall("files.read", {"path": "a.txt"}, "call_1"),)
-    assert "```tool" not in server.requests[0]["body"]["messages"][0]["content"]
+    assert "<tool_call>" not in server.requests[0]["body"]["messages"][0]["content"]
 
 
 def test_a_native_call_to_something_not_offered_is_dropped():

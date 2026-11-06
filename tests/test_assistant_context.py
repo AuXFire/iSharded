@@ -341,7 +341,7 @@ def test_a_failing_skills_part_does_not_stop_a_turn(assistant):
 
 
 def test_it_works_with_no_skills_attribute(assistant):
-    assert not hasattr(assistant, "skills")
+    del assistant.skills
     assert assistant.context.build("alice", "tea").messages
 
 

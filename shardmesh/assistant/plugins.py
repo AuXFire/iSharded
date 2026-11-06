@@ -562,7 +562,7 @@ def add_commands(commands: Any) -> None:
     plugin = commands.add_parser("plugin", help="install tools from outside, behind the broker")
     actions = plugin.add_subparsers(dest="plugin_command", required=True)
     add = actions.add_parser("add", help="install a plugin or an MCP server from a manifest, or turn it back on")
-    add.add_argument("manifest", help="the manifest file; see docs/assistant-parts/hands.md")
+    add.add_argument("manifest", help="the manifest file; see docs/ASSISTANT.md")
     add.add_argument("--effects", default=None, help="what every tool in it can do, comma separated, overriding the manifest")
     add.add_argument("--tool-effects", action="append", default=[], metavar="TOOL=EFFECTS", help="what one tool can do; can repeat")
     add.add_argument("--env", action="append", default=[], metavar="NAME", help="an environment variable to pass through, by name; can repeat")

@@ -281,7 +281,7 @@ class FakeBroker:
         self.verdicts: dict[str, Verdict] = {}
         self.approved: set[str] = set()
         self.declined: set[str] = set()
-        self.approvals: dict[str, dict[str, Any]] = {}
+        self.asked: dict[str, dict[str, Any]] = {}
         self.checks: list[tuple[ToolCall, CallContext]] = []
         self.invocations: list[tuple[ToolCall, CallContext]] = []
 
@@ -310,8 +310,8 @@ class FakeBroker:
                 return Decision(Verdict.ALLOW, "approved")
             if key in self.declined:
                 return Decision(Verdict.DENY, "a person declined this")
-            approval = f"approval-{len(self.approvals) + 1}"
-            self.approvals[approval] = {"key": key, "user": context.user, "capability": call.capability}
+            approval = f"approval-{len(self.asked) + 1}"
+            self.asked[approval] = {"key": key, "user": context.user, "capability": call.capability}
             return Decision(Verdict.ASK, "a person must approve this", approval_id=approval)
         return Decision(verdict, "by policy" if verdict is Verdict.ALLOW else f"{call.capability} is not granted")
 
@@ -319,11 +319,28 @@ class FakeBroker:
         self.invocations.append((call, context))
         return self.tools[call.capability][1](call.arguments, context)
 
-    def approve(self, approval_id: str, by: str = "owner") -> None:
-        self.approved.add(self.approvals[approval_id]["key"])
+    def decide(self, approval_id: str, approved: bool, by: str, user: str | None = None) -> bool:
+        asked = self.asked.get(approval_id)
+        if asked is None or asked.get("status", "pending") != "pending":
+            return False
+        asked["status"] = "approved" if approved else "denied"
+        (self.approved if approved else self.declined).add(asked["key"])
+        return True
 
-    def deny(self, approval_id: str, by: str = "owner") -> None:
-        self.declined.add(self.approvals[approval_id]["key"])
+    def approve(self, approval_id: str, by: str = "owner") -> None:
+        self.decide(approval_id, True, by)
+
+    def approval(self, approval_id: str) -> dict[str, Any] | None:
+        asked = self.asked.get(approval_id)
+        return {"id": approval_id, "status": asked.get("status", "pending"), **asked} if asked else None
+
+    def approvals(self, user: str | None = None, status: str | None = "pending") -> list[dict[str, Any]]:
+        rows = [self.approval(name) for name in self.asked]
+        return [row for row in rows if user in (None, row["user"]) and status in (None, row["status"])]
+
+    def grants(self, user: str | None = None, include_ended: bool = False) -> list[dict[str, Any]]:
+        """Every tool counts as granted here. A test says what happens with `verdicts`."""
+        return [{"capability": name} for name in self.tools]
 
 
 def wait_until(condition: Any, seconds: float = 5.0) -> bool:

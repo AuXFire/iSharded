@@ -238,6 +238,7 @@ def test_a_tool_that_is_not_registered_is_denied_by_the_broker(assistant):
 
 
 def test_with_no_broker_nothing_runs_and_nothing_is_offered(assistant):
+    del assistant.broker
     router = scripted(assistant, model_reply("", call("files.delete")), "No tools here.")
     result = assistant.conversation.say("alice", "Delete everything", learn="off")
     assert router.requests[0].tools == () and result.text == "No tools here."
@@ -315,8 +316,8 @@ class TaintAwareBroker(FakeBroker):
             key = json.dumps([call.capability, call.arguments], sort_keys=True)
             if key in self.approved:
                 return Decision(Verdict.ALLOW, "a person approved this exact action")
-            approval = f"approval-{len(self.approvals) + 1}"
-            self.approvals[approval] = {"key": key, "user": context.user, "capability": call.capability}
+            approval = f"approval-{len(self.asked) + 1}"
+            self.asked[approval] = {"key": key, "user": context.user, "capability": call.capability}
             return Decision(Verdict.ASK, "untrusted text is in view", approval_id=approval)
         return Decision(Verdict.ALLOW, "standing grant")
 
@@ -557,24 +558,13 @@ def test_a_second_call_after_the_first_is_approved_asks_again(assistant):
     assert final.status == "done" and len(assistant.broker.invocations) == 2
 
 
-def test_a_decision_goes_to_the_broker_by_whichever_name_it_uses(assistant):
+def test_a_decision_reaches_the_broker_and_a_stale_one_is_reported(assistant):
     assistant.broker = FakeBroker()
     assistant.broker.add("mail.send", verdict=Verdict.ASK)
-    assistant.broker.approvals["a"] = {"key": "k", "user": "alice", "capability": "mail.send"}
+    assistant.broker.asked["a"] = {"key": "k", "user": "alice", "capability": "mail.send"}
     assert decide_approval(assistant, "a", True, "alice") is True and "k" in assistant.broker.approved
-    assert decide_approval(assistant, "a", False, "alice") is True and "k" in assistant.broker.declined
-
-    class Other:
-        def __init__(self):
-            self.calls = []
-
-        def decide(self, approval_id, approved, by):
-            self.calls.append((approval_id, approved, by))
-
-    assistant.broker = Other()
-    assert decide_approval(assistant, "b", True, "alice") is True
-    assert assistant.broker.calls == [("b", True, "alice")]
-    assistant.broker = object()
+    assert decide_approval(assistant, "a", False, "alice") is False  # it was already decided
+    assistant.broker = None
     assert decide_approval(assistant, "c", True, "alice") is False
 
 
@@ -718,14 +708,28 @@ class Tasks:
         return "task-1"
 
     def status(self, task_id):
-        return {"id": task_id, "state": "running"}
+        return {"id": task_id, "status": "running"}
 
     def cancel(self, task_id, by):
         pass
 
+    def runner(self):
+        return {"pid": 1}
+
+
+class Plans:
+    """A planner that takes the goal as given, so these tests can look at what happens next."""
+
+    def __init__(self):
+        self.reaches = []
+
+    def plan(self, user, goal, reach=Reach.POOL, tainted=False):
+        self.reaches.append(reach)
+        return {"goal": goal, "steps": []}
+
 
 def test_full_work_goes_to_the_task_engine_when_attached(assistant):
-    assistant.tasks = Tasks()
+    assistant.tasks, assistant.planner = Tasks(), Plans()
     router = scripted(assistant)
     result = assistant.conversation.say("alice", "Check the backups every morning and tell me", learn="off")
     assert result.status == "task" and result.task_id == "task-1" and "task-1" in result.text
@@ -735,13 +739,14 @@ def test_full_work_goes_to_the_task_engine_when_attached(assistant):
 
 
 def test_a_forced_task_does_not_carry_its_prefix(assistant):
-    assistant.tasks = Tasks()
+    assistant.tasks, assistant.planner = Tasks(), Plans()
     scripted(assistant)
     assistant.conversation.say("alice", "/task tidy the shed", learn="off")
     assert assistant.tasks.submitted[0][1]["goal"] == "tidy the shed"
 
 
 def test_without_a_task_engine_everything_is_answered_directly(assistant):
+    del assistant.tasks
     router = scripted(assistant, "Here is my best attempt.")
     result = assistant.conversation.say("alice", "/task tidy the shed", learn="off")
     assert result.status == "done" and router.requests[0].role == "conversation"
@@ -749,7 +754,7 @@ def test_without_a_task_engine_everything_is_answered_directly(assistant):
 
 
 def test_only_what_software_cannot_tell_goes_to_a_model(assistant):
-    assistant.tasks = Tasks()
+    assistant.tasks, assistant.planner = Tasks(), Plans()
     router = scripted(assistant, "full")
     result = assistant.conversation.say("alice", "Please build a small tool that reads my calendar and sends a summary", learn="off")
     assert router.requests[0].role == "decision" and result.status == "task"
@@ -760,14 +765,14 @@ def test_only_what_software_cannot_tell_goes_to_a_model(assistant):
 
 
 def test_a_failed_decision_stays_small(assistant):
-    assistant.tasks = Tasks()
+    assistant.tasks, assistant.planner = Tasks(), Plans()
     scripted(assistant, RuntimeError("no decision model"), "Answered directly.")
     result = assistant.conversation.say("alice", "Please build a small tool that reads my calendar and sends a summary", learn="off")
     assert result.status == "done" and assistant.tasks.submitted == []
 
 
 def test_a_rejected_plan_is_answered_directly_and_audited(assistant):
-    assistant.tasks = Tasks(ValueError("that plan is invalid"))
+    assistant.tasks, assistant.planner = Tasks(ValueError("that plan is invalid")), Plans()
     scripted(assistant, "Answered directly.")
     result = assistant.conversation.say("alice", "Check the backups every morning and tell me", learn="off")
     assert result.status == "done" and any(row["action"] == "conversation.handoff_failed" for row in assistant.audit.read())
@@ -775,7 +780,7 @@ def test_a_rejected_plan_is_answered_directly_and_audited(assistant):
 
 def test_a_planner_is_used_when_attached(assistant):
     assistant.tasks = Tasks()
-    assistant.planner = type("Planner", (), {"plan": lambda self, user, goal: {"steps": [goal]}})()
+    assistant.planner = type("Planner", (), {"plan": lambda self, user, goal, reach=None: {"steps": [goal]}})()
     scripted(assistant)
     assistant.conversation.say("alice", "Check the backups every morning", learn="off")
     assert assistant.tasks.submitted[0][1] == {"steps": ["Check the backups every morning"]}

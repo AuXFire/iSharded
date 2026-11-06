@@ -57,6 +57,7 @@ class Assistant:
         self.clock = clock
         self.store = Store(self.home / "assistant.db")
         self.audit = AuditTrail(self.store, clock)
+        self.open_folders: list[Path] = []  # work kept under home that file and git tools may reach
         self.parts = installed_parts()
         for part in self.parts:
             attach = getattr(part, "attach", None)

@@ -20,6 +20,8 @@ from typing import Any
 
 from .broker import DEFAULT_USER
 from .contracts import Capability, Effect, ModelRequest, Reach
+from .providers import loose_json
+from .router import AllFailed, Refused
 from .tasks import count_steps, plan_errors, references_in, step_inputs, steps_referenced
 
 MAX_PLAN_STEPS = 50
@@ -93,11 +95,14 @@ def triage(goal: str) -> Triage:
 
 
 def parse_reply(text: str) -> Any:
-    """The model's JSON, allowing for the code fence many models add anyway."""
-    body = text.strip()
-    if body.startswith("```"):
-        body = re.sub(r"^```[A-Za-z]*\s*|\s*```$", "", body)
-    return json.loads(body)
+    """The model's JSON, allowing for the fences and words around it that models add anyway.
+
+    Whatever comes out still has to pass every check, so being generous here costs nothing.
+    """
+    found = loose_json(text)
+    if found is None:
+        raise ValueError("no complete JSON object was found in it")
+    return found
 
 
 def walk_steps(plan: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]:
@@ -273,6 +278,7 @@ class Planner:
                 continue
             entry = wanted.setdefault((capability.name, scope if isinstance(scope, str) else None), self._entry(user, capability, scope, physical))
             entry["steps"].append(step["id"])
+            entry["uses"] += 1 + step.get("retries", 0)  # each try spends a use, so a retry must have one
         return list(wanted.values())
 
     @staticmethod
@@ -286,6 +292,7 @@ class Planner:
             "scope": None if unknown or not needs_scope else scope,
             "effects": sorted(effect.value for effect in capability.effects),
             "steps": [],
+            "uses": 0,
             "note": (
                 "Moves or powers hardware, so a person approves each action when it runs."
                 if physical
@@ -306,7 +313,7 @@ class Planner:
             if capability is None or Effect.PHYSICAL in capability.effects or (capability.scope_field and entry["scope"] is None):
                 left.append(entry["capability"])
                 continue
-            granted.append(broker.add_grant(user, entry["capability"], entry["scope"], by, now + seconds, len(entry["steps"])))
+            granted.append(broker.add_grant(user, entry["capability"], entry["scope"], by, now + seconds, entry["uses"]))
         return {"granted": granted, "left_for_a_person": left}
 
 
@@ -327,7 +334,7 @@ def run_plan(assistant: Any, args: Any) -> int:
     print(f"{'Small enough to run directly' if judged.direct else 'Needs a plan'}: {judged.reason}")
     try:
         plan = assistant.planner.plan(args.user, args.goal)
-    except ValueError as error:
+    except (ValueError, Refused, AllFailed) as error:
         print(error)
         return 1
     text = json.dumps(plan, indent=2)

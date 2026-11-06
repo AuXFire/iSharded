@@ -19,9 +19,9 @@ import uuid
 
 from . import gateway_cli
 from .context import ContextTooSmall, TurnNotFound, estimate_tokens, merged
-from .contracts import CallContext, Capability, ContextItem, ModelReply, ModelRequest, Provenance, Reach, ToolCall, Trust, Verdict
+from .contracts import CallContext, Capability, ContextItem, Effect, ModelReply, ModelRequest, Provenance, Reach, ToolCall, Trust, Verdict
 from .memory import KINDS
-from .mind import actor, add_user_option, emit, LOCAL_USER, plainly
+from .mind import actor, add_user_option, emit, plainly
 from .providers import loose_json
 
 ROLE = "conversation"
@@ -74,23 +74,9 @@ def without_prefix(text: str) -> str:
 
 
 def decide_approval(assistant: Any, approval_id: str, approved: bool, by: str) -> bool:
-    """Tell the broker what a person decided, by whichever name it uses for that.
-
-    The contract covers asking and not answering, so this looks. It returns False
-    when the broker offers no way, which callers must report and not ignore.
-    """
+    """Tell the broker what a person decided. False means it was no longer waiting."""
     broker = getattr(assistant, "broker", None)
-    names = ("approve",) if approved else ("deny", "reject", "decline")
-    for name in names:
-        method = getattr(broker, name, None)
-        if method is not None:
-            method(approval_id, by)
-            return True
-    decide = getattr(broker, "decide", None)
-    if decide is not None:
-        decide(approval_id, approved, by)
-        return True
-    return False
+    return broker is not None and broker.decide(approval_id, approved, by)
 
 
 SCHEMA = [
@@ -231,7 +217,7 @@ class Conversation:
         yield from self._advance(turn, streaming)
 
     def _build(self, turn: Turn) -> None:
-        tools = self._tools()
+        tools = self._tools(turn.user)
         reserve = sum(estimate_tokens(tool.name + tool.summary + str(tool.input_schema)) for tool in tools)
         built = self.assistant.context.build(
             turn.user, turn.query, ROLE, self.budget_tokens, turn.conversation_id, turn.turn_id, reserve_tokens=reserve, exclude_turn=turn.turn_id,
@@ -240,13 +226,20 @@ class Conversation:
         turn.tainted = turn.tainted or built.tainted
         turn.reach = min(turn.reach, built.reach)
 
-    def _tools(self) -> list[Capability]:
-        """What to offer, harmless tools first, within a share of the budget."""
+    def _tools(self, user: str) -> list[Capability]:
+        """What this person could really use, harmless tools first, within a share of the budget.
+
+        Describing what nobody granted would only earn a refusal. With every part
+        attached it also filled the share, so a granted shell.run was never offered,
+        and a small model does worse the more it has to read.
+        """
         broker = getattr(self.assistant, "broker", None)
         if broker is None:
             return []
+        granted = {row["capability"] for row in broker.grants(user)}
+        usable = [tool for tool in broker.capabilities() if tool.name in granted or Effect.PHYSICAL in tool.effects]
         offered, spent = [], 0
-        for tool in sorted(broker.capabilities(), key=lambda item: (item.consequential, item.name)):
+        for tool in sorted(usable, key=lambda item: (item.consequential, item.name)):
             spent += estimate_tokens(tool.name + tool.summary + str(tool.input_schema))
             if spent > self.budget_tokens // TOOLS_SHARE:
                 break
@@ -256,7 +249,7 @@ class Conversation:
     # The loop
 
     def _advance(self, turn: Turn, streaming: bool, pending: Sequence[ToolCall] = ()) -> Iterator[str | TurnResult]:
-        tools = self._tools()
+        tools = self._tools(turn.user)
         if pending:
             paused = self._run_calls(turn, pending)
             if paused is not None:
@@ -346,7 +339,7 @@ class Conversation:
             if broker is None:
                 turn.transcript.append({"kind": "note", "text": f"{call.capability} is not available: no tools are installed."})
                 continue
-            context = CallContext(user=turn.user, actor=ROLE, tainted=turn.tainted)
+            context = CallContext(user=turn.user, actor=ROLE, tainted=turn.tainted, reach=turn.reach)
             decision = broker.check(call, context)
             if decision.verdict is Verdict.ASK:
                 return self._pause(turn, calls[index:], decision)
@@ -428,9 +421,8 @@ class Conversation:
 
         Taken by one caller only, so two clicks cannot run an action twice.
         """
-        cursor = self.store.connection.execute(
-            "UPDATE paused_turns SET status = 'running' WHERE turn_id = ? AND user = ? AND status = 'waiting'", (turn_id, user)
-        )
+        with self.store.transaction() as connection:
+            cursor = connection.execute("UPDATE paused_turns SET status = 'running' WHERE turn_id = ? AND user = ? AND status = 'waiting'", (turn_id, user))
         if cursor.rowcount == 0:
             raise TurnNotFound(f"No turn {turn_id} is waiting for a decision")
         row = self.store.one("SELECT * FROM paused_turns WHERE turn_id = ? AND user = ?", (turn_id, user))
@@ -440,7 +432,7 @@ class Conversation:
             transcript=state["transcript"], said=[], tools=state["tools"], rounds=state["rounds"], model=state["model"], provider=state["provider"],
         )
         try:
-            result = self._carry_on(turn, state, row["capability"], approved)
+            result = self._carry_on(turn, state, row, approved)
         except BaseException:
             # Put it back, so a person can decide again. Nothing runs twice: see __init__.
             self.store.execute("UPDATE paused_turns SET status = 'waiting' WHERE turn_id = ? AND user = ?", (turn_id, user))
@@ -450,9 +442,11 @@ class Conversation:
             self._learn_after(result, state["query"], learn)
         return result
 
-    def _carry_on(self, turn: Turn, state: dict[str, Any], capability: str, approved: bool) -> TurnResult:
+    def _carry_on(self, turn: Turn, state: dict[str, Any], paused: Any, approved: bool) -> TurnResult:
         if not approved:
-            return self._finish(turn, "done", f"Stopped. You declined {capability}, so it did not run.")
+            if paused["approval_id"]:  # or the question stays open in `approvals list` for nobody
+                decide_approval(self.assistant, paused["approval_id"], False, turn.user)
+            return self._finish(turn, "done", f"Stopped. You declined {paused['capability']}, so it did not run.")
         try:
             self._build(turn)  # afresh, so anything forgotten while waiting stays forgotten
         except ContextTooSmall as error:
@@ -481,10 +475,10 @@ class Conversation:
 
     def _plan(self, turn: Turn) -> dict[str, Any]:
         planner = getattr(self.assistant, "planner", None)
-        propose = next((getattr(planner, name) for name in ("plan", "propose") if hasattr(planner, name)), None)
-        if propose is not None:
-            return propose(turn.user, turn.query)
-        return {"goal": turn.query, "conversation_id": turn.conversation_id, "turn_id": turn.turn_id}
+        if planner is None:
+            raise ValueError("Handing work to a task needs the planner part")
+        # The goal is a person's own words, so it goes no further than theirs may.
+        return planner.plan(turn.user, turn.query, reach=turn.reach)
 
     def _hand_off(self, turn: Turn, kind: str) -> TurnResult | None:
         tasks = getattr(self.assistant, "tasks", None)
@@ -495,7 +489,8 @@ class Conversation:
         if kind != "full":
             return None
         try:
-            task_id = str(tasks.submit(turn.user, self._plan(turn)))
+            plan = self._plan(turn)
+            task_id = str(tasks.submit(turn.user, plan))
         except Exception as error:
             # Answering directly beats dropping the request.
             self.assistant.audit.record("conversation", "conversation.handoff_failed", f"turn:{turn.turn_id}", {"error": type(error).__name__})
@@ -504,7 +499,18 @@ class Conversation:
             "INSERT INTO handed_tasks (task_id, user, conversation_id, turn_id, created_at) VALUES (?, ?, ?, ?, ?)",
             (task_id, turn.user, turn.conversation_id, turn.turn_id, self.assistant.clock()),
         )
-        return replace(self._finish(turn, "task", f"This is a larger piece of work, so it is running as task {task_id}."), task_id=task_id)
+        return replace(self._finish(turn, "task", self._handed_notice(tasks, task_id, plan)), task_id=task_id)
+
+    @staticmethod
+    def _handed_notice(tasks: Any, task_id: str, plan: dict[str, Any]) -> str:
+        """What a person has to know, since a task can otherwise just sit there."""
+        words = [f"This is a larger piece of work, so it is now task {task_id}."]
+        needed = [entry.get("command") or entry.get("capability") for entry in plan.get("missing_grants", [])]
+        if needed:
+            words.append("It will stop at any step nothing allows yet. To allow them: " + "; ".join(needed) + ".")
+        if tasks.runner() is None:
+            words.append("Nothing is running tasks yet. `shardmesh assistant serve` or `task work` will run it.")
+        return " ".join(words)
 
     def tasks_of(self, user: str, limit: int = 100) -> list[str]:
         rows = self.store.query("SELECT task_id FROM handed_tasks WHERE user = ? ORDER BY created_at DESC LIMIT ?", (user, limit))
@@ -604,6 +610,8 @@ def footer(result: TurnResult) -> str:
     parts = [f"turn {result.turn_id}"]
     if result.model:
         parts.insert(0, f"{result.provider}/{result.model}")
+    if result.tools:  # a small model can invent what a tool would have said, and it reads just the same
+        parts.append("used " + " ".join(result.tools))
     if result.tainted:
         parts.append("tainted")
     return "[" + ", ".join(parts) + "]"
@@ -675,7 +683,7 @@ def ask_person(assistant: Any, user: str, result: TurnResult) -> TurnResult:
     except (EOFError, KeyboardInterrupt):
         approved = False
     if pending.get("approval_id") and not decide_approval(assistant, pending["approval_id"], approved, user) and approved:
-        emit("This broker offers no way to approve from here, so the action was not run.")
+        emit("That approval was no longer waiting, so the action was not run.")
         approved = False
     outcome = assistant.conversation.resume(user, result.turn_id, approved=approved)
     emit(outcome.text)

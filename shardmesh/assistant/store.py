@@ -6,6 +6,7 @@ backup and restore a single copy.
 """
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 import hashlib
@@ -17,7 +18,8 @@ import threading
 import time
 from typing import Any
 
-BUSY_MILLISECONDS = 10_000
+BUSY_MILLISECONDS = 10_000  # how long to wait on another process
+TURN_SECONDS = 60.0  # how long to wait behind other writers here; every write is short, so this means something is stuck
 GENESIS = "0" * 64
 
 
@@ -29,13 +31,55 @@ def default_home() -> Path:
     return Path(base) / "ShardMesh" / "assistant" if base else Path.home() / ".local" / "share" / "shardmesh" / "assistant"
 
 
+class Turns:
+    """First come, first served.
+
+    SQLite gives a waiting writer no turn. It sleeps and retries, and loses to anyone
+    writing back to back: with six conversations, ten tasks, and an index running,
+    a writer waited 11 s and two failed as locked. A plain lock would not help, since
+    the thread that just let go can take it again before the next one wakes.
+    """
+
+    def __init__(self) -> None:
+        self.guard = threading.Lock()
+        self.queue: deque[threading.Event] = deque()
+        self.taken = False
+
+    def take(self, seconds: float) -> bool:
+        with self.guard:
+            if not self.taken:
+                self.taken = True
+                return True
+            mine = threading.Event()
+            self.queue.append(mine)
+        if mine.wait(seconds):
+            return True
+        with self.guard:
+            if mine.is_set():  # handed over just as the time ran out
+                return True
+            self.queue.remove(mine)
+            return False
+
+    def give_back(self) -> None:
+        with self.guard:
+            if self.queue:
+                self.queue.popleft().set()  # handed straight over, so nobody can step in between
+            else:
+                self.taken = False
+
+
 class Store:
-    """One connection per thread, in WAL mode so readers never wait on a writer."""
+    """One connection per thread, in WAL mode so readers never wait on a writer.
+
+    Writers in this process queue in ``turns``, then wait on SQLite only for another
+    process. A write goes through ``transaction`` or ``execute``, or it skips the queue.
+    """
 
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
+        self.turns = Turns()
         self.execute("CREATE TABLE IF NOT EXISTS schema_versions (module TEXT PRIMARY KEY, version INTEGER NOT NULL)")
 
     @property
@@ -53,27 +97,44 @@ class Store:
         return connection
 
     @contextmanager
+    def _turn(self) -> Iterator[None]:
+        if not self.turns.take(TURN_SECONDS):
+            raise sqlite3.OperationalError("database is locked: too many writers were waiting")
+        try:
+            yield
+        finally:
+            self.turns.give_back()
+
+    @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         """All or nothing. Nested calls join the outer transaction."""
         connection = self.connection
-        outermost = self._local.depth == 0
-        if outermost:
+        if self._local.depth > 0:
+            self._local.depth += 1
+            try:
+                yield connection
+            finally:
+                self._local.depth -= 1
+            return
+        with self._turn():
             connection.execute("BEGIN IMMEDIATE")
-        self._local.depth += 1
-        try:
-            yield connection
-        except BaseException:
-            self._local.depth -= 1
-            if outermost:
+            self._local.depth = 1
+            try:
+                yield connection
+            except BaseException:
+                self._local.depth = 0
                 connection.execute("ROLLBACK")
-            raise
-        self._local.depth -= 1
-        if outermost:
+                raise
+            self._local.depth = 0
             connection.execute("COMMIT")
 
     def execute(self, sql: str, parameters: Sequence[Any] = ()) -> int:
         """Run a statement and return the new row's id."""
-        return self.connection.execute(sql, parameters).lastrowid or 0
+        connection = self.connection
+        if self._local.depth > 0:
+            return connection.execute(sql, parameters).lastrowid or 0
+        with self._turn():
+            return connection.execute(sql, parameters).lastrowid or 0
 
     def query(self, sql: str, parameters: Sequence[Any] = ()) -> list[sqlite3.Row]:
         return self.connection.execute(sql, parameters).fetchall()
@@ -174,7 +235,8 @@ class AuditTrail:
             previous = row["hash"]
         return None
 
-    def read(self, since: int = 0, actor: str | None = None, task_id: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+    def read(self, since: int = 0, actor: str | None = None, task_id: str | None = None, limit: int = 200, newest: bool = False) -> list[dict[str, Any]]:
+        """Oldest first. ``newest`` takes the last ``limit`` rows instead of the first."""
         clauses, parameters = ["id > ?"], [since]
         if actor:
             clauses.append("actor = ?")
@@ -182,5 +244,7 @@ class AuditTrail:
         if task_id:
             clauses.append("task_id = ?")
             parameters.append(task_id)
-        rows = self.store.query(f"SELECT * FROM audit WHERE {' AND '.join(clauses)} ORDER BY id LIMIT ?", [*parameters, limit])
-        return [{**dict(row), "detail": json.loads(row["detail"])} for row in rows]
+        order = "DESC" if newest else "ASC"
+        rows = self.store.query(f"SELECT * FROM audit WHERE {' AND '.join(clauses)} ORDER BY id {order} LIMIT ?", [*parameters, limit])
+        ordered = reversed(rows) if newest else rows
+        return [{**dict(row), "detail": json.loads(row["detail"])} for row in ordered]
