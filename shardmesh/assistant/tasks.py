@@ -875,12 +875,15 @@ class DurableTasks:
         series: str | None = None,
         run_at: float | None = None,
         priority: int | None = None,
+        reach_limit: int | None = None,
     ) -> str:
         whole = normalised(plan)
         task_id = f"t-{secrets.token_hex(8)}"
         now = self.clock()
         due = run_at if run_at is not None else (parse_time(plan["run_at"]) if "run_at" in plan else None)
         reach = int(Reach[str(plan.get("reach", "pool")).upper()])
+        if reach_limit is not None:  # a subtask carries its parent's text, so it can go no further
+            reach = min(reach, reach_limit)
         self.store.execute(
             "INSERT INTO tasks (id, user, title, plan, status, priority, tainted, reach, inputs, run_at, every_seconds, on_missed, "
             "series, parent_task, parent_step, queued_at, created_at) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1478,9 +1481,12 @@ class DurableTasks:
     def _start_subtask(self, task: Mapping[str, Any], step: Mapping[str, Any], spec: Mapping[str, Any]) -> int:
         outputs = self._outputs(task["id"])
         inputs, used = render(spec.get("inputs", {}), outputs, json.loads(task["inputs"]))
-        tainted = bool(task["tainted"]) or any(outputs[name]["tainted"] for name in used)
+        tainted = self._tainted(task, outputs, used)
+        limit = self._reach(task, outputs, used)
         with self.store.transaction():
-            child = self._insert(task["user"], spec["plan"], parent=(task["id"], step["step_id"]), tainted=tainted, inputs=inputs, priority=task["priority"])
+            child = self._insert(
+                task["user"], spec["plan"], parent=(task["id"], step["step_id"]), tainted=tainted, inputs=inputs, priority=task["priority"], reach_limit=limit
+            )
             self.store.execute(
                 "UPDATE task_steps SET status = 'waiting', wait = 'subtask', subtask_id = ?, started_at = ? WHERE task_id = ? AND step_id = ?",
                 (child, self.clock(), task["id"], step["step_id"]),

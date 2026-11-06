@@ -928,6 +928,15 @@ def test_reach_goes_down_to_the_strictest_input(assistant, engine):
     assert assistant.router.requests[0].reach is Reach.MACHINE
 
 
+def test_reach_is_not_lost_going_into_a_subtask(assistant, engine):
+    private = lambda a, c: ToolResult(True, "x", Provenance("tool", "x", "x", Trust.EXTERNAL, 0.0, Reach.MACHINE))
+    tool(assistant, "demo.private", private)
+    assistant.router = ScriptedRouter("ok")
+    child = plan_of({"id": "m", "kind": "model", "prompt": "{{inputs.t}}"}, reach="cloud")  # a nested plan cannot widen it
+    run(engine, plan_of(tool_step("a", "demo.private"), {"id": "s", "kind": "subtask", "inputs": {"t": "{{steps.a.output}}"}, "plan": child}))
+    assert assistant.router.requests[0].reach is Reach.MACHINE
+
+
 def test_a_plan_sets_how_far_its_text_may_travel(assistant, engine):
     assistant.router = ScriptedRouter("ok")
     run(engine, plan_of({"id": "b", "kind": "model", "prompt": "Hi"}, reach="machine"))
