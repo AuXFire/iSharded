@@ -65,7 +65,7 @@ from .gguf_stage import INITIAL_GUESSES, DraftModel, GgufStage, PromptPlan, next
 from . import __version__
 from .llamacpp import LlamaError, StageLost, ensure_build, pick_build, rocm_library_paths
 from .pool import check_exposure, load_token
-from .serving import MAX_STAGE_BYTES, BodyLimit, serve
+from .serving import MAX_STAGE_BYTES, BodyLimit, serve, where_everything_is
 from .slots import SlotGate
 from .access import Authority
 from .tickets import TicketIdentity, client_auth
@@ -312,6 +312,7 @@ class WorkerRuntime:
         self.gguf: GgufStage | None = None
         self.gguf_logits: torch.Tensor | None = None
         self.merge_passes = False
+        self.replacing = asyncio.Lock()
         self.merge_queue: list[MergedStep] = []
         self.merge_task: asyncio.Task[None] | None = None
         self.merged_passes = 0
@@ -573,16 +574,22 @@ class WorkerRuntime:
         for a replay and says nothing against the worker. A stage that will not
         restart is a real failure, and reads as one.
         """
-        self.last_error = str(lost)
-        self.caches.clear()
-        try:
-            assert self.gguf is not None
-            await asyncio.to_thread(self.gguf.respawn)
-        except (LlamaError, OSError, AssertionError) as exc:
-            self.last_error = f"stage would not restart: {exc}"
-            return HTTPException(status_code=500, detail=self.last_error)
-        self.stage_restarts += 1
-        return HTTPException(status_code=503, detail={"retry": True, "message": str(lost)})
+        retry = HTTPException(status_code=503, detail={"retry": True, "message": str(lost)})
+        # Several replies can find the same stage dead. Starting a second copy would
+        # kill the fresh one, and two loading at once can run a small GPU out of memory.
+        async with self.replacing:
+            if self.gguf is not None and lost.host is not None and lost.host is not self.gguf.host:
+                return retry
+            self.last_error = str(lost)
+            self.caches.clear()
+            try:
+                assert self.gguf is not None
+                await asyncio.to_thread(self.gguf.respawn)
+            except (LlamaError, OSError, AssertionError) as exc:
+                self.last_error = f"stage would not restart: {exc}"
+                return HTTPException(status_code=500, detail=self.last_error)
+            self.stage_restarts += 1
+        return retry
 
     async def replace_draft(self, reason: Exception) -> None:
         """A draft is only an accelerator: lose it, try for another, keep serving."""
@@ -1162,6 +1169,9 @@ class WorkerRuntime:
             self.schedule_checkpoint(request)
             return result
         except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 409:
+                # The route moved on. Nothing failed, and the reply can follow it.
+                raise HTTPException(status_code=409, detail=f"pipeline epoch mismatch; worker has {self.epoch}") from exc
             # The next stage is up and refused this request, so blame the request.
             self.last_error = str(exc)
             raise HTTPException(status_code=500, detail={"stage_error": str(exc)}) from exc
@@ -1453,6 +1463,13 @@ async def drain(body: dict[str, Any], authorization: str | None = Header(default
     """Ahead of a pool change: wait for the reply in progress, and hold new ones."""
     verify_token(authorization)
     return {"drained": await runtime.hold_gate(float(body.get("seconds", 30)))}
+
+
+@app.get("/internal/diag/tasks")
+async def diag_tasks(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """Where everything in this process is waiting, for a reply that has gone quiet."""
+    verify_token(authorization)
+    return where_everything_is()
 
 
 @app.post("/internal/release")

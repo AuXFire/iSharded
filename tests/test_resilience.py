@@ -994,3 +994,40 @@ def test_with_no_model_loaded_a_reply_does_not_wait():
     asyncio.run(orchestrator.wait_for_route())
     assert time.monotonic() - started < 0.5
     done(orchestrator)
+
+
+def test_a_dead_stage_is_only_restarted_once():
+    from types import SimpleNamespace
+
+    from shardmesh.llamacpp import StageLost
+    from shardmesh.worker import WorkerRuntime
+
+    started = []
+    current = object()
+
+    class Stage:
+        host = current
+
+        def respawn(self):
+            started.append(1)
+            self.host = object()
+
+    async def scenario():
+        worker = SimpleNamespace(replacing=asyncio.Lock(), gguf=Stage(), last_error=None, caches={}, stage_restarts=0)
+        lost = [StageLost("gone", current), StageLost("gone", current)]
+        return await asyncio.gather(*(WorkerRuntime.replace_stage(worker, item) for item in lost))
+
+    answers = asyncio.run(scenario())
+    assert len(started) == 1
+    assert all(answer.status_code == 503 for answer in answers)
+
+
+def test_diagnostics_show_what_is_waiting():
+    from shardmesh.serving import where_everything_is
+
+    async def scenario():
+        return where_everything_is()
+
+    found = asyncio.run(scenario())
+    assert any("scenario" in line for line in found["tasks"])
+    assert found["threads"]

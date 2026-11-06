@@ -152,6 +152,10 @@ class LlamaError(RuntimeError):
 class StageLost(LlamaError):
     """A stage process died. The worker is fine and can start another."""
 
+    def __init__(self, message: str, host: Any = None) -> None:
+        super().__init__(message)
+        self.host = host  # which process, since a reply can report one already replaced
+
 
 def filtered_distribution(logits: np.ndarray, temperature: float, top_p: float, top_k: int) -> tuple[np.ndarray, np.ndarray]:
     """Token ids and probabilities after top-k, temperature, and top-p, in that order."""

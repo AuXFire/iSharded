@@ -46,7 +46,7 @@ from .protocol import (
     auth_headers,
 )
 from .pool import check_exposure, home as pool_home, load_token
-from .serving import BodyLimit, serve
+from .serving import BodyLimit, serve, where_everything_is
 from .mesh import clean_url
 from .tickets import PREFIX as TICKET_PREFIX, NodeTickets, TicketChecker, TicketIdentity, client_auth, reply_audience
 from .tls import BEHALF, INTERCEPTED, intercepted, PEER, client_verify
@@ -2247,6 +2247,12 @@ async def gossip(body: dict[str, Any], authorization: str | None = Header(defaul
     except (KeyError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"bad gossip: {exc}") from exc
     return reply
+
+
+@app.get("/internal/diag/tasks")
+async def diag_tasks(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    verify_token(authorization)
+    return where_everything_is()
 
 
 @app.post("/internal/report")

@@ -194,7 +194,7 @@ class StageHost:
                 answer = json.loads(self.connection.recv_bytes())
                 data = self.connection.recv_bytes()
             except (EOFError, OSError) as exc:
-                raise StageLost(f"the stage process died (exit code {self.process.poll()})") from exc
+                raise StageLost(f"the stage process died (exit code {self.process.poll()})", self) from exc
         if not answer.pop("ok"):
             raise LlamaError(answer.get("error", "stage call failed"))
         return answer, data

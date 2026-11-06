@@ -6,6 +6,12 @@ ShardMesh runs code and holds prompts on every machine in a pool, so a pool is o
 
 A node in the route sees prompts and replies in plain text, as hidden states or tokens, and can return anything it likes. A node you cannot trust should not be in your pool. Certificates and revocation limit what a stolen credential can do and let you throw a node out. They do not make a hostile node safe to include.
 
+## Who owns a pool
+
+ShardMesh is decentralized in how it runs, not in who owns it. No server is special, any node can coordinate, and losing any machine loses nothing but what it was running. But a pool has an owner: whoever holds the authority key, or the shared token in a pool without one. That person decides who joins, who is thrown out, and who may load models.
+
+This suits a pool whose members trust each other. It is not a public mesh. A public mesh, where anyone can join, would need answers ShardMesh does not have today: a way to detect wrong results, a way to stop one person running thousands of nodes, and a clear warning that node operators can read prompts.
+
 ## Who can do what
 
 | Caller | Credential | Can do |

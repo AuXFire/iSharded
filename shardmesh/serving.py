@@ -5,6 +5,7 @@ import json
 import os
 import socket
 import sys
+import traceback
 from typing import Any
 
 import uvicorn
@@ -80,6 +81,19 @@ class BodyLimit:
         headers = [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()), (b"connection", b"close")]
         await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": body})
+
+
+def where_everything_is() -> dict[str, Any]:
+    """Each task's and thread's innermost frames. Stalls show up here and nowhere else."""
+    tasks = []
+    for task in asyncio.all_tasks():
+        frames = task.get_stack(limit=4)
+        tasks.append(" < ".join(f"{frame.f_code.co_name}:{frame.f_lineno}" for frame in reversed(frames)))
+    threads = [
+        " < ".join(f"{item.name}:{item.lineno}" for item in reversed(traceback.extract_stack(frame)[-4:]))
+        for frame in sys._current_frames().values()
+    ]
+    return {"tasks": sorted(tasks), "threads": sorted(threads)}
 
 
 def serve(app: Any, host: str, port: int) -> None:
