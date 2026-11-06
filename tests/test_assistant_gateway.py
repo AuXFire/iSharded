@@ -689,6 +689,79 @@ def test_serve_really_runs_and_binds_to_loopback_by_default(tmp_path):
         process.wait(timeout=15)
 
 
+def self_signed(folder: Path) -> tuple[Path, Path]:
+    import datetime
+    import ipaddress
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "assistant-test")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    certificate = (
+        x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key()).serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5)).not_valid_after(now + datetime.timedelta(hours=1))
+        .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), critical=False)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    certificate_path, key_path = folder / "cert.pem", folder / "key.pem"
+    certificate_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+    return certificate_path, key_path
+
+
+def test_serve_really_speaks_tls_when_given_a_certificate(tmp_path):
+    import ssl
+    import subprocess
+    import sys
+
+    certificate, key_file = self_signed(tmp_path)
+    home = tmp_path / "home"
+    with Assistant(home) as instance:
+        key = Users(instance).add("owner")
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    assert not 8000 <= port <= 8399
+    code = (
+        "import sys; from shardmesh.cli import main; "
+        "sys.argv=['shardmesh','assistant','--home',sys.argv[1],'serve','--port',sys.argv[2],'--tls-cert',sys.argv[3],'--tls-key',sys.argv[4]]; main()"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", code, str(home), str(port), str(certificate), str(key_file)],
+        cwd=str(Path(__file__).parent.parent), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    try:
+        # Not verified, because antivirus on a machine can re-sign even loopback TLS.
+        # It keeps the subject, which is what shows this is the certificate we gave it.
+        def up() -> bool:
+            try:
+                return httpx.get(f"https://127.0.0.1:{port}/healthz", verify=False, timeout=1.0, trust_env=False).status_code == 200
+            except httpx.HTTPError:
+                return False
+
+        assert wait_until(up, 40), "not up"
+        reply = httpx.get(f"https://127.0.0.1:{port}/assistant/whoami", verify=False, headers={"Authorization": f"Bearer {key}"}, trust_env=False)
+        assert reply.json()["user"] == "owner"
+        handshake = ssl.create_default_context()
+        handshake.check_hostname = False
+        handshake.verify_mode = ssl.CERT_NONE
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as plain, handshake.wrap_socket(plain) as secured:
+            from cryptography import x509
+
+            presented = x509.load_der_x509_certificate(secured.getpeercert(binary_form=True))
+        assert "assistant-test" in presented.subject.rfc4514_string()
+        with pytest.raises(httpx.HTTPError):  # a client speaking plain HTTP gets nothing
+            httpx.get(f"http://127.0.0.1:{port}/healthz", timeout=2.0, trust_env=False)
+    finally:
+        process.terminate()
+        process.wait(timeout=15)
+
+
 # The page
 
 

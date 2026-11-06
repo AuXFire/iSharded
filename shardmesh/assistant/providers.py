@@ -24,6 +24,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from shardmesh.tls import client_verify, intercepted
+
 from .contracts import Capability, ModelReply, ModelRequest, Reach, ToolCall
 from .mind import actor, emit, LOCAL_USER, plainly, reach_named, table
 
@@ -439,6 +441,7 @@ class OpenAICompatible:
     def _client(self, read: float) -> httpx.Client:
         return httpx.Client(
             timeout=httpx.Timeout(read, connect=CONNECT_SECONDS),
+            verify=client_verify(),  # a pool with its own authority is checked against it
             # A proxy set for the internet has no business seeing loopback traffic.
             trust_env=not is_loopback(self.base_url),
         )
@@ -456,6 +459,14 @@ class OpenAICompatible:
             key = None
         return short.replace(key, "[key]") if key else short
 
+    def _unreachable(self, error: httpx.HTTPError, what: str = "cannot be reached") -> ProviderError:
+        if intercepted(error):
+            return ProviderError(
+                f"{self.name}'s certificate could not be verified. If antivirus scans HTTPS on this machine, it is "
+                "probably replacing certificates: exclude this address from scanning"
+            )
+        return ProviderError(f"{self.name} {what}: {type(error).__name__}")
+
     def _failed(self, response: httpx.Response) -> ProviderError:
         return ProviderError(f"{self.name} answered HTTP {response.status_code}: {self._clean(response.text)}")
 
@@ -468,7 +479,7 @@ class OpenAICompatible:
             try:
                 response = client.get(f"{self.base_url}/models", headers=self._headers())
             except httpx.HTTPError as error:
-                raise ProviderError(f"{self.name} cannot be reached: {type(error).__name__}") from None
+                raise self._unreachable(error) from None
         if response.status_code != 200:
             raise self._failed(response)
         try:
@@ -539,7 +550,7 @@ class OpenAICompatible:
             except httpx.TimeoutException:
                 raise ProviderError(f"{self.name} went silent while answering") from None
             except httpx.HTTPError as error:
-                raise ProviderError(f"{self.name} cannot be reached: {type(error).__name__}") from None
+                raise self._unreachable(error) from None
         if native and self.tool_mode == "auto" and response.status_code in (400, 404, 422, 501):
             raise ToolsNotSupported
         if response.status_code != 200:
@@ -604,7 +615,7 @@ class OpenAICompatible:
             except httpx.TimeoutException:
                 raise ProviderError(f"{self.name} went silent for {self.read_seconds:.0f} s") from None
             except httpx.HTTPError as error:
-                raise ProviderError(f"{self.name} dropped the connection: {type(error).__name__}") from None
+                raise self._unreachable(error, "dropped the connection") from None
         if not finished:
             raise ProviderError(f"{self.name} stopped before finishing its reply")
         raw = "".join(parts)
@@ -646,7 +657,7 @@ class OpenAICompatible:
             except httpx.TimeoutException:
                 raise ProviderError(f"{self.name} went silent while embedding") from None
             except httpx.HTTPError as error:
-                raise ProviderError(f"{self.name} cannot be reached: {type(error).__name__}") from None
+                raise self._unreachable(error) from None
         if response.status_code != 200:
             raise self._failed(response)
         try:

@@ -335,6 +335,43 @@ def test_a_refused_connection_says_who_cannot_be_reached():
         OpenAICompatible("other", closed_port_url()).complete(request(), "fake-model")
 
 
+def tls_server(folder: Path) -> FakeModelServer:
+    import ssl
+
+    from test_assistant_gateway import self_signed
+
+    server = FakeModelServer()
+    certificate, key = self_signed(folder)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certificate, key)
+    server.server.socket = context.wrap_socket(server.server.socket, server_side=True)
+    return server
+
+
+def test_a_certificate_that_cannot_be_verified_says_what_to_look_at(tmp_path):
+    """On this owner's machine antivirus replaces certificates, and "ConnectError" says nothing."""
+    with tls_server(tmp_path) as server:
+        url = server.url.replace("http://", "https://")
+        for provider in (OpenAICompatible("other", url), MeshProvider("mesh", url)):
+            with pytest.raises(ProviderError, match="antivirus"):
+                provider.complete(request(), "m")
+
+
+def test_a_pool_with_its_own_authority_is_verified_against_it(tmp_path, monkeypatch):
+    from test_assistant_gateway import self_signed
+
+    certificate, _ = self_signed(tmp_path)
+    monkeypatch.setenv("SHARDMESH_CA_FILE", str(certificate))
+    monkeypatch.delenv("SHARDMESH_TLS_CERT", raising=False)
+    with httpx_client_of(MeshProvider("mesh", "https://127.0.0.1:1")) as client:
+        names = [item["subject"] for item in client._transport._pool._ssl_context.get_ca_certs()]
+    assert any("assistant-test" in str(name) for name in names)
+
+
+def httpx_client_of(provider):
+    return provider._client(1.0)
+
+
 def test_an_http_failure_says_what_the_server_said():
     with FakeModelServer([Reply(status=409, error_body='{"detail": "no model is ready; load one first"}')]) as server:
         with pytest.raises(ProviderError, match="409.*load one first"):

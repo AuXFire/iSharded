@@ -673,8 +673,10 @@ def read_passphrase(path: str) -> bytes:
 
 
 def derive_key(passphrase: bytes, salt: bytes, n: int, r: int, p: int) -> bytes:
-    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
-
+    try:
+        from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+    except ImportError:
+        raise ValueError("Backups need the cryptography package. Run: pip install cryptography") from None
     return Scrypt(salt=salt, length=32, n=n, r=r, p=p).derive(passphrase)
 
 
