@@ -262,6 +262,39 @@ fn passes_on_one_sequence_never_share_a_trip() {
 }
 
 #[test]
+fn a_rewind_clears_what_is_queued_past_it() {
+    let mut ring = ring(2, true, Duration::from_millis(30), 2000);
+    for id in 1..=8 {
+        ring.client.send(&pass(id, 1, 100 + id as u32).encode()).unwrap();
+    }
+    // The answer to the first pass said the rest were built on a wrong guess.
+    let rewind = Pass { rollback_to: Some(102), ..pass(9, 2, 102) };
+    ring.client.send(&rewind.encode()).unwrap();
+    let began = Instant::now();
+    let mut seen = vec![];
+    while seen.last() != Some(&9) {
+        seen.push(answer(&mut ring).id);
+    }
+    assert!(seen.len() < 5, "{seen:?}");
+    assert!(began.elapsed() < Duration::from_millis(250), "the rewind waited behind passes nobody wants");
+    assert!(ring.nodes[0].stats().dropped >= 5);
+}
+
+#[test]
+fn a_rewind_leaves_other_replies_and_earlier_places_alone() {
+    let mut ring = ring(2, true, Duration::from_millis(20), 2000);
+    let other = Pass { slot: 1, ..pass(1, 1, 500) };
+    ring.client.send(&pass(2, 1, 10).encode()).unwrap();
+    ring.client.send(&other.encode()).unwrap();
+    ring.client.send(&pass(3, 1, 11).encode()).unwrap();
+    ring.client.send(&Pass { rollback_to: Some(12), ..pass(4, 2, 12) }.encode()).unwrap();
+    let mut seen: Vec<u64> = (0..4).map(|_| answer(&mut ring).id).collect();
+    seen.sort_unstable();
+    assert_eq!(seen, vec![1, 2, 3, 4]);
+    assert_eq!(ring.nodes[0].stats().dropped, 0);
+}
+
+#[test]
 fn nobody_reaches_the_local_door_without_its_key() {
     let node = Node::new().unwrap();
     let door = listening(&node);

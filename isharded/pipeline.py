@@ -11,9 +11,9 @@ So a guess can only save time. Each pass is still one row at its own position, w
 plain decoding runs, so every token is the one plain decoding gives, seed and all. One row also
 matters on a mixture of experts, where a pass of 4 rows costs about 3.4 times a pass of one.
 
-Stages keep no state for this. A stage runs what reaches it in order, and an answer nobody is
-waiting for is dropped at the entry, so a thrown-away pass only ever uses a stage that had
-nothing better to do.
+Stages keep no state for this. A stage runs what reaches it in order, and a rewind clears
+whatever is queued past it, so a thrown-away pass only ever uses a stage that had nothing better
+to do, and the pass that replaces it does not wait behind it.
 """
 
 from __future__ import annotations
@@ -80,6 +80,11 @@ class Pipeline:
         self.answered: float | None = None
         # Where the draft's text went wrong, until it has been told.
         self.wrong_from: int | None = None
+        # The guess being made. It runs beside everything else, because a wrong guess must
+        # be answered the moment it shows, not when the draft next looks up.
+        self.guessing: asyncio.Task[int] | None = None
+        # Which guess that is for. Anything it was built on may be gone by the time it lands.
+        self.guessing_after = -1
         # The draft expects the reply to end here, so there is nothing to send past it.
         self.ending = False
         self.tokens_made = 0
@@ -107,16 +112,37 @@ class Pipeline:
         known = len(self.history)
         return self.history + [flight.token for flight in self.flights if flight.position >= known]
 
-    async def _fill(self) -> None:
-        while not self.ending and len(self.flights) < min(self.depth(), self.room) and not self.flights[0].answer.done():
-            if self.wrong_from is not None:
-                await self.rewind(self.wrong_from)
-                self.wrong_from = None
-            guess = await self.guess(self._text())
-            if guess in self.stops:
-                self.ending = True
-                return
+    async def _next_guess(self, text: list[int]) -> int:
+        if self.wrong_from is not None:
+            keep, self.wrong_from = self.wrong_from, None
+            await self.rewind(keep)
+        return await self.guess(text)
+
+    def _guess_on(self) -> None:
+        """Starts the next guess, if the route has room for one."""
+        if self.guessing is None and not self.ending and len(self.flights) < min(self.depth(), self.room):
+            self.guessing_after = self.misses
+            self.guessing = asyncio.ensure_future(self._next_guess(self._text()))
+
+    def _take_guess(self) -> None:
+        assert self.guessing is not None
+        guess = self.guessing.result()
+        self.guessing = None
+        if self.guessing_after != self.misses:
+            return  # built on a guess that has since failed
+        if guess in self.stops:
+            self.ending = True
+        else:
             self._launch(guess, self.flights[-1].position + 1)
+
+    async def _answer(self, flight: Flight) -> int:
+        """Keeps guessing until the oldest pass is back."""
+        while not flight.answer.done():
+            self._guess_on()
+            await asyncio.wait({flight.answer} if self.guessing is None else {flight.answer, self.guessing}, return_when=asyncio.FIRST_COMPLETED)
+            if self.guessing is not None and self.guessing.done():
+                self._take_guess()
+        return await self.wait(flight.answer)
 
     def _timed(self, flight: Flight) -> None:
         now = time.perf_counter()
@@ -128,6 +154,11 @@ class Pipeline:
             self.step = gap if self.step is None else self.step + (gap - self.step) * STEP_WEIGHT
         self.answered = now
 
+    def _abandon(self) -> None:
+        for flight in self.flights:
+            flight.answer.cancel()
+        self.flights.clear()
+
     def _follow(self, token: int, position: int) -> None:
         """The model said ``token`` goes at ``position``. Keeps what is out, or starts again."""
         if self.flights:
@@ -136,7 +167,7 @@ class Pipeline:
             if landed:
                 return
             self.misses += 1
-            self.flights.clear()
+            self._abandon()
             self.wrong_from = position if self.wrong_from is None else min(self.wrong_from, position)
             self.ending = False
             self._launch(token, position, position)
@@ -150,9 +181,9 @@ class Pipeline:
             newest = len(self.history) - 1
             self._launch(self.history[newest], newest, newest)
         for _ in range(count):
-            await self._fill()
-            flight = self.flights.popleft()
-            token = await self.wait(flight.answer)
+            flight = self.flights[0]
+            token = await self._answer(flight)
+            self.flights.popleft()
             self._timed(flight)
             self.history.append(token)
             self.room -= 1
@@ -167,7 +198,14 @@ class Pipeline:
 
     async def land(self) -> None:
         """Lets go of what is out, so a reply can go on from its newest token some other way."""
-        self.flights.clear()
+        self._abandon()
+        await self.close()
         known = len(self.history)
         await self.rewind(known if self.wrong_from is None else min(self.wrong_from, known))
         self.wrong_from = None
+
+    async def close(self) -> None:
+        """Waits for the guess being made, since the draft's text is not safe to touch until then."""
+        guessing, self.guessing = self.guessing, None
+        if guessing is not None:
+            await asyncio.gather(guessing, return_exceptions=True)

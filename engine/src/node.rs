@@ -115,6 +115,7 @@ pub struct Stats {
     pub merged_rows: u64,
     pub answers: u64,
     pub refusals: u64,
+    pub dropped: u64,
     pub compute_us: u64,
     pub wait_us: u64,
     pub link_rtt_us: u64,
@@ -133,6 +134,7 @@ struct Counters {
     merged_rows: AtomicU64,
     answers: AtomicU64,
     refusals: AtomicU64,
+    dropped: AtomicU64,
     compute_us: AtomicU64,
     wait_us: AtomicU64,
     link_rtt_us: AtomicU64,
@@ -339,6 +341,7 @@ impl Node {
             merged_rows: counters.merged_rows.load(Ordering::Relaxed),
             answers: counters.answers.load(Ordering::Relaxed),
             refusals: counters.refusals.load(Ordering::Relaxed),
+            dropped: counters.dropped.load(Ordering::Relaxed),
             compute_us: counters.compute_us.load(Ordering::Relaxed),
             wait_us: counters.wait_us.load(Ordering::Relaxed),
             link_rtt_us: counters.link_rtt_us.load(Ordering::Relaxed),
@@ -473,8 +476,7 @@ fn serve_passes(inner: &Arc<Inner>, link: &Arc<Link>, mut frames: Frames, acknow
                 if acknowledge && link.send(&Ack { id: pass.id }.encode()).is_err() {
                     return;
                 }
-                inner.jobs.lock().push_back(Job { pass, arrived: Instant::now() });
-                inner.ready.notify_one();
+                enqueue(inner, pass);
             }
             Kind::Ping => {
                 let Ok(stamp) = wire::read_beat(&body) else {
@@ -487,6 +489,21 @@ fn serve_passes(inner: &Arc<Inner>, link: &Arc<Link>, mut frames: Frames, acknow
             _ => return,
         }
     }
+}
+
+/// Queues a pass. A rewind says that whatever waits past it has already been thrown away,
+/// so it goes now and the rewind does not sit behind it. Nobody expects an answer to those:
+/// passes run in order, so once the newest pass of a reply is back, nothing of it is left.
+fn enqueue(inner: &Inner, pass: Pass) {
+    let mut jobs = inner.jobs.lock();
+    if let Some(keep) = pass.rollback_to {
+        let before = jobs.len();
+        jobs.retain(|job| job.pass.slot != pass.slot || job.pass.epoch != pass.epoch || job.pass.position < keep);
+        inner.counters.dropped.fetch_add((before - jobs.len()) as u64, Ordering::Relaxed);
+    }
+    jobs.push_back(Job { pass, arrived: Instant::now() });
+    drop(jobs);
+    inner.ready.notify_one();
 }
 
 /// At the entry: what the last stage sends straight back.

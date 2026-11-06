@@ -382,6 +382,7 @@ class WorkerRuntime:
         self.rewinds = False
         self.draft_passes = 0
         self.draft_accepted = 0
+        self.pipes: dict[int, Pipeline] = {}
         # The newest part of a prompt each slot has run, and word of the next one.
         self.parts_run: dict[int, tuple[str, int]] = {}
         self.part_ran = asyncio.Condition()
@@ -2361,6 +2362,7 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
                         rewind=rewind_draft,
                         sharing=lambda: runtime.gate.size - len(runtime.gate.free),
                     )
+                    runtime.pipes[request.slot] = pipe
                 made, misses = pipe.tokens_made, pipe.misses
                 async for token in pipe.tokens(PIPELINE_STRETCH):
                     produced += 1
@@ -2373,6 +2375,7 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             if pipe is not None:
                 await pipe.land()
                 pipe = None
+                del runtime.pipes[request.slot]
             drafting = way == GUESSED
             if drafting:
                 guesses = await draft_guesses(history, min(ahead, room))
@@ -2463,6 +2466,9 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             yield json.dumps({"error": failure}).encode() + b"\n"
         finally:
             try:
+                pipe = runtime.pipes.pop(slot, None)
+                if pipe is not None:
+                    await pipe.close()
                 await runtime.ring_settle(slot)
             finally:
                 runtime.slot_used_at[slot] = time.monotonic()

@@ -332,22 +332,28 @@ def test_a_refused_pass_raises_and_the_link_stays_up() -> None:
     assert asyncio.run(with_door(lambda identity: refusal(identity, native.REFUSE_STAGE_ERROR), use))
 
 
-def test_a_pass_nobody_waits_for_still_counts_until_it_lands() -> None:
-    held = asyncio.Event()
-
+def test_a_slot_has_settled_when_its_newest_pass_is_back() -> None:
     def answers(identity):
         return answer(identity, [identity])
 
     async def use(client):
         first = client.send(**FIELDS)
         second = client.send(**FIELDS)
-        assert await first == [1]
+        first.cancel()  # a stage may drop this one, so nothing can wait for it
         settled = await client.settled(0, 5)
-        held.set()
-        return settled, second.done(), client.out[0]
+        return settled, second.done(), client.waiting
 
-    assert asyncio.run(with_door(answers, use)) == (True, True, set())
-    assert held.is_set()
+    assert asyncio.run(with_door(answers, use)) == (True, True, {})
+
+
+def test_a_pass_let_go_leaves_nothing_behind() -> None:
+    async def use(client):
+        future = client.send(**FIELDS)
+        future.cancel()
+        await asyncio.sleep(0)
+        return client.waiting
+
+    assert asyncio.run(with_door(lambda identity: b"", use)) == {}
 
 
 def test_settling_says_so_when_a_pass_never_lands() -> None:

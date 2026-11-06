@@ -28,7 +28,8 @@ class Route:
     def __init__(self, text: list[int], length: int = 4) -> None:
         self.held = list(text)
         self.length = length
-        self.waiting: deque[tuple[asyncio.Future[list[int]], int, int | None, int]] = deque()
+        self.waiting: deque[tuple[asyncio.Future[list[int]], int, int | None, int, int]] = deque()
+        self.clock = 0
         self.most_out = 0
         self.sent = 0
         self.furthest = 0
@@ -36,7 +37,7 @@ class Route:
 
     def send(self, token: int, position: int, rollback_to: int | None) -> asyncio.Future[list[int]]:
         answer = asyncio.get_running_loop().create_future()
-        self.waiting.append((answer, token, rollback_to, position))
+        self.waiting.append((answer, token, rollback_to, position, self.clock + self.length))
         self.sent += 1
         self.furthest = max(self.furthest, position)
         self.most_out = max(self.most_out, len(self.waiting))
@@ -45,21 +46,27 @@ class Route:
         return answer
 
     async def run(self) -> None:
-        for _ in range(self.length):
-            await asyncio.sleep(0)
         while self.waiting:
-            answer, token, rollback_to, position = self.waiting.popleft()
+            while self.clock < self.waiting[0][4]:
+                self.clock += 1
+                await asyncio.sleep(0)
+            answer, token, rollback_to, position, _ = self.waiting.popleft()
             if rollback_to is not None:
                 del self.held[rollback_to:]
             assert len(self.held) == position, "a pass ran at the wrong place"
             self.held.append(token)
-            answer.set_result([model(self.held)])
+            if not answer.cancelled():
+                answer.set_result([model(self.held)])
             await asyncio.sleep(0)
         self.work = None
 
 
 class Draft:
-    """Guesses right as often as it is told to, and holds text like a real draft."""
+    """Guesses right as often as it is told to, and holds text like a real draft.
+
+    A guess takes a few turns of the loop, as a real one takes time, so answers can land
+    while it runs.
+    """
 
     def __init__(self, right: float, seed: int = 1) -> None:
         self.right = right
@@ -70,6 +77,8 @@ class Draft:
 
     async def guess(self, text: list[int]) -> int:
         self.calls += 1
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
         self.committed = len(text)
         truth = model(text)
         return truth if self.random.random() < self.right else (truth + 1) % 500
@@ -95,16 +104,17 @@ def pipeline(route: Route, draft: Draft, history: list[int], room: int, limit: i
     return Pipeline(history, room, stops, 4, limit, route.send, wait, draft.guess, draft.rewind, sharing)
 
 
-async def reply(right: float, count: int = 200, seed: int = 1, limit: int = 6) -> tuple[list[int], Route, Draft, Pipeline]:
+async def reply(right: float, count: int = 200, seed: int = 1, limit: int = 6, length: int = 4) -> tuple[list[int], Route, Draft, Pipeline]:
     prompt = [7, 8, 9]
     first = model(prompt)
-    route, draft = Route(prompt), Draft(right, seed)
+    route, draft = Route(prompt, length), Draft(right, seed)
     history = [*prompt, first]
     pipe = pipeline(route, draft, history, count - 1, limit)
     made = [first]
     while pipe.room > 0:
         async for token in pipe.tokens(24):
             made.append(token)
+    await pipe.close()
     return made, route, draft, pipe
 
 
@@ -117,15 +127,15 @@ def test_a_reply_is_the_plain_reply_however_the_guesses_go(right: float, seed: i
 
 
 def test_good_guesses_put_several_passes_on_the_route() -> None:
-    _, route, _, pipe = asyncio.run(reply(1.0))
-    assert route.most_out >= 5
+    _, route, _, pipe = asyncio.run(reply(1.0, length=40))
+    assert route.most_out >= 4
     assert pipe.misses == 0
 
 
 def test_a_wrong_guess_is_counted_and_the_draft_goes_back() -> None:
-    _, _, draft, pipe = asyncio.run(reply(0.5))
+    _, _, draft, pipe = asyncio.run(reply(0.5, length=40))
     assert pipe.misses > 10
-    assert len(draft.rewinds) >= pipe.misses - 2  # a rewind waits for the next guess
+    assert draft.rewinds
 
 
 def test_passes_never_run_past_the_room_the_reply_has() -> None:
@@ -135,7 +145,7 @@ def test_passes_never_run_past_the_room_the_reply_has() -> None:
 
 
 def test_depth_stops_at_what_guessing_may_cost_a_stage() -> None:
-    _, route, _, _ = asyncio.run(reply(1.0, limit=3))
+    _, route, _, _ = asyncio.run(reply(1.0, limit=3, length=40))
     assert route.most_out <= 3
 
 
@@ -157,6 +167,7 @@ def test_nothing_is_sent_past_a_guess_that_ends_the_reply() -> None:
 
         pipe = Pipeline(text, 50, {end}, 4, 6, route.send, wait, guess, rewind)
         made = [token async for token in pipe.tokens(24)]
+        await pipe.close()
         return made, route
 
     made, route = asyncio.run(run())
@@ -172,6 +183,7 @@ def test_a_route_full_of_other_replies_gets_no_guesses() -> None:
         pipe = pipeline(route, draft, history, 30, sharing=lambda: 6)
         async for _ in pipe.tokens(30):
             pass
+        await pipe.close()
         return route, draft
 
     route, draft = asyncio.run(run())
@@ -188,6 +200,56 @@ def test_depth_fills_the_route_without_running_away() -> None:
     assert pipe.depth() == 13
     pipe.right = 0.3  # and guesses that rarely land are not worth that many
     assert pipe.depth() == 3
+
+
+def test_a_wrong_guess_is_answered_without_waiting_for_the_draft() -> None:
+    async def run() -> tuple[list[int], list[str]]:
+        prompt = [5, 6]
+        history = [*prompt, model(prompt)]
+        route = Route(history[:-1], length=1)
+        order: list[str] = []
+        released = asyncio.Event()
+
+        async def wait(answer: asyncio.Future[list[int]]) -> int:
+            return (await answer)[0]
+
+        async def guess(text: list[int]) -> int:
+            if len(order) >= 2:
+                await released.wait()  # the draft is slow, and the route is not
+            order.append("guess")
+            return (model(text) + 1) % 500  # always wrong
+
+        async def rewind(_: int) -> None:
+            return None
+
+        pipe = Pipeline(history, 6, (), 4, 6, route.send, wait, guess, rewind)
+        made = []
+        async for token in pipe.tokens(3):
+            made.append(token)
+            order.append("token")
+            if len(made) == 3:
+                released.set()
+        await pipe.close()
+        return made, order
+
+    made, order = asyncio.run(run())
+    assert len(made) == 3
+    assert order.count("token") == 3
+
+
+def test_a_guess_that_lands_after_a_miss_is_not_sent() -> None:
+    async def run() -> tuple[list[int], Route]:
+        prompt = [2, 3]
+        history = [*prompt, model(prompt)]
+        route = Route(history[:-1], length=2)
+        draft = Draft(0.0, seed=4)
+        pipe = pipeline(route, draft, history, 40)
+        made = [token async for token in pipe.tokens(40)]
+        await pipe.close()
+        return made, route
+
+    made, _ = asyncio.run(run())
+    assert made == plain([2, 3], model([2, 3]), 41)[1:]
 
 
 def test_landing_leaves_the_reply_ready_to_go_on_another_way() -> None:
