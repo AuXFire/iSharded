@@ -1,6 +1,7 @@
 import io
 import os
 from pathlib import Path
+import re
 import struct
 
 import httpx
@@ -249,12 +250,14 @@ def pool(kind, gib, group):
     return MemoryPool(pool_id=f"{group}-{kind}", kind=kind, device=device, capacity_group=f"{group}-{kind}", budget_bytes=size, free_bytes=size, bandwidth_gbps=500 if kind == "vram" else 30)
 
 
-def profile_of(layers=16, size=256 * 1024**2, step=4, workspace=0):
+def profile_of(layers=16, size=256 * 1024**2, step=4, workspace=0, experts=0):
     def unit(name, kind, layer=None, nbytes=size):
         return WeightUnit(name=name, kind=kind, layer=layer, tensors=[TensorRef(name=name, file="f", dtype="U8", shape=[nbytes], start=0, end=nbytes)])
 
     units = [unit("embed", "embed", nbytes=1024), unit("head", "head", nbytes=1024)]
     units += [unit(f"layer-{i:05d}.dense", "dense", i) for i in range(layers)]
+    if experts:
+        units += [unit(f"layer-{i:05d}.experts", "experts", i, experts) for i in range(layers)]
     return ModelProfile(
         units=units,
         num_layers=layers,
@@ -272,6 +275,37 @@ def test_stage_boundaries_follow_the_attention_pattern():
     route = plan_placement([big, small], [], profile_of(), spread=True)
     assert len(route) == 2
     assert all(stage.start_layer % 4 == 0 for stage in route)
+
+
+def test_plan_stage_accepts_every_stage_the_planner_makes():
+    header = header_of(build_file())
+    for gib in (2.4, 1.3, 0.6):
+        nodes = [Candidate(name, f"http://{name}", [pool("vram", gib, name), pool("ram", 8, name)]) for name in ("a", "b", "c")]
+        route = plan_placement(nodes[:2], nodes[2:], profile_of(layers=LAYERS), spread=True)
+        for stage in route:
+            plan_stage(header, stage.start_layer, stage.end_layer, last=stage.end_layer == LAYERS)
+
+
+def test_a_spilled_block_reaches_llama_cpp_as_expert_patterns():
+    # The first stage's card is short of its second block by less than one layer's
+    # experts, so one layer's experts goes to RAM and the block stays whole.
+    gib = 1024**3
+    profile = profile_of(layers=12, size=gib // 4, experts=gib)
+    small = Candidate("small", "http://a", [pool("vram", 9.8, "small"), pool("ram", 8, "small")])
+    big = Candidate("big", "http://b", [pool("vram", 5.4, "big")])
+    stage = next(item for item in plan_placement([small, big], [], profile, spread=True) if item.worker_id == "small")
+    spilled = [item for item in stage.placements if item.pool_id == "small-ram"]
+    assert len(spilled) == 1 and spilled[0].unit.endswith(".experts")
+
+    pools = {item.pool_id: item for item in small.pools}
+    patterns = cpu_tensor_patterns(stage.placements, pools, stage.start_layer)
+    local = int(spilled[0].unit[6:11]) - stage.start_layer
+    assert patterns == [rf"^blk\.({local})\.ffn_[a-z_]*_exps\."]
+    assert re.search(patterns[0], f"blk.{local}.ffn_down_exps.weight")
+    assert re.search(patterns[0], f"blk.{local}.ffn_gate_up_exps.weight")
+    assert not re.search(patterns[0], f"blk.{local}.ffn_gate_shexp.weight")
+    assert not re.search(patterns[0], f"blk.{local}.attn_norm.weight")
+    assert not re.search(patterns[0], f"blk.{local + 1}.ffn_down_exps.weight")
 
 
 def test_stage_workspace_is_kept_out_of_gpu_memory():
