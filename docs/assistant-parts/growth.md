@@ -74,7 +74,7 @@ A result comes back as a `ToolResult` with trust `EXTERNAL` whatever the peer cl
 
 Version 1. All messages are JSON over HTTP POST, and the HTTP layer is not trusted for anything.
 
-Each install has an Ed25519 signing key and an X25519 key, made on first use and stored in `federation/identity.key` in its home. Its fingerprint is the first 32 hex digits of `SHA-256("shardmesh-peer-identity-v1\0" || signing public || exchange public)`, so it covers both keys.
+Each install has an Ed25519 signing key and an X25519 key, made on first use and stored in `federation/identity.key` in its home. They are kept out of the database so that a copy of it carries no private key, which means a backup needs this file too: without it, this install is a stranger to its peers and has to pair again. Its fingerprint is the first 32 hex digits of `SHA-256("shardmesh-peer-identity-v1\0" || signing public || exchange public)`, so it covers both keys.
 
 **A sealed message.** `body` is the JSON text of the message. The signature covers those exact bytes, prefixed by a domain string, so a signature for one kind of message means nothing as another:
 
