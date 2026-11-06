@@ -10,7 +10,7 @@ if [ -z "$python" ] || ! "$python" -c 'import sys; sys.exit(sys.version_info < (
   echo "ShardMesh needs Python 3.10 or newer. Install it, then run this again." >&2
   exit 1
 fi
-if ! "$python" -m venv "$folder" 2>/dev/null; then
+if ! "$python" -m venv "$folder" >/dev/null 2>&1; then
   # Debian and Ubuntu leave venv out of Python. The virtualenv zipapp needs nothing installed.
   rm -rf "$folder"
   mkdir -p "$(dirname "$folder")"
