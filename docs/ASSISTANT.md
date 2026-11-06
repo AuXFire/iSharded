@@ -14,13 +14,21 @@ Everything here was run in this order, from a clean install, on Windows, against
 python -m pip install .
 ```
 
-**2. Start a model.** This makes a mesh of one on this machine and loads a small model from a folder of GGUF files. It prints where it is, and keeps running, so leave it open and use a second terminal.
+**2. Start a model.** This makes a mesh of one on this machine, with a folder of GGUF files. It prints where it is and keeps running, so leave it open and use a second terminal. `shardmesh up` keeps the owner's key in `admin.key`, in the `up` folder under `ShardMesh` in your data folder.
 
 ```sh
-shardmesh up --gguf-dir FOLDER --model Qwen3-0.6B-Q8_0.gguf --no-browser
+shardmesh up --gguf-dir FOLDER --no-browser
 ```
 
-**3. Add it as a provider.** `shardmesh up` keeps the owner's key in `admin.key`, in the `up` folder under `ShardMesh` in your data folder, and the assistant holds only the path to it. The mesh's address is the one `up` printed.
+Then load a model by its full path, or from the chat page `up` printed:
+
+```sh
+shardmesh load FOLDER/Qwen3-0.6B-Q8_0.gguf --url http://127.0.0.1:8209 --token KEY_FROM_ADMIN_KEY
+```
+
+`up --model` with a bare file name did not work here: it can ask before the node is ready, and a name alone is refused until another node holds that file.
+
+**3. Add it as a provider.** The assistant holds only the path to the key, never the key. The mesh's address is the one `up` printed.
 
 ```sh
 shardmesh assistant provider add mesh http://127.0.0.1:8209 --mesh --key-file ADMIN_KEY_FILE
@@ -196,7 +204,7 @@ Reach defaults to `cloud`, the worst case, and to `pool` for a mesh. `machine` i
 
 The database holds the name of a variable or a file, never a key, and a key is read when it is used. Something that looks like a pasted key is refused. A bare UPPER_CASE name is a variable, and any other variable can be given as `env:name` once it is set. A key in an address is refused.
 
-The mesh's chat API takes plain strings and has no tool calling, so tools go in the system prompt and calls are read from a fenced block. Thinking is on only for `planning`, `coding`, and `verification`. A reply from the mesh is always streamed, even when nobody is watching it, because only a stream can tell a slow pool from a lost link. Other servers use native `tools` where they accept them, falling back to the prompt if they refuse, with capability names mapped since a function name cannot contain a dot.
+The mesh's chat API takes plain strings and has no tool calling, so tools go in the system prompt, as short signatures with an example built from a real tool, and calls are read from the reply. [How that wording was chosen](#how-a-small-model-does) matters more than it looks. Thinking is on only for `planning`, `coding`, and `verification`. A reply from the mesh is always streamed, even when nobody is watching it, because only a stream can tell a slow pool from a lost link. Other servers use native `tools` where they accept them, falling back to the prompt if they refuse, with capability names mapped since a function name cannot contain a dot.
 
 Models write tool calls in many shapes, and all of these are understood: a ` ```tool ` or ` ```json ` fence, `<tool_call>` tags, no fence at all, single quotes, trailing commas, and arguments as a string. Only tools that were offered count. Text in reasoning never counts, and neither does code. A call with no fence must end the reply. A call cut off by the token limit is never run, because a truncated argument is a different argument.
 
@@ -1169,6 +1177,22 @@ A tool that stores or sends text reads `CallContext.reach`, which says how far t
 - **Reflecting by itself.** `skill reflect` is a person's command. Nothing watches for finished tasks.
 - **Most of the assistant over HTTP.** Grants, providers, routes, skills, plugins, the coder, and peers have commands and no routes or page. A member of an install cannot manage any of these, and the owner uses a terminal.
 
+### How a small model does
+
+This is Qwen3-0.6B at Q8, on 2 CPU threads, on a mesh of one, with everything real from the assistant down. It is a floor, and a useful one: what works here should work on anything larger.
+
+| Tried | What happened |
+|---|---|
+| Plain conversation | Works, at 1 to 2 s a reply, and about 6.5 s for a turn with a tool in it. It keeps its name and manner, and it mixes up "I" and "you" |
+| Proposing memories | From one sentence it proposed three. "Sam keeps bees on his roof" was right. "Sam is helpful and kind" was invented. That is why these are kept as MODEL, and not as what you said |
+| Recalling in a new session | Worked, and it said "I keep bees on my roof" |
+| Reading a file with a tool | 8 of 10 tries read the right file through the broker and answered correctly from it. The other 2 answered without reading, and were wrong |
+| Reading, then writing, in one request | 0 of 5. It says what it will do, and stops. No tool ran, so nothing was held for approval either |
+| Writing a plan | Refused all three tries, over 200 s. It wrote real JSON, with tool names where step kinds belong, and software turned each one down, which is what that check is for |
+| Running a plan a person wrote | Finished, including a model step that summarized the file correctly and a mechanical check that passed |
+
+What it can do depends heavily on how tools are described, so this was measured. Shown each tool's JSON schema, it called nothing in 10 tries. Shown a placeholder example, it copied the placeholder word for word. Shown short signatures and an example built from a real tool, it made the right call 10 times in 10, on most wordings. One wording still got 1 in 10 in the same test, so do not expect a model this small to be dependable. Use one for a demo, and a larger one for work.
+
 **What the `process` sandbox cannot stop.** On Windows this is the only level, as there is no docker, podman, or bubblewrap here to use, and on any machine it is what is left when nothing stronger is present. It is a memory limit and a process tree that dies together, and it is not a wall:
 
 - It cannot block the network. `network: false` means nothing here, and each result says so in `network_blocked` and `notes`.
@@ -1178,7 +1202,7 @@ A tool that stores or sends text reads `CallContext.reach`, which says how far t
 
 **Proven only at small scale.**
 
-- Tool calling through the mesh was run with one small model, Qwen3-0.6B, on CPU. [What it managed is written up below.](#how-a-small-model-does)
+- Tool calling through the mesh was run with one small model, Qwen3-0.6B, on CPU. [What it managed is written up above.](#how-a-small-model-does) No larger model has been tried through the assistant.
 - The mesh's reach is taken on trust: `pool` means text goes to your own nodes, and nothing here checks where a node really is.
 - Federation was run between two installs on one machine over loopback, and in tests. It has not crossed a real network between two real owners.
 - The `container` and `namespace` sandbox levels have only had their command lines checked in tests. Neither has ever run a command for real, as this was built on Windows with no container service running.
