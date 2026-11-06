@@ -243,6 +243,17 @@ class Commands:
         inner = module._pack({"body": altered.decode(), "signature": module._b64(signature)})
         return {"sealed": module.seal(inner, peer.exchange_key, "request")}
 
+    def seal_signed_as(self, name: str, capability: str, kind: str) -> dict[str, Any]:
+        """A request whose seal is right, signed as some other kind of message."""
+        from shardmesh.assistant import federation as module
+
+        peer = self.federation.named(name)
+        now = time.time()
+        body = {"v": 1, "kind": "request", "from": self.fingerprint(), "to": peer.fingerprint, "nonce": os.urandom(16).hex(), "issued_at": now, "expires_at": now + 60, "capability": capability, "arguments": {"text": "x"}}
+        text = module._pack(body)
+        inner = module._pack({"body": text.decode(), "signature": module._b64(self.federation.identity.sign(kind, text))})
+        return {"sealed": module.seal(inner, peer.exchange_key, "request")}
+
     def notice(self, name: str, notice: str) -> dict[str, Any]:
         return {"sealed": self.federation._notice(self.federation.named(name), notice)[1]}
 
@@ -435,6 +446,70 @@ def test_an_invite_works_once_and_expires(world, tmp_path):
         second.stop()
 
 
+def pairing_message(identity: Any, secret: str) -> dict[str, Any]:
+    """What an install sends to accept an invite, built by hand."""
+    from shardmesh.assistant import federation as module
+
+    message = {"v": 1, "invite": module._invite_id(secret), "signing": module._b64(identity.signing_public), "exchange": module._b64(identity.exchange_public), "address": ""}
+    signature = module._b64(identity.sign("pair", module._pack(message)))
+    return {**message, "signature": signature, "proof": module._proof(module._proof_key(secret), b"accept", message)}
+
+
+def test_an_expired_invite_is_refused_by_the_install_that_made_it(fresh):
+    """The other side checks the date too, but it is not the one to trust."""
+    from shardmesh.assistant import federation as module
+
+    one, two = fresh
+    fields = module.read_code(one.invite("two", seconds=-1.0))
+    redated = module.make_code(fields["address"], fields["fingerprint"], fields["secret"], time.time() + 3600)
+    assert "expired" in two.refuses("accept", redated, "one")
+    assert one.names() == {}
+
+
+def test_a_code_used_at_the_same_moment_still_works_once(fresh):
+    from shardmesh.assistant import federation as module
+    from shardmesh.assistant.federation import Identity
+
+    one, _ = fresh
+    secret = module.read_code(one.invite("racer"))["secret"]
+    messages = [pairing_message(Identity(os.urandom(32), os.urandom(32)), secret) for _ in range(8)]
+    statuses: list[int] = []
+    threads = [threading.Thread(target=lambda message=message: statuses.append(one.post("/federation/pair", message).status_code)) for message in messages]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(statuses) == [200] + [403] * 7
+    assert len(one.names()) == 1
+
+
+def test_taking_an_invite_is_atomic(tmp_path):
+    """The race above is down to timing, so the step that decides it is tested directly too."""
+    from shardmesh.assistant import federation as module
+    from shardmesh.assistant.federation import Refused
+
+    assistant = build_assistant(str(tmp_path / "home"))
+    code = assistant.federation.invite(address="http://127.0.0.1:9")
+    invite = module._invite_id(module.read_code(code)["secret"])
+    assistant.federation._use_invite(invite)
+    with pytest.raises(Refused):
+        assistant.federation._use_invite(invite)
+    assistant.close()
+
+
+def test_a_message_needs_the_code_as_well_as_the_invite_id(fresh):
+    from shardmesh.assistant import federation as module
+    from shardmesh.assistant.federation import Identity
+
+    one, _ = fresh
+    secret = module.read_code(one.invite("two"))["secret"]
+    forged = {**pairing_message(Identity(os.urandom(32), os.urandom(32)), secret), "proof": module._b64(b"x" * 32)}
+    assert one.post("/federation/pair", forged).status_code == 403
+    assert one.names() == {}
+    # The invite survives a failed guess, so a stranger cannot use it up.
+    assert one.post("/federation/pair", pairing_message(Identity(os.urandom(32), os.urandom(32)), secret)).status_code == 200
+
+
 def test_an_invite_proves_who_answered_it(fresh):
     """Someone in the middle cannot answer an invite with their own keys."""
     one, two = fresh
@@ -592,10 +667,20 @@ def test_tampering_under_a_valid_seal_is_refused(world):
     assert len(alice.invoked()) == calls
 
 
-def test_a_signature_for_one_kind_of_message_means_nothing_as_another(world):
+def test_a_seal_for_one_kind_of_message_means_nothing_as_another(world):
     alice, bob, _ = world
     sealed = bob.seal("alice", "demo.echo", {"text": "a request"})["sealed"]
     assert alice.post("/federation/notice", sealed).status_code == 403
+
+
+def test_a_signature_for_one_kind_of_message_means_nothing_as_another(world):
+    """With the seal right, so that the signature is what gets judged."""
+    alice, bob, _ = world
+    assert alice.post("/federation/request", bob.seal_signed_as("alice", "demo.echo", "request")["sealed"]).status_code == 200
+    for kind in ("result", "notice", "notice-reply", "pair"):
+        reply = alice.post("/federation/request", bob.seal_signed_as("alice", "demo.echo", kind)["sealed"])
+        assert reply.status_code == 403, kind
+        assert "signature" in reply.json()["refused"]
 
 
 def test_an_unoffered_capability_is_refused(world):
