@@ -1326,9 +1326,8 @@ class DurableTasks:
 
     def _end(self, task_id: str, status: str) -> bool:
         """A task ends once, whichever process gets there first."""
-        updated = self.store.connection.execute(
-            f"UPDATE tasks SET status = ?, finished_at = ? WHERE id = ? AND status NOT IN {TASK_ENDED}", (status, self.clock(), task_id)
-        )
+        with self.store.transaction() as connection:
+            updated = connection.execute(f"UPDATE tasks SET status = ?, finished_at = ? WHERE id = ? AND status NOT IN {TASK_ENDED}", (status, self.clock(), task_id))
         return updated.rowcount == 1
 
     def _do_begin(self, task: Mapping[str, Any], action: Action, free: dict[str, int]) -> int:

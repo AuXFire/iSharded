@@ -13,7 +13,7 @@ import shlex
 
 import pytest
 
-from shardmesh.assistant import cli, context, conversation, gateway_cli, knowledge, memory, providers, router
+from shardmesh.assistant import cli, context, conversation, gateway, gateway_cli, knowledge, memory, providers, router
 from shardmesh.assistant.app import Assistant
 from shardmesh.assistant.contracts import Effect
 from shardmesh.assistant.gateway import create_app
@@ -118,8 +118,10 @@ def test_the_routes_left_open_are_exactly_the_ones_the_manual_says(tmp_path):
 
     for method, path in federation.PUBLIC_ROUTES:
         assert f"`{method} {path}`" in DOCS
-    open_section = DOCS.split("### Routes")[1]
-    assert "Every path needs a key except" in open_section
+    said = next(line for line in LINES if line.startswith("Every path needs a key except"))
+    assert "federation routes" in said
+    for path in gateway.PUBLIC_PATHS:
+        assert f"`GET {path}`" in said
 
 
 def real_settings() -> list[str]:

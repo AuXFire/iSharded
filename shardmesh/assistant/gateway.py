@@ -47,6 +47,7 @@ USER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 PUBLIC_PATHS = frozenset({"/", "/assistant", "/assistant/", "/healthz"})
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
 HTML_FILE = Path(__file__).with_name("assistant.html")
+SHARED_STYLES = Path(__file__).parent.parent / "ui.css"  # the design system every page in ShardMesh uses
 STREAM_POLL_SECONDS = 0.01
 
 BACKUP_MAGIC = b"SMAB1\n"
@@ -563,14 +564,12 @@ def create_app(assistant: Any) -> FastAPI:
         return {"cancelled": True}
 
     @api.get("/audit")
-    def audit(request: Request, since: int = 0, limit: int = 200) -> dict[str, Any]:
+    def audit(request: Request, since: int = 0, limit: int = 200, newest: bool = False) -> dict[str, Any]:
         # The trail covers everyone, so only the owner reads all of it. It holds
         # ids and decisions, never what anyone said.
         size = min(limit, 1000)
-        if request.state.role == "owner":
-            rows = assistant.audit.read(since=since, limit=size)
-        else:
-            rows = assistant.audit.read(since=since, actor=actor(me(request)), limit=size)
+        who = None if request.state.role == "owner" else actor(me(request))
+        rows = assistant.audit.read(since=since, actor=who, limit=size, newest=newest)
         return {"entries": rows, "intact": assistant.audit.verify() is None}
 
     @api.get("/why/{turn}")
@@ -603,6 +602,12 @@ def create_app(assistant: Any) -> FastAPI:
     @app.exception_handler(ValueError)
     async def bad_value(_: Request, error: ValueError) -> Any:
         return plain_error(400, error)
+
+    @app.exception_handler(sqlite3.OperationalError)
+    async def busy(_: Request, error: sqlite3.OperationalError) -> Any:
+        if "locked" not in str(error):
+            raise error
+        return JSONResponse({"detail": "Something else is busy writing to the assistant's data. Try again in a moment."}, status_code=503, headers={"Retry-After": "2"})
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -644,7 +649,8 @@ def include_parts(app: Any, assistant: Any) -> None:
 
 def page_response() -> HTMLResponse:
     nonce = secrets.token_urlsafe(16)
-    html = HTML_FILE.read_text(encoding="utf-8").replace("__CSP_NONCE__", nonce)
+    styles = SHARED_STYLES.read_text(encoding="utf-8")
+    html = HTML_FILE.read_text(encoding="utf-8").replace("/* shardmesh:ui.css */", styles).replace("__CSP_NONCE__", nonce)
     policy = (
         f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; connect-src 'self'; "
         "img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"

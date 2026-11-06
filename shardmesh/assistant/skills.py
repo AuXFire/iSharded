@@ -739,7 +739,10 @@ class Skills:
         tasks = getattr(self.assistant, "tasks", None)
         if tasks is None:
             raise SkillError("There is no task engine to reflect on. It needs the tasks part.")
-        status = tasks.status(task_id)
+        try:
+            status = tasks.status(task_id)
+        except ValueError as error:
+            raise SkillError(str(error)) from None
         outcome = self._outcome(status, task_id)
         steps = _steps(status)
         record = {

@@ -17,7 +17,7 @@ import httpx
 import pytest
 import uvicorn
 
-from shardmesh.assistant import gateway
+from shardmesh.assistant import federation, gateway
 from shardmesh.assistant.app import Assistant
 from shardmesh.assistant.cli import add_arguments, run
 from shardmesh.assistant.contracts import Effect, Provenance, Reach, ToolCall, Trust, Verdict
@@ -35,7 +35,8 @@ class Live:
 
     def __enter__(self) -> "Live":
         self.thread.start()
-        assert wait_until(lambda: self.server.started)
+        # Generous: with little memory free, starting took over 5 s and failed whichever test was next.
+        assert wait_until(lambda: self.server.started, 60.0)
         port = self.server.servers[0].sockets[0].getsockname()[1]
         self.url = f"http://127.0.0.1:{port}"
         return self
@@ -116,7 +117,7 @@ def test_every_route_needs_a_key_except_the_listed_few(live, assistant):
         for route in live.app.routes:
             path = re.sub(r"\{[^}]+\}", "x", getattr(route, "path", ""))
             for method in getattr(route, "methods", None) or ():
-                if method == "HEAD" or (path in public and method == "GET"):
+                if method == "HEAD" or (path in public and method == "GET") or (method, path) in federation.PUBLIC_ROUTES:
                     continue
                 assert stranger.request(method, path).status_code == 401, f"{method} {path}"
                 checked += 1
@@ -570,16 +571,29 @@ class Tasks:
     def submit(self, user, plan):
         return f"task-for-{user}"
 
-    def status(self, task_id):
-        if not task_id.startswith("task-for-"):
-            raise KeyError(task_id)
-        return {"id": task_id, "user": task_id.removeprefix("task-for-"), "state": "running"}
+    def status(self, task_id, user=None):
+        if not task_id.startswith(f"task-for-{user}"):
+            raise ValueError(f"There is no task {task_id}")
+        return {"id": task_id, "user": user, "status": "running"}
 
     def cancel(self, task_id, by):
         self.cancelled.append((task_id, by))
 
+    def list_tasks(self, user=None, limit=50, active_only=False):
+        return [{"id": f"task-for-{user}", "user": user, "status": "running"}] if user == "alice" else []
 
-def test_without_a_task_engine_tasks_say_so(alice):
+    def runner(self):
+        return {"pid": 1}
+
+    def start(self):
+        pass
+
+    def stop(self, wait_seconds=5.0):
+        pass
+
+
+def test_without_a_task_engine_tasks_say_so(alice, assistant):
+    del assistant.tasks
     assert alice.get("/assistant/tasks").json() == {"available": False, "tasks": []}
     assert alice.post("/assistant/tasks", json={"plan": {}}).status_code == 404
 
@@ -587,7 +601,7 @@ def test_without_a_task_engine_tasks_say_so(alice):
 def test_tasks_belong_to_their_user(alice, bob, assistant):
     assistant.tasks = Tasks()
     task = alice.post("/assistant/tasks", json={"plan": {"goal": "x"}}).json()["id"]
-    assert alice.get(f"/assistant/tasks/{task}").json()["state"] == "running"
+    assert alice.get(f"/assistant/tasks/{task}").json()["status"] == "running"
     assert bob.get(f"/assistant/tasks/{task}").status_code == 404
     assert bob.post(f"/assistant/tasks/{task}/cancel").status_code == 404
     assert assistant.tasks.cancelled == []
@@ -595,21 +609,9 @@ def test_tasks_belong_to_their_user(alice, bob, assistant):
     assert assistant.tasks.cancelled == [(task, "alice")]
 
 
-def test_a_task_that_does_not_say_whose_it_is_is_refused(alice, assistant):
-    class Silent(Tasks):
-        def status(self, task_id):
-            return {"id": task_id, "state": "running"}
-
-    assistant.tasks = Silent()
-    assert alice.get("/assistant/tasks/anything").status_code == 404
-
-
 def test_tasks_handed_off_from_a_conversation_are_listed_for_their_user(alice, bob, assistant):
-    class Anonymous(Tasks):
-        def status(self, task_id):
-            return {"id": task_id, "state": "running"}
-
-    assistant.tasks = Anonymous()
+    assistant.tasks = Tasks()
+    assistant.planner = type("Planner", (), {"plan": lambda self, user, goal, reach=None: {"goal": goal, "steps": []}})()
     assistant.router = ScriptedRouter()
     body = chat(alice, "Check the backups every morning")
     assert body["assistant"]["status"] == "task"
@@ -777,7 +779,7 @@ def test_each_load_of_the_page_has_its_own_nonce(live):
 
 
 def test_the_page_is_one_file_that_loads_nothing_from_elsewhere():
-    source = gateway.HTML_FILE.read_text(encoding="utf-8")
+    source = gateway.HTML_FILE.read_text(encoding="utf-8").replace("http://www.w3.org/2000/svg", "")  # a name, which nothing fetches
     assert not re.search(r"https?://", source)
     assert not re.search(r"<(script|link|img|iframe)[^>]*\s(src|href)=\"(?!data:)", source)
     assert "@import" not in source and "url(" not in source
@@ -799,8 +801,11 @@ def test_the_approvals_panel_is_only_redrawn_when_the_list_changes():
 
 
 def test_the_page_keeps_a_key_only_for_the_session():
+    """The theme is the one thing kept for longer, and it is shared with the mesh's own pages."""
     source = gateway.HTML_FILE.read_text(encoding="utf-8")
-    assert "sessionStorage" in source and "localStorage" not in source
+    assert "session.set('assistant-key'" in source and "lasting.set('assistant-key'" not in source
+    assert set(re.findall(r"localStorage\.\w+\(([^,)]*)", source)) == {"'shardmesh-theme'", "key"}
+    assert set(re.findall(r"lasting\.\w+\('([^']*)'", source)) == {"shardmesh-theme"}
 
 
 # Backup and restore

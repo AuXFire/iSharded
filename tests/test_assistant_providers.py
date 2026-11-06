@@ -240,7 +240,7 @@ def test_tools_are_offered_to_the_mesh_in_the_system_prompt():
     with FakeModelServer(mesh_shape=True) as server:
         MeshProvider("mesh", server.url).complete(request(tools=OFFERED), "fake-model")
     system = server.requests[0]["body"]["messages"][0]["content"]
-    assert system.startswith("Be kind.") and "files.read" in system and "mail.send" in system and "```tool" in system
+    assert system.startswith("Be kind.") and "files.read" in system and "mail.send" in system and "<tool_call>" in system
     assert server.requests[0]["body"]["messages"].count({"role": "system", "content": system}) == 1
 
 
@@ -431,7 +431,7 @@ def test_native_tools_are_sent_with_names_the_api_allows():
     assert [tool["function"]["name"] for tool in tools] == ["files__read", "mail__send"]
     assert tools[0]["function"]["parameters"]["properties"]["path"] == {"type": "string"}
     assert reply.tool_calls == (ToolCall("files.read", {"path": "a.txt"}, "call_1"),)
-    assert "```tool" not in server.requests[0]["body"]["messages"][0]["content"]
+    assert "<tool_call>" not in server.requests[0]["body"]["messages"][0]["content"]
 
 
 def test_a_native_call_to_something_not_offered_is_dropped():

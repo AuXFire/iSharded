@@ -21,7 +21,7 @@ from . import gateway_cli
 from .context import ContextTooSmall, TurnNotFound, estimate_tokens, merged
 from .contracts import CallContext, Capability, ContextItem, Effect, ModelReply, ModelRequest, Provenance, Reach, ToolCall, Trust, Verdict
 from .memory import KINDS
-from .mind import actor, add_user_option, emit, LOCAL_USER, plainly
+from .mind import actor, add_user_option, emit, plainly
 from .providers import loose_json
 
 ROLE = "conversation"
@@ -421,9 +421,8 @@ class Conversation:
 
         Taken by one caller only, so two clicks cannot run an action twice.
         """
-        cursor = self.store.connection.execute(
-            "UPDATE paused_turns SET status = 'running' WHERE turn_id = ? AND user = ? AND status = 'waiting'", (turn_id, user)
-        )
+        with self.store.transaction() as connection:
+            cursor = connection.execute("UPDATE paused_turns SET status = 'running' WHERE turn_id = ? AND user = ? AND status = 'waiting'", (turn_id, user))
         if cursor.rowcount == 0:
             raise TurnNotFound(f"No turn {turn_id} is waiting for a decision")
         row = self.store.one("SELECT * FROM paused_turns WHERE turn_id = ? AND user = ?", (turn_id, user))

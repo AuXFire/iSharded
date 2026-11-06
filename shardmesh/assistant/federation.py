@@ -10,7 +10,6 @@ in between only carries bytes. The protocol is in docs/ASSISTANT.md.
 """
 from __future__ import annotations
 
-import argparse
 import base64
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
@@ -28,9 +27,6 @@ import time
 from typing import Any
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, FastAPI, Request
-from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse
 import httpx
 
 from .contracts import (
@@ -559,7 +555,8 @@ class Federation:
         try:
             response = self._post(f"{address}/federation/pair", message, CONNECT_SECONDS + 10.0)
         except httpx.HTTPError as error:
-            raise FederationError(f"Could not reach {address}: {error}. Check that their install is serving and try again.") from error
+            # Their side may have used the code up before the answer was lost, so a retry can be refused.
+            raise FederationError(f"Could not reach {address}: {error}. Check that their install is serving and try again, with a new code if this one is refused.") from error
         reply = self._json(response)
         if response.status_code != 200:
             raise FederationError(f"They turned this down: {reply.get('refused', response.status_code)}.")
@@ -1435,56 +1432,18 @@ class PeerProvider:
         )
 
 
-async def _read_body(request: Request) -> Any:
-    """Bounded before anyone is identified."""
-    if int(request.headers.get("content-length") or 0) > MAX_MESSAGE_BYTES:
-        raise Refused("this message is too large")
-    body = b""
-    async for chunk in request.stream():
-        body += chunk
-        if len(body) > MAX_MESSAGE_BYTES:
-            raise Refused("this message is too large")
-    try:
-        return json.loads(body)
-    except (RecursionError, ValueError) as error:
-        raise Refused("this message could not be opened") from error
+def routes(assistant: Any) -> Any:
+    """The HTTP half is kept apart, because every shardmesh command imports this module."""
+    from . import federation_http
 
-
-def routes(assistant: Any) -> APIRouter:
-    """Only what a stranger may reach. Messages prove themselves, so a gateway must not ask them for a key."""
-    router = APIRouter(prefix="/federation")
-    federation = assistant.federation
-
-    async def answer(request: Request, handler: Callable[[Any], tuple[int, dict[str, Any]]]) -> JSONResponse:
-        try:
-            status, reply = await run_in_threadpool(handler, await _read_body(request))
-        except Refused as refusal:
-            return JSONResponse({"refused": str(refusal)}, status_code=403)
-        return JSONResponse(reply, status_code=status)
-
-    @router.get("/identity")
-    async def identity() -> dict[str, Any]:
-        return {"fingerprint": federation.identity.fingerprint, "protocol": PROTOCOL}
-
-    @router.post("/pair")
-    async def pair(request: Request) -> JSONResponse:
-        return await answer(request, federation.pair)
-
-    @router.post("/request")
-    async def incoming(request: Request) -> JSONResponse:
-        return await answer(request, federation.receive)
-
-    @router.post("/notice")
-    async def notice(request: Request) -> JSONResponse:
-        return await answer(request, federation.receive_notice)
-
-    return router
+    return federation_http.routes(assistant)
 
 
 class FederationServer:
     """The federation routes on their own, for installs without the gateway, and for tests."""
 
     def __init__(self, assistant: Any, host: str = "127.0.0.1", port: int = 0) -> None:
+        from fastapi import FastAPI
         import uvicorn
 
         app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)

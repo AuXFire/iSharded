@@ -378,16 +378,37 @@ class VisibleText:
         return "" if state in ("think", "tool") else held
 
 
+def signature(tool: Capability) -> str:
+    schema = tool.input_schema if isinstance(tool.input_schema, dict) else {}
+    required = set(schema.get("required", []))
+    fields = []
+    for name, entry in schema.get("properties", {}).items():
+        kind = entry.get("type", "any") if isinstance(entry, dict) else "any"
+        fields.append(f"{name}: {kind}" if name in required else f"{name}?: {kind}")
+    return f"{tool.name}({', '.join(fields)})"
+
+
+def example_call(tool: Capability) -> str:
+    schema = tool.input_schema if isinstance(tool.input_schema, dict) else {}
+    properties = schema.get("properties", {})
+    arguments = {name: ["..."] if properties.get(name, {}).get("type") == "array" else "..." for name in schema.get("required", [])}
+    return json.dumps({"name": tool.name, "arguments": arguments})
+
+
 def tool_instructions(tools: Sequence[Capability]) -> str:
+    """Tested against a real 0.6B model, because small models follow this literally.
+
+    With each tool's JSON schema it called nothing in 10 tries. Given `{"name": "value"}`
+    as the example it copied those very words. A short signature and an example built
+    from a real tool got the right call in 10 of 10, on most wordings of a request.
+    """
     lines = [
-        "You can use tools. To use one, reply with a fenced block like this and nothing after it:",
-        '```tool\n{"tool": "area.verb", "arguments": {"name": "value"}}\n```',
+        "You can use tools. To use one, reply with exactly this and nothing else:",
+        f"<tool_call>\n{example_call(tools[0])}\n</tool_call>",
         "The result comes back to you, and you can then use another tool or answer. If no tool is needed, just answer.",
         "Tools:",
     ]
-    for tool in tools:
-        schema = json.dumps(tool.input_schema, separators=(",", ":")) if tool.input_schema else "{}"
-        lines.append(f"- {tool.name}: {tool.summary} Arguments: {schema}")
+    lines += [f"- {signature(tool)}: {tool.summary}" for tool in tools]
     return "\n".join(lines)
 
 

@@ -22,7 +22,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 def run_audit(assistant: Assistant, args: Any) -> int:
     broken = assistant.audit.verify()
-    for row in assistant.audit.read(actor=args.actor)[-args.limit:]:
+    for row in assistant.audit.read(actor=args.actor, limit=args.limit, newest=True):
         print(f"{row['id']:>6}  {row['actor']:<20}  {row['action']:<20}  {row['subject']}")
     print("The record is intact." if broken is None else f"The record was changed at entry {broken}.")
     return 0 if broken is None else 1

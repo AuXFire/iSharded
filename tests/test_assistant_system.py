@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -425,6 +426,29 @@ def test_an_approval_given_on_the_command_line_can_still_carry_the_turn_on_over_
     assert tidied.exists()
 
 
+def test_the_whole_approval_path_works_from_the_command_line_across_processes(model, tmp_path):
+    folder, home = tmp_path / "work", tmp_path / "home"
+    folder.mkdir()
+    tidied = script_tidy(model, folder)
+    assert cli(home, "provider", "add", "scripted", model.url, "--reach", "pool", "--tools", "prompt").returncode == 0
+    assert cli(home, "grant", "add", "files.read", str(folder)).returncode == 0
+    assert cli(home, "grant", "add", "files.write", str(folder)).returncode == 0
+
+    stopped = cli(home, "say", "Please tidy my notes", "--no-learn")
+    assert stopped.returncode == 0, stopped.stdout + stopped.stderr
+    turn = re.search(r"resume (\w+)", stopped.stdout).group(1)
+    listed = cli(home, "approvals", "list").stdout
+    assert "files.write" in listed and not tidied.exists()
+    approval = re.search(r"a-[0-9a-f]+", listed).group(0)
+
+    assert cli(home, "approvals", "approve", approval).returncode == 0
+    resumed = cli(home, "resume", turn)
+
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    assert "tidy" in resumed.stdout
+    assert tidied.read_text(encoding="utf-8") == "eggs, milk"
+
+
 def test_only_what_a_person_granted_is_offered_to_a_model(install, model, tmp_path):
     """With every part attached the list used to fill up and drop shell.run even when granted."""
     install.use(model, tools="auto")
@@ -807,6 +831,8 @@ def test_the_coder_fixes_a_real_failing_test_and_commits_only_after_approval(ins
     assert "a - b" in (repository / "calc.py").read_text(encoding="utf-8")  # the owner's checkout is untouched
     assert not (repository / "hook-ran.txt").exists()
     assert audited(install.assistant, "coder.committed")[-1]["detail"]["as_tested"] is True
+    git(repository, "commit", "--allow-empty", "-m", "A person's own commit")
+    assert (repository / "hook-ran.txt").exists()  # so the hook was real, and only the assistant skipped it
 
 
 def test_the_git_tools_can_reach_the_coders_work_and_nothing_else_of_the_assistants(install, model, tmp_path):
@@ -1222,6 +1248,13 @@ def test_the_command_line_and_the_server_share_one_install(install, model, tmp_p
     assert audited(install.assistant, "task.submit")
 
 
+@pytest.mark.parametrize("words", [("plan", "Do a thing"), ("skill", "reflect", "t-nothing")])
+def test_a_failure_from_another_part_reaches_a_person_as_words(tmp_path, words):
+    done = cli(tmp_path / "home", *words)
+    assert done.returncode == 1
+    assert "Traceback" not in done.stderr
+
+
 def test_the_audit_record_holds_together_across_a_whole_day(install, model, tmp_path):
     install.use(model)
     install.grant("files.read", str(tmp_path))
@@ -1230,6 +1263,74 @@ def test_the_audit_record_holds_together_across_a_whole_day(install, model, tmp_
     assert install.assistant.audit.verify() is None
     assert install.http.get("/assistant/audit").json()["intact"] is True
     assert not any(b"Mornings are for walking" in json.dumps(row).encode() for row in install.assistant.audit.read(limit=10_000))
+
+
+def test_a_busy_writer_cannot_starve_the_others(tmp_path):
+    """SQLite gives nobody a turn: under real load a writer waited 11 s, and two failed as locked."""
+    with Assistant(tmp_path / "home") as assistant:
+        stop = threading.Event()
+
+        def hammer() -> None:
+            while not stop.is_set():
+                assistant.audit.record("test", "test.busy", "row")
+            assistant.store.close()
+
+        threads = [threading.Thread(target=hammer) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        waits = []
+        for _ in range(30):
+            started = time.perf_counter()
+            assistant.audit.record("test", "test.mine", "row")
+            waits.append(time.perf_counter() - started)
+        stop.set()
+        for thread in threads:
+            thread.join()
+    assert max(waits) < 3.0, waits
+
+
+def test_a_writer_that_fails_or_runs_out_of_time_leaves_the_queue_working(tmp_path):
+    with Assistant(tmp_path / "home") as assistant:
+        store = assistant.store
+        with pytest.raises(RuntimeError):
+            with store.transaction():
+                with store.transaction():
+                    raise RuntimeError("stop here")
+        assert store.turns.taken is False
+        store.turns.take(1)
+        assert store.turns.take(0.01) is False
+        assert not store.turns.queue
+        store.turns.give_back()
+        assert assistant.audit.record("test", "test.after", "row")
+
+
+def test_a_busy_store_is_a_503_that_says_to_try_again(install, monkeypatch):
+    def locked(*_: Any, **__: Any) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(install.assistant.memory, "entries", locked)
+    response = install.http.get("/assistant/memory")
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "2"
+
+
+def test_the_audit_record_can_show_what_just_happened(install):
+    """The first rows of a long record say nothing about today, and the page used to show only those."""
+    for number in range(30):
+        install.assistant.audit.record(OWNER, "test.row", str(number))
+    rows = install.http.get("/assistant/audit", params={"limit": 3, "newest": True}).json()["entries"]
+    assert [row["subject"] for row in rows] == ["27", "28", "29"]
+    assert re.search(r"\b29\b", cli(install.home, "audit", "--limit", "1").stdout)
+
+
+def test_the_page_is_built_on_the_shared_design_system(install):
+    page = httpx.get(f"{install.url}/", trust_env=False)
+    assert ".chat-page {" in page.text  # ui.css, inlined
+    assert "/* shardmesh:ui.css */" not in page.text
+    assert "__CSP_NONCE__" not in page.text
+    nonce = re.search(r"script-src 'nonce-([^']+)'", page.headers["content-security-policy"]).group(1)
+    assert page.text.count(f'nonce="{nonce}"') == 3
+    assert not re.search(r'(?:src|href)="https?://', page.text)
 
 
 def test_shell_effects_are_declared_for_the_worst_case(install):

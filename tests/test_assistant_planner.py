@@ -413,7 +413,7 @@ def test_the_plan_command_prints_a_plan_and_says_when_it_cannot(tmp_path, capsys
 
     home = tmp_path / "home"
     assert command(home, "plan", "Read the file") == 1
-    assert "router" in capsys.readouterr().out
+    assert "provider add" in capsys.readouterr().out
     monkeypatch.setattr(planner_part, "attach", attach_with_router)
     assert command(home, "plan", "Build a new feature") == 0
     assert "Needs a plan" in capsys.readouterr().out
