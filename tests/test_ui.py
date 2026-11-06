@@ -15,7 +15,7 @@ STYLES = (PACKAGE / "ui.css").read_text(encoding="utf-8")
 # An XML namespace is a name, and nothing ever fetches it.
 NOT_FETCHED = {"http://www.w3.org/2000/svg"}
 # A page may call this before the route lands, because it says so plainly on a 404.
-NOT_BUILT_YET = {("POST", "/admin/invites")}
+NOT_BUILT_YET = {("POST", "/admin/invites"), ("POST", "/admin/join/{name}/approve"), ("POST", "/admin/join/{name}/deny")}
 
 
 def source(name):
@@ -32,6 +32,9 @@ def calls(text):
     for match in re.finditer(r"api\('(/[^']+)'(?:,\s*\{([^}]*)\})?", text):
         method = re.search(r"method:\s*'(\w+)'", match.group(2) or "")
         found.add((method.group(1) if method else "GET", match.group(1)))
+    for match in re.finditer(r"api\(`(/[^`]+)`(?:,\s*\{([^}]*)\})?", text):
+        method = re.search(r"method:\s*'(\w+)'", match.group(2) or "")
+        found.add((method.group(1) if method else "GET", re.sub(r"\$\{[^}]*\}", "{name}", match.group(1))))
     for match in re.finditer(r"fetch\(base \+ '(/[^']+)',\s*\{\s*method:\s*'(\w+)'", text):
         found.add((match.group(2), match.group(1)))
     return found
@@ -97,6 +100,7 @@ def test_the_pages_still_call_what_they_are_for():
     for call in [
         ("GET", "/admin/status"), ("GET", "/admin/catalog"), ("POST", "/admin/plan"), ("POST", "/admin/load"), ("POST", "/admin/load/cancel"),
         ("POST", "/admin/rebalance"), ("GET", "/admin/inventory"), ("POST", "/admin/invites"), ("POST", "/v1/chat/completions"),
+        ("GET", "/join/requests"), ("POST", "/admin/join/{name}/approve"), ("POST", "/admin/join/{name}/deny"),
     ]:
         assert call in called
 
@@ -117,6 +121,20 @@ def test_what_arrives_from_outside_is_escaped(name):
     for name_of_field in ("error.message", "job.error", "quarantine_reason", "lane.error", "event.detail", "tel.last_error"):
         for match in re.finditer(r"\$\{([^{}]*" + re.escape(name_of_field) + r"[^{}]*)\}", text):
             assert "esc(" in match.group(1), match.group(0)
+
+
+def test_a_key_that_is_not_an_admins_does_not_sign_anyone_out():
+    text = source("dashboard.html")
+    for call in re.findall(r"api\([`'](?:/join/|/admin/join/)[^\n]*", text):
+        assert "admin: true" in call
+
+
+def test_chat_has_one_model_selector():
+    text = source("chat.html")
+    composer = text[text.index('id="composer"'):text.index("</form>", text.index('id="composer"'))]
+    assert "<select" not in composer
+    bar = text[text.index('<header class="top">'):text.index("</header>")]
+    assert 'id="modelChoice"' in bar
 
 
 @pytest.mark.parametrize("name", PAGES)

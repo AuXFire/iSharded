@@ -14,7 +14,11 @@
   <header class="top">
     <a class="brand" href="/chat"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 3h14l-2.4 5H3.6zM8 10h14l-2.4 5H5.6zM4 17h14l-2.4 5H1.6z"/></svg><span>ShardMesh</span></a>
     <nav class="tabs" aria-label="Pages"><a href="/chat" aria-current="page">Chat</a><a href="/dashboard">Dashboard</a></nav>
-    <button class="model-button" id="modelButton" type="button" aria-haspopup="dialog"><i class="glyph idle tone-idle" id="light"></i><span id="modelLabel">Choose a model</span><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m2.5 4.5 3.5 3.5 3.5-3.5"/></svg></button>
+    <div class="model-control">
+      <i class="glyph idle tone-idle" id="light"></i>
+      <select class="select" id="modelChoice" aria-label="Which running model answers this chat" hidden></select>
+      <button class="model-button" id="modelButton" type="button" aria-haspopup="dialog"><span id="modelLabel">Choose a model</span><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m2.5 4.5 3.5 3.5 3.5-3.5"/></svg></button>
+    </div>
     <div class="top-gap"></div>
     <div class="pill tone-idle" id="pill" role="status" hidden><i class="glyph idle" id="pillGlyph"></i><span id="pillText"></span></div>
     <button class="btn quiet" id="newChat" type="button">New chat</button>
@@ -32,7 +36,6 @@
           <label class="sr-only" for="prompt">Message</label>
           <textarea id="prompt" rows="1" placeholder="Message the model"></textarea>
           <div class="controls">
-            <label id="modelChoiceLabel" hidden>Model <select class="select" id="modelChoice" aria-label="Which running model answers this chat" hidden></select></label>
             <label class="switch" title="Lets the model reason before it answers, on models that support it"><input type="checkbox" id="thinking"><i></i>Thinking</label>
             <label>Temperature <input class="num-input" type="number" id="temperature" min="0" max="2" step="0.1" value="0.7"></label>
             <label>Max tokens <input class="num-input" type="number" id="maxTokens" min="1" max="32768" step="1" value="1024"></label>
@@ -121,18 +124,20 @@
     // GGUF ids carry a repository and a file; the file names the model and its quantization.
     const modelName = id => { const text = String(id || ''); if (/\.gguf$/i.test(text)) return text.split(/[:\\/]/).pop().replace(/\.gguf$/i, ''); if (/^([A-Za-z]:[\\/]|[\\/.~])/.test(text)) return text.split(/[\\/]/).filter(Boolean).pop() || text; return text; };
     const esc = value => String(value ?? '').replace(/[&<>'"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[c]));
-    const size = value => { if (!value) return '0 B'; const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']; const i = Math.min(Math.floor(Math.log(value) / Math.log(1024)), 4); return `${(value / 1024 ** i).toFixed(i > 2 ? 2 : 0)} ${units[i]}`; };
+    const size = value => { if (!value) return '0 B'; const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']; const i = Math.min(Math.floor(Math.log(value) / Math.log(1024)), 4); return `${(value / 1024 ** i).toFixed(i > 2 ? 2 : 1).replace(/\.0+$/, '')} ${units[i]}`; };
     const count = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
     const headers = () => state.token ? { Authorization: `Bearer ${state.token}` } : {};
+    const stageLayers = stage => { const start = Number(stage.start_layer), end = Number(stage.end_layer); return end - 1 > start ? `layers ${start}–${end - 1}` : `layer ${start}`; };
     const byName = (a, b) => String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' });
 
     // Repainting a region must not cost the reader their place in it.
+    const painted = new WeakMap();
     function paint(element, html) {
-      if (element.dataset.painted === html) return;
+      if (painted.get(element) === html) return;
       const focused = element.contains(document.activeElement) ? document.activeElement.dataset.key : null;
       const top = element.scrollTop;
       element.innerHTML = html;
-      element.dataset.painted = html;
+      painted.set(element, html);
       element.scrollTop = top;
       if (focused) element.querySelector(`[data-key="${CSS.escape(focused)}"]`)?.focus();
     }
@@ -250,7 +255,7 @@
       }
       if (status.status === 'recovering') return `<div class="greeting"><h1>Recovering ${esc(modelName(status.model) || 'the last model')}</h1><p>Waiting for its workers to come back. Chat opens when the route is whole again.</p></div>`;
       if (status.load_job?.phase === 'failed') return `<div class="greeting"><h1>${esc(modelName(status.load_job.model))} did not load</h1><p class="failure">${esc(status.load_job.error)}</p><div class="greeting-actions"><button class="btn primary" type="button" id="emptyPick">Choose a model</button></div></div>`;
-      if (!liveWorkers(status)) return '<div class="greeting"><h1>No workers connected</h1><p>Start a node with <code>python -m shardmesh node</code> and point it at this orchestrator, or create an invite on the dashboard. It will appear here.</p><div class="greeting-actions"><a class="btn" href="/dashboard">Open the dashboard</a></div></div>';
+      if (!liveWorkers(status)) return '<div class="greeting"><h1>No workers connected</h1><p>Start a node with <code>python -m shardmesh node</code> and point it at this node, or create an invite on the dashboard. It will appear here.</p><div class="greeting-actions"><a class="btn" href="/dashboard">Open the dashboard</a></div></div>';
       if (!state.catalog && !state.catalogFailed) readCatalog();
       return firstRun(status);
     }
@@ -262,13 +267,13 @@
         if ($('emptySignIn')) $('emptySignIn').onclick = () => askForKey(false);
         return;
       }
-      root.dataset.painted = '';
+      painted.delete(root);
       root.innerHTML = state.turns.map(turn => turn.role === 'user' ? `<div class="turn user"><div>${esc(turn.text)}</div></div>` : `<div class="turn">${renderAnswer(turn)}</div>`).join('');
     }
     // While a reply streams, only its own block changes, so earlier turns keep any selection.
     function renderLastTurn(turn) {
       const root = $('turns');
-      if (root.children.length === state.turns.length && !root.dataset.painted) root.lastElementChild.innerHTML = renderAnswer(turn);
+      if (root.children.length === state.turns.length && !painted.has(root)) root.lastElementChild.innerHTML = renderAnswer(turn);
       else renderTurns();
     }
     function stickToBottom(force) {
@@ -306,6 +311,7 @@
         const link = new AbortController(), stop = () => link.abort();
         state.abort.signal.addEventListener('abort', stop, { once: true });
         state.link = base ? null : link;
+        state.lastByte = performance.now();
         try {
           const response = await fetch(base + '/v1/chat/completions', {
             method: 'POST', signal: link.signal,
@@ -319,6 +325,7 @@
           for (;;) {
             const { value, done } = await reader.read();
             if (done) break;
+            state.lastByte = performance.now();
             buffer += decoder.decode(value, { stream: true });
             const events = buffer.split('\n\n'); buffer = events.pop();
             for (const event of events) {
@@ -413,7 +420,7 @@
       }
       const hop = index < count - 1 ? '<div class="hop">Activations hop to the next worker</div>' : '';
       const role = stageRole(index, count);
-      return `<section class="core-stage"><div class="core${progress ? ' fetching' : ''}" style="--layers:${Number(layers)}">${rows}<div class="pulse"></div></div><div class="core-note"><b>${esc(stage.worker_id)}</b><div class="core-range">${role ? `${role}, layers` : 'Layers'} ${Number(stage.start_layer)}–${Number(stage.end_layer) - 1}</div><ul class="core-memory">${memory}</ul>${fetchLine}</div></section>${hop}`;
+      return `<section class="core-stage"><div class="core${progress ? ' fetching' : ''}" style="--layers:${Number(layers)}">${rows}<div class="pulse"></div></div><div class="core-note"><b>${esc(stage.worker_id)}</b><div class="core-range">${role ? `${role}, ${stageLayers(stage)}` : stageLayers(stage).replace(/^l/, 'L')}</div><ul class="core-memory">${memory}</ul>${fetchLine}</div></section>${hop}`;
     }
     function strip(status, route) {
       const total = route.map(stage => {
@@ -442,7 +449,8 @@
         toggle = job.phase === 'fetching' && percent != null ? `Loading, ${percent}%` : 'Loading';
       } else if (route.length) {
         const speed = status.active_plan?.estimated_tokens_per_second;
-        html += `<h2>Where this model runs</h2><p class="rail-note">${count(route.length, 'stage')}, ${status.active_plan?.layers ?? ''} layers${speed ? `, planned for about ${speed} tokens/s` : ''}</p>`;
+        const layers = route.reduce((n, stage) => n + Number(stage.end_layer) - Number(stage.start_layer), 0);
+        html += `<h2>Where this model runs</h2><p class="rail-note">${count(route.length, 'stage')}, ${count(layers, 'layer')}${speed ? `, planned for about ${esc(speed)} tokens/s` : ''}</p>`;
         toggle = `Running on ${workerCount(route)}`;
       } else {
         html += `<h2>Nothing loaded</h2><p class="rail-note">The model's layers appear here, colored by the memory each one sits in.</p>`;
@@ -463,14 +471,16 @@
     function renderBar(status) {
       const busy = status.status === 'loading', moving = status.status === 'ready' && jobRunning(status), ready = status.status === 'ready';
       $('light').className = `glyph ${moving || busy ? 'work tone-work' : ready ? 'ok tone-ok' : 'idle tone-idle'}`;
-      $('modelLabel').textContent = busy ? `Loading ${modelName(status.load_job?.model)}` : status.model && ready ? modelName(status.model) : 'Choose a model';
       renderChoice(status);
+      // With a choice of running models, the select names the model and this only loads another.
+      const choosing = !$('modelChoice').hidden;
+      $('modelButton').classList.toggle('plain', choosing);
+      $('modelLabel').textContent = choosing ? 'Load a model' : busy ? `Loading ${modelName(status.load_job?.model)}` : status.model && ready ? modelName(status.model) : 'Choose a model';
     }
     function renderChoice(status) {
       const running = [status.status === 'ready' ? status.model : null, ...(status.lanes || []).filter(lane => lane.ready).map(lane => lane.model)].filter(Boolean);
       const pick = $('modelChoice');
       pick.hidden = running.length < 2;
-      $('modelChoiceLabel').hidden = pick.hidden;
       if (pick.dataset.running === running.join('|')) return;
       const chosen = pick.value;
       pick.dataset.running = running.join('|');
@@ -501,6 +511,7 @@
       paint($('notices'), failed + test);
     }
 
+    const QUIET_STREAM_MS = 15000;
     let pollTimer = null;
     async function poll() {
       clearTimeout(pollTimer);
@@ -516,7 +527,7 @@
       } catch (error) {
         if (error.offline) {
           state.failures += 1;
-          if (state.failures >= 3) state.link?.abort();
+          if (state.failures >= 3 && performance.now() - state.lastByte > QUIET_STREAM_MS) state.link?.abort();
           renderHealth();
           if (!state.status && !state.turns.length) renderTurns();
         } else if (error.status === 401) { renderSignedOut(); }
@@ -579,7 +590,7 @@
         const lines = plan.route.map(stage => {
           const memory = Object.entries(stageTotals(status, stage)).map(([kind, bytes]) => `${size(bytes)} ${TIER[kind] || kind}`).join(', ');
           const role = stageRole(plan.route.indexOf(stage), plan.route.length);
-          return `<li><span>${esc(stage.worker_id)}${role ? ` (${role.toLowerCase()})` : ''}</span><span>layers ${Number(stage.start_layer)}–${Number(stage.end_layer) - 1} in ${esc(memory)}</span></li>`;
+          return `<li><span>${esc(stage.worker_id)}${role ? ` (${role.toLowerCase()})` : ''}</span><span>${stageLayers(stage)} in ${esc(memory)}</span></li>`;
         }).join('');
         const speed = plan.estimated_tokens_per_second ? `, about ${esc(plan.estimated_tokens_per_second)} tokens/s` : '';
         const download = (plan.download_bytes ? `Needs ${size(plan.download_bytes)} of new shards.` : 'Every shard is already in place.') + (plan.draft_model ? ` A draft model (${modelName(plan.draft_model)}) will speed up replies.` : '');

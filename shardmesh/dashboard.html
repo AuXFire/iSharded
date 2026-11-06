@@ -87,7 +87,7 @@
 
       <aside class="side-col" aria-label="What needs you and recent activity">
         <section class="plate" id="attention" aria-labelledby="attentionTitle">
-          <div class="section-head"><h2 id="attentionTitle">Needs you</h2></div>
+          <div class="section-head"><h2 id="attentionTitle" tabindex="-1">Needs you</h2></div>
           <div id="attentionList"></div>
         </section>
         <section class="plate activity" aria-labelledby="activityTitle">
@@ -176,6 +176,7 @@
       latency: [], polling: false, timer: null, failures: 0, signedOut: false, problem: '', updatedAt: null, lastMembers: {},
       text: '', chip: 'all', group: store.get('shardmesh-group') || 'state', sortKey: 'state', sortDir: 1, groupsOpen: new Map(),
       allStages: false, feed: 'all', openWorker: null, selected: '', previewTimer: null, previewId: 0,
+      joins: [], joinsHidden: false, joinsAt: 0, joinBusy: new Set(), joinErrors: new Map(),
     };
 
     const TIERS = { vram: ['VRAM', '--tier-vram'], unified: ['Unified', '--tier-unified'], ram: ['RAM', '--tier-ram'], disk: ['Disk', '--tier-disk'] };
@@ -185,8 +186,13 @@
       offline: { label: 'Offline', rank: 1, glyph: 'bad', tone: 'bad' },
       active: { label: 'In route', rank: 2, glyph: 'ok', tone: 'idle' },
       service: { label: 'Cache service', rank: 3, glyph: 'idle', tone: 'idle' },
-      standby: { label: 'Standby', rank: 4, glyph: 'idle', tone: 'idle' },
+      standby: { label: 'Idle', rank: 4, glyph: 'idle', tone: 'idle' },
     };
+    // The route decides whether a worker is in it, so its label can never disagree with its row.
+    function workerState(id, worker, route) {
+      const listed = STATES[worker.state] ? worker.state : 'offline', onRoute = route.some(stage => stage.worker_id === id);
+      return listed === 'active' && !onRoute ? 'standby' : listed === 'standby' && onRoute ? 'active' : listed;
+    }
     const PHASES = [['resolving', 'Read the tensor list'], ['fetching', 'Download each worker\'s shards'], ['loading', 'Move weights into memory']];
     const WORKER_KINDS = ['gpu', 'cpu', 'memory'];
     const ICONS = {
@@ -215,12 +221,13 @@
     const byName = (a, b) => String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' });
 
     // Repainting a region must not cost the operator their place in it.
+    const painted = new WeakMap();
     function paint(element, html) {
-      if (element.dataset.painted === html) return;
+      if (painted.get(element) === html) return;
       const focused = element.contains(document.activeElement) ? document.activeElement.dataset.key : null;
       const top = element.scrollTop;
       element.innerHTML = html;
-      element.dataset.painted = html;
+      painted.set(element, html);
       element.scrollTop = top;
       if (focused) element.querySelector(`[data-key="${CSS.escape(focused)}"]`)?.focus();
     }
@@ -237,7 +244,7 @@
     }
 
     async function api(path, options = {}) {
-      const { timeout, ...rest } = options;
+      const { timeout, admin, ...rest } = options;
       const control = new AbortController();
       const timer = timeout ? setTimeout(() => control.abort(), timeout) : null;
       let response;
@@ -246,7 +253,7 @@
       } catch {
         throw Object.assign(new Error('This node did not answer.'), { offline: true });
       } finally { clearTimeout(timer); }
-      if (response.status === 401) { state.signedOut = true; askForKey(Boolean(state.token)); throw Object.assign(new Error('A key is needed.'), { status: 401 }); }
+      if (response.status === 401 && !admin) { state.signedOut = true; askForKey(Boolean(state.token)); throw Object.assign(new Error('A key is needed.'), { status: 401 }); }
       if (!response.ok) {
         let message = `Request failed with HTTP ${response.status}`, detail = null;
         try { const body = await response.json(); detail = typeof body.detail === 'string' ? body.detail : null; message = detail || JSON.stringify(body.detail); } catch {}
@@ -269,7 +276,9 @@
     }
     const legend = totals => `<div class="legend">${TIER_ORDER.filter(kind => totals[kind]).map(kind => `<span class="tier-${kind}"><i></i>${TIERS[kind][0]} <b>${bytes(totals[kind])}</b></span>`).join('')}</div>`;
     const stageRole = (index, total) => total === 1 ? 'Entry and exit' : index === 0 ? 'Entry' : index === total - 1 ? 'Exit' : `Stage ${index + 1}`;
-    const stageRange = stage => `${Number(stage.start_layer)}–${Number(stage.end_layer) - 1}`;
+    const span = (start, end) => Number(end) - 1 > Number(start) ? `${Number(start)}–${Number(end) - 1}` : `${Number(start)}`;
+    const stageRange = stage => span(stage.start_layer, stage.end_layer);
+    const stageLayers = stage => `${Number(stage.end_layer) - Number(stage.start_layer) > 1 ? 'layers' : 'layer'} ${stageRange(stage)}`;
     const stageMemory = (stage, data) => { const totals = tierTotals([stage], data); return TIER_ORDER.filter(kind => totals[kind]).map(kind => `${TIERS[kind][0]} ${bytes(totals[kind])}`).join(', '); };
 
     function ribbon(route, data, { progress = null, stale = false, open = true } = {}) {
@@ -289,17 +298,16 @@
           cells += `<span class="cell${progress && (offset + 1) / layers <= share ? ' done' : ''}"><i class="tier-${kind(dense)}"></i>${experts ? `<i class="experts tier-${kind(experts)}"></i>` : ''}</span>`;
         }
         const compute = worker?.runtime?.telemetry?.compute_ms_ema;
-        const tip = [`${stage.worker_id}, ${stageRole(index, route.length).toLowerCase()}`, `Layers ${stageRange(stage)}`, stageMemory(stage, data), job ? `${bytes(job.bytes_done)} of ${bytes(job.bytes_total)} fetched` : compute != null ? `${num(compute)} ms compute` : ''].filter(Boolean).join('\n');
+        const tip = [`${stage.worker_id}, ${stageRole(index, route.length).toLowerCase()}`, stageLayers(stage), stageMemory(stage, data), job ? `${bytes(job.bytes_done)} of ${bytes(job.bytes_total)} fetched` : compute != null ? `${num(compute)} ms compute` : ''].filter(Boolean).join('\n');
         return `<div class="seg${tone}${progress ? ' fetching' : ''}" style="--layers:${layers}" data-tip="${esc(tip)}"${open ? ` data-worker="${esc(stage.worker_id)}"` : ''}>${cells}</div>`;
       }).join('');
       return `<div class="ribbon${stale ? ' stale' : ''}" role="img" aria-label="${esc(`${route.length} stages. The stage list has the same details.`)}">${parts}</div>`;
     }
     function ribbonNotes(route) {
-      if (route.length > 6) {
-        const first = route[0], last = route[route.length - 1];
-        return `<div class="ribbon-ends"><span><b>${esc(first.worker_id)}</b> entry, layer ${Number(first.start_layer)}</span><span><b>${esc(last.worker_id)}</b> exit, layer ${Number(last.end_layer) - 1}</span></div>`;
-      }
-      return `<div class="ribbon-notes">${route.map((stage, index) => `<div style="--layers:${Number(stage.end_layer) - Number(stage.start_layer)}"><b>${esc(stage.worker_id)}</b><span>${stageRole(index, route.length)}, layers ${stageRange(stage)}</span></div>`).join('')}</div>`;
+      const first = route[0], last = route[route.length - 1], many = route.length > 2;
+      const ends = fit => `<div class="ribbon-ends${fit}"><span><b>${esc(first.worker_id)}</b> entry, layer ${Number(first.start_layer)}</span><span><b>${esc(last.worker_id)}</b> exit, layer ${Number(last.end_layer) - 1}</span></div>`;
+      if (route.length > 6) return ends('');
+      return `${many ? ends(' narrow-only') : ''}<div class="ribbon-notes${many ? ' wide-only' : ''}">${route.map((stage, index) => `<div style="--layers:${Number(stage.end_layer) - Number(stage.start_layer)}"><b>${esc(stage.worker_id)}</b><span>${stageRole(index, route.length)}, ${stageLayers(stage)}</span></div>`).join('')}</div>`;
     }
 
     function memoryOf(data) {
@@ -342,7 +350,8 @@
         return parts.join(', ');
       };
       const machines = data.virtual_hardware?.hosts ?? 0, memory = memoryOf(data);
-      const healthy = `${count(route.length, 'stage')} on ${count(new Set(route.map(stage => data.workers?.[stage.worker_id]?.hardware?.host_id ?? stage.worker_id)).size, 'machine')}. Nothing needs you.`;
+      const asking = state.joins.length ? `${count(state.joins.length, 'machine')} asking to join.` : 'Nothing needs you.';
+      const healthy = `${count(route.length, 'stage')} on ${count(new Set(route.map(stage => data.workers?.[stage.worker_id]?.hardware?.host_id ?? stage.worker_id)).size, 'machine')}. ${asking}`;
       if (data.status === 'ready') {
         if (lost.length) return { tone: 'bad', glyph: 'bad', label: 'Failed', title: `${name} lost part of its route`, detail: 'Replies may stall until the mesh repairs the route.', issues };
         if (alerts.length) return { tone: 'warn', glyph: 'warn', label: 'Degraded', title: `Serving ${name}`, detail: `${summary()}. Replies are still being served.`, issues };
@@ -351,7 +360,7 @@
       }
       if (running) return { tone: 'work', glyph: 'work', label: 'Loading', title: `Loading ${modelName(job.model)}`, detail: 'Chat opens when every shard is in place.', issues };
       if (data.status === 'recovering') return { tone: 'work', glyph: 'work', label: 'Recovering', title: `Recovering ${name || 'the last model'}`, detail: 'Waiting for its workers to come back.', issues };
-      if (job?.phase === 'failed') return { tone: 'bad', glyph: 'bad', label: 'Failed', title: `${modelName(job.model)} did not load`, detail: job.error, issues };
+      if (job?.phase === 'failed') return { tone: 'bad', glyph: 'bad', label: 'Failed', title: `${modelName(job.model)} did not load`, detail: job.error, issues, empty: workers.some(worker => worker.live) ? 'model' : 'machines' };
       if (!workers.some(worker => worker.live)) return { tone: 'idle', glyph: 'idle', label: 'No machines', title: 'No machines connected', detail: 'This node is running, but no worker has joined it yet.', issues, empty: 'machines' };
       return { tone: alerts.length ? 'warn' : 'idle', glyph: alerts.length ? 'warn' : 'idle', label: alerts.length ? 'Degraded' : 'No model', title: 'No model loaded', detail: `${count(machines, 'machine')} ready. Choose a model to start.`, issues, empty: 'model' };
     }
@@ -416,7 +425,7 @@
         const line = values.map((value, index) => `${(index / (values.length - 1) * 84).toFixed(1)},${(25 - (value - min) / range * 22).toFixed(1)}`).join(' L');
         return `<svg class="spark" viewBox="0 0 84 28" preserveAspectRatio="none" aria-hidden="true"><path d="M${line}"/></svg>`;
       })();
-      const figure = (label, value, unit, note = '', extra = '') => `<div class="figure"><dt>${esc(label)}</dt><dd><span class="figure-value">${esc(value)}${unit && value !== '—' ? `<span class="figure-unit">${esc(unit)}</span>` : ''}</span>${extra}</dd><div class="figure-note">${esc(note) || '&nbsp;'}</div></div>`;
+      const figure = (label, value, unit, note = '', extra = '') => `<div class="figure"><dt>${esc(label)}</dt><dd><div class="figure-row"><span class="figure-value">${esc(value)}${unit && value !== '—' ? `<span class="figure-unit">${esc(unit)}</span>` : ''}</span>${extra}</div><div class="figure-note">${esc(note) || '&nbsp;'}</div></dd></div>`;
       const memoryText = bytes(memory.budget).split(' ');
       paint($('figures'), [
         figure('Throughput', num(metrics.tokens_per_second_ema, 1), 'tokens/s'),
@@ -449,7 +458,7 @@
       const layers = route.reduce((n, stage) => n + Number(stage.end_layer) - Number(stage.start_layer), 0), plan = data.active_plan || {};
       const rows = route.map((stage, index) => {
         const worker = data.workers?.[stage.worker_id] || {};
-        return { stage, index, worker, compute: worker.runtime?.telemetry?.compute_ms_ema, state: worker.state || 'offline' };
+        return { stage, index, worker, compute: worker.runtime?.telemetry?.compute_ms_ema, state: workerState(stage.worker_id, worker, route) };
       });
       const timed = rows.filter(row => row.compute != null), slowest = timed.length > 2 ? timed.reduce((a, b) => b.compute > a.compute ? b : a) : null;
       const notes = [`${count(route.length, 'stage')}, ${count(layers, 'layer')}, epoch ${esc(data.epoch)}`];
@@ -477,7 +486,7 @@
         const route = lane.route || [], running = jobRunning(lane.load_job);
         const look = lane.error ? ['bad', 'bad', 'Failed: ' + lane.error] : lane.ready ? ['ok', 'idle', `Ready on ${count(route.length, 'stage')}`] : ['work', 'work', running ? `Loading, ${lane.load_job.phase}` : 'Starting'];
         const strip = route.length ? ribbon(route, data, { open: false }) : '';
-        return `<div class="lane"><div class="lane-name">${esc(lane.name)}<span class="sub">${esc(modelName(lane.model) || 'No model yet')}</span></div><div class="lane-state tone-${look[1]}"><i class="glyph ${look[0]}"></i><span style="color:var(--ink)">${esc(look[2])}</span></div><div>${strip}<span class="sub">${count(lane.workers || 0, 'worker')}</span></div></div>`;
+        return `<div class="lane"><div class="lane-name">${esc(lane.name)}<span class="sub">${esc(modelName(lane.model) || 'No model yet')}</span></div><div class="lane-state tone-${look[1]}"><i class="glyph ${look[0]}"></i><span style="color:var(--ink)">${esc(look[2])}</span></div><div>${strip}<span class="sub">${count(lane.workers || 0, 'worker')}${route.length ? ', memory not reported here' : ''}</span></div></div>`;
       }).join(''));
     }
 
@@ -489,10 +498,54 @@
         const action = issue.worker ? `<button class="btn small" type="button" data-worker="${esc(issue.worker)}" data-key="i:${esc(issue.worker)}">View</button>` : issue.filter ? `<button class="btn small" type="button" data-action="show-attention" data-key="i:filter">Show</button>` : '';
         return `<li><i class="glyph ${look[0]} tone-${look[1]}"></i><div class="issue-body"><b>${esc(issue.title)}</b><p>${esc(issue.detail)}</p></div>${action}</li>`;
       };
-      let html = list.length ? `<ul class="issues">${list.map(line).join('')}</ul>` : '';
+      const joins = state.joins.length ? `<div class="joins"><p class="join-note">Check that each fingerprint matches what the new machine shows before you approve it.</p><ul class="issues">${state.joins.map(joinLine).join('')}</ul></div>` : '';
+      let html = joins + (list.length ? `<ul class="issues">${list.map(line).join('')}</ul>` : '');
       if (view.empty === 'machines') html += '<div class="empty compact"><b>This mesh has no workers yet</b><button class="btn primary" type="button" data-action="invite" data-key="a:invite">Add a machine</button></div>';
-      else if (!list.some(issue => issue.tone !== 'info')) html = `<div class="all-clear tone-ok"><i class="glyph ok"></i><span>Nothing right now</span></div>${html}`;
+      else if (!joins && !list.some(issue => issue.tone !== 'info')) html = `<div class="all-clear tone-ok"><i class="glyph ok"></i><span>Nothing right now</span></div>${html}`;
       paint($('attentionList'), html);
+    }
+
+    /* Machines asking to join. Anyone may ask, so all of this is someone else's text. */
+
+    function joinLine(item) {
+      const name = String(item.name ?? ''), busy = state.joinBusy.has(name) ? ' disabled' : '', failure = state.joinErrors.get(name);
+      const addresses = [].concat(item.addresses ?? []).join(', ') || 'None given';
+      return `<li><i class="glyph ok tone-work"></i><div class="issue-body"><b>${esc(name)} wants to join</b><dl class="join-facts"><dt>Addresses</dt><dd>${esc(addresses)}</dd><dt>Key fingerprint</dt><dd><code>${esc(item.fingerprint ?? 'Unknown')}</code></dd></dl>${failure ? `<p class="error" role="alert">${esc(failure)}</p>` : ''}<div class="join-actions"><button class="btn small primary" type="button" data-join="approve" data-name="${esc(name)}" data-key="j:a:${esc(name)}"${busy}>Approve</button><button class="btn small" type="button" data-join="deny" data-name="${esc(name)}" data-key="j:d:${esc(name)}"${busy}>Deny</button></div></div></li>`;
+    }
+    function joinsChanged() {
+      if (!state.data) return;
+      const view = assess(state.data);
+      if (!state.failures) $('subline').textContent = view.detail;
+      renderAttention(view);
+    }
+    async function readJoins(force = false) {
+      if (state.joinsHidden || state.signedOut || document.hidden || readJoins.busy) return;
+      if (!force && Date.now() - state.joinsAt < 8000) return;
+      readJoins.busy = true; state.joinsAt = Date.now();
+      try {
+        state.joins = (await api('/join/requests', { timeout: 10000, admin: true })).requests || [];
+      } catch (error) {
+        // A key that cannot read the list, or a node without one, has nothing to act on here.
+        if ([401, 403, 404].includes(error.status)) { state.joins = []; state.joinsHidden = true; }
+      } finally { readJoins.busy = false; }
+      joinsChanged();
+    }
+    function joinError(error) {
+      if (error.offline) return 'This node did not answer, so nothing changed. Try again in a moment.';
+      if (error.status === 401 || error.status === 403) return error.detail || 'This needs an admin key.';
+      if (error.status === 404) return 'This node cannot answer join requests yet. It needs a newer version of ShardMesh.';
+      return error.detail || error.message;
+    }
+    async function answerJoin(name, decision) {
+      state.joinBusy.add(name); state.joinErrors.delete(name); joinsChanged();
+      try {
+        if (decision === 'approve') await api(`/admin/join/${encodeURIComponent(name)}/approve`, { method: 'POST', admin: true });
+        else await api(`/admin/join/${encodeURIComponent(name)}/deny`, { method: 'POST', admin: true });
+        state.joins = state.joins.filter(item => item.name !== name);
+        toast(`${decision === 'approve' ? 'Approved' : 'Denied'} ${name}`);
+        $('attentionTitle').focus();
+      } catch (error) { state.joinErrors.set(name, joinError(error)); }
+      finally { state.joinBusy.delete(name); joinsChanged(); readJoins(true); }
     }
 
     /* Workers */
@@ -519,20 +572,20 @@
       const pools = runtime.memory_pools || hw.memory_pools || [];
       const budget = isService ? cache.budget_bytes || contribution.ram_budget_bytes || 0 : pools.reduce((n, pool) => n + (pool.budget_bytes || 0), 0);
       const used = isService ? cache.used_bytes || 0 : pools.reduce((n, pool) => n + (pool.used_bytes || 0), 0);
-      const layers = assignment ? `${Number(assignment.start_layer)}–${Number(assignment.end_layer) - 1}` : '';
+      const layers = assignment ? stageLayers({ start_layer: Number(assignment.start_layer), end_layer: Number(assignment.end_layer) }) : position >= 0 ? stageLayers(route[position]) : '';
       const gpus = (inventory.gpus || []).filter(gpu => gpu.temperature_c != null || gpu.load_percent != null);
       const hottest = gpus.length ? gpus.reduce((a, b) => (b.temperature_c ?? -1) > (a.temperature_c ?? -1) ? b : a) : null;
       const accelerator = hw.accelerator_name || (hw.backend || '').toUpperCase() || 'Unknown';
       return {
-        id, worker, state: STATES[worker.state] ? worker.state : 'offline', host: hw.host_id || 'Unknown machine', accelerator, backend: hw.backend || '', pools, budget, used, layers, position, isService,
+        id, worker, state: workerState(id, worker, route), host: hw.host_id || 'Unknown machine', accelerator, backend: hw.backend || '', pools, budget, used, layers, position, isService,
         roles: (contribution.roles || []).join(', '), compute: telemetry.compute_ms_ema, rtt: worker.control_latency_ms, cordoned: (data.cordoned_nodes || []).includes(node), gpu: hottest,
-        search: [id, hw.host_id, hw.accelerator_name, hw.backend, STATES[worker.state]?.label, (contribution.roles || []).join(' ')].join(' ').toLowerCase(),
+        search: [id, hw.host_id, hw.accelerator_name, hw.backend, STATES[workerState(id, worker, route)].label, (contribution.roles || []).join(' ')].join(' ').toLowerCase(),
       };
     }
-    const CHIPS = { all: 'All', attention: 'Needs attention', active: 'In route', standby: 'Standby', service: 'Cache service' };
+    const CHIPS = { all: 'All', attention: 'Needs attention', active: 'In route', standby: 'Idle', service: 'Cache service' };
     const inChip = (row, chip) => chip === 'all' || (chip === 'attention' ? row.state === 'quarantined' || row.state === 'offline' : row.state === chip);
     const groupKey = row => state.group === 'machine' ? row.host : state.group === 'accelerator' ? row.accelerator : state.group === 'none' ? '' : row.state === 'quarantined' || row.state === 'offline' ? 'Needs attention' : STATES[row.state].label;
-    const STATE_GROUPS = ['Needs attention', 'In route', 'Cache service', 'Standby'];
+    const STATE_GROUPS = ['Needs attention', 'In route', 'Cache service', 'Idle'];
     const groupOrder = (a, b) => state.group === 'state' ? STATE_GROUPS.indexOf(a) - STATE_GROUPS.indexOf(b) : byName(a, b);
     const SORTS = {
       name: (a, b) => byName(a.id, b.id),
@@ -546,7 +599,8 @@
       const look = STATES[row.state];
       const problem = look.tone === 'idle' ? '' : ` problem ${look.tone}`;
       const route = state.data?.route || [];
-      const work = row.isService ? 'KV cache' : row.position >= 0 ? `${stageRole(row.position, route.length)}, layers ${esc(row.layers)}` : row.layers ? `Layers ${esc(row.layers)}` : 'Not on the route';
+      const doing = [row.position >= 0 ? stageRole(row.position, route.length) : '', row.layers].filter(Boolean).join(', ') || 'Not on the route';
+      const work = row.isService ? 'KV cache' : esc(doing[0].toUpperCase() + doing.slice(1));
       const fills = row.isService ? `<i class="tier-ram" style="width:${row.budget ? (row.used / row.budget * 100).toFixed(1) : 0}%"></i>` : row.pools.filter(pool => pool.used_bytes).map(pool => `<i class="tier-${TIERS[pool.kind] ? pool.kind : 'disk'}" style="width:${(pool.used_bytes / row.budget * 100).toFixed(1)}%"></i>`).join('');
       const memory = row.budget ? `<div class="meter" aria-hidden="true">${fills}</div>${bytes(row.used)} of ${bytes(row.budget)}` : '—';
       const gpu = showGpu ? `<td class="right" data-label="GPU">${row.gpu ? esc([row.gpu.temperature_c != null ? `${Math.round(row.gpu.temperature_c)}°C` : '', row.gpu.load_percent != null ? `${Math.round(row.gpu.load_percent)}%` : ''].filter(Boolean).join(', ')) : '—'}</td>` : '';
@@ -555,7 +609,7 @@
     }
     function renderMachines(data) {
       const all = Object.entries(data.workers || {}).map(([id, worker]) => describe(id, worker, data));
-      const live = all.filter(row => row.worker.live).length, hosts = new Set(all.map(row => row.host)).size;
+      const online = all.filter(row => row.worker.live), live = online.length, hosts = new Set(online.map(row => row.host)).size;
       paint($('machinesNote'), `${live} of ${count(all.length, 'worker')} online, on ${count(hosts, 'machine')}`);
       const ranked = [...all].sort(SORTS.state);
       const tally = {}; for (const row of all) tally[row.state] = (tally[row.state] || 0) + 1;
@@ -576,7 +630,7 @@
       const body = [...groups.keys()].sort(groupOrder).map(key => {
         const members = groups.get(key), lines = members.map(row => workerLine(row, showGpu)).join('');
         if (!key) return `<tbody>${lines}</tbody>`;
-        const open = state.groupsOpen.has(key) ? state.groupsOpen.get(key) : !(state.group === 'state' && key === 'Standby' && all.length > 24);
+        const open = state.groupsOpen.has(key) ? state.groupsOpen.get(key) : !(state.group === 'state' && key === 'Idle' && all.length > 24);
         const label = state.group === 'machine' ? `${count(members.length, 'worker')} on this machine` : count(members.length, 'worker');
         return `<tbody><tr class="group-row"><th colspan="${columns}" scope="colgroup"><button type="button" data-group="${esc(key)}" data-key="g:${esc(key)}" aria-expanded="${open}">${ICONS.chevron}${esc(key)} <span class="group-count">${esc(label)}</span><span class="group-memory">${hostMemory(members.map(row => row.worker))}</span></button></th></tr>${open ? lines : ''}</tbody>`;
       }).join('');
@@ -638,14 +692,14 @@
       if (!id) return;
       if (!w) { paint($('workerContent'), `<div class="drawer-head"><h2 id="workerTitle">${esc(id)}</h2><button class="icon-btn" type="button" data-action="close-worker" data-key="close" aria-label="Close details">${ICONS.close}</button></div><div class="drawer-body"><p class="quiet-text">This worker has left the mesh.</p></div>`); return; }
       const hw = w.hardware || {}, contribution = hw.contribution || {}, rt = w.runtime || {}, tel = rt.telemetry || {}, cache = rt.memory_store || {}, a = rt.assignment;
-      const look = STATES[w.state] || STATES.offline;
+      const look = STATES[workerState(id, w, state.data.route || [])];
       const alert = w.quarantined && w.quarantine_reason ? `<div class="notice warn"><i class="glyph warn"></i><div class="notice-body"><b>Quarantined</b><p>${esc(w.quarantine_reason)}</p></div></div>` : '';
       const failure = tel.last_error ? `<div class="notice"><i class="glyph idle"></i><div class="notice-body"><b>Last error</b><p>${esc(tel.last_error)}</p></div></div>` : '';
       paint($('workerContent'), `<div class="drawer-head"><div><h2 id="workerTitle">${esc(id)}</h2><div class="drawer-state tone-${look.tone}"><i class="glyph ${look.glyph}"></i><span>${esc(look.label)}</span></div></div><button class="icon-btn" type="button" data-action="close-worker" data-key="close" aria-label="Close details">${ICONS.close}</button></div><div class="drawer-body">${alert}${failure}
         <section class="detail"><h3>Live readings</h3>${readings(id)}</section>
         <section class="detail"><h3>Contribution</h3>${row('Roles', (contribution.roles || []).join(', ') || '—')}${row('CPU threads', contribution.cpu_threads ?? 0)}${row('RAM budget', bytes(contribution.ram_budget_bytes))}${row('Accelerator budget', bytes(contribution.accelerator_memory_budget_bytes))}${row('Standby', contribution.standby ? 'Yes' : 'No')}</section>
         <section class="detail"><h3>Memory for weights</h3>${(rt.memory_pools || hw.memory_pools || []).map(pool => row(`${TIERS[pool.kind]?.[0] || pool.kind} (${pool.pool_id})`, `${bytes(pool.used_bytes || 0)} of ${bytes(pool.budget_bytes)}, ${pool.dtype}, ${pool.bandwidth_gbps} GB/s`)).join('') || row('Pools', 'None')}</section>
-        <section class="detail"><h3>Placement</h3>${row('Layer range', a ? `${Number(a.start_layer)}–${Number(a.end_layer) - 1}` : 'Not on the active route')}${row('Pipeline epoch', rt.epoch ?? '—')}${row('Address', w.advertised_url)}</section>
+        <section class="detail"><h3>Placement</h3>${row('Layer range', a ? span(a.start_layer, a.end_layer) : 'Not on the active route')}${row('Pipeline epoch', rt.epoch ?? '—')}${row('Address', w.advertised_url)}</section>
         <section class="detail"><h3>Hardware</h3>${row('Machine', hw.host_id || '—')}${row('Backend', (hw.backend || '—').toUpperCase())}${row('Runtime', hw.runtime_version || '—')}${row('Accelerator', hw.accelerator_name || 'None')}${row('Accelerator memory', bytes(hw.accelerator_memory_bytes))}${row('System memory', bytes(hw.ram_total_bytes))}${row('CPU cores', hw.cpu_cores ?? '—')}</section>
         <section class="detail"><h3>Telemetry</h3>${row('Control RTT', `${num(w.control_latency_ms)} ms`)}${row('Local compute', `${num(tel.compute_ms_ema)} ms`)}${row('Downstream', `${num(tel.downstream_ms_ema)} ms`)}${row('Tokens processed', tel.tokens_processed ?? 0)}${row('Activations sent', bytes(tel.activation_bytes_sent))}${row('KV snapshots sent', tel.kv_snapshots_sent ?? 0)}${row('KV restores', tel.kv_restores ?? 0)}${row('RAM cache used', bytes(cache.used_bytes))}${row('RAM cache budget', bytes(cache.budget_bytes))}</section>
       </div>`);
@@ -653,7 +707,7 @@
     function openWorker(id) {
       if (!state.data?.workers?.[id]) return;
       state.openWorker = id;
-      $('workerContent').dataset.painted = '';
+      painted.delete($('workerContent'));
       renderWorker();
       if (!$('worker').open) $('worker').showModal();
       readInventory(true);
@@ -717,7 +771,7 @@
         const plan = await api('/admin/plan', { method: 'POST', body: JSON.stringify(loadOptions()) });
         if (ticket !== state.previewId) return;
         const data = state.data || { workers: {} };
-        const lines = plan.route.map((stage, index) => `<li><span>${esc(stage.worker_id)}${plan.route.length > 1 && (index === 0 || index === plan.route.length - 1) ? ` (${index === 0 ? 'entry' : 'exit'})` : ''}</span><span>layers ${stageRange(stage)} in ${esc(stageMemory(stage, data))}</span></li>`).join('');
+        const lines = plan.route.map((stage, index) => `<li><span>${esc(stage.worker_id)}${plan.route.length > 1 && (index === 0 || index === plan.route.length - 1) ? ` (${index === 0 ? 'entry' : 'exit'})` : ''}</span><span>${stageLayers(stage)} in ${esc(stageMemory(stage, data))}</span></li>`).join('');
         const speed = plan.estimated_tokens_per_second ? `, about ${esc(plan.estimated_tokens_per_second)} tokens/s` : '';
         const download = (plan.download_bytes ? `Needs ${bytes(plan.download_bytes)} of new shards.` : 'Every shard is already in place.') + (plan.draft_model ? ` A draft model (${modelName(plan.draft_model)}) will speed up replies.` : '');
         const busy = jobRunning(state.data?.load_job) ? ` ${modelName(state.data.load_job.model)} is still loading, so cancel it first to load this one.` : '';
@@ -838,6 +892,7 @@
       paint($('notices'), state.problem ? `<div class="notice bad"><i class="glyph bad"></i><div class="notice-body"><b>The last update failed</b><p>${esc(state.problem)}</p></div></div>` : '');
       showConsole(true);
       $('rebalanceButton').hidden = !(data.route || []).length;
+      $('loadButton').hidden = view.empty === 'machines';
       $('loadButton').classList.toggle('primary', view.empty === 'model');
       $('addMachine').classList.toggle('primary', view.empty === 'machines');
       if (data.metrics?.token_latency_ms_ema) { state.latency.push(data.metrics.token_latency_ms_ema); if (state.latency.length > 28) state.latency.shift(); }
@@ -861,6 +916,7 @@
         if ($('auth').open) $('auth').close();
         render(data);
         readInventory();
+        readJoins();
       } catch (error) {
         if (error.status === 401) renderSignedOut();
         else if (error.offline) { state.failures += 1; renderOffline(); }
@@ -876,7 +932,7 @@
     }
     function signOut() {
       store.drop('shardmesh-token');
-      state.token = ''; state.data = null; state.inventory = {}; state.latency = [];
+      state.token = ''; state.data = null; state.inventory = {}; state.latency = []; state.joins = []; state.joinsHidden = false;
       if ($('worker').open) $('worker').close();
       refresh();
     }
@@ -908,9 +964,10 @@
       else if (action === 'cancel') api('/admin/load/cancel', { method: 'POST' }).then(() => { toast('Load cancelled'); refresh(); }).catch(error => toast(error.message));
     }
     document.addEventListener('click', event => {
-      const target = event.target.closest?.('[data-action],[data-chip],[data-feed],[data-sort],[data-group],[data-model],[data-worker]');
+      const target = event.target.closest?.('[data-action],[data-join],[data-chip],[data-feed],[data-sort],[data-group],[data-model],[data-worker]');
       if (!target) return;
       if (target.dataset.action) onAction(target.dataset.action);
+      else if (target.dataset.join) answerJoin(target.dataset.name, target.dataset.join);
       else if (target.dataset.chip) { state.chip = target.dataset.chip; renderMachines(state.data); }
       else if (target.dataset.feed) { state.feed = target.dataset.feed; renderEvents(state.data); }
       else if (target.dataset.sort) {
@@ -966,12 +1023,12 @@
       event.preventDefault();
       const key = $('tokenInput').value.trim();
       if (!key) return;
-      state.token = key; store.set('shardmesh-token', key); state.signedOut = false;
+      state.token = key; store.set('shardmesh-token', key); state.signedOut = false; state.joinsHidden = false; state.joins = [];
       $('auth').close(); refresh(true);
     };
     $('signOut').onclick = signOut;
     $('themeButton').onclick = () => applyTheme(THEMES[(THEMES.indexOf($('themeButton').dataset.choice) + 1) % THEMES.length]);
-    addEventListener('hashchange', () => { if (takeKeyFromLink()) { state.signedOut = false; if ($('auth').open) $('auth').close(); refresh(); } });
+    addEventListener('hashchange', () => { if (takeKeyFromLink()) { state.signedOut = false; state.joinsHidden = false; state.joins = []; if ($('auth').open) $('auth').close(); refresh(); } });
     document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
 
     takeKeyFromLink();
