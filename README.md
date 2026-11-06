@@ -1222,7 +1222,7 @@ States also carry a conversation through failures, at the same places:
 - **A node is lost.** Each stage sends one copy of each state to one other machine, in the background, at `--state-copy-mb`. A spare that takes over those layers fetches the copy and carries on. Only that stage moves: the others stay as they are.
 - **The survivors have to split the layers differently.** A state is only good for the layers it came from, so no copy applies, and the prompt is read in full.
 
-Nothing waits for a copy. A newer turn replaces one still queued, so a slow link falls behind and does not back up. A copy that is missing, late, or damaged means reading the prompt, so the worst case is the cost of having no cache. Copies are full states, and sending less is not built. States under 256 tokens are not copied, because reading them again costs less.
+No reply waits for a copy to be sent. A newer turn replaces one still queued, so a slow link falls behind and does not back up. A copy that is missing, late, or damaged means reading the prompt. A stage that has to fetch one holds its reply up for 30 s at most, so a slow or silent holder can add that much to the cost of having no cache. Copies are full states, and sending less is not built. States under 256 tokens are not copied, since reading them again costs little.
 
 `--no-prompt-cache` on a load turns all of this off.
 
@@ -1638,6 +1638,22 @@ Models that need or suit the split, on the same test pool:
 | Qwen3.6-35B-A3B IQ2_XXS, a MoE with 256 experts | Laptop 1.2 GiB VRAM, desktop 8.8 GiB VRAM | 27 for one conversation, 48 in total for three |
 
 A 1,860-token first message took about 6.5 s to the first token. Later turns of that chat took 0.7 to 1.3 s, with over 2,000 tokens of history behind them. Downloads share the link: chat dropped to about 5 tokens per second while a new model downloaded over the desktop's Wi-Fi.
+
+Reusing prompts, on Qwen3-0.6B Q8_0 over two stages on CPU, all on one machine, with a system prompt of 1,326 tokens. Each cell is time, then prompt tokens computed. For failures, the time is the longest pause in the reply:
+
+| | Before | After |
+|---|---:|---:|
+| First conversation with a system prompt | 10.9 s, 1,354 | 10.9 s, 1,354 |
+| Later conversations with the same system prompt | 10.7 s, 1,354 | 1.0 s, 28 |
+| A conversation back after being pushed out | 11.1 s, 1,420 | 1.2 s, 77 |
+| The next turn of a conversation | 1.3 s, 51 | 1.3 s, 86 |
+| A stage process killed | 12.0 s, 1,414 | 2.6 s, 149 |
+| A node restarted | 19.8 s, 2,820 | 10.9 s, 149 |
+| A node killed, with a spare | 36.4 s, 1,414 | 23.5 s, 149 |
+| A link gone silent, with a spare | 31.9 s, 1,414 | 22.5 s, 149 |
+| A node killed, with no spare | 44.2 s, 1,414 | 36.0 s, 1,475 |
+
+With the cache on and off, 48 of 48 replies were the same on this model at temperature 0, and 19 of 19 on Qwen3.5-0.8B, with images and with a draft. That was one reply at a time, on one route, on CPU. Four conversations over two sequences, with a stage killed among them, finished all 24 replies on each model.
 
 Planner estimates leave out the draft and are rough. The figures above were measured. For failure timings, see [What happens when something fails](#what-happens-when-something-fails).
 

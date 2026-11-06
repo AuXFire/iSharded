@@ -89,6 +89,10 @@ A conversation keeps about one state, as each turn replaces the last, and a syst
 
 **When a copy does not help.** A stage only fetches a copy when it took over the same layers, so that needs a spare: a node outside the route that can hold them. With no spare, the survivors split the layers differently, and the prompt is read in full. On a slow link, fetching a copy can also take longer than reading the prompt on a fast GPU. A reply waits up to 30 s for a fetch and then reads the prompt instead.
 
+**When the holder fails.** Replies do not notice. With the node holding the copies gone silent on real processes, time to the first token stayed between 2.7 and 3.4 s, and no reply failed or waited for it, while the copies failed in the background and showed in `worker_state_copies_failed_total`. The next repair names another holder, and it gets the next state saved, not the old ones.
+
+**When a state is missing.** A stage says so, and the entry worker plans again from the next longest state, or from nothing. With `--state-disk-gb 0`, a killed stage process lost its states, and the reply recovered that way in 14.5 s with the same text, where restoring from disk took 2.6 s.
+
 **What gets deleted.** Stages delete states when the model or their layers change, and copies go when no stage runs those layers. Nothing deletes a conversation's states when it ends. See [Saved conversations](SECURITY.md#saved-conversations).
 
 ## Planned maintenance
