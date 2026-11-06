@@ -2370,6 +2370,7 @@ def verify_user(authorization: str | None) -> Caller:
 FORWARDED_PATHS = ("/v1/", "/admin/")
 SAFE_NODE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 # Connection details belong to each hop, and httpx sets the length itself.
+REPEATABLE_METHODS = {"GET", "HEAD"}
 HOP_HEADERS = {"host", "content-length", "connection", "transfer-encoding", "keep-alive", "content-encoding"}
 
 
@@ -2443,9 +2444,13 @@ async def forward_to_coordinator(request: Request, call_next: Any) -> Any:
         if wait:
             return JSONResponse(status_code=429, content={"detail": f"rate limit reached for {caller.name}"})
         headers.pop("authorization", None)
-        headers[BEHALF_HEADER] = runtime.speak_for(caller, runtime.control_name(mesh.leader_id), request.method, asked_path(request), await request.body())
-    try:
-        upstream = await runtime.client.send(
+    else:
+        caller = None
+
+    async def ask_coordinator() -> httpx.Response:
+        if caller is not None:  # a statement is good once, so each try makes its own
+            headers[BEHALF_HEADER] = runtime.speak_for(caller, runtime.control_name(mesh.leader_id), request.method, asked_path(request), await request.body())
+        return await runtime.client.send(
             runtime.client.build_request(
                 request.method,
                 target + request.url.path,
@@ -2455,6 +2460,15 @@ async def forward_to_coordinator(request: Request, call_next: Any) -> Any:
             ),
             stream=True,
         )
+
+    try:
+        try:
+            upstream = await ask_coordinator()
+        except httpx.RemoteProtocolError:
+            # A keep-alive connection can die while idle, seen only on its next use.
+            if request.method not in REPEATABLE_METHODS:
+                raise
+            upstream = await ask_coordinator()
     except httpx.HTTPError as exc:
         return JSONResponse(status_code=503, content={"detail": f"the coordinator did not answer: {exc}"})
     passed = {name: value for name, value in upstream.headers.items() if name.lower() not in HOP_HEADERS}

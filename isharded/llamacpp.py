@@ -16,6 +16,7 @@ import importlib.util
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import sys
 import tarfile
@@ -357,6 +358,12 @@ def load_native(path: Path) -> C.CDLL:
         return C.CDLL(str(path))
     except OSError as error:
         text = str(error)
+        needed = re.search(r"GLIBC_(\d+\.\d+)", text)
+        if needed:
+            raise LlamaError(
+                f"could not load {path.name}: this build needs glibc {needed.group(1)} or newer, and this system has "
+                f"{platform.libc_ver()[1] or 'an older one'}. Upgrade the system, or pass --llama-dir with a build made for it."
+            ) from error
         package = next((package for library, package in SYSTEM_LIBRARIES.items() if library in text), None)
         advice = f" On Debian or Ubuntu, install it with: sudo apt-get install {package}" if package else ""
         raise LlamaError(f"could not load {path.name}: {text}.{advice}") from error

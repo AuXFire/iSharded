@@ -763,6 +763,28 @@ def test_a_real_forward_works_with_the_key_left_behind(follow):
     assert from_node("follower").get("/admin/keys", headers=headers).status_code == 200
 
 
+@pytest.mark.parametrize(("method", "tries", "status"), [("GET", 2, 200), ("POST", 1, 503)])
+def test_a_dead_keep_alive_is_retried_for_a_read_only(coordinator, monkeypatch, method, tries, status):
+    statements = []
+
+    def handler(request):
+        statements.append(request.headers.get("x-isharded-on-behalf"))
+        if len(statements) == 1:
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        return httpx.Response(200, stream=httpx.ByteStream(b"{}"), headers={"content-type": "application/json"})
+
+    node = Orchestrator()
+    node.access = coordinator.access
+    node.mesh = ControlMesh("follower", "http://follower:1", (), Clock())
+    node.mesh.observe({"node_id": "boss", "url": "http://boss:9", "term": 1, "leader_id": "boss"})
+    node.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(orchestrator_module, "runtime", node)
+    answer = TestClient(orchestrator_module.app).request(method, "/admin/keys", headers={"Authorization": "Bearer isk-test"})
+    assert answer.status_code == status
+    assert len(statements) == tries
+    assert len(set(statements)) == tries  # a statement is good once
+
+
 def test_a_real_forward_carries_its_body_and_query(follow):
     body = b'{"name": "x", "role": "user"}'
     headers, sent = follow("POST", "/admin/keys?note=a%20b&first=1", body=body)

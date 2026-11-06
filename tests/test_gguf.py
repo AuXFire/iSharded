@@ -999,6 +999,19 @@ def test_a_missing_system_library_names_its_package(tmp_path, monkeypatch) -> No
         llamacpp.load_native(tmp_path / "libggml-base.so")
 
 
+def test_a_system_with_an_old_glibc_is_told_what_to_do(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    from isharded import llamacpp
+
+    def refuse(_):
+        raise OSError("/lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found (required by libllama.so)")
+
+    monkeypatch.setattr(llamacpp.C, "CDLL", refuse)
+    with pytest.raises(llamacpp.LlamaError, match="needs glibc 2.38 or newer.*--llama-dir"):
+        llamacpp.load_native(tmp_path / "libllama.so")
+
+
 def test_a_platform_without_that_build_says_what_it_offers(monkeypatch) -> None:
     import pytest
 

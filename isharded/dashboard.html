@@ -108,8 +108,8 @@
       <h2 id="pickerTitle">Load a model</h2>
       <label class="search" style="max-width:none"><span class="sr-only">Search models</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.8-3.8"/></svg><input class="input" id="catalogSearch" type="search" placeholder="Search the model list" autocomplete="off" spellcheck="false"></label>
       <div class="scroll-list" id="catalog"></div>
-      <label class="field">Or any Hugging Face model, or a folder on this node
-        <input class="input" id="customModel" placeholder="Qwen/Qwen3-4B" autocomplete="off" spellcheck="false">
+      <label class="field">Or any Hugging Face model or GGUF file, or a folder on this node
+        <input class="input" id="customModel" placeholder="Qwen/Qwen3-4B or owner/repo:file.gguf" autocomplete="off" spellcheck="false">
       </label>
       <div class="fields">
         <label class="field">Context length
@@ -186,13 +186,19 @@
       quarantined: { label: 'Quarantined', rank: 0, glyph: 'warn', tone: 'warn' },
       offline: { label: 'Offline', rank: 1, glyph: 'bad', tone: 'bad' },
       active: { label: 'In route', rank: 2, glyph: 'ok', tone: 'idle' },
+      fetching: { label: 'Downloading', rank: 2, glyph: 'idle', tone: 'idle' },
       service: { label: 'Cache service', rank: 3, glyph: 'idle', tone: 'idle' },
       standby: { label: 'Idle', rank: 4, glyph: 'idle', tone: 'idle' },
     };
     // The route decides whether a worker is in it, so its label can never disagree with its row.
     function workerState(id, worker, route) {
       const listed = STATES[worker.state] ? worker.state : 'offline', onRoute = route.some(stage => stage.worker_id === id);
-      return listed === 'active' && !onRoute ? 'standby' : listed === 'standby' && onRoute ? 'active' : listed;
+      const placed = listed === 'active' && !onRoute ? 'standby' : listed === 'standby' && onRoute ? 'active' : listed;
+      return placed === 'standby' && downloading(id) ? 'fetching' : placed;
+    }
+    function downloading(id) {
+      const job = state.data?.load_job, mine = job?.workers?.[id];
+      return jobRunning(job) && mine?.phase === 'fetching' ? mine : null;
     }
     const PHASES = [['resolving', 'Read the tensor list'], ['fetching', 'Download each worker\'s shards'], ['loading', 'Move weights into memory']];
     const WORKER_KINDS = ['gpu', 'cpu', 'memory'];
@@ -590,10 +596,10 @@
         search: [id, hw.host_id, hw.accelerator_name, hw.backend, countryName(worker.country), STATES[workerState(id, worker, route)].label, (contribution.roles || []).join(' ')].join(' ').toLowerCase(),
       };
     }
-    const CHIPS = { all: 'All', attention: 'Needs attention', active: 'In route', standby: 'Idle', service: 'Cache service' };
+    const CHIPS = { all: 'All', attention: 'Needs attention', active: 'In route', fetching: 'Downloading', standby: 'Idle', service: 'Cache service' };
     const inChip = (row, chip) => chip === 'all' || (chip === 'attention' ? row.state === 'quarantined' || row.state === 'offline' : row.state === chip);
     const groupKey = row => state.group === 'machine' ? row.host : state.group === 'accelerator' ? row.accelerator : state.group === 'none' ? '' : row.state === 'quarantined' || row.state === 'offline' ? 'Needs attention' : STATES[row.state].label;
-    const STATE_GROUPS = ['Needs attention', 'In route', 'Cache service', 'Idle'];
+    const STATE_GROUPS = ['Needs attention', 'In route', 'Downloading', 'Cache service', 'Idle'];
     const groupOrder = (a, b) => state.group === 'state' ? STATE_GROUPS.indexOf(a) - STATE_GROUPS.indexOf(b) : byName(a, b);
     const SORTS = {
       name: (a, b) => byName(a.id, b.id),
@@ -607,7 +613,8 @@
       const look = STATES[row.state];
       const problem = look.tone === 'idle' ? '' : ` problem ${look.tone}`;
       const route = state.data?.route || [];
-      const doing = [row.position >= 0 ? stageRole(row.position, route.length) : '', row.layers].filter(Boolean).join(', ') || 'Not on the route';
+      const fetched = row.state === 'fetching' ? downloading(row.id) : null;
+      const doing = fetched ? `downloading ${bytes(fetched.bytes_done)} of ${bytes(fetched.bytes_total)}` : [row.position >= 0 ? stageRole(row.position, route.length) : '', row.layers].filter(Boolean).join(', ') || 'Not on the route';
       const work = row.isService ? 'KV cache' : esc(doing[0].toUpperCase() + doing.slice(1));
       const fills = row.isService ? `<i class="tier-ram" style="width:${row.budget ? (row.used / row.budget * 100).toFixed(1) : 0}%"></i>` : row.pools.filter(pool => pool.used_bytes).map(pool => `<i class="tier-${TIERS[pool.kind] ? pool.kind : 'disk'}" style="width:${(pool.used_bytes / row.budget * 100).toFixed(1)}%"></i>`).join('');
       const memory = row.budget ? `<div class="meter" aria-hidden="true">${fills}</div>${bytes(row.used)} of ${bytes(row.budget)}` : '—';
@@ -751,8 +758,13 @@
       const { budget } = memoryOf(state.data || {});
       if (state.catalogFailed) { paint($('catalog'), '<p class="list-note">The model list could not be read. You can still load a model by name below.</p>'); return; }
       if (!state.catalog) { paint($('catalog'), '<p class="list-note">Reading the model list</p>'); return; }
-      const models = state.catalog.filter(model => { const text = `${model.id} ${model.family} ${model.kind}`.toLowerCase(); return words.every(word => text.includes(word)); });
+      const models = [...recentModels(), ...state.catalog].filter(model => { const text = `${model.id} ${model.family} ${model.kind}`.toLowerCase(); return words.every(word => text.includes(word)); });
       paint($('catalog'), models.length ? `<ul class="model-list">${modelRows(models, budget)}</ul>` : '<p class="list-note">No listed model matches. You can still load one by name below.</p>');
+    }
+    // What this pool last ran stays one click away, even when it is not on the list.
+    function recentModels() {
+      const listed = new Set(state.catalog.map(model => model.id));
+      return [...new Set([state.data?.model, state.data?.load_job?.model])].filter(id => id && !listed.has(id)).map(id => ({ id, family: '', kind: 'Loaded recently', size: '' }));
     }
     function selectModel(id) {
       state.selected = id.trim();
