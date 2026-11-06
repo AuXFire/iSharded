@@ -1111,3 +1111,26 @@ def test_a_slow_control_plane_does_not_delay_check_ins_with_the_others(monkeypat
     asyncio.run(run())
     assert calls["http://slow"] == 1  # still in flight, so not stacked up
     assert calls["http://fast"] > 5
+
+
+def test_links_are_measured_from_each_end_and_a_dead_one_stays_on_record() -> None:
+    from isharded import orchestrator as module
+
+    orchestrator = pool(one=record("one"), two=record("two"))
+    asked = []
+
+    def handler(request):
+        asked.append(request.url.host)
+        if request.url.host == "two":
+            return httpx.Response(500)
+        return httpx.Response(200, json={"100": {"median_ms": 42.5}})
+
+    async def run():
+        orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await orchestrator.measure_links()
+        await orchestrator.measure_links()
+
+    asyncio.run(run())
+    assert orchestrator.links == {("one", "two"): 42.5, ("two", "one"): module.UNREACHABLE_LINK_MS}
+    assert sorted(asked) == ["one", "two"]  # still fresh the second time, so nothing is sent again
+    done(orchestrator)

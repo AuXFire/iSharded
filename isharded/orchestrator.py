@@ -108,6 +108,12 @@ LOGGED_EVENTS = {"failure", "recovery", "mesh", "rebalance", "security"}
 # A live worker that failed to activate gets this many more tries, this far apart.
 ACTIVATE_RETRIES = 2
 ACTIVATE_RETRY_SECONDS = 5.0
+# How long a measured link is believed, how many tries make one measurement, and the
+# most a load waits for measuring. A link nobody could cross counts as this slow.
+LINK_TTL_SECONDS = 600.0
+LINK_PROBE_ROUNDS = 3
+LINK_PROBE_SECONDS = 30.0
+UNREACHABLE_LINK_MS = 10_000.0
 # Replanning around a worker that is alive but failed may move this much at most.
 REPLAN_MOVE_LIMIT_BYTES = 2 * 1024**3
 # Healthy checks before a quarantined worker may return, doubling per offense.
@@ -471,6 +477,8 @@ class Orchestrator:
         self.reuse_cached = os.getenv("ISHARDED_REUSE_CACHED", "1") != "0"
         self.peer_fetch = os.getenv("ISHARDED_PEER_FETCH", "1") != "0"
         self.workers: dict[str, WorkerRecord] = {}
+        self.links: dict[tuple[str, str], float] = {}  # round trip in ms, from one worker to another
+        self.links_checked: dict[tuple[str, str], float] = {}
         self.model_id: str | None = None
         self.planning_model: str | None = None
         self.active: ModelTarget | None = None
@@ -1118,6 +1126,44 @@ class Orchestrator:
             )
         return updated
 
+    async def measure_links(self) -> None:
+        """Time the links between workers, which the planner routes by.
+
+        Every token crosses each link on its route and comes back, so on a mesh that
+        spans cities these round trips set the speed. Each is measured from the end
+        that would send, and a link that fails stays on record so that no route needs it.
+        """
+        urls = {
+            worker_id: str(record.registration.advertised_url).rstrip("/")
+            for worker_id, record in self.workers.items()
+            if record.live and not record.quarantined
+        }
+        now = time.monotonic()
+
+        async def probe(source: str, target: str) -> None:
+            try:
+                response = await self.client.post(
+                    urls[source] + "/internal/diag/probe",
+                    json={"url": urls[target], "sizes": [100], "rounds": LINK_PROBE_ROUNDS},
+                    headers=auth_headers(self.pool_token),
+                    timeout=10.0,
+                )
+                response.raise_for_status()
+                self.links[source, target] = float(response.json()["100"]["median_ms"])
+            except (httpx.HTTPError, KeyError, TypeError, ValueError):
+                self.links[source, target] = UNREACHABLE_LINK_MS
+            self.links_checked[source, target] = now
+
+        async def from_one(source: str) -> None:
+            for target in urls:
+                if target != source and now - self.links_checked.get((source, target), -LINK_TTL_SECONDS) >= LINK_TTL_SECONDS:
+                    await probe(source, target)
+
+        try:
+            await asyncio.wait_for(asyncio.gather(*map(from_one, urls)), LINK_PROBE_SECONDS)
+        except asyncio.TimeoutError:
+            self.add_event("mesh", "Link measuring cut short", f"Planning with what {LINK_PROBE_SECONDS:.0f} s could measure")
+
     def plan(self, target: ModelTarget, *, honor_pins_strictly: bool = False) -> list[StageAssignment]:
         """Plan a route. A pin on a lost worker is dropped, not fatal.
 
@@ -1370,6 +1416,7 @@ class Orchestrator:
         for _ in range(MAX_DEPLOY_ATTEMPTS):
             await self.refresh_worker_metrics()
             await self.refresh_holdings(target)
+            await self.measure_links()
             try:
                 route = self.plan(target)
             except PlacementError as exc:
@@ -2707,6 +2754,7 @@ async def preview_plan(body: LoadModelRequest, authorization: str | None = Heade
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     await runtime.refresh_worker_metrics()
     await runtime.refresh_holdings(target)
+    await runtime.measure_links()
     try:
         route = runtime.plan(target, honor_pins_strictly=True)
     except PlacementError as exc:
