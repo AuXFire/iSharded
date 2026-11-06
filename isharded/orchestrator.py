@@ -34,7 +34,7 @@ from .lanes import LaneDoor
 from .mcp_server import INVALID_REQUEST, McpHandler, MeshTools, RpcError, answer_http
 from .mesh import GOSSIP_SECONDS, ControlMesh
 from .models import Adapter, GgufAdapter, SUPPORTED_TYPES, UnsupportedModel, create_adapter
-from .planner import AMORTIZE_TOKENS, HOP_MS, Candidate, ModelProfile, PlacementError, plan_placement
+from .planner import AMORTIZE_TOKENS, HOP_MS, Candidate, ModelProfile, PlacementError, memory_report, plan_placement
 from .protocol import (
     hosts_model,
     pass_seconds,
@@ -2692,9 +2692,11 @@ async def preview_plan(body: LoadModelRequest, authorization: str | None = Heade
     await runtime.refresh_worker_metrics()
     await runtime.refresh_holdings(target)
     try:
-        return describe_plan(target, runtime.plan(target, honor_pins_strictly=True))
+        route = runtime.plan(target, honor_pins_strictly=True)
     except PlacementError as exc:
         raise HTTPException(status_code=507, detail=str(exc)) from exc
+    preferred, standby = runtime.candidate_groups()
+    return {**describe_plan(target, route), "memory": memory_report(route, preferred + standby, target.profile)}
 
 
 @app.get("/admin/keys")

@@ -1,9 +1,11 @@
 import asyncio
 
+from fastapi.testclient import TestClient
 import httpx
 import pytest
 import torch
 
+from isharded import orchestrator as orchestrator_module
 from isharded.orchestrator import ModelTarget, Orchestrator
 from isharded.worker import MAX_PENDING_CHECKPOINTS, CacheEntry, WorkerRuntime, choose_dtype
 from isharded.planner import ModelProfile, PlacementError
@@ -125,6 +127,70 @@ def test_a_lost_pinned_worker_is_dropped_so_recovery_can_continue() -> None:
         assert any("entry_worker pin" in event["detail"] for event in orchestrator.events)
         with pytest.raises(PlacementError, match="cannot be pinned"):
             orchestrator.plan(target, honor_pins_strictly=True)
+    finally:
+        asyncio.run(orchestrator.close())
+
+
+def test_a_plan_preview_says_what_goes_unused_on_every_node(monkeypatch) -> None:
+    orchestrator = Orchestrator()
+    gib = 1024**3
+    try:
+        for name, budget in (("a", gib), ("spare", 2 * gib)):
+            pool = MemoryPool(
+                pool_id="ram",
+                kind="ram",
+                device="cpu",
+                capacity_group=f"{name}:ram",
+                budget_bytes=budget,
+                free_bytes=budget,
+                bandwidth_gbps=20,
+            )
+            record = registration(name, "cpu", ["inference"])
+            record.hardware.memory_pools = [pool]
+            orchestrator.register(record)
+        target = ModelTarget.__new__(ModelTarget)
+        target.embedding = False
+        unit = WeightUnit(
+            name="x",
+            kind="embed",
+            tensors=[TensorRef(name="x", file="f", dtype="BF16", shape=[1], start=0, end=2)],
+        )
+        head = unit.model_copy(update={"name": "h", "kind": "head"})
+        dense = unit.model_copy(update={"name": "d", "kind": "dense", "layer": 0})
+        target.profile = ModelProfile(
+            units=[unit, head, dense],
+            num_layers=1,
+            expert_active_fraction=1.0,
+            kv_bytes_per_token=[0],
+            state_bytes=[0],
+        )
+        target.spread = False
+        target.entry_worker = "a"
+        target.exit_worker = "a"
+        target.reuse_cached = False
+        target.peer_fetch = False
+        target.held = {}
+        target.serving = set()
+
+        async def nothing(*args):
+            return {}
+
+        orchestrator.gguf_sources = nothing
+        orchestrator.refresh_worker_metrics = nothing
+        orchestrator.refresh_holdings = nothing
+        monkeypatch.setattr(orchestrator_module, "runtime", orchestrator)
+        monkeypatch.setattr(orchestrator_module, "build_target", lambda *args: target)
+        monkeypatch.setattr(orchestrator_module, "describe_plan", lambda target, route: {"model": "m"})
+        response = TestClient(orchestrator_module.app).post("/admin/plan", json={"model_id": "m"})
+        assert response.status_code == 200
+        plan = response.json()
+        assert plan["model"] == "m"
+        rows = {row["workers"][0]: row for row in plan["memory"]["pools"]}
+        assert rows["spare"]["used_bytes"] == 0
+        assert rows["spare"]["unused_bytes"] == 2 * gib
+        assert rows["a"]["used_bytes"] > 0
+        assert rows["a"]["unused_bytes"] == gib - rows["a"]["used_bytes"]
+        assert plan["memory"]["spilled_bytes"] == 0
     finally:
         asyncio.run(orchestrator.close())
 

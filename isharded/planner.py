@@ -9,12 +9,19 @@ must be contiguous, so that activations cross the network once per stage.
 
 Layer boundaries come from a dynamic program over contiguous ranges. Within a
 stage, units then fill the worker's pools fastest first.
+
+A model that can only be cut at coarse boundaries strands memory: a card holds
+whole blocks, and what is left of it holds nothing. Such a stage can still be
+larger than its card, because its layers stay whole for llama.cpp while its
+routed experts sit in RAM. So those models get a search over every worker order,
+which keeps that spill small and off the slowest stage.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from itertools import permutations
+from typing import Any, Callable
 
 from .protocol import MemoryPool, StageAssignment, UnitPlacement, WeightUnit
 
@@ -44,10 +51,20 @@ DEFAULT_FETCH_BYTES_PER_SECOND = 40e6
 PEER_FETCH_BYTES_PER_SECOND = 100e6
 # Up to this many workers, every order through them is tried.
 MAX_PERMUTED_WORKERS = 4
+# The same for models with a block rule, which have few places to cut. The work
+# doubles with each worker: 10 took about 0.3 s, and 12 about a second.
+MAX_SEARCHED_WORKERS = 10
+# How much slower than the fastest plan the plan with the least spill may be, on
+# the whole route and on its slowest stage. A judgment, not a measurement: the
+# estimate counts a spilled expert's read but not the CPU's work on it or the
+# trips between GPU and CPU, so it flatters spill and near ties should avoid it.
+SPILL_ALLOWANCE = 0.1
 # Breaks ties toward even stages without outweighing real latency differences.
 BALANCE_WEIGHT = 1e-4
 # Whole-unit packing wastes some of what the aggregate estimate assumed.
 PACKING_RETRIES = (1.0, 0.95, 0.9, 0.8, 0.65)
+# Memory kinds from fastest to slowest. Weights below a worker's best are spill.
+MEMORY_TIERS = {"vram": 0, "unified": 0, "ram": 1, "disk": 2}
 INFEASIBLE = float("inf")
 
 
@@ -186,6 +203,17 @@ def _read_ms(size: int, active: float, pool: MemoryPool, compact: bool) -> float
     return size * active / (rate * 1e6)
 
 
+def _state_bytes(item: _Item, pool: MemoryPool) -> int:
+    """Context state a unit brings into a pool.
+
+    It is sized for BF16. For a disk-mapped layer it lives in RAM, uncounted
+    here, and is small beside the layer's weights.
+    """
+    if pool.kind == "disk":
+        return 0
+    return item.extra_bytes * (2 if pool.dtype == "float32" else 1)
+
+
 def _pack(
     profile: ModelProfile,
     items: list[_Item],
@@ -220,10 +248,7 @@ def _pack(
             # Mapped files cannot be converted, so disk always stays compact.
             compact = stays_compact or (quantized and pool.kind == "disk")
             size = profile.size_in(item.unit, pool, compact)
-            # Context state is sized for BF16. For a disk-mapped layer it lives
-            # in RAM, uncounted here, and is small beside the layer's weights.
-            state = item.extra_bytes * (2 if pool.dtype == "float32" else 1)
-            needed = size + (0 if pool.kind == "disk" else state)
+            needed = size + _state_bytes(item, pool)
             if needed <= remaining[pool.capacity_group]:
                 remaining[pool.capacity_group] -= needed
                 placements.append(
@@ -256,7 +281,53 @@ def _fill(
         for compact_first in ((False, True) if quantized else (False,))
     ]
     packed = [attempt for attempt in attempts if attempt is not None]
-    return min(packed, key=lambda attempt: attempt[1]) if packed else None
+    best = min(packed, key=lambda attempt: attempt[1]) if packed else None
+    if best is not None and profile.layer_step > 1 and not quantized:
+        return _spill_less(profile, items, pools, capacity, best)
+    return best
+
+
+def _spill_less(
+    profile: ModelProfile,
+    items: list[_Item],
+    pools: list[MemoryPool],
+    capacity: dict[str, int],
+    filled: tuple[list[UnitPlacement], float],
+) -> tuple[list[UnitPlacement], float]:
+    """Spill the fewest expert bytes that make a stage fit.
+
+    Packing keeps experts in layer order until the fast pool is full, so it
+    spills whichever came last. They are all read alike but differ in size, so
+    the better choice is the smallest unit that covers what will not fit, or
+    failing that the largest, and then the same again for what is left.
+    """
+    fastest = max(pools, key=_speed)
+    # The embedding is cold and leaves first, so it never pushes an expert out.
+    wanted = [item for item in items if item.unit.kind != "embed"]
+    excess = sum(profile.size_in(item.unit, fastest) + _state_bytes(item, fastest) for item in wanted)
+    excess -= capacity[fastest.capacity_group]
+    waiting = sorted(
+        (item for item in items if item.unit.kind == "experts"), key=lambda item: profile.size_in(item.unit, fastest)
+    )
+    chosen: list[_Item] = []
+    while excess > 0 and waiting:
+        sizes = [profile.size_in(item.unit, fastest) for item in waiting]
+        pick = next((index for index, size in enumerate(sizes) if size >= excess), len(waiting) - 1)
+        chosen.append(waiting.pop(pick))
+        excess -= sizes[pick]
+    if excess > 0 or not chosen:
+        return filled  # nothing has to leave, or dense weights must leave as well
+    names = {item.unit.name for item in chosen}
+    queue = [item for item in items if item.unit.name not in names] + chosen
+    packed = _pack(profile, queue, pools, capacity, 0, False)
+    return filled if packed is None else min(filled, packed, key=lambda attempt: attempt[1])
+
+
+def _spilled_bytes(placements: list[UnitPlacement], pools: list[MemoryPool]) -> int:
+    """Bytes held below the best kind of memory the worker offers."""
+    best = min(MEMORY_TIERS[pool.kind] for pool in pools)
+    below = {pool.pool_id for pool in pools if MEMORY_TIERS[pool.kind] > best}
+    return sum(item.bytes for item in placements if item.pool_id in below)
 
 
 def _download_ms(candidate: Candidate, profile: ModelProfile, start: int, end: int) -> float:
@@ -274,6 +345,14 @@ def _download_ms(candidate: Candidate, profile: ModelProfile, start: int, end: i
     return seconds * 1000 / profile.amortize_tokens
 
 
+def _weight_room(pool: MemoryPool, workspace: int) -> int:
+    """What a pool can give to weights and context."""
+    available = usable_bytes(pool)
+    if pool.kind in {"vram", "unified"}:
+        available = max(available - workspace, 0)
+    return available
+
+
 def _capacities(candidates: list[Candidate], shrink: float, workspace: int = 0) -> dict[str, dict[str, int]]:
     """Give each worker its share of every capacity group it can reach.
 
@@ -285,10 +364,7 @@ def _capacities(candidates: list[Candidate], shrink: float, workspace: int = 0) 
     for candidate in candidates:
         for pool in candidate.pools:
             sharers.setdefault(pool.capacity_group, set()).add(candidate.worker_id)
-            available = usable_bytes(pool)
-            if pool.kind in {"vram", "unified"}:
-                available = max(available - workspace, 0)
-            limits[pool.capacity_group] = max(limits.get(pool.capacity_group, 0), available)
+            limits[pool.capacity_group] = max(limits.get(pool.capacity_group, 0), _weight_room(pool, workspace))
     return {
         candidate.worker_id: {
             pool.capacity_group: int(
@@ -369,6 +445,116 @@ def _partition(
     return ranges
 
 
+# Spilled bytes, read time, and a third number: a stage's cost, or a route's total.
+_Score = tuple[int, float, float]
+
+
+def _search_blocks(
+    candidates: list[Candidate],
+    profile: ModelProfile,
+    stage: Callable[[Candidate, int, int], _Score | None],
+    spread: bool,
+    entry: str | None,
+    exit_: str | None,
+    rank: Callable[[_Score], tuple[Any, ...]],
+    slowest_allowed: float = INFEASIBLE,
+) -> list[tuple[Candidate, int, int]] | None:
+    """Choose every stage at once, for a model with few places to cut.
+
+    A stage's cost does not depend on who comes before it, so walking over which
+    workers are spent and how far they reach covers every order through them.
+    Trying orders one by one could only sample them past a few workers. ``stage``
+    gives a stage's spilled bytes, read time, and cost, and a route's score is
+    (spilled bytes, slowest read, total cost), compared through ``rank``.
+    """
+    cuts = [*range(0, profile.num_layers, profile.layer_step), profile.num_layers]
+    last = len(cuts) - 1
+    everyone = (1 << len(candidates)) - 1
+    # best[spent][cut]: the best way to reach this cut with exactly these workers.
+    best: list[list[_Score | None]] = [[None] * len(cuts) for _ in range(everyone + 1)]
+    came: dict[tuple[int, int], tuple[int, int, int]] = {}
+    best[0][0] = (0, 0.0, 0.0)
+    for spent in range(everyone + 1):  # adding a worker only ever raises this number
+        for here in range(last):
+            score = best[spent][here]
+            if score is None:
+                continue
+            for index, candidate in enumerate(candidates):
+                if spent >> index & 1 or (entry and not spent and candidate.worker_id != entry):
+                    continue
+                for there in range(here + 1, last + 1):
+                    if exit_ and (candidate.worker_id == exit_) != (there == last):
+                        continue
+                    found = stage(candidate, cuts[here], cuts[there])
+                    if found is None or found[1] > slowest_allowed:
+                        continue
+                    spilled, read, cost = found
+                    total = score[2] + cost + BALANCE_WEIGHT * cost * cost + (HOP_MS if here else 0.0)
+                    reached = (score[0] + spilled, max(score[1], read), total)
+                    held = best[spent | 1 << index][there]
+                    if held is None or rank(reached) < rank(held):
+                        best[spent | 1 << index][there] = reached
+                        came[spent | 1 << index, there] = (spent, here, index)
+
+    endings = [spent for spent in range(everyone + 1) if best[spent][last] and (spent == everyone or not spread)]
+    if not endings:
+        return None
+    position = min(endings, key=lambda spent: rank(best[spent][last])), last  # type: ignore[arg-type]
+    ranges: list[tuple[Candidate, int, int]] = []
+    while position in came:
+        spent, here, index = came[position]
+        ranges.append((candidates[index], cuts[here], cuts[position[1]]))
+        position = spent, here
+    ranges.reverse()
+    return ranges
+
+
+def _plan_blocks(
+    candidates: list[Candidate],
+    profile: ModelProfile,
+    spread: bool,
+    entry: str | None,
+    exit_: str | None,
+) -> list[StageAssignment] | None:
+    """Plan a model with a block rule, keeping spill small without losing speed.
+
+    The fastest plan comes first, as for any model. Spill counts toward its
+    estimate, but a plan with less spill is taken if it is nearly as fast,
+    because the estimate flatters spill. Least spill alone would be wrong: a
+    worker with only RAM has no spill by definition, so it would draw dense
+    weights off a GPU. A route's cost counts its hops and downloads, so a plan
+    does not add a stage or move shards just to spill a little less.
+    """
+    capacities = _capacities(candidates, 1.0, profile.stage_workspace_bytes)
+    known: dict[tuple[str, int, int], _Score | None] = {}
+
+    def stage(candidate: Candidate, start: int, end: int) -> _Score | None:
+        key = (candidate.worker_id, start, end)
+        if key not in known:
+            filled = _fill(profile, _stage_items(profile, start, end), candidate.pools, capacities[candidate.worker_id])
+            known[key] = None
+            if filled is not None:
+                placements, milliseconds = filled
+                cost = milliseconds + _download_ms(candidate, profile, start, end)
+                known[key] = (_spilled_bytes(placements, candidate.pools), milliseconds, cost)
+        return known[key]
+
+    def route(rank: Callable[[_Score], tuple[Any, ...]], slowest: float = INFEASIBLE) -> list[StageAssignment] | None:
+        ranges = _search_blocks(candidates, profile, stage, spread, entry, exit_, rank, slowest)
+        return None if ranges is None else _build_route(ranges, profile, capacities)
+
+    fastest = route(lambda score: (score[2], score[0], score[1]))
+    workers = {candidate.worker_id: candidate for candidate in candidates}
+    if fastest is None or not any(_spilled_bytes(item.placements, workers[item.worker_id].pools) for item in fastest):
+        return fastest
+    reads = [item.estimated_ms_per_token for item in fastest]
+    leanest = route(lambda score: score, max(reads) * (1 + SPILL_ALLOWANCE))
+    if leanest is None:
+        return fastest
+    slower = _route_cost(leanest, candidates, profile) - _route_cost(fastest, candidates, profile)
+    return leanest if slower <= sum(reads) * SPILL_ALLOWANCE else fastest
+
+
 def _best_speed(candidate: Candidate) -> float:
     return max((_speed(pool) for pool in candidate.pools), default=0.0)
 
@@ -411,6 +597,8 @@ def _attempt(
     entry: str | None = None,
     exit_: str | None = None,
 ) -> list[StageAssignment] | None:
+    if profile.layer_step > 1 and len(candidates) <= MAX_SEARCHED_WORKERS:
+        return _plan_blocks(candidates, profile, spread, entry, exit_)
     required = {name for name in (entry, exit_) if name}
     for shrink in PACKING_RETRIES:
         capacities = _capacities(candidates, shrink, profile.stage_workspace_bytes)
@@ -522,9 +710,67 @@ def plan_placement(
     needed = min(sum(profile.size_in(unit, pool, profile.quantized(unit)) for unit in profile.units) for pool in pools)
     hint = "remove a pin, " if pinned else ""
     extra = f" and {profile.entry_extra_bytes / 1024**3:.1f} GiB for a draft model or projector" if profile.entry_extra_bytes else ""
+    blocks = ""
+    if profile.layer_step > 1:
+        # Without this the numbers above can look like the model fits.
+        size = needed / -(-profile.num_layers // profile.layer_step)
+        blocks = (
+            f". Stages of this model start on a multiple of {profile.layer_step} layers, so a worker takes whole "
+            f"blocks of about {size / 1024**3:.1f} GiB, and room left on a card goes unused unless that worker "
+            "also offers RAM for the part of a block that does not fit"
+        )
     raise PlacementError(
         f"This model needs {needed / 1024**3:.1f} GiB of weights plus "
         f"{context / 1024**3:.2f} GiB of context state{extra}, but the pool offers "
         f"{sum(offered.values()) / 1024**3:.1f} GiB across {len(everyone)} worker(s); "
-        f"{hint}add a worker, raise a RAM or disk budget, or lower the context length"
+        f"{hint}add a worker, raise a RAM or disk budget, or lower the context length{blocks}"
     )
+
+
+def memory_report(route: list[StageAssignment], candidates: list[Candidate], profile: ModelProfile) -> dict[str, Any]:
+    """What a plan does with the memory it was offered.
+
+    One row per physical memory, so RAM two workers share counts once. A pool's
+    room is what weights and context could have taken, after working space and
+    anything not free right now. Its unused bytes are what is left of that room,
+    which on a worker with no stage is all of it. Spilled bytes are weights held
+    below the best kind of memory their worker offers.
+    """
+    rows: dict[str, dict[str, Any]] = {}
+    room: dict[str, int] = {}
+    for candidate in candidates:
+        for pool in candidate.pools:
+            group = pool.capacity_group
+            row = rows.setdefault(
+                group,
+                {"workers": [], "pools": [], "kind": pool.kind, "offered_bytes": 0, "used_bytes": 0, "spilled_bytes": 0},
+            )
+            if candidate.worker_id not in row["workers"]:
+                row["workers"].append(candidate.worker_id)
+            if pool.pool_id not in row["pools"]:
+                row["pools"].append(pool.pool_id)
+            row["offered_bytes"] = max(row["offered_bytes"], pool.budget_bytes)
+            room[group] = max(room.get(group, 0), _weight_room(pool, profile.stage_workspace_bytes))
+
+    workers = {candidate.worker_id: candidate for candidate in candidates}
+    for stage in route:
+        pools = workers[stage.worker_id].pools
+        by_id = {pool.pool_id: pool for pool in pools}
+        best = min(MEMORY_TIERS[pool.kind] for pool in pools)
+        placed = {item.unit: item for item in stage.placements}
+        for item in _stage_items(profile, stage.start_layer, stage.end_layer):
+            placement = placed[item.unit.name]
+            pool = by_id[placement.pool_id]
+            row = rows[pool.capacity_group]
+            row["used_bytes"] += placement.bytes + _state_bytes(item, pool)
+            if MEMORY_TIERS[pool.kind] > best:
+                row["spilled_bytes"] += placement.bytes
+
+    for group, row in rows.items():
+        row["reserved_bytes"] = row["offered_bytes"] - room[group]
+        row["unused_bytes"] = max(room[group] - row["used_bytes"], 0)
+    return {
+        "spilled_bytes": sum(row["spilled_bytes"] for row in rows.values()),
+        "unused_bytes": sum(row["unused_bytes"] for row in rows.values()),
+        "pools": list(rows.values()),
+    }
