@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>ShardMesh Assistant</title>
+  <link rel="icon" href="data:,">
+  <style nonce="__CSP_NONCE__">
+    :root {
+      --bg: #090c11;
+      --surface: #10141c;
+      --raised: #171d27;
+      --line: rgba(255, 255, 255, .09);
+      --text: #f1f4f2;
+      --muted: #94a0ae;
+      --faint: #5f6b7a;
+      --good: #7cf0c6;
+      --info: #6fc3ff;
+      --warn: #ffc56e;
+      --red: #ff7f90;
+      --rail-width: 380px;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      color: var(--text);
+      background: var(--bg);
+      font: 15px/1.6 "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", sans-serif;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+    }
+    button, input, textarea { font: inherit; color: inherit; }
+    button { cursor: pointer; }
+    button:disabled { cursor: not-allowed; opacity: .5; }
+    :focus-visible { outline: 2px solid var(--good); outline-offset: 2px; }
+    [hidden] { display: none !important; }
+
+    .bar { display: flex; align-items: center; gap: 14px; padding: 10px 18px; border-bottom: 1px solid var(--line); min-width: 0; }
+    .wordmark { font-weight: 650; letter-spacing: -.01em; }
+    .spacer { flex: 1; }
+    .who { color: var(--muted); font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .quiet { background: none; border: 0; padding: 6px 8px; color: var(--muted); border-radius: 6px; font-size: 14px; white-space: nowrap; }
+    .quiet:hover { color: var(--text); background: var(--surface); }
+
+    .workspace { display: grid; grid-template-columns: minmax(0, 1fr) var(--rail-width); min-height: 0; }
+    .conversation { display: grid; grid-template-rows: minmax(0, 1fr) auto; min-height: 0; min-width: 0; }
+    .log { overflow-y: auto; padding: 22px max(18px, calc((100% - 760px) / 2)); display: flex; flex-direction: column; gap: 18px; }
+    .empty { color: var(--faint); margin: auto; text-align: center; max-width: 34ch; }
+    .turn { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+    .turn.user { align-items: flex-end; }
+    .bubble { max-width: 100%; overflow-wrap: anywhere; }
+    .turn.user .bubble { background: var(--raised); padding: 8px 12px; border-radius: 12px; white-space: pre-wrap; }
+    .prose { white-space: pre-wrap; margin: 0; }
+    .bubble pre { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; overflow-x: auto; margin: 8px 0; font: 13px/1.5 ui-monospace, "Cascadia Code", Consolas, monospace; }
+    .waiting { color: var(--faint); }
+    .failure { color: var(--red); }
+    .receipt { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; color: var(--faint); font-size: 12.5px; }
+    .receipt .model { color: var(--muted); overflow-wrap: anywhere; }
+    .tag { border: 1px solid var(--line); border-radius: 999px; padding: 0 8px; font-size: 12px; white-space: nowrap; }
+    .tag.warn { color: var(--warn); border-color: rgba(255, 197, 110, .35); }
+    .tag.good { color: var(--good); border-color: rgba(124, 240, 198, .3); }
+    .tag.info { color: var(--info); border-color: rgba(111, 195, 255, .3); }
+    .tag.bad { color: var(--red); border-color: rgba(255, 127, 144, .35); }
+    .link { background: none; border: 0; padding: 0; color: var(--muted); text-decoration: underline; font-size: 12.5px; }
+    .link:hover { color: var(--text); }
+
+    .composer { display: flex; gap: 10px; padding: 12px max(18px, calc((100% - 760px) / 2)) 16px; border-top: 1px solid var(--line); align-items: flex-end; }
+    textarea { flex: 1; min-width: 0; resize: none; max-height: 200px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 9px 12px; }
+    .primary { background: var(--good); color: #06241a; border: 0; border-radius: 8px; padding: 8px 14px; font-weight: 600; }
+    .plain { background: var(--raised); border: 1px solid var(--line); border-radius: 8px; padding: 5px 10px; font-size: 13px; }
+    .plain:hover { border-color: rgba(255, 255, 255, .22); }
+    .plain.danger { color: var(--red); }
+
+    .rail { border-left: 1px solid var(--line); display: grid; grid-template-rows: auto minmax(0, 1fr); min-height: 0; min-width: 0; background: var(--surface); }
+    .tabs { display: flex; gap: 2px; padding: 8px 10px 0; border-bottom: 1px solid var(--line); overflow-x: auto; }
+    .tab { background: none; border: 0; border-bottom: 2px solid transparent; padding: 6px 10px; color: var(--muted); font-size: 14px; white-space: nowrap; }
+    .tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--good); }
+    .count { background: var(--warn); color: #2b1d05; border-radius: 999px; padding: 0 6px; font-size: 12px; font-weight: 650; margin-left: 4px; }
+    .panel { overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+    .card { background: var(--raised); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+    .card .text { overflow-wrap: anywhere; white-space: pre-wrap; }
+    .meta { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+    .row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .row.end { justify-content: flex-end; }
+    .field { flex: 1; min-width: 0; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
+    .note { color: var(--faint); font-size: 13.5px; }
+    pre.arguments { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 12.5px/1.5 ui-monospace, "Cascadia Code", Consolas, monospace; color: var(--muted); }
+    .audit-line { font: 12.5px/1.5 ui-monospace, "Cascadia Code", Consolas, monospace; color: var(--muted); overflow-wrap: anywhere; }
+
+    dialog { background: var(--surface); color: var(--text); border: 1px solid var(--line); border-radius: 12px; padding: 18px; width: min(640px, calc(100vw - 32px)); max-height: calc(100vh - 48px); }
+    dialog::backdrop { background: rgba(0, 0, 0, .6); }
+    dialog h2 { margin: 0 0 10px; font-size: 17px; font-weight: 650; }
+    dialog h3 { margin: 14px 0 6px; font-size: 14px; color: var(--muted); font-weight: 600; }
+    .stack { display: flex; flex-direction: column; gap: 10px; }
+
+    @media (max-width: 820px) {
+      .workspace { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, 42%); }
+      .rail { border-left: 0; border-top: 1px solid var(--line); }
+      .log, .composer { padding-left: 16px; padding-right: 16px; }
+    }
+  </style>
+</head>
+<body>
+  <header class="bar">
+    <span class="wordmark" id="name">Assistant</span>
+    <span class="who" id="who"></span>
+    <span class="spacer"></span>
+    <button class="quiet" id="new-chat" type="button">New conversation</button>
+    <button class="quiet" id="sign-out" type="button">Sign out</button>
+  </header>
+
+  <div class="workspace">
+    <main class="conversation">
+      <div class="log" id="log" aria-live="polite"><p class="empty" id="empty">Everything said here is remembered, with where it came from. Try asking something.</p></div>
+      <form class="composer" id="composer">
+        <textarea id="input" rows="1" placeholder="Say something" aria-label="Message"></textarea>
+        <button class="primary" id="send" type="submit">Send</button>
+      </form>
+    </main>
+
+    <aside class="rail" aria-label="What the assistant is doing">
+      <div class="tabs" role="tablist">
+        <button class="tab" role="tab" type="button" data-panel="approvals" aria-selected="true">Approvals<span class="count" id="approval-count" hidden></span></button>
+        <button class="tab" role="tab" type="button" data-panel="memory" aria-selected="false">Memory</button>
+        <button class="tab" role="tab" type="button" data-panel="tasks" aria-selected="false">Tasks</button>
+        <button class="tab" role="tab" type="button" data-panel="audit" aria-selected="false">Audit</button>
+      </div>
+      <section class="panel" id="panel-approvals"></section>
+      <section class="panel" id="panel-memory" hidden>
+        <form class="row" id="memory-search">
+          <input class="field" id="memory-query" placeholder="Search memory" aria-label="Search memory">
+          <button class="plain" type="submit">Search</button>
+        </form>
+        <form class="row" id="memory-add">
+          <input class="field" id="memory-text" placeholder="Remember this" aria-label="Remember this">
+          <button class="plain" type="submit">Keep</button>
+        </form>
+        <div class="stack" id="memory-list"></div>
+      </section>
+      <section class="panel" id="panel-tasks" hidden></section>
+      <section class="panel" id="panel-audit" hidden></section>
+    </aside>
+  </div>
+
+  <dialog id="sign-in">
+    <form class="stack" id="sign-in-form" method="dialog">
+      <h2>Your key</h2>
+      <p class="note">Each person has their own. <code>shardmesh assistant user add NAME</code> makes one. It is kept only until this tab closes.</p>
+      <input class="field" id="key" type="password" autocomplete="off" aria-label="Key" required>
+      <p class="failure" id="sign-in-error" hidden></p>
+      <div class="row end"><button class="primary" type="submit">Sign in</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="why">
+    <div class="stack">
+      <h2>What the model saw</h2>
+      <div id="why-body" class="stack"></div>
+      <div class="row end"><button class="plain" id="why-close" type="button">Close</button></div>
+    </div>
+  </dialog>
+
+  <script nonce="__CSP_NONCE__">
+    // Everything shown here can come from a model, a file, or a tool, so text only
+    // ever reaches the page as text.
+    const $ = id => document.getElementById(id);
+    const storage = {
+      get: key => { try { return sessionStorage.getItem(key); } catch { return null; } },
+      set: (key, value) => { try { sessionStorage.setItem(key, value); } catch {} },
+      drop: key => { try { sessionStorage.removeItem(key); } catch {} },
+    };
+    const state = { key: storage.get('assistant-key') || '', conversation: newId(), busy: false, panel: 'approvals', role: 'member' };
+
+    function newId() { return `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`; }
+    function make(tag, className, text) {
+      const element = document.createElement(tag);
+      if (className) element.className = className;
+      if (text !== undefined && text !== null) element.textContent = text;
+      return element;
+    }
+    function button(text, className, action) {
+      const element = make('button', className, text);
+      element.type = 'button';
+      element.addEventListener('click', action);
+      return element;
+    }
+    const when = seconds => seconds ? new Date(seconds * 1000).toLocaleString() : '';
+    const tag = (text, kind) => make('span', `tag ${kind || ''}`, text);
+    const trustKind = trust => ({ verified: 'good', owner: 'good', model: 'info', external: 'warn' }[trust] || '');
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, { ...options, headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.key}` } });
+      if (response.status === 401) { askForKey('That key was not accepted.'); throw new Error('Sign in first'); }
+      if (!response.ok) {
+        let message = `Request failed with HTTP ${response.status}`;
+        try { const body = await response.json(); if (typeof body.detail === 'string') message = body.detail; } catch {}
+        throw new Error(message);
+      }
+      return response.json();
+    }
+
+    function askForKey(problem) {
+      state.key = '';
+      storage.drop('assistant-key');
+      $('sign-in-error').hidden = !problem;
+      $('sign-in-error').textContent = problem || '';
+      if (!$('sign-in').open) $('sign-in').showModal();
+    }
+
+    function renderText(container, text) {
+      container.replaceChildren();
+      text.split(/(```[\s\S]*?(?:```|$))/g).forEach(part => {
+        if (!part) return;
+        if (part.startsWith('```')) {
+          const block = make('pre');
+          block.append(make('code', '', part.replace(/^```[^\n]*\n?/, '').replace(/```$/, '')));
+          container.append(block);
+        } else {
+          container.append(make('p', 'prose', part.replace(/^\n+|\n+$/g, '')));
+        }
+      });
+    }
+
+    function addTurn(kind) {
+      $('empty').hidden = true;
+      const turn = make('article', `turn ${kind}`);
+      const bubble = make('div', 'bubble');
+      turn.append(bubble);
+      $('log').append(turn);
+      return { turn, bubble };
+    }
+    const scrollDown = () => { $('log').scrollTop = $('log').scrollHeight; };
+
+    function addReceipt(turn, details) {
+      const receipt = make('div', 'receipt');
+      if (details.model) receipt.append(make('span', 'model', `${details.model} via ${details.provider}`));
+      else receipt.append(make('span', 'model', 'no model answered'));
+      receipt.append(tag(`reach ${details.reach}`));
+      if (details.tainted) receipt.append(tag('read untrusted text', 'warn'));
+      if (details.tools?.length) receipt.append(tag(`used ${details.tools.join(', ')}`, 'info'));
+      if (details.status === 'task') receipt.append(tag(`task ${details.task}`, 'info'));
+      if (details.status === 'refused') receipt.append(tag('refused', 'bad'));
+      if (details.status === 'failed') receipt.append(tag('failed', 'bad'));
+      if (details.turn) receipt.append(button('What did it see?', 'link', () => showWhy(details.turn)));
+      turn.append(receipt);
+    }
+
+    async function send(text) {
+      state.busy = true;
+      $('send').disabled = true;
+      const mine = addTurn('user');
+      mine.bubble.textContent = text;
+      const reply = addTurn('assistant');
+      const waiting = make('span', 'waiting', 'Working on it');
+      reply.bubble.append(waiting);
+      scrollDown();
+      let answer = '', details = null;
+      try {
+        const response = await fetch('/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.key}` },
+          body: JSON.stringify({ messages: [{ role: 'user', content: text }], stream: true, conversation_id: state.conversation }),
+        });
+        if (response.status === 401) { askForKey('That key was not accepted.'); throw new Error('Sign in first'); }
+        if (!response.ok) throw new Error(`Request failed with HTTP ${response.status}`);
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const events = buffer.split('\n\n');
+          buffer = events.pop();
+          for (const event of events) {
+            if (!event.startsWith('data: ') || event === 'data: [DONE]') continue;
+            const payload = JSON.parse(event.slice(6));
+            if (payload.error) throw new Error(payload.error.message);
+            const piece = payload.choices?.[0]?.delta?.content;
+            if (piece) { answer += piece; renderText(reply.bubble, answer); scrollDown(); }
+            if (payload.assistant) details = payload.assistant;
+          }
+        }
+        if (details) addReceipt(reply.turn, details);
+        if (details?.pending_approval) { await refreshApprovals(); showPanel('approvals'); }
+      } catch (error) {
+        waiting.remove();
+        reply.bubble.append(make('p', 'failure', error.message));
+      } finally {
+        state.busy = false;
+        $('send').disabled = false;
+        scrollDown();
+      }
+    }
+
+    async function showWhy(turn) {
+      const body = $('why-body');
+      body.replaceChildren(make('p', 'note', 'Looking it up'));
+      $('why').showModal();
+      try {
+        const record = await api(`/assistant/why/${encodeURIComponent(turn)}`);
+        const who = [...new Set(record.answered_by.map(row => `${row.model} via ${row.provider}`))].join(', ') || 'nobody';
+        const summary = make('div', 'row');
+        summary.append(make('span', 'meta', `Answered by ${who}`), tag(`reach ${record.reach}`), tag(`${record.tokens} of ${record.budget} tokens`));
+        if (record.tainted) summary.append(tag('read untrusted text', 'warn'));
+        body.replaceChildren(summary);
+        for (const [title, rows] of [['Seen', record.seen], ['Left out for space', record.left_out]]) {
+          if (!rows.length) continue;
+          body.append(make('h3', '', title));
+          for (const row of rows) {
+            const card = make('div', 'card');
+            const line = make('div', 'row');
+            line.append(tag(row.trust, trustKind(row.trust)), tag(row.reach), make('span', 'meta', `${row.source}: ${row.source_id}`));
+            card.append(line, make('div', 'text', row.text === null ? '(no longer held)' : row.text.slice(0, 600)));
+            body.append(card);
+          }
+        }
+      } catch (error) {
+        body.replaceChildren(make('p', 'failure', error.message));
+      }
+    }
+
+    async function refreshApprovals() {
+      const { approvals } = await api('/assistant/approvals');
+      const count = $('approval-count');
+      count.hidden = !approvals.length;
+      count.textContent = approvals.length;
+      // This runs on a timer. Redrawing an unchanged list would pull the buttons
+      // out from under a click, and take keyboard focus away from them.
+      const shown = JSON.stringify(approvals.map(item => item.approval_id));
+      if (shown === state.approvalsShown) return;
+      state.approvalsShown = shown;
+      const panel = $('panel-approvals');
+      panel.replaceChildren();
+      if (!approvals.length) { panel.append(make('p', 'note', 'Nothing is waiting for you. When an action needs your say, it stops here, and nothing runs until you decide.')); return; }
+      for (const item of approvals) {
+        const card = make('div', 'card');
+        card.append(make('strong', '', item.capability), make('div', 'meta', item.reason));
+        card.append(make('pre', 'arguments', JSON.stringify(item.arguments, null, 2)));
+        const row = make('div', 'row end');
+        const decide = approve => async () => {
+          row.querySelectorAll('button').forEach(item => { item.disabled = true; });
+          try {
+            const outcome = await api(`/assistant/approvals/${encodeURIComponent(item.approval_id)}`, { method: 'POST', body: JSON.stringify({ approve }) });
+            if (outcome.turn) {
+              const reply = addTurn('assistant');
+              renderText(reply.bubble, outcome.turn.text);
+              addReceipt(reply.turn, outcome.turn);
+              scrollDown();
+            }
+          } catch (error) {
+            card.append(make('p', 'failure', error.message));
+            row.querySelectorAll('button').forEach(item => { item.disabled = false; });  // it is still waiting
+          }
+          await refreshApprovals();
+        };
+        row.append(button('Decline', 'plain', decide(false)), button('Approve this exact action', 'plain', decide(true)));
+        card.append(row);
+        panel.append(card);
+      }
+    }
+
+    function memoryCard(row, onChange) {
+      const card = make('div', 'card');
+      card.append(make('div', 'text', row.text));
+      const tags = make('div', 'row');
+      tags.append(tag(row.trust, trustKind(row.trust)), tag(row.kind), tag(`reach ${row.reach}`));
+      card.append(tags);
+      card.append(make('div', 'meta', `From ${row.source} (${row.source_id}), by ${row.author}, ${when(row.captured_at)}`));
+      const actions = make('div', 'row end');
+      if (row.trust === 'model') {
+        actions.append(button('This is right', 'plain', async () => {
+          try { await api(`/assistant/memory/${row.id}/confirm`, { method: 'POST' }); await onChange(); }
+          catch (error) { card.append(make('p', 'failure', error.message)); }
+        }));
+      }
+      const forget = button('Forget', 'plain danger', async () => {
+        if (forget.dataset.armed !== 'yes') { forget.dataset.armed = 'yes'; forget.textContent = 'Delete for good?'; return; }
+        try { await api(`/assistant/memory/${row.id}`, { method: 'DELETE' }); await onChange(); }
+        catch (error) { card.append(make('p', 'failure', error.message)); }
+      });
+      actions.append(forget);
+      card.append(actions);
+      return card;
+    }
+
+    async function refreshMemory() {
+      const query = $('memory-query').value.trim();
+      const list = $('memory-list');
+      if (query) {
+        const { results } = await api(`/assistant/memory?q=${encodeURIComponent(query)}`);
+        list.replaceChildren(...results.map(item => {
+          const card = make('div', 'card');
+          const tags = make('div', 'row');
+          tags.append(tag(item.trust, trustKind(item.trust)), tag(`reach ${item.reach}`));
+          card.append(make('div', 'text', item.text), tags, make('div', 'meta', `${item.source_id}, by ${item.author}`));
+          return card;
+        }));
+        if (!results.length) list.append(make('p', 'note', 'Nothing remembered matches that.'));
+        return;
+      }
+      const { memories } = await api('/assistant/memory');
+      list.replaceChildren(...memories.map(row => memoryCard(row, refreshMemory)));
+      if (!memories.length) list.append(make('p', 'note', 'Nothing is remembered yet.'));
+    }
+
+    async function refreshTasks() {
+      const { available, tasks } = await api('/assistant/tasks');
+      const panel = $('panel-tasks');
+      panel.replaceChildren();
+      if (!available) { panel.append(make('p', 'note', 'The task engine is not installed, so everything is answered directly.')); return; }
+      if (!tasks.length) { panel.append(make('p', 'note', 'No tasks yet. Larger pieces of work appear here.')); return; }
+      for (const task of tasks) {
+        const id = task.id || task.task_id;
+        const card = make('div', 'card');
+        card.append(make('strong', '', task.title || task.goal || id), make('div', 'meta', `${task.state || task.status || 'unknown'}, ${id}`));
+        const row = make('div', 'row end');
+        row.append(button('Cancel', 'plain danger', async () => {
+          try { await api(`/assistant/tasks/${encodeURIComponent(id)}/cancel`, { method: 'POST' }); await refreshTasks(); }
+          catch (error) { card.append(make('p', 'failure', error.message)); }
+        }));
+        card.append(row);
+        panel.append(card);
+      }
+    }
+
+    async function refreshAudit() {
+      const { entries, intact } = await api('/assistant/audit?limit=200');
+      const panel = $('panel-audit');
+      panel.replaceChildren();
+      const status = make('div', 'row');
+      status.append(tag(intact ? 'the record is intact' : 'the record was changed', intact ? 'good' : 'bad'));
+      panel.append(status);
+      if (state.role !== 'owner') panel.append(make('p', 'note', 'Showing your own actions. Only the owner sees the whole record.'));
+      for (const row of entries.slice(-100).reverse()) {
+        panel.append(make('div', 'audit-line', `${when(row.at)}  ${row.actor}  ${row.action}  ${row.subject}`));
+      }
+      if (!entries.length) panel.append(make('p', 'note', 'Nothing recorded yet.'));
+    }
+
+    const panels = { approvals: refreshApprovals, memory: refreshMemory, tasks: refreshTasks, audit: refreshAudit };
+    function showPanel(name) {
+      state.panel = name;
+      for (const tab of document.querySelectorAll('.tab')) tab.setAttribute('aria-selected', String(tab.dataset.panel === name));
+      for (const key of Object.keys(panels)) $(`panel-${key}`).hidden = key !== name;
+      panels[name]().catch(() => {});
+    }
+
+    async function start() {
+      if (!state.key) { askForKey(); return; }
+      try {
+        const me = await api('/assistant/whoami');
+        state.role = me.role;
+        $('name').textContent = me.assistant;
+        $('who').textContent = `with ${me.user}`;
+        document.title = me.assistant;
+        showPanel(state.panel);
+        refreshApprovals().catch(() => {});
+      } catch {}
+    }
+
+    $('sign-in-form').addEventListener('submit', () => {
+      state.key = $('key').value.trim();
+      storage.set('assistant-key', state.key);
+      $('key').value = '';
+      start();
+    });
+    $('composer').addEventListener('submit', event => {
+      event.preventDefault();
+      const text = $('input').value.trim();
+      if (!text || state.busy) return;
+      $('input').value = '';
+      $('input').style.height = '';
+      send(text);
+    });
+    $('input').addEventListener('keydown', event => {
+      if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); $('composer').requestSubmit(); }
+    });
+    $('input').addEventListener('input', () => {
+      $('input').style.height = 'auto';
+      $('input').style.height = `${$('input').scrollHeight + 2}px`;
+    });
+    for (const tab of document.querySelectorAll('.tab')) tab.addEventListener('click', () => showPanel(tab.dataset.panel));
+    $('memory-search').addEventListener('submit', event => { event.preventDefault(); refreshMemory().catch(() => {}); });
+    $('memory-add').addEventListener('submit', async event => {
+      event.preventDefault();
+      const text = $('memory-text').value.trim();
+      if (!text) return;
+      await api('/assistant/memory', { method: 'POST', body: JSON.stringify({ text }) });
+      $('memory-text').value = '';
+      await refreshMemory();
+    });
+    $('new-chat').addEventListener('click', () => {
+      state.conversation = newId();
+      $('log').replaceChildren($('empty'));
+      $('empty').hidden = false;
+    });
+    $('sign-out').addEventListener('click', () => askForKey());
+    $('why-close').addEventListener('click', () => $('why').close());
+    setInterval(() => { if (state.key && !document.hidden) refreshApprovals().catch(() => {}); }, 5000);
+    start();
+  </script>
+</body>
+</html>

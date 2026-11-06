@@ -15,7 +15,7 @@ import time
 from typing import Any
 
 from .contracts import ModelReply, ModelRequest, Reach
-from .mind import LOCAL_USER, actor, emit, table
+from .mind import actor, emit, LOCAL_USER, plainly, table
 from .providers import VisibleText, estimate_tokens
 
 ROLES = ("conversation", "planning", "coding", "worker", "decision", "vision", "embedding", "verification")
@@ -427,15 +427,15 @@ def attach(assistant: Any) -> None:
 def add_commands(commands: Any) -> None:
     models = commands.add_parser("models", help="show how each model has really done, per role")
     models.add_argument("--role", default=None, choices=ROLES, help="only this role")
-    models.set_defaults(run=run_models)
+    models.set_defaults(run=plainly(run_models))
     route = commands.add_parser("route", help="choose which models serve each role")
     actions = route.add_subparsers(dest="route_command", required=True)
     change = actions.add_parser("set", help="set a role's candidates, as PROVIDER or PROVIDER/MODEL")
     change.add_argument("role", choices=ROLES, help="the role")
     change.add_argument("candidates", nargs="+", help="its candidates; on equal results the first listed wins")
-    change.set_defaults(run=run_route_set)
+    change.set_defaults(run=plainly(run_route_set))
     show = actions.add_parser("show", help="show each role's candidates")
-    show.set_defaults(run=run_route_show)
+    show.set_defaults(run=plainly(run_route_show))
 
 
 def run_models(assistant: Any, args: argparse.Namespace) -> int:

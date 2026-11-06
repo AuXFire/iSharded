@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import ContextItem, Provenance, Reach, Trust
-from .mind import actor, add_reach_option, add_user_option, emit, reach_named, search_terms
+from .mind import actor, add_reach_option, add_user_option, emit, plainly, reach_named, search_terms
 
 KINDS = ("episodic", "semantic", "procedural", "user", "system")
 RANK = {Trust.EXTERNAL: 0, Trust.MODEL: 1, Trust.OWNER: 2, Trust.VERIFIED: 3}
@@ -411,30 +411,30 @@ def add_commands(commands: Any) -> None:
     remember.add_argument("--expires-days", type=float, default=None, help="stop using it after this many days")
     add_reach_option(remember, "pool", "this fact")
     add_user_option(remember)
-    remember.set_defaults(run=run_remember)
+    remember.set_defaults(run=plainly(run_remember))
 
     recall = commands.add_parser("recall", help="search what is remembered, showing where each memory came from")
     recall.add_argument("query", help="what to look for")
     recall.add_argument("--limit", type=int, default=8, help="how many results to show")
     recall.add_argument("--said", action="store_true", help="also search what was actually said in conversations")
     add_user_option(recall)
-    recall.set_defaults(run=run_recall)
+    recall.set_defaults(run=plainly(run_recall))
 
     forget = commands.add_parser("forget", help="delete a memory for good, with its older versions")
     forget.add_argument("id", nargs="?", default=None, help="the memory's number, from recall")
     forget.add_argument("--conversation", default=None, help="delete this whole conversation instead")
     add_user_option(forget)
-    forget.set_defaults(run=run_forget)
+    forget.set_defaults(run=plainly(run_forget))
 
     confirm = commands.add_parser("confirm", help="vouch for something a model inferred, so it counts as yours")
     confirm.add_argument("id", help="the memory's number, from recall")
     add_user_option(confirm)
-    confirm.set_defaults(run=run_confirm)
+    confirm.set_defaults(run=plainly(run_confirm))
 
     export = commands.add_parser("export", help="write everything held for one person as JSON")
     export.add_argument("file", help="where to write it")
     add_user_option(export)
-    export.set_defaults(run=run_export)
+    export.set_defaults(run=plainly(run_export))
 
 
 def run_remember(assistant: Any, args: argparse.Namespace) -> int:

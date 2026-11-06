@@ -17,10 +17,11 @@ import re
 from typing import Any
 import uuid
 
-from .context import ContextTooSmall, estimate_tokens, merged
+from . import gateway_cli
+from .context import ContextTooSmall, TurnNotFound, estimate_tokens, merged
 from .contracts import CallContext, Capability, ContextItem, ModelReply, ModelRequest, Provenance, Reach, ToolCall, Trust, Verdict
 from .memory import KINDS
-from .mind import LOCAL_USER, actor, add_user_option, emit
+from .mind import actor, add_user_option, emit, LOCAL_USER, plainly
 from .providers import loose_json
 
 ROLE = "conversation"
@@ -431,7 +432,7 @@ class Conversation:
             "UPDATE paused_turns SET status = 'running' WHERE turn_id = ? AND user = ? AND status = 'waiting'", (turn_id, user)
         )
         if cursor.rowcount == 0:
-            raise LookupError(f"No turn {turn_id} is waiting for a decision")
+            raise TurnNotFound(f"No turn {turn_id} is waiting for a decision")
         row = self.store.one("SELECT * FROM paused_turns WHERE turn_id = ? AND user = ?", (turn_id, user))
         state = json.loads(row["state"])
         turn = Turn(
@@ -581,24 +582,22 @@ def detach(assistant: Any) -> None:
 
 
 def add_commands(commands: Any) -> None:
-    from . import gateway  # not a part, since it is the server built on them, so it joins here
-
     chat = commands.add_parser("chat", help="talk with the assistant here in the terminal")
     chat.add_argument("--conversation", default=None, help="continue this conversation")
     add_user_option(chat)
-    chat.set_defaults(run=run_chat)
+    chat.set_defaults(run=plainly(run_chat))
     say = commands.add_parser("say", help="say one thing and print the reply")
     say.add_argument("text", help="what to say")
     say.add_argument("--conversation", default=None, help="continue this conversation")
     say.add_argument("--no-learn", action="store_true", help="do not propose memories from this turn")
     add_user_option(say)
-    say.set_defaults(run=run_say)
+    say.set_defaults(run=plainly(run_say))
     resume = commands.add_parser("resume", help="carry on a turn that was waiting for your approval")
     resume.add_argument("turn", help="the turn's id")
     resume.add_argument("--decline", action="store_true", help="do not do what it asked; end the turn")
     add_user_option(resume)
-    resume.set_defaults(run=run_resume)
-    gateway.add_commands(commands)
+    resume.set_defaults(run=plainly(run_resume))
+    gateway_cli.add_commands(commands)  # the server is not a part, so its commands join here
 
 
 def footer(result: TurnResult) -> str:

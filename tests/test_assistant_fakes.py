@@ -243,12 +243,15 @@ class FakeProvider:
 class ScriptedRouter:
     """Implements contracts.Router. Each reply is text, a ModelReply, an exception, or a callable."""
 
-    def __init__(self, *replies: Any) -> None:
+    def __init__(self, *replies: Any, skip_workers: bool = False) -> None:
         self.replies = list(replies)
         self.requests: list[ModelRequest] = []
+        self.skip_workers = skip_workers  # learning runs in the background, in no fixed order
 
     def complete(self, request: ModelRequest) -> ModelReply:
         self.requests.append(request)
+        if self.skip_workers and request.role == "worker":
+            return model_reply("[]")
         reply = self.replies.pop(0) if self.replies else "ok"
         if callable(reply) and not isinstance(reply, type):
             reply = reply(request)

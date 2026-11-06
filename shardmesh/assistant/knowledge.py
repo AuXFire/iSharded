@@ -22,7 +22,7 @@ from typing import Any
 import numpy as np
 
 from .contracts import ContextItem, Provenance, Reach, Trust
-from .mind import actor, add_reach_option, add_user_option, emit, reach_named, search_terms
+from .mind import actor, add_reach_option, add_user_option, emit, plainly, reach_named, search_terms
 
 SKIPPED_FOLDERS = frozenset(
     {".git", ".hg", ".svn", ".ssh", ".gnupg", ".aws", "node_modules", "__pycache__", ".venv", "venv", ".tox", ".mypy_cache", ".pytest_cache"}
@@ -628,23 +628,23 @@ def add_commands(commands: Any) -> None:
     add.add_argument("path", help="the folder")
     add_reach_option(add, "pool", "text from this folder")
     add_user_option(add)
-    add.set_defaults(run=run_add)
+    add.set_defaults(run=plainly(run_add))
     remove = actions.add_parser("remove", help="stop using a folder and delete its index; the files are not touched")
     remove.add_argument("root", help="the folder, or its number from `library list`")
     add_user_option(remove)
-    remove.set_defaults(run=run_remove)
+    remove.set_defaults(run=plainly(run_remove))
     listing = actions.add_parser("list", help="show the authorized folders")
     add_user_option(listing)
-    listing.set_defaults(run=run_list)
+    listing.set_defaults(run=plainly(run_list))
     index = actions.add_parser("index", help="bring the index up to date; only changed files are read")
     index.add_argument("root", nargs="?", default=None, help="one folder, or its number; default is all of them")
     add_user_option(index)
-    index.set_defaults(run=run_index)
+    index.set_defaults(run=plainly(run_index))
     search = actions.add_parser("search", help="search the library")
     search.add_argument("query", help="what to look for")
     search.add_argument("--limit", type=int, default=8, help="how many results to show")
     add_user_option(search)
-    search.set_defaults(run=run_search)
+    search.set_defaults(run=plainly(run_search))
 
 
 def run_add(assistant: Any, args: argparse.Namespace) -> int:

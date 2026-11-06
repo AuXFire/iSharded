@@ -22,7 +22,7 @@ import uuid
 
 from .contracts import ContextItem, Provenance, Reach, Trust, is_tainted, lowest_reach
 from .memory import MemoryNotFound
-from .mind import LOCAL_USER, actor, add_user_option, emit, reach_named
+from .mind import actor, add_user_option, emit, LOCAL_USER, plainly, reach_named
 
 DEFAULT_BUDGET_TOKENS = 6144
 HISTORY_MESSAGES = 40
@@ -420,11 +420,11 @@ def add_commands(commands: Any) -> None:
     why.add_argument("turn", nargs="?", default=None, help="the turn's id; default is the latest")
     why.add_argument("--json", action="store_true", help="print the whole record as JSON")
     add_user_option(why)
-    why.set_defaults(run=run_why)
+    why.set_defaults(run=plainly(run_why))
     context = commands.add_parser("context", help="how far a person's words may travel by default")
     context.add_argument("--reach", default=None, choices=[item.name.lower() for item in Reach], help="set it; the default is pool")
     add_user_option(context)
-    context.set_defaults(run=run_context)
+    context.set_defaults(run=plainly(run_context))
 
 
 def run_why(assistant: Any, args: argparse.Namespace) -> int:

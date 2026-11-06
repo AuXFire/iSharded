@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 from typing import Any
 
-from .mind import LOCAL_USER, actor, add_user_option, emit
+from .mind import actor, add_user_option, emit, LOCAL_USER, plainly
 
 DEFAULT_NAME = "Mesh"
 DEFAULT_STYLE = "Plain, direct, and warm. Says what it knows, what it does not, and how sure it is."
@@ -216,7 +216,7 @@ def add_commands(commands: Any) -> None:
     show = actions.add_parser("show", help="show the name, style, promises, and relationship")
     add_user_option(show)
     show.add_argument("--prompt", action="store_true", help="also show the exact text models receive")
-    show.set_defaults(run=run_show)
+    show.set_defaults(run=plainly(run_show))
     change = actions.add_parser("set", help="change the name, style, voice, promises, or a relationship note")
     add_user_option(change)
     change.add_argument("--name", default=None, help="what the assistant is called")
@@ -226,7 +226,7 @@ def add_commands(commands: Any) -> None:
     change.add_argument("--to-user", action="store_true", help="make --commit a promise to --user alone, not to everyone")
     change.add_argument("--withdraw", type=int, default=None, help="withdraw the promise with this number; it stays in the history")
     change.add_argument("--relationship", default=None, help="set the relationship note for --user")
-    change.set_defaults(run=run_set)
+    change.set_defaults(run=plainly(run_set))
 
 
 def run_show(assistant: Any, args: argparse.Namespace) -> int:

@@ -25,7 +25,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from .contracts import Capability, ModelReply, ModelRequest, Reach, ToolCall
-from .mind import LOCAL_USER, actor, emit, reach_named, table
+from .mind import actor, emit, LOCAL_USER, plainly, reach_named, table
 
 CONNECT_SECONDS = 10.0
 READ_SECONDS = 120.0  # silence this long means the link is gone; covers a long prefill
@@ -801,13 +801,13 @@ def add_commands(commands: Any) -> None:
     add.add_argument("--daily-tokens", type=int, default=None, help="stop using it after this many tokens in a day")
     add.add_argument("--read-seconds", type=float, default=READ_SECONDS, help="how long silence may last before it counts as failed")
     add.add_argument("--model", default=None, help="the model to use; default is the first it lists")
-    add.set_defaults(run=run_add)
+    add.set_defaults(run=plainly(run_add))
     listing = actions.add_parser("list", help="show providers, and check each one is up")
     listing.add_argument("--no-check", action="store_true", help="do not contact them")
-    listing.set_defaults(run=run_list)
+    listing.set_defaults(run=plainly(run_list))
     remove = actions.add_parser("remove", help="remove a provider")
     remove.add_argument("name", help="its name")
-    remove.set_defaults(run=run_remove)
+    remove.set_defaults(run=plainly(run_remove))
 
 
 def run_add(assistant: Any, args: argparse.Namespace) -> int:

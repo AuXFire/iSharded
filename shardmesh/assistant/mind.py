@@ -5,7 +5,10 @@ This is not a part: it attaches nothing and decides nothing.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
+import functools
 import re
+import sqlite3
 import sys
 from typing import Any, TextIO
 
@@ -38,6 +41,29 @@ def emit(text: str = "", end: str = "\n", stream: TextIO | None = None) -> None:
         encoding = target.encoding or "ascii"
         target.write((text + end).encode(encoding, "backslashreplace").decode(encoding))
     target.flush()
+
+
+def plainly(run: Callable[[Any, argparse.Namespace], int]) -> Callable[[Any, argparse.Namespace], int]:
+    """A command's own refusals are for a person, so they print as words.
+
+    KeyError and IndexError are left alone: those are bugs, and a bug should be loud.
+    """
+
+    @functools.wraps(run)
+    def wrapped(assistant: Any, args: argparse.Namespace) -> int:
+        try:
+            return run(assistant, args)
+        except (KeyError, IndexError):
+            raise
+        except (ValueError, LookupError) as error:
+            emit(str(error.args[0] if error.args else error), stream=sys.stderr)
+        except sqlite3.OperationalError as error:
+            if "locked" not in str(error):
+                raise
+            emit("Something else is busy writing to the assistant's data. Try again in a moment.", stream=sys.stderr)
+        return 1
+
+    return wrapped
 
 
 def reach_named(name: str | Reach) -> Reach:

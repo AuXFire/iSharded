@@ -11,8 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from collections.abc import AsyncIterator, Iterator
-import getpass
+from collections.abc import AsyncIterator
 import hashlib
 import json
 import os
@@ -28,18 +27,25 @@ import time
 from typing import Any
 import uuid
 
-from .conversation import TurnResult, decide_approval
+from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+
+from shardmesh.pool import LOOPBACK
+from shardmesh.serving import BodyLimit, NoDelayHTTPProtocol
+
+from .context import TurnNotFound
 from .contracts import Provenance, Reach, Trust
+from .conversation import TurnResult, decide_approval
 from .memory import KINDS, MemoryNotFound, MemoryRefused
 from .mind import LOCAL_USER, actor, emit, table
 
-DEFAULT_PORT = 8470
 KEY_PREFIX = "sma-"
 USER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 PUBLIC_PATHS = frozenset({"/", "/assistant", "/assistant/", "/healthz"})
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
 HTML_FILE = Path(__file__).with_name("assistant.html")
-STREAM_POLL_SECONDS = 0.1
+STREAM_POLL_SECONDS = 0.01
 
 BACKUP_MAGIC = b"SMAB1\n"
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2**15, 8, 1
@@ -113,7 +119,7 @@ class Users:
                 raise ValueError(f"There is no user {name}. `user list` shows them")
             self.assistant.audit.record(actor(LOCAL_USER), "user.remove", f"user:{name}")
 
-    def list(self) -> list[dict[str, Any]]:
+    def entries(self) -> list[dict[str, Any]]:
         rows = self.store.query("SELECT name, role, added_at FROM gateway_users WHERE removed_at IS NULL ORDER BY added_at, name")
         return [dict(row) for row in rows]
 
@@ -256,52 +262,53 @@ async def next_item(items: "queue.Queue[Any]") -> Any:
         try:
             return items.get_nowait()
         except queue.Empty:
-            await asyncio.sleep(STREAM_POLL_SECONDS / 10)
+            await asyncio.sleep(STREAM_POLL_SECONDS)
 
 
-def create_app(assistant: Any) -> Any:
-    from fastapi import APIRouter, FastAPI, HTTPException, Request
-    from fastapi.responses import HTMLResponse, StreamingResponse
-    from pydantic import BaseModel, Field
+class ClientMessage(BaseModel):
+    role: str
+    content: Any = ""
 
-    from shardmesh.serving import BodyLimit
 
+class ChatRequest(BaseModel):
+    messages: list[ClientMessage]
+    model: str | None = None
+    stream: bool = False
+    conversation_id: str | None = Field(default=None, max_length=128)
+
+
+class SayRequest(BaseModel):
+    text: str
+    conversation_id: str | None = Field(default=None, max_length=128)
+
+
+class MemoryRequest(BaseModel):
+    text: str
+    kind: str = "user"
+    subject: str | None = None
+    reach: str = "pool"
+    expires_at: float | None = None
+
+
+class RootRequest(BaseModel):
+    path: str
+    reach: str = "pool"
+    for_user: str | None = None
+
+
+class DecisionRequest(BaseModel):
+    approve: bool
+
+
+class TaskRequest(BaseModel):
+    plan: dict[str, Any]
+
+
+def create_app(assistant: Any) -> FastAPI:
     users = Users(assistant)
     app = FastAPI(title="ShardMesh assistant", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.assistant = assistant
     app.state.users = users
-
-    class ClientMessage(BaseModel):
-        role: str
-        content: Any = ""
-
-    class ChatRequest(BaseModel):
-        messages: list[ClientMessage]
-        model: str | None = None
-        stream: bool = False
-        conversation_id: str | None = Field(default=None, max_length=128)
-
-    class SayRequest(BaseModel):
-        text: str
-        conversation_id: str | None = Field(default=None, max_length=128)
-
-    class MemoryRequest(BaseModel):
-        text: str
-        kind: str = "user"
-        subject: str | None = None
-        reach: str = "pool"
-        expires_at: float | None = None
-
-    class RootRequest(BaseModel):
-        path: str
-        reach: str = "pool"
-        for_user: str | None = None
-
-    class DecisionRequest(BaseModel):
-        approve: bool
-
-    class TaskRequest(BaseModel):
-        plan: dict[str, Any]
 
     def me(request: Request) -> str:
         return request.state.user
@@ -575,8 +582,8 @@ def create_app(assistant: Any) -> Any:
     async def not_found(_: Request, error: MemoryNotFound) -> Any:
         return plain_error(404, error)
 
-    @app.exception_handler(LookupError)
-    async def lookup_failed(_: Request, error: LookupError) -> Any:
+    @app.exception_handler(TurnNotFound)
+    async def turn_not_found(_: Request, error: TurnNotFound) -> Any:
         return plain_error(404, error)
 
     @app.exception_handler(MemoryRefused)
@@ -602,9 +609,7 @@ def create_app(assistant: Any) -> Any:
     return app
 
 
-def plain_error(status: int, error: Exception) -> Any:
-    from fastapi.responses import JSONResponse
-
+def plain_error(status: int, error: Exception) -> JSONResponse:
     detail = error.args[0] if error.args else str(error)
     return JSONResponse({"detail": str(detail)}, status_code=status)
 
@@ -622,13 +627,11 @@ def include_parts(app: Any, assistant: Any) -> None:
             clash = [method for method in getattr(route, "methods", None) or () if (route.path, method) in taken]
             if clash:
                 router.routes.remove(route)
-                emit(f"The {name} part's {route.path} was not added: the gateway already serves it.", stream=None)
+                assistant.audit.record("gateway", "gateway.route_shadowed", route.path, {"part": name})
         app.include_router(router)
 
 
-def page_response() -> Any:
-    from fastapi.responses import HTMLResponse
-
+def page_response() -> HTMLResponse:
     nonce = secrets.token_urlsafe(16)
     html = HTML_FILE.read_text(encoding="utf-8").replace("__CSP_NONCE__", nonce)
     policy = (
@@ -646,15 +649,9 @@ def page_response() -> Any:
     )
 
 
-def is_loopback_host(host: str) -> bool:
-    from shardmesh.pool import LOOPBACK
-
-    return host in LOOPBACK
-
-
 def check_bind(host: str, tls: bool, trusted_network: bool) -> None:
     """Keys cross the network with every request, so they need a link nobody can read."""
-    if is_loopback_host(host) or tls or trusted_network:
+    if host in LOOPBACK or tls or trusted_network:
         return
     raise ValueError(
         f"{host} is reachable from other machines, and this would send keys and conversations unencrypted. "
@@ -724,7 +721,7 @@ def decrypt_file(source: Path, target: Path, passphrase: bytes) -> None:
         header = magic + fixed + salt + prefix
         try:
             cipher = AESGCM(derive_key(passphrase, salt, n, r, p))
-        except ValueError:
+        except (ValueError, MemoryError):  # a header changed to ask for impossible settings
             raise ValueError(wrong) from None
         index = 0
         size_bytes = reader.read(4)
@@ -748,6 +745,9 @@ def backup(assistant: Any, target: Path, passphrase: bytes) -> dict[str, Any]:
     protected as the database is, and is gone when this returns."""
     target = Path(target)
     started = time.perf_counter()
+    # Recorded first: if this cannot be written nothing has happened yet, a good
+    # backup is never reported as failed, and the copy carries its own record.
+    assistant.audit.record(actor(LOCAL_USER), "backup.started", target.name)
     with tempfile.TemporaryDirectory(dir=assistant.home, prefix="backup-") as folder:
         copy = Path(folder) / "copy.db"
         destination = sqlite3.connect(copy)
@@ -757,7 +757,6 @@ def backup(assistant: Any, target: Path, passphrase: bytes) -> dict[str, Any]:
             destination.close()
         size = copy.stat().st_size
         encrypt_file(copy, target, passphrase)
-    assistant.audit.record(actor(LOCAL_USER), "backup.made", target.name, {"bytes": size})
     return {"bytes": size, "seconds": time.perf_counter() - started}
 
 
@@ -785,50 +784,14 @@ def restore(assistant: Any, source: Path, passphrase: bytes, force: bool = False
 # Commands
 
 
-def add_commands(commands: Any) -> None:
-    serve = commands.add_parser("serve", help="run the web page and API; loopback only unless told otherwise")
-    serve.add_argument("--host", default="127.0.0.1", help="address to listen on; default is this machine only")
-    serve.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"port to listen on; default is {DEFAULT_PORT}")
-    serve.add_argument("--tls-cert", default=None, help="TLS certificate file")
-    serve.add_argument("--tls-key", default=None, help="TLS key file")
-    serve.add_argument("--trusted-network", action="store_true", help="serve without TLS, because nobody else can read this network")
-    serve.set_defaults(run=run_serve)
-
-    user = commands.add_parser("user", help="who may connect, each with their own key")
-    actions = user.add_subparsers(dest="user_command", required=True)
-    add = actions.add_parser("add", help="make a user, and write their key to a private file")
-    add.add_argument("name", help="their name")
-    add.add_argument("--role", default=None, choices=["owner", "member"], help="default is owner for the first user and member after")
-    add.add_argument("--key-file", default=None, help="where to write the key; default is keys/NAME.key in the assistant's folder")
-    add.add_argument("--reclaim", action="store_true", help="give a removed name, and the data it left, to this person")
-    add.set_defaults(run=run_user_add)
-    listing = actions.add_parser("list", help="show who may connect")
-    listing.set_defaults(run=run_user_list)
-    remove = actions.add_parser("remove", help="end a user's access now; their data stays")
-    remove.add_argument("name", help="their name")
-    remove.set_defaults(run=run_user_remove)
-
-    make = commands.add_parser("backup", help="write an encrypted copy of everything to one file")
-    make.add_argument("file", help="where to write it")
-    make.add_argument("--passphrase-file", required=True, help="a file holding the passphrase")
-    make.set_defaults(run=run_backup)
-    back = commands.add_parser("restore", help="replace this install's state with a backup")
-    back.add_argument("file", help="the backup")
-    back.add_argument("--passphrase-file", required=True, help="a file holding the passphrase")
-    back.add_argument("--force", action="store_true", help="replace what is already here")
-    back.set_defaults(run=run_restore)
-
-
 def run_serve(assistant: Any, args: argparse.Namespace) -> int:
     import uvicorn
-
-    from shardmesh.serving import NoDelayHTTPProtocol
 
     if bool(args.tls_cert) != bool(args.tls_key):
         raise ValueError("TLS needs both --tls-cert and --tls-key")
     check_bind(args.host, bool(args.tls_cert), args.trusted_network)
     users = Users(assistant)
-    if not users.list():
+    if not users.entries():
         raise ValueError("Nobody could connect yet. Run `shardmesh assistant user add NAME` first")
     options = {"ssl_certfile": args.tls_cert, "ssl_keyfile": args.tls_key} if args.tls_cert else {}
     scheme = "https" if args.tls_cert else "http"
@@ -850,7 +813,7 @@ def run_user_add(assistant: Any, args: argparse.Namespace) -> int:
 
 
 def run_user_list(assistant: Any, args: argparse.Namespace) -> int:
-    emit(table(Users(assistant).list(), ["name", "role"]) or "Nobody yet. Add someone with `user add`.")
+    emit(table(Users(assistant).entries(), ["name", "role"]) or "Nobody yet. Add someone with `user add`.")
     return 0
 
 
