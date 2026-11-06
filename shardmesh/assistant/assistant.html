@@ -153,7 +153,9 @@
     const note = text => make('p', 'rail-note', text);
 
     async function api(path, options = {}) {
-      const response = await fetch(path, { ...options, headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.key}` } });
+      const key = state.key;
+      const response = await fetch(path, { ...options, headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` } });
+      if (key !== state.key) throw new Error('Signed out');  // an answer for someone who has left must not be drawn
       if (response.status === 401) { askForKey('That key was not accepted.'); throw new Error('Sign in first'); }
       if (!response.ok) {
         let message = `Request failed with HTTP ${response.status}`;
@@ -163,9 +165,27 @@
       return response.json();
     }
 
+    // Whoever signs in next must not see this person's words, even dimmed behind the sheet.
+    function forgetPerson() {
+      state.opening += 1;
+      state.conversation = '';
+      state.approvalsShown = null;
+      session.drop('assistant-conversation');
+      showConversation([]);
+      for (const id of ['panel-approvals', 'panel-tasks', 'panel-history', 'panel-audit', 'memory-list']) $(id).replaceChildren();
+      $('memory-query').value = '';
+      $('memory-text').value = '';
+      $('who').textContent = '';
+      $('name').textContent = 'Assistant';
+      $('greeting').textContent = 'Hello';
+      document.title = 'ShardMesh assistant';
+      showCount(0);
+    }
+
     function askForKey(problem) {
       state.key = '';
       session.drop('assistant-key');
+      forgetPerson();
       $('sign-in-error').hidden = !problem;
       $('sign-in-error').textContent = problem || '';
       if (!$('sign-in').open) $('sign-in').showModal();
@@ -487,6 +507,8 @@
       $('key').value = '';
       start();
     });
+    // Escape closes a dialog however it is asked not to, and without a key nothing here works.
+    $('sign-in').addEventListener('close', () => { if (!state.key) askForKey(); });
     $('composer').addEventListener('submit', event => {
       event.preventDefault();
       const text = $('input').value.trim();
@@ -523,13 +545,7 @@
       newConversation();
       showConversation([]);
     });
-    $('sign-out').addEventListener('click', () => {
-      session.drop('assistant-conversation');
-      state.conversation = '';
-      state.approvalsShown = null;
-      showConversation([]);
-      askForKey();
-    });
+    $('sign-out').addEventListener('click', () => askForKey());
     $('why-close').addEventListener('click', () => $('why').close());
     $('theme-button').addEventListener('click', () => applyTheme(THEMES[(THEMES.indexOf($('theme-button').dataset.choice) + 1) % THEMES.length]));
     $('rail-toggle').addEventListener('click', () => {
