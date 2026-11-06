@@ -836,6 +836,36 @@ def test_repair_does_not_wait_for_a_reply_that_needs_it():
     done(orchestrator)
 
 
+def test_repair_does_not_wait_for_a_reply_stuck_on_a_restarted_stage():
+    # Found on a one-stage lane: the reply waited for the repair, and the repair for the reply.
+    orchestrator, calls = repairing_pool(w1=record("w1", health={"status": "ok", "epoch": 99}))
+    orchestrator.absent_since = {}
+    orchestrator.replies_in_flight = 1
+    asyncio.run(orchestrator._repair_route())
+    assert calls
+    done(orchestrator)
+
+
+def test_a_repair_with_nowhere_to_go_is_tried_again_soon():
+    from fastapi import HTTPException
+
+    from shardmesh.orchestrator import REPAIR_COOLDOWN_SECONDS, REPAIR_RETRY_SECONDS
+
+    dead = record("w1")
+    dead.last_seen -= 60
+    orchestrator, _ = repairing_pool(w1=dead)
+
+    async def nowhere(**_):
+        raise HTTPException(status_code=409, detail="no worker offers any memory for weights")
+
+    orchestrator.rebalance = nowhere
+    with pytest.raises(HTTPException):
+        asyncio.run(orchestrator._repair_route())
+    waited = time.monotonic() - orchestrator.last_repair_at
+    assert REPAIR_COOLDOWN_SECONDS - REPAIR_RETRY_SECONDS - 1 < waited <= REPAIR_COOLDOWN_SECONDS - REPAIR_RETRY_SECONDS + 1
+    done(orchestrator)
+
+
 def test_a_returned_node_still_waits_for_replies_to_finish():
     orchestrator, calls = repairing_pool(w1=record("w1"), w2=record("w2"))
     orchestrator.lost_from_route = {"w2"}

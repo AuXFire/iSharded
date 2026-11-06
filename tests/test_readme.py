@@ -46,7 +46,7 @@ def test_every_option_explains_itself():
 
 
 def test_every_command_has_a_section():
-    for command in ("demo", "node", "load", "cordon", "model hash", "key", "pool"):
+    for command in ("demo", "node", "load", "lane", "cordon", "model hash", "key", "pool"):
         assert re.search(rf"^### shardmesh {command}", README, re.M), command
 
 

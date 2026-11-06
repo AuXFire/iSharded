@@ -271,6 +271,10 @@
         <div class="section-head"><div><h2 class="section-title">Execution pipeline</h2><div class="section-subtitle" id="pipelineSubtitle">Layer placement across the active route</div></div><div class="updated" id="updated">Never updated</div></div>
         <div class="pipeline-wrap"><div class="pipeline" id="pipeline"><div class="empty">Waiting for a model pipeline…</div></div></div>
       </section>
+      <section class="section" id="lanesSection" hidden>
+        <div class="section-head"><div><h2 class="section-title">Also running</h2><div class="section-subtitle">Models in their own lanes, beside the main one</div></div></div>
+        <div id="lanes"></div>
+      </section>
 
       <section class="lower">
         <div>
@@ -361,6 +365,15 @@
       for(const entry of Object.values(groups)){const kind=kinds[entry.kind]||(kinds[entry.kind]={budget:0,used:0});kind.budget+=entry.budget;kind.used+=entry.used;}
       return Object.entries(kinds).map(([kind,value])=>`<span><i style="background:var(${TIERS[kind]?.[1]||'--tier-disk'})"></i>${esc(TIERS[kind]?.[0]||kind)} ${bytes(value.used)} of ${bytes(value.budget)}</span>`).join('');
     }
+    function renderLanes(data) {
+      const lanes=data.lanes||[]; ui('lanesSection').hidden=!lanes.length;
+      ui('lanes').replaceChildren(...lanes.map(lane=>{
+        const row=document.createElement('div'); row.className='empty';
+        const state=lane.error?`failed: ${lane.error}`:lane.ready?`ready on ${(lane.route||[]).length} stage${(lane.route||[]).length===1?'':'s'}`:'starting';
+        row.textContent=`${lane.name}: ${lane.model||'no model yet'}, ${state}`;
+        return row;
+      }));
+    }
     function renderNodes(data) {
       const workers=workerList(data);
       if(!workers.length){ui('nodeGrid').innerHTML='<div class="empty">No workers registered</div>';return;}
@@ -384,7 +397,7 @@
       ui('workerCount').textContent=live; ui('workerTotal').textContent=`/ ${workers.length}`; ui('tokenLatency').textContent=num(metrics.token_latency_ms_ema); const byKind=virtual.memory_by_kind||{}, pooled=Object.values(byKind).reduce((n,k)=>n+k.budget_bytes,0); ui('memoryLabel').textContent='Memory for weights'; ui('vram').textContent=num((pooled||virtual.ram_total_bytes||0)/1024**3); ui('recoveries').textContent=metrics.recoveries_total??0;
       if(metrics.token_latency_ms_ema){appState.latency.push(metrics.token_latency_ms_ema); if(appState.latency.length>28)appState.latency.shift();renderSpark();}
       ui('updated').textContent=`Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}`;
-      renderLoad(data); renderPipeline(data); renderNodes(data); renderEvents(data);
+      renderLoad(data); renderPipeline(data); renderLanes(data); renderNodes(data); renderEvents(data);
     }
     async function refresh(showError=false) {
       if(appState.polling)return; appState.polling=true; try { const data=await api('/admin/status'); ui('auth').classList.remove('show'); render(data); } catch(error) { ui('liveDot').className='dot bad';ui('liveText').textContent='offline';if(showError)toast(error.message); } finally { appState.polling=false; }

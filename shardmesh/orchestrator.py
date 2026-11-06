@@ -23,6 +23,7 @@ from starlette.background import BackgroundTask
 from . import __version__
 from .access import Authority, NeedsAuthority, node_of, ROLE_ADMIN, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, Caller
 from .gguf import parse_source
+from .lanes import LaneDoor
 from .mesh import GOSSIP_SECONDS, ControlMesh
 from .models import Adapter, GgufAdapter, SUPPORTED_TYPES, UnsupportedModel, create_adapter
 from .planner import AMORTIZE_TOKENS, HOP_MS, Candidate, ModelProfile, PlacementError, plan_placement
@@ -50,7 +51,7 @@ from .pool import check_exposure, home as pool_home, load_token, read_membership
 from .serving import BodyLimit, serve, where_everything_is
 from .mesh import clean_url
 from .tickets import PREFIX as TICKET_PREFIX, NodeTickets, TicketChecker, TicketIdentity, client_auth, reply_audience
-from .tls import BEHALF, INTERCEPTED, intercepted, PEER, client_verify
+from .tls import BEHALF, BEHALF_HEADER, FORWARD_MARK, INTERCEPTED, intercepted, PEER, client_verify
 from .tokenizer import ChatTokenizer, IncrementalText, load_tokenizer
 from .weights import apply_model_hashes, Manifest, WeightSourceError, build_manifest
 
@@ -83,6 +84,7 @@ PROBATION_PASSES = 3
 MAX_PROBATION_PASSES = 48
 # Least time between repairs the orchestrator starts by itself.
 REPAIR_COOLDOWN_SECONDS = 120.0
+REPAIR_RETRY_SECONDS = 15.0
 # Wi-Fi drops out. A stage has to stay gone this long before weights move for it.
 REPAIR_GRACE_SECONDS = 30.0
 # How long a reply waits for a repair another node is carrying out, and how long
@@ -407,6 +409,8 @@ class Orchestrator:
             seeds = tuple(url.strip() for url in os.getenv("SHARDMESH_JOIN", "").split(",") if url.strip())
             self.mesh = ControlMesh(os.getenv("SHARDMESH_NODE_ID") or socket.gethostname(), seen_as, seeds)
         self.background: set[asyncio.Task[Any]] = set()
+        self.lanes = LaneDoor(self)
+        self.lane_name = os.getenv("SHARDMESH_LANE") or None
         self.started_at = time.time()
         self.requests_total = 0
         self.tokens_generated = 0
@@ -656,6 +660,9 @@ class Orchestrator:
         self.maintenance_task = asyncio.create_task(self._maintain())
         if self.mesh is not None:
             self.gossip_task = asyncio.create_task(self._gossip())
+        if self.lanes.active:
+            self.lanes.restore()
+            self.spawn(self.lanes.run())
 
     async def _maintain(self) -> None:
         while True:
@@ -757,8 +764,10 @@ class Orchestrator:
             return
         waited = time.monotonic() - self.last_repair_at
         # A reply in progress waits out a move, except one that cannot finish: with
-        # a stage gone it needs this repair, and they must not wait for each other.
-        if waited < REPAIR_COOLDOWN_SECONDS or self.control_lock.locked() or (self.replies_in_flight and not absent):
+        # a stage gone or restarted empty it needs this repair, and they must not
+        # wait for each other.
+        broken = absent or self.need_reconfigure
+        if waited < REPAIR_COOLDOWN_SECONDS or self.control_lock.locked() or (self.replies_in_flight and not broken):
             return
         self.last_repair_at = time.monotonic()
         if absent:
@@ -768,8 +777,14 @@ class Orchestrator:
         else:
             reason = f"{', '.join(sorted(self.need_reconfigure))} restarted without its stage"
         self.add_event("recovery", "Repairing the route", reason)
-        async with self.control_lock:
-            await self.rebalance(generation_lock_held=False)
+        try:
+            async with self.control_lock:
+                await self.rebalance(generation_lock_held=False)
+        except HTTPException:
+            # Nothing could take the model yet. A worker may be on its way back,
+            # and the replies waiting on it should not sit out a full cooldown.
+            self.last_repair_at = time.monotonic() - REPAIR_COOLDOWN_SECONDS + REPAIR_RETRY_SECONDS
+            raise
         self.lost_from_route -= {stage.worker_id for stage in self.route} | returned
         self.need_reconfigure.clear()
 
@@ -1905,6 +1920,7 @@ class Orchestrator:
                 else None
             ),
             "cordoned_nodes": sorted(self.access.cordoned),
+            "lanes": self.lanes.status(),
             "model": self.model_id,
             "load_job": self.job.snapshot() if self.job else None,
             "active_plan": describe_plan(self.active, self.route) if self.active and self.route else None,
@@ -2029,7 +2045,7 @@ def verify_admin(authorization: str | None) -> None:
     require(authorization, ROLE_ADMIN)
 
 
-def verify_user(authorization: str | None) -> None:
+def verify_user(authorization: str | None) -> Caller:
     caller = require(authorization, ROLE_USER)
     wait = runtime.access.spend(caller)
     if wait:
@@ -2038,12 +2054,11 @@ def verify_user(authorization: str | None) -> None:
             detail=f"rate limit reached for {caller.name}",
             headers={"Retry-After": str(max(int(wait) + 1, 1))},
         )
+    return caller
 
 
 FORWARDED_PATHS = ("/v1/", "/admin/")
 SAFE_NODE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
-FORWARD_MARK = "x-shardmesh-forwarded"
-BEHALF_HEADER = "x-shardmesh-on-behalf"
 # Connection details belong to each hop, and httpx sets the length itself.
 HOP_HEADERS = {"host", "content-length", "connection", "transfer-encoding", "keep-alive", "content-encoding"}
 
@@ -2292,7 +2307,9 @@ async def _run_load(body: LoadModelRequest, job: LoadJob) -> list[StageAssignmen
 
 @app.post("/admin/load")
 async def load(body: LoadModelRequest, authorization: str | None = Header(default=None)) -> Any:
-    verify_admin(authorization)
+    caller = require(authorization, ROLE_ADMIN)
+    if body.lane:
+        return JSONResponse(status_code=202, content=await runtime.lanes.load(body, caller))
     if runtime.control_lock.locked():
         raise HTTPException(status_code=409, detail="another load is already running")
     job = LoadJob(job_id=uuid.uuid4().hex, model_id=body.model_id)
@@ -2436,7 +2453,7 @@ async def cordon_node(
     authorization: str | None = Header(default=None),
 ) -> dict[str, str]:
     """Take a node out of service for maintenance, without dropping a reply."""
-    verify_admin(authorization)
+    caller = require(authorization, ROLE_ADMIN)
     cost = runtime.cost_of_losing(name)
     if cost is None:
         raise HTTPException(status_code=409, detail=f"the rest of the pool cannot hold this model without {name}")
@@ -2447,6 +2464,7 @@ async def cordon_node(
     runtime.add_event("recovery", "Node cordoned", f"Moving {name}'s share elsewhere")
     if runtime.active is not None:
         runtime.spawn(runtime.move_off())
+    runtime.spawn(runtime.lanes.tell_all(f"/admin/nodes/{name}/cordon?force=true", caller))
     return {"status": "cordoned"}
 
 
@@ -2481,6 +2499,37 @@ async def rebalance(authorization: str | None = Header(default=None)) -> dict[st
     return {"status": "rebalanced", "epoch": runtime.epoch, "route": route}
 
 
+@app.delete("/admin/lanes/{name}")
+async def remove_lane(name: str, authorization: str | None = Header(default=None)) -> dict[str, str]:
+    verify_admin(authorization)
+    runtime.lanes.remove(name)
+    return {"status": "removed"}
+
+
+@app.get("/internal/lane")
+async def lane_status(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """What a front door needs to know about the lane it sits beside."""
+    verify_token(authorization)
+    return {
+        "lane": runtime.lane_name,
+        "model": runtime.model_id,
+        "ready": bool(runtime.tokenizer and runtime.route),
+        "leader_url": runtime.mesh.leader_url if runtime.mesh else None,
+        "workers": sum(1 for record in runtime.workers.values() if record.live),
+        "route": [{"worker_id": stage.worker_id, "start_layer": stage.start_layer, "end_layer": stage.end_layer} for stage in runtime.route],
+        "load_job": runtime.job.snapshot() if runtime.job else None,
+    }
+
+
+@app.post("/internal/lane/access")
+async def lane_access(body: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, str]:
+    """Signed access changes, passed in by this node's front door. Signatures are checked in merge."""
+    verify_token(authorization)
+    runtime.access.merge(body)
+    runtime.apply_revocations()
+    return {"status": "merged"}
+
+
 @app.get("/admin/status")
 async def status(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     verify_user(authorization)
@@ -2491,8 +2540,9 @@ async def status(authorization: str | None = Header(default=None)) -> dict[str, 
 @app.get("/v1/models")
 async def models(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     verify_user(authorization)
-    data = [] if not runtime.model_id else [{"id": runtime.model_id, "object": "model", "owned_by": "shardmesh"}]
-    return {"object": "list", "data": data}
+    names = [runtime.model_id] if runtime.model_id else []
+    names += [name for name in runtime.lanes.models() if name not in names]
+    return {"object": "list", "data": [{"id": name, "object": "model", "owned_by": "shardmesh"} for name in names]}
 
 
 async def check_request(model: str | None) -> None:
@@ -2548,7 +2598,10 @@ async def completions(
     body: CompletionRequest,
     authorization: str | None = Header(default=None),
 ) -> Any:
-    verify_user(authorization)
+    caller = verify_user(authorization)
+    lane = runtime.lanes.serving(body.model)
+    if lane:
+        return await runtime.lanes.forward(lane, "/v1/completions", body.model_dump(exclude_none=True), caller)
     await check_request(body.model)
     if isinstance(body.prompt, list):
         if len(body.prompt) != 1:
@@ -2589,7 +2642,10 @@ async def chat_completions(
     body: ChatCompletionRequest,
     authorization: str | None = Header(default=None),
 ) -> Any:
-    verify_user(authorization)
+    caller = verify_user(authorization)
+    lane = runtime.lanes.serving(body.model)
+    if lane:
+        return await runtime.lanes.forward(lane, "/v1/chat/completions", body.model_dump(exclude_none=True), caller)
     await check_request(body.model)
     messages = [message.model_dump() for message in body.messages]
     assert runtime.tokenizer is not None
@@ -2647,6 +2703,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trusted-network", action="store_true", help="send pool credentials unencrypted, because nobody else can read this network")
     parser.add_argument("--open", action="store_true", help="serve a network with no credentials, trusting everyone on it")
     parser.add_argument("--audit-file", default=os.getenv("SHARDMESH_AUDIT_FILE"), help="where to record who did what")
+    parser.add_argument("--lane", default=None, help="run as this lane, beside a node's main control plane")
     return parser
 
 
@@ -2656,6 +2713,7 @@ def main() -> None:
     os.environ["SHARDMESH_NODE_ID"] = args.node_id or ""
     os.environ["SHARDMESH_NODE_URL"] = args.advertise_url or ""
     os.environ["SHARDMESH_JOIN"] = args.join
+    os.environ["SHARDMESH_LANE"] = args.lane or ""
     base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".cache") / "ShardMesh"
     os.environ["SHARDMESH_STATE_FILE"] = args.state_file or str(base / "orchestrator-state.json")
     os.environ["SHARDMESH_AUDIT_FILE"] = args.audit_file or str(base / "audit.jsonl")

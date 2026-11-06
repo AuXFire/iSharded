@@ -159,7 +159,7 @@ With certificates, the pool token stops working. Use your admin key, in the chat
 
 The diagrams use the same line colors throughout: solid blue-green for a reply's data, dashed violet for control messages, and pink for anything signed by the owner.
 
-The first six diagrams show what is built and tested on a two-machine pool. The right half of the last one is a proposal. A mesh runs one model at a time today.
+The first six diagrams show what is built and tested on a two-machine pool. The right half of the last one is a proposal.
 
 ### Two networks in one
 
@@ -297,9 +297,33 @@ If the connection to a node drops, retry against another node. Replies survive a
 | A bare GGUF file name | `file.gguf` | Whichever node holds it, with no internet needed |
 | A local safetensors folder | `D:\models\qwen3-8b` | That machine. In a secured pool it must be in `--model-dir` |
 
-Only one model runs at a time, so loading another replaces the current one. To see where a model would go without moving anything, use `POST /admin/plan`, or the picker on the chat page.
+Loading a model replaces the main one. To run another beside it, see [Several models at once](#several-models-at-once). To see where a model would go without moving anything, use `POST /admin/plan`, or the picker on the chat page.
 
 Gated models need `HF_TOKEN` set on each worker.
+
+### Several models at once
+
+Load another model beside the main one by giving it a lane:
+
+```bash
+shardmesh load Qwen3-0.6B-Q8_0.gguf --lane small --url http://node-a:8669
+```
+
+Each node then starts a control plane and workers for that lane, on ports 1000 above its own for the first lane, 2000 for the second, and so on. Open those ports wherever a firewall sits between nodes. The lane gets only what each node has spare under the limits its owner set, and `--lane-gpu-gb` and `--lane-ram-gb` lower that. A node started with `--no-lanes` hosts only the main model.
+
+`GET /v1/models` lists every running model on every node, and a request goes to the model it names. The chat page shows a picker once two models run. A request that names no model goes to the main one. Keys stay with each node's main control plane, which checks the key and the rate limit before passing a request on.
+
+Lanes are separate on purpose: a failure in one stays there, and each has its own coordinator. See or stop them with:
+
+```bash
+shardmesh lane list --url http://node-a:8669
+```
+
+```bash
+shardmesh lane remove small --url http://node-a:8669
+```
+
+Removing a lane stops its processes on every node and frees their memory. Lanes come back after a restart, like the main model.
 
 ## Recommended configuration
 
@@ -453,6 +477,7 @@ Other:
 |---|---|---|
 | `--log-file` | None | Write this node's output here. Over 64 MiB, the last one is kept as `.1` at the next start |
 | `--no-local-copy` | Off | Run workers from a network path as it is, instead of copying the code to local disk |
+| `--no-lanes` | Off | Host only the main model here, never one loaded with `load --lane` |
 
 A node contributes whatever you give it. With a GPU and weight memory, one worker spans them all. With no GPU, `--cpu-threads` or a weight budget adds a CPU worker. `--ram-budget-gb` adds a memory worker on the next port. A node that contributes nothing is refused.
 
@@ -474,6 +499,13 @@ Loads a model on a running pool and shows progress. `model` is any [model id](#l
 | `--hashes` | None | File from `shardmesh model hash`. Every node checks every unit against it |
 | `--no-reuse-cached` | Off | Plan as if no worker held any shards |
 | `--no-peer-fetch` | Off | Download every shard from the model host |
+| `--lane` | None | Load beside the running model, in a lane of this name. See [Several models at once](#several-models-at-once) |
+| `--lane-gpu-gb` | What is spare | Most VRAM per node for this lane |
+| `--lane-ram-gb` | What is spare | Most RAM per node for this lane |
+
+### shardmesh lane
+
+`shardmesh lane list` shows the pool's lanes, and `shardmesh lane remove NAME` stops one and frees its memory on every node. Both take `--url` and `--token` (`--pool-token`), as `load` does.
 
 ### shardmesh cordon and uncordon
 
@@ -591,6 +623,7 @@ A flag takes priority over its variable.
 | `SHARDMESH_DEVICE`, `SHARDMESH_ROLES`, `SHARDMESH_CPU_THREADS` | `--device`, `--roles`, `--cpu-threads` |
 | `SHARDMESH_GPU_MEMORY_GB`, `SHARDMESH_RAM_BUDGET_GB` | `--gpu-memory-gb`, `--ram-budget-gb` |
 | `SHARDMESH_CACHE_DIR`, `SHARDMESH_LLAMA_DIR` | `--cache-dir`, `--llama-dir` |
+| `SHARDMESH_LANE`, `SHARDMESH_LANES_FILE` | Set by `shardmesh node`: which lane a process is, and where a node keeps the lanes it should run |
 | `SHARDMESH_MODEL_DIRS` | `--model-dir`, separated by the system's path separator |
 | `SHARDMESH_REUSE_CACHED`, `SHARDMESH_PEER_FETCH` | Set to `0` for the control plane's `--no-reuse-cached`, `--no-peer-fetch` |
 | `SHARDMESH_HOST_ID` | Which physical machine a worker is on. Defaults to the computer name, so workers sharing a host do not count its RAM twice |
@@ -617,6 +650,7 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `POST` | `/admin/plan` | Admin key | Show where a model would run, without moving anything |
 | `POST` | `/admin/load` | Admin key | Load a model |
 | `POST` | `/admin/load/cancel` | Admin key | Stop a load. Finished units stay cached |
+| `DELETE` | `/admin/lanes/{name}` | Admin key | Stop a lane and free its memory on every node |
 | `POST` | `/admin/rebalance` | Admin key | Reconsider all live workers and apply a new layout |
 | `POST` | `/admin/nodes/{name}/cordon` | Admin key | Move a node's share elsewhere. `?force=true` allows a large transfer |
 | `POST` | `/admin/nodes/{name}/uncordon` | Admin key | Put a node back in service |
@@ -659,6 +693,8 @@ Prompts longer than the loaded context are refused with a 400. A reply that woul
 | Field | Default | What it does |
 |---|---|---|
 | `model_id` | `distilbert/distilgpt2` | Any [model id](#loading-a-model) |
+| `lane` | None | Load beside the main model, in a lane of this name |
+| `lane_gpu_gb`, `lane_ram_gb` | What is spare | Most VRAM and RAM per node for a new lane |
 | `revision` | `main` | Branch, tag, or commit on the model host |
 | `control_model_id` | None | Read the description from here instead of `model_id` |
 | `worker_model_ids` | None | A local source per worker, as worker name to path |
@@ -965,7 +1001,7 @@ Trust and status:
 - Two machines is the most this has run on. The longest test ran under an hour. No human has audited it, and reviews by AI do not show it is free of flaws.
 - A node in the route can read prompts and return wrong answers, and nothing detects that. Certificates limit who is in a pool. They do not make a hostile member safe.
 - An owned network has an owner. The ownerless version in the diagrams is a proposal, and is not built.
-- One model runs at a time.
+- Several models run in lanes with fixed memory shares. The main model's planner does not see a lane's memory, so moving layers after a failure can run a node short. Workers started with `--no-control` do not join lanes.
 - GitHub Actions has not run yet, because the account's jobs do not start. The same steps pass locally on Linux and Windows.
 
 Behavior:

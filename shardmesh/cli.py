@@ -168,13 +168,25 @@ def run_load(args: argparse.Namespace) -> int:
         body["draft_model"] = args.draft
     if args.no_peer_fetch:
         body["peer_fetch"] = False
+    if args.lane:
+        body.update({"lane": args.lane, "lane_gpu_gb": args.lane_gpu_gb, "lane_ram_gb": args.lane_ram_gb})
     response = httpx.post(base + "/admin/load", json=body, headers=headers, timeout=120.0)
     if response.status_code >= 400:
         print(f"Load refused: {response.text}", file=sys.stderr)
         return 1
     while True:
         time.sleep(2)
-        job = httpx.get(base + "/admin/status", headers=headers, timeout=30.0).json()["load_job"]
+        status = httpx.get(base + "/admin/status", headers=headers, timeout=30.0).json()
+        job = status["load_job"]
+        if args.lane:
+            lane = next((item for item in status["lanes"] if item["name"] == args.lane), {})
+            if lane.get("error"):
+                print(lane["error"], file=sys.stderr)
+                return 1
+            job = lane.get("load_job")
+            if job is None or job.get("model") != args.model:
+                print(f"Starting lane {args.lane}: {lane.get('workers', 0)} workers so far.", flush=True)
+                continue
         gib = 1024**3
         print(
             f"{job['phase']}: {job['bytes_done'] / gib:.2f} of {job['bytes_total'] / gib:.2f} GiB, "
@@ -186,6 +198,19 @@ def run_load(args: argparse.Namespace) -> int:
         if job["phase"] in {"failed", "cancelled"}:
             print(job["error"], file=sys.stderr)
             return 1
+
+
+def run_lane(args: argparse.Namespace) -> int:
+    base = args.url.rstrip("/")
+    headers = {"Authorization": f"Bearer {args.pool_token}"} if args.pool_token else {}
+    if args.lane_command == "remove":
+        response = httpx.delete(f"{base}/admin/lanes/{args.name}", headers=headers, timeout=30.0)
+        print(f"Removed lane {args.name}." if response.status_code < 400 else f"Refused: {response.text}")
+        return 0 if response.status_code < 400 else 1
+    for lane in httpx.get(base + "/admin/status", headers=headers, timeout=30.0).json()["lanes"]:
+        state = "ready" if lane["ready"] else lane["error"] or "starting"
+        print(f"{lane['name']}: {lane['model'] or 'no model'}, {lane['workers']} workers, {state}")
+    return 0
 
 
 def send_signed(args: argparse.Namespace, entry: dict[str, Any]) -> None:
@@ -361,8 +386,20 @@ def build_parser() -> argparse.ArgumentParser:
     load.add_argument("--no-peer-fetch", action="store_true", help="download every shard from the model host")
     load.add_argument("--token", "--pool-token", dest="pool_token", default=load_token(), help="an admin key; defaults to this machine's pool token")
     load.add_argument("--no-merge-passes", dest="merge_passes", action="store_false", help="make conversations take turns on each stage")
+    load.add_argument("--lane", default=None, help="load beside the running model, in a lane of this name")
+    load.add_argument("--lane-gpu-gb", type=float, default=None, help="most VRAM per node for this lane; default is what is spare")
+    load.add_argument("--lane-ram-gb", type=float, default=None, help="most RAM per node for this lane; default is what is spare")
     load.add_argument("--hashes", default=None, help="file from `shardmesh model hash`: every node checks every unit against it")
     load.set_defaults(handler=run_load)
+    lane = subparsers.add_parser("lane", help="see or remove models running beside the main one")
+    lane_commands = lane.add_subparsers(dest="lane_command", required=True)
+    for name, text in (("list", "show the pool's lanes"), ("remove", "stop a lane and free its memory on every node")):
+        command = lane_commands.add_parser(name, help=text)
+        if name == "remove":
+            command.add_argument("name", help="the lane to remove")
+        command.add_argument("--url", default="http://127.0.0.1:8000", help="any node's control address")
+        command.add_argument("--token", "--pool-token", dest="pool_token", default=load_token(), help="an admin key; defaults to this machine's pool token")
+        command.set_defaults(handler=run_lane)
     node = subparsers.add_parser("node", help="contribute CPU, RAM, GPU, or any combination")
     add_node_arguments(node)
     node.set_defaults(handler=run_node)

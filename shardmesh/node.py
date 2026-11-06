@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import ctypes
 import os
 import shutil
@@ -12,6 +13,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from .lanes import lane_port, lane_url, read_lanes
 from .pool import check_exposure, load_token
 
 def is_remote_path(path: str | Path) -> bool:
@@ -102,6 +104,7 @@ def add_node_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-peer-fetch", action="store_true", help="always download from the model host")
     parser.add_argument("--no-peer-serve", action="store_true", help="do not send shards to other workers")
     parser.add_argument("--no-local-copy", action="store_true", help="run workers from a network path as it is")
+    parser.add_argument("--no-lanes", action="store_true", help="host only the main model here, never one loaded with load --lane")
     parser.add_argument("--llama-dir", default=None, help="a llama.cpp build for GGUF models; downloaded if not set")
     parser.add_argument(
         "--gguf-dir",
@@ -171,7 +174,33 @@ def _control_command(args: argparse.Namespace) -> list[str]:
         ",".join(_seeds(args)),
         *(["--open"] if getattr(args, "open_pool", False) else []),
         *(["--trusted-network"] if getattr(args, "trusted_network", False) else []),
+        *_lane_flags(args),
     ]
+
+
+def data_folder() -> Path:
+    return Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".cache") / "ShardMesh"
+
+
+def _lane_flags(args: argparse.Namespace) -> list[str]:
+    """A lane keeps its own records. The node's keys stay with the front door."""
+    lane = getattr(args, "lane", None)
+    if not lane:
+        return []
+    return [
+        "--lane",
+        lane,
+        "--state-file",
+        str(lane_state_file(args.node_id, lane)),
+        "--audit-file",
+        str(data_folder() / f"audit-{args.node_id}-{lane}.jsonl"),
+        "--keys-file",
+        str(data_folder() / f"access-{args.node_id}-{lane}.json"),
+    ]
+
+
+def lane_state_file(node_id: str, lane: str) -> Path:
+    return data_folder() / f"orchestrator-state-{node_id}-{lane}.json"
 
 
 def _worker_command(
@@ -300,36 +329,8 @@ class Service:
             self.process.kill()
 
 
-def run_node(args: argparse.Namespace) -> int:
-    if getattr(args, "pool_token_file", None):
-        os.environ["SHARDMESH_POOL_TOKEN_FILE"] = str(Path(args.pool_token_file).resolve())
-    if getattr(args, "ca_file", None):
-        os.environ["SHARDMESH_CA_FILE"] = str(Path(args.ca_file).resolve())
-    if getattr(args, "identity_cert", None) and getattr(args, "identity_key", None):
-        os.environ["SHARDMESH_IDENTITY_CERT"] = str(Path(args.identity_cert).resolve())
-        os.environ["SHARDMESH_IDENTITY_KEY"] = str(Path(args.identity_key).resolve())
-    if getattr(args, "model_dir", None):
-        os.environ["SHARDMESH_MODEL_DIRS"] = os.pathsep.join(str(Path(item).resolve()) for item in args.model_dir)
-    if getattr(args, "advertise_host", "auto") == "auto":
-        args.advertise_host = detect_address()
-        print(f"Advertising {args.advertise_host}.", flush=True)
-    if getattr(args, "tls_cert", None):
-        args.advertise_scheme = "https"
-        os.environ.setdefault("SHARDMESH_TLS_CERT", str(Path(args.tls_cert).resolve()))
-        if getattr(args, "tls_key", None) and os.getenv("SHARDMESH_CA_FILE"):
-            # The same certificate also signs what TLS cannot vouch for: gossip replies.
-            os.environ.setdefault("SHARDMESH_IDENTITY_CERT", str(Path(args.tls_cert).resolve()))
-            os.environ.setdefault("SHARDMESH_IDENTITY_KEY", str(Path(args.tls_key).resolve()))
-    check_exposure(
-        args.bind_host,
-        load_token(),
-        os.getenv("SHARDMESH_CA_FILE"),
-        getattr(args, "open_pool", False),
-        args.advertise_host,
-        getattr(args, "trusted_network", False),
-    )
-    for seed in _seeds(args):  # credentials go to the peers named here, too
-        check_exposure(args.bind_host, load_token(), os.getenv("SHARDMESH_CA_FILE"), getattr(args, "open_pool", False), seed, getattr(args, "trusted_network", False))
+def node_specs(args: argparse.Namespace) -> list[tuple[str, list[str]]]:
+    """What this node runs: a label and a command for each process."""
     specs: list[tuple[str, list[str]]] = []
     port = args.base_port
     gpu_device = args.gpu_device
@@ -388,12 +389,101 @@ def run_node(args: argparse.Namespace) -> int:
                 ),
             )
         )
-    if not specs:
+    if not specs and not getattr(args, "lane", None):
         raise ValueError("node contributes nothing; enable a GPU, CPU threads, or a RAM or disk budget")
     if not getattr(args, "no_control", False):
         specs.insert(0, ("Control plane", _control_command(args)))
     elif not _seeds(args):
         raise ValueError("a node without a control plane needs --join")
+    return specs
+
+
+def lane_arguments(args: argparse.Namespace, name: str, lane: dict[str, Any]) -> argparse.Namespace:
+    """This node's settings for one lane: higher ports, and only what is spare."""
+    budget = lane["budgets"].get(args.node_id, {})
+    slot = lane["slot"]
+    changed = copy.copy(args)
+    changed.lane = name
+    changed.base_port = lane_port(args.base_port, slot)
+    changed.control_port = lane_port(_control_port(args), slot)
+    changed.join = ",".join(lane_url(seed, slot) for seed in _seeds(args))
+    changed.orchestrator_url = None
+    changed.gpu_memory_gb = budget.get("gpu_gb", 0.0)
+    changed.gpu_device = args.gpu_device if changed.gpu_memory_gb else "none"
+    ram = budget.get("ram_gb", 0.0)
+    changed.weights_ram_gb = str(ram) if ram else None
+    changed.weights_disk_gb = 0
+    changed.ram_budget_gb = 0
+    changed.cpu_active = True
+    if not ram:
+        changed.cpu_threads = 0
+    return changed
+
+
+class LaneKeeper:
+    """Starts and stops this node's lanes as the pool asks."""
+
+    def __init__(self, args: argparse.Namespace, path: Path, make_service: Callable[[str, list[str]], Service]) -> None:
+        self.args = args
+        self.path = path
+        self.make_service = make_service
+        self.running: dict[str, list[Service]] = {}
+
+    def supervise(self) -> None:
+        wanted, _ = read_lanes(self.path)
+        for name in [name for name in self.running if name not in wanted]:
+            for service in reversed(self.running.pop(name)):
+                service.stop()
+            lane_state_file(self.args.node_id, name).unlink(missing_ok=True)
+            print(f"Lane {name} stopped.", flush=True)
+        for name, lane in wanted.items():
+            if name not in self.running:
+                specs = node_specs(lane_arguments(self.args, name, lane))
+                self.running[name] = [self.make_service(f"{name}: {label}", command) for label, command in specs]
+                for service in self.running[name]:
+                    service.start()
+                print(f"Lane {name} started on slot {lane['slot']}.", flush=True)
+        for services in self.running.values():
+            for service in services:
+                service.supervise()
+
+    def stop(self) -> None:
+        for services in self.running.values():
+            for service in reversed(services):
+                service.stop()
+
+
+def run_node(args: argparse.Namespace) -> int:
+    if getattr(args, "pool_token_file", None):
+        os.environ["SHARDMESH_POOL_TOKEN_FILE"] = str(Path(args.pool_token_file).resolve())
+    if getattr(args, "ca_file", None):
+        os.environ["SHARDMESH_CA_FILE"] = str(Path(args.ca_file).resolve())
+    if getattr(args, "identity_cert", None) and getattr(args, "identity_key", None):
+        os.environ["SHARDMESH_IDENTITY_CERT"] = str(Path(args.identity_cert).resolve())
+        os.environ["SHARDMESH_IDENTITY_KEY"] = str(Path(args.identity_key).resolve())
+    if getattr(args, "model_dir", None):
+        os.environ["SHARDMESH_MODEL_DIRS"] = os.pathsep.join(str(Path(item).resolve()) for item in args.model_dir)
+    if getattr(args, "advertise_host", "auto") == "auto":
+        args.advertise_host = detect_address()
+        print(f"Advertising {args.advertise_host}.", flush=True)
+    if getattr(args, "tls_cert", None):
+        args.advertise_scheme = "https"
+        os.environ.setdefault("SHARDMESH_TLS_CERT", str(Path(args.tls_cert).resolve()))
+        if getattr(args, "tls_key", None) and os.getenv("SHARDMESH_CA_FILE"):
+            # The same certificate also signs what TLS cannot vouch for: gossip replies.
+            os.environ.setdefault("SHARDMESH_IDENTITY_CERT", str(Path(args.tls_cert).resolve()))
+            os.environ.setdefault("SHARDMESH_IDENTITY_KEY", str(Path(args.tls_key).resolve()))
+    check_exposure(
+        args.bind_host,
+        load_token(),
+        os.getenv("SHARDMESH_CA_FILE"),
+        getattr(args, "open_pool", False),
+        args.advertise_host,
+        getattr(args, "trusted_network", False),
+    )
+    for seed in _seeds(args):  # credentials go to the peers named here, too
+        check_exposure(args.bind_host, load_token(), os.getenv("SHARDMESH_CA_FILE"), getattr(args, "open_pool", False), seed, getattr(args, "trusted_network", False))
+    specs = node_specs(args)
 
     env = os.environ.copy()
     # When ShardMesh is launched directly from a checkout (including an RDP
@@ -416,10 +506,15 @@ def run_node(args: argparse.Namespace) -> int:
             env[variable] = str(Path(getattr(args, option)).resolve())
     output = open_log(getattr(args, "log_file", None))
     extra = {"stdout": output, "stderr": subprocess.STDOUT} if output else {}
-    services = [
-        Service(label, lambda command=command: subprocess.Popen(command, env=env, cwd=code_root, **extra))
-        for label, command in specs
-    ]
+    def make_service(label: str, command: list[str]) -> Service:
+        return Service(label, lambda: subprocess.Popen(command, env=env, cwd=code_root, **extra))
+
+    services = [make_service(label, command) for label, command in specs]
+    keeper = None
+    if not getattr(args, "no_lanes", False) and not getattr(args, "no_control", False):
+        lanes_file = data_folder() / f"lanes-{args.node_id}.json"
+        env["SHARDMESH_LANES_FILE"] = str(lanes_file)
+        keeper = LaneKeeper(args, lanes_file, make_service)
     try:
         print(f"ShardMesh node {args.node_id} contributing:", flush=True)
         for service in services:
@@ -429,9 +524,13 @@ def run_node(args: argparse.Namespace) -> int:
         while True:
             for service in services:
                 service.supervise()
+            if keeper is not None:
+                keeper.supervise()
             time.sleep(2)
     except KeyboardInterrupt:
         return 0
     finally:
+        if keeper is not None:
+            keeper.stop()
         for service in reversed(services):
             service.stop()

@@ -26,3 +26,4 @@ orchestrator-state*.json
 *.gguf
 *.safetensors
 *.log
+/.claude/

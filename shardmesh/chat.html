@@ -46,6 +46,7 @@
       height: 36px; padding: 0 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
     }
     .model-button:hover { border-color: rgba(255, 255, 255, .22); }
+    .model-choice { height: 36px; max-width: 240px; padding: 0 10px; font: inherit; color: inherit; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
     .model-button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .light { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--faint); }
     .light.ready { background: var(--vram); }
@@ -165,6 +166,7 @@
   <header class="bar">
     <div class="wordmark">ShardMesh</div>
     <button class="model-button" id="modelButton" aria-haspopup="dialog"><i class="light" id="light"></i><span id="modelLabel">Choose a model</span></button>
+    <select class="model-choice" id="modelChoice" aria-label="Which running model answers this chat" hidden></select>
     <div class="spacer"></div>
     <button class="quiet" id="newChat">New chat</button>
     <a class="quiet" href="/dashboard">Dashboard</a>
@@ -351,7 +353,7 @@
         const response = await fetch(base + '/v1/chat/completions', {
           method: 'POST', signal: state.abort.signal,
           headers: { 'Content-Type': 'application/json', ...headers() },
-          body: JSON.stringify({ messages: history, stream: true, temperature: Number($('temperature').value), top_p: 0.9, top_k: 40, max_tokens: Number($('maxTokens').value), enable_thinking: $('thinking').checked }),
+          body: JSON.stringify({ model: $('modelChoice').hidden ? undefined : $('modelChoice').value, messages: history, stream: true, temperature: Number($('temperature').value), top_p: 0.9, top_k: 40, max_tokens: Number($('maxTokens').value), enable_thinking: $('thinking').checked }),
         });
         if (!response.ok) { let message = `The request failed with HTTP ${response.status}.`; try { message = (await response.json()).detail; } catch {} throw new Error(message); }
         const reader = response.body.getReader(), decoder = new TextDecoder();
@@ -472,6 +474,17 @@
       const busy = status.status === 'loading', moving = status.status === 'ready' && jobRunning(status);
       $('light').className = `light${moving || busy ? ' busy' : status.status === 'ready' ? ' ready' : ''}`;
       $('modelLabel').textContent = busy ? `Loading ${modelName(status.load_job?.model)}` : status.model && status.status === 'ready' ? modelName(status.model) : 'Choose a model';
+      renderChoice(status);
+    }
+    function renderChoice(status) {
+      const running = [status.status === 'ready' ? status.model : null, ...(status.lanes || []).filter(lane => lane.ready).map(lane => lane.model)].filter(Boolean);
+      const pick = $('modelChoice');
+      pick.hidden = running.length < 2;
+      if (pick.dataset.running === running.join('|')) return;
+      const chosen = pick.value;
+      pick.dataset.running = running.join('|');
+      pick.replaceChildren(...running.map(name => new Option(modelName(name), name)));
+      if (running.includes(chosen)) pick.value = chosen;
     }
 
     let pollTimer = null;

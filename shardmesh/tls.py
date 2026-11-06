@@ -20,6 +20,8 @@ from typing import Any
 PEER: ContextVar[str | None] = ContextVar("shardmesh_peer", default=None)
 # Who a verified node says it is passing a request on for: (name, role).
 BEHALF: ContextVar[tuple[str, str] | None] = ContextVar("shardmesh_behalf", default=None)
+FORWARD_MARK = "x-shardmesh-forwarded"
+BEHALF_HEADER = "x-shardmesh-on-behalf"
 
 
 def client_verify() -> Any:

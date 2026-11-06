@@ -231,6 +231,10 @@ class LoadModelRequest(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
     model_id: str = "distilbert/distilgpt2"
+    # Load beside what is running, in this lane, rather than replacing it.
+    lane: str | None = None
+    lane_gpu_gb: float | None = None
+    lane_ram_gb: float | None = None
     control_model_id: str | None = None
     worker_model_ids: dict[str, str] = Field(default_factory=dict)
     revision: str = "main"

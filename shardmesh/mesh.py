@@ -74,6 +74,8 @@ class ControlMesh:
         self.barred: set[str] = set()
         # The coordinator's latest state, kept by every peer.
         self.replica: dict[str, Any] | None = None
+        self.lanes: dict[str, Any] = {}
+        self.lanes_version = 0
         self.replica_version = 0
 
     @property
@@ -124,6 +126,8 @@ class ControlMesh:
             "peers": sorted(self.alive().values()),
             "replica": self.replica if self.is_leader else None,
             "replica_version": self.replica_version if self.is_leader else 0,
+            "lanes": self.lanes if self.is_leader else None,
+            "lanes_version": self.lanes_version if self.is_leader else 0,
         }
 
     def observe(self, message: dict[str, Any]) -> bool:
@@ -163,6 +167,10 @@ class ControlMesh:
         if replica is not None and sender == self.leader_id and message.get("replica_version", 0) >= self.replica_version:
             self.replica = replica
             self.replica_version = int(message["replica_version"])
+        lanes = message.get("lanes")
+        if isinstance(lanes, dict) and sender == self.leader_id and int(message.get("lanes_version", 0)) >= self.lanes_version:
+            self.lanes = lanes
+            self.lanes_version = int(message["lanes_version"])
         return was_leader and not self.is_leader
 
     def _outranks(self, term: int, candidate: str) -> bool:
@@ -192,6 +200,11 @@ class ControlMesh:
         """Record the coordinator's state for the next round of gossip."""
         self.replica = state
         self.replica_version += 1
+
+    def publish_lanes(self, lanes: dict[str, Any]) -> None:
+        """Record which lanes the pool runs, for the next round of gossip."""
+        self.lanes = lanes
+        self.lanes_version += 1
 
     def learn_term(self, term: int) -> None:
         """Workers remember the highest term, which outlives any control process."""
