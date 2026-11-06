@@ -25,7 +25,7 @@ from typing import Any, Callable, Sequence
 import httpx
 
 from . import __version__
-from .mcp_server import LEGACY_VERSIONS, MODERN_VERSIONS, UNSUPPORTED_VERSION, VERSION_KEY
+from .mcp_server import LEGACY_VERSIONS, MODERN_VERSIONS, SERVER_KEY, UNSUPPORTED_VERSION, VERSION_KEY
 from .toolcalls import without_reasoning
 
 CLIENT_INFO = {"name": "shardmesh-mcp-run", "version": __version__}
@@ -72,18 +72,16 @@ class StdioServer:
     """An MCP server this process started: JSON-RPC, one message per line."""
 
     def __init__(self, command: str, environment: dict[str, str]) -> None:
-        self.command = command
+        parts = split_command(command)
         try:
-            self.process = subprocess.Popen(
-                split_command(command), stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=environment, bufsize=0
-            )
+            self.process = subprocess.Popen(parts, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=environment, bufsize=0)
         except OSError as exc:
             raise ServerError(f"could not start {command!r}: {exc}") from None
         self.lock = threading.Lock()
         self.next_id = 0
         self.waiting: dict[int, queue.Queue[dict[str, Any] | None]] = {}
         self.modern_version: str | None = None
-        self.name = Path(split_command(command)[0]).stem
+        self.name = Path(parts[0]).stem  # until it says what it is called
         threading.Thread(target=self._read, daemon=True).start()
 
     def _read(self) -> None:
@@ -125,24 +123,30 @@ class StdioServer:
         except (OSError, ValueError):
             raise ServerError(f"{self.name} stopped listening") from None
 
-    def request(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
+    def _exchange(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
+        """Send a request and wait for its reply. Raises queue.Empty if none comes in time."""
         with self.lock:
             self.next_id += 1
             number = self.next_id
             box: queue.Queue[dict[str, Any] | None] = queue.Queue(1)
             self.waiting[number] = box
-        if self.modern_version:
-            params = {**params, "_meta": self._meta(self.modern_version)}
         try:
             self._send({"jsonrpc": "2.0", "id": number, "method": method, "params": params})
             reply = box.get(timeout=timeout)
-        except queue.Empty:
-            raise ServerError(f"{self.name} took longer than {timeout:g} seconds over {method}") from None
         finally:
             with self.lock:
                 self.waiting.pop(number, None)
         if reply is None:
             raise ServerError(f"{self.name} stopped while answering")
+        return reply
+
+    def request(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
+        if self.modern_version:
+            params = {**params, "_meta": self._meta(self.modern_version)}
+        try:
+            reply = self._exchange(method, params, timeout)
+        except queue.Empty:
+            raise ServerError(f"{self.name} took longer than {timeout:g} seconds over {method}") from None
         if "error" in reply:
             error = reply["error"]
             raise ToolRefused(str(error.get("message", error)) if isinstance(error, dict) else str(error))
@@ -155,31 +159,19 @@ class StdioServer:
 
     def _probe(self) -> str | None:
         """Ask a server what it speaks, the way the specification says to. None means a legacy server."""
-        with self.lock:
-            self.next_id += 1
-            number = self.next_id
-            box: queue.Queue[dict[str, Any] | None] = queue.Queue(1)
-            self.waiting[number] = box
-        preferred = MODERN_VERSIONS[0]
-        self._send({"jsonrpc": "2.0", "id": number, "method": "server/discover", "params": {"_meta": self._meta(preferred)}})
         try:
-            reply = box.get(timeout=PROBE_SECONDS)
+            reply = self._exchange("server/discover", {"_meta": self._meta(MODERN_VERSIONS[0])}, PROBE_SECONDS)
         except queue.Empty:
             return None
-        finally:
-            with self.lock:
-                self.waiting.pop(number, None)
-        if reply is None:
-            raise ServerError(f"{self.name} stopped as it started")
         error = reply.get("error")
         if isinstance(error, dict) and error.get("code") == UNSUPPORTED_VERSION:
             offered = (error.get("data") or {}).get("supported") or []
         elif isinstance(reply.get("result"), dict):
             offered = reply["result"].get("supportedVersions") or []
+            self.name = str(((reply["result"].get("_meta") or {}).get(SERVER_KEY) or {}).get("name") or self.name)
         else:
             return None
-        common = [version for version in MODERN_VERSIONS if version in offered]
-        return common[0] if common else None
+        return next((version for version in MODERN_VERSIONS if version in offered), None)
 
     def start(self) -> None:
         self.modern_version = self._probe()

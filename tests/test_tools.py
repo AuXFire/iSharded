@@ -572,6 +572,12 @@ def test_a_tool_reply_has_the_openai_shape(mesh):
     assert call["function"] == {"name": "get_weather", "arguments": '{"city": "Paris"}'}
 
 
+def test_the_settled_history_is_rendered_with_the_tools_too():
+    # Without them it would not match the prompt, and no checkpoint could be reused.
+    prompt, history = orchestrator.render_prompts(Scripted(QWEN3), [{"role": "user", "content": "hi"}], None, [WEATHER])
+    assert '"get_weather"' in prompt and '"get_weather"' in history
+
+
 def test_tools_go_through_the_template_and_not_into_the_text(mesh):
     mesh.use(QWEN3, "ok")
     ask(mesh, tools=[WEATHER])

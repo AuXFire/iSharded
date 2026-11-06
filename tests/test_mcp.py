@@ -327,19 +327,30 @@ class Pipes:
         raise AssertionError(f"no reply to {identifier}")
 
 
-def serve_in_thread(pipes: Pipes, transport) -> threading.Thread:
-    async def run():
-        async with httpx.AsyncClient(transport=transport, base_url="http://mesh") as client:
-            await serve_stdio(client, pipes, pipes)
+@pytest.fixture
+def stdio():
+    """Serve over pipes, and always close them, or a failed test would hang the run."""
+    started = []
 
-    thread = threading.Thread(target=lambda: asyncio.run(run()), daemon=True)
-    thread.start()
-    return thread
+    def serve(transport) -> tuple[Pipes, threading.Thread]:
+        pipes = Pipes()
+
+        async def run():
+            async with httpx.AsyncClient(transport=transport, base_url="http://mesh") as client:
+                await serve_stdio(client, pipes, pipes)
+
+        thread = threading.Thread(target=lambda: asyncio.run(run()), daemon=True)
+        thread.start()
+        started.append(pipes)
+        return pipes, thread
+
+    yield serve
+    for pipes in started:
+        pipes.incoming.put(b"")
 
 
-def test_stdio_answers_line_by_line_and_stops_when_the_input_ends():
-    pipes = Pipes()
-    thread = serve_in_thread(pipes, httpx.MockTransport(fake_mesh))
+def test_stdio_answers_line_by_line_and_stops_when_the_input_ends(stdio):
+    pipes, thread = stdio(httpx.MockTransport(fake_mesh))
     pipes.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
     pipes.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
     assert pipes.wait_for(1)["result"]["protocolVersion"] == "2025-06-18"
@@ -369,10 +380,9 @@ class SlowThenFine(httpx.AsyncBaseTransport):
         return fake_mesh(request)
 
 
-def test_a_long_reply_holds_nothing_up_and_can_be_cancelled():
-    pipes = Pipes()
+def test_a_long_reply_holds_nothing_up_and_can_be_cancelled(stdio):
     transport = SlowThenFine()
-    thread = serve_in_thread(pipes, transport)
+    pipes, thread = stdio(transport)
     pipes.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}})
     pipes.wait_for(1)
     pipes.send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "chat", "arguments": {"prompt": "slow"}}})
