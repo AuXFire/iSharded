@@ -200,6 +200,25 @@ def run_load(args: argparse.Namespace) -> int:
             return 1
 
 
+def run_net(args: argparse.Namespace) -> int:
+    from .commons import make_identity, sign_vouch, write_policy
+
+    if args.net_command == "init":
+        name = make_identity(args.dir)
+        write_policy(args.dir, args.joining, args.quorum, args.trust)
+        print(f"This node is {name}. Give that name to anyone who should vouch for it or trust it.")
+        return 0
+    if args.net_command == "vouch":
+        response = httpx.post(args.url.rstrip("/") + "/access/entries", json=sign_vouch(args.dir, args.name), timeout=30.0)
+        print(f"Vouched for {args.name}." if response.status_code < 400 else f"Refused: {response.text}")
+        return 0 if response.status_code < 400 else 1
+    method = httpx.post if args.net_command == "block" else httpx.delete
+    headers = {"Authorization": f"Bearer {args.pool_token}"} if args.pool_token else {}
+    response = method(f"{args.url.rstrip('/')}/admin/nodes/{args.name}/revoke", headers=headers, timeout=30.0)
+    print(f"Done: {args.net_command} {args.name}." if response.status_code < 400 else f"Refused: {response.text}")
+    return 0 if response.status_code < 400 else 1
+
+
 def run_lane(args: argparse.Namespace) -> int:
     base = args.url.rstrip("/")
     headers = {"Authorization": f"Bearer {args.pool_token}"} if args.pool_token else {}
@@ -400,6 +419,25 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--url", default="http://127.0.0.1:8000", help="any node's control address")
         command.add_argument("--token", "--pool-token", dest="pool_token", default=load_token(), help="an admin key; defaults to this machine's pool token")
         command.set_defaults(handler=run_lane)
+    net = subparsers.add_parser("net", help="take part in a network nobody owns")
+    net_commands = net.add_subparsers(dest="net_command", required=True)
+    start = net_commands.add_parser("init", help="make this node's identity, and choose who it accepts")
+    start.add_argument("--dir", required=True, help="where this node keeps its identity")
+    start.add_argument("--joining", choices=["open", "vouched"], default="open", help="accept anyone, or only nodes others vouched for")
+    start.add_argument("--quorum", type=int, default=1, help="vouches a node needs from nodes this one accepts")
+    start.add_argument("--trust", action="append", default=[], help="a node to accept from the start; repeatable")
+    start.set_defaults(handler=run_net)
+    vouch = net_commands.add_parser("vouch", help="say this node accepts another, for nodes that accept this one")
+    vouch.add_argument("name", help="the node to vouch for")
+    vouch.add_argument("--dir", required=True, help="this node's identity folder")
+    vouch.add_argument("--url", default="http://127.0.0.1:8000", help="any node's control address")
+    vouch.set_defaults(handler=run_net)
+    for name, text in (("block", "stop this node dealing with another; only this node is affected"), ("unblock", "undo a block on this node")):
+        change = net_commands.add_parser(name, help=text)
+        change.add_argument("name", help="the node to block or unblock")
+        change.add_argument("--url", default="http://127.0.0.1:8000", help="this node's control address")
+        change.add_argument("--token", "--pool-token", dest="pool_token", default=load_token(), help="this node's admin key")
+        change.set_defaults(handler=run_net)
     node = subparsers.add_parser("node", help="contribute CPU, RAM, GPU, or any combination")
     add_node_arguments(node)
     node.set_defaults(handler=run_node)

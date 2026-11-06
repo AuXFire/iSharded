@@ -349,6 +349,7 @@ def test_workers_refuse_orders_from_an_older_term(monkeypatch):
 
     runtime = worker.WorkerRuntime.__new__(worker.WorkerRuntime)
     runtime.roles = {"inference"}
+    runtime.host_models = []
     runtime.worker_id = "w"
     runtime.term = 5
     stage = StageAssignment(worker_id="w", url="http://w", start_layer=0, end_layer=1)

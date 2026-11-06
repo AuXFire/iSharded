@@ -265,7 +265,7 @@ f6.text(490, 438, "good for one node, 2 minutes", "lbl halo")
 
 # ---------------------------------------------------------------- 7. owned or ownerless
 f7 = Fig("f7", 960, 356, "The difference between the two kinds of network is the owner and its signing arrows, which disappear in the ownerless version.")
-for x0, title, tag, kind in ((16, "Owned", "built", "tag-built"), (492, "Ownerless", "proposed, not built", "tag-plan")):
+for x0, title, tag, kind in ((16, "Owned", "built", "tag-built"), (492, "Ownerless", "built", "tag-built")):
     f7.add(f'<rect x="{x0}" y="10" width="452" height="336" rx="11" class="node"/>')
     f7.text(x0 + 16, 34, title, "ttl big", "start")
     f7.text(x0 + 436, 34, tag, f"ttl {kind}", "end")
@@ -383,7 +383,7 @@ PAGE = f"""<title>How ShardMesh Works</title>
 <header>
   <h1>How ShardMesh Works</h1>
   <p class="lead">ShardMesh runs one language model across several machines. Each machine holds some of the model's layers, and any machine can answer a request. No server is in charge.</p>
-  <p class="status">Diagrams 1 to 6 show what is built and tested on a two-machine pool. The right half of diagram 7 is a proposal. A mesh runs one model at a time today.</p>
+  <p class="status">These diagrams show what is built. Measured figures come from the test pool, which is two machines so far.</p>
   <div class="key" aria-label="Line colors">
     <span><i class="k-route"></i>A reply's data</span>
     <span><i class="k-mesh"></i>Control messages</span>
@@ -403,7 +403,7 @@ PAGE = f"""<title>How ShardMesh Works</title>
 <section id="structure">
   <h2>1. Two networks in one</h2>
   <p>Every node runs the same software. Control messages spread between all nodes, while a reply's data runs in a line through the stages.</p>
-  {figure(f1, "Layers are split by what each machine can hold, so one model can span a GPU on one node and RAM and disk on another. The test pool has two nodes: a laptop RTX 3060 with layers 0 to 7, and a desktop RX 7900 XT with layers 8 to 63, over Tailscale. Workers check in with every control plane, so any of them can take over.")}
+  {figure(f1, "Layers are split by what each machine can hold, so one model can span a GPU on one node and RAM and disk on another. On the test pool, a laptop RTX 3060 holds layers 0 to 7 and a desktop RX 7900 XT holds layers 8 to 63, over Tailscale. Workers check in with every control plane, so any of them can take over.")}
 </section>
 
 <section id="reply">
@@ -427,7 +427,7 @@ PAGE = f"""<title>How ShardMesh Works</title>
 <section id="failures">
   <h2>5. What happens when something fails</h2>
   <p>The rule is that a failure must not drop a reply, and weights move only when they must.</p>
-  {figure(f5, "Times are measured on the two-machine pool, except the stage crash, measured on a small model. In the last soak test, 405 replies finished and none were lost while processes were killed on both machines for 21 minutes.")}
+  {figure(f5, "Times are measured on the test pool, except the stage crash, measured on a small model. In the last soak test, 405 replies finished and none were lost while processes were killed on both machines for 21 minutes.")}
 </section>
 
 <section id="joining">
@@ -439,13 +439,13 @@ PAGE = f"""<title>How ShardMesh Works</title>
 <section id="ownership">
   <h2>7. Owned or ownerless</h2>
   <p>An owned network runs without a central server, but one person decides who belongs. Removing the owner removes the signing arrows, and everything they did has to be done another way.</p>
-  {figure(f7, "Both kinds would work for private or public networks. The left side is built. The right side is a proposal.")}
+  {figure(f7, "Both kinds work for private or public networks.")}
   <div class="table"><table>
     <thead><tr><th>Question</th><th>Owned</th><th>Ownerless</th></tr></thead>
     <tbody>
-      <tr><td>Who lets a node in?</td><td>The owner approves it</td><td>Open, or existing members vouch for it</td></tr>
-      <tr><td>Who removes a node?</td><td>The owner, for everyone</td><td>Nobody can. Each node keeps its own blocklist</td></tr>
-      <tr><td>Who picks the models?</td><td>The owner, or anyone with an admin key</td><td>Each node chooses what it hosts, and users pick from what's running</td></tr>
+      <tr><td>Who lets a node in?</td><td>The owner approves it</td><td>Each node decides: anyone, or nodes vouched for by those it already accepts</td></tr>
+      <tr><td>Who removes a node?</td><td>The owner, for everyone</td><td>Nobody can. Each node blocks whoever it chooses, for itself</td></tr>
+      <tr><td>Who picks the models?</td><td>The owner, or anyone with an admin key</td><td>Anyone can propose one beside what runs. Each node chooses what it hosts, and users pick from what's running</td></tr>
       <tr><td>What is still unsolved?</td><td>A member can read prompts and return wrong answers</td><td>The same, plus one person could run thousands of nodes</td></tr>
     </tbody>
   </table></div>

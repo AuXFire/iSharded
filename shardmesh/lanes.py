@@ -20,7 +20,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
-from .access import node_of
+from .access import ROLE_MEMBER, node_of
 
 LANE_PORT_STEP = 1000
 MAX_LANES = 7
@@ -60,7 +60,7 @@ def clean_lanes(raw: Any) -> dict[str, dict[str, Any]]:
         except (AttributeError, KeyError, TypeError, ValueError):
             continue
         if LANE_NAME.fullmatch(str(name)) and 1 <= slot <= MAX_LANES:
-            lanes[str(name)] = {"slot": slot, "budgets": budgets}
+            lanes[str(name)] = {"slot": slot, "budgets": budgets, "by": str(lane.get("by", ""))}
     return lanes
 
 
@@ -122,6 +122,11 @@ def lane_budgets(
             "ram_gb": round(ram if ram_gb is None else min(ram, ram_gb), 2),
         }
     return budgets
+
+
+def proposer(caller: Any, this_node: str) -> str:
+    """The node asking. A member's name starts with theirs, and an admin here means this one."""
+    return caller.name.partition("/")[0] if caller.role == ROLE_MEMBER else this_node
 
 
 class LaneDoor:
@@ -257,7 +262,7 @@ class LaneDoor:
             background=BackgroundTask(response.aclose),
         )
 
-    def create(self, name: str, gpu_gb: float | None, ram_gb: float | None) -> None:
+    def create(self, name: str, gpu_gb: float | None, ram_gb: float | None, by: str = "") -> None:
         from fastapi import HTTPException
 
         if not self.active:
@@ -274,7 +279,7 @@ class LaneDoor:
         budgets = lane_budgets(spare_budgets(self.runtime.workers), lanes, gpu_gb, ram_gb)
         if not any(budget["gpu_gb"] or budget["ram_gb"] for budget in budgets.values()):
             raise HTTPException(status_code=409, detail="no node has memory left under the limits its owner set")
-        lanes[name] = {"slot": slot, "budgets": budgets}
+        lanes[name] = {"slot": slot, "budgets": budgets, "by": by}
         mesh.publish_lanes(lanes)
         self.sync()
         self.runtime.add_event("pool", "Lane created", f"{name}: {budgets}")
@@ -302,7 +307,7 @@ class LaneDoor:
 
     async def load(self, body: Any, caller: Any) -> dict[str, Any]:
         name = body.lane
-        self.create(name, body.lane_gpu_gb, body.lane_ram_gb)
+        self.create(name, body.lane_gpu_gb, body.lane_ram_gb, proposer(caller, self.runtime.mesh.node_id))
         self.problems.pop(name, None)
         payload = body.model_dump(exclude_none=True, exclude={"lane", "lane_gpu_gb", "lane_ram_gb"})
         payload["wait"] = False
@@ -317,13 +322,15 @@ class LaneDoor:
         self.runtime.spawn(start())
         return {"status": "started", "lane": name}
 
-    def remove(self, name: str) -> None:
+    def remove(self, name: str, caller: Any) -> None:
         from fastapi import HTTPException
 
         mesh = self.runtime.mesh
         lanes = clean_lanes(mesh.lanes) if self.active else {}
         if name not in lanes:
             raise HTTPException(status_code=404, detail=f"no lane named {name}")
+        if caller.role == ROLE_MEMBER and lanes[name]["by"] != proposer(caller, mesh.node_id):
+            raise HTTPException(status_code=403, detail="only the node that proposed a lane can remove it")
         del lanes[name]
         mesh.publish_lanes(lanes)
         self.sync()

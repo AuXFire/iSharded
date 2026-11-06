@@ -84,7 +84,7 @@ This puts it back, and stops a move still under way. A cordon is shared by every
 
 A cordon is refused if the pool could not hold the model without that node, and if it would transfer more than 2 GiB between nodes, which can take a long time on a slow link. `--force` allows the large transfer.
 
-On the two-machine pool, cordoning the laptop during a reply with Qwen3.6-27B: the reply finished with a longest pause of 0.67 s, the model was on the desktop alone 26 s later, and uncordoning restored the split in 21 s.
+On the test pool, cordoning the laptop during a reply with Qwen3.6-27B: the reply finished with a longest pause of 0.67 s, the model was on the desktop alone 26 s later, and uncordoning restored the split in 21 s.
 
 ### Split networks
 
@@ -107,9 +107,15 @@ After healing, the pool stays on the layout the winning side settled on if the m
 
 Failures, repairs, and leadership changes also go to each node's output with timestamps, so the reason for a failure survives the process that saw it. Use `--log-file` to keep it. A log over 64 MiB is set aside as `.1` when the node starts, so restart nodes now and then or rotate the file yourself.
 
+## Several models
+
+Each [lane](../README.md#several-models-at-once) is a full control plane and set of workers, so everything here applies to a lane as it does to the main route, with two differences. Its ports are 1000 per lane above the node's own, so a firewall between nodes must allow them. Cordons pass to every lane, but `load`, `plan`, and rebalancing act on one route at a time.
+
+A lane's memory share is fixed when it starts, from what each node had spare. To change it, remove the lane and load it again.
+
 ## Soak test
 
-The last run: 21 minutes on the two-machine pool with Qwen3.6-27B, four conversations running continuously with merged passes on, and a fault every two to three minutes. Faults were stage processes, workers, and control planes killed on both machines, cordons, and malformed or oversized requests.
+The last run: 21 minutes on the test pool with Qwen3.6-27B, four conversations running continuously with merged passes on, and a fault every two to three minutes. Faults were stage processes, workers, and control planes killed on both machines, cordons, and malformed or oversized requests.
 
 | | |
 |---|---|

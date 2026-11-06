@@ -72,7 +72,7 @@ def test_gpu_is_preferred_cpu_is_standby_and_memory_is_service() -> None:
 def test_worker_model_sources_can_differ_from_logical_model_id() -> None:
     target = ModelTarget.__new__(ModelTarget)
     target.model_id = "distilbert/distilgpt2"
-    target.worker_model_ids = {"local-gpu": r"D:\project\models\distilgpt2"}
+    target.worker_model_ids = {"local-gpu": r"D:\models\distilgpt2"}
 
     assert target.source_for("local-gpu").endswith("models\\distilgpt2")
     assert target.source_for("remote-rocm") == "distilbert/distilgpt2"

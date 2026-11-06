@@ -10,7 +10,24 @@ A node in the route sees prompts and replies in plain text, as hidden states or 
 
 ShardMesh is decentralized in how it runs, not in who owns it. No server is special, any node can coordinate, and losing any machine loses nothing but what it was running. But a pool has an owner: whoever holds the authority key, or the shared token in a pool without one. That person decides who joins, who is thrown out, and who may load models.
 
-This suits a pool whose members trust each other. It is not a public mesh. A public mesh, where anyone can join, would need answers ShardMesh does not have today: a way to detect wrong results, a way to stop one person running thousands of nodes, and a clear warning that node operators can read prompts.
+This suits a pool whose members trust each other. It is not a public mesh. A public mesh, where anyone can join, would need answers ShardMesh does not have today: a way to detect wrong results, a way to stop one person running thousands of nodes, and a clear warning that node operators can read prompts. The next section covers what is built for that, and what stays unanswered.
+
+## A network nobody owns
+
+In this kind of network there is no pool authority and no owner. [The README shows how to run one](../README.md#a-network-nobody-owns). What changes:
+
+- A node makes its own key, and its name is a hash of that key. A certificate is accepted only if it signed itself and carries the name its key gives, so nobody can claim another node's name.
+- Each node decides who it accepts: anyone, or nodes vouched for by nodes it already accepts, starting from itself and whoever it trusts. Nodes can disagree, and nothing makes them agree.
+- Gossip carries signed vouches and nothing else. Keys, blocks, and cordons never travel between nodes, and a signature on any other kind of entry counts for nothing.
+- An operator's key is an admin of their own node only. To everyone else, including on the coordinator's own node, they are a member: they can propose a model beside what runs, remove a lane their node proposed, and take their own node out.
+- A block is one node's own choice. Nobody can remove a node for everyone, which also means a bad node stays in the network for anyone who has not blocked it.
+
+What this does not give you:
+
+- Identities cost nothing. With open joining one person can run many nodes. With vouched joining, the protection is only as good as the vouchers.
+- A name is a hash, so someone can grind out a low one to win coordination. A coordinator can stall a route, or place work badly. It cannot make a node host a model that node refuses, or change who it accepts.
+- A member in the route can read prompts and return wrong answers, as in any pool, and here you did not choose that member.
+- Traffic is not encrypted: certificates here prove names, not privacy. Run it over a network that encrypts, such as Tailscale.
 
 ## Who can do what
 
@@ -59,7 +76,7 @@ With a pool authority the pool token counts for nothing, on control planes and w
 
 Many antivirus products intercept TLS on every port, even on loopback, and replace the certificates in it. Nodes only trust the pool authority, so this fails closed: mutual TLS stops working rather than becoming insecure. AVG does this on the development laptop. There are three ways to run such a node:
 
-- Use Tailscale and tickets. Nothing depends on TLS, so antivirus has nothing to intercept. This is what the two-machine test pool runs, with AVG on.
+- Use Tailscale and tickets. Nothing depends on TLS, so antivirus has nothing to intercept. This is what the test pool runs, with antivirus on.
 - Exclude the pool's ports or `python.exe` from HTTPS scanning, and use mutual TLS.
 - On a private network, use tickets with `--trusted-network`, accepting that traffic is unencrypted.
 

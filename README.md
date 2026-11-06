@@ -1,10 +1,10 @@
 # ShardMesh
 
-ShardMesh runs one language model across several computers, using whatever memory each one has: VRAM, unified memory, system RAM, or disk. A model too big for any one of them can run across all of them. There is no central server. Every node runs the same software, the nodes elect one of themselves to coordinate, and any node can serve the API.
+ShardMesh runs language models across a mesh of many computers, using whatever memory each one has: VRAM, unified memory, system RAM, or disk. A model too big for any one of them can run across all of them. There is no central server. Every node runs the same software, the nodes elect one of themselves to coordinate, and any node can serve the API.
 
 It works on a closed network, a LAN, across VLANs, over Tailscale, or between remote machines with TLS. The API follows OpenAI's, so existing clients only need a new URL and key.
 
-This is execution sharding, not simulated work distribution: each token really crosses every machine in the route. It has been tested on two machines. Its security has been reviewed by AI only, not by a person. [Current limits](#current-limits) says what that means for you.
+This is execution sharding, not simulated work distribution: each token really crosses every machine in the route. It is built to grow to many nodes. So far it has been tested on two machines, and [Scaling to many nodes](#scaling-to-many-nodes) separates what is proven from what comes next. Its security has been reviewed by AI only, not by a person. [Current limits](#current-limits) says what that means for you.
 
 ## Contents
 
@@ -12,6 +12,7 @@ This is execution sharding, not simulated work distribution: each token really c
 - [Install](#install)
 - [Quick start](#quick-start)
 - [How it works](#how-it-works)
+- [Scaling to many nodes](#scaling-to-many-nodes)
 - [Using a pool](#using-a-pool)
 - [Recommended configuration](#recommended-configuration)
 - [Command reference](#command-reference)
@@ -87,7 +88,7 @@ python -m shardmesh demo --workers 2 --model .smoke-model --device cpu
 
 That model is random, so its output means nothing. It proves that sharded and unsharded runs agree.
 
-### Two machines on Tailscale
+### Several machines on Tailscale
 
 Tailscale encrypts the link, so a shared token is enough here. On the first machine, make the pool's credentials:
 
@@ -101,7 +102,7 @@ Copy `pool-secrets/pool.token` to `%LOCALAPPDATA%\ShardMesh\pool.token` on each 
 shardmesh node --node-id node-a --gguf-dir D:\models --weights-ram-gb auto
 ```
 
-It prints the address it advertises, and its control plane listens on port 8209. Start the second node, naming the first:
+It prints the address it advertises, and its control plane listens on port 8209. Start each further node the same way, naming any node already running:
 
 ```bash
 shardmesh node --node-id node-b --join http://100.64.0.1:8209 --weights-ram-gb auto
@@ -159,7 +160,7 @@ With certificates, the pool token stops working. Use your admin key, in the chat
 
 The diagrams use the same line colors throughout: solid blue-green for a reply's data, dashed violet for control messages, and pink for anything signed by the owner.
 
-The first six diagrams show what is built and tested on a two-machine pool. The right half of the last one is a proposal.
+These diagrams show what is built. Measured figures come from the test pool, which is two machines so far.
 
 ### Two networks in one
 
@@ -170,7 +171,7 @@ Every node runs the same software. Control messages spread between all nodes, wh
   <img alt="Three nodes. Control planes gossip with each other, while a reply's data runs in a line through the workers." src="docs/diagrams/structure-light.png">
 </picture>
 
-Layers are split by what each machine can hold, so one model can span a GPU on one node and RAM and disk on another. The test pool has two nodes: a laptop RTX 3060 with layers 0 to 7, and a desktop RX 7900 XT with layers 8 to 63, over Tailscale. Workers check in with every control plane, so any of them can take over.
+Layers are split by what each machine can hold, so one model can span a GPU on one node and RAM and disk on another. On the test pool, a laptop RTX 3060 holds layers 0 to 7 and a desktop RX 7900 XT holds layers 8 to 63, over Tailscale. Workers check in with every control plane, so any of them can take over.
 
 ### One reply, from message to text
 
@@ -214,7 +215,7 @@ The rule is that a failure must not drop a reply, and weights move only when the
   <img alt="Seven kinds of failure keep the reply going. Only losing the node you are connected to restarts it." src="docs/diagrams/failures-light.png">
 </picture>
 
-Times are measured on the two-machine pool, except the stage crash, measured on a small model. In the last soak test, 405 replies finished and none were lost while processes were killed on both machines for 21 minutes. [Operating ShardMesh](docs/OPERATIONS.md) has the details.
+Times are measured on the test pool, except the stage crash, measured on a small model. In the last soak test, 405 replies finished and none were lost while processes were killed on both machines for 21 minutes. [Operating ShardMesh](docs/OPERATIONS.md) has the details.
 
 ### Joining an owned network
 
@@ -229,21 +230,48 @@ Asking grants nothing. The new node's private key never leaves it, and the owner
 
 ### Owned or ownerless
 
-An owned network runs without a central server, but one person decides who belongs. Removing the owner removes the signing arrows, and everything they did has to be done another way. Both kinds would work for private or public networks.
+An owned network runs without a central server, but one person decides who belongs. Removing the owner removes the signing arrows, and everything they did is done another way. Both kinds work for private or public networks.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/ownership-dark.png">
   <img alt="The difference between the two kinds of network is the owner and its signing arrows, which disappear in the ownerless version." src="docs/diagrams/ownership-light.png">
 </picture>
 
-| Question | Owned (built) | Ownerless (proposed, not built) |
+| Question | Owned | Ownerless |
 |---|---|---|
-| Who lets a node in? | The owner approves it | Open, or existing members vouch for it |
-| Who removes a node? | The owner, for everyone | Nobody can. Each node keeps its own blocklist |
-| Who picks the models? | The owner, or anyone with an admin key | Each node chooses what it hosts, and users pick from what's running |
+| Who lets a node in? | The owner approves it | Each node decides: anyone, or nodes vouched for by those it already accepts |
+| Who removes a node? | The owner, for everyone | Nobody can. Each node blocks whoever it chooses, for itself |
+| Who picks the models? | The owner, or anyone with an admin key | Anyone can propose one beside what runs. Each node chooses what it hosts, and users pick from what's running |
 | What is still unsolved? | A member can read prompts and return wrong answers | The same, plus one person could run thousands of nodes |
 
-To redraw these diagrams, run `python scripts/build_diagrams.py`.
+See [A network nobody owns](#a-network-nobody-owns) to run one. To redraw these diagrams, run `python scripts/build_diagrams.py`.
+
+## Scaling to many nodes
+
+ShardMesh is meant to run on many machines, not two. Two is only how many it has been tested on so far. Every node runs the same software, any node can coordinate, and a new node joins by naming any node already running, so nothing in how a mesh forms stops at two.
+
+What more nodes give you:
+
+| More nodes give you | How | Status |
+|---|---|---|
+| Bigger models | Each node holds only its share, so the limit is the mesh's total memory | Built |
+| More models at once | Each model runs in its own [lane](#several-models-at-once) | Built |
+| Survival | Any node can coordinate, serve the API, or take over a lost stage | Built, tested on two machines |
+| More replies at once | Several routes for one model, across separate groups of nodes | Next |
+| A faster single reply | It does not: every token crosses every stage, so a longer route is a slower one | Keep routes short with `--placement compact` |
+
+So a large mesh should run many short routes side by side, not one long one. That is the direction, and these are the parts that stop it getting there today:
+
+| What stops it | Today | Where it needs to go |
+|---|---|---|
+| Gossip | Every node contacts every other every 3 s, so messages grow with the square of the node count | Contact a few peers per round, with liveness spreading through them |
+| Worker check-ins | Each worker checks in with every control plane every 5 s | Check in with a few, and let gossip carry the rest |
+| Routes | One route per lane, so one model's capacity is one route's | Several routes per model, with requests spread across them |
+| Placement | A fixed cost per hop | Use measured latency between nodes, so a route stays among close neighbours. Each node already measures this |
+| Splits | Each side of a split elects a coordinator | With three or more nodes, let only the majority side coordinate |
+| Memory | A lane's share is fixed when it starts | Share memory between lanes as load changes |
+
+None of this has been measured past two machines, so the first milestone is a real mesh of more. If you have spare machines, running a node is the most useful test you can give it.
 
 ## Using a pool
 
@@ -325,6 +353,39 @@ shardmesh lane remove small --url http://node-a:8669
 
 Removing a lane stops its processes on every node and frees their memory. Lanes come back after a restart, like the main model.
 
+### A network nobody owns
+
+Each node makes its own identity. Its name comes from its key, so nobody hands names out and nobody can take one:
+
+```bash
+shardmesh net init --dir ./identity --joining vouched --trust n-1a2b3c4d5e6f70819203
+```
+
+`--joining open` accepts anyone. `--joining vouched` accepts only nodes vouched for by nodes this one already accepts, starting from itself and whoever `--trust` names, and `--quorum` sets how many vouches it takes. Each node works this out for itself, so two nodes can disagree and neither can overrule the other.
+
+Give your node's name to someone already in the network, and have them vouch for it:
+
+```bash
+shardmesh net vouch n-9f8e7d6c5b4a39281706 --dir ./identity --url http://127.0.0.1:8009
+```
+
+Start the node with `--ownerless ./identity`. Make yourself a key for your own node with `shardmesh key create me --role admin --file keys.json`, and pass `--keys-file keys.json`. That key is an admin of your node and means nothing anywhere else. Your users' keys live on your node too, and you set their limits.
+
+What an operator can do on the rest of the network is propose:
+
+| Action | Your node | The rest of the network |
+|---|---|---|
+| Load the first model | Yes | Yes, anyone can |
+| Replace what is running | | Nobody can |
+| Load a model beside it | Yes, with `--lane` | Yes, and each node hosts it only if its owner allows |
+| Remove a lane | Yes, if your node proposed it | Nobody else can |
+| Take a node out | Your own | Nobody can take out another's |
+| Block a node | `shardmesh net block NAME`, for your node only | Nobody can block for anyone else |
+
+`--host-models` lists the models your node will host, as patterns such as `*Qwen3*`, in any kind of network. A worker refuses anything else, whatever a coordinator tells it.
+
+Nodes still pick a coordinator by lowest name, to keep a route in order. It can place work and hold a route up, but it cannot make a node host anything or change who that node accepts. Read [Current limits](#current-limits) before opening one to strangers.
+
 ## Recommended configuration
 
 ### Start from your situation
@@ -364,7 +425,7 @@ The entry node also carries the draft model, about 1.7 GiB of VRAM for the defau
 | `--placement` | Leave at `spread` | `compact` may skip workers, which only helps when a model fits on fewer of them |
 | `--hashes` | Use it when any node or mirror is less than fully trusted | Every node then checks every unit |
 
-Measured on the two-machine pool with Qwen3.6-27B Q4_K_M, total tokens per second across all conversations, at `--parallel 4`:
+Measured on the test pool with Qwen3.6-27B Q4_K_M, total tokens per second across all conversations, at `--parallel 4`:
 
 | Conversations at once | No draft, merged passes | With a draft |
 |---:|---:|---:|
@@ -384,16 +445,18 @@ Use wired links if you can: every token crosses every stage, so a pass costs at 
 The test pool: a laptop with a 6 GB RTX 3060 and a desktop with a 20 GB RX 7900 XT, over Tailscale, running Qwen3.6-27B Q4_K_M. The planner gave the laptop layers 0 to 7 and the desktop layers 8 to 63.
 
 ```bash
-shardmesh node --node-id node-a --join http://100.64.0.12:8300 --control-port 8000 --gpu-device cuda --gpu-memory-gb 4.5 --cpu-threads 4 --weights-ram-gb 6 --cache-dir D:\isharded-cache --ram-budget-gb 0.5 --gguf-dir I:\models --log-file D:\isharded-cache\node.log --ca-file ca.pem --identity-cert node-a.pem --identity-key node-a.key
+shardmesh node --node-id laptop --join http://100.64.0.2:8300 --control-port 8000 --gpu-device cuda --gpu-memory-gb 4.5 --cpu-threads 4 --weights-ram-gb 6 --cache-dir D:\shardmesh-cache --ram-budget-gb 0.5 --gguf-dir D:\models --log-file D:\shardmesh-cache\node.log --ca-file ca.pem --identity-cert laptop.pem --identity-key laptop.key
 ```
 
 ```bash
-shardmesh node --node-id node-rocm --join http://100.64.0.11:8000 --control-port 8300 --base-port 8311 --gpu-memory-gb 16 --cpu-threads 8 --weights-ram-gb auto --gguf-dir J:\models --ca-file ca.pem --identity-cert node-rocm.pem --identity-key node-rocm.key
+shardmesh node --node-id desktop --join http://100.64.0.1:8000 --control-port 8300 --base-port 8311 --gpu-memory-gb 16 --cpu-threads 8 --weights-ram-gb auto --gguf-dir D:\models --ca-file ca.pem --identity-cert desktop.pem --identity-key desktop.key
 ```
 
 ```bash
-shardmesh load lmstudio-community/Qwen3.6-27B-GGUF:Qwen3.6-27B-Q4_K_M.gguf --url http://100.64.0.12:8300 --context-tokens 8192 --parallel 2 --token YOUR_ADMIN_KEY
+shardmesh load lmstudio-community/Qwen3.6-27B-GGUF:Qwen3.6-27B-Q4_K_M.gguf --url http://100.64.0.2:8300 --context-tokens 8192 --parallel 2 --token YOUR_ADMIN_KEY
 ```
+
+A third node and every one after it joins the same way, with `--join` naming any node already running.
 
 ## Command reference
 
@@ -478,6 +541,8 @@ Other:
 | `--log-file` | None | Write this node's output here. Over 64 MiB, the last one is kept as `.1` at the next start |
 | `--no-local-copy` | Off | Run workers from a network path as it is, instead of copying the code to local disk |
 | `--no-lanes` | Off | Host only the main model here, never one loaded with `load --lane` |
+| `--host-models` | Any | Comma-separated patterns such as `*Qwen3*`. Host only models that match |
+| `--ownerless` | Off | Join a network nobody owns, using the identity folder from `shardmesh net init` |
 
 A node contributes whatever you give it. With a GPU and weight memory, one worker spans them all. With no GPU, `--cpu-threads` or a weight budget adds a CPU worker. `--ram-budget-gb` adds a memory worker on the next port. A node that contributes nothing is refused.
 
@@ -506,6 +571,17 @@ Loads a model on a running pool and shows progress. `model` is any [model id](#l
 ### shardmesh lane
 
 `shardmesh lane list` shows the pool's lanes, and `shardmesh lane remove NAME` stops one and frees its memory on every node. Both take `--url` and `--token` (`--pool-token`), as `load` does.
+
+### shardmesh net
+
+For a [network nobody owns](#a-network-nobody-owns).
+
+| Command | What it does |
+|---|---|
+| `shardmesh net init --dir DIR` | Make this node's identity. `--joining` is `open` or `vouched`, `--quorum` is the vouches a node needs, and `--trust NAME` accepts a node from the start |
+| `shardmesh net vouch NAME --dir DIR --url URL` | Say this node accepts another |
+| `shardmesh net block NAME --url URL --token KEY` | Stop this node dealing with another. Only this node is affected |
+| `shardmesh net unblock NAME --url URL --token KEY` | Undo that |
 
 ### shardmesh cordon and uncordon
 
@@ -624,6 +700,8 @@ A flag takes priority over its variable.
 | `SHARDMESH_GPU_MEMORY_GB`, `SHARDMESH_RAM_BUDGET_GB` | `--gpu-memory-gb`, `--ram-budget-gb` |
 | `SHARDMESH_CACHE_DIR`, `SHARDMESH_LLAMA_DIR` | `--cache-dir`, `--llama-dir` |
 | `SHARDMESH_LANE`, `SHARDMESH_LANES_FILE` | Set by `shardmesh node`: which lane a process is, and where a node keeps the lanes it should run |
+| `SHARDMESH_OWNERLESS` | `--ownerless` |
+| `SHARDMESH_HOST_MODELS` | `--host-models` |
 | `SHARDMESH_MODEL_DIRS` | `--model-dir`, separated by the system's path separator |
 | `SHARDMESH_REUSE_CACHED`, `SHARDMESH_PEER_FETCH` | Set to `0` for the control plane's `--no-reuse-cached`, `--no-peer-fetch` |
 | `SHARDMESH_HOST_ID` | Which physical machine a worker is on. Defaults to the computer name, so workers sharing a host do not count its RAM twice |
@@ -651,6 +729,8 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `POST` | `/admin/load` | Admin key | Load a model |
 | `POST` | `/admin/load/cancel` | Admin key | Stop a load. Finished units stay cached |
 | `DELETE` | `/admin/lanes/{name}` | Admin key | Stop a lane and free its memory on every node |
+| `GET` | `/admin/inventory` | User key | Each node's system, disks, GPU temperature and power, load, battery, and round trip from this node, where the machine reports them |
+| `DELETE` | `/admin/nodes/{name}/revoke` | Admin key | In a network nobody owns, undo this node's block on another |
 | `POST` | `/admin/rebalance` | Admin key | Reconsider all live workers and apply a new layout |
 | `POST` | `/admin/nodes/{name}/cordon` | Admin key | Move a node's share elsewhere. `?force=true` allows a large transfer |
 | `POST` | `/admin/nodes/{name}/uncordon` | Admin key | Put a node back in service |
@@ -949,7 +1029,7 @@ Qwen3.6-27B Q4_K_M, split across an RX 7900 XT desktop and an RTX 3060 laptop, b
 | Both nodes, ShardMesh with a draft, code | 33 |
 | Both nodes, ShardMesh with a draft, chat page settings, four-turn chat | 21.6 |
 
-Models that need or suit the split, on the same two machines:
+Models that need or suit the split, on the same test pool:
 
 | Model | Placement | Tokens per second |
 |---|---|---:|
@@ -981,7 +1061,7 @@ Adapter tests compare every family with the reference `transformers` implementat
 | `scripts/build_diagrams.py` | Redraws the diagrams in this file |
 | `scripts/ci_local.sh` | Runs the tests from a clean clone |
 | `scripts/install_node_task.ps1` | Starts a node at boot on Windows |
-| `scripts/launch_lan_node_55.py`, `scripts/launch_lan_node_55_rocm.py`, `scripts/bootstrap_remote_node_55.py`, `scripts/bootstrap_remote_rocm_node_55.py` | Launchers for the test pool, as examples |
+| `scripts/launch_lan_node_55.py`, `scripts/launch_lan_node_55_rocm.py`, `scripts/bootstrap_remote_node_55.py`, `scripts/bootstrap_remote_rocm_node_55.py` | Example launchers. They read `SHARDMESH_NODE_ID`, `SHARDMESH_JOIN`, `SHARDMESH_ADVERTISE_HOST`, and `SHARDMESH_GGUF_DIR` |
 
 | Code | What it holds |
 |---|---|
@@ -998,9 +1078,10 @@ Adapter tests compare every family with the reference `transformers` implementat
 
 Trust and status:
 
-- Two machines is the most this has run on. The longest test ran under an hour. No human has audited it, and reviews by AI do not show it is free of flaws.
+- Two machines is the most this has run on, so everything about larger meshes is design, not measurement. See [Scaling to many nodes](#scaling-to-many-nodes). The longest test ran under an hour. No human has audited it, and reviews by AI do not show it is free of flaws.
 - A node in the route can read prompts and return wrong answers, and nothing detects that. Certificates limit who is in a pool. They do not make a hostile member safe.
-- An owned network has an owner. The ownerless version in the diagrams is a proposal, and is not built.
+- An owned network has an owner.
+- A network nobody owns has run on three processes on one machine, not between strangers. Identities are free, so `--joining open` lets one person run many nodes, and a low name can be ground out to win coordination. A coordinator can stall a route. Traffic is not encrypted, so run it over a network that is, such as Tailscale. Use `--joining vouched` with a quorum unless you accept all of that.
 - Several models run in lanes with fixed memory shares. The main model's planner does not see a lane's memory, so moving layers after a failure can run a node short. Workers started with `--no-control` do not join lanes.
 - GitHub Actions has not run yet, because the account's jobs do not start. The same steps pass locally on Linux and Windows.
 

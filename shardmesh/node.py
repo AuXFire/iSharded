@@ -105,6 +105,8 @@ def add_node_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-peer-serve", action="store_true", help="do not send shards to other workers")
     parser.add_argument("--no-local-copy", action="store_true", help="run workers from a network path as it is")
     parser.add_argument("--no-lanes", action="store_true", help="host only the main model here, never one loaded with load --lane")
+    parser.add_argument("--host-models", default="", help="comma-separated patterns such as *Qwen3*; host only models that match")
+    parser.add_argument("--ownerless", default=None, metavar="DIR", help="join a network nobody owns, using the identity in DIR from shardmesh net init")
     parser.add_argument("--llama-dir", default=None, help="a llama.cpp build for GGUF models; downloaded if not set")
     parser.add_argument(
         "--gguf-dir",
@@ -232,6 +234,7 @@ def _worker_command(
         roles,
         *(["--open"] if getattr(args, "open_pool", False) else []),
         *(["--trusted-network"] if getattr(args, "trusted_network", False) else []),
+        *(["--host-models", args.host_models] if getattr(args, "host_models", "") else []),
         *extra,
     ]
 
@@ -453,7 +456,24 @@ class LaneKeeper:
                 service.stop()
 
 
+def join_commons(args: argparse.Namespace) -> None:
+    """A network nobody owns: this node's identity stands in for a certificate from an owner."""
+    from .commons import certificate_file, identity_name, key_file
+
+    folder = Path(args.ownerless).resolve()
+    if not certificate_file(folder).is_file():
+        raise SystemExit(f"{folder} has no identity; run shardmesh net init --dir {folder} first")
+    args.node_id = identity_name(folder)
+    args.ca_file = str(certificate_file(folder))
+    args.identity_cert = str(certificate_file(folder))
+    args.identity_key = str(key_file(folder))
+    os.environ["SHARDMESH_OWNERLESS"] = str(folder)
+    print(f"This node is {args.node_id}.", flush=True)
+
+
 def run_node(args: argparse.Namespace) -> int:
+    if getattr(args, "ownerless", None):
+        join_commons(args)
     if getattr(args, "pool_token_file", None):
         os.environ["SHARDMESH_POOL_TOKEN_FILE"] = str(Path(args.pool_token_file).resolve())
     if getattr(args, "ca_file", None):

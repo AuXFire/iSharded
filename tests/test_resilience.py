@@ -866,6 +866,17 @@ def test_a_repair_with_nowhere_to_go_is_tried_again_soon():
     done(orchestrator)
 
 
+def test_a_node_is_only_planned_for_models_its_owner_agreed_to_host():
+    choosy, willing = record("w1"), record("w2")
+    choosy.registration.hardware.contribution.host_models = ["*llama*"]
+    orchestrator = pool(w1=choosy, w2=willing)
+    orchestrator.planning_model = "Qwen3-0.6B-Q8_0.gguf"
+    assert [item.worker_id for item in orchestrator.candidates()] == ["w2"]
+    orchestrator.planning_model = "tiny-llama.gguf"
+    assert sorted(item.worker_id for item in orchestrator.candidates()) == ["w1", "w2"]
+    done(orchestrator)
+
+
 def test_a_returned_node_still_waits_for_replies_to_finish():
     orchestrator, calls = repairing_pool(w1=record("w1"), w2=record("w2"))
     orchestrator.lost_from_route = {"w2"}

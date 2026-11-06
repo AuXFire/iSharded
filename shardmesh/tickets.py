@@ -99,6 +99,9 @@ class TicketChecker:
         self.known[ticket] = verified
         return verified[1]
 
+    def check_issuer(self, certificate: Any) -> None:
+        certificate.verify_directly_issued_by(self.authority)
+
     def _verify(self, ticket: str, now: float) -> tuple[float, str] | None:
         from cryptography import x509
         from cryptography.exceptions import InvalidSignature
@@ -116,7 +119,7 @@ class TicketChecker:
             if expires <= now or expires > now + TICKET_SECONDS + CLOCK_SKEW_SECONDS:
                 return None
             certificate = x509.load_pem_x509_certificate(str(claims["cert"]).encode())
-            certificate.verify_directly_issued_by(self.authority)
+            self.check_issuer(certificate)
             moment = datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
             if not certificate.not_valid_before_utc <= moment <= certificate.not_valid_after_utc:
                 return None
@@ -163,6 +166,17 @@ def own_audiences() -> set[str]:
     return audiences
 
 
+def make_checker(audiences: set[str]) -> TicketChecker | None:
+    """The checker for this network, whether it has an authority or nobody owns it."""
+    folder = os.getenv("SHARDMESH_OWNERLESS")
+    if folder:
+        from .commons import CommonsChecker
+
+        return CommonsChecker(folder, audiences)
+    authority = os.getenv("SHARDMESH_CA_FILE")
+    return TicketChecker(authority, audiences) if authority else None
+
+
 class TicketIdentity:
     """Treats a good ticket as the TLS layer treats a verified certificate."""
 
@@ -173,9 +187,7 @@ class TicketIdentity:
 
     def _prepare(self) -> None:
         self.ready = True
-        authority = os.getenv("SHARDMESH_CA_FILE")
-        if authority:
-            self.checker = TicketChecker(authority, own_audiences())
+        self.checker = make_checker(own_audiences())
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope["type"] == "http":

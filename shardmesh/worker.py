@@ -38,6 +38,8 @@ from .memory import (
 from .models import Adapter, GgufAdapter, create_adapter
 from .models.base import layer_unit
 from .protocol import (
+    host_model_patterns,
+    hosts_model,
     pass_seconds,
     META_HEADER,
     PROTOCOL_VERSION,
@@ -67,7 +69,8 @@ from .llamacpp import LlamaError, StageLost, ensure_build, pick_build, rocm_libr
 from .pool import check_exposure, load_token
 from .serving import MAX_STAGE_BYTES, BodyLimit, serve, where_everything_is
 from .slots import SlotGate
-from .access import Authority
+from .access import load_authority
+from .inventory import inventory
 from .tickets import TicketIdentity, client_auth
 from .tls import PEER, client_verify
 from .weights import FetchProgress, LoadedUnit, UnitCache, WeightSourceError, gguf_reader, load_unit, map_unit
@@ -134,6 +137,7 @@ def hardware_info(
                 accelerator_memory,
             ),
             standby=standby,
+            host_models=host_model_patterns(),
         ),
         memory_pools=pools,
     )
@@ -276,7 +280,7 @@ class WorkerRuntime:
         self.advertised_url = os.getenv("SHARDMESH_ADVERTISE_URL", "http://127.0.0.1:8100").rstrip("/")
         self.pool_token = load_token()
         self.requires_identity = bool(os.getenv("SHARDMESH_CA_FILE"))
-        self.authority = Authority(os.environ["SHARDMESH_CA_FILE"]) if self.requires_identity else None
+        self.authority = load_authority()
         self.revoked_nodes: set[str] = set()
         self.roles = {
             role.strip()
@@ -295,6 +299,7 @@ class WorkerRuntime:
         self.weights_ram_bytes = parse_ram_budget(os.getenv("SHARDMESH_WEIGHTS_RAM_GB", ""))
         self.weights_disk_bytes = int(float(os.getenv("SHARDMESH_WEIGHTS_DISK_GB", "0")) * 1024**3)
         self.standby = os.getenv("SHARDMESH_STANDBY", "0").lower() in {"1", "true", "yes"}
+        self.host_models = host_model_patterns()
         self.requested_device = os.getenv("SHARDMESH_DEVICE", "auto")
         self.dtype_name = choose_dtype_name(os.getenv("SHARDMESH_DTYPE", "auto"))
         self.cache_dir = Path(os.getenv("SHARDMESH_CACHE_DIR") or DEFAULT_CACHE_DIR)
@@ -747,6 +752,8 @@ class WorkerRuntime:
     async def configure(self, request: ConfigureRequest) -> None:
         if "inference" not in self.roles:
             raise ValueError("this worker does not contribute an inference executor")
+        if not hosts_model(self.host_models, request.model_id):
+            raise ValueError(f"this node's owner does not host {request.model_id}")
         if request.assignment.worker_id != self.worker_id:
             raise ValueError("assignment targets a different worker")
         if request.term < self.term:
@@ -1321,6 +1328,12 @@ async def diag_probe(body: dict[str, Any], authorization: str | None = Header(de
     return results
 
 
+@app.get("/internal/inventory")
+async def node_inventory(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    verify_token(authorization)
+    return await asyncio.to_thread(inventory)  # asking a GPU tool can take a moment
+
+
 @app.get("/internal/diag/runtime")
 async def diag_runtime(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     """Report why this process might be slow, independent of any network."""
@@ -1799,6 +1812,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="auto is bfloat16; float32 runs this node at full precision",
     )
+    parser.add_argument("--host-models", default=os.getenv("SHARDMESH_HOST_MODELS", ""), help="comma-separated patterns; host only models that match")
     parser.add_argument("--standby", action="store_true", default=False, help="only use this worker when a model does not fit without it")
     return parser
 
@@ -1824,6 +1838,7 @@ def main() -> None:
     os.environ["SHARDMESH_GGUF_DIRS"] = os.pathsep.join(args.gguf_dir or [])
     os.environ["SHARDMESH_DTYPE"] = args.dtype
     os.environ["SHARDMESH_STANDBY"] = "1" if args.standby else "0"
+    os.environ["SHARDMESH_HOST_MODELS"] = args.host_models
     global runtime
     runtime = WorkerRuntime()
     serve(app, args.host, args.port)

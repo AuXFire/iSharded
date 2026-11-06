@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 import hashlib
 import hmac
 import json
+import os
 from pathlib import Path
 import secrets
 import threading
@@ -34,14 +35,17 @@ import time
 from typing import Any, Callable
 
 ROLE_USER = "user"
+# In a network nobody owns, another node's operator: they may propose, not command.
+ROLE_MEMBER = "member"
 ROLE_ADMIN = "admin"
 ROLE_NODE = "node"
 # A node proven by its certificate: node routes only, however it got here.
 ROLE_PEER = "peer"
-RANKS = {ROLE_PEER: 0, ROLE_USER: 1, ROLE_ADMIN: 2, ROLE_NODE: 3}
+RANKS = {ROLE_PEER: 0, ROLE_USER: 1, ROLE_MEMBER: 2, ROLE_ADMIN: 3, ROLE_NODE: 4}
 WORKER_KINDS = {"gpu", "cpu", "memory"}
 AUDIT_ROTATE_BYTES = 64 * 1024 * 1024
 MAX_JOIN_REQUESTS = 64
+MAX_SIGNED_ENTRIES = 8192
 
 
 def node_of(worker_id: str) -> str:
@@ -87,6 +91,17 @@ class Authority:
         return entry if isinstance(entry, dict) else None
 
 
+def load_authority() -> Any:
+    """What this network's signatures are checked against, if anything."""
+    folder = os.getenv("SHARDMESH_OWNERLESS")
+    if folder:
+        from .commons import Commons
+
+        return Commons(folder)
+    path = os.getenv("SHARDMESH_CA_FILE")
+    return Authority(path) if path else None
+
+
 @dataclass(slots=True)
 class Caller:
     name: str
@@ -110,7 +125,7 @@ class AccessControl:
     path: Path | None = None
     # Nodes prove themselves with certificates, so nothing is open even with no token.
     identities: bool = False
-    authority: Authority | None = None
+    authority: Any = None
     # Signed entries, by the hash of what they say, since one entry can carry many
     # valid signatures. Everything a pool with an authority shares.
     signed: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -128,7 +143,7 @@ class AccessControl:
         pool_token: str | None,
         path: str | None,
         identities: bool = False,
-        authority: Authority | None = None,
+        authority: Any = None,
     ) -> "AccessControl":
         control = cls(pool_token=pool_token, path=Path(path) if path else None, identities=identities, authority=authority)
         if control.path and control.path.is_file():
@@ -137,7 +152,18 @@ class AccessControl:
             # and go no further. Signed entries are checked again, as peers' would be.
             control._apply(document)
             control._take_signed(document)
+        if control.ownerless:
+            control._tell_authority()
         return control
+
+    @property
+    def ownerless(self) -> bool:
+        return bool(getattr(self.authority, "ownerless", False))
+
+    def _tell_authority(self) -> None:
+        saved = getattr(self.authority, "saved", None)
+        if saved:
+            saved(self)
 
     def _apply(self, document: dict[str, Any]) -> None:
         keys: dict[str, Caller] = {}
@@ -193,7 +219,7 @@ class AccessControl:
             if not isinstance(claimed, dict):
                 continue
             held = hashlib.sha256(canonical(claimed)).hexdigest()
-            if held in self.signed:
+            if held in self.signed or len(self.signed) >= MAX_SIGNED_ENTRIES:
                 continue
             entry = self.authority.verified(signed)
             if entry is not None and self._apply_entry(entry):
@@ -210,6 +236,8 @@ class AccessControl:
             if name not in self.removed_names:
                 self.keys[entry["sha256"]] = Caller(name, entry["role"], int(entry.get("requests_per_minute", 0)))
             return True
+        if kind == "vouch" and name:
+            return True  # the commons works out what vouches add up to
         if kind == "remove_key" and name:
             self.removed_names.add(name)
             for hashed in [hashed for hashed, caller in self.keys.items() if caller.name == name]:
@@ -256,6 +284,11 @@ class AccessControl:
     def _merge_with_authority(self, document: dict[str, Any]) -> bool:
         mine = self.document()
         changed = self._take_signed(document)
+        if self.ownerless:
+            # Only signed vouches travel. Each node keeps its own keys, blocks, and cordons.
+            if changed:
+                self._save()
+            return changed
         self._take_join_requests(document)
         if self._rank(document) > self._rank(mine):
             cordoned = set(document.get("cordoned_nodes", []))
@@ -301,18 +334,20 @@ class AccessControl:
 
     def _save(self) -> None:
         if self.path is None:
+            self._tell_authority()
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         partial = self.path.with_suffix(".part")
         partial.write_text(json.dumps(self.document(), indent=2), encoding="utf-8")
         partial.replace(self.path)
+        self._tell_authority()
 
     def _changed(self) -> None:
         self.version += 1
         self._save()
 
     def _refuse_with_authority(self, change: str) -> None:
-        if self.authority is not None:
+        if self.authority is not None and not self.ownerless:
             raise NeedsAuthority(f"{change} needs the pool authority's signature; use the shardmesh command with --dir")
 
     def add_key(self, name: str, role: str, requests_per_minute: int = 0) -> str:
@@ -339,6 +374,13 @@ class AccessControl:
     def revoke_node(self, name: str) -> None:
         self._refuse_with_authority("revoking a node")
         self.revoked.add(name)
+        self._changed()
+
+    def unblock_node(self, name: str) -> None:
+        """Only where nobody owns the network, because a block there is one node's own choice."""
+        if not self.ownerless:
+            raise NeedsAuthority("a revocation is for good; give the machine a new name")
+        self.revoked.discard(name)
         self._changed()
 
     def cordon(self, name: str) -> None:

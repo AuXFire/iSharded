@@ -52,8 +52,8 @@ def test_only_well_formed_lanes_survive() -> None:
 
 def test_the_file_survives_a_round_trip_and_a_bad_one_means_no_lanes(tmp_path: Path) -> None:
     path = tmp_path / "folder" / "lanes.json"
-    write_lanes(path, {"small": {"slot": 1, "budgets": {}}}, 4)
-    assert read_lanes(path) == ({"small": {"slot": 1, "budgets": {}}}, 4)
+    write_lanes(path, {"small": {"slot": 1, "budgets": {}, "by": "n-1"}}, 4)
+    assert read_lanes(path) == ({"small": {"slot": 1, "budgets": {}, "by": "n-1"}}, 4)
     path.write_text("{broken", encoding="utf-8")
     assert read_lanes(path) == ({}, 0)
     assert read_lanes(tmp_path / "missing.json") == ({}, 0)

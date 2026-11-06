@@ -342,10 +342,10 @@ def test_a_local_copy_is_used_instead_of_the_source(local_model, tmp_path):
     assert all(cache.has("m", manifest.revision, unit) for unit in units)
 
 
-BUILD = os.environ.get("SHARDMESH_TEST_LLAMA_DIR", r"D:\models\bin-cuda")
-MODEL = os.environ.get("SHARDMESH_TEST_GGUF", r"D:\models\small\Qwen3.5-0.8B-Q8_0.gguf")
+BUILD = os.environ.get("SHARDMESH_TEST_LLAMA_DIR", "")
+MODEL = os.environ.get("SHARDMESH_TEST_GGUF", "")
 needs_real_model = pytest.mark.skipif(
-    not (Path(BUILD).is_dir() and Path(MODEL).is_file()), reason="needs a llama.cpp build and a real GGUF"
+    not (BUILD and MODEL and Path(BUILD).is_dir() and Path(MODEL).is_file()), reason="needs a llama.cpp build and a real GGUF"
 )
 
 
@@ -972,3 +972,14 @@ def test_a_platform_without_that_build_says_what_it_offers(monkeypatch) -> None:
     monkeypatch.setattr(llamacpp, "this_platform", lambda: "macos-arm64")
     with pytest.raises(llamacpp.LlamaError, match="it offers cpu"):
         llamacpp.ensure_build("cuda")
+
+
+def test_a_gpu_reading_a_card_cannot_give_is_left_out(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from shardmesh import inventory
+
+    monkeypatch.setattr(inventory.shutil, "which", lambda _: "nvidia-smi")
+    answer = SimpleNamespace(returncode=0, stdout="RTX 3060, 57, [N/A], 3, 3971, 6144\nbroken line\n")
+    (gpu,) = inventory.nvidia_gpus(run=lambda *_, **__: answer)
+    assert gpu == {"name": "RTX 3060", "temperature_c": 57.0, "load_percent": 3.0, "memory_used_mib": 3971.0, "memory_total_mib": 6144.0}

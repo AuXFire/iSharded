@@ -21,13 +21,14 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from starlette.background import BackgroundTask
 
 from . import __version__
-from .access import Authority, NeedsAuthority, node_of, ROLE_ADMIN, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, Caller
+from .access import load_authority, NeedsAuthority, node_of, ROLE_ADMIN, ROLE_MEMBER, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, Caller
 from .gguf import parse_source
 from .lanes import LaneDoor
 from .mesh import GOSSIP_SECONDS, ControlMesh
 from .models import Adapter, GgufAdapter, SUPPORTED_TYPES, UnsupportedModel, create_adapter
 from .planner import AMORTIZE_TOKENS, HOP_MS, Candidate, ModelProfile, PlacementError, plan_placement
 from .protocol import (
+    hosts_model,
     pass_seconds,
     CacheRestoreRequest,
     ChatCompletionRequest,
@@ -50,7 +51,7 @@ from .protocol import (
 from .pool import check_exposure, home as pool_home, load_token, read_membership_request
 from .serving import BodyLimit, serve, where_everything_is
 from .mesh import clean_url
-from .tickets import PREFIX as TICKET_PREFIX, NodeTickets, TicketChecker, TicketIdentity, client_auth, reply_audience
+from .tickets import PREFIX as TICKET_PREFIX, NodeTickets, TicketChecker, TicketIdentity, client_auth, make_checker, reply_audience
 from .tls import BEHALF, BEHALF_HEADER, FORWARD_MARK, INTERCEPTED, intercepted, PEER, client_verify
 from .tokenizer import ChatTokenizer, IncrementalText, load_tokenizer
 from .weights import apply_model_hashes, Manifest, WeightSourceError, build_manifest
@@ -364,6 +365,7 @@ class Orchestrator:
         self.peer_fetch = os.getenv("SHARDMESH_PEER_FETCH", "1") != "0"
         self.workers: dict[str, WorkerRecord] = {}
         self.model_id: str | None = None
+        self.planning_model: str | None = None
         self.active: ModelTarget | None = None
         self.tokenizer: ChatTokenizer | None = None
         self.route: list[StageAssignment] = []
@@ -371,12 +373,12 @@ class Orchestrator:
         self.epoch = 0
         self.job: LoadJob | None = None
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(3600.0, connect=10.0), verify=client_verify(), auth=client_auth())
-        authority_file = os.getenv("SHARDMESH_CA_FILE")
+        authority = load_authority()
         self.access = AccessControl.load(
             self.pool_token,
             os.getenv("SHARDMESH_KEYS_FILE"),
-            identities=bool(authority_file),
-            authority=Authority(authority_file) if authority_file else None,
+            identities=authority is not None,
+            authority=authority,
         )
         self.audit = AuditLog(os.getenv("SHARDMESH_AUDIT_FILE"), os.getenv("SHARDMESH_NODE_ID") or socket.gethostname())
         self.control_lock = asyncio.Lock()
@@ -410,6 +412,7 @@ class Orchestrator:
             self.mesh = ControlMesh(os.getenv("SHARDMESH_NODE_ID") or socket.gethostname(), seen_as, seeds)
         self.background: set[asyncio.Task[Any]] = set()
         self.lanes = LaneDoor(self)
+        self.round_trip_ms: dict[str, float] = {}
         self.lane_name = os.getenv("SHARDMESH_LANE") or None
         self.started_at = time.time()
         self.requests_total = 0
@@ -514,7 +517,7 @@ class Orchestrator:
             return True
         assert self.mesh is not None
         if self.reply_checker is None:
-            self.reply_checker = TicketChecker(os.environ["SHARDMESH_CA_FILE"], {reply_audience(self.mesh.url)})
+            self.reply_checker = make_checker({reply_audience(self.mesh.url)})
         proof = str(reply.get("proof", ""))
         return proof.startswith(TICKET_PREFIX) and self.reply_checker.name(proof) == reply.get("node_id")
 
@@ -551,6 +554,7 @@ class Orchestrator:
         assert self.mesh is not None
 
         async def talk(url: str) -> None:
+            started = time.monotonic()
             try:
                 response = await self.client.post(
                     url + "/internal/gossip",
@@ -561,6 +565,7 @@ class Orchestrator:
                 response.raise_for_status()
                 reply = response.json()
                 if self._reply_is_genuine(reply):
+                    self.round_trip_ms[str(reply.get("node_id"))] = round((time.monotonic() - started) * 1000, 1)
                     self.receive_gossip(reply)
             except (httpx.HTTPError, httpx.InvalidURL, ValueError, KeyError, TypeError) as exc:
                 # Silence is how a peer's absence is noticed, so this says nothing
@@ -868,10 +873,14 @@ class Orchestrator:
         for worker_id, record in self.workers.items():
             contribution = record.registration.hardware.contribution
             usable = record.live and not record.quarantined and not self._cordoned(worker_id)
-            if usable and "inference" in contribution.roles:
+            if usable and "inference" in contribution.roles and self._hosts(contribution):
                 group = standby if contribution.standby else preferred
                 group.append(self._candidate(worker_id, record))
         return preferred, standby
+
+    def _hosts(self, contribution: Any) -> bool:
+        model = self.planning_model or self.model_id
+        return not model or hosts_model(contribution.host_models, model)
 
     def candidates(self) -> list[Candidate]:
         preferred, standby = self.candidate_groups()
@@ -1289,6 +1298,13 @@ class Orchestrator:
             job.finished_at = time.time()
 
     async def load(self, request: LoadModelRequest, job: LoadJob) -> list[StageAssignment]:
+        self.planning_model = request.model_id
+        try:
+            return await self._load(request, job)
+        finally:
+            self.planning_model = None
+
+    async def _load(self, request: LoadModelRequest, job: LoadJob) -> list[StageAssignment]:
         try:
             target = await self._resolve(request)
         except (UnsupportedModel, WeightSourceError, OSError, httpx.HTTPError, ValueError) as exc:
@@ -1863,6 +1879,42 @@ class Orchestrator:
         urls = {str(record.registration.advertised_url) for record in self.workers.values() if record.live}
         await asyncio.gather(*(clear(url) for url in urls))
 
+    async def node_inventory(self) -> dict[str, Any]:
+        """Each node's own report, from one of its workers, with how far away it is."""
+        chosen: dict[str, str] = {}
+        for worker_id, record in self.workers.items():
+            if record.live:
+                chosen.setdefault(node_of(worker_id), str(record.registration.advertised_url).rstrip("/"))
+
+        async def ask(url: str) -> dict[str, Any]:
+            try:
+                response = await self.client.get(url + "/internal/inventory", headers=auth_headers(self.pool_token), timeout=10.0)
+                response.raise_for_status()
+                return response.json()
+            except (httpx.HTTPError, ValueError):
+                return {"error": "no answer"}
+
+        reports = await asyncio.gather(*(ask(url) for url in chosen.values()))
+        nodes = dict(zip(chosen, reports))
+        for node, report in nodes.items():
+            if node in self.round_trip_ms:
+                report["round_trip_ms"] = self.round_trip_ms[node]
+        return {"nodes": nodes}
+
+    def network_view(self) -> dict[str, Any] | None:
+        """This node's own view of a network nobody owns. Another node's may differ."""
+        if not self.access.ownerless:
+            return None
+        commons = self.access.authority
+        members = commons.members(self.access.signed)
+        return {
+            "this_node": commons.me,
+            "joining": commons.policy["joining"],
+            "quorum": commons.policy["quorum"],
+            "accepted": sorted(members) if members is not None else None,
+            "blocked": sorted(self.access.revoked),
+        }
+
     def memory_summary(self) -> dict[str, dict[str, int]]:
         """Pool totals by kind, counting each physical resource once."""
         groups: dict[str, dict[str, int | str]] = {}
@@ -1921,6 +1973,7 @@ class Orchestrator:
             ),
             "cordoned_nodes": sorted(self.access.cordoned),
             "lanes": self.lanes.status(),
+            "ownerless": self.network_view(),
             "model": self.model_id,
             "load_job": self.job.snapshot() if self.job else None,
             "active_plan": describe_plan(self.active, self.route) if self.active and self.route else None,
@@ -2027,6 +2080,27 @@ def require(authorization: str | None, role: str) -> Caller:
     return caller
 
 
+def network_caller(authorization: str | None) -> Caller:
+    """Whoever asks, as the network sees them.
+
+    Where nobody owns the network, no key commands it, the coordinator's own
+    operator's included. Coordinating orders a route and carries no other rights.
+    """
+    caller = require(authorization, ROLE_MEMBER)
+    if runtime.access.ownerless and caller.role == ROLE_ADMIN:
+        assert runtime.mesh is not None
+        return Caller(f"{runtime.mesh.node_id}/{caller.name}", ROLE_MEMBER)
+    return caller
+
+
+def require_own_node(authorization: str | None, name: str) -> Caller:
+    """An admin, or a member acting on their own node."""
+    caller = network_caller(authorization)
+    if caller.role == ROLE_MEMBER and caller.name.partition("/")[0] != name:
+        raise HTTPException(status_code=403, detail="a member can only take their own node out")
+    return caller
+
+
 def verify_token(authorization: str | None) -> None:
     """Node to node. API keys do not reach this far."""
     require(authorization, ROLE_NODE)
@@ -2076,7 +2150,11 @@ async def forward_to_coordinator(request: Request, call_next: Any) -> Any:
         # With an authority, that node checked the key and kept it, and says who asked.
         vouched = request.headers.get(BEHALF_HEADER, "")
         role, _, name = vouched.partition(":")
-        if PEER.get() is not None and runtime.access.authority is not None and role in {ROLE_USER, ROLE_ADMIN}:
+        if PEER.get() is not None and runtime.access.authority is not None and role in {ROLE_USER, ROLE_MEMBER, ROLE_ADMIN}:
+            if runtime.access.ownerless:
+                # An operator commands their own node. Here they are only a member,
+                # and the node that passed this on is the one that answers for them.
+                name, role = f"{PEER.get()}/{name.rpartition('/')[2]}", ROLE_USER if role == ROLE_USER else ROLE_MEMBER
             BEHALF.set((name, role))
         PEER.set(None)
     mesh = runtime.mesh
@@ -2085,7 +2163,8 @@ async def forward_to_coordinator(request: Request, call_next: Any) -> Any:
         # httpx would resolve these, turning a forwarded path into any other.
         return JSONResponse(status_code=400, content={"detail": "bad path"})
     serves_locally = path.startswith("/v1/") and bool(runtime.route)
-    if mesh is None or mesh.is_leader or serves_locally or not path.startswith(FORWARDED_PATHS):
+    own_choice = runtime.access.ownerless and (path.startswith("/admin/keys") or path.endswith("/revoke"))
+    if mesh is None or mesh.is_leader or serves_locally or own_choice or not path.startswith(FORWARDED_PATHS):
         return await call_next(request)
     target = mesh.leader_url
     if target is None or FORWARD_MARK in request.headers:
@@ -2307,7 +2386,9 @@ async def _run_load(body: LoadModelRequest, job: LoadJob) -> list[StageAssignmen
 
 @app.post("/admin/load")
 async def load(body: LoadModelRequest, authorization: str | None = Header(default=None)) -> Any:
-    caller = require(authorization, ROLE_ADMIN)
+    caller = network_caller(authorization)
+    if caller.role == ROLE_MEMBER and not body.lane and runtime.route:
+        raise HTTPException(status_code=403, detail="nobody can replace what this network runs; load beside it with a lane")
     if body.lane:
         return JSONResponse(status_code=202, content=await runtime.lanes.load(body, caller))
     if runtime.control_lock.locked():
@@ -2402,10 +2483,21 @@ async def revoke_node(name: str, authorization: str | None = Header(default=None
     return {"status": "revoked"}
 
 
+@app.delete("/admin/nodes/{name}/revoke")
+async def unblock_node(name: str, authorization: str | None = Header(default=None)) -> dict[str, str]:
+    """Where nobody owns the network, a block is this node's own choice to undo."""
+    verify_admin(authorization)
+    try:
+        runtime.access.unblock_node(name)
+    except NeedsAuthority as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"status": "unblocked"}
+
+
 @app.post("/join/requests")
 async def request_to_join(body: dict[str, Any]) -> dict[str, str]:
     """Anyone may ask. Asking grants nothing until the owner signs an answer."""
-    if runtime.access.authority is None:
+    if runtime.access.authority is None or runtime.access.ownerless:
         raise HTTPException(status_code=404, detail="this pool has no owner to ask")
     try:
         details = read_membership_request(str(body["request"]))
@@ -2453,7 +2545,7 @@ async def cordon_node(
     authorization: str | None = Header(default=None),
 ) -> dict[str, str]:
     """Take a node out of service for maintenance, without dropping a reply."""
-    caller = require(authorization, ROLE_ADMIN)
+    caller = require_own_node(authorization, name)
     cost = runtime.cost_of_losing(name)
     if cost is None:
         raise HTTPException(status_code=409, detail=f"the rest of the pool cannot hold this model without {name}")
@@ -2470,7 +2562,7 @@ async def cordon_node(
 
 @app.post("/admin/nodes/{name}/uncordon")
 async def uncordon_node(name: str, authorization: str | None = Header(default=None)) -> dict[str, str]:
-    verify_admin(authorization)
+    require_own_node(authorization, name)
     if name not in runtime.access.cordoned:
         return {"status": "uncordoned"}  # nothing changed, so nothing should move
     runtime.access.uncordon(name)
@@ -2490,7 +2582,8 @@ async def catalog(authorization: str | None = Header(default=None)) -> dict[str,
 
 @app.post("/admin/rebalance")
 async def rebalance(authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    verify_admin(authorization)
+    if not runtime.access.permits(network_caller(authorization), ROLE_ADMIN):
+        raise HTTPException(status_code=403, detail="this needs the admin role")
     # Fetching happens with generation still running; the switch itself waits
     # for a request boundary. Failure-triggered rebalances happen inside the
     # generation lock and call the runtime method directly.
@@ -2501,8 +2594,7 @@ async def rebalance(authorization: str | None = Header(default=None)) -> dict[st
 
 @app.delete("/admin/lanes/{name}")
 async def remove_lane(name: str, authorization: str | None = Header(default=None)) -> dict[str, str]:
-    verify_admin(authorization)
-    runtime.lanes.remove(name)
+    runtime.lanes.remove(name, network_caller(authorization))
     return {"status": "removed"}
 
 
@@ -2535,6 +2627,12 @@ async def status(authorization: str | None = Header(default=None)) -> dict[str, 
     verify_user(authorization)
     await runtime.refresh_worker_metrics()
     return runtime.status()
+
+
+@app.get("/admin/inventory")
+async def node_inventory(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    verify_user(authorization)
+    return await runtime.node_inventory()
 
 
 @app.get("/v1/models")

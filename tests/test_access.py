@@ -218,8 +218,8 @@ def test_an_exposed_pool_with_no_credentials_refuses_to_start():
     with pytest.raises(ExposedPool, match="pool init"):
         check_exposure("0.0.0.0", None, None, False)
     check_exposure("127.0.0.1", None, None, False)
-    check_exposure("0.0.0.0", "token", None, False, "http://100.64.0.12:8300")
-    check_exposure("0.0.0.0", None, "ca.pem", False, "http://100.64.0.12:8300")
+    check_exposure("0.0.0.0", "token", None, False, "http://100.64.0.2:8300")
+    check_exposure("0.0.0.0", None, "ca.pem", False, "http://100.64.0.2:8300")
     check_exposure("0.0.0.0", None, None, True)
 
 

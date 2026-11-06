@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import fnmatch
+
 import base64
 import json
 import re
@@ -27,6 +29,20 @@ class ResourceContribution(BaseModel):
     ram_budget_bytes: int = 0
     accelerator_memory_budget_bytes: int = 0
     standby: bool = False
+    # Patterns naming the only models this node will host. Empty means any.
+    host_models: list[str] = Field(default_factory=list)
+
+
+def host_model_patterns() -> list[str]:
+    return [item.strip() for item in os.getenv("SHARDMESH_HOST_MODELS", "").split(",") if item.strip()]
+
+
+def hosts_model(patterns: list[str], model_id: str) -> bool:
+    """Whether a node's owner agreed to host this model."""
+    if not patterns:
+        return True
+    wanted = model_id.lower()
+    return any(fnmatch.fnmatchcase(wanted, pattern.lower()) for pattern in patterns)
 
 
 class MemoryPool(BaseModel):

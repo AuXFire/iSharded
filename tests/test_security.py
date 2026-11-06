@@ -112,7 +112,7 @@ def test_a_revoked_node_cannot_register_under_a_new_worker_name(pool_with_author
 
 def test_node_names_come_from_the_whole_worker_name():
     assert node_of("desktop-2-gpu") == "desktop-2"
-    assert node_of("node-a-memory") == "node-a"
+    assert node_of("laptop-memory") == "laptop"
     assert node_of("standalone") == "standalone"
 
 
@@ -311,7 +311,7 @@ def test_credentials_do_not_cross_a_plain_network(monkeypatch):
     with pytest.raises(ExposedPool, match="unencrypted"):
         check_exposure("0.0.0.0", "token", None, False, "http://192.168.1.20:8000")
     check_exposure("0.0.0.0", "token", None, False, "http://192.168.1.20:8000", trusted_network=True)
-    check_exposure("0.0.0.0", "token", None, False, "http://100.64.0.12:8300")
+    check_exposure("0.0.0.0", "token", None, False, "http://100.64.0.2:8300")
     check_exposure("0.0.0.0", "token", None, False, "desktop.tail1234.ts.net")
     check_exposure("0.0.0.0", "token", None, False, "http://127.0.0.1:8100")
     monkeypatch.setenv("SHARDMESH_TLS_CERT", "node.pem")
