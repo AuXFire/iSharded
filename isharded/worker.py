@@ -41,7 +41,7 @@ from .memory import (
     discover_accelerators,
     live_free_bytes,
 )
-from .engine import REFUSE_EPOCH, REFUSE_FAILED_STAGE, REFUSE_STAGE_ERROR, EngineClient, EngineRefusal
+from .engine import REFUSE_EPOCH, REFUSE_STAGE_ERROR, EngineClient, EngineRefusal
 from .geo import country_code, node_country
 from .models import Adapter, GgufAdapter, create_adapter
 from .models.base import layer_unit
@@ -1094,9 +1094,9 @@ class WorkerRuntime:
             return HTTPException(status_code=409, detail=f"pipeline epoch mismatch; worker has {self.epoch}")
         if refused.refusal == REFUSE_STAGE_ERROR:
             return HTTPException(status_code=500, detail={"stage_error": refused.message})
-        if refused.refusal == REFUSE_FAILED_STAGE and refused.stage < len(self.route):
-            self.ring_live = False
-            return HTTPException(status_code=502, detail={"failed_worker": self.route[refused.stage].worker_id, "message": refused.message})
+        # A dead link does not say a worker is dead: its stage may just need restarting. So
+        # nobody is blamed here. The replay runs over HTTP, which finds out what really
+        # happened, and a worker that is still there keeps its place and its weights.
         self.ring_live = False
         return HTTPException(status_code=503, detail={"retry": True, "message": refused.message})
 
@@ -1674,6 +1674,7 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
             "cache": runtime.cache_report(),
             "phases_ms": runtime.phases,
             "ring": await asyncio.to_thread(runtime.gguf.ring_stats) if runtime.gguf is not None else None,
+            "ring_live": runtime.ring_live,
         },
     }
 

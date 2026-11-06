@@ -853,6 +853,7 @@ class Orchestrator:
         self._review_quarantine()
         await self._adopt_saved_route()
         await self._repair_route()
+        self._check_ring()
         await self._start_ring()
 
     def _review_quarantine(self) -> None:
@@ -1198,6 +1199,21 @@ class Orchestrator:
                 )
             )
         return updated
+
+    def _check_ring(self) -> None:
+        """Notice a ring that lost a link, so the next pass of this loop reopens it."""
+        if self.ring_epoch is None or self.ring_epoch != self.epoch or not self.route:
+            return
+        last = len(self.route) - 1
+        for index, stage in enumerate(self.route):
+            record = self.workers.get(stage.worker_id)
+            telemetry = ((record.health if record else None) or {}).get("telemetry") or {}
+            ring = telemetry.get("ring")
+            if index == 0 and telemetry.get("ring_live") is False:
+                self.ring_epoch = None
+            # Nothing to say means the stage was busy, which is no sign of trouble.
+            elif ring and (ring.get("epoch") != self.epoch or (index < last and not ring.get("next_up"))):
+                self.ring_epoch = None
 
     async def _start_ring(self) -> None:
         """Open direct links along the route, for the passes every token makes.
