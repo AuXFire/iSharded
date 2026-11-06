@@ -351,6 +351,12 @@ class InferRequest(BaseModel):
     images: list[str] = Field(default_factory=list)
     # Where the sequence stands after this pass, for a pass holding image rows.
     next_position: int | None = None
+    # A long prompt goes out in parts, so a stage can start on the first part while the
+    # stage before it reads the next. Parts can overtake each other on separate
+    # connections, so they say who they belong to, and each stage runs them in order.
+    part_of: str | None = None
+    part_index: int = 0
+    part_count: int = 1
 
 
 class GenerateRequest(InferRequest):

@@ -6,9 +6,13 @@ import asyncio
 from collections import deque
 import random
 
+from fastapi import HTTPException
 import pytest
 
+from isharded import worker as worker_module
 from isharded.pipeline import Pipeline
+from isharded.protocol import InferRequest, SavePoint
+from isharded.statestore import pass_ends, prompt_parts
 
 STOP = 999
 
@@ -204,3 +208,111 @@ def test_landing_leaves_the_reply_ready_to_go_on_another_way() -> None:
     history, draft, _ = asyncio.run(run())
     assert draft.committed <= len(history) - 1
     assert history[3:] == plain([5, 6], model([5, 6]), 12)[1:]
+
+
+def test_a_prompt_divides_where_a_whole_prompt_would_stop() -> None:
+    assert prompt_parts([], 100) == [(0, 100)]
+    assert prompt_parts([], 1500) == [(0, 512), (512, 1024), (1024, 1500)]
+    # A cut starts a pass of its own, so the passes after it count from the cut.
+    assert prompt_parts([700], 2000) == [(0, 512), (512, 700 + 512), (1212, 1724), (1724, 2000)]
+    every = [end for _, end in prompt_parts([700], 2000)]
+    assert set(every[:-1]) <= set(pass_ends([700], 2000))
+
+
+class Parts:
+    """A stage's ordering, without a stage."""
+
+    def __init__(self) -> None:
+        self.runtime = worker_module.WorkerRuntime.__new__(worker_module.WorkerRuntime)
+        self.runtime.parts_run = {}
+        self.runtime.part_ran = asyncio.Condition()
+        self.seen: list[InferRequest] = []
+        self.delays: dict[int, int] = {}
+        self.fail_at: int | None = None
+
+    async def step(self, part: InferRequest) -> dict[str, int]:
+        if part.part_index == self.fail_at:
+            raise HTTPException(status_code=502, detail="gone")
+        self.seen.append(part)
+        await self.runtime.note_part(part)
+        for _ in range(self.delays.get(part.part_index, 0)):
+            await asyncio.sleep(0)
+        return {"token_id": part.part_index}
+
+
+def whole_prompt(**fields) -> InferRequest:
+    saves = [SavePoint(at=512, length=512, key="a", kind="prefix"), SavePoint(at=1100, length=1100, key="b", kind="history")]
+    return InferRequest(session_id="s", epoch=1, input_ids=list(range(1500)), reset=True, prompt_rows=True, cuts=[1100], saves=saves, **fields)
+
+
+PIECES = [(0, 512), (512, 1100), (1100, 1500)]
+
+
+def test_parts_carry_their_own_rows_cuts_and_saves() -> None:
+    parts = Parts()
+    result = asyncio.run(parts.runtime.run_in_parts(whole_prompt(), PIECES, parts.step))
+    assert result == {"token_id": 2}
+    first, second, third = parts.seen
+    assert [len(part.input_ids) for part in parts.seen] == [512, 588, 400]
+    assert second.input_ids[0] == 512 and third.input_ids[0] == 1100
+    assert [save.at for save in first.saves] == [512]
+    assert [save.at for save in second.saves] == [588]
+    assert third.saves == []
+    assert first.cuts == second.cuts == third.cuts == []
+    assert (first.reset, second.reset, third.reset) == (True, False, False)
+    assert {part.part_count for part in parts.seen} == {3}
+    assert len({part.part_of for part in parts.seen}) == 1
+
+
+def test_only_the_first_part_restores() -> None:
+    parts = Parts()
+    whole = whole_prompt(restore_length=100, checkpoint_key="k", reused_rows=100)
+    asyncio.run(parts.runtime.run_in_parts(whole, PIECES, parts.step))
+    assert parts.seen[0].restore_length == 100
+    assert parts.seen[1].restore_length is None and parts.seen[1].checkpoint_key is None and parts.seen[1].reused_rows == 0
+
+
+def test_a_part_leaves_before_the_one_ahead_has_crossed_the_route() -> None:
+    parts = Parts()
+    parts.delays = {0: 1000}  # the first part is still away along the route
+    asyncio.run(parts.runtime.run_in_parts(whole_prompt(), PIECES, parts.step))
+    assert [part.part_index for part in parts.seen] == [0, 1, 2]
+
+
+def test_a_failed_part_fails_the_prompt_and_stops_the_rest() -> None:
+    parts = Parts()
+    parts.fail_at = 1
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(parts.runtime.run_in_parts(whole_prompt(), PIECES, parts.step))
+    assert caught.value.status_code == 502
+    assert [part.part_index for part in parts.seen] == [0]
+
+
+def test_a_stage_runs_parts_in_order_even_if_they_arrive_out_of_order() -> None:
+    async def run() -> list[int]:
+        parts = Parts()
+        order: list[int] = []
+
+        async def arrive(index: int) -> None:
+            part = InferRequest(session_id="s", epoch=1, input_ids=[1], slot=2, part_of="g", part_index=index, part_count=3)
+            if index:
+                await parts.runtime.await_part(part, index - 1, 5)
+            order.append(index)
+            await parts.runtime.note_part(part)
+
+        await asyncio.gather(arrive(2), arrive(1), arrive(0))
+        return order
+
+    assert asyncio.run(run()) == [0, 1, 2]
+
+
+def test_a_part_whose_prompt_was_replaced_never_runs() -> None:
+    async def run() -> None:
+        parts = Parts()
+        await parts.runtime.note_part(InferRequest(session_id="s", epoch=1, input_ids=[1], part_of="new", part_index=0))
+        stale = InferRequest(session_id="s", epoch=1, input_ids=[1], part_of="old", part_index=1)
+        await parts.runtime.await_part(stale, 0, 0.01)
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(run())
+    assert caught.value.status_code == 503

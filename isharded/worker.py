@@ -10,6 +10,7 @@ import json
 import os
 import platform
 import re
+import secrets
 import socket
 import sys
 import threading
@@ -94,7 +95,7 @@ from .pool import check_exposure, load_token
 from .serving import MAX_STAGE_BYTES, MAX_STATE_BYTES, BodyLimit, serve, where_everything_is
 from .slots import SlotGate
 from .statecopy import CopySender, fetch_file
-from .statestore import HISTORY, PARTIAL, PrefixIndex, StateStore, clear_other_stores, stage_namespace
+from .statestore import HISTORY, PARTIAL, PrefixIndex, StateStore, clear_other_stores, prompt_parts, stage_namespace
 from .access import load_authority
 from .inventory import inventory
 from .tickets import TicketIdentity, client_auth
@@ -190,6 +191,8 @@ CHECK_IN_SECONDS = 5.0
 # How long a link may go without an acknowledgement, and how long a stage keeps dialling.
 RING_ACK_MS = 5000
 RING_DIAL_MS = 10_000
+# Off is for checking results against a prompt that went out whole.
+PROMPT_PARTS = os.getenv("ISHARDED_PROMPT_PARTS", "1") != "0"
 UNAVAILABLE_STATUSES = {502, 503, 504}
 
 
@@ -379,6 +382,9 @@ class WorkerRuntime:
         self.rewinds = False
         self.draft_passes = 0
         self.draft_accepted = 0
+        # The newest part of a prompt each slot has run, and word of the next one.
+        self.parts_run: dict[int, tuple[str, int]] = {}
+        self.part_ran = asyncio.Condition()
         self.pipeline_tokens = 0
         self.pipeline_misses = 0
         self.pipeline_depth = 0
@@ -1566,12 +1572,67 @@ class WorkerRuntime:
         self.compute_ms_ema = self._ema(self.compute_ms_ema, (time.perf_counter() - started) * 1000)
         return [results[index] for index in range(len(steps))]
 
+    async def await_part(self, request: InferRequest, index: int, seconds: float) -> None:
+        """Waits for a part of a prompt to have run on this stage."""
+        wanted = (request.part_of, index)
+        async with self.part_ran:
+            try:
+                await asyncio.wait_for(self.part_ran.wait_for(lambda: self.parts_run.get(request.slot) == wanted), seconds)
+            except asyncio.TimeoutError as exc:
+                # The part before never came: this prompt failed, or was replaced by a replay.
+                raise HTTPException(status_code=503, detail={"retry": True, "message": "a part of the prompt was lost"}) from exc
+
+    async def note_part(self, request: InferRequest) -> None:
+        async with self.part_ran:
+            self.parts_run[request.slot] = (request.part_of, request.part_index)
+            self.part_ran.notify_all()
+
+    async def run_in_parts(self, whole: InferRequest, pieces: list[tuple[int, int]], step: Any) -> dict[str, Any]:
+        """Runs a prompt a part at a time, without waiting for each to cross the route.
+
+        A part leaves as soon as this stage has run the one before, so the next stage reads
+        while this one does, and a long prompt takes about one stage's share of the time.
+        """
+        group = secrets.token_hex(8)
+        running: list[asyncio.Task[dict[str, Any]]] = []
+        try:
+            for index, (first, end) in enumerate(pieces):
+                update: dict[str, Any] = {
+                    "input_ids": whole.input_ids[first:end],
+                    "cuts": [cut - first for cut in whole.cuts if first < cut < end],
+                    "saves": [save.model_copy(update={"at": save.at - first}) for save in whole.saves if first < save.at <= end],
+                    "part_of": group,
+                    "part_index": index,
+                    "part_count": len(pieces),
+                }
+                if index:
+                    update.update({"reset": False, "restore_length": None, "checkpoint_key": None, "reused_rows": 0, "restore_kind": None})
+                part = whole.model_copy(update=update)
+                running.append(asyncio.ensure_future(step(part)))
+                if index + 1 < len(pieces):
+                    here = asyncio.ensure_future(self.await_part(part, index, pass_seconds(len(whole.input_ids), 1)))
+                    await asyncio.wait({here, running[-1]}, return_when=asyncio.FIRST_COMPLETED)
+                    if running[-1].done():
+                        here.cancel()
+                        running[-1].result()
+                    await here
+            return (await asyncio.gather(*running))[-1]
+        except BaseException:
+            for task in running:
+                task.cancel()
+            await asyncio.gather(*running, return_exceptions=True)
+            raise
+
     async def execute(self, hidden: torch.Tensor, request: InferRequest, places: np.ndarray | None = None) -> dict[str, Any]:
         if self.assignment is None or self.model_id is None:
             raise HTTPException(status_code=409, detail="worker is not configured")
         if request.epoch != self.epoch:
             raise HTTPException(status_code=409, detail=f"pipeline epoch mismatch; worker has {self.epoch}")
         next_stage = self._next_stage()
+        # The rows of a whole prompt, since one part can wait behind all the others.
+        rows = hidden.shape[1] * request.part_count
+        if request.part_index:
+            await self.await_part(request, request.part_index - 1, pass_seconds(rows, len(self.route)))
         if self._can_merge(hidden, request):
             outcome = await self._step_together(hidden, request)
         else:
@@ -1579,6 +1640,8 @@ class WorkerRuntime:
             # is away at the next stage, this stage can work on another.
             async with self.lock:
                 outcome = await self._step_alone(hidden, request, places)
+        if request.part_of is not None:
+            await self.note_part(request)
         if request.saves:
             self.copies.add(request.saves)
         if isinstance(outcome, dict):
@@ -1604,7 +1667,7 @@ class WorkerRuntime:
                 next_stage.url.rstrip("/") + "/internal/forward",
                 content=payload,
                 headers=headers,
-                timeout=httpx.Timeout(pass_seconds(hidden.shape[1], self._stages_after()), connect=10.0),
+                timeout=httpx.Timeout(pass_seconds(rows, self._stages_after()), connect=10.0),
             )
             report = failure_report(response)
             if report is not None:
@@ -1741,7 +1804,7 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
             "stages_kept": runtime.stages_kept,
             "draft_passes": runtime.draft_passes,
             "draft_tokens_per_pass": round(runtime.draft_accepted / runtime.draft_passes, 2) if runtime.draft_passes else None,
-            "pipeline": {"tokens": runtime.pipeline_tokens, "misses": runtime.pipeline_misses, "depth": runtime.pipeline_depth},
+            "pipeline": {"tokens": runtime.pipeline_tokens, "misses": runtime.pipeline_misses, "depth": runtime.pipeline_depth, "rewinds": runtime.rewinds, "ring_live": runtime.ring_live, "stages": len(runtime.route)},
             "draft_ways": {way: round(runtime.draft_choice.rate(way), 2) for way in runtime.draft_choice.seconds},
             "checkpoints_dropped": runtime.checkpoints_dropped,
             "cache": runtime.cache_report(),
@@ -2196,23 +2259,22 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
         """
         prompt, start = body.input_ids, plan.start
         part = rows.part(start, len(prompt)) if rows else None
-        result = await step(
-            request.model_copy(
-                update={
-                    "input_ids": prompt[start:],
-                    "reset": not start,
-                    "restore_length": (rows.position_at(start) if rows else start) or None,
-                    "checkpoint_key": plan.key,
-                    "reused_rows": start,
-                    "restore_kind": plan.kind,
-                    "prompt_rows": True,
-                    "cuts": plan.cuts,
-                    "saves": plan.saves,
-                    "next_position": part.after if part else None,
-                }
-            ),
-            part,
+        whole = request.model_copy(
+            update={
+                "input_ids": prompt[start:],
+                "reset": not start,
+                "restore_length": (rows.position_at(start) if rows else start) or None,
+                "checkpoint_key": plan.key,
+                "reused_rows": start,
+                "restore_kind": plan.kind,
+                "prompt_rows": True,
+                "cuts": plan.cuts,
+                "saves": plan.saves,
+                "next_position": part.after if part else None,
+            }
         )
+        pieces = prompt_parts(plan.cuts, len(prompt) - start) if PROMPT_PARTS and rows is None and len(runtime.route) > 1 else []
+        result = await (runtime.run_in_parts(whole, pieces, step) if len(pieces) > 1 else step(whole, part))
         for save in plan.saves:
             if save.replaces:
                 runtime.prefix.drop(save.replaces)

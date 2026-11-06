@@ -109,6 +109,21 @@ def pass_ends(cuts: list[int], total: int) -> list[int]:
     return [end for end in ends if end < total]
 
 
+def prompt_parts(cuts: list[int], total: int) -> list[tuple[int, int]]:
+    """Rows of a prompt in parts of about one pass, each ending where a pass ends anyway.
+
+    A part stops only where a whole prompt would have stopped, so a stage runs the same
+    passes on the same rows, and the result does not depend on how the prompt went out.
+    """
+    parts: list[tuple[int, int]] = []
+    first = 0
+    for end in [*pass_ends(cuts, total), total]:
+        if end - first >= PASS_ROWS or end == total:
+            parts.append((first, end))
+            first = end
+    return parts
+
+
 def stage_namespace(build: str, model_id: str, revision: str, start: int, end: int, rollback_tokens: int, kv_type: str) -> str:
     """What a stage's states belong to. Anything that changes their meaning must be in here.
 
