@@ -6,7 +6,7 @@ It is a separate process that each person runs for themselves, `shardmesh assist
 
 ## Quick start
 
-Steps 2 to 7 were run in this order on Windows, from outside the repository, against a real model on a real mesh. It needs a model to talk to, and any OpenAI-compatible server will do in place of the mesh.
+Steps 2 to 7 were run in this order on Windows, from outside the repository, against a real model on a real mesh, with `--port` and limits on CPU and memory added to `up`. It needs a model to talk to, and any OpenAI-compatible server will do in place of the mesh.
 
 **1. Install it,** from a checkout of this repository. It fetches `setuptools` 69 or later to build, if you have an older one. This step alone was not run as written: the machine had an older `setuptools` and no downloading was allowed, so the same files were copied by the rules in `pyproject.toml`.
 
@@ -20,13 +20,13 @@ python -m pip install .
 shardmesh up --gguf-dir FOLDER --no-browser
 ```
 
-Once it says it is up, load a model by its file name, from the second terminal or from the chat page `up` printed. Point `SHARDMESH_POOL_TOKEN_FILE` at `admin.key` first, which keeps the key off the command line. In PowerShell that is `$env:SHARDMESH_POOL_TOKEN_FILE = "ADMIN_KEY_FILE"` on a line of its own. A 0.6B model took about 20 seconds.
+Give it about 10 seconds after it says it is up, then load a model by its file name, from the second terminal or from the chat page `up` printed. Point `SHARDMESH_POOL_TOKEN_FILE` at `admin.key` first, which keeps the key off the command line. In PowerShell that is `$env:SHARDMESH_POOL_TOKEN_FILE = "ADMIN_KEY_FILE"` on a line of its own.
 
 ```sh
 SHARDMESH_POOL_TOKEN_FILE=ADMIN_KEY_FILE shardmesh load Qwen3-0.6B-Q8_0.gguf --url http://127.0.0.1:8209
 ```
 
-Do not use `up --model` for this yet. It asks once while the node is still starting, is told `no coordinator yet`, and does not ask again, so no model loads.
+`Load refused: no coordinator yet` means it was too soon, so run it again. `up` says it is up about 9 seconds before it can take a load. That is also why `up --model` does not work yet: it asks once at that moment, is refused, and does not ask again, so no model loads.
 
 **3. Add it as a provider.** The assistant holds only the path to the key, never the key. The mesh's address is the one `up` printed.
 
@@ -58,7 +58,7 @@ shardmesh assistant why
 shardmesh assistant audit --limit 10
 ```
 
-Look for `used files.read` at the end of the reply. A small model sometimes skips the tool and makes up what the file says, in the same confident words, and that line is how you tell. [Here is how often.](#how-a-small-model-does)
+Look for `used files.read` at the end of the reply. A small model sometimes skips the tool and makes up what the file says, in the same confident words, and without that line the file was not read on that turn. [Here is how often.](#how-a-small-model-does)
 
 `why` shows what the model saw, and `audit` shows every decision the broker made. What it read is marked as outside text, so from then on that conversation cannot use a grant for anything with consequences without asking you. `approvals list` shows what is waiting, and `approvals approve ID` then `resume TURN` carries on.
 
@@ -1192,7 +1192,7 @@ This is Qwen3-0.6B at Q8, on 2 CPU threads, on a mesh of one, with everything re
 | Recalling in a new session | 4 of 5, saying "What I keep on my roof are bees". The fifth invented plants and flowers |
 | Reading a file, offered one tool | 8 of 10 read the right file through the broker and answered from it, at a median of 6.1 s |
 | Reading a file, offered two tools | 5 of 10, from the same request with `files.write` granted as well |
-| What it said when it did not read | Every miss, in both tests, said it had read the file and made up what was in it. A miss shows no `used files.read`, and that line is the only sign |
+| What it said when it did not read | Every miss, in both tests, said it had read the file and made up what was in it. No `used files.read` means the file was not read on that turn: the reply is invented, or repeats a memory of an earlier read, and `why` shows which |
 | Reading, then writing, in one request | 0 of 5. It says what it will do, and stops. No tool ran, so nothing was held for approval either |
 | Writing a plan | 2 of 3 passed software's checks, at 171 and 199 s. The third was refused after 376 s, as it never wrote complete JSON. An earlier run had all three refused. Passing means well formed, and not good: both plans used `shell.run`, which was not granted, and one had the command `shell.run` and a path. They would stop at `missing_grants`, and nothing ran |
 | Running a plan a person wrote | Finished in 1.2 s, including a model step and a mechanical check that passed |
