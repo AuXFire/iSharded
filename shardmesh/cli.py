@@ -213,8 +213,12 @@ def run_net(args: argparse.Namespace) -> int:
         response = httpx.post(args.url.rstrip("/") + "/access/entries", json=sign_vouch(args.dir, args.name), timeout=30.0)
         print(f"Vouched for {args.name}." if response.status_code < 400 else f"Refused: {response.text}")
         return 0 if response.status_code < 400 else 1
-    method = httpx.post if args.net_command == "block" else httpx.delete
     headers = {"Authorization": f"Bearer {args.pool_token}"} if args.pool_token else {}
+    if args.net_command == "show":
+        response = httpx.get(args.url.rstrip("/") + "/admin/network", headers=headers, timeout=30.0)
+        print(json.dumps(response.json(), indent=2) if response.status_code < 400 else f"Refused: {response.text}")
+        return 0 if response.status_code < 400 else 1
+    method = httpx.post if args.net_command == "block" else httpx.delete
     response = method(f"{args.url.rstrip('/')}/admin/nodes/{args.name}/revoke", headers=headers, timeout=30.0)
     print(f"Done: {args.net_command} {args.name}." if response.status_code < 400 else f"Refused: {response.text}")
     return 0 if response.status_code < 400 else 1
@@ -433,6 +437,10 @@ def build_parser() -> argparse.ArgumentParser:
     vouch.add_argument("--dir", required=True, help="this node's identity folder")
     vouch.add_argument("--url", default="http://127.0.0.1:8000", help="any node's control address")
     vouch.set_defaults(handler=run_net)
+    show = net_commands.add_parser("show", help="this node's view: who it accepts, blocks, and can see")
+    show.add_argument("--url", default="http://127.0.0.1:8000", help="this node's control address")
+    show.add_argument("--token", "--pool-token", dest="pool_token", default=load_token(), help="a key for this node")
+    show.set_defaults(handler=run_net)
     for name, text in (("block", "stop this node dealing with another; only this node is affected"), ("unblock", "undo a block on this node")):
         change = net_commands.add_parser(name, help=text)
         change.add_argument("name", help="the node to block or unblock")

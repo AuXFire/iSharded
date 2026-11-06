@@ -1913,6 +1913,7 @@ class Orchestrator:
             "quorum": commons.policy["quorum"],
             "accepted": sorted(members) if members is not None else None,
             "blocked": sorted(self.access.revoked),
+            "peers": sorted(self.mesh.alive()) if self.mesh else [],
         }
 
     def memory_summary(self) -> dict[str, dict[str, int]]:
@@ -2163,7 +2164,7 @@ async def forward_to_coordinator(request: Request, call_next: Any) -> Any:
         # httpx would resolve these, turning a forwarded path into any other.
         return JSONResponse(status_code=400, content={"detail": "bad path"})
     serves_locally = path.startswith("/v1/") and bool(runtime.route)
-    own_choice = path == "/admin/invites" or (runtime.access.ownerless and (path.startswith("/admin/keys") or path.endswith("/revoke")))
+    own_choice = path in {"/admin/invites", "/admin/network"} or (runtime.access.ownerless and (path.startswith("/admin/keys") or path.endswith("/revoke")))
     if mesh is None or mesh.is_leader or serves_locally or own_choice or not path.startswith(FORWARDED_PATHS):
         return await call_next(request)
     target = mesh.leader_url
@@ -2650,6 +2651,16 @@ async def status(authorization: str | None = Header(default=None)) -> dict[str, 
     verify_user(authorization)
     await runtime.refresh_worker_metrics()
     return runtime.status()
+
+
+@app.get("/admin/network")
+async def network_view(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """This node's own view of a network nobody owns, which /admin/status, from the coordinator, is not."""
+    verify_user(authorization)
+    view = runtime.network_view()
+    if view is None:
+        raise HTTPException(status_code=404, detail="this network has an owner; see /admin/status")
+    return view
 
 
 @app.get("/admin/inventory")

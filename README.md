@@ -677,6 +677,7 @@ For a [network nobody owns](#a-network-nobody-owns).
 |---|---|
 | `shardmesh net init --dir DIR` | Make this node's identity. `--joining` is `open` or `vouched`, `--quorum` is the vouches a node needs, and `--trust NAME` accepts a node from the start |
 | `shardmesh net vouch NAME --dir DIR --url URL` | Say this node accepts another |
+| `shardmesh net show --url URL --token KEY` | This node's own view: who it accepts, blocks, and can see |
 | `shardmesh net block NAME --url URL --token KEY` | Stop this node dealing with another. Only this node is affected |
 | `shardmesh net unblock NAME --url URL --token KEY` | Undo that |
 
@@ -829,6 +830,7 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `DELETE` | `/admin/lanes/{name}` | Admin key | Stop a lane and free its memory on every node |
 | `POST` | `/admin/invites` | Admin key | Make a code that adds a machine. Takes `uses` and `hours`, and only the machine that made the mesh can |
 | `GET` | `/join/authority` | None | The mesh's public certificate, for a new machine to check against its invite |
+| `GET` | `/admin/network` | User key | In a network nobody owns, this node's own view. `/admin/status` shows the coordinator's |
 | `GET` | `/admin/inventory` | User key | Each node's system, disks, GPU temperature and power, load, battery, and round trip from this node, where the machine reports them |
 | `DELETE` | `/admin/nodes/{name}/revoke` | Admin key | In a network nobody owns, undo this node's block on another |
 | `POST` | `/admin/rebalance` | Admin key | Reconsider all live workers and apply a new layout |
