@@ -1207,7 +1207,7 @@ The number of guesses adapts as a reply goes, up to `draft_tokens`, because code
 
 ### Conversation reuse
 
-The same tokens are computed once per stage and reused. Every stage saves its state in two places: where a chat's system prompt and tool list end, which other conversations share, and where its settled history ends, which is where the conversation picks up next turn. If a prompt starts with exactly those tokens, stages restore the state and process only what is new. Anything else, such as an edited history, reads the whole prompt. This covers GGUF models.
+The same tokens are computed once per stage and reused. Every stage saves its state in two places: where a chat's system prompt and tool list end, which other conversations share, and where its settled history ends, which is where the conversation picks up next turn. If a prompt starts with exactly those tokens, stages restore the state and process only what is new. An image counts as tokens, by a digest of its bytes, so the same words about a different image share nothing past that image. Anything else, such as an edited history, reads the whole prompt. Plain text sent to `/v1/completions` has no turns to go by, so it is saved once two prompts turn out to share 512 tokens or more, and a third can reuse them. This covers GGUF models.
 
 A state holds attention and recurrent state alike, so this works on hybrid models. A hybrid model can only resume where a state was saved, because recurrent state cannot be cut back to an earlier token. llama.cpp's own sequence copy is not used: copying part of a sequence aborts a stage process, and on a shared cache it leaves a hybrid model with the wrong recurrent state and no error.
 
@@ -1224,7 +1224,18 @@ States also carry a conversation through failures, at the same places:
 
 Nothing waits for a copy. A newer turn replaces one still queued, so a slow link falls behind and does not back up. A copy that is missing, late, or damaged means reading the prompt, so the worst case is the cost of having no cache. Copies are full states, and sending less is not built. States under 256 tokens are not copied, because reading them again costs less.
 
-`--no-prompt-cache` on a load turns all of this off. `--kv-type q8_0` keeps attention KV in 8 bits.
+`--no-prompt-cache` on a load turns all of this off.
+
+`--kv-type q8_0` keeps attention KV in 8 bits, which takes 47% less memory. It stays off by default, because it changes replies and was slower here. Use it when memory is what limits you. Measured on CPU, with no GPU, over about 1,000 tokens of real text:
+
+| | Qwen3-0.6B, `f16` to `q8_0` | Qwen3.5-0.8B, `f16` to `q8_0` |
+|---|---|---|
+| KV per token | 114,700 to 60,940 bytes | 12,312 to 6,552 bytes |
+| Saved state | 117 to 62 MB | 33 to 27 MB, as recurrent state stays full size |
+| Reading the prompt | 7.2 to 12.5 s | 7.8 to 8.6 s |
+| Tokens per second | 21.3 to 18.2 | 22.1 to 22.3 |
+| Same next token, given the same text | 148 of 150 | 143 of 150 |
+| A greedy reply of 120 tokens | All the same | Differs from token 71 |
 
 ### Several conversations at once
 

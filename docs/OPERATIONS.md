@@ -68,6 +68,28 @@ The rule is that a failure or a pool change must not drop a reply, and that weig
 
 A reply is lost when the node a client is connected to dies, because that node holds the connection. The chat page restarts the reply through another mesh node when that happens, and says so. API clients should do the same.
 
+## Saved prompt states
+
+Stages save what they computed for a prompt, at the end of a chat's system prompt and at the end of its settled history. [Conversation reuse](../README.md#conversation-reuse) says what that does. This is how to run it.
+
+**Reading the saving.** `metrics.cache` in `/admin/status` has `saved_percent`, and `/metrics` has `prompt_tokens_computed_total` and `prompt_tokens_reused_total`. `worker_tokens_reused_total` says where each token came from: `prefix` or `history`, then `ram`, `disk`, or `copy`. A `copy` means a stage took over from one that was lost.
+
+**Sizing it.** A state holds every token up to where it was saved, for one stage's layers:
+
+| Model | Per token | Fixed | State at 4,000 tokens, all stages |
+|---|---|---|---|
+| Qwen3-0.6B, measured | 114,700 bytes | None | 459 MB |
+| Qwen3.5-0.8B, measured | 12,312 bytes | 20 MB | 69 MB |
+| Qwen3.8-27B, worked out from its file, not measured | 65,536 bytes | 157 MB | 419 MB |
+
+A conversation keeps about one state, as each turn replaces the last, and a system prompt shared by many conversations is one more. `--state-ram-gb` and `--state-disk-gb` are per worker. A node also keeps up to `--state-disk-gb` of copies for other stages, so count that twice. States leave 2 GiB of a disk free, as a model's cache does, and past that they stay in RAM only.
+
+**What a copy costs.** Each turn that saves a state sends all of it to one other node, at up to `--state-copy-mb`. Sending only what changed is not built. At the default 10 MB per second, a stage's share of a 400 MB state takes about 20 s, so turns faster than that fall behind: a newer state replaces a queued one, and recovery uses whatever arrived. Lower the rate if a link is shared with tokens. `--state-copy-mb 0` sends none, and a lost node then costs a full reread. Copy traffic is `worker_state_copy_bytes_total`.
+
+**When a copy does not help.** A stage only fetches a copy when it took over the same layers, so that needs a spare: a node outside the route that can hold them. With no spare, the survivors split the layers differently, and the prompt is read in full. On a slow link, fetching a copy can also take longer than reading the prompt on a fast GPU. A reply waits up to 30 s for a fetch and then reads the prompt instead.
+
+**What gets deleted.** Stages delete states when the model or their layers change, and copies go when no stage runs those layers. Nothing deletes a conversation's states when it ends. See [Saved conversations](SECURITY.md#saved-conversations).
+
 ## Planned maintenance
 
 To take a node out of service:
