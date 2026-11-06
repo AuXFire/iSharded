@@ -6,14 +6,14 @@ iSharded runs language models across a mesh of many computers, using whatever me
 
 It works on a closed network, a LAN, across VLANs, over Tailscale, or between remote machines with TLS. The API follows OpenAI's, so existing clients only need a new URL and key.
 
-This is execution sharding, not simulated work distribution: each token really crosses every machine in the route. It is built to grow to many nodes. So far it has been tested on two machines, and [Scaling to many nodes](#scaling-to-many-nodes) separates what is proven from what comes next. Its security has been reviewed by AI only, not by a person. [Current limits](#current-limits) says what that means for you.
+This is execution sharding, not simulated work distribution: each token really crosses every machine in the route. It is built to grow to many nodes. The largest run so far is seven machines in four countries, and [Scaling to many nodes](#scaling-to-many-nodes) separates what is proven from what comes next. Its security has been reviewed by AI only, not by a person. [Current limits](#current-limits) says what that means for you.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/dashboard-dark.png">
-  <img alt="The dashboard, on simulated data: a model's layers across six machines, pool metrics, the route's stages, and what needs attention." src="docs/screenshots/dashboard-light.png">
+  <img alt="The dashboard on a real mesh: a 235B model's 94 layers in VRAM across seven machines, with each stage's country, memory, and compute time." src="docs/screenshots/dashboard-light.png">
 </picture>
 
-*The dashboard, showing simulated data. [More of the console](#chat-page-and-dashboard).*
+*The dashboard on a real seven-machine mesh, serving a 235B model from VRAM alone. [More of the console](#chat-page-and-dashboard).*
 
 ## Contents
 
@@ -243,7 +243,7 @@ With certificates, the pool token stops working. Use your admin key, in the chat
 
 The diagrams use the same line colors throughout: solid blue-green for a reply's data, dashed violet for control messages, and pink for anything signed by the owner.
 
-These diagrams show what is built. Measured figures come from the test pool, which is two machines so far.
+These diagrams show what is built. Measured figures come from the two-machine test pool unless they say otherwise.
 
 ### Two networks in one
 
@@ -331,7 +331,7 @@ See [A network nobody owns](#a-network-nobody-owns) to run one. To redraw these 
 
 ## Scaling to many nodes
 
-iSharded is meant to run on many machines, not two. Two is only how many it has been tested on so far. Every node runs the same software, any node can coordinate, and a new node joins by naming any node already running, so nothing in how a mesh forms stops at two.
+iSharded is meant to run on many machines. Seven is the most it has run on so far. Every node runs the same software, any node can coordinate, and a new node joins by naming any node already running, so nothing in how a mesh forms stops at seven.
 
 What more nodes give you:
 
@@ -339,7 +339,7 @@ What more nodes give you:
 |---|---|---|
 | Bigger models | Each node holds only its share, so the limit is the mesh's total memory | Built |
 | More models at once | Each model runs in its own [lane](#several-models-at-once) | Built |
-| Survival | Any node can coordinate, serve the API, or take over a lost stage | Built, tested on two machines |
+| Survival | Any node can coordinate, serve the API, or take over a lost stage | Built, tested on seven machines |
 | More replies at once | Several routes for one model, across separate groups of nodes | Next |
 | A faster single reply | It does not: every token crosses every stage, so a longer route is a slower one | Keep routes short with `--placement compact` |
 
@@ -350,24 +350,50 @@ So a large mesh should run many short routes side by side, not one long one. Tha
 | Gossip | Every node contacts every other every 3 s, so messages grow with the square of the node count | Contact a few peers per round, with liveness spreading through them |
 | Worker check-ins | Each worker checks in with every control plane every 5 s | Check in with a few, and let gossip carry the rest |
 | Routes | One route per lane, so one model's capacity is one route's | Several routes per model, with requests spread across them |
-| Placement | A fixed cost per hop | Use measured latency between nodes, so a route stays among close neighbours. Each node already measures this |
+| Placement | Every pair of workers is timed before a load, for up to 30 s, and routes follow those times | Time a sample of neighbours once a mesh is too large to time every pair |
 | Splits | Each side of a split elects a coordinator | With three or more nodes, let only the majority side coordinate |
 | Memory | A lane's share is fixed when it starts | Share memory between lanes as load changes |
 
-None of this has been measured past two machines, so the first milestone is a real mesh of more. If you have spare machines, running a node is the most useful test you can give it.
+None of this has been measured past seven machines. If you have spare machines, running a node is the most useful test you can give it.
+
+### Measured across data centers
+
+Seven machines ran Qwen3-235B-A22B Instruct at Q6_K, 180 GiB and 94 layers, over TLS. Five were rented GPUs in the United States, Canada, Sweden, and Romania: three A40s, an RTX PRO 4000, and a 24 GB slice of an RTX PRO 6000. Two were at home behind relays: a laptop RTX 3060 and a desktop RX 7900 XT. That mixed CUDA on Linux and Windows with ROCm on Windows, and the final plan held every layer in VRAM.
+
+| What | Result |
+|---|---|
+| One reply | 1.26 tokens/s, 794 ms a token, of which 81 ms was compute |
+| One reply with a 0.6B draft | 1.9 to 2.4 tokens/s |
+| Four replies at once, `--parallel 4` | 5.37 tokens/s in all, against 1.03 at `--parallel 1`. Each reply ran at about 1.8 |
+| First token, prompt seen before | 0.8 to 1.0 s |
+| First token, new short prompt | 5 to 8 s |
+| First token, new prompt of about 3,400 tokens | 25 s |
+| Reloading a model already on every disk | 64 s |
+| A node choosing where to fetch from | 192 MB/s from a neighbour against 29 MB/s from the model host. Another went from 16 to 103 MB/s by using both |
+| A stage's engine killed mid-reply | The reply paused 10 s and finished correctly |
+| A stage frozen silently for 45 s mid-reply | The reply paused 48 s and finished correctly |
+| A worker process killed mid-reply | The reply paused 76 s and finished correctly, on the same layout |
+
+Across cities, speed comes from the links. Each hop cost its full round trip plus about 10 ms, because a stage waits for the next stage's answer, so the 794 ms above was almost all network. That has three consequences:
+
+- A draft pays for itself, because a pass costs the same whether it carries one token or several.
+- `--parallel` is the biggest lever for a shared mesh, because replies fill the stages that would otherwise wait.
+- Route order matters more than any GPU. The route in this run was chosen without measured links. Planning now uses them, and that has been tested only in code, not on a real mesh.
+
+Two limits showed here. Why a new short prompt takes 5 to 8 s has not been explained: it did not improve when RAM spill was removed, and one suspect is TCP starting slowly on idle long-distance links. The mesh also ran for only about two hours, in rented cloud GPUs, and its largest stage failures were one at a time.
 
 ## Using a pool
 
 ### Chat page and dashboard
 
-Every node serves a chat page at `/chat` and a console at `/dashboard`. These screenshots show the real pages with simulated data, because no mesh this size has run yet. Each page shows what it does today, and none of these figures are measurements.
+Every node serves a chat page at `/chat` and a console at `/dashboard`. The chat page below and the dashboard at the top of this page are from the [seven-machine mesh](#measured-across-data-centers). Their speed estimates are the planner's, from before it used measured links, so go by the measured figures in that section.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/chat-dark.png">
   <img alt="The chat page: a reply with its speed, and the stages it ran on." src="docs/screenshots/chat-light.png">
 </picture>
 
-The console is built to stay readable at 60 workers, grouping them by state so what needs you comes first:
+The console is built to stay readable at 60 workers, grouping them by state so what needs you comes first. No mesh this size has run yet, so this view uses simulated data:
 
 ![The dashboard with 60 simulated workers, marked as simulated at the top of the page.](docs/screenshots/dashboard-60-workers.png)
 
@@ -1412,7 +1438,9 @@ Each pool reports its budget, free space, precision, and measured bandwidth. The
 - Never spends the same physical memory twice, whether two workers share a host's RAM or a GPU shares it through unified memory.
 - Promotes standby workers only when a model does not fit without them.
 
-Hybrid Qwen GGUF models can only start a stage on a multiple of 4 layers, so a card takes whole blocks and the rest of it can go unused. If a worker also offers RAM, a stage can be larger than its card: its layers stay whole, and routed experts sit in that worker's RAM one layer's worth at a time. For these models the planner tries every order through up to 10 workers, and takes the plan with the least spill unless that is over 10% slower by its estimate. A plan from `POST /admin/plan` has a `memory` field, with what each pool was offered and what the plan used, spilled, and left unused.
+Hybrid Qwen GGUF models can only start a stage on a multiple of 4 layers, so a card takes whole blocks and the rest of it can go unused. If a worker also offers RAM, a stage can be larger than its card: its layers stay whole, and routed experts sit in that worker's RAM one layer's worth at a time. For these models the planner tries every order through up to 8 workers.
+
+For any model, VRAM comes first: a layer goes to RAM only when no worker has room for a whole layer in the VRAM it offered, and that ranks above speed and download time. A plan from `POST /admin/plan` has a `memory` field, with what each pool was offered and what the plan used, spilled, and left unused, and `memory.stages` gives each stage's spill.
 
 The ends of the pipeline are not equal: the exit reads the whole output head for every token, while the entry reads one embedding row. So the planner tries every order through the workers and keeps the fastest (up to four workers exhaustively, then a sample of orders). Pin the ends with `--entry` and `--exit`, or in the chat page's picker, for example to keep prompts and replies on a machine you trust. Only the entry sees prompt tokens and only the exit sees generated tokens, though activations passing through other stages can still reveal information. One worker pinned to both ends runs the whole model. If a pinned worker is lost, recovery drops the pin and logs it.
 
@@ -1701,7 +1729,7 @@ Adapter tests compare every family with the reference `transformers` implementat
 
 Trust and status:
 
-- Two machines is the most this has run on, so everything about larger meshes is design, not measurement. Runs of three nodes were all on one machine. See [Scaling to many nodes](#scaling-to-many-nodes). The longest test ran under an hour. No human has audited it, and reviews by AI do not show it is free of flaws.
+- Seven machines is the most this has run on, for about two hours, so everything about larger meshes is design, not measurement. See [Scaling to many nodes](#scaling-to-many-nodes). The longest continuous soak ran under an hour. No human has audited it, and reviews by AI do not show it is free of flaws.
 - A node in the route can read prompts. It can return wrong answers too: [checking answers](#checking-answers) catches a route that disagrees with others, but not one that only misbehaves when it is not being tested, and it has been measured only with every route on one machine. Certificates limit who is in a pool. They do not make a hostile member safe.
 - An owned network has an owner.
 - A network nobody owns passed 27 of 27 checks on real processes, but as three nodes on one machine, not between strangers. Identities are free, so `--joining open` lets one person run many nodes, and a low name can be ground out to win coordination. A coordinator can stall a route. Traffic is not encrypted, so run it over a network that is, such as Tailscale. Use `--joining vouched` with a quorum unless you accept all of that.

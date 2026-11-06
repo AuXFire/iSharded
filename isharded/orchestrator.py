@@ -36,7 +36,7 @@ from .lanes import LaneDoor
 from .mcp_server import INVALID_REQUEST, McpHandler, MeshTools, RpcError, answer_http
 from .mesh import GOSSIP_SECONDS, ControlMesh
 from .models import Adapter, GgufAdapter, SUPPORTED_TYPES, UnsupportedModel, create_adapter
-from .planner import AMORTIZE_TOKENS, HOP_MS, UNREACHABLE_LINK_MS, Candidate, ModelProfile, PlacementError, keep_layers, link_ms, memory_report, plan_placement
+from .planner import AMORTIZE_TOKENS, UNREACHABLE_LINK_MS, Candidate, ModelProfile, PlacementError, keep_layers, link_ms, memory_report, plan_placement
 from .protocol import (
     hosts_model,
     pass_seconds,
