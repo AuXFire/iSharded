@@ -1,4 +1,4 @@
-"""Build a deterministic, offline GPT-2 model for ShardMesh smoke tests."""
+"""Build a deterministic, offline GPT-2 model for iSharded smoke tests."""
 
 from __future__ import annotations
 

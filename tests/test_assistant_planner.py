@@ -6,11 +6,11 @@ import json
 
 import pytest
 
-from shardmesh.assistant import cli
-from shardmesh.assistant import planner as planner_part
-from shardmesh.assistant.app import Assistant
-from shardmesh.assistant.contracts import Capability, Effect, ModelReply, Reach
-from shardmesh.assistant.planner import MAX_ASKS, PlanRejected, parse_reply, triage
+from isharded.assistant import cli
+from isharded.assistant import planner as planner_part
+from isharded.assistant.app import Assistant
+from isharded.assistant.contracts import Capability, Effect, ModelReply, Reach
+from isharded.assistant.planner import MAX_ASKS, PlanRejected, parse_reply, triage
 
 
 class ScriptedRouter:
@@ -258,7 +258,7 @@ def test_missing_grants_are_listed_up_front(assistant):
     listed = {entry["capability"]: entry for entry in plan["missing_grants"]}
     assert listed["files.read"]["steps"] == ["a", "b"] and listed["files.read"]["scope"] == "/data/x"
     assert listed["files.write"]["effects"] == ["write_local"]
-    assert listed["files.read"]["command"] == "shardmesh assistant grant add files.read /data/x --user ann"
+    assert listed["files.read"]["command"] == "isharded assistant grant add files.read /data/x --user ann"
 
 
 def test_what_is_already_granted_is_not_listed(assistant, tmp_path):
@@ -400,7 +400,7 @@ def test_the_plan_command_writes_a_plan_the_engine_accepts(tmp_path, capsys, mon
     home, out = tmp_path / "home", tmp_path / "plan.json"
     assert command(home, "plan", "Read the file", "--user", "ann", "--out", str(out)) == 0
     shown = capsys.readouterr().out
-    assert "Small enough to run directly" in shown and "Missing: shardmesh assistant grant add files.read" in shown
+    assert "Small enough to run directly" in shown and "Missing: isharded assistant grant add files.read" in shown
     assert command(home, "task", "run", str(out), "--detach") == 0
 
 

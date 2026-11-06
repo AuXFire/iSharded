@@ -15,9 +15,9 @@ from typing import Any
 
 import pytest
 
-from shardmesh.assistant.app import Assistant
-from shardmesh.assistant.cli import add_arguments
-from shardmesh.assistant.coder import (
+from isharded.assistant.app import Assistant
+from isharded.assistant.cli import add_arguments
+from isharded.assistant.coder import (
     COMMITTED,
     PROPOSING,
     PUSHED,
@@ -34,7 +34,7 @@ from shardmesh.assistant.coder import (
     safe_path,
     slug_of,
 )
-from shardmesh.assistant.contracts import (
+from isharded.assistant.contracts import (
     Capability,
     Decision,
     Effect,
@@ -606,7 +606,7 @@ def test_a_write_through_a_symlink_is_refused(assistant, repo, tmp_path):
 
 
 def test_a_tool_call_from_the_model_is_ignored(assistant, repo):
-    from shardmesh.assistant.contracts import ToolCall
+    from isharded.assistant.contracts import ToolCall
 
     class Scheming(ScriptedRouter):
         def complete(self, request: Any) -> ModelReply:
@@ -706,7 +706,7 @@ NODE = """
 import sys
 sys.path.insert(0, sys.argv[1])
 import test_assistant_coder as helpers
-from shardmesh.assistant.app import Assistant
+from isharded.assistant.app import Assistant
 
 class Dying(helpers.ProcessSandbox):
     def run(self, command, workdir, **kwargs):
@@ -914,29 +914,29 @@ def test_an_unclosed_block_is_not_a_change():
     assert parse_changes("<<<FILE a.py\nx = 1\n>>>FILE\n<<<FILE b.py\ny = 2\n") == [FileChange("a.py", "x = 1\n")]
 
 
-# ShardMesh itself
+# iSharded itself
 
 
 @pytest.fixture
-def shardmesh_repo(tmp_path) -> Path:
-    folder = tmp_path / "shardmesh-checkout"
-    (folder / "shardmesh" / "assistant").mkdir(parents=True)
+def isharded_repo(tmp_path) -> Path:
+    folder = tmp_path / "isharded-checkout"
+    (folder / "isharded" / "assistant").mkdir(parents=True)
     git(folder, "init", "-q", "-b", "main")
     git(folder, "config", "core.autocrlf", "false")
-    (folder / "pyproject.toml").write_bytes(b'[project]\nname = "shardmesh"\n')
-    (folder / "shardmesh" / "orchestrator.py").write_bytes(b"VERSION = 1\n")
-    (folder / "shardmesh" / "assistant" / "skills.py").write_bytes(b"LIMIT = 1\n")
+    (folder / "pyproject.toml").write_bytes(b'[project]\nname = "isharded"\n')
+    (folder / "isharded" / "orchestrator.py").write_bytes(b"VERSION = 1\n")
+    (folder / "isharded" / "assistant" / "skills.py").write_bytes(b"LIMIT = 1\n")
     (folder / "test_version.py").write_bytes(b"def test_version():\n    assert 2 == 2\n")
     git(folder, "add", "-A")
     git(folder, "commit", "-q", "-m", "Start")
     return folder
 
 
-def test_shardmesh_itself_gets_a_branch_tests_and_a_written_plan(assistant, shardmesh_repo):
-    change = "<<<FILE shardmesh/orchestrator.py\nVERSION = 2\n>>>FILE\n"
+def test_isharded_itself_gets_a_branch_tests_and_a_written_plan(assistant, isharded_repo):
+    change = "<<<FILE isharded/orchestrator.py\nVERSION = 2\n>>>FILE\n"
     assistant.router = ScriptedRouter([change])
-    before = snapshot(shardmesh_repo)
-    run = assistant.coder.start(shardmesh_repo, "Raise the version")
+    before = snapshot(isharded_repo)
+    run = assistant.coder.start(isharded_repo, "Raise the version")
 
     assert run.state == READY and run.branch == "assistant/raise-the-version"
     assert run.note
@@ -945,16 +945,16 @@ def test_shardmesh_itself_gets_a_branch_tests_and_a_written_plan(assistant, shar
     assert "nodes and the orchestrator" in run.note
     assert (run.folder / "HEALTH_AND_ROLLBACK.md").read_text(encoding="utf-8") == run.note
     assert "HEALTH_AND_ROLLBACK" not in assistant.coder.show(run.id)["diff"]  # the plan is not part of the change
-    assert snapshot(shardmesh_repo) == before
+    assert snapshot(isharded_repo) == before
 
 
-def test_a_change_to_the_assistant_alone_says_so(assistant, shardmesh_repo):
-    assistant.router = ScriptedRouter(["<<<FILE shardmesh/assistant/skills.py\nLIMIT = 2\n>>>FILE\n"])
-    run = assistant.coder.start(shardmesh_repo, "Raise the limit")
-    assert "only `shardmesh assistant`" in run.note
+def test_a_change_to_the_assistant_alone_says_so(assistant, isharded_repo):
+    assistant.router = ScriptedRouter(["<<<FILE isharded/assistant/skills.py\nLIMIT = 2\n>>>FILE\n"])
+    run = assistant.coder.start(isharded_repo, "Raise the limit")
+    assert "only `isharded assistant`" in run.note
 
 
-def test_shardmesh_is_never_deployed_or_restarted(assistant, shardmesh_repo, monkeypatch):
+def test_isharded_is_never_deployed_or_restarted(assistant, isharded_repo, monkeypatch):
     commands: list[list[str]] = []
     real_run = subprocess.run
 
@@ -963,8 +963,8 @@ def test_shardmesh_is_never_deployed_or_restarted(assistant, shardmesh_repo, mon
         return real_run(command, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", recording_run)
-    assistant.router = ScriptedRouter(["<<<FILE shardmesh/orchestrator.py\nVERSION = 2\n>>>FILE\n"])
-    run = assistant.coder.approve(assistant.coder.start(shardmesh_repo, "Raise the version").id)
+    assistant.router = ScriptedRouter(["<<<FILE isharded/orchestrator.py\nVERSION = 2\n>>>FILE\n"])
+    run = assistant.coder.approve(assistant.coder.start(isharded_repo, "Raise the version").id)
 
     assert run.state == COMMITTED
     assert [capability for capability, _, _ in assistant.broker.calls] == ["git.commit"]
@@ -981,7 +981,7 @@ def test_a_project_merely_named_like_it_gets_none(assistant, tmp_path):
     folder = tmp_path / "other"
     folder.mkdir()
     git(folder, "init", "-q", "-b", "main")
-    (folder / "pyproject.toml").write_bytes(b'[project]\nname = "not-shardmesh"\n')
+    (folder / "pyproject.toml").write_bytes(b'[project]\nname = "not-isharded"\n')
     (folder / "test_x.py").write_bytes(b"def test_x():\n    assert True\n")
     git(folder, "add", "-A")
     git(folder, "commit", "-q", "-m", "x")

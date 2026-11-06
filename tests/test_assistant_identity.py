@@ -7,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from shardmesh.assistant import identity as identity_module
-from shardmesh.assistant.app import Assistant
-from shardmesh.assistant.cli import add_arguments, run
+from isharded.assistant import identity as identity_module
+from isharded.assistant.app import Assistant
+from isharded.assistant.cli import add_arguments, run
 
 
 @pytest.fixture

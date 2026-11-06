@@ -11,17 +11,17 @@ from jinja2.exceptions import TemplateError
 from pydantic import ValidationError
 import pytest
 
-from shardmesh import orchestrator as orchestrator_module
-from shardmesh import worker as worker_module
-from shardmesh.access import ROLE_ADMIN, ROLE_NODE, ROLE_USER, AccessControl, node_of
-from shardmesh.llamacpp import TokenEmbedding
-from shardmesh.mesh import RUMOR_SECONDS, ControlMesh, clean_url
-from shardmesh.orchestrator import FORWARD_MARK, Orchestrator, verify_worker_name
-from shardmesh.pool import ExposedPool, check_exposure
-from shardmesh.protocol import ChatCompletionRequest, CompletionRequest, DraftModel, TensorRef
-from shardmesh.tls import PEER
-from shardmesh.tokenizer import template_json
-from shardmesh.weights import UnitCache
+from isharded import orchestrator as orchestrator_module
+from isharded import worker as worker_module
+from isharded.access import ROLE_ADMIN, ROLE_NODE, ROLE_USER, AccessControl, node_of
+from isharded.llamacpp import TokenEmbedding
+from isharded.mesh import RUMOR_SECONDS, ControlMesh, clean_url
+from isharded.orchestrator import FORWARD_MARK, Orchestrator, verify_worker_name
+from isharded.pool import ExposedPool, check_exposure
+from isharded.protocol import ChatCompletionRequest, CompletionRequest, DraftModel, TensorRef
+from isharded.tls import PEER
+from isharded.tokenizer import template_json
+from isharded.weights import UnitCache
 
 
 class Clock:
@@ -230,7 +230,7 @@ def test_a_seed_that_would_crash_a_stage_is_refused_at_the_door(model):
 
 def test_a_stage_refusing_a_request_costs_nobody_their_place():
     from test_resilience import pool, record, stage
-    from shardmesh.orchestrator import SessionState
+    from isharded.orchestrator import SessionState
 
     orchestrator = pool(w1=record("w1"))
 
@@ -291,7 +291,7 @@ def test_only_offered_folders_can_be_a_model_source(tmp_path, monkeypatch):
     with pytest.raises(HTTPException) as refused:
         worker_module.verify_source(str(private))
     assert refused.value.status_code == 403
-    monkeypatch.setenv("SHARDMESH_MODEL_DIRS", str(private))
+    monkeypatch.setenv("ISHARDED_MODEL_DIRS", str(private))
     worker_module.verify_source(str(private))
 
 
@@ -307,14 +307,14 @@ def test_a_worker_with_an_authority_ignores_the_token(monkeypatch):
 
 
 def test_credentials_do_not_cross_a_plain_network(monkeypatch):
-    monkeypatch.delenv("SHARDMESH_TLS_CERT", raising=False)
+    monkeypatch.delenv("ISHARDED_TLS_CERT", raising=False)
     with pytest.raises(ExposedPool, match="unencrypted"):
         check_exposure("0.0.0.0", "token", None, False, "http://192.168.1.20:8000")
     check_exposure("0.0.0.0", "token", None, False, "http://192.168.1.20:8000", trusted_network=True)
     check_exposure("0.0.0.0", "token", None, False, "http://100.64.0.2:8300")
     check_exposure("0.0.0.0", "token", None, False, "desktop.tail1234.ts.net")
     check_exposure("0.0.0.0", "token", None, False, "http://127.0.0.1:8100")
-    monkeypatch.setenv("SHARDMESH_TLS_CERT", "node.pem")
+    monkeypatch.setenv("ISHARDED_TLS_CERT", "node.pem")
     check_exposure("0.0.0.0", "token", None, False, "https://192.168.1.20:8000")
 
 
@@ -325,7 +325,7 @@ def test_a_chat_template_cannot_pass_code_to_json():
 
 
 def test_a_chat_template_cannot_reach_the_process_through_tojson():
-    from shardmesh.tokenizer import ChatTokenizer as Holder
+    from isharded.tokenizer import ChatTokenizer as Holder
 
     source = '{{ raise_exception|tojson(default="{0.__globals__}".format) }}'
     tokenizer = Holder.__new__(Holder)
@@ -364,8 +364,8 @@ def test_a_page_on_a_dead_node_can_still_fail_over_but_a_revoked_one_cannot():
 
 @pytest.fixture
 def signed_pool(tmp_path):
-    from shardmesh.access import Authority
-    from shardmesh.pool import init_pool
+    from isharded.access import Authority
+    from isharded.pool import init_pool
 
     pytest.importorskip("cryptography")
     folder = init_pool(str(tmp_path / "pool"))
@@ -373,14 +373,14 @@ def signed_pool(tmp_path):
 
 
 def key_entry(name="alice", role="admin", key="smk-test"):
-    from shardmesh.access import digest
+    from isharded.access import digest
 
     return {"type": "key", "name": name, "role": role, "sha256": digest(key)}
 
 
 def test_a_signed_key_spreads_and_works(signed_pool):
-    from shardmesh.access import Authority
-    from shardmesh.pool import sign_entry
+    from isharded.access import Authority
+    from isharded.pool import sign_entry
 
     folder, access = signed_pool
     assert access.add_signed(sign_entry(folder, key_entry()))
@@ -391,7 +391,7 @@ def test_a_signed_key_spreads_and_works(signed_pool):
 
 
 def test_a_compromised_node_cannot_add_a_key_through_gossip(signed_pool):
-    from shardmesh.access import digest
+    from isharded.access import digest
 
     _, access = signed_pool
     forged = {
@@ -406,7 +406,7 @@ def test_a_compromised_node_cannot_add_a_key_through_gossip(signed_pool):
 
 
 def test_an_entry_signed_by_another_authority_is_ignored(signed_pool, tmp_path):
-    from shardmesh.pool import init_pool, sign_entry
+    from isharded.pool import init_pool, sign_entry
 
     _, access = signed_pool
     other = init_pool(str(tmp_path / "other"))
@@ -415,7 +415,7 @@ def test_an_entry_signed_by_another_authority_is_ignored(signed_pool, tmp_path):
 
 
 def test_changing_a_signed_entry_breaks_it(signed_pool):
-    from shardmesh.pool import sign_entry
+    from isharded.pool import sign_entry
 
     folder, access = signed_pool
     signed = sign_entry(folder, key_entry(role="user"))
@@ -424,7 +424,7 @@ def test_changing_a_signed_entry_breaks_it(signed_pool):
 
 
 def test_a_signed_revocation_and_removal_stick(signed_pool):
-    from shardmesh.pool import sign_entry
+    from isharded.pool import sign_entry
 
     folder, access = signed_pool
     held = access.document()
@@ -440,8 +440,8 @@ def test_a_signed_revocation_and_removal_stick(signed_pool):
 
 
 def test_signed_entries_survive_a_restart(signed_pool, tmp_path):
-    from shardmesh.access import Authority
-    from shardmesh.pool import sign_entry
+    from isharded.access import Authority
+    from isharded.pool import sign_entry
 
     folder, _ = signed_pool
     path = tmp_path / "access.json"
@@ -453,7 +453,7 @@ def test_signed_entries_survive_a_restart(signed_pool, tmp_path):
 
 
 def test_with_an_authority_nodes_cannot_change_access_themselves(signed_pool):
-    from shardmesh.access import NeedsAuthority
+    from isharded.access import NeedsAuthority
 
     _, access = signed_pool
     for change in (lambda: access.add_key("x", ROLE_USER), lambda: access.remove_key("x"), lambda: access.revoke_node("x")):
@@ -462,7 +462,7 @@ def test_with_an_authority_nodes_cannot_change_access_themselves(signed_pool):
 
 
 def test_the_api_takes_signed_entries_and_refuses_the_rest(signed_pool, monkeypatch):
-    from shardmesh.pool import sign_entry
+    from isharded.pool import sign_entry
 
     folder, access = signed_pool
     runtime = Orchestrator()
@@ -478,7 +478,7 @@ def test_the_api_takes_signed_entries_and_refuses_the_rest(signed_pool, monkeypa
 
 @pytest.fixture
 def ticket_pool(tmp_path):
-    from shardmesh.pool import add_node, init_pool
+    from isharded.pool import add_node, init_pool
 
     pytest.importorskip("cryptography")
     folder = init_pool(str(tmp_path / "pool"))
@@ -487,14 +487,14 @@ def ticket_pool(tmp_path):
 
 
 def maker(folder, name="node-a", clock=None):
-    from shardmesh.tickets import TicketMaker
+    from isharded.tickets import TicketMaker
 
     options = {"clock": clock} if clock else {}
     return TicketMaker(str(folder / f"{name}.pem"), str(folder / f"{name}.key"), **options)
 
 
 def checker(folder, audiences=("b:1",), clock=None):
-    from shardmesh.tickets import TicketChecker
+    from isharded.tickets import TicketChecker
 
     options = {"clock": clock} if clock else {}
     return TicketChecker(str(folder / "ca.pem"), set(audiences), **options)
@@ -519,7 +519,7 @@ def test_a_ticket_expires(ticket_pool):
 
 
 def test_a_ticket_from_another_authority_is_refused(ticket_pool, tmp_path):
-    from shardmesh.pool import add_node, init_pool
+    from isharded.pool import add_node, init_pool
 
     other = init_pool(str(tmp_path / "other"))
     add_node(str(other), "node-a", ["10.0.0.1"])
@@ -529,7 +529,7 @@ def test_a_ticket_from_another_authority_is_refused(ticket_pool, tmp_path):
 def test_an_altered_ticket_is_refused(ticket_pool):
     import json
 
-    from shardmesh.tickets import PREFIX, _decode, _encode
+    from isharded.tickets import PREFIX, _decode, _encode
 
     ticket = maker(ticket_pool).ticket("b:1")
     body, signature = ticket[len(PREFIX):].split(".")
@@ -550,10 +550,10 @@ def test_a_far_future_ticket_is_refused(ticket_pool):
 
 
 def test_a_ticket_identifies_a_node_to_a_control_plane(ticket_pool, monkeypatch):
-    from shardmesh.tickets import TicketIdentity
+    from isharded.tickets import TicketIdentity
 
-    monkeypatch.setenv("SHARDMESH_CA_FILE", str(ticket_pool / "ca.pem"))
-    monkeypatch.setenv("SHARDMESH_NODE_URL", "http://b:1")
+    monkeypatch.setenv("ISHARDED_CA_FILE", str(ticket_pool / "ca.pem"))
+    monkeypatch.setenv("ISHARDED_NODE_URL", "http://b:1")
     runtime = Orchestrator()
     runtime.mesh = ControlMesh("me", "http://b:1", (), Clock())
     runtime.mesh.leader_id = "me"
@@ -569,10 +569,10 @@ def test_a_ticket_identifies_a_node_to_a_control_plane(ticket_pool, monkeypatch)
 
 
 def test_a_worker_takes_tickets_and_refuses_the_revoked(ticket_pool, monkeypatch):
-    from shardmesh.tickets import TicketIdentity
+    from isharded.tickets import TicketIdentity
 
-    monkeypatch.setenv("SHARDMESH_CA_FILE", str(ticket_pool / "ca.pem"))
-    monkeypatch.setenv("SHARDMESH_ADVERTISE_URL", "http://b:1")
+    monkeypatch.setenv("ISHARDED_CA_FILE", str(ticket_pool / "ca.pem"))
+    monkeypatch.setenv("ISHARDED_ADVERTISE_URL", "http://b:1")
     runtime = SimpleNamespace(pool_token=None, requires_identity=True, revoked_nodes=set())
     monkeypatch.setattr(worker_module, "runtime", runtime)
     seen = {}
@@ -593,7 +593,7 @@ def test_a_worker_takes_tickets_and_refuses_the_revoked(ticket_pool, monkeypatch
 
 
 def test_tickets_leave_a_callers_own_credentials_alone(ticket_pool):
-    from shardmesh.tickets import NodeTickets
+    from isharded.tickets import NodeTickets
 
     auth = NodeTickets(maker(ticket_pool))
     plain = httpx.Request("GET", "http://b:1/x")
@@ -622,9 +622,9 @@ def test_certificate_interception_gets_a_plain_explanation():
 
 
 def test_a_control_plane_cannot_clear_or_invent_a_workers_revocations(signed_pool):
-    from shardmesh.access import Authority
-    from shardmesh.pool import sign_entry
-    from shardmesh.worker import WorkerRuntime
+    from isharded.access import Authority
+    from isharded.pool import sign_entry
+    from isharded.worker import WorkerRuntime
 
     folder, _ = signed_pool
     worker = SimpleNamespace(authority=Authority(folder + "/ca.pem"), revoked_nodes={"bad"})
@@ -637,7 +637,7 @@ def test_a_control_plane_cannot_clear_or_invent_a_workers_revocations(signed_poo
 
 
 def test_without_an_authority_a_workers_revocations_only_add_up():
-    from shardmesh.worker import WorkerRuntime
+    from isharded.worker import WorkerRuntime
 
     worker = SimpleNamespace(authority=None, revoked_nodes={"bad"})
     WorkerRuntime._take_revocations(worker, {"revoked_nodes": []})
@@ -652,10 +652,10 @@ def proof_pool(ticket_pool, signed_access):
 
 
 def test_a_gossip_reply_must_prove_who_sent_it(ticket_pool, monkeypatch):
-    from shardmesh.access import Authority
-    from shardmesh.tickets import reply_audience
+    from isharded.access import Authority
+    from isharded.tickets import reply_audience
 
-    monkeypatch.setenv("SHARDMESH_CA_FILE", str(ticket_pool / "ca.pem"))
+    monkeypatch.setenv("ISHARDED_CA_FILE", str(ticket_pool / "ca.pem"))
     orchestrator = proof_pool(ticket_pool, AccessControl(identities=True, authority=Authority(str(ticket_pool / "ca.pem"))))
     proof = maker(ticket_pool).ticket(reply_audience("http://me:1"))
     assert orchestrator._reply_is_genuine({"node_id": "node-a", "proof": proof})
@@ -667,7 +667,7 @@ def test_a_gossip_reply_must_prove_who_sent_it(ticket_pool, monkeypatch):
 
 
 def test_a_persons_key_never_leaves_the_node_they_gave_it_to(signed_pool, monkeypatch):
-    from shardmesh.pool import sign_entry
+    from isharded.pool import sign_entry
 
     folder, access = signed_pool
     access.add_signed(sign_entry(folder, key_entry()))
@@ -688,7 +688,7 @@ def test_a_persons_key_never_leaves_the_node_they_gave_it_to(signed_pool, monkey
     assert client.get("/admin/status").status_code == 401
     assert client.get("/admin/status", headers={"Authorization": "Bearer smk-test"}).status_code == 200
     assert "authorization" not in seen
-    assert seen["x-shardmesh-on-behalf"] == "admin:alice"
+    assert seen["x-isharded-on-behalf"] == "admin:alice"
 
 
 def test_a_verified_node_can_vouch_for_a_caller_but_a_stranger_cannot(signed_pool, monkeypatch):
@@ -696,14 +696,14 @@ def test_a_verified_node_can_vouch_for_a_caller_but_a_stranger_cannot(signed_poo
     runtime = Orchestrator()
     runtime.access = access
     monkeypatch.setattr(orchestrator_module, "runtime", runtime)
-    headers = {FORWARD_MARK: "node-b", "x-shardmesh-on-behalf": "admin:alice"}
+    headers = {FORWARD_MARK: "node-b", "x-isharded-on-behalf": "admin:alice"}
     assert TestClient(orchestrator_module.app).get("/admin/keys", headers=headers).status_code == 401
     node = TestClient(connected_as(orchestrator_module.app, "node-b"))
     assert node.get("/admin/keys", headers=headers).status_code == 200
 
 
 def test_a_signed_entry_with_a_new_signature_changes_nothing(signed_pool):
-    from shardmesh.pool import sign_entry
+    from isharded.pool import sign_entry
 
     folder, access = signed_pool
     signed = sign_entry(folder, key_entry())
@@ -740,7 +740,7 @@ def test_a_ticket_with_no_real_expiry_is_refused(ticket_pool):
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import ec
 
-    from shardmesh.tickets import PREFIX, _encode
+    from isharded.tickets import PREFIX, _encode
 
     made = maker(ticket_pool)
     body = json.dumps({"aud": "b:1", "exp": float("nan"), "cert": made.certificate.decode()}).encode()
@@ -749,8 +749,8 @@ def test_a_ticket_with_no_real_expiry_is_refused(ticket_pool):
 
 
 def test_a_stage_cannot_be_built_from_units_that_fail_their_hash(tmp_path):
-    from shardmesh.gguf_stage import build_stage_file
-    from shardmesh.weights import UnitCache
+    from isharded.gguf_stage import build_stage_file
+    from isharded.weights import UnitCache
 
     cache = UnitCache(tmp_path / "cache")
     path = cache.path("m", "r", "unit")
@@ -762,8 +762,8 @@ def test_a_stage_cannot_be_built_from_units_that_fail_their_hash(tmp_path):
 
 
 def test_a_stage_built_with_hashes_does_not_reuse_an_older_file(tmp_path):
-    from shardmesh.gguf_stage import build_stage_file
-    from shardmesh.weights import UnitCache, file_sha256
+    from isharded.gguf_stage import build_stage_file
+    from isharded.weights import UnitCache, file_sha256
 
     cache = UnitCache(tmp_path / "cache")
     folder = cache.directory("m", "r") / "stages"
@@ -782,7 +782,7 @@ def test_a_stage_built_with_hashes_does_not_reuse_an_older_file(tmp_path):
 @pytest.fixture
 def owned(signed_pool, tmp_path, monkeypatch):
     folder, access = signed_pool
-    monkeypatch.setenv("SHARDMESH_CA_FILE", folder + "/ca.pem")
+    monkeypatch.setenv("ISHARDED_CA_FILE", folder + "/ca.pem")
     runtime = Orchestrator()
     runtime.access = access
     monkeypatch.setattr(orchestrator_module, "runtime", runtime)
@@ -790,8 +790,8 @@ def owned(signed_pool, tmp_path, monkeypatch):
 
 
 def test_a_node_joins_by_asking_and_the_owner_approving(owned):
-    from shardmesh.pool import approve_membership, request_membership, sign_entry
-    from shardmesh.tickets import TicketChecker, TicketMaker
+    from isharded.pool import approve_membership, request_membership, sign_entry
+    from isharded.tickets import TicketChecker, TicketMaker
 
     folder, access, client, home = owned
     request = request_membership(str(home), "newcomer", ["10.0.0.9"])
@@ -811,7 +811,7 @@ def test_a_node_joins_by_asking_and_the_owner_approving(owned):
 
 
 def test_asking_to_join_grants_nothing(owned):
-    from shardmesh.pool import request_membership
+    from isharded.pool import request_membership
 
     _, access, client, home = owned
     client.post("/join/requests", json={"request": request_membership(str(home), "newcomer", ["10.0.0.9"])})
@@ -827,7 +827,7 @@ def test_a_forged_join_request_is_refused(owned):
 
 
 def test_a_revoked_name_cannot_ask_again(owned):
-    from shardmesh.pool import request_membership, sign_entry
+    from isharded.pool import request_membership, sign_entry
 
     folder, access, client, home = owned
     access.add_signed(sign_entry(folder, {"type": "revoke", "name": "banned"}))
@@ -837,7 +837,7 @@ def test_a_revoked_name_cannot_ask_again(owned):
 
 
 def test_a_denied_key_stays_denied(owned):
-    from shardmesh.pool import request_membership, sign_entry
+    from isharded.pool import request_membership, sign_entry
 
     folder, access, client, home = owned
     request = request_membership(str(home), "newcomer", ["10.0.0.9"])
@@ -848,7 +848,7 @@ def test_a_denied_key_stays_denied(owned):
 
 
 def test_only_the_owner_can_admit_a_node(owned, tmp_path):
-    from shardmesh.pool import approve_membership, init_pool, request_membership, sign_entry
+    from isharded.pool import approve_membership, init_pool, request_membership, sign_entry
 
     folder, access, client, home = owned
     other = init_pool(str(tmp_path / "other"))
@@ -859,8 +859,8 @@ def test_only_the_owner_can_admit_a_node(owned, tmp_path):
 
 
 def test_join_requests_are_bounded_and_spread(owned):
-    from shardmesh.access import AccessControl, Authority, MAX_JOIN_REQUESTS
-    from shardmesh.pool import read_membership_request, request_membership
+    from isharded.access import AccessControl, Authority, MAX_JOIN_REQUESTS
+    from isharded.pool import read_membership_request, request_membership
 
     folder, access, _, home = owned
     text = request_membership(str(home), "one", ["10.0.0.9"])

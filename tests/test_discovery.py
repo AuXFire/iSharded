@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from shardmesh import discovery
+from isharded import discovery
 
 GOOD = {"url": "http://10.0.0.5:8209/", "authority": "a" * 64, "name": "first"}
 

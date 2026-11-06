@@ -1,6 +1,6 @@
 import torch
 
-from shardmesh.protocol import decode_activation, decode_meta, encode_activation, encode_meta
+from isharded.protocol import decode_activation, decode_meta, encode_activation, encode_meta
 
 
 def test_activation_round_trip_is_lossless() -> None:

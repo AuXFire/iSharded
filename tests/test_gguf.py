@@ -7,7 +7,7 @@ import httpx
 import numpy as np
 import pytest
 
-from shardmesh.gguf import (
+from isharded.gguf import (
     GgufError,
     GgufHeader,
     STUB_VOCAB,
@@ -22,11 +22,11 @@ from shardmesh.gguf import (
     read_strings,
     write_stage,
 )
-from shardmesh.gguf_stage import cpu_tensor_patterns
-from shardmesh.models import create_adapter
-from shardmesh.planner import Candidate, ModelProfile, plan_placement, stored_bytes
-from shardmesh.protocol import MemoryPool, TensorRef, UnitPlacement, WeightUnit
-from shardmesh.weights import build_manifest, iter_unit_tensor, unit_tensor_span, UnitCache, FetchProgress
+from isharded.gguf_stage import cpu_tensor_patterns
+from isharded.models import create_adapter
+from isharded.planner import Candidate, ModelProfile, plan_placement, stored_bytes
+from isharded.protocol import MemoryPool, TensorRef, UnitPlacement, WeightUnit
+from isharded.weights import build_manifest, iter_unit_tensor, unit_tensor_span, UnitCache, FetchProgress
 
 WIDTH = 8
 LAYERS = 8
@@ -102,7 +102,7 @@ def test_parse_reads_keys_and_tensors():
 
 
 def test_a_small_read_window_still_parses(monkeypatch):
-    monkeypatch.setattr("shardmesh.gguf.READ_CHUNK", 7)
+    monkeypatch.setattr("isharded.gguf.READ_CHUNK", 7)
     assert header_of(build_file()).layer_count == LAYERS
 
 
@@ -204,7 +204,7 @@ def test_a_name_not_on_this_machine_means_whoever_has_it(source):
 
 
 def test_a_file_nobody_has_is_a_clear_error():
-    from shardmesh.weights import WeightSourceError, open_reader
+    from isharded.weights import WeightSourceError, open_reader
 
     with pytest.raises(WeightSourceError, match="no node in the pool has m.gguf"):
         open_reader("m.gguf")
@@ -342,8 +342,8 @@ def test_a_local_copy_is_used_instead_of_the_source(local_model, tmp_path):
     assert all(cache.has("m", manifest.revision, unit) for unit in units)
 
 
-BUILD = os.environ.get("SHARDMESH_TEST_LLAMA_DIR", "")
-MODEL = os.environ.get("SHARDMESH_TEST_GGUF", "")
+BUILD = os.environ.get("ISHARDED_TEST_LLAMA_DIR", "")
+MODEL = os.environ.get("ISHARDED_TEST_GGUF", "")
 needs_real_model = pytest.mark.skipif(
     not (BUILD and MODEL and Path(BUILD).is_dir() and Path(MODEL).is_file()), reason="needs a llama.cpp build and a real GGUF"
 )
@@ -353,9 +353,9 @@ needs_real_model = pytest.mark.skipif(
 def test_tokenizer_matches_llama_cpp():
     import ctypes as C
 
-    from shardmesh.gguf import read_file_header
-    from shardmesh.llamacpp import LlamaLibrary
-    from shardmesh.tokenizer import tokenizer_from_gguf
+    from isharded.gguf import read_file_header
+    from isharded.llamacpp import LlamaLibrary
+    from isharded.tokenizer import tokenizer_from_gguf
 
     library = LlamaLibrary.load(BUILD)
     lib = library.llama
@@ -392,8 +392,8 @@ def test_tokenizer_matches_llama_cpp():
 @needs_real_model
 def test_two_stages_match_the_whole_model(tmp_path):
     """Runs in stage processes, as workers do: torch is loaded here and they must stay apart."""
-    from shardmesh.gguf import file_reader, read_file_header
-    from shardmesh.llama_host import StageHost
+    from isharded.gguf import file_reader, read_file_header
+    from isharded.llama_host import StageHost
 
     header = read_file_header(MODEL)
     reader = file_reader(MODEL)
@@ -436,8 +436,8 @@ def test_two_stages_match_the_whole_model(tmp_path):
 
 @needs_real_model
 def test_a_failed_stage_reports_instead_of_crashing_the_worker(tmp_path):
-    from shardmesh.llama_host import StageHost
-    from shardmesh.llamacpp import LlamaError
+    from isharded.llama_host import StageHost
+    from isharded.llamacpp import LlamaError
 
     broken = tmp_path / "broken.gguf"
     broken.write_bytes(b"GGUF" + bytes(64))
@@ -455,8 +455,8 @@ def test_a_failed_stage_reports_instead_of_crashing_the_worker(tmp_path):
 @needs_real_model
 def test_layers_kept_in_ram_give_the_same_answer_as_layers_on_the_gpu():
     """The GPU plus RAM split: the plan's CPU placements must change speed, not results."""
-    from shardmesh.gguf import read_file_header
-    from shardmesh.llama_host import StageHost
+    from isharded.gguf import read_file_header
+    from isharded.llama_host import StageHost
 
     header = read_file_header(MODEL)
     table = header.tensors["token_embd.weight"]
@@ -495,7 +495,7 @@ def one_hot_rows(*choices, vocabulary=12):
     ],
 )
 def test_greedy_keeps_guesses_while_they_match(guesses, choices, expected):
-    from shardmesh.llamacpp import speculative_choice
+    from isharded.llamacpp import speculative_choice
 
     rows = one_hot_rows(*choices)
     assert speculative_choice(lambda row: rows[row], guesses, 0.0, 1.0, 0, np.random.default_rng(0)) == expected
@@ -507,7 +507,7 @@ def test_greedy_keeps_guesses_while_they_match(guesses, choices, expected):
 )
 def test_sampling_with_a_draft_keeps_the_model_distribution(temperature, top_p, top_k, guess):
     """The first token out of a pass must follow the same law with or without a guess."""
-    from shardmesh.llamacpp import filtered_distribution, speculative_choice
+    from isharded.llamacpp import filtered_distribution, speculative_choice
 
     logits = np.array([2.0, 1.4, 1.0, 0.2, -0.5, -1.0], dtype=np.float32)
     ids, expected = filtered_distribution(logits, temperature, top_p, top_k)
@@ -523,7 +523,7 @@ def test_sampling_with_a_draft_keeps_the_model_distribution(temperature, top_p, 
 
 
 def test_a_filtered_out_guess_is_never_accepted():
-    from shardmesh.llamacpp import speculative_choice
+    from isharded.llamacpp import speculative_choice
 
     logits = np.array([5.0, 4.0, -9.0, -9.0], dtype=np.float32)
     generator = np.random.default_rng(1)
@@ -532,7 +532,7 @@ def test_a_filtered_out_guess_is_never_accepted():
 
 
 def test_a_pass_never_returns_more_than_guesses_plus_one():
-    from shardmesh.llamacpp import speculative_choice
+    from isharded.llamacpp import speculative_choice
 
     logits = np.zeros(4, dtype=np.float32)
     generator = np.random.default_rng(2)
@@ -543,7 +543,7 @@ def test_a_pass_never_returns_more_than_guesses_plus_one():
 def test_filtered_distribution_matches_the_regular_sampler():
     import torch
 
-    from shardmesh.llamacpp import filtered_distribution
+    from isharded.llamacpp import filtered_distribution
 
     logits = torch.tensor([3.0, 2.5, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0])
     temperature, top_p, top_k = 0.7, 0.9, 5
@@ -563,8 +563,8 @@ def test_filtered_distribution_matches_the_regular_sampler():
 @needs_real_model
 def test_a_rewound_stage_continues_exactly(tmp_path):
     """Run wrong guesses through a stage, rewind, and carry on: nothing may leak."""
-    from shardmesh.gguf import read_file_header
-    from shardmesh.llama_host import StageHost
+    from isharded.gguf import read_file_header
+    from isharded.llama_host import StageHost
 
     header = read_file_header(MODEL)
     table = header.tensors["token_embd.weight"]
@@ -606,7 +606,7 @@ def test_a_rewound_stage_continues_exactly(tmp_path):
 
 @needs_real_model
 def test_draft_guesses_extend_from_committed_text():
-    from shardmesh.llama_host import StageHost
+    from isharded.llama_host import StageHost
 
     host = StageHost()
     common = {"folder": BUILD, "extra_paths": [], "path": MODEL, "context_tokens": 256, "gpu_layers": -1, "threads": 4}
@@ -623,8 +623,8 @@ def test_draft_guesses_extend_from_committed_text():
 
 
 def test_a_draft_needs_a_matching_vocabulary(local_model, tmp_path, monkeypatch):
-    from shardmesh import orchestrator
-    from shardmesh.protocol import LoadModelRequest
+    from isharded import orchestrator
+    from isharded.protocol import LoadModelRequest
 
     manifest = build_manifest(str(local_model))
     adapter = create_adapter(manifest.config)
@@ -638,8 +638,8 @@ def test_a_draft_needs_a_matching_vocabulary(local_model, tmp_path, monkeypatch)
 
 
 def test_auto_draft_never_fails_a_load(local_model, monkeypatch):
-    from shardmesh import orchestrator
-    from shardmesh.protocol import LoadModelRequest
+    from isharded import orchestrator
+    from isharded.protocol import LoadModelRequest
 
     def unavailable(*args, **kwargs):
         raise OSError("no network")
@@ -655,8 +655,8 @@ def test_forward_can_return_a_speculative_answer(monkeypatch):
     import torch
     from fastapi.testclient import TestClient
 
-    from shardmesh import worker
-    from shardmesh.protocol import InferRequest, encode_activation, encode_meta
+    from isharded import worker
+    from isharded.protocol import InferRequest, encode_activation, encode_meta
 
     class Runtime:
         lock = __import__("asyncio").Lock()
@@ -676,7 +676,7 @@ def test_forward_can_return_a_speculative_answer(monkeypatch):
     response = client.post(
         "/internal/forward",
         content=encode_activation(torch.zeros(1, 1, 4)),
-        headers={"x-shardmesh-meta": encode_meta(meta.model_dump())},
+        headers={"x-isharded-meta": encode_meta(meta.model_dump())},
     )
     assert response.status_code == 200
     assert response.json() == {"token_ids": [1, 2, 3]}
@@ -694,7 +694,7 @@ def test_forward_can_return_a_speculative_answer(monkeypatch):
     ],
 )
 def test_guess_count_follows_what_lands(current, right, limit, expected):
-    from shardmesh.gguf_stage import next_guess_count
+    from isharded.gguf_stage import next_guess_count
 
     assert next_guess_count(current, right, limit) == expected
 
@@ -702,9 +702,9 @@ def test_guess_count_follows_what_lands(current, right, limit, expected):
 @needs_real_model
 def test_a_restored_checkpoint_continues_exactly():
     """Save mid-conversation, wander off, restore, and get the same answer as before."""
-    from shardmesh.gguf import read_file_header
-    from shardmesh.llama_host import StageHost
-    from shardmesh.llamacpp import LlamaError
+    from isharded.gguf import read_file_header
+    from isharded.llama_host import StageHost
+    from isharded.llamacpp import LlamaError
 
     header = read_file_header(MODEL)
     table = header.tensors["token_embd.weight"]
@@ -739,7 +739,7 @@ def test_a_restored_checkpoint_continues_exactly():
 
 
 def test_a_prompt_reuses_only_the_conversation_it_continues():
-    from shardmesh.gguf_stage import checkpoint_key, plan_prompt
+    from isharded.gguf_stage import checkpoint_key, plan_prompt
 
     held = (checkpoint_key([1, 2, 3]), [1, 2, 3])
     plan = plan_prompt(held, [1, 2, 3, 4, 5, 6], 5)
@@ -751,13 +751,13 @@ def test_a_prompt_reuses_only_the_conversation_it_continues():
 
 
 def test_a_checkpoint_needs_something_left_to_run():
-    from shardmesh.gguf_stage import plan_prompt
+    from isharded.gguf_stage import plan_prompt
 
     assert plan_prompt(("k", [1, 2, 3]), [1, 2, 3], None).start == 0
 
 
 def test_no_new_checkpoint_before_the_old_one_ends():
-    from shardmesh.gguf_stage import plan_prompt
+    from isharded.gguf_stage import plan_prompt
 
     assert plan_prompt(("k", [1, 2, 3]), [1, 2, 3, 4], 3).mark is None
 
@@ -781,7 +781,7 @@ class Holder:
 
 
 def peer_reader(handler, urls=("http://a",)):
-    from shardmesh.weights import PeerReader
+    from isharded.weights import PeerReader
 
     reader = PeerReader(list(urls))
     reader.client = httpx.Client(transport=httpx.MockTransport(handler))
@@ -789,7 +789,7 @@ def peer_reader(handler, urls=("http://a",)):
 
 
 def test_a_model_can_be_read_entirely_from_a_peer():
-    from shardmesh.weights import read_gguf_header
+    from isharded.weights import read_gguf_header
 
     blob = build_file()
     reader = peer_reader(Holder(blob))
@@ -811,7 +811,7 @@ def test_a_failed_holder_hands_over_to_the_next():
 
 
 def test_nobody_answering_is_an_error_not_short_data():
-    from shardmesh.weights import WeightSourceError
+    from isharded.weights import WeightSourceError
 
     reader = peer_reader(Holder(bytes(64), fail_after=0))
     with pytest.raises(WeightSourceError, match="no node could send"):
@@ -819,7 +819,7 @@ def test_nobody_answering_is_an_error_not_short_data():
 
 
 def test_every_node_fingerprints_a_file_the_same_way(tmp_path):
-    from shardmesh.weights import LocalReader, file_fingerprint
+    from isharded.weights import LocalReader, file_fingerprint
 
     blob = build_file()
     one, two = tmp_path / "one", tmp_path / "two"
@@ -835,7 +835,7 @@ def test_every_node_fingerprints_a_file_the_same_way(tmp_path):
 
 
 def test_a_manifest_can_come_from_the_pool_alone(monkeypatch):
-    from shardmesh import weights
+    from isharded import weights
 
     blob = build_file()
     reader = peer_reader(Holder(blob))
@@ -848,7 +848,7 @@ def test_a_manifest_can_come_from_the_pool_alone(monkeypatch):
 def test_workers_only_serve_files_from_their_index(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 
-    from shardmesh import worker
+    from isharded import worker
 
     (tmp_path / "m.gguf").write_bytes(b"0123456789")
     (tmp_path / "secret.txt").write_bytes(b"private")
@@ -870,8 +870,8 @@ def test_workers_only_serve_files_from_their_index(tmp_path, monkeypatch):
 @needs_real_model
 def test_two_conversations_do_not_touch_each_other():
     """The same stage, two sequences, interleaved, each matching a run on its own."""
-    from shardmesh.gguf import read_file_header
-    from shardmesh.llama_host import StageHost
+    from isharded.gguf import read_file_header
+    from isharded.llama_host import StageHost
 
     header = read_file_header(MODEL)
     table = header.tensors["token_embd.weight"]
@@ -909,8 +909,8 @@ def test_two_conversations_do_not_touch_each_other():
 
 
 def test_only_disk_tier_stages_map_their_file():
-    from shardmesh.gguf_stage import needs_mapping
-    from shardmesh.protocol import MemoryPool, UnitPlacement
+    from isharded.gguf_stage import needs_mapping
+    from isharded.protocol import MemoryPool, UnitPlacement
 
     def pool(kind):
         return MemoryPool(pool_id=kind, kind=kind, device="cpu", label=kind, capacity_group=kind, total_bytes=1, budget_bytes=1, free_bytes=1, bandwidth_gbps=1.0, dtype="bfloat16")
@@ -924,7 +924,7 @@ def test_only_disk_tier_stages_map_their_file():
 
 
 def test_every_platform_has_a_cpu_build_with_a_full_hash() -> None:
-    from shardmesh.llamacpp import BUILDS
+    from isharded.llamacpp import BUILDS
 
     for platform_name, kinds in BUILDS.items():
         assert "cpu" in kinds, platform_name
@@ -936,7 +936,7 @@ def test_release_archives_nest_their_libraries(tmp_path, monkeypatch) -> None:
     import io
     import tarfile
 
-    from shardmesh import llamacpp
+    from isharded import llamacpp
 
     monkeypatch.setattr(llamacpp.os, "name", "posix")
     monkeypatch.setattr(llamacpp.sys, "platform", "linux")
@@ -954,7 +954,7 @@ def test_release_archives_nest_their_libraries(tmp_path, monkeypatch) -> None:
 def test_a_missing_system_library_names_its_package(tmp_path, monkeypatch) -> None:
     import pytest
 
-    from shardmesh import llamacpp
+    from isharded import llamacpp
 
     def refuse(_):
         raise OSError("libgomp.so.1: cannot open shared object file: No such file or directory")
@@ -967,7 +967,7 @@ def test_a_missing_system_library_names_its_package(tmp_path, monkeypatch) -> No
 def test_a_platform_without_that_build_says_what_it_offers(monkeypatch) -> None:
     import pytest
 
-    from shardmesh import llamacpp
+    from isharded import llamacpp
 
     monkeypatch.setattr(llamacpp, "this_platform", lambda: "macos-arm64")
     with pytest.raises(llamacpp.LlamaError, match="it offers cpu"):
@@ -977,7 +977,7 @@ def test_a_platform_without_that_build_says_what_it_offers(monkeypatch) -> None:
 def test_a_gpu_reading_a_card_cannot_give_is_left_out(monkeypatch) -> None:
     from types import SimpleNamespace
 
-    from shardmesh import inventory
+    from isharded import inventory
 
     monkeypatch.setattr(inventory.shutil, "which", lambda _: "nvidia-smi")
     answer = SimpleNamespace(returncode=0, stdout="RTX 3060, 57, [N/A], 3, 3971, 6144\nbroken line\n")

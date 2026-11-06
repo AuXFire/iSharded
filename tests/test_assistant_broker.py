@@ -11,11 +11,11 @@ import threading
 
 import pytest
 
-from shardmesh.assistant import broker as broker_part
-from shardmesh.assistant import cli
-from shardmesh.assistant.app import Assistant
-from shardmesh.assistant.broker import argument_hash, path_within, redacted, scope_kind, url_host
-from shardmesh.assistant.contracts import (
+from isharded.assistant import broker as broker_part
+from isharded.assistant import cli
+from isharded.assistant.app import Assistant
+from isharded.assistant.broker import argument_hash, path_within, redacted, scope_kind, url_host
+from isharded.assistant.contracts import (
     CallContext,
     Capability,
     Effect,

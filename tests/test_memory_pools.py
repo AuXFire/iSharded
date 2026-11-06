@@ -3,9 +3,9 @@ from pathlib import Path
 
 import pytest
 
-from shardmesh.memory import Accelerator, build_pools, discover_accelerators
-from shardmesh.node import _weight_memory_flags, is_remote_path, local_code_root, run_node
-from shardmesh.worker import parse_ram_budget
+from isharded.memory import Accelerator, build_pools, discover_accelerators
+from isharded.node import _weight_memory_flags, is_remote_path, local_code_root, run_node
+from isharded.worker import parse_ram_budget
 
 GIB = 1024**3
 
@@ -29,7 +29,7 @@ def pools(tmp_path: Path, accelerators: list[Accelerator], **options) -> dict:
 
 @pytest.fixture(autouse=True)
 def fixed_bandwidth(monkeypatch) -> None:
-    monkeypatch.setattr("shardmesh.memory.measure_bandwidth", lambda device: 100.0)
+    monkeypatch.setattr("isharded.memory.measure_bandwidth", lambda device: 100.0)
 
 
 def test_cpu_only_worker_offers_ram_without_being_told(tmp_path: Path) -> None:
@@ -125,8 +125,8 @@ def launched(monkeypatch, **options) -> list[list[str]]:
     def stop(seconds: float) -> None:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr("shardmesh.node.subprocess.Popen", record)
-    monkeypatch.setattr("shardmesh.node.time.sleep", stop)
+    monkeypatch.setattr("isharded.node.subprocess.Popen", record)
+    monkeypatch.setattr("isharded.node.time.sleep", stop)
     settings = dict(
         node_id="node",
         orchestrator_url="http://orchestrator:8000",
@@ -143,7 +143,7 @@ def launched(monkeypatch, **options) -> list[list[str]]:
     )
     settings.update(options)
     run_node(argparse.Namespace(**settings))
-    return [command for command in commands if "shardmesh.orchestrator" not in command]
+    return [command for command in commands if "isharded.orchestrator" not in command]
 
 
 def flag(command: list[str], name: str) -> str | None:
@@ -201,20 +201,20 @@ def test_local_paths_are_left_alone(tmp_path: Path) -> None:
 
 def test_a_remote_checkout_runs_from_a_local_copy(tmp_path: Path, monkeypatch) -> None:
     source = tmp_path / "remote"
-    (source / "shardmesh" / "__pycache__").mkdir(parents=True)
-    (source / "shardmesh" / "worker.py").write_text("new")
-    (source / "shardmesh" / "__pycache__" / "worker.pyc").write_text("skip")
+    (source / "isharded" / "__pycache__").mkdir(parents=True)
+    (source / "isharded" / "worker.py").write_text("new")
+    (source / "isharded" / "__pycache__" / "worker.pyc").write_text("skip")
     home = tmp_path / "local"
-    (home / "ShardMesh" / "app" / "shardmesh").mkdir(parents=True)
-    (home / "ShardMesh" / "app" / "shardmesh" / "stale.py").write_text("old")
+    (home / "iSharded" / "app" / "isharded").mkdir(parents=True)
+    (home / "iSharded" / "app" / "isharded" / "stale.py").write_text("old")
     monkeypatch.setenv("LOCALAPPDATA", str(home))
-    monkeypatch.setattr("shardmesh.node.is_remote_path", lambda path: True)
+    monkeypatch.setattr("isharded.node.is_remote_path", lambda path: True)
 
     root = local_code_root(source)
 
-    assert (root / "shardmesh" / "worker.py").read_text() == "new"
-    assert not (root / "shardmesh" / "stale.py").exists()
-    assert not (root / "shardmesh" / "__pycache__").exists()
+    assert (root / "isharded" / "worker.py").read_text() == "new"
+    assert not (root / "isharded" / "stale.py").exists()
+    assert not (root / "isharded" / "__pycache__").exists()
 
 
 def test_every_node_runs_a_control_plane_and_finds_it(monkeypatch) -> None:
@@ -223,9 +223,9 @@ def test_every_node_runs_a_control_plane_and_finds_it(monkeypatch) -> None:
 
 
 def test_a_large_node_log_starts_over_and_keeps_the_last(tmp_path, monkeypatch) -> None:
-    from shardmesh.node import open_log
+    from isharded.node import open_log
 
-    monkeypatch.setattr("shardmesh.node.LOG_ROTATE_BYTES", 4)
+    monkeypatch.setattr("isharded.node.LOG_ROTATE_BYTES", 4)
     path = tmp_path / "node.log"
     path.write_bytes(b"123456")
     open_log(str(path)).close()
@@ -238,7 +238,7 @@ def test_a_vulkan_gpu_is_read_from_the_probe_and_software_devices_are_left_out(t
     import json
     from types import SimpleNamespace
 
-    from shardmesh.memory import read_vulkan_devices
+    from isharded.memory import read_vulkan_devices
 
     report = [
         {"backend": "Vulkan0", "name": "Radeon RX 7900 XT", "integrated": False, "free_bytes": 18 * 1024**3, "total_bytes": 20 * 1024**3},
@@ -254,14 +254,14 @@ def test_a_vulkan_gpu_is_read_from_the_probe_and_software_devices_are_left_out(t
 def test_a_crashing_driver_means_no_vulkan_gpu_and_no_crash(tmp_path) -> None:
     from types import SimpleNamespace
 
-    from shardmesh.memory import read_vulkan_devices
+    from isharded.memory import read_vulkan_devices
 
     assert read_vulkan_devices(tmp_path, run=lambda *_, **__: SimpleNamespace(returncode=3, stdout="")) == []
     assert read_vulkan_devices(tmp_path, run=lambda *_, **__: SimpleNamespace(returncode=0, stdout="")) == []
 
 
 def test_asking_for_vulkan_with_none_says_what_to_check(monkeypatch) -> None:
-    from shardmesh import memory
+    from isharded import memory
 
     monkeypatch.setattr(memory, "vulkan_accelerators", lambda: ())
     with pytest.raises(ValueError, match="no Vulkan GPU found"):

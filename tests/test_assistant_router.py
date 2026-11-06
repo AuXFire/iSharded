@@ -7,10 +7,10 @@ import time
 
 import pytest
 
-from shardmesh.assistant.app import Assistant
-from shardmesh.assistant.cli import add_arguments, run
-from shardmesh.assistant.contracts import ModelReply, ModelRequest, Reach
-from shardmesh.assistant.router import (
+from isharded.assistant.app import Assistant
+from isharded.assistant.cli import add_arguments, run
+from isharded.assistant.contracts import ModelReply, ModelRequest, Reach
+from isharded.assistant.router import (
     BACKOFF_SECONDS,
     MAX_BACKOFF_SECONDS,
     MEASURED_RUNS,

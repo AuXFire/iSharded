@@ -14,10 +14,10 @@ import time
 import psutil
 import pytest
 
-from shardmesh.assistant import cli
-from shardmesh.assistant import sandbox as sandbox_part
-from shardmesh.assistant.app import Assistant
-from shardmesh.assistant.sandbox import (
+from isharded.assistant import cli
+from isharded.assistant import sandbox as sandbox_part
+from isharded.assistant.app import Assistant
+from isharded.assistant.sandbox import (
     LocalSandbox,
     NETWORK_NOT_BLOCKED,
     ProcessTree,
@@ -107,7 +107,7 @@ def test_a_child_left_behind_by_a_finished_command_dies_too(sandbox, tmp_path):
 
 
 def test_a_secret_in_the_parents_environment_is_invisible(sandbox, tmp_path, monkeypatch):
-    monkeypatch.setenv("SHARDMESH_POOL_TOKEN", "hunter2-token")
+    monkeypatch.setenv("ISHARDED_POOL_TOKEN", "hunter2-token")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "hunter2-aws")
     monkeypatch.setenv("SOMETHING_NOBODY_THOUGHT_OF", "hunter2-other")
     script = """
@@ -119,7 +119,7 @@ def test_a_secret_in_the_parents_environment_is_invisible(sandbox, tmp_path, mon
     assert result.exit_code == 0, result.stderr
     seen = json.loads(result.stdout)
     assert "hunter2" not in result.stdout
-    assert "SHARDMESH_POOL_TOKEN" not in seen["child"] and "SHARDMESH_POOL_TOKEN" not in seen["grandchild"]
+    assert "ISHARDED_POOL_TOKEN" not in seen["child"] and "ISHARDED_POOL_TOKEN" not in seen["grandchild"]
 
 
 def test_the_environment_is_an_allow_list(monkeypatch, tmp_path):
@@ -248,7 +248,7 @@ def test_a_killed_parent_takes_the_sandbox_with_it(tmp_path):
             import sys, textwrap
             sys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r})
             from pathlib import Path
-            from shardmesh.assistant.sandbox import LocalSandbox
+            from isharded.assistant.sandbox import LocalSandbox
             LocalSandbox(prefer="process").run(
                 [sys.executable, "-c", textwrap.dedent({FAMILY!r})], Path({str(tmp_path)!r}), timeout=120
             )
@@ -400,7 +400,7 @@ def test_each_run_is_audited_without_the_command_text(tmp_path):
 
 
 def test_the_command_says_what_level_this_machine_got(tmp_path, capsys, monkeypatch):
-    monkeypatch.setenv("SHARDMESH_SANDBOX", "process")
+    monkeypatch.setenv("ISHARDED_SANDBOX", "process")
     parser = argparse.ArgumentParser()
     cli.add_arguments(parser)
     assert cli.run(parser.parse_args(["--home", str(tmp_path / "home"), "sandbox"])) == 0
@@ -421,9 +421,9 @@ def test_stopping_the_assistant_stops_what_is_running(tmp_path):
 
 
 def test_a_setting_chooses_the_limits(monkeypatch):
-    monkeypatch.setenv("SHARDMESH_SANDBOX_MEMORY_MB", "333")
-    monkeypatch.setenv("SHARDMESH_SANDBOX_OUTPUT_BYTES", "4444")
-    monkeypatch.setenv("SHARDMESH_SANDBOX_IMAGE", "mine:1")
+    monkeypatch.setenv("ISHARDED_SANDBOX_MEMORY_MB", "333")
+    monkeypatch.setenv("ISHARDED_SANDBOX_OUTPUT_BYTES", "4444")
+    monkeypatch.setenv("ISHARDED_SANDBOX_IMAGE", "mine:1")
     made = LocalSandbox()
     assert (made.memory_mb, made.output_bytes, made.image) == (333, 4444, "mine:1")
 

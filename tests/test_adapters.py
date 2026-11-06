@@ -15,8 +15,8 @@ import torch
 import transformers
 from transformers import AutoModelForCausalLM
 
-from shardmesh.models import create_adapter
-from shardmesh.weights import FetchProgress, UnitCache, build_manifest, load_unit, map_unit
+from isharded.models import create_adapter
+from isharded.weights import FetchProgress, UnitCache, build_manifest, load_unit, map_unit
 
 COMMON = dict(
     vocab_size=96,

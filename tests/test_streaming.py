@@ -10,10 +10,10 @@ from tokenizers import Tokenizer
 from tokenizers.models import BPE, WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 
-from shardmesh.models import GgufAdapter
-from shardmesh.orchestrator import Orchestrator
-from shardmesh.protocol import StageAssignment
-from shardmesh.tokenizer import ChatTokenizer, IncrementalText, _parse_tokenizer, load_tokenizer
+from isharded.models import GgufAdapter
+from isharded.orchestrator import Orchestrator
+from isharded.protocol import StageAssignment
+from isharded.tokenizer import ChatTokenizer, IncrementalText, _parse_tokenizer, load_tokenizer
 
 STOP_TOKEN = 99
 

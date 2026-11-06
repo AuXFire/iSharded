@@ -1,0 +1,564 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>iSharded assistant</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%2308738a' d='M6 3h14l-2.4 5H3.6zM8 10h14l-2.4 5H5.6zM4 17h14l-2.4 5H1.6z'/%3E%3C/svg%3E">
+  <script nonce="__CSP_NONCE__">try { const theme = localStorage.getItem('isharded-theme'); if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme; } catch {}</script>
+  <style nonce="__CSP_NONCE__">/* isharded:ui.css */
+
+    /* What only this page has. Everything else comes from the design system above. */
+    .who { color: var(--ink-2); font-size: var(--t-sm); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .panel-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: var(--s-3); }
+    .count { display: inline-grid; place-items: center; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--warn); color: var(--plate); font: 600 var(--t-xs)/1 var(--font-display); }
+    .panel { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s-2); }
+    .card { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s-2); padding: var(--s-3); border: 1px solid var(--edge); border-radius: var(--r-control); background: var(--plate); }
+    .card-text { overflow-wrap: anywhere; white-space: pre-wrap; }
+    .card-note { color: var(--ink-2); font-size: var(--t-xs); overflow-wrap: anywhere; }
+    .card-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--s-2); }
+    .tags { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-1); }
+    .tag.tone-ok { color: var(--good); }
+    .tag.tone-work { color: var(--accent-text); }
+    .tag.tone-warn { color: var(--warn); }
+    .tag.tone-bad { color: var(--bad); }
+    .arguments { margin: 0; color: var(--ink-2); font: 400 var(--t-xs)/1.5 var(--font-code); white-space: pre-wrap; overflow-wrap: anywhere; }
+    .audit-line { color: var(--ink-2); font: 400 var(--t-xs)/1.5 var(--font-code); overflow-wrap: anywhere; }
+    .inline-form { display: flex; gap: var(--s-2); }
+    .inline-form .input { flex: 1; min-width: 0; }
+    .receipt { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-1) var(--s-2); }
+    .send-row { justify-content: flex-end; }
+    .open-conversation { padding: 0; border: 0; background: none; color: var(--ink); font-weight: 600; text-align: left; overflow-wrap: anywhere; }
+    .open-conversation:hover { color: var(--accent-text); text-decoration: underline; text-underline-offset: 2px; }
+    .rail-toggle svg { margin-left: auto; }
+    @media (max-width: 760px) { .who { display: none; } }
+  </style>
+</head>
+<body class="chat-page">
+  <a class="skip" href="#input">Skip to the message box</a>
+  <header class="top">
+    <span class="brand"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 3h14l-2.4 5H3.6zM8 10h14l-2.4 5H5.6zM4 17h14l-2.4 5H1.6z"/></svg><span id="name">Assistant</span></span>
+    <span class="who" id="who"></span>
+    <div class="top-gap"></div>
+    <button class="btn quiet" id="new-chat" type="button">New conversation</button>
+    <button class="icon-btn" id="theme-button" type="button">
+      <svg data-theme-icon="system" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor" stroke="none"/></svg>
+      <svg data-theme-icon="light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true" hidden><circle cx="12" cy="12" r="4"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6 7 7M17 17l1.4 1.4M5.6 18.4 7 17M17 7l1.4-1.4"/></svg>
+      <svg data-theme-icon="dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true" hidden><path d="M20 14.5A8.5 8.5 0 1 1 9.5 4a7 7 0 0 0 10.5 10.5z"/></svg>
+    </button>
+    <button class="btn quiet" id="sign-out" type="button">Sign out</button>
+  </header>
+
+  <div class="workspace">
+    <button class="rail-toggle" id="rail-toggle" type="button" aria-expanded="false" aria-controls="rail"><span>Approvals, memory, tasks</span><span class="count" id="toggle-count" hidden></span><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m2.5 4.5 3.5 3.5 3.5-3.5"/></svg></button>
+    <main class="conversation">
+      <div class="log" id="log" role="log" tabindex="0" aria-label="Conversation">
+        <div class="column" id="turns">
+          <div class="greeting" id="empty"><h1 id="greeting">Hello</h1><p>What is said here is remembered, with where it came from. Nothing runs without a grant, and anything with consequences that untrusted text could have steered waits for you first.</p></div>
+        </div>
+      </div>
+      <form class="composer" id="composer">
+        <div class="column box">
+          <label class="sr-only" for="input">Message</label>
+          <textarea id="input" rows="1" placeholder="Say something"></textarea>
+          <div class="controls send-row"><button class="btn primary send" id="send" type="submit">Send</button></div>
+        </div>
+      </form>
+    </main>
+
+    <aside class="rail" id="rail" aria-label="What the assistant is doing">
+      <div class="panel-tabs" id="panel-tabs">
+        <button class="chip" type="button" data-panel="approvals" aria-pressed="true">Approvals<span class="count" id="approval-count" hidden></span></button>
+        <button class="chip" type="button" data-panel="memory" aria-pressed="false">Memory</button>
+        <button class="chip" type="button" data-panel="tasks" aria-pressed="false">Tasks</button>
+        <button class="chip" type="button" data-panel="history" aria-pressed="false">History</button>
+        <button class="chip" type="button" data-panel="audit" aria-pressed="false">Audit</button>
+      </div>
+      <section class="panel" id="panel-approvals" aria-label="Approvals"></section>
+      <section class="panel" id="panel-memory" aria-label="Memory" hidden>
+        <form class="inline-form" id="memory-search">
+          <input class="input" id="memory-query" placeholder="Search memory" aria-label="Search memory">
+          <button class="btn small" type="submit">Search</button>
+        </form>
+        <form class="inline-form" id="memory-add">
+          <input class="input" id="memory-text" placeholder="Remember this" aria-label="Remember this">
+          <button class="btn small" type="submit">Keep</button>
+        </form>
+        <p class="error" id="memory-error" role="alert" hidden></p>
+        <div class="panel" id="memory-list"></div>
+      </section>
+      <section class="panel" id="panel-tasks" aria-label="Tasks" hidden></section>
+      <section class="panel" id="panel-history" aria-label="Earlier conversations" hidden></section>
+      <section class="panel" id="panel-audit" aria-label="Audit" hidden></section>
+    </aside>
+  </div>
+
+  <dialog class="sheet narrow" id="sign-in" aria-labelledby="sign-in-title">
+    <form class="sheet-body" id="sign-in-form" method="dialog">
+      <h2 id="sign-in-title">Your key</h2>
+      <p>Each person has their own. <code>isharded assistant user add NAME</code> makes one. It is kept only until this tab closes.</p>
+      <label class="field">Key
+        <input class="input" id="key" type="password" autocomplete="off" required>
+      </label>
+      <p class="error" id="sign-in-error" role="alert" hidden></p>
+      <div class="sheet-actions"><button class="btn primary" type="submit">Sign in</button></div>
+    </form>
+  </dialog>
+
+  <dialog class="sheet" id="why" aria-labelledby="why-title">
+    <div class="sheet-body">
+      <h2 id="why-title">What the model saw</h2>
+      <div class="panel" id="why-body"></div>
+      <div class="sheet-actions"><button class="btn" id="why-close" type="button">Close</button></div>
+    </div>
+  </dialog>
+
+  <script nonce="__CSP_NONCE__">
+    // Everything shown here can come from a model, a file, or a tool, so text only
+    // ever reaches the page as text.
+    const $ = id => document.getElementById(id);
+    const session = {
+      get: key => { try { return sessionStorage.getItem(key); } catch { return null; } },
+      set: (key, value) => { try { sessionStorage.setItem(key, value); } catch {} },
+      drop: key => { try { sessionStorage.removeItem(key); } catch {} },
+    };
+    const lasting = {
+      set: (key, value) => { try { localStorage.setItem(key, value); } catch {} },
+      drop: key => { try { localStorage.removeItem(key); } catch {} },
+    };
+    const state = { key: session.get('assistant-key') || '', conversation: session.get('assistant-conversation') || '', busy: false, panel: 'approvals', role: 'member', opening: 0 };
+    const ENDED = ['done', 'partial', 'failed', 'cancelled', 'missed'];
+    const TONE = { done: 'ok', partial: 'warn', failed: 'bad', cancelled: 'idle', missed: 'warn', blocked: 'warn', paused: 'warn', running: 'work', pending: 'idle' };
+
+    function newConversation() {
+      state.conversation = `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+      session.set('assistant-conversation', state.conversation);
+    }
+    function make(tag, className, text) {
+      const element = document.createElement(tag);
+      if (className) element.className = className;
+      if (text !== undefined && text !== null) element.textContent = text;
+      return element;
+    }
+    function button(text, className, action) {
+      const element = make('button', className, text);
+      element.type = 'button';
+      element.addEventListener('click', action);
+      return element;
+    }
+    const when = seconds => seconds ? new Date(seconds * 1000).toLocaleString() : '';
+    const tag = (text, tone) => make('span', `tag ${tone ? `tone-${tone}` : ''}`, text);
+    const trustTone = trust => ({ verified: 'ok', owner: 'ok', model: 'work', external: 'warn' }[trust] || '');
+    const note = text => make('p', 'rail-note', text);
+
+    async function api(path, options = {}) {
+      const key = state.key;
+      const response = await fetch(path, { ...options, headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` } });
+      if (key !== state.key) throw new Error('Signed out');  // an answer for someone who has left must not be drawn
+      if (response.status === 401) { askForKey('That key was not accepted.'); throw new Error('Sign in first'); }
+      if (!response.ok) {
+        let message = `Request failed with HTTP ${response.status}`;
+        try { const body = await response.json(); if (typeof body.detail === 'string') message = body.detail; } catch {}
+        throw new Error(message);
+      }
+      return response.json();
+    }
+
+    // Whoever signs in next must not see this person's words, even dimmed behind the sheet.
+    function forgetPerson() {
+      state.opening += 1;
+      state.conversation = '';
+      state.approvalsShown = null;
+      session.drop('assistant-conversation');
+      showConversation([]);
+      for (const id of ['panel-approvals', 'panel-tasks', 'panel-history', 'panel-audit', 'memory-list']) $(id).replaceChildren();
+      $('memory-query').value = '';
+      $('memory-text').value = '';
+      $('who').textContent = '';
+      $('name').textContent = 'Assistant';
+      $('greeting').textContent = 'Hello';
+      document.title = 'iSharded assistant';
+      showCount(0);
+    }
+
+    function askForKey(problem) {
+      state.key = '';
+      session.drop('assistant-key');
+      forgetPerson();
+      $('sign-in-error').hidden = !problem;
+      $('sign-in-error').textContent = problem || '';
+      if (!$('sign-in').open) $('sign-in').showModal();
+    }
+
+    function renderText(container, text) {
+      container.replaceChildren();
+      text.split(/(```[\s\S]*?(?:```|$))/g).forEach(part => {
+        if (!part) return;
+        if (part.startsWith('```')) {
+          const block = make('pre');
+          block.append(make('code', '', part.replace(/^```[^\n]*\n?/, '').replace(/```$/, '')));
+          container.append(block);
+        } else {
+          for (const paragraph of part.replace(/^\n+|\n+$/g, '').split(/\n{2,}/)) if (paragraph) container.append(make('p', '', paragraph));
+        }
+      });
+    }
+
+    function addTurn(kind) {
+      $('empty').hidden = true;
+      const turn = make('article', `turn ${kind}`);
+      const body = make('div', kind === 'user' ? '' : 'answer');
+      turn.append(body);
+      $('turns').append(turn);
+      return { turn, body };
+    }
+    const scrollDown = () => { $('log').scrollTop = $('log').scrollHeight; };
+
+    function addReceipt(turn, details) {
+      const receipt = make('div', 'receipt');
+      receipt.append(make('span', '', details.model ? `${details.model} via ${details.provider}` : 'no model answered'));
+      receipt.append(tag(`reach ${details.reach}`));
+      if (details.tainted) receipt.append(tag('read untrusted text', 'warn'));
+      if (details.tools?.length) receipt.append(tag(`used ${details.tools.join(', ')}`, 'work'));
+      if (details.status === 'task') receipt.append(tag(`task ${details.task}`, 'work'));
+      if (details.status === 'awaiting_approval') receipt.append(tag('waiting for you', 'warn'));
+      if (details.status === 'refused') receipt.append(tag('refused', 'bad'));
+      if (details.status === 'failed') receipt.append(tag('failed', 'bad'));
+      if (details.turn) receipt.append(button('What did it see?', 'link', () => showWhy(details.turn)));
+      turn.append(receipt);
+    }
+
+    async function send(text) {
+      state.busy = true;
+      $('send').disabled = true;
+      addTurn('user').body.textContent = text;
+      const reply = addTurn('assistant');
+      const waiting = make('span', 'waiting');
+      waiting.append(make('i', 'glyph work tone-work'), make('span', '', 'Working on it'));
+      reply.body.append(waiting);
+      scrollDown();
+      let answer = '', details = null;
+      try {
+        const response = await fetch('/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.key}` },
+          body: JSON.stringify({ messages: [{ role: 'user', content: text }], stream: true, conversation_id: state.conversation }),
+        });
+        if (response.status === 401) { askForKey('That key was not accepted.'); throw new Error('Sign in first'); }
+        if (!response.ok) throw new Error(`Request failed with HTTP ${response.status}`);
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const events = buffer.split('\n\n');
+          buffer = events.pop();
+          for (const event of events) {
+            if (!event.startsWith('data: ') || event === 'data: [DONE]') continue;
+            const payload = JSON.parse(event.slice(6));
+            if (payload.error) throw new Error(payload.error.message);
+            const piece = payload.choices?.[0]?.delta?.content;
+            if (piece) { answer += piece; renderText(reply.body, answer); scrollDown(); }
+            if (payload.assistant) details = payload.assistant;
+          }
+        }
+        if (!answer) waiting.remove();
+        if (details) addReceipt(reply.turn, details);
+        if (details?.pending_approval) { await refreshApprovals(); showPanel('approvals'); }
+        if (details?.status === 'task') showPanel('tasks');
+      } catch (error) {
+        waiting.remove();
+        reply.turn.append(make('p', 'failure', error.message));
+      } finally {
+        state.busy = false;
+        $('send').disabled = false;
+        scrollDown();
+        if (state.panel === 'memory') refreshMemory().catch(() => {});
+      }
+    }
+
+    async function showWhy(turn) {
+      const body = $('why-body');
+      body.replaceChildren(note('Looking it up'));
+      $('why').showModal();
+      try {
+        const record = await api(`/assistant/why/${encodeURIComponent(turn)}`);
+        const who = [...new Set(record.answered_by.map(row => `${row.model} via ${row.provider}`))].join(', ') || 'nobody';
+        const summary = make('div', 'tags');
+        summary.append(make('span', 'card-note', `Answered by ${who}`), tag(`reach ${record.reach}`), tag(`${record.tokens} of ${record.budget} tokens`));
+        if (record.tainted) summary.append(tag('read untrusted text', 'warn'));
+        body.replaceChildren(summary);
+        for (const [title, rows] of [['Seen', record.seen], ['Left out for space', record.left_out]]) {
+          if (!rows.length) continue;
+          body.append(make('h3', '', title));
+          for (const row of rows) {
+            const card = make('div', 'card');
+            const line = make('div', 'tags');
+            line.append(tag(row.trust, trustTone(row.trust)), tag(row.reach), make('span', 'card-note', `${row.source}: ${row.source_id}`));
+            card.append(line, make('div', 'card-text', row.text === null ? '(no longer held)' : row.text.slice(0, 600)));
+            body.append(card);
+          }
+        }
+      } catch (error) {
+        body.replaceChildren(make('p', 'error', error.message));
+      }
+    }
+
+    function showCount(total) {
+      for (const id of ['approval-count', 'toggle-count']) {
+        $(id).hidden = !total;
+        $(id).textContent = total;
+      }
+    }
+
+    async function refreshApprovals() {
+      const { approvals } = await api('/assistant/approvals');
+      showCount(approvals.length);
+      // This runs on a timer. Redrawing an unchanged list would pull the buttons
+      // out from under a click, and take keyboard focus away from them.
+      const shown = JSON.stringify(approvals.map(item => item.approval_id));
+      if (shown === state.approvalsShown) return;
+      state.approvalsShown = shown;
+      const panel = $('panel-approvals');
+      panel.replaceChildren();
+      if (!approvals.length) { panel.append(note('Nothing is waiting for you. When an action needs your say, it stops here, and nothing runs until you decide.')); return; }
+      for (const item of approvals) {
+        const card = make('div', 'card');
+        card.append(make('strong', '', item.capability), make('div', 'card-note', item.reason));
+        card.append(make('pre', 'arguments', JSON.stringify(item.arguments, null, 2)));
+        if (item.user && item.user.startsWith('peer:')) card.append(tag('asked by another install', 'warn'));
+        const row = make('div', 'card-actions');
+        const decide = approve => async () => {
+          row.querySelectorAll('button').forEach(other => { other.disabled = true; });
+          try {
+            const outcome = await api(`/assistant/approvals/${encodeURIComponent(item.approval_id)}`, { method: 'POST', body: JSON.stringify({ approve }) });
+            if (outcome.turn) {
+              const reply = addTurn('assistant');
+              renderText(reply.body, outcome.turn.text);
+              addReceipt(reply.turn, outcome.turn);
+              scrollDown();
+            }
+          } catch (error) {
+            card.append(make('p', 'error', error.message));
+            row.querySelectorAll('button').forEach(other => { other.disabled = false; });  // it is still waiting
+          }
+          await refreshApprovals();
+        };
+        row.append(button('Decline', 'btn small', decide(false)), button('Approve this exact action', 'btn small primary', decide(true)));
+        card.append(row);
+        panel.append(card);
+      }
+    }
+
+    function memoryCard(row, onChange) {
+      const card = make('div', 'card');
+      card.append(make('div', 'card-text', row.text));
+      const tags = make('div', 'tags');
+      tags.append(tag(row.trust, trustTone(row.trust)), tag(row.kind), tag(`reach ${row.reach}`));
+      card.append(tags, make('div', 'card-note', `From ${row.source} (${row.source_id}), by ${row.author}, ${when(row.captured_at)}`));
+      const actions = make('div', 'card-actions');
+      if (row.trust === 'model') {
+        actions.append(button('This is right', 'btn small', async () => {
+          try { await api(`/assistant/memory/${row.id}/confirm`, { method: 'POST' }); await onChange(); }
+          catch (error) { card.append(make('p', 'error', error.message)); }
+        }));
+      }
+      const forget = button('Forget', 'btn small', async () => {
+        if (forget.dataset.armed !== 'yes') { forget.dataset.armed = 'yes'; forget.textContent = 'Delete for good?'; return; }
+        try { await api(`/assistant/memory/${row.id}`, { method: 'DELETE' }); await onChange(); }
+        catch (error) { card.append(make('p', 'error', error.message)); }
+      });
+      actions.append(forget);
+      card.append(actions);
+      return card;
+    }
+
+    async function refreshMemory() {
+      const query = $('memory-query').value.trim();
+      const list = $('memory-list');
+      if (query) {
+        const { results } = await api(`/assistant/memory?q=${encodeURIComponent(query)}`);
+        list.replaceChildren(...results.map(item => {
+          const card = make('div', 'card');
+          const tags = make('div', 'tags');
+          tags.append(tag(item.trust, trustTone(item.trust)), tag(`reach ${item.reach}`));
+          card.append(make('div', 'card-text', item.text), tags, make('div', 'card-note', `${item.source_id}, by ${item.author}`));
+          return card;
+        }));
+        if (!results.length) list.append(note('Nothing remembered matches that.'));
+        return;
+      }
+      const { memories } = await api('/assistant/memory');
+      list.replaceChildren(...memories.map(row => memoryCard(row, refreshMemory)));
+      if (!memories.length) list.append(note('Nothing is remembered yet.'));
+    }
+
+    async function refreshTasks() {
+      const { available, tasks } = await api('/assistant/tasks');
+      const panel = $('panel-tasks');
+      panel.replaceChildren();
+      if (!available) { panel.append(note('The task engine is not installed, so everything is answered directly.')); return; }
+      if (!tasks.length) { panel.append(note('No tasks yet. Larger pieces of work appear here.')); return; }
+      for (const task of tasks) {
+        const card = make('div', 'card');
+        const tags = make('div', 'tags');
+        tags.append(tag(task.status, TONE[task.status]), make('span', 'card-note', when(task.created_at)));
+        card.append(make('strong', '', task.title), tags, make('div', 'card-note', task.id));
+        if (!ENDED.includes(task.status)) {
+          const row = make('div', 'card-actions');
+          row.append(button('Cancel', 'btn small', async () => {
+            try { await api(`/assistant/tasks/${encodeURIComponent(task.id)}/cancel`, { method: 'POST' }); await refreshTasks(); }
+            catch (error) { card.append(make('p', 'error', error.message)); }
+          }));
+          card.append(row);
+        }
+        panel.append(card);
+      }
+    }
+
+    function showConversation(rows) {
+      $('turns').querySelectorAll('.turn').forEach(turn => turn.remove());
+      $('empty').hidden = rows.length > 0;
+      for (const row of rows) {
+        if (row.role === 'user') addTurn('user').body.textContent = row.content;
+        if (row.role === 'assistant') renderText(addTurn('assistant').body, row.content);
+        if (row.role === 'notice') addTurn('assistant').body.append(make('p', 'quiet-text', row.content));
+      }
+      scrollDown();
+    }
+
+    async function openConversation(id) {
+      const mine = ++state.opening;
+      const { messages } = await api(`/assistant/conversations/${encodeURIComponent(id)}`);
+      if (mine !== state.opening) return;  // a person moved on while this was loading
+      state.conversation = id;
+      session.set('assistant-conversation', id);
+      showConversation(messages);
+    }
+
+    async function refreshHistory() {
+      const { conversations } = await api('/assistant/conversations');
+      const panel = $('panel-history');
+      panel.replaceChildren();
+      if (!conversations.length) { panel.append(note('Nothing has been said yet.')); return; }
+      for (const row of conversations) {
+        const card = make('div', 'card');
+        card.append(button(when(row.last_at), 'open-conversation', () => openConversation(row.conversation_id).catch(error => card.append(make('p', 'error', error.message)))));
+        card.append(make('div', 'card-note', `${row.messages} messages${row.conversation_id === state.conversation ? ', open now' : ''}`));
+        panel.append(card);
+      }
+    }
+
+    async function refreshAudit() {
+      const { entries, intact } = await api('/assistant/audit?limit=100&newest=true');
+      const panel = $('panel-audit');
+      panel.replaceChildren();
+      const status = make('div', 'tags');
+      status.append(tag(intact ? 'the record is intact' : 'the record was changed', intact ? 'ok' : 'bad'));
+      panel.append(status);
+      if (state.role !== 'owner') panel.append(note('Showing your own actions. Only the owner sees the whole record.'));
+      for (const row of entries.slice().reverse()) {
+        panel.append(make('div', 'audit-line', `${when(row.at)}  ${row.actor}  ${row.action}  ${row.subject}`));
+      }
+      if (!entries.length) panel.append(note('Nothing recorded yet.'));
+    }
+
+    const panels = { approvals: refreshApprovals, memory: refreshMemory, tasks: refreshTasks, history: refreshHistory, audit: refreshAudit };
+    function showPanel(name) {
+      state.panel = name;
+      for (const tab of document.querySelectorAll('[data-panel]')) tab.setAttribute('aria-pressed', String(tab.dataset.panel === name));
+      for (const key of Object.keys(panels)) $(`panel-${key}`).hidden = key !== name;
+      panels[name]().catch(error => $(`panel-${name}`).append(make('p', 'error', error.message)));
+    }
+
+    async function start() {
+      if (!state.key) { askForKey(); return; }
+      try {
+        const me = await api('/assistant/whoami');
+        state.role = me.role;
+        $('name').textContent = me.assistant;
+        $('who').textContent = `with ${me.user}`;
+        $('greeting').textContent = `${me.assistant} is here`;
+        document.title = me.assistant;
+        session.set('assistant-key', state.key);
+        if (state.conversation) await openConversation(state.conversation).catch(() => {});
+        else newConversation();
+        showPanel(state.panel);
+        refreshApprovals().catch(() => {});
+      } catch {}
+    }
+
+    const THEMES = ['system', 'light', 'dark'];
+    function applyTheme(choice) {
+      if (choice === 'system') { delete document.documentElement.dataset.theme; lasting.drop('isharded-theme'); }
+      else { document.documentElement.dataset.theme = choice; lasting.set('isharded-theme', choice); }
+      const next = THEMES[(THEMES.indexOf(choice) + 1) % THEMES.length];
+      for (const icon of document.querySelectorAll('[data-theme-icon]')) icon.toggleAttribute('hidden', icon.dataset.themeIcon !== choice);
+      $('theme-button').dataset.choice = choice;
+      $('theme-button').title = `Theme: ${choice}`;
+      $('theme-button').setAttribute('aria-label', `Theme: ${choice}. Switch to ${next}.`);
+    }
+
+    $('sign-in-form').addEventListener('submit', () => {
+      state.key = $('key').value.trim();
+      $('key').value = '';
+      start();
+    });
+    // Escape closes a dialog however it is asked not to, and without a key nothing here works.
+    $('sign-in').addEventListener('close', () => { if (!state.key) askForKey(); });
+    $('composer').addEventListener('submit', event => {
+      event.preventDefault();
+      const text = $('input').value.trim();
+      if (!text || state.busy) return;
+      $('input').value = '';
+      $('input').style.height = '';
+      send(text);
+    });
+    $('input').addEventListener('keydown', event => {
+      if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); $('composer').requestSubmit(); }
+    });
+    $('input').addEventListener('input', () => {
+      $('input').style.height = 'auto';
+      $('input').style.height = `${$('input').scrollHeight + 2}px`;
+    });
+    for (const tab of document.querySelectorAll('[data-panel]')) tab.addEventListener('click', () => showPanel(tab.dataset.panel));
+    $('memory-search').addEventListener('submit', event => { event.preventDefault(); refreshMemory().catch(() => {}); });
+    $('memory-add').addEventListener('submit', async event => {
+      event.preventDefault();
+      const text = $('memory-text').value.trim();
+      if (!text) return;
+      $('memory-error').hidden = true;
+      try {
+        await api('/assistant/memory', { method: 'POST', body: JSON.stringify({ text }) });
+        $('memory-text').value = '';
+        await refreshMemory();
+      } catch (error) {
+        $('memory-error').hidden = false;
+        $('memory-error').textContent = error.message;
+      }
+    });
+    $('new-chat').addEventListener('click', () => {
+      state.opening += 1;
+      newConversation();
+      showConversation([]);
+    });
+    $('sign-out').addEventListener('click', () => askForKey());
+    $('why-close').addEventListener('click', () => $('why').close());
+    $('theme-button').addEventListener('click', () => applyTheme(THEMES[(THEMES.indexOf($('theme-button').dataset.choice) + 1) % THEMES.length]));
+    $('rail-toggle').addEventListener('click', () => {
+      const open = $('rail').classList.toggle('open');
+      $('rail-toggle').setAttribute('aria-expanded', String(open));
+    });
+    setInterval(() => {
+      if (!state.key || document.hidden) return;
+      refreshApprovals().catch(() => {});
+      if (state.panel === 'tasks') refreshTasks().catch(() => {});
+    }, 5000);
+    applyTheme(document.documentElement.dataset.theme || 'system');
+    start();
+  </script>
+</body>
+</html>

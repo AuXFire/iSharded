@@ -16,10 +16,10 @@ import time
 import psutil
 import pytest
 
-from shardmesh.assistant import cli
-from shardmesh.assistant import tasks as tasks_part
-from shardmesh.assistant.app import Assistant
-from shardmesh.assistant.contracts import (
+from isharded.assistant import cli
+from isharded.assistant import tasks as tasks_part
+from isharded.assistant.app import Assistant
+from isharded.assistant.contracts import (
     Capability,
     Effect,
     ModelReply,
@@ -29,8 +29,8 @@ from shardmesh.assistant.contracts import (
     ToolResult,
     Trust,
 )
-from shardmesh.assistant.sandbox import LocalSandbox
-from shardmesh.assistant.tasks import (
+from isharded.assistant.sandbox import LocalSandbox
+from isharded.assistant.tasks import (
     AGING_SECONDS,
     GRACE_SECONDS,
     Action,
@@ -1477,8 +1477,8 @@ CHILD = """
 import os, sys, time
 sys.path.insert(0, {root!r})
 from pathlib import Path
-from shardmesh.assistant.app import Assistant
-from shardmesh.assistant.contracts import Capability, Effect
+from isharded.assistant.app import Assistant
+from isharded.assistant.contracts import Capability, Effect
 
 home, mode, log, marker = sys.argv[1:5]
 
@@ -1669,8 +1669,8 @@ def test_the_audit_trail_survives_a_kill_and_records_the_unknown(crash):
 
 def engine_process(home, plan_path):
     """The real command line, as a person would leave it running in another terminal."""
-    environment = {**os.environ, "SHARDMESH_SANDBOX": "process"}
-    command_line = [sys.executable, "-m", "shardmesh.cli", "assistant", "--home", str(home), "task", "run", str(plan_path), "--user", "ann"]
+    environment = {**os.environ, "ISHARDED_SANDBOX": "process"}
+    command_line = [sys.executable, "-m", "isharded.cli", "assistant", "--home", str(home), "task", "run", str(plan_path), "--user", "ann"]
     return subprocess.Popen(command_line, cwd=ROOT, env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
 
@@ -1814,10 +1814,10 @@ def test_a_very_long_output_is_cut_when_stored(assistant, engine):
 
 
 def test_slots_come_from_a_setting(assistant, monkeypatch):
-    monkeypatch.setenv("SHARDMESH_TASK_SLOTS", "gpu:3, disk:2")
+    monkeypatch.setenv("ISHARDED_TASK_SLOTS", "gpu:3, disk:2")
     slots = tasks_part.configured_slots()
     assert slots["gpu"] == 3 and slots["disk"] == 2
-    monkeypatch.setenv("SHARDMESH_TASK_SLOTS", "gpu:lots")
+    monkeypatch.setenv("ISHARDED_TASK_SLOTS", "gpu:lots")
     with pytest.raises(ValueError, match="should look like"):
         tasks_part.configured_slots()
 

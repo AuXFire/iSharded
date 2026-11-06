@@ -8,9 +8,9 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from shardmesh import weights
-from shardmesh.protocol import TensorRef, WeightUnit
-from shardmesh.weights import (
+from isharded import weights
+from isharded.protocol import TensorRef, WeightUnit
+from isharded.weights import (
     FetchProgress,
     HubReader,
     LocalReader,

@@ -1,7 +1,7 @@
 """MCP in both directions, against the published specification.
 
 Clients of both eras are real here: a real server process in tests/mcp_test_server.py,
-and a real orchestrator on a real socket. With SHARDMESH_TEST_MCP_PYTHON naming a
+and a real orchestrator on a real socket. With ISHARDED_TEST_MCP_PYTHON naming a
 Python that has the official ``mcp`` package, that client is tried as well.
 """
 
@@ -24,9 +24,9 @@ import httpx
 import pytest
 from starlette.testclient import TestClient
 
-from shardmesh import cli, mcp_client, orchestrator
-from shardmesh.access import AccessControl, create_key
-from shardmesh.mcp_client import (
+from isharded import cli, mcp_client, orchestrator
+from isharded.access import AccessControl, create_key
+from isharded.mcp_client import (
     SAFE_ENVIRONMENT,
     ServerError,
     StdioServer,
@@ -38,7 +38,7 @@ from shardmesh.mcp_client import (
     server_environment,
     split_command,
 )
-from shardmesh.mcp_server import (
+from isharded.mcp_server import (
     HEADER_MISMATCH,
     INVALID_PARAMS,
     INVALID_REQUEST,
@@ -57,8 +57,8 @@ from shardmesh.mcp_server import (
     header_value,
     serve_stdio,
 )
-from shardmesh.protocol import StageAssignment
-from shardmesh.tokenizer import ChatTokenizer
+from isharded.protocol import StageAssignment
+from isharded.tokenizer import ChatTokenizer
 
 ROOT = Path(__file__).resolve().parents[1]
 TEST_SERVER = Path(__file__).with_name("mcp_test_server.py")
@@ -111,7 +111,7 @@ def test_initialize_answers_with_the_version_asked_for(version):
     result = reply["result"]
     assert result["protocolVersion"] == version
     assert result["capabilities"]["tools"] == {"listChanged": False}
-    assert result["serverInfo"]["name"] == "shardmesh"
+    assert result["serverInfo"]["name"] == "isharded"
     assert "resultType" not in result
 
 
@@ -147,7 +147,7 @@ def test_discover_says_what_is_supported_without_any_handshake():
     assert result["supportedVersions"] == list(SUPPORTED_VERSIONS)
     assert result["capabilities"] == {"tools": {}}
     assert result["resultType"] == "complete"
-    assert result["_meta"][SERVER_KEY]["name"] == "shardmesh"
+    assert result["_meta"][SERVER_KEY]["name"] == "isharded"
     assert result["ttlMs"] > 0 and result["cacheScope"] in {"public", "private"}
 
 
@@ -156,7 +156,7 @@ def test_modern_requests_need_no_initialize_and_carry_the_new_fields():
     result = modern(target, "tools/list")["result"]
     assert [tool["name"] for tool in result["tools"]] == ["chat", "embed", "list_models", "mesh_status"]
     assert result["resultType"] == "complete" and result["ttlMs"] > 0 and result["cacheScope"] == "private"
-    assert result["_meta"][SERVER_KEY]["name"] == "shardmesh"
+    assert result["_meta"][SERVER_KEY]["name"] == "isharded"
     called = modern(target, "tools/call", {"name": "list_models", "arguments": {}})["result"]
     assert called["resultType"] == "complete" and not called.get("isError")
 
@@ -425,14 +425,14 @@ def test_a_long_reply_holds_nothing_up_and_can_be_cancelled(stdio):
 
 
 def project_env(tmp_path: Path) -> dict[str, str]:
-    env = {key: value for key, value in os.environ.items() if not key.startswith("SHARDMESH_")}
-    env.update(SHARDMESH_POOL_TOKEN_FILE=str(tmp_path / "no-token"), PYTHONUTF8="1")
+    env = {key: value for key, value in os.environ.items() if not key.startswith("ISHARDED_")}
+    env.update(ISHARDED_POOL_TOKEN_FILE=str(tmp_path / "no-token"), PYTHONUTF8="1")
     return env
 
 
 def test_the_real_command_keeps_stdout_for_the_protocol(tmp_path):
     process = subprocess.Popen(
-        [sys.executable, "-m", "shardmesh", "mcp", "--url", "http://127.0.0.1:9"],
+        [sys.executable, "-m", "isharded", "mcp", "--url", "http://127.0.0.1:9"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=ROOT, env=project_env(tmp_path),
     )
     lines = [
@@ -670,10 +670,10 @@ def real_socket(tmp_path_factory):
     """A real orchestrator on a real socket, on a port kept for this project's tests."""
     home = tmp_path_factory.mktemp("mcp-node")
     port = 9531
-    env = {key: value for key, value in os.environ.items() if not key.startswith("SHARDMESH_")}
-    env.update(SHARDMESH_POOL_TOKEN_FILE=str(home / "no-token"), PYTHONUTF8="1")
+    env = {key: value for key, value in os.environ.items() if not key.startswith("ISHARDED_")}
+    env.update(ISHARDED_POOL_TOKEN_FILE=str(home / "no-token"), PYTHONUTF8="1")
     command = [
-        sys.executable, "-m", "shardmesh.orchestrator", "--host", "127.0.0.1", "--port", str(port), "--open",
+        sys.executable, "-m", "isharded.orchestrator", "--host", "127.0.0.1", "--port", str(port), "--open",
         "--keys-file", str(home / "keys.json"), "--state-file", str(home / "state.json"), "--audit-file", str(home / "audit.jsonl"),
     ]
     process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -799,14 +799,14 @@ def test_quoted_paths_with_spaces_stay_whole():
 
 
 def test_servers_see_only_the_basics_unless_told_otherwise(started, monkeypatch):
-    monkeypatch.setenv("SHARDMESH_POOL_TOKEN", "secret-value")
+    monkeypatch.setenv("ISHARDED_POOL_TOKEN", "secret-value")
     monkeypatch.setenv("SOME_API_KEY", "secret-value")
     monkeypatch.setenv("WANTED_BY_SERVER", "yes")
     assert "SOME_API_KEY" not in server_environment([])
-    assert "SHARDMESH_POOL_TOKEN" not in server_environment(["WANTED_BY_SERVER"])
+    assert "ISHARDED_POOL_TOKEN" not in server_environment(["WANTED_BY_SERVER"])
     assert server_environment(["WANTED_BY_SERVER"])["WANTED_BY_SERVER"] == "yes"
     seen = Toolbox([started()]).call("environment", {}, 10)
-    assert "SOME_API_KEY" not in seen and "SHARDMESH_POOL_TOKEN" not in seen
+    assert "SOME_API_KEY" not in seen and "ISHARDED_POOL_TOKEN" not in seen
     assert {name.upper() for name in json.loads(seen)} - {name.upper() for name in SAFE_ENVIRONMENT} <= {"SYSTEMROOT", "PYTHONIOENCODING", "COMSPEC", "WINDIR"}
 
 
@@ -1038,7 +1038,7 @@ def test_run_needs_a_model_and_a_server(capsys):
 
 # --- the official client
 
-OFFICIAL_PYTHON = os.environ.get("SHARDMESH_TEST_MCP_PYTHON", "")
+OFFICIAL_PYTHON = os.environ.get("ISHARDED_TEST_MCP_PYTHON", "")
 needs_official = pytest.mark.skipif(not (OFFICIAL_PYTHON and Path(OFFICIAL_PYTHON).is_file()), reason="needs a Python with the official mcp package")
 OFFICIAL_SCRIPT = """
 import asyncio, json, sys
@@ -1058,8 +1058,8 @@ async def exercise(client):
 
 async def main():
     python, cwd, url, token_file = sys.argv[1:5]
-    env = {"SHARDMESH_POOL_TOKEN_FILE": token_file, "PYTHONUTF8": "1", "SYSTEMROOT": sys.argv[5]}
-    parameters = StdioServerParameters(command=python, args=["-m", "shardmesh", "mcp", "--url", url], env=env, cwd=cwd)
+    env = {"ISHARDED_POOL_TOKEN_FILE": token_file, "PYTHONUTF8": "1", "SYSTEMROOT": sys.argv[5]}
+    parameters = StdioServerParameters(command=python, args=["-m", "isharded", "mcp", "--url", url], env=env, cwd=cwd)
     results = {}
     for mode in ("auto", "legacy"):
         async with Client(stdio_client(parameters), mode=mode) as client:

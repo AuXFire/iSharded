@@ -6,11 +6,11 @@ import re
 
 import pytest
 
-from shardmesh import cli, orchestrator, worker
+from isharded import cli, orchestrator, worker
 
 ROOT = Path(__file__).resolve().parents[1]
 README = (ROOT / "README.md").read_text(encoding="utf-8")
-CODE = {path: path.read_text(encoding="utf-8") for path in (ROOT / "shardmesh").glob("*.py")}
+CODE = {path: path.read_text(encoding="utf-8") for path in (ROOT / "isharded").glob("*.py")}
 
 
 def parsers():
@@ -22,7 +22,7 @@ def parsers():
                     if command != "assistant":  # docs/ASSISTANT.md documents those; see test_assistant_docs
                         yield from walk(child, f"{name} {command}")
 
-    yield from walk(cli.build_parser(), "shardmesh")
+    yield from walk(cli.build_parser(), "isharded")
     yield "orchestrator", orchestrator.build_parser()
     yield "worker", worker.build_parser()
 
@@ -47,7 +47,7 @@ def test_every_option_explains_itself():
 
 def test_every_command_has_a_section():
     for command in ("up", "invite", "approve", "doctor", "service", "demo", "node", "load", "lane", "net", "audit", "cordon", "model hash", "key", "pool"):
-        assert re.search(rf"^### shardmesh {command}", README, re.M), command
+        assert re.search(rf"^### isharded {command}", README, re.M), command
 
 
 @pytest.mark.parametrize("name", ["init", "add-node", "request-join", "requests", "approve", "deny", "revoke"])
@@ -58,32 +58,32 @@ def test_every_pool_command_is_documented(name):
 def test_every_setting_is_documented():
     found = set()
     for text in CODE.values():
-        found |= set(re.findall(r"\b(?:SHARDMESH|HF|HUGGING_FACE)_[A-Z0-9_]+", text))
+        found |= set(re.findall(r"\b(?:ISHARDED|HF|HUGGING_FACE)_[A-Z0-9_]+", text))
     missing = sorted(name for name in found if name not in README)
     assert not missing
 
 
 def test_every_public_route_is_documented():
-    routes = set(re.findall(r'@app\.(?:get|post|delete)\("(/[^"]+)"', CODE[ROOT / "shardmesh" / "orchestrator.py"]))
+    routes = set(re.findall(r'@app\.(?:get|post|delete)\("(/[^"]+)"', CODE[ROOT / "isharded" / "orchestrator.py"]))
     public = {route for route in routes if not route.startswith("/internal")}
     missing = sorted(route for route in public if f"`{route}`" not in README and route not in README)
     assert not missing
 
 
 def test_every_metric_is_documented():
-    names = set(re.findall(r'add\(\s*"([a-z_]+)"', CODE[ROOT / "shardmesh" / "orchestrator.py"]))
+    names = set(re.findall(r'add\(\s*"([a-z_]+)"', CODE[ROOT / "isharded" / "orchestrator.py"]))
     assert names
     assert not sorted(name for name in names if f"`{name}`" not in README)
 
 
 def test_every_load_field_is_documented():
-    from shardmesh.protocol import LoadModelRequest
+    from isharded.protocol import LoadModelRequest
 
     assert not sorted(name for name in LoadModelRequest.model_fields if f"`{name}`" not in README)
 
 
 def test_every_chat_field_is_documented():
-    from shardmesh.protocol import ChatCompletionRequest, CompletionRequest
+    from isharded.protocol import ChatCompletionRequest, CompletionRequest
 
     fields = {*ChatCompletionRequest.model_fields, *CompletionRequest.model_fields}
     assert not sorted(name for name in fields if f"`{name}`" not in README)
@@ -106,5 +106,5 @@ def test_links_inside_the_page_have_a_heading():
 
 
 def test_scripts_named_in_the_readme_exist():
-    for name in re.findall(r"`(scripts/[\w./-]+|packaging/[\w./-]+|shardmesh/\w+\.py)`", README):
+    for name in re.findall(r"`(scripts/[\w./-]+|packaging/[\w./-]+|isharded/\w+\.py)`", README):
         assert (ROOT / name).exists(), name

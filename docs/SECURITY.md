@@ -1,6 +1,6 @@
-# ShardMesh security
+# iSharded security
 
-ShardMesh runs code and holds prompts on every machine in a pool, so a pool is only as trustworthy as its least trusted node. Read this before connecting machines you do not fully control.
+iSharded runs code and holds prompts on every machine in a pool, so a pool is only as trustworthy as its least trusted node. Read this before connecting machines you do not fully control.
 
 ## Trust model
 
@@ -8,13 +8,13 @@ A node in the route sees prompts and replies in plain text, as hidden states or 
 
 ## Who owns a pool
 
-ShardMesh is decentralized in how it runs, not in who owns it. No server is special, any node can coordinate, and losing any machine loses nothing but what it was running. But a pool has an owner: whoever holds the authority key, or the shared token in a pool without one. That person decides who joins, who is thrown out, and who may load models.
+iSharded is decentralized in how it runs, not in who owns it. No server is special, any node can coordinate, and losing any machine loses nothing but what it was running. But a pool has an owner: whoever holds the authority key, or the shared token in a pool without one. That person decides who joins, who is thrown out, and who may load models.
 
-This suits a pool whose members trust each other. It is not a public mesh. A public mesh, where anyone can join, would need answers ShardMesh does not have today: a way to detect wrong results, a way to stop one person running thousands of nodes, and a clear warning that node operators can read prompts. The next section covers what is built for that, and what stays unanswered.
+This suits a pool whose members trust each other. It is not a public mesh. A public mesh, where anyone can join, would need answers iSharded does not have today: a way to detect wrong results, a way to stop one person running thousands of nodes, and a clear warning that node operators can read prompts. The next section covers what is built for that, and what stays unanswered.
 
 ## Invites
 
-`shardmesh up` makes an owned network without anyone handling certificates. It does not weaken anything: the authority's key stays on the owner's machine, and only the process there can sign.
+`isharded up` makes an owned network without anyone handling certificates. It does not weaken anything: the authority's key stays on the owner's machine, and only the process there can sign.
 
 - A code carries the mesh's addresses, a hash of its authority, and a secret. It works a set number of times, one by default, for a set time, 24 hours by default.
 - A new machine fetches the authority and checks it against the hash, so a stranger cannot pose as the mesh. Its key never leaves it.
@@ -25,7 +25,7 @@ This suits a pool whose members trust each other. It is not a public mesh. A pub
 
 ## Finding a mesh
 
-A mesh started with `shardmesh up` answers a UDP broadcast on port 8208, and serves its public certificate at `/join/authority`, so anyone on the network can learn that it exists, its name, and its address. `--no-discovery` turns the broadcast off.
+A mesh started with `isharded up` answers a UDP broadcast on port 8208, and serves its public certificate at `/join/authority`, so anyone on the network can learn that it exists, its name, and its address. `--no-discovery` turns the broadcast off.
 
 An answer proves nothing, and anyone can send one. A machine that finds a mesh only asks to join. A person on the owner's side approves it after comparing the key fingerprint both machines show, so nothing gets in by being found. Going the other way, a rogue answer can lure a new machine to ask a stranger, so a new machine shows the authority's hash and asks you before it does. `--find` skips that question, so use it only on a network you trust.
 
@@ -57,7 +57,7 @@ What this does not give you:
 
 A node starts refusing to serve a network if it would be exposed:
 
-- With no credentials, it will not listen beyond loopback. Run `shardmesh pool init`, or pass `--open` if the network itself is the protection.
+- With no credentials, it will not listen beyond loopback. Run `isharded pool init`, or pass `--open` if the network itself is the protection.
 - With credentials but no encryption, it will not advertise an ordinary LAN address, because every gossip round carries the pool token. Use TLS or a Tailscale address, or pass `--trusted-network` if nobody else can read that network.
 
 ## Setting up a pool
@@ -65,15 +65,15 @@ A node starts refusing to serve a network if it would be exposed:
 For a pool on Tailscale or a closed network, a shared token is enough:
 
 ```bash
-shardmesh pool init --dir pool-secrets
+isharded pool init --dir pool-secrets
 ```
 
-Copy `pool.token` to each node as `%LOCALAPPDATA%\ShardMesh\pool.token` (Windows) or `~/.shardmesh/pool.token`. Anyone holding it can act as any node.
+Copy `pool.token` to each node as `%LOCALAPPDATA%\iSharded\pool.token` (Windows) or `~/.isharded/pool.token`. Anyone holding it can act as any node.
 
-For machines you may need to throw out individually, or remotes across the internet, give each node a certificate. Every node then needs the `pool` extra (`pip install shardmesh[pool]`).
+For machines you may need to throw out individually, or remotes across the internet, give each node a certificate. Every node then needs the `pool` extra (`pip install isharded[pool]`).
 
 ```bash
-shardmesh pool add-node --dir pool-secrets node-b --address 10.0.0.6
+isharded pool add-node --dir pool-secrets node-b --address 10.0.0.6
 ```
 
 Keep `ca.key` off the nodes. The name in the certificate must match `--node-id`, because a node may only speak for itself and its own workers.
@@ -99,24 +99,24 @@ Many antivirus products intercept TLS on every port, even on loopback, and repla
 
 ## Adding members
 
-An owner can issue a certificate directly with `shardmesh pool add-node`, or a node can ask. Asking keeps the node's private key on the node, and the owner's key off the network.
+An owner can issue a certificate directly with `isharded pool add-node`, or a node can ask. Asking keeps the node's private key on the node, and the owner's key off the network.
 
 ```bash
-shardmesh pool request-join node-c --dir node-identity --address 100.64.0.9 --url http://10.0.0.5:8000 --wait
+isharded pool request-join node-c --dir node-identity --address 100.64.0.9 --url http://10.0.0.5:8000 --wait
 ```
 
 The node prints a key fingerprint. Any member passes the request on. The owner lists what is waiting, checks the fingerprint with whoever is asking, and answers:
 
 ```bash
-shardmesh pool requests --url http://10.0.0.5:8000 --token <admin key>
+isharded pool requests --url http://10.0.0.5:8000 --token <admin key>
 ```
 
 ```bash
-shardmesh pool approve node-c --dir pool-secrets --url http://10.0.0.5:8000 --token <admin key>
+isharded pool approve node-c --dir pool-secrets --url http://10.0.0.5:8000 --token <admin key>
 ```
 
 ```bash
-shardmesh pool deny node-c --dir pool-secrets --url http://10.0.0.5:8000 --token <admin key>
+isharded pool deny node-c --dir pool-secrets --url http://10.0.0.5:8000 --token <admin key>
 ```
 
 Asking grants nothing. An approved node collects its certificate from any member and starts with `--ca-file`, `--identity-cert`, and `--identity-key`. A denied key stays denied, and a revoked name cannot ask again. Up to 64 requests wait at once. Check `ca.pem` against the owner's copy before trusting it, because the node that hands it over could be lying.
@@ -126,20 +126,20 @@ Asking grants nothing. An approved node collects its certificate from any member
 With a pool authority, keys and revocations are signed with `ca.key` and sent to any node, and gossip carries them to the rest. Nodes ignore anything unsigned, so a compromised node cannot add a key, remove one, or revoke a peer.
 
 ```bash
-shardmesh key create alice --role user --requests-per-minute 60 --dir pool-secrets --url http://10.0.0.5:8000
+isharded key create alice --role user --requests-per-minute 60 --dir pool-secrets --url http://10.0.0.5:8000
 ```
 
 ```bash
-shardmesh key remove alice --dir pool-secrets --url http://10.0.0.5:8000
+isharded key remove alice --dir pool-secrets --url http://10.0.0.5:8000
 ```
 
 ```bash
-shardmesh pool revoke node-b --dir pool-secrets --url http://10.0.0.5:8000
+isharded pool revoke node-b --dir pool-secrets --url http://10.0.0.5:8000
 ```
 
 A key is shown once and stored as a SHA-256 hash. `/admin/keys` and `/admin/nodes/{name}/revoke` refuse these changes in such a pool, and say to use these commands.
 
-Without a pool authority, an admin key or the pool token changes these through any node: `POST /admin/keys`, `DELETE /admin/keys/{name}`, `POST /admin/nodes/{name}/revoke`. To seed a key before a pool starts, in either kind of pool, use `shardmesh key create root --role admin --file access.json`, and give each node the file with `--keys-file`. A key file is trusted by the node that reads it, and nothing else.
+Without a pool authority, an admin key or the pool token changes these through any node: `POST /admin/keys`, `DELETE /admin/keys/{name}`, `POST /admin/nodes/{name}/revoke`. To seed a key before a pool starts, in either kind of pool, use `isharded key create root --role admin --file access.json`, and give each node the file with `--keys-file`. A key file is trusted by the node that reads it, and nothing else.
 
 Revocation stops every node accepting that certificate, takes its workers out of the route, and stops gossip with it. A revoked name cannot register new workers.
 
@@ -178,11 +178,11 @@ Fetched ranges are checked for size, and pinned to a commit or a content fingerp
 To check every byte, hash the model on a copy you trust and load with the result:
 
 ```bash
-shardmesh model hash D:\models\model.gguf --out model.hashes
+isharded model hash D:\models\model.gguf --out model.hashes
 ```
 
 ```bash
-shardmesh load model.gguf --hashes model.hashes
+isharded load model.gguf --hashes model.hashes
 ```
 
 Every node then checks every unit against that list, whether it came from a peer, a mirror, or its own disk. A peer serving altered weights is passed over, and if no source matches, the load stops. The list also covers the model's description: config, tensor shapes, and offsets. It does not cover the tokenizer's source or a draft model. A wrong draft can only slow replies, because the main model checks every guess.

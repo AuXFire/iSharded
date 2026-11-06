@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from shardmesh.assistant.gateway import Users
+from isharded.assistant.gateway import Users
 from test_assistant_system import OWNER, Install, ScriptedModel, install, model  # noqa: F401
 
 playwright_api = pytest.importorskip("playwright.sync_api")

@@ -4,10 +4,10 @@ import httpx
 import pytest
 import torch
 
-from shardmesh.orchestrator import ModelTarget, Orchestrator
-from shardmesh.worker import MAX_PENDING_CHECKPOINTS, CacheEntry, WorkerRuntime, choose_dtype
-from shardmesh.planner import ModelProfile, PlacementError
-from shardmesh.protocol import (
+from isharded.orchestrator import ModelTarget, Orchestrator
+from isharded.worker import MAX_PENDING_CHECKPOINTS, CacheEntry, WorkerRuntime, choose_dtype
+from isharded.planner import ModelProfile, PlacementError
+from isharded.protocol import (
     META_HEADER,
     CacheRestoreRequest,
     ConfigureRequest,

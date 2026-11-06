@@ -1,8 +1,8 @@
 """Tool calling on /v1/chat/completions, from a chat template to OpenAI's response shape.
 
 Replies are scripted under the real route, scanner and token loop, so each test
-sees what a client would. Tests that need a real model read SHARDMESH_TEST_LLAMA_DIR
-and SHARDMESH_TEST_GGUF, as tests/test_gguf.py does.
+sees what a client would. Tests that need a real model read ISHARDED_TEST_LLAMA_DIR
+and ISHARDED_TEST_GGUF, as tests/test_gguf.py does.
 """
 
 from __future__ import annotations
@@ -19,11 +19,11 @@ from starlette.testclient import TestClient
 from tokenizers import AddedToken, Tokenizer
 from tokenizers.models import WordLevel
 
-from shardmesh import orchestrator, tokenizer as tokenizer_module
-from shardmesh.llamacpp import step_random
-from shardmesh.protocol import ChatCompletionRequest, ChatMessage, StageAssignment
-from shardmesh.tokenizer import ChatTokenizer, IncrementalText, tokenizer_from_gguf
-from shardmesh.toolcalls import (
+from isharded import orchestrator, tokenizer as tokenizer_module
+from isharded.llamacpp import step_random
+from isharded.protocol import ChatCompletionRequest, ChatMessage, StageAssignment
+from isharded.tokenizer import ChatTokenizer, IncrementalText, tokenizer_from_gguf
+from isharded.toolcalls import (
     DEFAULT_REPLY_TOKENS,
     MARKER_TOKENS,
     TOOL_REPLY_TOKENS,
@@ -255,7 +255,7 @@ def test_tools_use_the_template_kept_for_them():
 def test_named_templates_are_read_from_the_model_config(tmp_path):
     from tokenizers.models import WordLevel as Word
 
-    from shardmesh.tokenizer import load_tokenizer
+    from isharded.tokenizer import load_tokenizer
 
     Tokenizer(Word({"a": 0}, unk_token="a")).save(str(tmp_path / "tokenizer.json"))
     named = [{"name": "default", "template": "chat"}, {"name": "tool_use", "template": "tools"}]
@@ -843,14 +843,14 @@ def test_a_call_survives_the_entry_worker_failing_half_way_through_it(mesh, stre
 
 # --- with a real model
 
-BUILD = os.environ.get("SHARDMESH_TEST_LLAMA_DIR", "")
-MODEL = os.environ.get("SHARDMESH_TEST_GGUF", "")
+BUILD = os.environ.get("ISHARDED_TEST_LLAMA_DIR", "")
+MODEL = os.environ.get("ISHARDED_TEST_GGUF", "")
 needs_real_model = pytest.mark.skipif(not (MODEL and Path(MODEL).is_file()), reason="needs a real GGUF")
 
 
 @needs_real_model
 def test_a_real_gguf_keeps_tool_markers_and_renders_tools():
-    from shardmesh.tokenizer import load_tokenizer
+    from isharded.tokenizer import load_tokenizer
 
     chat = load_tokenizer(MODEL)
     assert tool_format(chat.tool_template) in {"hermes", "xml"}
@@ -866,7 +866,7 @@ def test_a_real_gguf_keeps_tool_markers_and_renders_tools():
 @needs_real_model
 @pytest.mark.parametrize("choice", ["required", {"type": "function", "function": {"name": "get_time"}}])
 def test_a_forced_opening_ends_where_a_real_token_ends(choice):
-    from shardmesh.tokenizer import load_tokenizer
+    from isharded.tokenizer import load_tokenizer
 
     chat = load_tokenizer(MODEL)
     plan = plan_tools([WEATHER, OTHER], choice, None, chat.tool_template)

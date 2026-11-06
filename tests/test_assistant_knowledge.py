@@ -10,11 +10,11 @@ import sys
 import numpy as np
 import pytest
 
-from shardmesh.assistant import knowledge
-from shardmesh.assistant.app import Assistant
-from shardmesh.assistant.cli import add_arguments, run
-from shardmesh.assistant.contracts import Reach, Trust, is_tainted, lowest_reach
-from shardmesh.assistant.knowledge import LibraryRefused, chunk_blocks, chunk_markdown, fuse, is_secret
+from isharded.assistant import knowledge
+from isharded.assistant.app import Assistant
+from isharded.assistant.cli import add_arguments, run
+from isharded.assistant.contracts import Reach, Trust, is_tainted, lowest_reach
+from isharded.assistant.knowledge import LibraryRefused, chunk_blocks, chunk_markdown, fuse, is_secret
 
 
 @pytest.fixture

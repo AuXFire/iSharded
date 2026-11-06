@@ -13,23 +13,23 @@ import shlex
 
 import pytest
 
-from shardmesh.assistant import cli, context, conversation, gateway, gateway_cli, knowledge, memory, providers, router
-from shardmesh.assistant.app import Assistant
-from shardmesh.assistant.contracts import Effect
-from shardmesh.assistant.gateway import create_app
-from shardmesh.assistant.mind import LOCAL_USER
-from shardmesh.assistant.tasks import plan_errors
+from isharded.assistant import cli, context, conversation, gateway, gateway_cli, knowledge, memory, providers, router
+from isharded.assistant.app import Assistant
+from isharded.assistant.contracts import Effect
+from isharded.assistant.gateway import create_app
+from isharded.assistant.mind import LOCAL_USER
+from isharded.assistant.tasks import plan_errors
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCS = (ROOT / "docs" / "ASSISTANT.md").read_text(encoding="utf-8")
 LINES = DOCS.splitlines()
-PACKAGE = ROOT / "shardmesh" / "assistant"
+PACKAGE = ROOT / "isharded" / "assistant"
 # Handed to a child process by the assistant itself. Nobody sets these.
-INTERNAL_SETTINGS = {"SHARDMESH_VOICE_OUT", "SHARDMESH_VOICE_TEXT", "SHARDMESH_VOICE_NAME"}
+INTERNAL_SETTINGS = {"ISHARDED_VOICE_OUT", "ISHARDED_VOICE_TEXT", "ISHARDED_VOICE_NAME"}
 
 
 def root_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="shardmesh assistant")
+    parser = argparse.ArgumentParser(prog="isharded assistant")
     cli.add_arguments(parser)
     return parser
 
@@ -114,7 +114,7 @@ def test_every_documented_route_exists(tmp_path):
 
 
 def test_the_routes_left_open_are_exactly_the_ones_the_manual_says(tmp_path):
-    from shardmesh.assistant import federation
+    from isharded.assistant import federation
 
     for method, path in federation.PUBLIC_ROUTES:
         assert f"`{method} {path}`" in DOCS
@@ -127,7 +127,7 @@ def test_the_routes_left_open_are_exactly_the_ones_the_manual_says(tmp_path):
 def real_settings() -> list[str]:
     found: set[str] = set()
     for path in PACKAGE.glob("*.py"):
-        found |= set(re.findall(r"\bSHARDMESH_[A-Z0-9_]+", path.read_text(encoding="utf-8")))
+        found |= set(re.findall(r"\bISHARDED_[A-Z0-9_]+", path.read_text(encoding="utf-8")))
     return sorted(found - INTERNAL_SETTINGS)
 
 
@@ -202,7 +202,7 @@ def test_the_table_of_tools_matches_what_is_registered(tmp_path):
 
 def shell_lines() -> list[str]:
     blocks = re.findall(r"```(?:text|sh|bash|powershell)?\n(.*?)```", DOCS, re.DOTALL)
-    return [line.strip() for block in blocks for line in block.splitlines() if line.strip().startswith("shardmesh assistant ")]
+    return [line.strip() for block in blocks for line in block.splitlines() if line.strip().startswith("isharded assistant ")]
 
 
 @pytest.mark.parametrize("line", shell_lines())
@@ -239,4 +239,4 @@ def test_the_parts_folder_is_gone_and_nothing_points_at_it():
 
 
 def test_the_page_ships_with_the_package():
-    assert '"shardmesh.assistant" = ["assistant.html"]' in (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert '"isharded.assistant" = ["assistant.html"]' in (ROOT / "pyproject.toml").read_text(encoding="utf-8")

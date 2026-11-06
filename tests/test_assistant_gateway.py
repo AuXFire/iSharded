@@ -17,11 +17,11 @@ import httpx
 import pytest
 import uvicorn
 
-from shardmesh.assistant import federation, gateway
-from shardmesh.assistant.app import Assistant
-from shardmesh.assistant.cli import add_arguments, run
-from shardmesh.assistant.contracts import Effect, Provenance, Reach, ToolCall, Trust, Verdict
-from shardmesh.assistant.gateway import Users, backup, check_bind, create_app, restore
+from isharded.assistant import federation, gateway
+from isharded.assistant.app import Assistant
+from isharded.assistant.cli import add_arguments, run
+from isharded.assistant.contracts import Effect, Provenance, Reach, ToolCall, Trust, Verdict
+from isharded.assistant.gateway import Users, backup, check_bind, create_app, restore
 from test_assistant_fakes import FakeBroker, FakeModelServer, Reply, ScriptedRouter, model_reply, wait_until
 
 
@@ -306,7 +306,7 @@ def test_a_failure_partway_is_kept_and_told_to_the_client(alice, assistant):
 
 def test_another_parts_routes_are_included_and_protected(tmp_path):
     class Part:
-        __name__ = "shardmesh.assistant.fakepart"
+        __name__ = "isharded.assistant.fakepart"
 
         @staticmethod
         def routes(assistant):
@@ -665,7 +665,7 @@ def test_serve_really_runs_and_binds_to_loopback_by_default(tmp_path):
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
     assert not 8000 <= port <= 8399
-    code = "import sys; from shardmesh.cli import main; sys.argv=['shardmesh','assistant','--home',sys.argv[1],'serve','--port',sys.argv[2]]; main()"
+    code = "import sys; from isharded.cli import main; sys.argv=['isharded','assistant','--home',sys.argv[1],'serve','--port',sys.argv[2]]; main()"
     process = subprocess.Popen([sys.executable, "-c", code, str(home), str(port)], cwd=str(Path(__file__).parent.parent), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     try:
         url = f"http://127.0.0.1:{port}"
@@ -722,8 +722,8 @@ def test_serve_really_speaks_tls_when_given_a_certificate(tmp_path):
         port = probe.getsockname()[1]
     assert not 8000 <= port <= 8399
     code = (
-        "import sys; from shardmesh.cli import main; "
-        "sys.argv=['shardmesh','assistant','--home',sys.argv[1],'serve','--port',sys.argv[2],'--tls-cert',sys.argv[3],'--tls-key',sys.argv[4]]; main()"
+        "import sys; from isharded.cli import main; "
+        "sys.argv=['isharded','assistant','--home',sys.argv[1],'serve','--port',sys.argv[2],'--tls-cert',sys.argv[3],'--tls-key',sys.argv[4]]; main()"
     )
     process = subprocess.Popen(
         [sys.executable, "-c", code, str(home), str(port), str(certificate), str(key_file)],
@@ -804,8 +804,8 @@ def test_the_page_keeps_a_key_only_for_the_session():
     """The theme is the one thing kept for longer, and it is shared with the mesh's own pages."""
     source = gateway.HTML_FILE.read_text(encoding="utf-8")
     assert "session.set('assistant-key'" in source and "lasting.set('assistant-key'" not in source
-    assert set(re.findall(r"localStorage\.\w+\(([^,)]*)", source)) == {"'shardmesh-theme'", "key"}
-    assert set(re.findall(r"lasting\.\w+\('([^']*)'", source)) == {"shardmesh-theme"}
+    assert set(re.findall(r"localStorage\.\w+\(([^,)]*)", source)) == {"'isharded-theme'", "key"}
+    assert set(re.findall(r"lasting\.\w+\('([^']*)'", source)) == {"isharded-theme"}
 
 
 # Backup and restore
@@ -1057,11 +1057,11 @@ def test_a_key_file_is_never_overwritten_by_accident(tmp_path, capsys):
 
 
 def test_building_the_command_line_does_not_load_the_web_server():
-    """Every shardmesh command builds this parser, and FastAPI costs most of a second."""
+    """Every isharded command builds this parser, and FastAPI costs most of a second."""
     import subprocess
     import sys
 
-    code = "import sys, argparse; from shardmesh.assistant.cli import add_arguments; add_arguments(argparse.ArgumentParser()); print('fastapi' in sys.modules, 'uvicorn' in sys.modules)"
+    code = "import sys, argparse; from isharded.assistant.cli import add_arguments; add_arguments(argparse.ArgumentParser()); print('fastapi' in sys.modules, 'uvicorn' in sys.modules)"
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=str(Path(__file__).parent.parent), timeout=60)
     assert result.stdout.strip() == "False False", result.stderr[-400:]
 
@@ -1092,13 +1092,13 @@ def test_a_real_refused_command_shows_no_traceback(tmp_path):
     import subprocess
     import sys
 
-    code = "import sys; from shardmesh.cli import main; sys.argv=['shardmesh','assistant','--home',sys.argv[1],'forget','999']; main()"
+    code = "import sys; from isharded.cli import main; sys.argv=['isharded','assistant','--home',sys.argv[1],'forget','999']; main()"
     result = subprocess.run([sys.executable, "-c", code, str(tmp_path)], capture_output=True, text=True, cwd=str(Path(__file__).parent.parent), timeout=60)
     assert result.returncode == 1 and result.stderr.strip() == "There is no memory 999"
 
 
 def test_a_bug_is_still_loud():
-    from shardmesh.assistant.mind import plainly
+    from isharded.assistant.mind import plainly
 
     def broken(assistant, args):
         return {}["missing"]
@@ -1108,7 +1108,7 @@ def test_a_bug_is_still_loud():
 
 
 def test_a_busy_database_is_explained():
-    from shardmesh.assistant.mind import plainly
+    from isharded.assistant.mind import plainly
 
     def busy(assistant, args):
         raise sqlite3.OperationalError("database is locked")

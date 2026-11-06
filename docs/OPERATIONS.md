@@ -1,19 +1,19 @@
-# Operating ShardMesh
+# Operating iSharded
 
-ShardMesh has no central server. Every node runs the same control plane, the nodes elect one of themselves to coordinate, and any node can serve the API. This guide covers running a pool, what it does on its own when something fails, and what to watch.
+iSharded has no central server. Every node runs the same control plane, the nodes elect one of themselves to coordinate, and any node can serve the API. This guide covers running a pool, what it does on its own when something fails, and what to watch.
 
 ## Start a pool
 
 On the first node:
 
 ```powershell
-shardmesh node --node-id node-a --gguf-dir D:\models
+isharded node --node-id node-a --gguf-dir D:\models
 ```
 
 On every other node, name any node that is already running:
 
 ```powershell
-shardmesh node --node-id node-b --join http://10.0.0.5:8209
+isharded node --node-id node-b --join http://10.0.0.5:8209
 ```
 
 The address and control port are worked out for you: `--advertise-host` defaults to `auto`, which prefers a Tailscale address and then the address on the route out, and the control plane listens on `--base-port` plus 9. Set `--advertise-host` when a machine has several networks and peers should use a particular one. Once a node has joined, it learns the rest of the mesh by gossip.
@@ -23,12 +23,12 @@ Node names decide who coordinates when nobody does yet (the lowest name wins), s
 Load a model from any node:
 
 ```powershell
-shardmesh load "ggml-org/Qwen3.8-27B-GGUF:Qwen3.8-27B-Q4_K_M.gguf" --url http://10.0.0.6:8209
+isharded load "ggml-org/Qwen3.8-27B-GGUF:Qwen3.8-27B-Q4_K_M.gguf" --url http://10.0.0.6:8209
 ```
 
 `/chat` and `/dashboard` work on every node.
 
-To start a node when its machine boots, use `scripts\install_node_task.ps1` on Windows, which registers a scheduled task, or `packaging/shardmesh-node.service` on Linux. A node restarts its own services, so these only have to start it once. The systemd unit has not been run on a real machine yet.
+To start a node when its machine boots, use `scripts\install_node_task.ps1` on Windows, which registers a scheduled task, or `packaging/isharded-node.service` on Linux. A node restarts its own services, so these only have to start it once. The systemd unit has not been run on a real machine yet.
 
 A node will not start on a network without protection. See `docs/SECURITY.md` for setting up credentials.
 
@@ -36,7 +36,7 @@ A node will not start on a network without protection. See `docs/SECURITY.md` fo
 
 | Network | What to set |
 |---|---|
-| Closed network, no internet | Put GGUF files on any node with `--gguf-dir`, and load by file name: `shardmesh load Qwen3.6-27B-Q4_K_M.gguf`. Give each node a llama.cpp build with `--llama-dir`, because automatic downloads need GitHub. |
+| Closed network, no internet | Put GGUF files on any node with `--gguf-dir`, and load by file name: `isharded load Qwen3.6-27B-Q4_K_M.gguf`. Give each node a llama.cpp build with `--llama-dir`, because automatic downloads need GitHub. |
 | LAN | Use TLS, or pass `--trusted-network` if nobody else can read the network. Without either a node refuses to start, because the pool token would cross the LAN unencrypted. |
 | VLANs | As for a LAN. Peers must be able to route to each other's ports. Discovery does not use broadcast, so `--join` works across VLANs. Open the control port and worker ports between them. |
 | Tailscale | Nothing special. Links are encrypted, and addresses work from anywhere on the tailnet. Add certificates with tickets for per-node identity. This works with antivirus intercepting TLS. |
@@ -73,13 +73,13 @@ A reply is lost when the node a client is connected to dies, because that node h
 To take a node out of service:
 
 ```bash
-shardmesh cordon node-b --url http://10.0.0.5:8000
+isharded cordon node-b --url http://10.0.0.5:8000
 ```
 
 Replies in progress finish, then the node's layers move to the rest of the pool. The node stays in the mesh and can still serve the API. When it is safe to work on, nothing in the route depends on it.
 
 ```bash
-shardmesh uncordon node-b --url http://10.0.0.5:8000
+isharded uncordon node-b --url http://10.0.0.5:8000
 ```
 
 This puts it back, and stops a move still under way. A cordon is shared by every node and survives restarts.
@@ -149,20 +149,20 @@ Metrics worth alerting on:
 
 | Metric | Meaning |
 |---|---|
-| `shardmesh_stream_fallbacks_total` rising | Replies are failing and being replayed. Fallbacks keep replies alive, so nothing else may look wrong. |
-| `shardmesh_worker_stage_restarts_total` rising | A stage keeps crashing. |
-| `shardmesh_workers_quarantined` above zero | A worker is held out of the route. |
-| `shardmesh_mesh_members` below the node count | A node cannot see part of the mesh. |
-| `shardmesh_serving` at zero | This node cannot serve replies. |
-| `shardmesh_worker_draft_tokens_per_pass` near 1 | The draft is not helping. |
-| `shardmesh_stage_errors_total` rising | Stages are refusing requests. Nobody is quarantined for this, so a real fault in a stage shows up here and in failed replies. |
+| `isharded_stream_fallbacks_total` rising | Replies are failing and being replayed. Fallbacks keep replies alive, so nothing else may look wrong. |
+| `isharded_worker_stage_restarts_total` rising | A stage keeps crashing. |
+| `isharded_workers_quarantined` above zero | A worker is held out of the route. |
+| `isharded_mesh_members` below the node count | A node cannot see part of the mesh. |
+| `isharded_serving` at zero | This node cannot serve replies. |
+| `isharded_worker_draft_tokens_per_pass` near 1 | The draft is not helping. |
+| `isharded_stage_errors_total` rising | Stages are refusing requests. Nobody is quarantined for this, so a real fault in a stage shows up here and in failed replies. |
 
 ## Files each node keeps
 
 | What | Default | Notes |
 |---|---|---|
-| Route state | `%LOCALAPPDATA%\ShardMesh\orchestrator-state.json` | Copied to every node by gossip. |
-| Audit log | `%LOCALAPPDATA%\ShardMesh\audit.jsonl` | Rotates at 64 MiB, keeping one old file. |
+| Route state | `%LOCALAPPDATA%\iSharded\orchestrator-state.json` | Copied to every node by gossip. |
+| Audit log | `%LOCALAPPDATA%\iSharded\audit.jsonl` | Rotates at 64 MiB, keeping one old file. |
 | Node log | `--log-file` | Nothing is kept unless you set this. |
 | Fetched shards | `--cache-dir` | Evicted by age past `--cache-budget-gb`. |
 | Stage files | Inside the cache | Rebuilt from shards when a stage moves. Count double the node's share. |
@@ -171,10 +171,10 @@ The dashboard's "Memory for weights" counts weights only. Real use is higher: KV
 
 Stages read their weights once rather than mapping the file, unless some of them are on the disk tier. A mapped file stays resident in RAM even when the tensors live in VRAM: with Qwen3.6-27B on the 7900 XT, mapping cost 15.1 GiB of RAM and reading cost 1.0 GiB, at the same 35.6 tok/s. Windows reports "private" memory near the VRAM size in both cases, which is GPU allocation and not RAM.
 
-Request logging is off, because nodes poll each other constantly. Set `SHARDMESH_ACCESS_LOG=1` to turn it on while debugging.
+Request logging is off, because nodes poll each other constantly. Set `ISHARDED_ACCESS_LOG=1` to turn it on while debugging.
 
 ## Upgrading
 
 Nodes refuse peers on a different `PROTOCOL_VERSION`, and the refusal names both versions. Upgrade all nodes together when that number changes. Otherwise, restart nodes one at a time, and the mesh carries on around each one.
 
-`shardmesh/llamacpp.py` is written against one llama.cpp build, `PINNED_BUILD`. A different build fails a check at load rather than misreading memory. Check `llama.h` before changing it.
+`isharded/llamacpp.py` is written against one llama.cpp build, `PINNED_BUILD`. A different build fails a check at load rather than misreading memory. Check `llama.h` before changing it.

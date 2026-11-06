@@ -1,8 +1,8 @@
 import pytest
 import torch
 
-from shardmesh.protocol import decode_tensors, encode_tensors
-from shardmesh.worker import MemoryStore
+from isharded.protocol import decode_tensors, encode_tensors
+from isharded.worker import MemoryStore
 
 
 def snapshot(layer: int, value: float) -> bytes:

@@ -14,7 +14,7 @@ import threading
 import time
 from typing import Any
 
-from shardmesh.assistant.contracts import (
+from isharded.assistant.contracts import (
     CallContext,
     Capability,
     Decision,
@@ -145,7 +145,7 @@ class FakeModelServer:
         """Hold requests to the mesh's real schema, so a fake cannot drift from it."""
         from pydantic import ValidationError
 
-        from shardmesh.protocol import ChatCompletionRequest
+        from isharded.protocol import ChatCompletionRequest
 
         try:
             ChatCompletionRequest.model_validate(body)

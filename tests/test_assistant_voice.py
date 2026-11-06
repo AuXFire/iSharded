@@ -22,10 +22,10 @@ import httpx
 import pytest
 import uvicorn
 
-from shardmesh.assistant.app import Assistant
-from shardmesh.assistant.cli import add_arguments
-from shardmesh.assistant.contracts import Capability, Decision, Effect, Trust, Verdict
-from shardmesh.assistant.voice import (
+from isharded.assistant.app import Assistant
+from isharded.assistant.cli import add_arguments
+from isharded.assistant.contracts import Capability, Decision, Effect, Trust, Verdict
+from isharded.assistant.voice import (
     INSTALL_SPEECH,
     INSTALL_WHISPER,
     SPEAK,
@@ -39,11 +39,11 @@ from shardmesh.assistant.voice import (
 )
 
 SETTINGS = (
-    "SHARDMESH_ASSISTANT_WHISPER_MODEL",
-    "SHARDMESH_ASSISTANT_WHISPER_CPP",
-    "SHARDMESH_ASSISTANT_WHISPER_CPP_MODEL",
-    "SHARDMESH_ASSISTANT_PIPER",
-    "SHARDMESH_ASSISTANT_PIPER_MODEL",
+    "ISHARDED_ASSISTANT_WHISPER_MODEL",
+    "ISHARDED_ASSISTANT_WHISPER_CPP",
+    "ISHARDED_ASSISTANT_WHISPER_CPP_MODEL",
+    "ISHARDED_ASSISTANT_PIPER",
+    "ISHARDED_ASSISTANT_PIPER_MODEL",
 )
 HAS_SYSTEM_VOICE = bool(shutil.which("powershell") if os.name == "nt" else shutil.which("say") or shutil.which("espeak-ng"))
 needs_system_voice = pytest.mark.skipif(not HAS_SYSTEM_VOICE, reason="this machine has no system voice")
@@ -172,7 +172,7 @@ def test_the_model_is_loaded_once(assistant, monkeypatch, audio):
 def test_the_model_setting_is_used(assistant, monkeypatch, audio):
     recorded: list[Any] = []
     fake_whisper(monkeypatch, recorded)
-    monkeypatch.setenv("SHARDMESH_ASSISTANT_WHISPER_MODEL", "/models/small")
+    monkeypatch.setenv("ISHARDED_ASSISTANT_WHISPER_MODEL", "/models/small")
     assistant.voice.transcribe(audio)
     assert recorded[0][0] == "/models/small"
 
@@ -180,7 +180,7 @@ def test_the_model_setting_is_used(assistant, monkeypatch, audio):
 def test_the_real_library_with_no_model_says_so_and_touches_no_network(assistant, monkeypatch, audio):
     """This is faster-whisper itself, if it is installed here."""
     pytest.importorskip("faster_whisper")
-    monkeypatch.setenv("SHARDMESH_ASSISTANT_WHISPER_MODEL", "no-such-model-here")
+    monkeypatch.setenv("ISHARDED_ASSISTANT_WHISPER_MODEL", "no-such-model-here")
     connections: list[Any] = []
     real_connect = socket.socket.connect
     monkeypatch.setattr(socket.socket, "connect", lambda self, address: connections.append(address) or real_connect(self, address))
@@ -191,22 +191,22 @@ def test_the_real_library_with_no_model_says_so_and_touches_no_network(assistant
 
 def test_whisper_cpp_is_the_fallback(assistant, monkeypatch, audio, tmp_path):
     no_whisper(monkeypatch)
-    monkeypatch.setenv("SHARDMESH_ASSISTANT_WHISPER_CPP", str(stand_in(tmp_path, "whisper-cli", WHISPER_CPP)))
-    monkeypatch.setenv("SHARDMESH_ASSISTANT_WHISPER_CPP_MODEL", "ggml-base.bin")
+    monkeypatch.setenv("ISHARDED_ASSISTANT_WHISPER_CPP", str(stand_in(tmp_path, "whisper-cli", WHISPER_CPP)))
+    monkeypatch.setenv("ISHARDED_ASSISTANT_WHISPER_CPP_MODEL", "ggml-base.bin")
     assert assistant.voice.transcribe(audio) == "heard from wav with ggml-base.bin"
 
 
 def test_whisper_cpp_covers_a_faster_whisper_with_no_model(assistant, monkeypatch, audio, tmp_path):
     fake_whisper(monkeypatch, [], fails=True)
-    monkeypatch.setenv("SHARDMESH_ASSISTANT_WHISPER_CPP", str(stand_in(tmp_path, "whisper-cli", WHISPER_CPP)))
-    monkeypatch.setenv("SHARDMESH_ASSISTANT_WHISPER_CPP_MODEL", "m.bin")
+    monkeypatch.setenv("ISHARDED_ASSISTANT_WHISPER_CPP", str(stand_in(tmp_path, "whisper-cli", WHISPER_CPP)))
+    monkeypatch.setenv("ISHARDED_ASSISTANT_WHISPER_CPP_MODEL", "m.bin")
     assert "heard" in assistant.voice.transcribe(audio)
 
 
 def test_whisper_cpp_needs_a_model(assistant, monkeypatch, audio, tmp_path):
     no_whisper(monkeypatch)
-    monkeypatch.setenv("SHARDMESH_ASSISTANT_WHISPER_CPP", str(stand_in(tmp_path, "whisper-cli", WHISPER_CPP)))
-    with pytest.raises(VoiceUnavailable, match="SHARDMESH_ASSISTANT_WHISPER_CPP_MODEL"):
+    monkeypatch.setenv("ISHARDED_ASSISTANT_WHISPER_CPP", str(stand_in(tmp_path, "whisper-cli", WHISPER_CPP)))
+    with pytest.raises(VoiceUnavailable, match="ISHARDED_ASSISTANT_WHISPER_CPP_MODEL"):
         assistant.voice.transcribe(audio)
 
 
@@ -225,8 +225,8 @@ def test_a_missing_file_says_so(assistant, tmp_path):
 
 def test_a_failing_engine_says_so(assistant, monkeypatch, audio, tmp_path):
     no_whisper(monkeypatch)
-    monkeypatch.setenv("SHARDMESH_ASSISTANT_WHISPER_CPP", str(stand_in(tmp_path, "whisper-cli", "import sys\nsys.exit('bad audio')\n")))
-    monkeypatch.setenv("SHARDMESH_ASSISTANT_WHISPER_CPP_MODEL", "m.bin")
+    monkeypatch.setenv("ISHARDED_ASSISTANT_WHISPER_CPP", str(stand_in(tmp_path, "whisper-cli", "import sys\nsys.exit('bad audio')\n")))
+    monkeypatch.setenv("ISHARDED_ASSISTANT_WHISPER_CPP_MODEL", "m.bin")
     with pytest.raises(VoiceError, match="bad audio"):
         assistant.voice.transcribe(audio)
 
@@ -273,15 +273,15 @@ def test_the_text_file_is_cleaned_up(assistant):
 def test_piper_comes_first_when_it_has_a_model(assistant, monkeypatch, tmp_path):
     model = tmp_path / "en.onnx"
     model.write_bytes(b"model")
-    monkeypatch.setenv("SHARDMESH_ASSISTANT_PIPER", str(stand_in(tmp_path, "piper", PIPER)))
-    monkeypatch.setenv("SHARDMESH_ASSISTANT_PIPER_MODEL", str(model))
+    monkeypatch.setenv("ISHARDED_ASSISTANT_PIPER", str(stand_in(tmp_path, "piper", PIPER)))
+    monkeypatch.setenv("ISHARDED_ASSISTANT_PIPER_MODEL", str(model))
     spoken = assistant.voice.speak("Grüße")
     assert spoken["engine"] == "piper"
     assert json.loads(Path(spoken["path"]).read_bytes()[4:]) == {"text": "Grüße", "model": str(model)}
 
 
 def test_piper_with_no_model_falls_back_to_the_system_voice(assistant, monkeypatch, tmp_path):
-    monkeypatch.setenv("SHARDMESH_ASSISTANT_PIPER", str(stand_in(tmp_path, "piper", PIPER)))
+    monkeypatch.setenv("ISHARDED_ASSISTANT_PIPER", str(stand_in(tmp_path, "piper", PIPER)))
     if HAS_SYSTEM_VOICE:
         assert assistant.voice.status()["speak"]["engine"] != "piper"
 
@@ -300,9 +300,9 @@ def test_with_no_engine_it_says_what_to_install(assistant, monkeypatch):
 @pytest.mark.parametrize("platform, tool", [("posix", "say"), ("posix", "espeak-ng")])
 def test_each_system_voice_keeps_text_out_of_its_arguments(assistant, monkeypatch, platform, tool):
     commands: list[list[str]] = []
-    monkeypatch.setattr("shardmesh.assistant.voice.os.name", platform)
+    monkeypatch.setattr("isharded.assistant.voice.os.name", platform)
     monkeypatch.setattr(shutil, "which", lambda name: f"/bin/{name}" if name == tool else None)
-    monkeypatch.setattr("shardmesh.assistant.voice._run", lambda command, **_: commands.append(command) or b"")
+    monkeypatch.setattr("isharded.assistant.voice._run", lambda command, **_: commands.append(command) or b"")
     assistant.voice.speak("-v secret text", voice="Ada")
     flat = " ".join(commands[0])
     assert "secret" not in flat
@@ -318,8 +318,8 @@ def test_unusable_text_is_refused(assistant, text, message):
 def test_an_out_path_is_used(assistant, monkeypatch, tmp_path):
     model = tmp_path / "en.onnx"
     model.write_bytes(b"model")
-    monkeypatch.setenv("SHARDMESH_ASSISTANT_PIPER", str(stand_in(tmp_path, "piper", PIPER)))
-    monkeypatch.setenv("SHARDMESH_ASSISTANT_PIPER_MODEL", str(model))
+    monkeypatch.setenv("ISHARDED_ASSISTANT_PIPER", str(stand_in(tmp_path, "piper", PIPER)))
+    monkeypatch.setenv("ISHARDED_ASSISTANT_PIPER_MODEL", str(model))
     out = tmp_path / "deep" / "speech.wav"
     assert Path(assistant.voice.speak("hi", out_path=out)["path"]) == out.resolve()
     assert out.exists()
@@ -347,8 +347,8 @@ def test_a_persona_picks_the_voice(assistant, monkeypatch, tmp_path):
     model = tmp_path / "en.onnx"
     model.write_bytes(b"model")
     (tmp_path / "Ada.onnx").write_bytes(b"model")
-    monkeypatch.setenv("SHARDMESH_ASSISTANT_PIPER", str(stand_in(tmp_path, "piper", PIPER)))
-    monkeypatch.setenv("SHARDMESH_ASSISTANT_PIPER_MODEL", str(model))
+    monkeypatch.setenv("ISHARDED_ASSISTANT_PIPER", str(stand_in(tmp_path, "piper", PIPER)))
+    monkeypatch.setenv("ISHARDED_ASSISTANT_PIPER_MODEL", str(model))
     persona(assistant, "Ada")
     spoken = assistant.voice.speak("hi")
     assert spoken["voice"] == "Ada"
@@ -372,8 +372,8 @@ def test_a_persona_voice_outside_the_model_folder_cannot_be_reached(assistant, m
     folder.mkdir()
     (folder / "en.onnx").write_bytes(b"model")
     (tmp_path / "evil.onnx").write_bytes(b"model")
-    monkeypatch.setenv("SHARDMESH_ASSISTANT_PIPER", str(stand_in(tmp_path, "piper", PIPER)))
-    monkeypatch.setenv("SHARDMESH_ASSISTANT_PIPER_MODEL", str(folder / "en.onnx"))
+    monkeypatch.setenv("ISHARDED_ASSISTANT_PIPER", str(stand_in(tmp_path, "piper", PIPER)))
+    monkeypatch.setenv("ISHARDED_ASSISTANT_PIPER_MODEL", str(folder / "en.onnx"))
     persona(assistant, "../evil")
     spoken = assistant.voice.speak("hi")
     assert json.loads(Path(spoken["path"]).read_bytes()[4:])["model"] == str(folder / "en.onnx")
@@ -382,8 +382,8 @@ def test_a_persona_voice_outside_the_model_folder_cannot_be_reached(assistant, m
 def test_changing_voice_changes_no_permission(assistant, monkeypatch, tmp_path):
     model = tmp_path / "en.onnx"
     model.write_bytes(b"model")
-    monkeypatch.setenv("SHARDMESH_ASSISTANT_PIPER", str(stand_in(tmp_path, "piper", PIPER)))
-    monkeypatch.setenv("SHARDMESH_ASSISTANT_PIPER_MODEL", str(model))
+    monkeypatch.setenv("ISHARDED_ASSISTANT_PIPER", str(stand_in(tmp_path, "piper", PIPER)))
+    monkeypatch.setenv("ISHARDED_ASSISTANT_PIPER_MODEL", str(model))
     assistant.broker = FakeBroker()
     assistant.voice.broker()
     declared_before = dict(assistant.broker.declared)
@@ -540,7 +540,7 @@ def test_bad_bodies_are_refused(assistant):
 
 
 def test_too_much_audio_is_refused_before_it_is_kept(assistant, monkeypatch):
-    monkeypatch.setattr("shardmesh.assistant.voice_http.MAX_AUDIO_BYTES", 1000)
+    monkeypatch.setattr("isharded.assistant.voice_http.MAX_AUDIO_BYTES", 1000)
     with Server(assistant) as url:
         response = post(f"{url}/assistant/voice/transcribe", content=b"x" * 2000, headers={"Content-Type": "audio/wav"})
     assert response.status_code == 413
@@ -588,8 +588,8 @@ def test_the_commands_transcribe_and_speak(assistant, monkeypatch, audio, tmp_pa
     fake_whisper(monkeypatch, [])
     model = tmp_path / "en.onnx"
     model.write_bytes(b"model")
-    monkeypatch.setenv("SHARDMESH_ASSISTANT_PIPER", str(stand_in(tmp_path, "piper", PIPER)))
-    monkeypatch.setenv("SHARDMESH_ASSISTANT_PIPER_MODEL", str(model))
+    monkeypatch.setenv("ISHARDED_ASSISTANT_PIPER", str(stand_in(tmp_path, "piper", PIPER)))
+    monkeypatch.setenv("ISHARDED_ASSISTANT_PIPER_MODEL", str(model))
 
     assert run_command(assistant, "voice", "transcribe", str(audio)) == 0
     assert "hello there" in capsys.readouterr().out

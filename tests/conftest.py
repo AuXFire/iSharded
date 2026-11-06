@@ -4,5 +4,5 @@ import os
 from pathlib import Path
 import tempfile
 
-os.environ.pop("SHARDMESH_POOL_TOKEN", None)
-os.environ["SHARDMESH_POOL_TOKEN_FILE"] = str(Path(tempfile.gettempdir()) / "shardmesh-tests-have-no-token")
+os.environ.pop("ISHARDED_POOL_TOKEN", None)
+os.environ["ISHARDED_POOL_TOKEN_FILE"] = str(Path(tempfile.gettempdir()) / "isharded-tests-have-no-token")

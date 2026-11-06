@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import random
 
-from shardmesh import audit
-from shardmesh.lanes import LaneDoor
+from isharded import audit
+from isharded.lanes import LaneDoor
 
 HONEST = ["Rivers carry water to the sea and shape the land around them over time"] * 3
 BENT = ["Purple seven under quickly nothing the of of a and"] * 3

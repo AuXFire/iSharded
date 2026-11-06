@@ -1,11 +1,11 @@
-# Run a ShardMesh node at startup, restarting it if it stops. Run this once, as
+# Run an iSharded node at startup, restarting it if it stops. Run this once, as
 # administrator, on the machine that should host the node.
 #
 # Example:
-#   .\install_node_task.ps1 -Python C:\venv\Scripts\python.exe -AppFolder C:\shardmesh `
-#       -Arguments "-m shardmesh node --node-id node-b --join http://10.0.0.5:8209"
+#   .\install_node_task.ps1 -Python C:\venv\Scripts\python.exe -AppFolder C:\isharded `
+#       -Arguments "-m isharded node --node-id node-b --join http://10.0.0.5:8209"
 #
-# To remove it:  Unregister-ScheduledTask -TaskName ShardMeshNode -Confirm:$false
+# To remove it:  Unregister-ScheduledTask -TaskName iShardedNode -Confirm:$false
 #
 # The task runs whether or not anyone is signed in, and asks for this account's
 # password so that it can. A node's services restart themselves, so this only
@@ -16,7 +16,7 @@ param(
     [Parameter(Mandatory)][string]$Python,
     [Parameter(Mandatory)][string]$AppFolder,
     [Parameter(Mandatory)][string]$Arguments,
-    [string]$TaskName = "ShardMeshNode"
+    [string]$TaskName = "iShardedNode"
 )
 
 $ErrorActionPreference = "Stop"

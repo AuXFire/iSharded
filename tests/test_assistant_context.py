@@ -7,10 +7,10 @@ import re
 
 import pytest
 
-from shardmesh.assistant.app import Assistant
-from shardmesh.assistant.cli import add_arguments, run
-from shardmesh.assistant.context import ContextTooSmall, TurnNotFound, clean_label
-from shardmesh.assistant.contracts import ContextItem, Provenance, Reach, Trust
+from isharded.assistant.app import Assistant
+from isharded.assistant.cli import add_arguments, run
+from isharded.assistant.context import ContextTooSmall, TurnNotFound, clean_label
+from isharded.assistant.contracts import ContextItem, Provenance, Reach, Trust
 
 
 class Clock:

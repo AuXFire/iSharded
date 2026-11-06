@@ -1,0 +1,38 @@
+# Run an iSharded node at boot on Linux, restarting it if it stops.
+#
+#   sudo useradd --system --create-home --home-dir /var/lib/isharded isharded
+#   sudo python3 -m venv /opt/isharded && sudo /opt/isharded/bin/pip install 'isharded[pool]'
+#   sudo cp isharded-node.service /etc/systemd/system/
+#   sudo install -d -m 750 -o isharded /etc/isharded
+#   sudo cp isharded-node.env /etc/isharded/node.env   # then edit it
+#   sudo systemctl enable --now isharded-node
+#
+# A node's services restart themselves. This only has to get the node going and
+# bring it back if the supervisor itself stops.
+
+[Unit]
+Description=iSharded node
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=isharded
+EnvironmentFile=/etc/isharded/node.env
+ExecStart=/opt/isharded/bin/isharded node $ISHARDED_NODE_ARGS
+Restart=always
+RestartSec=5
+# Replies get a moment to finish, and stage processes a moment to exit.
+TimeoutStopSec=30
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+StateDirectory=isharded
+LogsDirectory=isharded
+ReadWritePaths=/var/lib/isharded
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

@@ -1,13 +1,13 @@
 #!/bin/sh
-# Install ShardMesh for this user, on Linux or macOS. Nothing here needs root.
+# Install iSharded for this user, on Linux or macOS. Nothing here needs root.
 set -e
 
-folder="${SHARDMESH_INSTALL_DIR:-$HOME/.shardmesh/app}"
-source="${SHARDMESH_SOURCE:-https://github.com/AuXFire/shardmesh/archive/refs/heads/main.tar.gz}"
+folder="${ISHARDED_INSTALL_DIR:-$HOME/.isharded/app}"
+source="${ISHARDED_SOURCE:-https://github.com/AuXFire/iSharded/archive/refs/heads/main.tar.gz}"
 
 python=$(command -v python3 || true)
 if [ -z "$python" ] || ! "$python" -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then
-  echo "ShardMesh needs Python 3.10 or newer. Install it, then run this again." >&2
+  echo "iSharded needs Python 3.10 or newer. Install it, then run this again." >&2
   exit 1
 fi
 if ! "$python" -m venv "$folder" >/dev/null 2>&1; then
@@ -28,12 +28,12 @@ fi
 "$folder/bin/python" -m pip install --quiet "$source"
 
 mkdir -p "$HOME/.local/bin"
-ln -sf "$folder/bin/shardmesh" "$HOME/.local/bin/shardmesh"
+ln -sf "$folder/bin/isharded" "$HOME/.local/bin/isharded"
 case ":$PATH:" in
   *":$HOME/.local/bin:"*) ;;
-  *) echo "Add $HOME/.local/bin to your PATH, or run $folder/bin/shardmesh directly." ;;
+  *) echo "Add $HOME/.local/bin to your PATH, or run $folder/bin/isharded directly." ;;
 esac
 if [ "$(uname)" = "Linux" ] && ! ldconfig -p 2>/dev/null | grep -q libgomp; then
   echo "GGUF models need one system library: sudo apt-get install libgomp1"
 fi
-echo "Installed. Start with: shardmesh up"
+echo "Installed. Start with: isharded up"

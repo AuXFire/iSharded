@@ -10,10 +10,10 @@ import torch
 from fastapi.testclient import TestClient
 from safetensors.torch import save_file
 
-from shardmesh import worker as worker_module
-from shardmesh.planner import Candidate, ModelProfile, plan_placement
-from shardmesh.protocol import MemoryPool, TensorRef, WeightUnit
-from shardmesh.weights import (
+from isharded import worker as worker_module
+from isharded.planner import Candidate, ModelProfile, plan_placement
+from isharded.protocol import MemoryPool, TensorRef, WeightUnit
+from isharded.weights import (
     FetchProgress,
     LocalReader,
     UnitCache,
@@ -92,7 +92,7 @@ def test_progress_matches_the_plan_when_a_peer_delivers(held, tmp_path: Path, mo
         on_bytes(len(payload))
         return True
 
-    monkeypatch.setattr("shardmesh.weights.fetch_from_peer", copy)
+    monkeypatch.setattr("isharded.weights.fetch_from_peer", copy)
     cache = UnitCache(tmp_path / "cache")
     progress = FetchProgress("job")
     cache.fetch("unused-source", "m", "r", [unit], progress, peers={"unit": ["http://peer"]})
@@ -222,13 +222,13 @@ def test_a_shard_a_peer_holds_is_cheaper_than_downloading_it() -> None:
 
 
 def hashed(unit: WeightUnit, file: Path) -> WeightUnit:
-    from shardmesh.weights import file_sha256
+    from isharded.weights import file_sha256
 
     return unit.model_copy(update={"sha256": file_sha256(file)})
 
 
 def test_a_peer_serving_altered_weights_is_refused_for_the_real_source(held, tmp_path: Path, monkeypatch) -> None:
-    from shardmesh import weights
+    from isharded import weights
 
     unit, file = held
     unit = hashed(unit, file)
@@ -247,7 +247,7 @@ def test_a_peer_serving_altered_weights_is_refused_for_the_real_source(held, tmp
 
 
 def test_a_source_with_altered_weights_stops_the_load(held, tmp_path: Path) -> None:
-    from shardmesh.weights import WeightSourceError
+    from isharded.weights import WeightSourceError
 
     unit, _ = held
     unit = unit.model_copy(update={"sha256": "0" * 64})
@@ -271,7 +271,7 @@ def test_weights_altered_on_disk_are_fetched_again(held, tmp_path: Path) -> None
 
 
 def test_model_hashes_cover_every_unit_and_the_description(held, tmp_path: Path) -> None:
-    from shardmesh.weights import Manifest, MANIFEST_KEY, WeightSourceError, apply_model_hashes, hash_model
+    from isharded.weights import Manifest, MANIFEST_KEY, WeightSourceError, apply_model_hashes, hash_model
 
     unit, file = held
     manifest = Manifest(source="s", revision="r", config={"a": 1}, tensors={tensor.name: tensor for tensor in unit.tensors})
@@ -288,8 +288,8 @@ def test_model_hashes_cover_every_unit_and_the_description(held, tmp_path: Path)
 
 
 def test_a_dropped_connection_resumes_where_it_stopped(monkeypatch) -> None:
-    from shardmesh import weights
-    from shardmesh.weights import PeerReader
+    from isharded import weights
+    from isharded.weights import PeerReader
 
     monkeypatch.setattr(weights, "RANGE_RETRY_SECONDS", 0.0)
     data = bytes(range(200))
@@ -314,8 +314,8 @@ def test_a_dropped_connection_resumes_where_it_stopped(monkeypatch) -> None:
 
 
 def test_giving_up_on_a_range_says_why(monkeypatch) -> None:
-    from shardmesh import weights
-    from shardmesh.weights import PeerReader, WeightSourceError
+    from isharded import weights
+    from isharded.weights import PeerReader, WeightSourceError
 
     monkeypatch.setattr(weights, "RANGE_RETRY_SECONDS", 0.0)
     reader = PeerReader(["http://peer"])

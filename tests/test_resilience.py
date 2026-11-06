@@ -6,11 +6,11 @@ import time
 import httpx
 import pytest
 
-from shardmesh import orchestrator as orchestrator_module
-from shardmesh.node import Service
-from shardmesh.orchestrator import Orchestrator, WorkerRecord
-from shardmesh.planner import ModelProfile, _stage_items
-from shardmesh.protocol import (
+from isharded import orchestrator as orchestrator_module
+from isharded.node import Service
+from isharded.orchestrator import Orchestrator, WorkerRecord
+from isharded.planner import ModelProfile, _stage_items
+from isharded.protocol import (
     PROTOCOL_VERSION,
     HardwareInfo,
     LoadModelRequest,
@@ -408,7 +408,7 @@ def test_a_new_route_for_the_same_model_reads_nothing(monkeypatch):
 
 
 def test_a_follower_reports_a_failure_and_waits_for_the_repair(monkeypatch):
-    from shardmesh.mesh import ControlMesh
+    from isharded.mesh import ControlMesh
 
     seen = []
 
@@ -450,9 +450,9 @@ def test_heartbeat_answers_with_the_control_planes():
 
 
 def test_an_unchanged_stage_keeps_its_weights():
-    from shardmesh import worker
-    from shardmesh.models import GgufAdapter
-    from shardmesh.protocol import ConfigureRequest, UnitPlacement
+    from isharded import worker
+    from isharded.models import GgufAdapter
+    from isharded.protocol import ConfigureRequest, UnitPlacement
 
     assignment = stage("w").model_copy(update={"placements": [UnitPlacement(unit="u", pool_id="p", bytes=1)]})
     request = ConfigureRequest(model_id="m", revision="r", architecture={}, epoch=2, assignment=assignment, route=[assignment])
@@ -467,8 +467,8 @@ def test_an_unchanged_stage_keeps_its_weights():
 
 
 def test_a_moved_stage_reloads():
-    from shardmesh import worker
-    from shardmesh.protocol import ConfigureRequest
+    from isharded import worker
+    from isharded.protocol import ConfigureRequest
 
     def request(end):
         assignment = stage("w", 0, end)
@@ -480,7 +480,7 @@ def test_a_moved_stage_reloads():
 
 
 def test_a_drain_waits_for_the_reply_and_gives_up_on_time():
-    from shardmesh.slots import SlotGate
+    from isharded.slots import SlotGate
 
     async def scenario():
         gate = SlotGate(1)
@@ -499,7 +499,7 @@ def test_a_drain_waits_for_the_reply_and_gives_up_on_time():
 
 
 def test_slots_are_handed_out_and_returned():
-    from shardmesh.slots import SlotGate
+    from isharded.slots import SlotGate
 
     async def scenario():
         gate = SlotGate(2)
@@ -515,7 +515,7 @@ def test_slots_are_handed_out_and_returned():
 
 
 def test_shrinking_slots_forgets_the_ones_gone():
-    from shardmesh.slots import SlotGate
+    from isharded.slots import SlotGate
 
     async def scenario():
         gate = SlotGate(3)
@@ -528,7 +528,7 @@ def test_shrinking_slots_forgets_the_ones_gone():
 
 
 def test_a_conversation_returns_to_the_sequence_that_holds_it():
-    from shardmesh import worker
+    from isharded import worker
 
     runtime = worker.WorkerRuntime.__new__(worker.WorkerRuntime)
     runtime.checkpoints = {0: ("a", [1, 2]), 1: ("b", [7, 8, 9])}
@@ -589,7 +589,7 @@ def test_other_errors_are_not_mistaken_for_a_restart():
 
 def saved(tmp_path, monkeypatch, epoch=5):
     path = tmp_path / "state.json"
-    monkeypatch.setenv("SHARDMESH_STATE_FILE", str(path))
+    monkeypatch.setenv("ISHARDED_STATE_FILE", str(path))
     state = {
         "request": LoadModelRequest(model_id="m").model_dump(),
         "revision": "abc",
@@ -612,7 +612,7 @@ def test_saved_state_restores_the_epoch(tmp_path, monkeypatch):
 def test_corrupt_saved_state_is_survived(tmp_path, monkeypatch):
     path = tmp_path / "state.json"
     path.write_text("{ not json", encoding="utf-8")
-    monkeypatch.setenv("SHARDMESH_STATE_FILE", str(path))
+    monkeypatch.setenv("ISHARDED_STATE_FILE", str(path))
     orchestrator = Orchestrator()
     orchestrator.load_saved_state()
     assert orchestrator.saved_state is None
@@ -677,7 +677,7 @@ def test_the_model_reloads_once_workers_have_had_their_chance(tmp_path, monkeypa
 
 def test_saving_state_is_atomic_and_round_trips(tmp_path, monkeypatch):
     path = tmp_path / "deep" / "state.json"
-    monkeypatch.setenv("SHARDMESH_STATE_FILE", str(path))
+    monkeypatch.setenv("ISHARDED_STATE_FILE", str(path))
     orchestrator = Orchestrator()
     orchestrator.epoch = 3
     orchestrator.route = [stage("w1")]
@@ -724,7 +724,7 @@ def test_draft_memory_is_planned_on_the_entry_stage():
 
 
 def test_a_mismatched_llama_build_is_refused():
-    from shardmesh.llamacpp import ContextParams, LlamaError, LlamaLibrary, ModelParams
+    from isharded.llamacpp import ContextParams, LlamaError, LlamaLibrary, ModelParams
 
     class Native:
         def __init__(self, context_size):
@@ -820,7 +820,7 @@ def test_an_event_that_cannot_be_printed_fails_nothing(monkeypatch):
 
 
 def test_a_silent_stage_is_blamed_by_the_nearest_hop():
-    from shardmesh.protocol import pass_seconds
+    from isharded.protocol import pass_seconds
 
     assert pass_seconds(1, 1) < pass_seconds(1, 2) < pass_seconds(1, 3)
     assert pass_seconds(1000, 1) > pass_seconds(1, 1) + 900
@@ -850,7 +850,7 @@ def test_repair_does_not_wait_for_a_reply_stuck_on_a_restarted_stage():
 def test_a_repair_with_nowhere_to_go_is_tried_again_soon():
     from fastapi import HTTPException
 
-    from shardmesh.orchestrator import REPAIR_COOLDOWN_SECONDS, REPAIR_RETRY_SECONDS
+    from isharded.orchestrator import REPAIR_COOLDOWN_SECONDS, REPAIR_RETRY_SECONDS
 
     dead = record("w1")
     dead.last_seen -= 60
@@ -988,7 +988,7 @@ def test_merged_passes_stay_off_unless_asked_for():
 
     import torch
 
-    from shardmesh.worker import WorkerRuntime
+    from isharded.worker import WorkerRuntime
 
     step = SimpleNamespace(verify=False, reset=False, prefill_only=False, save_checkpoint=None, restore_length=None, next_position=None)
     hidden = torch.zeros(1, 1, 4)
@@ -1052,8 +1052,8 @@ def test_with_no_model_loaded_a_reply_does_not_wait():
 def test_a_dead_stage_is_only_restarted_once():
     from types import SimpleNamespace
 
-    from shardmesh.llamacpp import StageLost
-    from shardmesh.worker import WorkerRuntime
+    from isharded.llamacpp import StageLost
+    from isharded.worker import WorkerRuntime
 
     started = []
     current = object()
@@ -1076,7 +1076,7 @@ def test_a_dead_stage_is_only_restarted_once():
 
 
 def test_diagnostics_show_what_is_waiting():
-    from shardmesh.serving import where_everything_is
+    from isharded.serving import where_everything_is
 
     async def scenario():
         return where_everything_is()

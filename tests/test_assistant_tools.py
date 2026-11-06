@@ -17,10 +17,10 @@ import threading
 
 import pytest
 
-from shardmesh.assistant import cli
-from shardmesh.assistant import tools as tools_part
-from shardmesh.assistant.app import Assistant
-from shardmesh.assistant.contracts import (
+from isharded.assistant import cli
+from isharded.assistant import tools as tools_part
+from isharded.assistant.app import Assistant
+from isharded.assistant.contracts import (
     CallContext,
     ContextItem,
     Effect,
@@ -30,8 +30,8 @@ from shardmesh.assistant.contracts import (
     Trust,
     Verdict,
 )
-from shardmesh.assistant.sandbox import LocalSandbox
-from shardmesh.assistant.tools import Refusal, is_public, parse_gpu_line, replace_atomically
+from isharded.assistant.sandbox import LocalSandbox
+from isharded.assistant.tools import Refusal, is_public, parse_gpu_line, replace_atomically
 
 ALL_NAMES = {
     "files.read", "files.list", "files.search", "files.write", "shell.run", "web.fetch", "memory.search", "memory.remember",
@@ -334,7 +334,7 @@ def test_shell_works_with_any_sandbox_on_the_contract(assistant, work):
     class Minimal:
         def run(self, command, workdir, *, timeout=120.0, network=False, env=None):
             seen.update(command=command, timeout=timeout)
-            from shardmesh.assistant.contracts import SandboxResult
+            from isharded.assistant.contracts import SandboxResult
 
             return SandboxResult(0, "fine", "", False, "container")
 
@@ -739,7 +739,7 @@ def test_a_gpu_line_is_read_and_missing_values_stay_missing():
 def test_mesh_status_reads_a_mesh(assistant, site, monkeypatch):
     site.pages["/health"] = Page(body=b'{"status": "ok"}')
     site.pages["/v1/models"] = Page(body=json.dumps({"data": [{"id": "qwen"}]}).encode())
-    monkeypatch.setenv("SHARDMESH_ORCHESTRATOR_URL", f"http://127.0.0.1:{site.port}")
+    monkeypatch.setenv("ISHARDED_ORCHESTRATOR_URL", f"http://127.0.0.1:{site.port}")
     result = use(assistant, "mesh.status")
     assert result.data["up"] is True and result.data["models"] == ["qwen"]
 
@@ -748,7 +748,7 @@ def test_mesh_status_says_when_the_mesh_is_down(assistant, site, monkeypatch):
     port = site.port
     site.close()
     site.close = lambda: None
-    monkeypatch.setenv("SHARDMESH_ORCHESTRATOR_URL", f"http://127.0.0.1:{port}")
+    monkeypatch.setenv("ISHARDED_ORCHESTRATOR_URL", f"http://127.0.0.1:{port}")
     result = use(assistant, "mesh.status")
     assert result.ok and result.data["up"] is False and "error" in result.data
 

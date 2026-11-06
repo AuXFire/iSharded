@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run what .github/workflows/tests.yml runs, from a clean clone, without GitHub.
 #
-#   bash scripts/ci_local.sh https://github.com/you/shardmesh.git
+#   bash scripts/ci_local.sh https://github.com/you/isharded.git
 #
 # A clean clone matters: it fails if a test needs a file that only your machine has.
 set -euo pipefail

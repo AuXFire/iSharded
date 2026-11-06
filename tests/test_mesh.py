@@ -4,13 +4,13 @@ import json
 from fastapi.testclient import TestClient
 import httpx
 
-from shardmesh.serving import MAX_REQUEST_BYTES
+from isharded.serving import MAX_REQUEST_BYTES
 import pytest
 
-from shardmesh import orchestrator as orchestrator_module
-from shardmesh.mesh import GOSSIP_SECONDS, JOIN_GRACE_SECONDS, PEER_TIMEOUT_SECONDS, ControlMesh
-from shardmesh.orchestrator import Orchestrator
-from shardmesh.protocol import LoadModelRequest, StageAssignment
+from isharded import orchestrator as orchestrator_module
+from isharded.mesh import GOSSIP_SECONDS, JOIN_GRACE_SECONDS, PEER_TIMEOUT_SECONDS, ControlMesh
+from isharded.orchestrator import Orchestrator
+from isharded.protocol import LoadModelRequest, StageAssignment
 
 
 class Clock:
@@ -193,9 +193,9 @@ def test_a_term_learned_from_workers_outlives_the_control_plane():
 
 @pytest.fixture
 def mesh_orchestrator(monkeypatch):
-    monkeypatch.setenv("SHARDMESH_NODE_URL", "http://me:1")
-    monkeypatch.setenv("SHARDMESH_NODE_ID", "me")
-    monkeypatch.delenv("SHARDMESH_STATE_FILE", raising=False)
+    monkeypatch.setenv("ISHARDED_NODE_URL", "http://me:1")
+    monkeypatch.setenv("ISHARDED_NODE_ID", "me")
+    monkeypatch.delenv("ISHARDED_STATE_FILE", raising=False)
     orchestrator = Orchestrator()
     yield orchestrator
     asyncio.run(orchestrator.close())
@@ -235,9 +235,9 @@ def test_followers_do_not_repair_anything(mesh_orchestrator, monkeypatch):
 
 def test_state_reaches_followers_on_disk(tmp_path, monkeypatch):
     path = tmp_path / "state.json"
-    monkeypatch.setenv("SHARDMESH_NODE_URL", "http://me:1")
-    monkeypatch.setenv("SHARDMESH_NODE_ID", "me")
-    monkeypatch.setenv("SHARDMESH_STATE_FILE", str(path))
+    monkeypatch.setenv("ISHARDED_NODE_URL", "http://me:1")
+    monkeypatch.setenv("ISHARDED_NODE_ID", "me")
+    monkeypatch.setenv("ISHARDED_STATE_FILE", str(path))
     orchestrator = Orchestrator()
     state = {"epoch": 4, "request": LoadModelRequest(model_id="m").model_dump(), "route": []}
     orchestrator.receive_gossip(
@@ -264,7 +264,7 @@ def test_any_node_serves_the_api_by_forwarding_it(monkeypatch):
     def handler(request):
         seen["url"] = str(request.url)
         seen["body"] = json.loads(request.content)
-        seen["forwarded"] = request.headers.get("x-shardmesh-forwarded")
+        seen["forwarded"] = request.headers.get("x-isharded-forwarded")
         return httpx.Response(200, stream=httpx.ByteStream(b'{"answer": 42}'), headers={"content-type": "application/json"})
 
     client = forwarding(monkeypatch, "http://boss:9", handler)
@@ -332,7 +332,7 @@ def test_forwarding_cannot_loop(monkeypatch):
         raise AssertionError("must not forward twice")
 
     client = forwarding(monkeypatch, "http://boss:9", handler)
-    assert client.get("/admin/status", headers={"x-shardmesh-forwarded": "x"}).status_code == 503
+    assert client.get("/admin/status", headers={"x-isharded-forwarded": "x"}).status_code == 503
 
 
 def test_a_dead_coordinator_is_reported_not_raised(monkeypatch):
@@ -344,8 +344,8 @@ def test_a_dead_coordinator_is_reported_not_raised(monkeypatch):
 
 
 def test_workers_refuse_orders_from_an_older_term(monkeypatch):
-    from shardmesh import worker
-    from shardmesh.protocol import ConfigureRequest
+    from isharded import worker
+    from isharded.protocol import ConfigureRequest
 
     runtime = worker.WorkerRuntime.__new__(worker.WorkerRuntime)
     runtime.roles = {"inference"}
@@ -380,7 +380,7 @@ def test_a_cordoned_node_gets_no_work(mesh_orchestrator):
 
 
 def test_cordons_reach_every_node():
-    from shardmesh.access import AccessControl
+    from isharded.access import AccessControl
 
     first, second = AccessControl(), AccessControl()
     first.cordon("laptop")

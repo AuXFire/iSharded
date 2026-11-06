@@ -1,7 +1,7 @@
 import pytest
 
-from shardmesh.planner import Candidate, ModelProfile, PlacementError, plan_placement, stored_bytes
-from shardmesh.protocol import MemoryPool, TensorRef, WeightUnit
+from isharded.planner import Candidate, ModelProfile, PlacementError, plan_placement, stored_bytes
+from isharded.protocol import MemoryPool, TensorRef, WeightUnit
 
 MIB = 1024**2
 GIB = 1024**3

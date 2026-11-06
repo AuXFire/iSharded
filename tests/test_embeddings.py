@@ -1,7 +1,7 @@
 """/v1/embeddings: packing, shaping, refusals, and agreement with llama.cpp itself.
 
-Real-model tests need SHARDMESH_TEST_LLAMA_DIR and SHARDMESH_TEST_EMBED_GGUF. Set
-SHARDMESH_TEST_EMBED_PORT as well to compare with llama-server on that port.
+Real-model tests need ISHARDED_TEST_LLAMA_DIR and ISHARDED_TEST_EMBED_GGUF. Set
+ISHARDED_TEST_EMBED_PORT as well to compare with llama-server on that port.
 """
 
 import asyncio
@@ -17,9 +17,9 @@ import httpx
 import numpy as np
 import pytest
 
-from shardmesh import orchestrator as orchestrator_module
-from shardmesh import worker as worker_module
-from shardmesh.embedding import (
+from isharded import orchestrator as orchestrator_module
+from isharded import worker as worker_module
+from isharded.embedding import (
     MOST_INPUTS,
     PASS_SEQUENCES,
     dimensions_problem,
@@ -30,11 +30,11 @@ from shardmesh.embedding import (
     shaped,
     smallest_dimensions,
 )
-from shardmesh.gguf import GgufHeader, KeyValue, T_BOOL, T_STRING, T_UINT32
-from shardmesh.models import GgufAdapter, UnsupportedModel
-from shardmesh.planner import PlacementError
-from shardmesh.protocol import EmbeddingRequest, LoadModelRequest, StageAssignment
-from shardmesh.tokenizer import gguf_marks
+from isharded.gguf import GgufHeader, KeyValue, T_BOOL, T_STRING, T_UINT32
+from isharded.models import GgufAdapter, UnsupportedModel
+from isharded.planner import PlacementError
+from isharded.protocol import EmbeddingRequest, LoadModelRequest, StageAssignment
+from isharded.tokenizer import gguf_marks
 
 WIDTH = 8
 
@@ -384,7 +384,7 @@ def test_the_chat_page_leaves_embedding_models_out_of_its_picker():
 
 
 def test_an_embedding_stage_is_rebuilt_when_the_mode_changes():
-    from shardmesh.protocol import ConfigureRequest
+    from isharded.protocol import ConfigureRequest
 
     assignment = stage("w", 0, 8)
     plain = ConfigureRequest(model_id="m", revision="r", architecture={}, epoch=1, assignment=assignment, route=[assignment])
@@ -392,9 +392,9 @@ def test_an_embedding_stage_is_rebuilt_when_the_mode_changes():
     assert signature(plain) != signature(plain.model_copy(update={"embedding": True}))
 
 
-BUILD = os.environ.get("SHARDMESH_TEST_LLAMA_DIR", "")
-MODEL = os.environ.get("SHARDMESH_TEST_EMBED_GGUF", "")
-PORT = os.environ.get("SHARDMESH_TEST_EMBED_PORT", "")
+BUILD = os.environ.get("ISHARDED_TEST_LLAMA_DIR", "")
+MODEL = os.environ.get("ISHARDED_TEST_EMBED_GGUF", "")
+PORT = os.environ.get("ISHARDED_TEST_EMBED_PORT", "")
 needs_real_model = pytest.mark.skipif(
     not (BUILD and MODEL and Path(BUILD).is_dir() and Path(MODEL).is_file()), reason="needs a llama.cpp build and an embedding GGUF"
 )
@@ -415,9 +415,9 @@ def unit_rows(rows):
 @pytest.fixture(scope="module")
 def real_stage(tmp_path_factory):
     """A whole model in a stage process, built the way a worker builds one."""
-    from shardmesh.gguf import file_reader, plan_stage, read_file_header, write_stage
-    from shardmesh.llama_host import StageHost
-    from shardmesh.tokenizer import tokenizer_from_gguf
+    from isharded.gguf import file_reader, plan_stage, read_file_header, write_stage
+    from isharded.llama_host import StageHost
+    from isharded.tokenizer import tokenizer_from_gguf
 
     header = read_file_header(MODEL)
     path = tmp_path_factory.mktemp("embed") / "stage.gguf"
@@ -467,7 +467,7 @@ def test_a_batch_gives_what_inputs_give_alone(real_stage):
 
 
 @needs_real_model
-@pytest.mark.skipif(not PORT, reason="needs SHARDMESH_TEST_EMBED_PORT for llama-server")
+@pytest.mark.skipif(not PORT, reason="needs ISHARDED_TEST_EMBED_PORT for llama-server")
 def test_vectors_match_llama_servers_own(real_stage):
     executable = next(path for path in (Path(BUILD) / "llama-server.exe", Path(BUILD) / "llama-server") if path.is_file())
     server = subprocess.Popen(

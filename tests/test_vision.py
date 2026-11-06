@@ -1,7 +1,7 @@
 """Images in chat: what is refused, how rows sit in a prompt, and that a split sees what one stage sees.
 
-Real-model tests need SHARDMESH_TEST_LLAMA_DIR, SHARDMESH_TEST_VISION_GGUF, and
-SHARDMESH_TEST_VISION_MMPROJ.
+Real-model tests need ISHARDED_TEST_LLAMA_DIR, ISHARDED_TEST_VISION_GGUF, and
+ISHARDED_TEST_VISION_MMPROJ.
 """
 
 import asyncio
@@ -19,15 +19,15 @@ import numpy as np
 import pytest
 import torch
 
-from shardmesh import orchestrator as orchestrator_module
-from shardmesh import worker as worker_module
-from shardmesh.gguf import GgufHeader, KeyValue, T_ARRAY, T_BOOL, T_STRING, T_UINT32
-from shardmesh.gguf_stage import ImageEncoder, checkpoint_key, plan_prompt
-from shardmesh.llamacpp import LlamaError, StageLost
-from shardmesh.models import GgufAdapter, UnsupportedModel
-from shardmesh.mtmd import BitmapWrapper, ContextParams, DecoderPosition, InputText, VideoParams
-from shardmesh.protocol import InferRequest, LoadModelRequest, SessionState, decode_pass, encode_activation
-from shardmesh.vision import (
+from isharded import orchestrator as orchestrator_module
+from isharded import worker as worker_module
+from isharded.gguf import GgufHeader, KeyValue, T_ARRAY, T_BOOL, T_STRING, T_UINT32
+from isharded.gguf_stage import ImageEncoder, checkpoint_key, plan_prompt
+from isharded.llamacpp import LlamaError, StageLost
+from isharded.models import GgufAdapter, UnsupportedModel
+from isharded.mtmd import BitmapWrapper, ContextParams, DecoderPosition, InputText, VideoParams
+from isharded.protocol import InferRequest, LoadModelRequest, SessionState, decode_pass, encode_activation
+from isharded.vision import (
     MOST_IMAGE_BYTES,
     MOST_IMAGE_PIXELS,
     MOST_IMAGES,
@@ -643,7 +643,7 @@ def test_a_replay_carries_the_images_and_the_next_step_does_not(monkeypatch):
 
 
 def test_a_projector_is_rebuilt_when_it_changes_and_only_on_the_entry_stage():
-    from shardmesh.protocol import ConfigureRequest, DraftModel, StageAssignment
+    from isharded.protocol import ConfigureRequest, DraftModel, StageAssignment
 
     def stage(start):
         return StageAssignment(worker_id="w", url="http://x:1", start_layer=start, end_layer=start + 4, placements=[], estimated_ms_per_token=1.0)
@@ -667,9 +667,9 @@ def test_the_chat_page_offers_images_only_when_the_model_can_see():
     assert "turn.images" in text[text.index("function renderTurns"):text.index("function renderLastTurn")]
 
 
-BUILD = os.environ.get("SHARDMESH_TEST_LLAMA_DIR", "")
-MODEL = os.environ.get("SHARDMESH_TEST_VISION_GGUF", "")
-MMPROJ = os.environ.get("SHARDMESH_TEST_VISION_MMPROJ", "")
+BUILD = os.environ.get("ISHARDED_TEST_LLAMA_DIR", "")
+MODEL = os.environ.get("ISHARDED_TEST_VISION_GGUF", "")
+MMPROJ = os.environ.get("ISHARDED_TEST_VISION_MMPROJ", "")
 needs_real_model = pytest.mark.skipif(
     not (BUILD and MODEL and MMPROJ and Path(BUILD).is_dir() and Path(MODEL).is_file() and Path(MMPROJ).is_file()),
     reason="needs a llama.cpp build, a vision GGUF, and its projector",
@@ -698,9 +698,9 @@ class RealPipeline:
     """Stage processes and a projector process, joined the way workers join them."""
 
     def __init__(self, folder):
-        from shardmesh.gguf import file_reader, plan_stage, read_file_header, write_stage
-        from shardmesh.llama_host import StageHost
-        from shardmesh.tokenizer import tokenizer_from_gguf
+        from isharded.gguf import file_reader, plan_stage, read_file_header, write_stage
+        from isharded.llama_host import StageHost
+        from isharded.tokenizer import tokenizer_from_gguf
 
         self.header = read_file_header(MODEL)
         self.tokenizer = tokenizer_from_gguf(self.header)

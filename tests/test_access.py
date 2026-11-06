@@ -11,9 +11,9 @@ import httpx
 import pytest
 import uvicorn
 
-from shardmesh import orchestrator as orchestrator_module
-from shardmesh.access import ROLE_ADMIN, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, create_key, digest
-from shardmesh.orchestrator import Orchestrator
+from isharded import orchestrator as orchestrator_module
+from isharded.access import ROLE_ADMIN, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, create_key, digest
+from isharded.orchestrator import Orchestrator
 
 
 @pytest.fixture
@@ -55,7 +55,7 @@ def test_an_open_pool_needs_nothing():
 def test_rate_limits_refill():
     now = [0.0]
     path_free = AccessControl(clock=lambda: now[0])
-    from shardmesh.access import Caller
+    from isharded.access import Caller
 
     caller = Caller("c", ROLE_USER, requests_per_minute=2)
     assert path_free.spend(caller) == 0
@@ -66,7 +66,7 @@ def test_rate_limits_refill():
 
 
 def test_the_audit_log_rotates(tmp_path, monkeypatch):
-    monkeypatch.setattr("shardmesh.access.AUDIT_ROTATE_BYTES", 10)
+    monkeypatch.setattr("isharded.access.AUDIT_ROTATE_BYTES", 10)
     path = tmp_path / "audit.jsonl"
     log = AuditLog(str(path), "n")
     log.record("a", "POST", "/admin/load", 200, "1.2.3.4")
@@ -78,10 +78,10 @@ def test_the_audit_log_rotates(tmp_path, monkeypatch):
 @pytest.fixture
 def secured(monkeypatch, tmp_path, keys):
     path, alice, root = keys
-    monkeypatch.setenv("SHARDMESH_KEYS_FILE", path)
-    monkeypatch.setenv("SHARDMESH_POOL_TOKEN", "pool-secret")
-    monkeypatch.setenv("SHARDMESH_AUDIT_FILE", str(tmp_path / "audit.jsonl"))
-    monkeypatch.delenv("SHARDMESH_NODE_URL", raising=False)
+    monkeypatch.setenv("ISHARDED_KEYS_FILE", path)
+    monkeypatch.setenv("ISHARDED_POOL_TOKEN", "pool-secret")
+    monkeypatch.setenv("ISHARDED_AUDIT_FILE", str(tmp_path / "audit.jsonl"))
+    monkeypatch.delenv("ISHARDED_NODE_URL", raising=False)
     runtime = Orchestrator()
     monkeypatch.setattr(orchestrator_module, "runtime", runtime)
     return TestClient(orchestrator_module.app), alice, root, tmp_path / "audit.jsonl"
@@ -110,9 +110,9 @@ def test_metrics_need_admin_and_report_the_counters_that_matter(secured):
     client, alice, root, _ = secured
     assert client.get("/metrics", headers=bearer(alice)).status_code == 403
     text = client.get("/metrics", headers=bearer(root)).text
-    assert "shardmesh_stream_fallbacks_total 0" in text
-    assert "shardmesh_workers_live 0" in text
-    assert text.count("# HELP shardmesh_requests_total") == 1
+    assert "isharded_stream_fallbacks_total 0" in text
+    assert "isharded_workers_live 0" in text
+    assert text.count("# HELP isharded_requests_total") == 1
 
 
 def test_ready_reports_whether_this_node_can_serve(secured):
@@ -135,9 +135,9 @@ def test_changes_are_audited_without_their_content(secured):
 def test_a_rate_limited_key_is_told_when_to_return(monkeypatch, tmp_path):
     path = str(tmp_path / "keys.json")
     key = create_key(path, "slow", ROLE_USER, requests_per_minute=1)
-    monkeypatch.setenv("SHARDMESH_KEYS_FILE", path)
-    monkeypatch.delenv("SHARDMESH_POOL_TOKEN", raising=False)
-    monkeypatch.delenv("SHARDMESH_NODE_URL", raising=False)
+    monkeypatch.setenv("ISHARDED_KEYS_FILE", path)
+    monkeypatch.delenv("ISHARDED_POOL_TOKEN", raising=False)
+    monkeypatch.delenv("ISHARDED_NODE_URL", raising=False)
     monkeypatch.setattr(orchestrator_module, "runtime", Orchestrator())
     client = TestClient(orchestrator_module.app)
     assert client.get("/v1/models", headers=bearer(key)).status_code == 200
@@ -151,7 +151,7 @@ def test_addresses_prefer_the_tailnet(monkeypatch):
 
     import psutil
 
-    from shardmesh.node import detect_address
+    from isharded.node import detect_address
 
     class Address:
         family = socket.AF_INET
@@ -166,8 +166,8 @@ def test_addresses_prefer_the_tailnet(monkeypatch):
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="needs openssl")
 def test_nodes_can_talk_over_tls_with_a_private_authority(tmp_path, monkeypatch):
     """A real server and client, as a pool of remote machines would use."""
-    from shardmesh.serving import NoDelayHTTPProtocol
-    from shardmesh.tls import client_verify, server_options
+    from isharded.serving import NoDelayHTTPProtocol
+    from isharded.tls import client_verify, server_options
 
     certificate, key = tmp_path / "node.pem", tmp_path / "node.key"
     subprocess.run(
@@ -175,9 +175,9 @@ def test_nodes_can_talk_over_tls_with_a_private_authority(tmp_path, monkeypatch)
          "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1"],
         check=True, capture_output=True,
     )
-    monkeypatch.setenv("SHARDMESH_TLS_CERT", str(certificate))
-    monkeypatch.setenv("SHARDMESH_TLS_KEY", str(key))
-    monkeypatch.setenv("SHARDMESH_CA_FILE", str(certificate))
+    monkeypatch.setenv("ISHARDED_TLS_CERT", str(certificate))
+    monkeypatch.setenv("ISHARDED_TLS_KEY", str(key))
+    monkeypatch.setenv("ISHARDED_CA_FILE", str(certificate))
 
     async def app(scope, receive, send):
         await send({"type": "http.response.start", "status": 200, "headers": []})
@@ -204,16 +204,16 @@ def test_nodes_can_talk_over_tls_with_a_private_authority(tmp_path, monkeypatch)
 
 
 def test_tls_needs_both_halves(monkeypatch):
-    from shardmesh.tls import server_options
+    from isharded.tls import server_options
 
-    monkeypatch.setenv("SHARDMESH_TLS_CERT", "x")
-    monkeypatch.delenv("SHARDMESH_TLS_KEY", raising=False)
+    monkeypatch.setenv("ISHARDED_TLS_CERT", "x")
+    monkeypatch.delenv("ISHARDED_TLS_KEY", raising=False)
     with pytest.raises(ValueError):
         server_options()
 
 
 def test_an_exposed_pool_with_no_credentials_refuses_to_start():
-    from shardmesh.pool import ExposedPool, check_exposure
+    from isharded.pool import ExposedPool, check_exposure
 
     with pytest.raises(ExposedPool, match="pool init"):
         check_exposure("0.0.0.0", None, None, False)
@@ -224,14 +224,14 @@ def test_an_exposed_pool_with_no_credentials_refuses_to_start():
 
 
 def test_the_token_comes_from_the_nodes_file(tmp_path, monkeypatch):
-    from shardmesh.pool import load_token
+    from isharded.pool import load_token
 
-    monkeypatch.delenv("SHARDMESH_POOL_TOKEN", raising=False)
+    monkeypatch.delenv("ISHARDED_POOL_TOKEN", raising=False)
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
-    monkeypatch.delenv("SHARDMESH_POOL_TOKEN_FILE", raising=False)
+    monkeypatch.delenv("ISHARDED_POOL_TOKEN_FILE", raising=False)
     assert load_token() is None
-    (tmp_path / "ShardMesh").mkdir()
-    (tmp_path / "ShardMesh" / "pool.token").write_text("secret\n", encoding="utf-8")
+    (tmp_path / "iSharded").mkdir()
+    (tmp_path / "iSharded" / "pool.token").write_text("secret\n", encoding="utf-8")
     assert load_token() == "secret"
 
 
@@ -293,8 +293,8 @@ def test_keys_are_managed_through_the_api_and_shown_once(secured):
 
 
 def test_revoking_a_node_quarantines_its_workers_and_keeps_them_out(secured):
-    from shardmesh.orchestrator import WorkerRecord
-    from shardmesh.protocol import HardwareInfo, WorkerRegistration
+    from isharded.orchestrator import WorkerRecord
+    from isharded.protocol import HardwareInfo, WorkerRegistration
 
     client, _, root, _ = secured
     hardware = HardwareInfo(device="cpu", backend="cpu", cpu_cores=1, ram_total_bytes=1)
@@ -309,7 +309,7 @@ def test_revoking_a_node_quarantines_its_workers_and_keeps_them_out(secured):
 
 
 def test_worker_health_says_nothing_to_strangers(monkeypatch):
-    from shardmesh import worker
+    from isharded import worker
 
     class Runtime:
         pool_token = "secret"
@@ -324,7 +324,7 @@ def test_worker_health_says_nothing_to_strangers(monkeypatch):
 def test_pool_credentials_issue_working_certificates(tmp_path):
     from cryptography import x509
 
-    from shardmesh.pool import add_node, init_pool
+    from isharded.pool import add_node, init_pool
 
     folder = str(tmp_path / "pool")
     init_pool(folder)
@@ -342,7 +342,7 @@ def test_pool_credentials_issue_working_certificates(tmp_path):
 
 
 def test_a_certificate_name_is_read_from_its_subject():
-    from shardmesh.tls import peer_name
+    from isharded.tls import peer_name
 
     assert peer_name({"subject": ((("commonName", "node-a"),),)}) == "node-a"
     assert peer_name(None) is None

@@ -9,10 +9,10 @@ import threading
 
 import pytest
 
-from shardmesh.assistant.app import Assistant
-from shardmesh.assistant.cli import add_arguments, run
-from shardmesh.assistant.contracts import Provenance, Reach, Trust
-from shardmesh.assistant.memory import MemoryNotFound, MemoryRefused
+from isharded.assistant.app import Assistant
+from isharded.assistant.cli import add_arguments, run
+from isharded.assistant.contracts import Provenance, Reach, Trust
+from isharded.assistant.memory import MemoryNotFound, MemoryRefused
 
 DAY = 86_400.0
 

@@ -4,8 +4,8 @@ import argparse
 from pathlib import Path
 from types import SimpleNamespace
 
-from shardmesh import node as node_module
-from shardmesh.lanes import (
+from isharded import node as node_module
+from isharded.lanes import (
     LANE_GPU_OVERHEAD_GB,
     LANE_PORT_STEP,
     clean_lanes,
@@ -15,9 +15,9 @@ from shardmesh.lanes import (
     spare_budgets,
     write_lanes,
 )
-from shardmesh.mesh import ControlMesh
-from shardmesh.node import LaneKeeper, add_node_arguments, lane_arguments, node_specs
-from shardmesh.protocol import MemoryPool
+from isharded.mesh import ControlMesh
+from isharded.node import LaneKeeper, add_node_arguments, lane_arguments, node_specs
+from isharded.protocol import MemoryPool
 
 GIB = 1024**3
 

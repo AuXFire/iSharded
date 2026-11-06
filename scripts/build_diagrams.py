@@ -374,15 +374,15 @@ def figure(fig, caption):
     )
 
 
-PAGE = f"""<title>How ShardMesh Works</title>
+PAGE = f"""<title>How iSharded Works</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="{FONTS}">
 <style>{STYLE}</style>
 <main class="page">
 <header>
-  <h1>How ShardMesh Works</h1>
-  <p class="lead">ShardMesh runs one language model across several machines. Each machine holds some of the model's layers, and any machine can answer a request. No server is in charge.</p>
+  <h1>How iSharded Works</h1>
+  <p class="lead">iSharded runs one language model across several machines. Each machine holds some of the model's layers, and any machine can answer a request. No server is in charge.</p>
   <p class="status">These diagrams show what is built. Measured figures come from the test pool, which is two machines so far.</p>
   <div class="key" aria-label="Line colors">
     <span><i class="k-route"></i>A reply's data</span>

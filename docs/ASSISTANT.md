@@ -1,8 +1,8 @@
 # The assistant
 
-ShardMesh runs one model across many machines. The assistant runs on top of that: a persistent identity that remembers, learns tested skills, runs durable tasks, uses tools under strict permissions, and works with other owners' installs without merging with them.
+iSharded runs one model across many machines. The assistant runs on top of that: a persistent identity that remembers, learns tested skills, runs durable tasks, uses tools under strict permissions, and works with other owners' installs without merging with them.
 
-It is a separate process that each person runs for themselves, `shardmesh assistant serve`. The mesh is one of its model providers, reached through the OpenAI-compatible API, so the mesh core never depends on it and a person's memories never live on the mesh.
+It is a separate process that each person runs for themselves, `isharded assistant serve`. The mesh is one of its model providers, reached through the OpenAI-compatible API, so the mesh core never depends on it and a person's memories never live on the mesh.
 
 ## Quick start
 
@@ -14,48 +14,48 @@ Steps 2 to 7 were run in this order on Windows, from outside the repository, aga
 python -m pip install .
 ```
 
-**2. Start a model.** This makes a mesh of one on this machine, with a folder of GGUF files. It prints where it is and keeps running, so leave it open and use a second terminal. `shardmesh up` keeps the owner's key in `admin.key`, in the `up` folder under `ShardMesh` in your data folder.
+**2. Start a model.** This makes a mesh of one on this machine, with a folder of GGUF files. It prints where it is and keeps running, so leave it open and use a second terminal. `isharded up` keeps the owner's key in `admin.key`, in the `up` folder under `iSharded` in your data folder.
 
 ```sh
-shardmesh up --gguf-dir FOLDER --no-browser
+isharded up --gguf-dir FOLDER --no-browser
 ```
 
-Once it says it is up, load a model by its file name, from the second terminal or from the chat page `up` printed. Point `SHARDMESH_POOL_TOKEN_FILE` at `admin.key` first, which keeps the key off the command line. In PowerShell that is `$env:SHARDMESH_POOL_TOKEN_FILE = "ADMIN_KEY_FILE"` on a line of its own.
+Once it says it is up, load a model by its file name, from the second terminal or from the chat page `up` printed. Point `ISHARDED_POOL_TOKEN_FILE` at `admin.key` first, which keeps the key off the command line. In PowerShell that is `$env:ISHARDED_POOL_TOKEN_FILE = "ADMIN_KEY_FILE"` on a line of its own.
 
 ```sh
-SHARDMESH_POOL_TOKEN_FILE=ADMIN_KEY_FILE shardmesh load Qwen3-0.6B-Q8_0.gguf --url http://127.0.0.1:8209
+ISHARDED_POOL_TOKEN_FILE=ADMIN_KEY_FILE isharded load Qwen3-0.6B-Q8_0.gguf --url http://127.0.0.1:8209
 ```
 
-`shardmesh up --model FILE` does this step for you and says when the model is ready.
+`isharded up --model FILE` does this step for you and says when the model is ready.
 
 **3. Add it as a provider.** The assistant holds only the path to the key, never the key. The mesh's address is the one `up` printed.
 
 ```sh
-shardmesh assistant provider add mesh http://127.0.0.1:8209 --mesh --key-file ADMIN_KEY_FILE
-shardmesh assistant provider list
+isharded assistant provider add mesh http://127.0.0.1:8209 --mesh --key-file ADMIN_KEY_FILE
+isharded assistant provider list
 ```
 
 **4. Talk to it.** A chat in the terminal is `chat`, and one line is `say`. It keeps what is worth keeping, and each reply ends with who answered and which tools really ran.
 
 ```sh
-shardmesh assistant say "My name is Sam and I keep bees on my roof."
-shardmesh assistant recall bees
-shardmesh assistant say "What do I keep on my roof?"
+isharded assistant say "My name is Sam and I keep bees on my roof."
+isharded assistant recall bees
+isharded assistant say "What do I keep on my roof?"
 ```
 
 A model proposes what to remember, and a small one often proposes nothing useful. What you say yourself with `remember` is kept as your own words.
 
 ```sh
-shardmesh assistant remember "I keep bees on my roof." --subject bees
+isharded assistant remember "I keep bees on my roof." --subject bees
 ```
 
 **5. Grant a tool.** Until now the assistant could do nothing but talk. A grant says who, what, and how far. Here the assistant may read one folder, and nothing else.
 
 ```sh
-shardmesh assistant grant add files.read NOTES_FOLDER
-shardmesh assistant say "Use the files.read tool to read NOTES_FOLDER/notes.txt, then tell me what it says."
-shardmesh assistant why
-shardmesh assistant audit --limit 10
+isharded assistant grant add files.read NOTES_FOLDER
+isharded assistant say "Use the files.read tool to read NOTES_FOLDER/notes.txt, then tell me what it says."
+isharded assistant why
+isharded assistant audit --limit 10
 ```
 
 Look for `used files.read` at the end of the reply. A small model sometimes skips the tool and makes up what the file says, in the same confident words, and without that line the file was not read on that turn. [Here is how often.](#how-a-small-model-does)
@@ -76,15 +76,15 @@ Look for `used files.read` at the end of the reply. A small model sometimes skip
 ```
 
 ```sh
-shardmesh assistant task run plan.json
-shardmesh assistant task list
+isharded assistant task run plan.json
+isharded assistant task list
 ```
 
 **7. Use the page.** Each person has their own key, in a file and never on the screen. Name the first user `owner`, since commands on this machine act for `owner`.
 
 ```sh
-shardmesh assistant user add owner
-shardmesh assistant serve
+isharded assistant user add owner
+isharded assistant serve
 ```
 
 Open `http://127.0.0.1:8470/`, and give it the key from the file `user add` named. While it runs, `serve` also runs tasks. Anything OpenAI-compatible can use `http://127.0.0.1:8470/v1` with that key.
@@ -103,7 +103,7 @@ Providers      mesh models, other models, tools, peers      providers router too
 Hardware       this machine, the mesh, other owners' installs by agreement
 ```
 
-Every part attaches to one `Assistant`, which owns one folder. Commands take `--home` before the command to pick that folder, and it defaults to `ShardMesh/assistant` in your data folder, or `SHARDMESH_ASSISTANT_HOME`.
+Every part attaches to one `Assistant`, which owns one folder. Commands take `--home` before the command to pick that folder, and it defaults to `iSharded/assistant` in your data folder, or `ISHARDED_ASSISTANT_HOME`.
 
 | Part | Attaches | Does |
 |---|---|---|
@@ -141,7 +141,7 @@ These hold for every part, and each has a test. `tests/test_assistant_system.py`
 - **Every decision is audited,** refusals included, in a hash-chained record that shows tampering.
 - **Remote systems gain nothing by connecting.** A peer can call only what was offered to it and granted, and its text is always tainted.
 
-Every command below goes after `shardmesh assistant`. Commands that act for a person take `--user NAME`, which defaults to `owner`. Over HTTP a key says who is calling, and `--user` does not exist there.
+Every command below goes after `isharded assistant`. Commands that act for a person take `--user NAME`, which defaults to `owner`. Over HTTP a key says who is calling, and `--user` does not exist there.
 
 ## Who the assistant is
 
@@ -198,7 +198,7 @@ Measured on this machine with 5,000 mixed files (26.5 MB, 27,257 chunks), while 
 
 | Command | Does |
 |---|---|
-| `provider add NAME URL` | `--mesh` for a ShardMesh pool, `--key-env NAME` or `--key-file PATH`, `--reach`, `--tools auto\|native\|prompt`, `--daily-tokens`, `--read-seconds`, `--model` |
+| `provider add NAME URL` | `--mesh` for an iSharded pool, `--key-env NAME` or `--key-file PATH`, `--reach`, `--tools auto\|native\|prompt`, `--daily-tokens`, `--read-seconds`, `--model` |
 | `provider list` | Shows providers and checks each is up. `--no-check` does not contact them |
 | `provider remove NAME` | Removes one |
 
@@ -214,7 +214,7 @@ A person never watches a call arrive. While tools are offered, a stream holds an
 
 Silence is handled as failure. Every read has a limit, a failure sent inside a stream is seen, and a stream that ends without finishing is a failure and not a short answer.
 
-A pool with its own authority is verified against `SHARDMESH_CA_FILE`, as nodes are. If a certificate cannot be verified, the error says antivirus may be replacing it, since some antivirus re-signs HTTPS even on loopback.
+A pool with its own authority is verified against `ISHARDED_CA_FILE`, as nodes are. If a certificate cannot be verified, the error says antivirus may be replacing it, since some antivirus re-signs HTTPS even on loopback.
 
 ## The router
 
@@ -374,7 +374,7 @@ Effects are stated for the worst a call can do. `web.fetch` is network and not r
 
 **Git.** Hooks do not run, and `core.fsmonitor`, external diffs, and commit signing are pinned off on the command line. Anything that would be read as a flag is refused: `git diff --output=` would otherwise write a file from a read tool. If the repository's own config sets something no flag can turn off, the tool refuses and names the setting: filters, diff drivers, merge drivers, credential helpers, `core.sshCommand`, `core.gitProxy`, `core.askPass`, `core.worktree`, remote programs, and includes. The owner's global config is trusted. This matters because sandboxed code can write to the folder it works in, and would otherwise be able to plant a command for a later read to run outside the sandbox. `git.push` takes only the name of a configured remote and a plain branch, and never forces. It uses your own git credentials.
 
-**`mesh.status`** reads `/health` and `/v1/models` from `SHARDMESH_ORCHESTRATOR_URL`, or `http://127.0.0.1:8000`.
+**`mesh.status`** reads `/health` and `/v1/models` from `ISHARDED_ORCHESTRATOR_URL`, or `http://127.0.0.1:8000`.
 
 **`memory.remember`** keeps what it is given as a model's claim, or EXTERNAL from a tainted context, and no freer than the reach of the call. It never counts as a person saying it.
 
@@ -406,16 +406,16 @@ Generated code runs here, never in the assistant's process. The strongest walls 
 
 Every level has a scrubbed environment built from a short allow-list, so a secret added tomorrow stays out too. Each has a time limit that kills everything the command started, and capped output. Whatever a command leaves running is killed when it ends.
 
-Nothing is ever downloaded: a container level needs its image on the machine already. If you demand a level with `SHARDMESH_SANDBOX` and it is missing, nothing runs. Otherwise a weaker level is used and `sandbox` says why.
+Nothing is ever downloaded: a container level needs its image on the machine already. If you demand a level with `ISHARDED_SANDBOX` and it is missing, nothing runs. Otherwise a weaker level is used and `sandbox` says why.
 
 **What the `process` level does not do.** It cannot block the network, and each result says so in `network_blocked`, `notes`, and a line on stderr. It gives no file wall: the command can read and change whatever this user can. Because it runs as this user, a program that means harm can read other processes of this user, including this one's environment. On Linux a child that leaves its session escapes unless its parent is still alive, and if the assistant is killed its children keep running. On Windows the job kills them.
 
 | Setting | Meaning | Default |
 |---|---|---|
-| `SHARDMESH_SANDBOX` | `auto`, `container`, `namespace`, or `process` | `auto` |
-| `SHARDMESH_SANDBOX_IMAGE` | The local container image | `python:3.12-slim` |
-| `SHARDMESH_SANDBOX_MEMORY_MB` | Memory limit per run | `2048` |
-| `SHARDMESH_SANDBOX_OUTPUT_BYTES` | Output kept per stream | `1048576` |
+| `ISHARDED_SANDBOX` | `auto`, `container`, `namespace`, or `process` | `auto` |
+| `ISHARDED_SANDBOX_IMAGE` | The local container image | `python:3.12-slim` |
+| `ISHARDED_SANDBOX_MEMORY_MB` | Memory limit per run | `2048` |
+| `ISHARDED_SANDBOX_OUTPUT_BYTES` | Output kept per stream | `1048576` |
 
 ### `sandbox`
 
@@ -530,7 +530,7 @@ In `expect`, `step` and `text` default to the step's own result.
 
 | Setting | Meaning | Default |
 |---|---|---|
-| `SHARDMESH_TASK_SLOTS` | Slot sizes, such as `gpu:2,cpu:8,worker:4` | `worker:8`, `gpu:1`, `cpu:` this machine's count |
+| `ISHARDED_TASK_SLOTS` | Slot sizes, such as `gpu:2,cpu:8,worker:4` | `worker:8`, `gpu:1`, `cpu:` this machine's count |
 
 ### `task run PLAN`
 
@@ -667,10 +667,10 @@ Two independent installs, with different owners, cooperate without merging anyth
 Both owners must agree, and nothing works until they have.
 
 ```
-first$   shardmesh assistant peer invite --name bob --address http://100.64.0.2:9300
-second$  shardmesh assistant peer accept CODE --name alice --address http://100.64.0.3:9300
+first$   isharded assistant peer invite --name bob --address http://100.64.0.2:9300
+second$  isharded assistant peer accept CODE --name alice --address http://100.64.0.3:9300
          (the two owners read their fingerprints to each other, by phone or in person)
-first$   shardmesh assistant peer approve bob
+first$   isharded assistant peer approve bob
 ```
 
 The code works once and expires. It holds the first install's address and fingerprint, and a secret. The second install proves it holds the code, and the first proves it made it, so nobody on the path can answer with their own keys. Comparing fingerprints is what catches someone who stole the code.
@@ -728,14 +728,14 @@ A result comes back as a `ToolResult` with trust `EXTERNAL` whatever the peer cl
 
 Version 1. All messages are JSON over HTTP POST, and the HTTP layer is not trusted for anything.
 
-Each install has an Ed25519 signing key and an X25519 key, made on first use and stored in `federation/identity.key` in its home. They are kept out of the database so that a copy of it carries no private key, which means a backup needs this file too: without it, this install is a stranger to its peers and has to pair again. Its fingerprint is the first 32 hex digits of `SHA-256("shardmesh-peer-identity-v1\0" || signing public || exchange public)`, so it covers both keys.
+Each install has an Ed25519 signing key and an X25519 key, made on first use and stored in `federation/identity.key` in its home. They are kept out of the database so that a copy of it carries no private key, which means a backup needs this file too: without it, this install is a stranger to its peers and has to pair again. Its fingerprint is the first 32 hex digits of `SHA-256("isharded-peer-identity-v1\0" || signing public || exchange public)`, so it covers both keys.
 
 **A sealed message.** `body` is the JSON text of the message. The signature covers those exact bytes, prefixed by a domain string, so a signature for one kind of message means nothing as another:
 
 ```
-signature = Ed25519(sender, "shardmesh-peer-<kind>-v1\0" || body)
+signature = Ed25519(sender, "isharded-peer-<kind>-v1\0" || body)
 inner     = {"body": body, "signature": base64url(signature)}
-key       = HKDF-SHA256(X25519(ephemeral, recipient), info = "shardmesh-peer-seal-v1|<kind>|" || ephemeral public || recipient public)
+key       = HKDF-SHA256(X25519(ephemeral, recipient), info = "isharded-peer-seal-v1|<kind>|" || ephemeral public || recipient public)
 sealed    = {"v": 1, "ephemeral": ..., "nonce": ..., "ciphertext": AES-256-GCM(key, nonce, inner, aad = <kind>)}
 ```
 
@@ -816,7 +816,7 @@ A provider is registered for each paired peer known to offer `models.complete`. 
 
 | Setting | Means |
 |---|---|
-| `SHARDMESH_ASSISTANT_USER` | Who `peer ask` acts as, if the identity part does not name an owner. Default `owner` |
+| `ISHARDED_ASSISTANT_USER` | Who `peer ask` acts as, if the identity part does not name an owner. Default `owner` |
 
 ## Skills
 
@@ -871,7 +871,7 @@ Passing all its tests makes the text trust `VERIFIED`. Failing later takes that 
 
 `promote` needs the owner. It holds only for the exact version and active version that were compared, so if the active version has changed, evaluate again. There is deliberately no capability for promoting a skill, so no model, task, or peer can reach it.
 
-With `SHARDMESH_ASSISTANT_SKILL_AUTO_PROMOTE` on, an eligible candidate promotes itself only if every capability it needs is declared and read-only, and it did not come from a tainted task. A capability nobody declared counts as consequential. A skill cannot use this to hide what it does, as it can only call what it declared.
+With `ISHARDED_ASSISTANT_SKILL_AUTO_PROMOTE` on, an eligible candidate promotes itself only if every capability it needs is declared and read-only, and it did not come from a tainted task. A capability nobody declared counts as consequential. A skill cannot use this to hide what it does, as it can only call what it declared.
 
 ### In use
 
@@ -904,7 +904,7 @@ Each run is counted, or reported with `record_run(version, ok)`. Once a new vers
 
 | Setting | Means |
 |---|---|
-| `SHARDMESH_ASSISTANT_SKILL_AUTO_PROMOTE` | `1`, `true`, `yes`, or `on` allows automatic promotion as above. Off by default |
+| `ISHARDED_ASSISTANT_SKILL_AUTO_PROMOTE` | `1`, `true`, `yes`, or `on` allows automatic promotion as above. Off by default |
 
 ## Coding
 
@@ -913,9 +913,9 @@ Each run is counted, or reported with `record_run(version, ok)`. Once a new vers
 ### A run
 
 ```
-shardmesh assistant code start --repo PATH "Fix the rounding in invoices"
-shardmesh assistant code show ID
-shardmesh assistant code approve ID
+isharded assistant code start --repo PATH "Fix the rounding in invoices"
+isharded assistant code show ID
+isharded assistant code approve ID
 ```
 
 | State | Means |
@@ -972,9 +972,9 @@ A pass means the command exited 0. A test run that finds no tests, or times out,
 
 There is deliberately no capability for approving or pushing, so no model, task, or peer can reach them. Calls name their arguments from what `git.commit` and `git.push` declare in `input_schema`, and send only what the tool takes. The worktree is the repository named, so a scoped grant must cover the assistant's `coder` folder: `grant add git.commit HOME/coder`, where `HOME` is the assistant's folder. That folder is listed in `assistant.open_folders`, so file and git tools may reach it, and nothing else of the assistant's own.
 
-### Working on ShardMesh itself
+### Working on iSharded itself
 
-The same path applies, with nothing extra allowed: a candidate branch, tests, and approval. When the repository is ShardMesh, `coder/<slug>/HEALTH_AND_ROLLBACK.md` is written beside the worktree and shown by `code show`. It holds the base commit, what the change affects, a health check, and how to roll back. It is not part of the diff.
+The same path applies, with nothing extra allowed: a candidate branch, tests, and approval. When the repository is iSharded, `coder/<slug>/HEALTH_AND_ROLLBACK.md` is written beside the worktree and shown by `code show`. It holds the base commit, what the change affects, a health check, and how to roll back. It is not part of the diff.
 
 The coder never deploys or restarts anything. That stays a person's decision.
 
@@ -1003,7 +1003,7 @@ Test commands are detected from `pyproject.toml`, `pytest.ini`, `tox.ini`, `setu
 `transcribe(audio_path)` returns the words in an audio file.
 
 1. It uses `faster-whisper` if installed, on the CPU, as the GPU belongs to the mesh. The model comes from local files only and is never downloaded by itself.
-2. Otherwise it uses a whisper.cpp binary if `SHARDMESH_ASSISTANT_WHISPER_CPP` is set. That needs 16 kHz WAV input.
+2. Otherwise it uses a whisper.cpp binary if `ISHARDED_ASSISTANT_WHISPER_CPP` is set. That needs 16 kHz WAV input.
 
 Transcribed text is trust `EXTERNAL`: what a recording says is data, whoever seems to be speaking in it.
 
@@ -1011,7 +1011,7 @@ Transcribed text is trust `EXTERNAL`: what a recording says is data, whoever see
 
 `speak(text, voice=None, out_path=None)` writes a WAV file and returns `{"path", "engine", "voice"}`. It does not play anything: the interface decides whether and where to.
 
-1. It uses piper if installed, or `SHARDMESH_ASSISTANT_PIPER` if set, and only with a voice model in `SHARDMESH_ASSISTANT_PIPER_MODEL`.
+1. It uses piper if installed, or `ISHARDED_ASSISTANT_PIPER` if set, and only with a voice model in `ISHARDED_ASSISTANT_PIPER_MODEL`.
 2. Otherwise it uses the system voice: Windows SAPI through PowerShell, `say` on macOS, or `espeak-ng`.
 
 The text always travels through a file or a pipe, never inside a command, so nothing it says can run. Speech left in `voice/speech` is removed after an hour. The caller keeps what it needs.
@@ -1056,11 +1056,11 @@ Those content types are required because a web page cannot send them without ask
 
 | Setting | Means |
 |---|---|
-| `SHARDMESH_ASSISTANT_WHISPER_MODEL` | A faster-whisper model name found locally, or a folder holding a converted model. Default `base` |
-| `SHARDMESH_ASSISTANT_WHISPER_CPP` | The whisper.cpp binary |
-| `SHARDMESH_ASSISTANT_WHISPER_CPP_MODEL` | Its model file |
-| `SHARDMESH_ASSISTANT_PIPER` | The piper binary, if not on the path |
-| `SHARDMESH_ASSISTANT_PIPER_MODEL` | Its voice model, a `.onnx` file |
+| `ISHARDED_ASSISTANT_WHISPER_MODEL` | A faster-whisper model name found locally, or a folder holding a converted model. Default `base` |
+| `ISHARDED_ASSISTANT_WHISPER_CPP` | The whisper.cpp binary |
+| `ISHARDED_ASSISTANT_WHISPER_CPP_MODEL` | Its model file |
+| `ISHARDED_ASSISTANT_PIPER` | The piper binary, if not on the path |
+| `ISHARDED_ASSISTANT_PIPER_MODEL` | Its voice model, a `.onnx` file |
 
 ## The gateway
 
@@ -1151,7 +1151,7 @@ These are constants, with the file that holds each. `conversation.budget_tokens`
 
 ## For people writing a part
 
-A part is a module in `shardmesh/assistant/` with `attach(assistant)`, and optionally `detach(assistant)`, `add_commands(subparsers)`, `routes(assistant)`, and `PUBLIC_ROUTES`. `app.py` loads whichever parts exist, in the order of `PARTS`, so a later part can use an earlier one. Parts meet through `contracts.py`, each owns its tables through `store.migrate`, and each writes to the audit trail through `assistant.audit`.
+A part is a module in `isharded/assistant/` with `attach(assistant)`, and optionally `detach(assistant)`, `add_commands(subparsers)`, `routes(assistant)`, and `PUBLIC_ROUTES`. `app.py` loads whichever parts exist, in the order of `PARTS`, so a later part can use an earlier one. Parts meet through `contracts.py`, each owns its tables through `store.migrate`, and each writes to the audit trail through `assistant.audit`.
 
 | A part reaches | Which holds |
 |---|---|

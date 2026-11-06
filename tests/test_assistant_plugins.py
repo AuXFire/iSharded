@@ -12,10 +12,10 @@ import time
 import psutil
 import pytest
 
-from shardmesh.assistant import cli
-from shardmesh.assistant.app import Assistant
-from shardmesh.assistant.contracts import CallContext, Effect, ToolCall, Trust, Verdict
-from shardmesh.assistant.plugins import MAX_FAILURES, fingerprint, parse_effects, text_of
+from isharded.assistant import cli
+from isharded.assistant.app import Assistant
+from isharded.assistant.contracts import CallContext, Effect, ToolCall, Trust, Verdict
+from isharded.assistant.plugins import MAX_FAILURES, fingerprint, parse_effects, text_of
 
 PYTHON = sys.executable
 
@@ -119,7 +119,7 @@ def test_a_plugin_cannot_take_a_built_ins_name(assistant, tmp_path):
 
 
 def test_a_secret_in_the_environment_is_invisible_to_a_plugin(assistant, tmp_path, monkeypatch):
-    monkeypatch.setenv("SHARDMESH_POOL_TOKEN", "hunter2")
+    monkeypatch.setenv("ISHARDED_POOL_TOKEN", "hunter2")
     body = """
         import json, os
         print(json.dumps({"ok": True, "output": json.dumps(dict(os.environ))}))
@@ -473,7 +473,7 @@ def test_mcp_tools_become_capabilities_after_a_proper_handshake(assistant, mcp):
     methods = [message.get("method") for message in mcp.seen()]
     assert methods[:3] == ["initialize", "notifications/initialized", "tools/list"]
     start = mcp.seen()[0]["params"]
-    assert start["clientInfo"]["name"] == "shardmesh-assistant"
+    assert start["clientInfo"]["name"] == "isharded-assistant"
     assert start["capabilities"] == {}  # we offer the server nothing to call back into
 
 
@@ -686,7 +686,7 @@ def test_closing_the_assistant_stops_the_servers(home, mcp):
 
 
 def test_a_secret_is_invisible_to_an_mcp_server(assistant, tmp_path, monkeypatch):
-    monkeypatch.setenv("SHARDMESH_POOL_TOKEN", "hunter2")
+    monkeypatch.setenv("ISHARDED_POOL_TOKEN", "hunter2")
     leak = tmp_path / "environment.json"
     body = f"""
         import json, os, sys

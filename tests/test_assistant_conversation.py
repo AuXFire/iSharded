@@ -12,11 +12,11 @@ import threading
 
 import pytest
 
-from shardmesh.assistant.app import Assistant
-from shardmesh.assistant.cli import add_arguments, run
-from shardmesh.assistant.contracts import CallContext, Decision, Effect, Provenance, Reach, ToolCall, Trust, Verdict
-from shardmesh.assistant.conversation import MAX_ROUNDS, classify, decide_approval
-from shardmesh.assistant.mind import emit
+from isharded.assistant.app import Assistant
+from isharded.assistant.cli import add_arguments, run
+from isharded.assistant.contracts import CallContext, Decision, Effect, Provenance, Reach, ToolCall, Trust, Verdict
+from isharded.assistant.conversation import MAX_ROUNDS, classify, decide_approval
+from isharded.assistant.mind import emit
 from test_assistant_fakes import FakeBroker, FakeModelServer, FakeProvider, Reply, ScriptedRouter, model_reply
 
 
@@ -893,7 +893,7 @@ def test_redirected_output_on_a_narrow_code_page_does_not_crash(tmp_path):
     script = tmp_path / "print_it.py"
     script.write_text(
         f"import sys\nsys.path.insert(0, {str(Path(__file__).parent.parent)!r})\n"
-        "from shardmesh.assistant.mind import emit\n"
+        "from isharded.assistant.mind import emit\n"
         "emit('Arrow \\u2192 snake \\U0001f40d done')\n",
         encoding="utf-8",
     )

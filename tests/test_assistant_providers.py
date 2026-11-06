@@ -8,10 +8,10 @@ import time
 
 import pytest
 
-from shardmesh.assistant.app import Assistant
-from shardmesh.assistant.cli import add_arguments, run
-from shardmesh.assistant.contracts import Capability, Effect, ModelReply, ModelRequest, Reach, ToolCall
-from shardmesh.assistant.providers import (
+from isharded.assistant.app import Assistant
+from isharded.assistant.cli import add_arguments, run
+from isharded.assistant.contracts import Capability, Effect, ModelReply, ModelRequest, Reach, ToolCall
+from isharded.assistant.providers import (
     MeshProvider,
     OpenAICompatible,
     ProviderError,
@@ -384,8 +384,8 @@ def test_a_pool_with_its_own_authority_is_verified_against_it(tmp_path, monkeypa
     from test_assistant_gateway import self_signed
 
     certificate, _ = self_signed(tmp_path)
-    monkeypatch.setenv("SHARDMESH_CA_FILE", str(certificate))
-    monkeypatch.delenv("SHARDMESH_TLS_CERT", raising=False)
+    monkeypatch.setenv("ISHARDED_CA_FILE", str(certificate))
+    monkeypatch.delenv("ISHARDED_TLS_CERT", raising=False)
     with httpx_client_of(MeshProvider("mesh", "https://127.0.0.1:1")) as client:
         names = [item["subject"] for item in client._transport._pool._ssl_context.get_ca_certs()]
     assert any("assistant-test" in str(name) for name in names)
@@ -414,7 +414,7 @@ def test_a_reply_that_is_not_json_is_a_failure_with_a_plain_message():
 
 
 def test_a_stalled_model_list_is_bounded(monkeypatch):
-    monkeypatch.setattr("shardmesh.assistant.providers.HEALTH_SECONDS", 0.3)
+    monkeypatch.setattr("isharded.assistant.providers.HEALTH_SECONDS", 0.3)
     with FakeModelServer() as server:
         server.model_list_silent = True
         started = time.monotonic()

@@ -6,7 +6,7 @@ import time
 import httpx
 import uvicorn
 
-from shardmesh.serving import NoDelayHTTPProtocol, set_nodelay
+from isharded.serving import NoDelayHTTPProtocol, set_nodelay
 
 
 class Transport:
@@ -66,7 +66,7 @@ def test_a_body_limit_refuses_from_the_headers_alone():
     from starlette.routing import Route
     from starlette.testclient import TestClient
 
-    from shardmesh.serving import BodyLimit
+    from isharded.serving import BodyLimit
 
     async def echo(request):
         return PlainTextResponse(str(len(await request.body())))

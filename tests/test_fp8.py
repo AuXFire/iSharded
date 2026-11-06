@@ -11,10 +11,10 @@ import transformers
 from safetensors.torch import load, save_file
 from transformers import AutoModelForCausalLM
 
-from shardmesh.models import create_adapter
-from shardmesh.planner import Candidate, ModelProfile, plan_placement
-from shardmesh.protocol import MemoryPool, TensorRef, WeightUnit
-from shardmesh.weights import (
+from isharded.models import create_adapter
+from isharded.planner import Candidate, ModelProfile, plan_placement
+from isharded.protocol import MemoryPool, TensorRef, WeightUnit
+from isharded.weights import (
     FP8,
     FetchProgress,
     UnitCache,

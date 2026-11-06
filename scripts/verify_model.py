@@ -1,4 +1,4 @@
-"""Compare a live ShardMesh greedy completion with an unsharded reference."""
+"""Compare a live iSharded greedy completion with an unsharded reference."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    token = os.getenv("SHARDMESH_POOL_TOKEN")
+    token = os.getenv("ISHARDED_POOL_TOKEN")
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     status = httpx.get(f"{args.url}/admin/status", headers=headers, timeout=10).json()
     active = [worker for worker in status["workers"].values() if worker["active"]]

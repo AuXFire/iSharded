@@ -7,9 +7,9 @@ from typing import Any
 
 import pytest
 
-from shardmesh.assistant.app import Assistant
-from shardmesh.assistant.cli import add_arguments
-from shardmesh.assistant.contracts import (
+from isharded.assistant.app import Assistant
+from isharded.assistant.cli import add_arguments
+from isharded.assistant.contracts import (
     Capability,
     Decision,
     Effect,
@@ -21,7 +21,7 @@ from shardmesh.assistant.contracts import (
     Trust,
     Verdict,
 )
-from shardmesh.assistant.skills import (
+from isharded.assistant.skills import (
     ACTIVE,
     CANDIDATE,
     REJECTED,
@@ -102,7 +102,7 @@ class FakeTasks:
 
 @pytest.fixture
 def assistant(tmp_path, monkeypatch):
-    monkeypatch.delenv("SHARDMESH_ASSISTANT_SKILL_AUTO_PROMOTE", raising=False)
+    monkeypatch.delenv("ISHARDED_ASSISTANT_SKILL_AUTO_PROMOTE", raising=False)
     with Assistant(tmp_path / "home") as built:
         built.broker = FakeBroker()
         built.router = ScriptedRouter()
@@ -500,7 +500,7 @@ def test_promotion_waits_for_the_owner_by_default(assistant):
 
 
 def test_the_setting_is_read_from_the_environment(tmp_path, monkeypatch):
-    monkeypatch.setenv("SHARDMESH_ASSISTANT_SKILL_AUTO_PROMOTE", "1")
+    monkeypatch.setenv("ISHARDED_ASSISTANT_SKILL_AUTO_PROMOTE", "1")
     with Assistant(tmp_path / "home") as built:
         assert built.skills.auto_promote
 

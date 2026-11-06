@@ -1,8 +1,8 @@
-# ShardMesh
+# iSharded
 
-> ShardMesh is an active project, changing quickly. Commands and the network protocol can change between versions, so upgrade all of a mesh's nodes together. Nothing here should be treated as finished or production-proven yet.
+> iSharded is an active project, changing quickly. Commands and the network protocol can change between versions, so upgrade all of a mesh's nodes together. Nothing here should be treated as finished or production-proven yet.
 
-ShardMesh runs language models across a mesh of many computers, using whatever memory each one has: VRAM, unified memory, system RAM, or disk. A model too big for any one of them can run across all of them. There is no central server. Every node runs the same software, the nodes elect one of themselves to coordinate, and any node can serve the API.
+iSharded runs language models across a mesh of many computers, using whatever memory each one has: VRAM, unified memory, system RAM, or disk. A model too big for any one of them can run across all of them. There is no central server. Every node runs the same software, the nodes elect one of themselves to coordinate, and any node can serve the API.
 
 It works on a closed network, a LAN, across VLANs, over Tailscale, or between remote machines with TLS. The API follows OpenAI's, so existing clients only need a new URL and key.
 
@@ -35,7 +35,7 @@ This is execution sharding, not simulated work distribution: each token really c
 - [Current limits](#current-limits)
 - [License](#license)
 
-More detail lives in [Operating ShardMesh](docs/OPERATIONS.md) and [ShardMesh security](docs/SECURITY.md).
+More detail lives in [Operating iSharded](docs/OPERATIONS.md) and [iSharded security](docs/SECURITY.md).
 
 ## What it does
 
@@ -57,21 +57,21 @@ More detail lives in [Operating ShardMesh](docs/OPERATIONS.md) and [ShardMesh se
 
 ## Install
 
-You need Python 3.10 or newer. These install ShardMesh for your user only, and pick a PyTorch build for your hardware.
+You need Python 3.10 or newer. These install iSharded for your user only, and pick a PyTorch build for your hardware.
 
 On Windows, in PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/AuXFire/shardmesh/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/AuXFire/iSharded/main/install.ps1 | iex
 ```
 
 On Linux or macOS:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AuXFire/shardmesh/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/AuXFire/iSharded/main/install.sh | sh
 ```
 
-Then `shardmesh doctor` checks the machine, and says what to fix if anything is missing.
+Then `isharded doctor` checks the machine, and says what to fix if anything is missing.
 
 The installers pick a CUDA build of PyTorch where they find an NVIDIA GPU, and otherwise a CPU build on Windows. A GPU PyTorch cannot see, such as an AMD card on Windows, still works for GGUF models: the node finds it through llama.cpp's Vulkan build. See [Any GPU](#any-gpu).
 
@@ -80,11 +80,11 @@ The installers pick a CUDA build of PyTorch where they find an NVIDIA GPU, and o
 You need PyTorch built for your hardware. Install PyTorch first, because the default package may not match your GPU. See [pytorch.org](https://pytorch.org/get-started/locally/) for CUDA, ROCm, and CPU builds.
 
 ```bash
-git clone https://github.com/AuXFire/shardmesh.git
+git clone https://github.com/AuXFire/iSharded.git
 ```
 
 ```bash
-cd shardmesh
+cd isharded
 ```
 
 ```bash
@@ -93,9 +93,9 @@ python -m pip install -e .
 
 The `test` extra adds what the test suite needs.
 
-This installs `shardmesh`, `shardmesh-node`, `shardmesh-orchestrator`, and `shardmesh-worker`. From a checkout with the dependencies in place, `python -m shardmesh` works the same way without installing.
+This installs `isharded`, `isharded-node`, `isharded-orchestrator`, and `isharded-worker`. From a checkout with the dependencies in place, `python -m isharded` works the same way without installing.
 
-For GGUF models, nodes download a pinned, hash-checked llama.cpp build for their hardware to `%LOCALAPPDATA%\ShardMesh\llama` on Windows or `~/.cache/shardmesh/llama` elsewhere. On a minimal Linux install, add the one system library it needs with `sudo apt-get install libgomp1`. On a closed network, give each node a build with `--llama-dir`.
+For GGUF models, nodes download a pinned, hash-checked llama.cpp build for their hardware to `%LOCALAPPDATA%\iSharded\llama` on Windows or `~/.cache/isharded/llama` elsewhere. On a minimal Linux install, add the one system library it needs with `sudo apt-get install libgomp1`. On a closed network, give each node a build with `--llama-dir`.
 
 On a machine where antivirus intercepts HTTPS, `pip` may fail with a certificate error. Add `--use-feature=truststore` so it uses the system's trusted certificates.
 
@@ -106,7 +106,7 @@ On a machine where antivirus intercepts HTTPS, `pip` may fail with a certificate
 On the first machine:
 
 ```bash
-shardmesh up
+isharded up
 ```
 
 That is all it needs. It finds the hardware, picks an address, makes the mesh's certificates, and opens the chat page signed in as the owner, where you choose a model. Running it again starts the same node with the same settings.
@@ -116,18 +116,18 @@ That is all it needs. It finds the hardware, picks an address, makes the mesh's 
 On the machine that made the mesh:
 
 ```bash
-shardmesh invite
+isharded invite
 ```
 
-It prints one command to run on the new machine, with a code that works once and lasts 24 hours. The dashboard's "Add a machine" button does the same. The new machine makes its own key, proves it holds the code, and gets a certificate signed by the owner's machine, which has to be running at that moment. Nothing needs copying. Run `shardmesh up --invite CODE` on as many machines as you invite.
+It prints one command to run on the new machine, with a code that works once and lasts 24 hours. The dashboard's "Add a machine" button does the same. The new machine makes its own key, proves it holds the code, and gets a certificate signed by the owner's machine, which has to be running at that moment. Nothing needs copying. Run `isharded up --invite CODE` on as many machines as you invite.
 
 The new machine gets its own key for the chat page, with the user role. The owner's key stays the only admin key.
 
-Or skip the code. A new machine running `shardmesh up` looks for a mesh on its LAN and its tailnet, and offers to join what it finds. The machine then waits for someone to approve it, on the dashboard or with `shardmesh approve NAME`, and both sides show the same key fingerprint to check. If a firewall blocks the search, which uses UDP port 8208 on a LAN, use an invite.
+Or skip the code. A new machine running `isharded up` looks for a mesh on its LAN and its tailnet, and offers to join what it finds. The machine then waits for someone to approve it, on the dashboard or with `isharded approve NAME`, and both sides show the same key fingerprint to check. If a firewall blocks the search, which uses UDP port 8208 on a LAN, use an invite.
 
 ### What it works out
 
-| Setting | How `shardmesh up` decides |
+| Setting | How `isharded up` decides |
 |---|---|
 | Address | Tailscale if this machine has it, otherwise the LAN |
 | Encryption | None added on Tailscale, which encrypts already. Otherwise TLS with the mesh's own certificate, so a browser warns once. `--trusted-network` skips it |
@@ -135,14 +135,14 @@ Or skip the code. A new machine running `shardmesh up` looks for a mesh on its L
 | Models on disk | LM Studio's folders and `~/models`, so nothing downloads twice |
 | Name | This machine's name |
 
-Everything it decides is in `settings.json` in its folder, `%LOCALAPPDATA%\ShardMesh\up` on Windows or `~/.shardmesh/up` elsewhere. That folder also holds the mesh's authority key on the owner's machine, so keep it safe. To start a node at login, run `shardmesh service install`.
+Everything it decides is in `settings.json` in its folder, `%LOCALAPPDATA%\iSharded\up` on Windows or `~/.isharded/up` elsewhere. That folder also holds the mesh's authority key on the owner's machine, so keep it safe. To start a node at login, run `isharded service install`.
 
 The rest of this section sets things up by hand, which gives you every option in the [command reference](#command-reference).
 
 ### One machine
 
 ```bash
-python -m shardmesh demo --workers 2
+python -m isharded demo --workers 2
 ```
 
 This starts a control plane on port 8000 and two workers on ports 8100 and 8101, then loads `distilbert/distilgpt2` across them. Open [http://127.0.0.1:8000/chat](http://127.0.0.1:8000/chat) to chat, or [http://127.0.0.1:8000/dashboard](http://127.0.0.1:8000/dashboard) to watch it work.
@@ -154,7 +154,7 @@ python scripts/build_tiny_model.py .smoke-model
 ```
 
 ```bash
-python -m shardmesh demo --workers 2 --model .smoke-model --device cpu
+python -m isharded demo --workers 2 --model .smoke-model --device cpu
 ```
 
 That model is random, so its output means nothing. It proves that sharded and unsharded runs agree.
@@ -164,25 +164,25 @@ That model is random, so its output means nothing. It proves that sharded and un
 Tailscale encrypts the link, so a shared token is enough here. On the first machine, make the pool's credentials:
 
 ```bash
-shardmesh pool init --dir pool-secrets
+isharded pool init --dir pool-secrets
 ```
 
-Copy `pool-secrets/pool.token` to `%LOCALAPPDATA%\ShardMesh\pool.token` on each Windows machine, or `~/.shardmesh/pool.token` elsewhere. Anyone holding it has full control of the pool. Then start the first node:
+Copy `pool-secrets/pool.token` to `%LOCALAPPDATA%\iSharded\pool.token` on each Windows machine, or `~/.isharded/pool.token` elsewhere. Anyone holding it has full control of the pool. Then start the first node:
 
 ```bash
-shardmesh node --node-id node-a --gguf-dir D:\models --weights-ram-gb auto
+isharded node --node-id node-a --gguf-dir D:\models --weights-ram-gb auto
 ```
 
 It prints the address it advertises, and its control plane listens on port 8209. Start each further node the same way, naming any node already running:
 
 ```bash
-shardmesh node --node-id node-b --join http://100.64.0.1:8209 --weights-ram-gb auto
+isharded node --node-id node-b --join http://100.64.0.1:8209 --weights-ram-gb auto
 ```
 
 Load a model from either machine. The `--url` matters, because `load` otherwise assumes the demo's port:
 
 ```bash
-shardmesh load "unsloth/Qwen3.6-27B-GGUF:Qwen3.6-27B-Q4_K_M.gguf" --url http://100.64.0.1:8209
+isharded load "unsloth/Qwen3.6-27B-GGUF:Qwen3.6-27B-Q4_K_M.gguf" --url http://100.64.0.1:8209
 ```
 
 Open `http://100.64.0.1:8209/chat` and enter the token. A file already in a `--gguf-dir` folder is read locally, and a node without it reads only its share from the node that has it.
@@ -192,35 +192,35 @@ Open `http://100.64.0.1:8209/chat` and enter the token. A file already in a `--g
 Certificates give each node its own identity, so one can be thrown out without touching the others. On your own machine, which keeps the authority key:
 
 ```bash
-shardmesh pool init --dir pool-secrets
+isharded pool init --dir pool-secrets
 ```
 
 ```bash
-shardmesh key create root --role admin --file access.json
+isharded key create root --role admin --file access.json
 ```
 
 ```bash
-shardmesh pool add-node --dir pool-secrets node-a --address 100.64.0.1
+isharded pool add-node --dir pool-secrets node-a --address 100.64.0.1
 ```
 
 The second command prints an admin key, once. Copy `ca.pem`, `node-a.pem`, `node-a.key`, and `access.json` to node-a, and keep `ca.key` where it is. Start the node:
 
 ```bash
-shardmesh node --node-id node-a --ca-file ca.pem --identity-cert node-a.pem --identity-key node-a.key --keys-file access.json
+isharded node --node-id node-a --ca-file ca.pem --identity-cert node-a.pem --identity-key node-a.key --keys-file access.json
 ```
 
 Other nodes ask to join, which keeps their private keys on their own machines:
 
 ```bash
-shardmesh pool request-join node-b --dir node-identity --address 100.64.0.2 --url http://100.64.0.1:8209 --wait
+isharded pool request-join node-b --dir node-identity --address 100.64.0.2 --url http://100.64.0.1:8209 --wait
 ```
 
 ```bash
-shardmesh pool requests --url http://100.64.0.1:8209 --token YOUR_ADMIN_KEY
+isharded pool requests --url http://100.64.0.1:8209 --token YOUR_ADMIN_KEY
 ```
 
 ```bash
-shardmesh pool approve node-b --dir pool-secrets --url http://100.64.0.1:8209 --token YOUR_ADMIN_KEY
+isharded pool approve node-b --dir pool-secrets --url http://100.64.0.1:8209 --token YOUR_ADMIN_KEY
 ```
 
 Check the fingerprint with whoever is asking before you approve. Once approved, the waiting command saves the certificate. Start that node with its own files and `--join http://100.64.0.1:8209`.
@@ -286,7 +286,7 @@ The rule is that a failure must not drop a reply, and weights move only when the
   <img alt="Seven kinds of failure keep the reply going. Only losing the node you are connected to restarts it." src="docs/diagrams/failures-light.png">
 </picture>
 
-Times are measured on the test pool, except the stage crash, measured on a small model. In the last soak test, 405 replies finished and none were lost while processes were killed on both machines for 21 minutes. [Operating ShardMesh](docs/OPERATIONS.md) has the details.
+Times are measured on the test pool, except the stage crash, measured on a small model. In the last soak test, 405 replies finished and none were lost while processes were killed on both machines for 21 minutes. [Operating iSharded](docs/OPERATIONS.md) has the details.
 
 ### Joining an owned network
 
@@ -297,7 +297,7 @@ A node makes its own key and asks to join through any member. The owner approves
   <img alt="A node asks through any member, the owner signs the answer offline, and neither private key ever crosses the network." src="docs/diagrams/joining-light.png">
 </picture>
 
-Asking grants nothing. The new node's private key never leaves it, and the owner's key never touches the network, so a compromised node can't add a key or revoke a peer. Tickets prove a node's name without TLS, so antivirus that intercepts TLS can't break them. The link still needs Tailscale or another private network, because tickets don't encrypt anything. [ShardMesh security](docs/SECURITY.md) has the commands.
+Asking grants nothing. The new node's private key never leaves it, and the owner's key never touches the network, so a compromised node can't add a key or revoke a peer. Tickets prove a node's name without TLS, so antivirus that intercepts TLS can't break them. The link still needs Tailscale or another private network, because tickets don't encrypt anything. [iSharded security](docs/SECURITY.md) has the commands.
 
 ### Owned or ownerless
 
@@ -319,7 +319,7 @@ See [A network nobody owns](#a-network-nobody-owns) to run one. To redraw these 
 
 ## Scaling to many nodes
 
-ShardMesh is meant to run on many machines, not two. Two is only how many it has been tested on so far. Every node runs the same software, any node can coordinate, and a new node joins by naming any node already running, so nothing in how a mesh forms stops at two.
+iSharded is meant to run on many machines, not two. Two is only how many it has been tested on so far. Every node runs the same software, any node can coordinate, and a new node joins by naming any node already running, so nothing in how a mesh forms stops at two.
 
 What more nodes give you:
 
@@ -403,7 +403,7 @@ If the connection to a node drops, retry against another node. Replies survive a
 
 ### Loading a model
 
-`shardmesh load` starts a load, prints progress, and returns when the model is ready. The old model keeps serving until then.
+`isharded load` starts a load, prints progress, and returns when the model is ready. The old model keeps serving until then.
 
 | A model id can be | Example | Comes from |
 |---|---|---|
@@ -422,7 +422,7 @@ Gated models need `HF_TOKEN` set on each worker.
 Load another model beside the main one by giving it a lane:
 
 ```bash
-shardmesh load Qwen3-0.6B-Q8_0.gguf --lane small --url http://node-a:8669
+isharded load Qwen3-0.6B-Q8_0.gguf --lane small --url http://node-a:8669
 ```
 
 Each node then starts a control plane and workers for that lane, on ports 1000 above its own for the first lane, 2000 for the second, and so on. Open those ports wherever a firewall sits between nodes. The lane gets only what each node has spare under the limits its owner set, and `--lane-gpu-gb` and `--lane-ram-gb` lower that. A node started with `--no-lanes` hosts only the main model.
@@ -432,11 +432,11 @@ Each node then starts a control plane and workers for that lane, on ports 1000 a
 Lanes are separate on purpose: a failure in one stays there, and each has its own coordinator. See or stop them with:
 
 ```bash
-shardmesh lane list --url http://node-a:8669
+isharded lane list --url http://node-a:8669
 ```
 
 ```bash
-shardmesh lane remove small --url http://node-a:8669
+isharded lane remove small --url http://node-a:8669
 ```
 
 Removing a lane stops its processes on every node and frees their memory. Lanes come back after a restart, like the main model.
@@ -446,7 +446,7 @@ Removing a lane stops its processes on every node and frees their memory. Lanes 
 Each node makes its own identity. Its name comes from its key, so nobody hands names out and nobody can take one:
 
 ```bash
-shardmesh net init --dir ./identity --joining vouched --trust n-1a2b3c4d5e6f70819203
+isharded net init --dir ./identity --joining vouched --trust n-1a2b3c4d5e6f70819203
 ```
 
 `--joining open` accepts anyone. `--joining vouched` accepts only nodes vouched for by nodes this one already accepts, starting from itself and whoever `--trust` names, and `--quorum` sets how many vouches it takes. Each node works this out for itself, so two nodes can disagree and neither can overrule the other.
@@ -454,10 +454,10 @@ shardmesh net init --dir ./identity --joining vouched --trust n-1a2b3c4d5e6f7081
 Give your node's name to someone already in the network, and have them vouch for it:
 
 ```bash
-shardmesh net vouch n-9f8e7d6c5b4a39281706 --dir ./identity --url http://127.0.0.1:8009
+isharded net vouch n-9f8e7d6c5b4a39281706 --dir ./identity --url http://127.0.0.1:8009
 ```
 
-Start the node with `--ownerless ./identity`. Make yourself a key for your own node with `shardmesh key create me --role admin --file keys.json`, and pass `--keys-file keys.json`. That key is an admin of your node and means nothing anywhere else. Your users' keys live on your node too, and you set their limits.
+Start the node with `--ownerless ./identity`. Make yourself a key for your own node with `isharded key create me --role admin --file keys.json`, and pass `--keys-file keys.json`. That key is an admin of your node and means nothing anywhere else. Your users' keys live on your node too, and you set their limits.
 
 What an operator can do on the rest of the network is propose:
 
@@ -468,7 +468,7 @@ What an operator can do on the rest of the network is propose:
 | Load a model beside it | Yes, with `--lane` | Yes, and each node hosts it only if its owner allows |
 | Remove a lane | Yes, if your node proposed it | Nobody else can |
 | Take a node out | Your own | Nobody can take out another's |
-| Block a node | `shardmesh net block NAME`, for your node only | Nobody can block for anyone else |
+| Block a node | `isharded net block NAME`, for your node only | Nobody can block for anyone else |
 
 `--host-models` lists the models your node will host, as patterns such as `*Qwen3*`, in any kind of network. A worker refuses anything else, whatever a coordinator tells it.
 
@@ -533,15 +533,15 @@ Use wired links if you can: every token crosses every stage, so a pass costs at 
 The test pool: a laptop with a 6 GB RTX 3060 and a desktop with a 20 GB RX 7900 XT, over Tailscale, running Qwen3.6-27B Q4_K_M. The planner gave the laptop layers 0 to 7 and the desktop layers 8 to 63.
 
 ```bash
-shardmesh node --node-id laptop --join http://100.64.0.2:8300 --control-port 8000 --gpu-device cuda --gpu-memory-gb 4.5 --cpu-threads 4 --weights-ram-gb 6 --cache-dir D:\shardmesh-cache --ram-budget-gb 0.5 --gguf-dir D:\models --log-file D:\shardmesh-cache\node.log --ca-file ca.pem --identity-cert laptop.pem --identity-key laptop.key
+isharded node --node-id laptop --join http://100.64.0.2:8300 --control-port 8000 --gpu-device cuda --gpu-memory-gb 4.5 --cpu-threads 4 --weights-ram-gb 6 --cache-dir D:\isharded-cache --ram-budget-gb 0.5 --gguf-dir D:\models --log-file D:\isharded-cache\node.log --ca-file ca.pem --identity-cert laptop.pem --identity-key laptop.key
 ```
 
 ```bash
-shardmesh node --node-id desktop --join http://100.64.0.1:8000 --control-port 8300 --base-port 8311 --gpu-memory-gb 16 --cpu-threads 8 --weights-ram-gb auto --gguf-dir D:\models --ca-file ca.pem --identity-cert desktop.pem --identity-key desktop.key
+isharded node --node-id desktop --join http://100.64.0.1:8000 --control-port 8300 --base-port 8311 --gpu-memory-gb 16 --cpu-threads 8 --weights-ram-gb auto --gguf-dir D:\models --ca-file ca.pem --identity-cert desktop.pem --identity-key desktop.key
 ```
 
 ```bash
-shardmesh load lmstudio-community/Qwen3.6-27B-GGUF:Qwen3.6-27B-Q4_K_M.gguf --url http://100.64.0.2:8300 --context-tokens 8192 --parallel 2 --token YOUR_ADMIN_KEY
+isharded load lmstudio-community/Qwen3.6-27B-GGUF:Qwen3.6-27B-Q4_K_M.gguf --url http://100.64.0.2:8300 --context-tokens 8192 --parallel 2 --token YOUR_ADMIN_KEY
 ```
 
 A third node and every one after it joins the same way, with `--join` naming any node already running.
@@ -550,13 +550,13 @@ A third node and every one after it joins the same way, with `--join` naming any
 
 Every `--url` takes any node's control address. Commands default to `http://127.0.0.1:8000`, which is the demo's port. A node's control port is `--base-port` plus 9, so 8209 unless you change it.
 
-### shardmesh up
+### isharded up
 
 Starts a node with everything worked out, and is the easy way in. See [Quick start](#quick-start).
 
 | Option | Default | What it does |
 |---|---|---|
-| `--invite` | None | Join a mesh, with a code from `shardmesh invite` |
+| `--invite` | None | Join a mesh, with a code from `isharded invite` |
 | `--name` | This machine's name | This node's name |
 | `--port` | 8209 | Port for the chat page and API |
 | `--address` | Found for you | The address other nodes reach this one on |
@@ -576,23 +576,23 @@ Starts a node with everything worked out, and is the easy way in. See [Quick sta
 | `--joining` | `vouched` | With `--ownerless`: who this node accepts, `open` or `vouched` |
 | `--join` | None | With `--ownerless`: any node already in the network |
 
-### shardmesh invite
+### isharded invite
 
 Makes a code that adds a machine to this mesh, on the machine that made it. `--uses` sets how many machines it can add, 1 by default, and `--hours` how long it lasts, 24 by default.
 
-### shardmesh approve and deny
+### isharded approve and deny
 
-`shardmesh approve NAME` lets in a machine that asked to join, and `shardmesh deny NAME` turns it down. Run them on the machine that made the mesh. The dashboard does the same.
+`isharded approve NAME` lets in a machine that asked to join, and `isharded deny NAME` turns it down. Run them on the machine that made the mesh. The dashboard does the same.
 
-### shardmesh doctor
+### isharded doctor
 
 Checks this machine and says what to fix: Python, addresses, ports, memory, disk, and local models.
 
-### shardmesh service
+### isharded service
 
-`shardmesh service install` starts this node when you log in, for this user only, and `shardmesh service remove` stops that. It uses a scheduled task on Windows, a systemd user unit on Linux, and a launch agent on macOS.
+`isharded service install` starts this node when you log in, for this user only, and `isharded service remove` stops that. It uses a scheduled task on Windows, a systemd user unit on Linux, and a launch agent on macOS.
 
-### shardmesh demo
+### isharded demo
 
 Starts a control plane and workers on this machine, and loads a model.
 
@@ -602,9 +602,9 @@ Starts a control plane and workers on this machine, and loads a model.
 | `--model` | `distilbert/distilgpt2` | Model to load once they are up |
 | `--device` | `auto` | `auto`, `cpu`, `cuda:0`, or another device |
 | `--port` | 8000 | Control plane port. Workers use the next hundred up |
-| `--pool-token` | `SHARDMESH_POOL_TOKEN` | Require this token |
+| `--pool-token` | `ISHARDED_POOL_TOKEN` | Require this token |
 
-### shardmesh node
+### isharded node
 
 Runs one machine's share of a pool: a control plane, plus workers for what it contributes, restarted if they stop.
 
@@ -631,11 +631,11 @@ Security:
 
 | Option | Default | What it does |
 |---|---|---|
-| `--pool-token-file` | `pool.token` in the ShardMesh folder | File holding the pool token |
+| `--pool-token-file` | `pool.token` in the iSharded folder | File holding the pool token |
 | `--ca-file` | None | Authority that signed the nodes' certificates. Turns on certificate identity |
 | `--identity-cert`, `--identity-key` | None | This node's certificate and key, to prove its name with tickets, without TLS |
 | `--tls-cert`, `--tls-key` | None | Certificate and key for this node's servers, for TLS |
-| `--keys-file` | `access.json` in the ShardMesh folder | Where this node keeps the pool's API keys |
+| `--keys-file` | `access.json` in the iSharded folder | Where this node keeps the pool's API keys |
 | `--open` | Off | Serve a network with no credentials, trusting everyone on it |
 | `--trusted-network` | Off | Send credentials unencrypted, because nobody else can read this network |
 
@@ -659,7 +659,7 @@ Models and cache:
 | `--gguf-dir` | None | Folder to search for GGUF files already here, such as LM Studio's. Repeatable |
 | `--model-dir` | None | A folder of local models peers may ask this node to load. Repeatable |
 | `--llama-dir` | Downloaded | A llama.cpp build for GGUF models. Needed on closed networks |
-| `--cache-dir` | `~/.cache/shardmesh/units` | Where fetched weights are kept. Put it on a fast disk |
+| `--cache-dir` | `~/.cache/isharded/units` | Where fetched weights are kept. Put it on a fast disk |
 | `--cache-budget-gb` | 0 (no limit) | Evict old models past this size |
 | `--no-peer-fetch` | Off | Always download from the model host |
 | `--no-peer-serve` | Off | Do not send shards to other workers |
@@ -672,11 +672,11 @@ Other:
 | `--no-local-copy` | Off | Run workers from a network path as it is, instead of copying the code to local disk |
 | `--no-lanes` | Off | Host only the main model here, never one loaded with `load --lane` |
 | `--host-models` | Any | Comma-separated patterns such as `*Qwen3*`. Host only models that match |
-| `--ownerless` | Off | Join a network nobody owns, using the identity folder from `shardmesh net init` |
+| `--ownerless` | Off | Join a network nobody owns, using the identity folder from `isharded net init` |
 
 A node contributes whatever you give it. With a GPU and weight memory, one worker spans them all. With no GPU, `--cpu-threads` or a weight budget adds a CPU worker. `--ram-budget-gb` adds a memory worker on the next port. A node that contributes nothing is refused.
 
-### shardmesh load
+### isharded load
 
 Loads a model on a running pool and shows progress. `model` is any [model id](#loading-a-model).
 
@@ -691,7 +691,7 @@ Loads a model on a running pool and shows progress. `model` is any [model id](#l
 | `--draft` | Chosen automatically | Small GGUF for speculative decoding |
 | `--no-draft` | Off | Turn speculative decoding off |
 | `--no-merge-passes` | Off | Make conversations take turns on each stage |
-| `--hashes` | None | File from `shardmesh model hash`. Every node checks every unit against it |
+| `--hashes` | None | File from `isharded model hash`. Every node checks every unit against it |
 | `--no-reuse-cached` | Off | Plan as if no worker held any shards |
 | `--no-peer-fetch` | Off | Download every shard from the model host |
 | `--lane` | None | Load beside the running model, in a lane of this name. See [Several models at once](#several-models-at-once) |
@@ -701,23 +701,23 @@ Loads a model on a running pool and shows progress. `model` is any [model id](#l
 | `--embedding` | Off | This is an embedding model: one stage, for `/v1/embeddings` and not chat. See [Embeddings](#embeddings) |
 | `--mmproj` | None | Projector GGUF for images, hosted on the entry stage and found by name like other GGUF files. See [Vision](#vision) |
 
-### shardmesh lane
+### isharded lane
 
-`shardmesh lane list` shows the pool's lanes, and `shardmesh lane remove NAME` stops one and frees its memory on every node. Both take `--url` and `--token` (`--pool-token`), as `load` does.
+`isharded lane list` shows the pool's lanes, and `isharded lane remove NAME` stops one and frees its memory on every node. Both take `--url` and `--token` (`--pool-token`), as `load` does.
 
-### shardmesh net
+### isharded net
 
 For a [network nobody owns](#a-network-nobody-owns).
 
 | Command | What it does |
 |---|---|
-| `shardmesh net init --dir DIR` | Make this node's identity. `--joining` is `open` or `vouched`, `--quorum` is the vouches a node needs, and `--trust NAME` accepts a node from the start |
-| `shardmesh net vouch NAME --dir DIR --url URL` | Say this node accepts another |
-| `shardmesh net show --url URL --token KEY` | This node's own view: who it accepts, blocks, and can see |
-| `shardmesh net block NAME --url URL --token KEY` | Stop this node dealing with another. Only this node is affected |
-| `shardmesh net unblock NAME --url URL --token KEY` | Undo that |
+| `isharded net init --dir DIR` | Make this node's identity. `--joining` is `open` or `vouched`, `--quorum` is the vouches a node needs, and `--trust NAME` accepts a node from the start |
+| `isharded net vouch NAME --dir DIR --url URL` | Say this node accepts another |
+| `isharded net show --url URL --token KEY` | This node's own view: who it accepts, blocks, and can see |
+| `isharded net block NAME --url URL --token KEY` | Stop this node dealing with another. Only this node is affected |
+| `isharded net unblock NAME --url URL --token KEY` | Undo that |
 
-### shardmesh audit
+### isharded audit
 
 Asks every route serving a model the same questions, and compares the answers. See [Checking answers](#checking-answers).
 
@@ -730,7 +730,7 @@ Asks every route serving a model the same questions, and compares the answers. S
 
 It exits with 1 if routes disagree, so it can sit in a script.
 
-### shardmesh cordon and uncordon
+### isharded cordon and uncordon
 
 `cordon` moves a node's share elsewhere for maintenance, and `uncordon` puts the node back. Both take the node's name.
 
@@ -740,7 +740,7 @@ It exits with 1 if routes disagree, so it can sit in a script.
 | `--token` | This machine's pool token | An admin key |
 | `--force` | Off | `cordon` only: go ahead even if this moves over 2 GiB between nodes |
 
-### shardmesh model hash
+### isharded model hash
 
 Hashes a model on a copy you trust, for `load --hashes`. It reads the whole model. `source` is a GGUF file or a safetensors folder.
 
@@ -748,7 +748,7 @@ Hashes a model on a copy you trust, for `load --hashes`. It reads the whole mode
 |---|---|---|
 | `--out` | Required | The file to write |
 
-### shardmesh key
+### isharded key
 
 `key create NAME` makes an API key and shows it once. `key remove NAME` removes one for good, and needs the authority.
 
@@ -760,7 +760,7 @@ Hashes a model on a copy you trust, for `load --hashes`. It reads the whole mode
 | `--dir` | both | None | The pool's secrets folder. Sign the change with its authority and send it to `--url` |
 | `--url` | both | `http://127.0.0.1:8000` | Any node's control address, with `--dir` |
 
-### shardmesh pool
+### isharded pool
 
 Commands for a pool's credentials and members.
 
@@ -776,9 +776,9 @@ Commands for a pool's credentials and members.
 
 `--address` is one an address peers use for that node, and is repeatable. `--token` is an admin key.
 
-### shardmesh mcp
+### isharded mcp
 
-`shardmesh mcp` serves a mesh to an MCP client over stdio. `shardmesh mcp run PROMPT` gives a model on the mesh the tools of MCP servers, and prints its answer. [MCP](#mcp) has the details.
+`isharded mcp` serves a mesh to an MCP client over stdio. `isharded mcp run PROMPT` gives a model on the mesh the tools of MCP servers, and prints its answer. [MCP](#mcp) has the details.
 
 | Option | Applies to | Default | What it does |
 |---|---|---|---|
@@ -794,9 +794,9 @@ Commands for a pool's credentials and members.
 
 ### Running the pieces by hand
 
-`shardmesh node` starts these for you. Start them directly only for unusual layouts, such as a control plane on a machine with no workers.
+`isharded node` starts these for you. Start them directly only for unusual layouts, such as a control plane on a machine with no workers.
 
-`python -m shardmesh.orchestrator` runs a control plane:
+`python -m isharded.orchestrator` runs a control plane:
 
 | Option | Default | What it does |
 |---|---|---|
@@ -806,16 +806,16 @@ Commands for a pool's credentials and members.
 | `--advertise-url` | None | How other nodes reach this one. Setting it joins the mesh |
 | `--join` | None | Any existing nodes, comma separated |
 | `--state-file` | `orchestrator-state.json` in the state folder | Where the running route is saved |
-| `--keys-file` | `access.json` in the ShardMesh folder | Where this node keeps the pool's API keys |
+| `--keys-file` | `access.json` in the iSharded folder | Where this node keeps the pool's API keys |
 | `--audit-file` | `audit.jsonl` in the state folder | Where to record who did what |
 | `--no-reuse-cached` | Off | Plan as if no worker held any shards |
 | `--no-peer-fetch` | Off | Always download from the model host |
 | `--open` | Off | Serve a network with no credentials |
 | `--trusted-network` | Off | Send credentials unencrypted, on a network nobody else can read |
 
-The state folder is `%LOCALAPPDATA%\ShardMesh` on Windows and `~/.cache/ShardMesh` elsewhere. The ShardMesh folder is `%LOCALAPPDATA%\ShardMesh` on Windows and `~/.shardmesh` elsewhere.
+The state folder is `%LOCALAPPDATA%\iSharded` on Windows and `~/.cache/iSharded` elsewhere. The iSharded folder is `%LOCALAPPDATA%\iSharded` on Windows and `~/.isharded` elsewhere.
 
-`python -m shardmesh.worker` runs one worker:
+`python -m isharded.worker` runs one worker:
 
 | Option | Default | What it does |
 |---|---|---|
@@ -832,7 +832,7 @@ The state folder is `%LOCALAPPDATA%\ShardMesh` on Windows and `~/.cache/ShardMes
 | `--weights-ram-gb` | None | System RAM for model weights, or `auto` |
 | `--weights-disk-gb` | 0 | Disk for memory-mapped model weights |
 | `--ram-budget-gb` | 0 | RAM for KV checkpoints, not weights |
-| `--cache-dir` | `~/.cache/shardmesh/units` | Where fetched weights live |
+| `--cache-dir` | `~/.cache/isharded/units` | Where fetched weights live |
 | `--cache-budget-gb` | 0 (no limit) | Evict old models past this size |
 | `--gguf-dir` | None | Folder holding GGUF files. Repeatable |
 | `--llama-dir` | Downloaded | A llama.cpp build for GGUF models |
@@ -848,34 +848,34 @@ A flag takes priority over its variable.
 
 | Variable | Same as, or what it does |
 |---|---|
-| `SHARDMESH_POOL_TOKEN` | The pool token, ahead of any token file |
-| `SHARDMESH_POOL_TOKEN_FILE` | `--pool-token-file` |
-| `SHARDMESH_CA_FILE` | `--ca-file` |
-| `SHARDMESH_IDENTITY_CERT`, `SHARDMESH_IDENTITY_KEY` | `--identity-cert`, `--identity-key` |
-| `SHARDMESH_TLS_CERT`, `SHARDMESH_TLS_KEY` | `--tls-cert`, `--tls-key` |
-| `SHARDMESH_KEYS_FILE` | `--keys-file` |
-| `SHARDMESH_STATE_FILE` | `--state-file` |
-| `SHARDMESH_AUDIT_FILE` | `--audit-file` |
-| `SHARDMESH_HOST`, `SHARDMESH_PORT` | `--host`, `--port` |
-| `SHARDMESH_NODE_ID`, `SHARDMESH_NODE_URL`, `SHARDMESH_JOIN` | The control plane's `--node-id`, `--advertise-url`, `--join` |
-| `SHARDMESH_WORKER_ID`, `SHARDMESH_ORCHESTRATOR_URL`, `SHARDMESH_ADVERTISE_URL` | The worker's `--worker-id`, `--orchestrator-url`, `--advertise-url` |
-| `SHARDMESH_DEVICE`, `SHARDMESH_ROLES`, `SHARDMESH_CPU_THREADS` | `--device`, `--roles`, `--cpu-threads` |
-| `SHARDMESH_GPU_MEMORY_GB`, `SHARDMESH_RAM_BUDGET_GB` | `--gpu-memory-gb`, `--ram-budget-gb` |
-| `SHARDMESH_CACHE_DIR`, `SHARDMESH_LLAMA_DIR` | `--cache-dir`, `--llama-dir` |
-| `SHARDMESH_LANE`, `SHARDMESH_LANES_FILE` | Set by `shardmesh node`: which lane a process is, and where a node keeps the lanes it should run |
-| `SHARDMESH_OWNERLESS` | `--ownerless` |
-| `SHARDMESH_UP_HOME` | Where `shardmesh up` keeps its settings and keys |
-| `SHARDMESH_DISCOVERABLE` | Set by `shardmesh up`: answer machines looking for a mesh |
-| `SHARDMESH_HOST_MODELS` | `--host-models` |
-| `SHARDMESH_MODEL_DIRS` | `--model-dir`, separated by the system's path separator |
-| `SHARDMESH_REUSE_CACHED`, `SHARDMESH_PEER_FETCH` | Set to `0` for the control plane's `--no-reuse-cached`, `--no-peer-fetch` |
-| `SHARDMESH_HOST_ID` | Which physical machine a worker is on. Defaults to the computer name, so workers sharing a host do not count its RAM twice |
-| `SHARDMESH_FETCH_CONCURRENCY` | Units a worker fetches at once. Default 4 |
-| `SHARDMESH_ACCESS_LOG` | Set to `1` to log every request while debugging. Off by default, because nodes poll each other constantly |
+| `ISHARDED_POOL_TOKEN` | The pool token, ahead of any token file |
+| `ISHARDED_POOL_TOKEN_FILE` | `--pool-token-file` |
+| `ISHARDED_CA_FILE` | `--ca-file` |
+| `ISHARDED_IDENTITY_CERT`, `ISHARDED_IDENTITY_KEY` | `--identity-cert`, `--identity-key` |
+| `ISHARDED_TLS_CERT`, `ISHARDED_TLS_KEY` | `--tls-cert`, `--tls-key` |
+| `ISHARDED_KEYS_FILE` | `--keys-file` |
+| `ISHARDED_STATE_FILE` | `--state-file` |
+| `ISHARDED_AUDIT_FILE` | `--audit-file` |
+| `ISHARDED_HOST`, `ISHARDED_PORT` | `--host`, `--port` |
+| `ISHARDED_NODE_ID`, `ISHARDED_NODE_URL`, `ISHARDED_JOIN` | The control plane's `--node-id`, `--advertise-url`, `--join` |
+| `ISHARDED_WORKER_ID`, `ISHARDED_ORCHESTRATOR_URL`, `ISHARDED_ADVERTISE_URL` | The worker's `--worker-id`, `--orchestrator-url`, `--advertise-url` |
+| `ISHARDED_DEVICE`, `ISHARDED_ROLES`, `ISHARDED_CPU_THREADS` | `--device`, `--roles`, `--cpu-threads` |
+| `ISHARDED_GPU_MEMORY_GB`, `ISHARDED_RAM_BUDGET_GB` | `--gpu-memory-gb`, `--ram-budget-gb` |
+| `ISHARDED_CACHE_DIR`, `ISHARDED_LLAMA_DIR` | `--cache-dir`, `--llama-dir` |
+| `ISHARDED_LANE`, `ISHARDED_LANES_FILE` | Set by `isharded node`: which lane a process is, and where a node keeps the lanes it should run |
+| `ISHARDED_OWNERLESS` | `--ownerless` |
+| `ISHARDED_UP_HOME` | Where `isharded up` keeps its settings and keys |
+| `ISHARDED_DISCOVERABLE` | Set by `isharded up`: answer machines looking for a mesh |
+| `ISHARDED_HOST_MODELS` | `--host-models` |
+| `ISHARDED_MODEL_DIRS` | `--model-dir`, separated by the system's path separator |
+| `ISHARDED_REUSE_CACHED`, `ISHARDED_PEER_FETCH` | Set to `0` for the control plane's `--no-reuse-cached`, `--no-peer-fetch` |
+| `ISHARDED_HOST_ID` | Which physical machine a worker is on. Defaults to the computer name, so workers sharing a host do not count its RAM twice |
+| `ISHARDED_FETCH_CONCURRENCY` | Units a worker fetches at once. Default 4 |
+| `ISHARDED_ACCESS_LOG` | Set to `1` to log every request while debugging. Off by default, because nodes poll each other constantly |
 | `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` | Hugging Face token, for gated models. Needed on each worker |
 | `HF_ENDPOINT` | Another Hugging Face address, such as a mirror |
 
-A worker's launcher also passes some flags through `SHARDMESH_WEIGHTS_RAM_GB`, `SHARDMESH_WEIGHTS_DISK_GB`, `SHARDMESH_CACHE_BUDGET_GB`, `SHARDMESH_PEER_SERVE`, `SHARDMESH_GGUF_DIRS`, `SHARDMESH_DTYPE`, and `SHARDMESH_STANDBY`. Use the flags for those, because they overwrite the variables. `SHARDMESH_STAGE_KEY` is internal.
+A worker's launcher also passes some flags through `ISHARDED_WEIGHTS_RAM_GB`, `ISHARDED_WEIGHTS_DISK_GB`, `ISHARDED_CACHE_BUDGET_GB`, `ISHARDED_PEER_SERVE`, `ISHARDED_GGUF_DIRS`, `ISHARDED_DTYPE`, and `ISHARDED_STANDBY`. Use the flags for those, because they overwrite the variables. `ISHARDED_STAGE_KEY` is internal.
 
 ## HTTP API
 
@@ -1023,7 +1023,7 @@ On two nodes on one machine, the same loop ran through the coordinator, a follow
 
 ### Load requests
 
-`POST /admin/load` and `/admin/plan` take these fields. `shardmesh load` sets most of them for you.
+`POST /admin/load` and `/admin/plan` take these fields. `isharded load` sets most of them for you.
 
 | Field | Default | What it does |
 |---|---|---|
@@ -1041,7 +1041,7 @@ On two nodes on one machine, the same loop ran through the coordinator, a follow
 | `draft_model` | `auto` | A GGUF id, `auto`, or `none` |
 | `draft_tokens` | 6 | Most guesses per pass, 1 to 16 |
 | `merge_passes` | `true` | Let conversations share a pass |
-| `model_hashes` | None | The contents of a `shardmesh model hash` file |
+| `model_hashes` | None | The contents of a `isharded model hash` file |
 | `embedding` | `false` | This is an embedding model. See [Embeddings](#embeddings) |
 | `mmproj` | None | A projector GGUF for images. See [Vision](#vision) |
 | `reuse_cached`, `peer_fetch` | Pool default | Weigh cached shards, and copy from peers |
@@ -1069,14 +1069,14 @@ On two nodes on one machine, the same loop ran through the coordinator, a follow
 
 ## MCP
 
-[MCP](https://modelcontextprotocol.io), the Model Context Protocol, is how AI applications connect to tools. ShardMesh speaks it in both directions. It follows the current revision, 2026-07-28, which has no `initialize` and no sessions, and also the older revisions back to 2024-11-05, which many clients still use. How a client opens decides which it gets.
+[MCP](https://modelcontextprotocol.io), the Model Context Protocol, is how AI applications connect to tools. iSharded speaks it in both directions. It follows the current revision, 2026-07-28, which has no `initialize` and no sessions, and also the older revisions back to 2024-11-05, which many clients still use. How a client opens decides which it gets.
 
 ### The mesh as an MCP server
 
 Over stdio, give your MCP client this command:
 
 ```json
-{"mcpServers": {"mesh": {"command": "shardmesh", "args": ["mcp", "--url", "http://NODE:8209", "--token", "KEY"]}}}
+{"mcpServers": {"mesh": {"command": "isharded", "args": ["mcp", "--url", "http://NODE:8209", "--token", "KEY"]}}}
 ```
 
 Over HTTP, point it at `http://NODE:8209/mcp` with `Authorization: Bearer KEY`. Every control plane serves this, behind the same keys as `/v1`.
@@ -1100,10 +1100,10 @@ The official `mcp` Python package, version 2.3.0, has used this as a client in b
 
 ### MCP tools for models on the mesh
 
-`shardmesh mcp run` is an agent loop. It starts MCP stdio servers, gives the model their tools, runs the calls it asks for, and prints its answer to stdout. Everything else goes to stderr.
+`isharded mcp run` is an agent loop. It starts MCP stdio servers, gives the model their tools, runs the calls it asks for, and prints its answer to stdout. Everything else goes to stderr.
 
 ```bash
-shardmesh mcp run --url http://NODE:8209 --token KEY --model MODEL \
+isharded mcp run --url http://NODE:8209 --token KEY --model MODEL \
   --server "python my_server.py" --server "other-server --flag" --allow search \
   "What changed in the release notes?"
 ```
@@ -1118,7 +1118,7 @@ Do not take a model's word that a tool ran. Each run goes to stderr as `Calling 
 
 Stdio servers only: `mcp run` does not connect to HTTP MCP servers. It offers servers no sampling and no roots. The whole command has run with both models [measured above](#tool-calling), against a test server of each era, through a read-only tool, a refused tool, and `--allow`. Its client has also listed and called tools on a server built with the official `mcp` package, without a model. How well a run does depends on the model.
 
-The assistant has its own MCP client, in `shardmesh/assistant/plugins.py`, which adds its broker and sandbox. See [the assistant's guide](docs/ASSISTANT.md).
+The assistant has its own MCP client, in `isharded/assistant/plugins.py`, which adds its broker and sandbox. See [the assistant's guide](docs/ASSISTANT.md).
 
 ## Models
 
@@ -1140,7 +1140,7 @@ Workers run these with their own forward pass instead of `transformers` classes,
 
 ### GGUF models
 
-GGUF is the fast path. A quantized model runs on llama.cpp's kernels, which is what makes a 27B model practical on consumer GPUs, while ShardMesh still plans, fetches, and routes it.
+GGUF is the fast path. A quantized model runs on llama.cpp's kernels, which is what makes a 27B model practical on consumer GPUs, while iSharded still plans, fetches, and routes it.
 
 Supported architectures are `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`, `qwen35`, `qwen35moe`, and `llama`. Real weights have been checked for `qwen3`, `qwen35`, and `qwen35moe`, where two stages matched the whole model, and `qwen35` and `qwen35moe` have run across real machines. The others share that code but are untested. Tokenizers are built from the GGUF itself, for `qwen2` and `qwen35` vocabularies. Split GGUF files (`-00001-of-00003`) are refused for now.
 
@@ -1151,7 +1151,7 @@ Supported architectures are `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`, `qwen35`, 
 - Stages read their weights once, unless some are on the disk tier, which needs the file mapped. Mapping kept the whole file in RAM even with the tensors in VRAM: 15.1 GiB against 1.0 GiB on a 15 GiB model, at the same speed.
 - Experts are placed separately from the rest of a layer, so a MoE can keep attention on the GPU and its experts in RAM.
 
-The Windows ROCm release of llama.cpp leaves out `hipblas.dll`. ShardMesh finds it in the node's PyTorch ROCm install, so the node needs that environment.
+The Windows ROCm release of llama.cpp leaves out `hipblas.dll`. iSharded finds it in the node's PyTorch ROCm install, so the node needs that environment.
 
 ### Speculative decoding
 
@@ -1198,7 +1198,7 @@ To check every byte against a list you trust, see [Models in the security guide]
 `POST /v1/embeddings` takes OpenAI's request and runs a GGUF embedding model on llama.cpp, behind the same keys and rate limits as chat. Load one with `--embedding`, in a lane or as the main model:
 
 ```bash
-shardmesh load Qwen3-Embedding-0.6B-Q8_0.gguf --lane vectors --embedding --url http://node-a:8669
+isharded load Qwen3-Embedding-0.6B-Q8_0.gguf --lane vectors --embedding --url http://node-a:8669
 ```
 
 ```bash
@@ -1245,7 +1245,7 @@ An embedding model has not been run on a GPU stage, or anywhere but Windows. BER
 Load a model with its projector, and `/v1/chat/completions` takes images:
 
 ```bash
-shardmesh load Qwen3.5-0.8B-Q8_0.gguf --mmproj mmproj-Qwen3.5-0.8B-BF16.gguf --url http://node-a:8669
+isharded load Qwen3.5-0.8B-Q8_0.gguf --mmproj mmproj-Qwen3.5-0.8B-BF16.gguf --url http://node-a:8669
 ```
 
 Send OpenAI's `image_url` parts in a user message, as data URLs:
@@ -1367,7 +1367,7 @@ Compact is several times slower because PyTorch has no fused FP8 kernel, and nei
 
 ## Networks and security
 
-The full guide is [ShardMesh security](docs/SECURITY.md).
+The full guide is [iSharded security](docs/SECURITY.md).
 
 | Network | What to set |
 |---|---|
@@ -1398,24 +1398,24 @@ Any node in a route can return anything, and nothing in a reply proves otherwise
 Load the same model again on other machines, then ask:
 
 ```bash
-shardmesh load Qwen3-0.6B-Q8_0.gguf --lane check --lane-apart --url http://node-a:8209
+isharded load Qwen3-0.6B-Q8_0.gguf --lane check --lane-apart --url http://node-a:8209
 ```
 
 ```bash
-shardmesh audit --url http://node-a:8209
+isharded audit --url http://node-a:8209
 ```
 
-With two routes, a disagreement says something is wrong without saying where. With three or more, the route out of line with the others is named, along with the machines it runs on. What you do about that is yours: cordon or revoke it in an owned network, or `shardmesh net block` it for your own node in one nobody owns.
+With two routes, a disagreement says something is wrong without saying where. With three or more, the route out of line with the others is named, along with the machines it runs on. What you do about that is yours: cordon or revoke it in an owned network, or `isharded net block` it for your own node in one nobody owns.
 
 The questions are made up and look like ordinary chat, so nobody's real words travel anywhere extra, and a node cannot easily tell it is being tested. This is a smoke alarm, not a proof. It catches a stage that is broken, or that tampers with what it handles. It does not catch one that behaves whenever it might be watched, or that only touches certain topics. It costs a second copy of the model, which a large mesh can spare and a small one may not.
 
 ## Running a pool
 
-The full guide is [Operating ShardMesh](docs/OPERATIONS.md).
+The full guide is [Operating iSharded](docs/OPERATIONS.md).
 
-**Start at boot.** A node started with `shardmesh up` needs only `shardmesh service install`, which starts it when you log in. To start at boot instead, on Windows, `scripts\install_node_task.ps1` registers a scheduled task. On Linux, use `packaging/shardmesh-node.service`, which has not been run on a real machine yet. A node restarts its own services, so these only have to start it once.
+**Start at boot.** A node started with `isharded up` needs only `isharded service install`, which starts it when you log in. To start at boot instead, on Windows, `scripts\install_node_task.ps1` registers a scheduled task. On Linux, use `packaging/isharded-node.service`, which has not been run on a real machine yet. A node restarts its own services, so these only have to start it once.
 
-**Maintenance.** `shardmesh cordon NAME` lets replies finish and moves that node's layers away. The node stays in the mesh. `shardmesh uncordon NAME` brings it back. A cordon is shared by every node and survives restarts. It is refused if the pool could not hold the model without that node, and if it would transfer over 2 GiB, unless you add `--force`.
+**Maintenance.** `isharded cordon NAME` lets replies finish and moves that node's layers away. The node stays in the mesh. `isharded uncordon NAME` brings it back. A cordon is shared by every node and survives restarts. It is refused if the pool could not hold the model without that node, and if it would transfer over 2 GiB, unless you add `--force`.
 
 **Upgrades.** Nodes refuse peers on a different `PROTOCOL_VERSION`, and the refusal names both versions. Upgrade all nodes together when that number changes. Otherwise, restart them one at a time, and the mesh carries on around each one.
 
@@ -1426,13 +1426,13 @@ The full guide is [Operating ShardMesh](docs/OPERATIONS.md).
 | What | Where | Notes |
 |---|---|---|
 | Route state | `orchestrator-state.json` in the state folder | Copied to every node by gossip |
-| Keys and revocations | `access.json` in the ShardMesh folder | Copied to every node by gossip |
+| Keys and revocations | `access.json` in the iSharded folder | Copied to every node by gossip |
 | Audit log | `audit.jsonl` in the state folder | Rotates at 64 MiB, keeping one old file. Each node logs only what it served |
 | Node log | `--log-file` | Nothing is kept unless you set this |
 | Fetched shards | `--cache-dir` | Evicted past `--cache-budget-gb` |
 | Stage files | Inside the cache | Rebuilt from shards when a stage moves. Count double the node's share |
 
-**Metrics.** `/metrics` serves Prometheus format on every node, to an admin key. All names start with `shardmesh_`.
+**Metrics.** `/metrics` serves Prometheus format on every node, to an admin key. All names start with `isharded_`.
 
 | Metric | Meaning |
 |---|---|
@@ -1454,11 +1454,11 @@ The full guide is [Operating ShardMesh](docs/OPERATIONS.md).
 
 | What you see | Cause | What to do |
 |---|---|---|
-| `reachable by other machines and this pool has no credentials` | No token or authority on a node listening on the network | Run `shardmesh pool init`, or pass `--open` on a network you trust completely |
+| `reachable by other machines and this pool has no credentials` | No token or authority on a node listening on the network | Run `isharded pool init`, or pass `--open` on a network you trust completely |
 | `would carry the pool's credentials unencrypted` | The node would send credentials across a plain network | Use Tailscale or TLS, or pass `--trusted-network` |
 | The chat page keeps asking for a token | A wrong key, or a pool token in a pool with certificates | Use an API key. With certificates, the pool token does nothing |
 | `no model is ready; load one first` | Nothing is loaded, or a load is still running | Load a model, or check progress on the dashboard |
-| `shardmesh load` cannot connect | It assumes the demo's port | Pass `--url http://NODE:8209` |
+| `isharded load` cannot connect | It assumes the demo's port | Pass `--url http://NODE:8209` |
 | A node shows as standby | Its share moved away after a failure, and the model still fits without it | `POST /admin/rebalance` when you want the layout back. It returns by itself when idle |
 | `failed to load, and replanning would move` | A live node could not load its stage, and moving its share would be large | Read the error after the colon. The old model keeps serving meanwhile |
 | `no node could send bytes` | A peer transfer failed after retries. The message ends with the reason | Check the link, and that the node holding the file is up |
@@ -1469,22 +1469,22 @@ The full guide is [Operating ShardMesh](docs/OPERATIONS.md).
 | A reply went quiet | A stage or link is stuck | Read `GET /internal/diag/tasks` on each node to see what everything is waiting on |
 | `the rest of the pool cannot hold this model` | A cordon would leave nowhere for that node's layers | Add memory, or load a smaller model first |
 | `libgomp.so.1: cannot open shared object file` | A minimal Linux install lacks a library llama.cpp needs | `sudo apt-get install libgomp1` |
-| A browser warns about the certificate | `shardmesh up` used TLS with the mesh's own certificate, off Tailscale | Accept it once, or use Tailscale, which needs no warning |
-| `nobody signed this request` | The owner's machine is off, or the invite ran out | Start `shardmesh up` on the owner's machine, and make a new invite |
+| A browser warns about the certificate | `isharded up` used TLS with the mesh's own certificate, off Tailscale | Accept it once, or use Tailscale, which needs no warning |
+| `nobody signed this request` | The owner's machine is off, or the invite ran out | Start `isharded up` on the owner's machine, and make a new invite |
 | `is not the mesh this invite is for` | The address in the invite answers with a different mesh | Stop, and ask the owner for a new code. Something else is at that address |
-| `another machine already uses the name` | Two machines have the same name | Run `shardmesh up --invite CODE --name another-name` |
-| `This machine already belongs to a mesh` | `shardmesh up` has settings from an earlier mesh | Remove the folder it names to join another |
-| A new machine does not find the mesh | A firewall blocks UDP port 8208, or the mesh was started with `--no-discovery` | Use `shardmesh invite` |
-| `only the machine that made this mesh can invite` | The authority's key is on the owner's machine | Run `shardmesh invite` or open the page there |
+| `another machine already uses the name` | Two machines have the same name | Run `isharded up --invite CODE --name another-name` |
+| `This machine already belongs to a mesh` | `isharded up` has settings from an earlier mesh | Remove the folder it names to join another |
+| A new machine does not find the mesh | A firewall blocks UDP port 8208, or the mesh was started with `--no-discovery` | Use `isharded invite` |
+| `only the machine that made this mesh can invite` | The authority's key is on the owner's machine | Run `isharded invite` or open the page there |
 | A lane stays on `starting` | A firewall blocks its ports, which are 1000 per lane above the node's own | Open them between nodes, then remove the lane and load it again |
 | `no node has memory left under the limits its owner set` | The main model uses all that owners gave | Give nodes more with `--gpu-memory-gb` or `--weights-ram-gb`, or load a smaller main model |
-| In a network nobody owns, a node never appears | The others do not accept it yet | Have a node they accept run `shardmesh net vouch`, or use `--joining open` |
+| In a network nobody owns, a node never appears | The others do not accept it yet | Have a node they accept run `isharded net vouch`, or use `--joining open` |
 | `nobody can replace what this network runs` | In a network nobody owns, the running model stays | Load yours beside it with `--lane` |
-| `this model's chat template has no tool format` | The template shows no way of calling tools, or one ShardMesh cannot read | Send `tool_choice: "none"`, or load a model the [table](#tool-calling) lists |
+| `this model's chat template has no tool format` | The template shows no way of calling tools, or one iSharded cannot read | Send `tool_choice: "none"`, or load a model the [table](#tool-calling) lists |
 | `does not fit the model's chat template` | The template refused the conversation. The message ends with its reason, such as parallel calls on Llama | Change the conversation to suit the model |
 | A tool call comes back as text | The model wrote something that is not a call to an offered tool | Read `content` to see what it wrote. Small models do this often, so retry or use a larger one |
 | A model answers without calling a tool | `auto` leaves that to the model | Send `tool_choice: "required"` |
-| `shardmesh mcp run` says `Refused`, with no question | There is no terminal to ask at | Name the tool with `--allow` |
+| `isharded mcp run` says `Refused`, with no question | There is no terminal to ask at | Name the tool with `--allow` |
 | An MCP server cannot find a key or setting | Servers see only a short list of environment variables | Pass it with `--pass-env` |
 
 ## Measured performance
@@ -1495,10 +1495,10 @@ Qwen3.6-27B Q4_K_M, split across an RX 7900 XT desktop and an RTX 3060 laptop, b
 |---|---:|
 | Desktop alone, llama.cpp, no split (ceiling) | 35.2 |
 | Both nodes, llama.cpp's own RPC, whole file on one node | 13.6 |
-| Both nodes, ShardMesh, no draft | 14.6 |
-| Both nodes, ShardMesh with a draft, prose and lists | 19–21 |
-| Both nodes, ShardMesh with a draft, code | 33 |
-| Both nodes, ShardMesh with a draft, chat page settings, four-turn chat | 21.6 |
+| Both nodes, iSharded, no draft | 14.6 |
+| Both nodes, iSharded with a draft, prose and lists | 19–21 |
+| Both nodes, iSharded with a draft, code | 33 |
+| Both nodes, iSharded with a draft, chat page settings, four-turn chat | 21.6 |
 
 Models that need or suit the split, on the same test pool:
 
@@ -1521,7 +1521,7 @@ python -m pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-Adapter tests compare every family with the reference `transformers` implementation, and skip families newer than the installed release, so run them under a current `transformers` as well. TLS tests skip on a machine where antivirus intercepts loopback. `tests/test_readme.py` fails if an option, setting, endpoint, or metric is missing from this file. `tests/test_mcp.py` also tries the official `mcp` package when `SHARDMESH_TEST_MCP_PYTHON` names a Python that has it, and uses port 9531.
+Adapter tests compare every family with the reference `transformers` implementation, and skip families newer than the installed release, so run them under a current `transformers` as well. TLS tests skip on a machine where antivirus intercepts loopback. `tests/test_readme.py` fails if an option, setting, endpoint, or metric is missing from this file. `tests/test_mcp.py` also tries the official `mcp` package when `ISHARDED_TEST_MCP_PYTHON` names a Python that has it, and uses port 9531.
 
 `scripts/ci_local.sh` runs what CI runs from a clean clone, which catches anything only your machine has.
 
@@ -1533,25 +1533,25 @@ Adapter tests compare every family with the reference `transformers` implementat
 | `scripts/build_diagrams.py` | Redraws the diagrams in this file |
 | `scripts/ci_local.sh` | Runs the tests from a clean clone |
 | `scripts/install_node_task.ps1` | Starts a node at boot on Windows |
-| `scripts/launch_lan_node_55.py`, `scripts/launch_lan_node_55_rocm.py`, `scripts/bootstrap_remote_node_55.py`, `scripts/bootstrap_remote_rocm_node_55.py` | Example launchers. They read `SHARDMESH_NODE_ID`, `SHARDMESH_JOIN`, `SHARDMESH_ADVERTISE_HOST`, and `SHARDMESH_GGUF_DIR` |
+| `scripts/launch_lan_node_55.py`, `scripts/launch_lan_node_55_rocm.py`, `scripts/bootstrap_remote_node_55.py`, `scripts/bootstrap_remote_rocm_node_55.py` | Example launchers. They read `ISHARDED_NODE_ID`, `ISHARDED_JOIN`, `ISHARDED_ADVERTISE_HOST`, and `ISHARDED_GGUF_DIR` |
 
 | Code | What it holds |
 |---|---|
-| `shardmesh/orchestrator.py` | The control plane: API, planning, repair, gossip handling |
-| `shardmesh/worker.py` | A worker: stages, the token loop, merged passes, fetching |
-| `shardmesh/up.py`, `shardmesh/discovery.py` | One-command setup: settings, invites, finding a mesh, `doctor`, and `service` |
-| `shardmesh/node.py` | The launcher that supervises a node's services |
-| `shardmesh/lanes.py` | Several models at once: the front door and each node's lanes |
-| `shardmesh/toolcalls.py` | Tool calling: what a template offers, and finding calls in replies |
-| `shardmesh/mcp_server.py`, `shardmesh/mcp_client.py` | The mesh as an MCP server, and the agent loop for `shardmesh mcp run` |
-| `shardmesh/commons.py` | A network nobody owns: self-made identities, vouches, and each node's view |
-| `shardmesh/inventory.py`, `shardmesh/gpu_probe.py` | What a node reports about itself, and how it finds GPUs PyTorch cannot see |
-| `shardmesh/audit.py` | Comparing routes that serve the same model |
-| `shardmesh/mesh.py` | Membership and leader election, as pure logic |
-| `shardmesh/planner.py`, `shardmesh/memory.py` | Placement, and memory pool discovery |
-| `shardmesh/gguf.py`, `shardmesh/gguf_stage.py`, `shardmesh/llamacpp.py`, `shardmesh/llama_host.py` | GGUF parsing, stage files, the llama.cpp binding, and the stage process |
-| `shardmesh/weights.py` | Readers, the unit cache, and hash checks |
-| `shardmesh/access.py`, `shardmesh/pool.py`, `shardmesh/tickets.py`, `shardmesh/tls.py` | Keys, certificates, signed entries, tickets, and TLS |
+| `isharded/orchestrator.py` | The control plane: API, planning, repair, gossip handling |
+| `isharded/worker.py` | A worker: stages, the token loop, merged passes, fetching |
+| `isharded/up.py`, `isharded/discovery.py` | One-command setup: settings, invites, finding a mesh, `doctor`, and `service` |
+| `isharded/node.py` | The launcher that supervises a node's services |
+| `isharded/lanes.py` | Several models at once: the front door and each node's lanes |
+| `isharded/toolcalls.py` | Tool calling: what a template offers, and finding calls in replies |
+| `isharded/mcp_server.py`, `isharded/mcp_client.py` | The mesh as an MCP server, and the agent loop for `isharded mcp run` |
+| `isharded/commons.py` | A network nobody owns: self-made identities, vouches, and each node's view |
+| `isharded/inventory.py`, `isharded/gpu_probe.py` | What a node reports about itself, and how it finds GPUs PyTorch cannot see |
+| `isharded/audit.py` | Comparing routes that serve the same model |
+| `isharded/mesh.py` | Membership and leader election, as pure logic |
+| `isharded/planner.py`, `isharded/memory.py` | Placement, and memory pool discovery |
+| `isharded/gguf.py`, `isharded/gguf_stage.py`, `isharded/llamacpp.py`, `isharded/llama_host.py` | GGUF parsing, stage files, the llama.cpp binding, and the stage process |
+| `isharded/weights.py` | Readers, the unit cache, and hash checks |
+| `isharded/access.py`, `isharded/pool.py`, `isharded/tickets.py`, `isharded/tls.py` | Keys, certificates, signed entries, tickets, and TLS |
 
 ## Current limits
 
@@ -1590,4 +1590,4 @@ Behavior:
 
 ## License
 
-ShardMesh is licensed under the [Apache License 2.0](LICENSE). Copyright 2026 AuXFire.
+iSharded is licensed under the [Apache License 2.0](LICENSE). Copyright 2026 AuXFire.

@@ -26,13 +26,13 @@ import httpx
 import pytest
 import uvicorn
 
-from shardmesh.assistant.app import Assistant
-from shardmesh.assistant.coder import CoderError
-from shardmesh.assistant.contracts import CallContext, Effect, Reach, ToolCall, Trust, Verdict
-from shardmesh.assistant.federation import MODELS, FederationError
-from shardmesh.assistant.gateway import Users, create_app
-from shardmesh.assistant.providers import native_name
-from shardmesh.assistant.skills import SkillError
+from isharded.assistant.app import Assistant
+from isharded.assistant.coder import CoderError
+from isharded.assistant.contracts import CallContext, Effect, Reach, ToolCall, Trust, Verdict
+from isharded.assistant.federation import MODELS, FederationError
+from isharded.assistant.gateway import Users, create_app
+from isharded.assistant.providers import native_name
+from isharded.assistant.skills import SkillError
 
 ROOT = Path(__file__).resolve().parents[1]
 PORTS = itertools.cycle(range(9450, 9500))  # this machine runs other work, so stay inside this range
@@ -264,12 +264,12 @@ def model() -> Iterator[ScriptedModel]:
 
 
 def cli(home: Path, *words: str) -> subprocess.CompletedProcess:
-    command = [sys.executable, "-m", "shardmesh", "assistant", "--home", str(home), *words]
+    command = [sys.executable, "-m", "isharded", "assistant", "--home", str(home), *words]
     return subprocess.run(command, cwd=ROOT, capture_output=True, text=True, encoding="utf-8", timeout=180)
 
 
 def task_worker(home: Path) -> subprocess.Popen:
-    command = [sys.executable, "-m", "shardmesh", "assistant", "--home", str(home), "task", "work"]
+    command = [sys.executable, "-m", "isharded", "assistant", "--home", str(home), "task", "work"]
     return subprocess.Popen(command, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -491,7 +491,7 @@ def test_a_grant_for_one_folder_does_not_stretch_and_the_model_is_told_how_a_per
     assert answered["status"] == "done"
     assert answered["tools"] == []
     assert not model.saw("nothing to see")
-    assert model.saw("shardmesh assistant grant add files.read")
+    assert model.saw("isharded assistant grant add files.read")
 
 
 def test_a_model_cannot_send_text_past_its_reach_through_a_tool(pair, model):
@@ -1077,7 +1077,7 @@ def test_memory_cannot_be_reached_from_another_install(pair, model):
 
 
 def provenance_for_owner(install: Install) -> Any:
-    from shardmesh.assistant.contracts import Provenance
+    from isharded.assistant.contracts import Provenance
 
     return Provenance("user", "test", OWNER, Trust.OWNER, install.assistant.clock(), Reach.POOL)
 
@@ -1344,7 +1344,7 @@ def test_the_audit_record_can_show_what_just_happened(install):
 def test_the_page_is_built_on_the_shared_design_system(install):
     page = httpx.get(f"{install.url}/", trust_env=False)
     assert ".chat-page {" in page.text  # ui.css, inlined
-    assert "/* shardmesh:ui.css */" not in page.text
+    assert "/* isharded:ui.css */" not in page.text
     assert "__CSP_NONCE__" not in page.text
     nonce = re.search(r"script-src 'nonce-([^']+)'", page.headers["content-security-policy"]).group(1)
     assert page.text.count(f'nonce="{nonce}"') == 3

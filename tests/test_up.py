@@ -9,9 +9,9 @@ import pytest
 
 pytest.importorskip("cryptography")
 
-from shardmesh import up
-from shardmesh.access import AccessControl, Authority, digest
-from shardmesh.pool import read_membership_request, request_membership
+from isharded import up
+from isharded.access import AccessControl, Authority, digest
+from isharded.pool import read_membership_request, request_membership
 
 
 def owner(tmp_path: Path) -> Path:
@@ -34,7 +34,7 @@ def test_a_new_mesh_gets_an_authority_a_certificate_and_a_signed_owner_key(tmp_p
 def test_an_invite_survives_the_trip_and_says_what_it_can(tmp_path: Path) -> None:
     home = owner(tmp_path)
     made = up.create_invite(home, ["http://100.64.0.1:8209/"], uses=2, hours=1)
-    assert made["command"] == f"shardmesh up --invite {made['code']}"
+    assert made["command"] == f"isharded up --invite {made['code']}"
     invite = up.read_invite(made["code"])
     assert invite["urls"] == ["http://100.64.0.1:8209"]
     assert invite["authority"] == up.authority_hash((home / "ca.pem").read_text(encoding="utf-8"))
@@ -152,7 +152,7 @@ def test_machine_names_are_safe_for_a_node(monkeypatch) -> None:
 
 
 def test_a_machine_in_a_mesh_refuses_to_join_another(tmp_path: Path, monkeypatch, capsys) -> None:
-    monkeypatch.setenv("SHARDMESH_UP_HOME", str(tmp_path))
+    monkeypatch.setenv("ISHARDED_UP_HOME", str(tmp_path))
     up.write_settings(tmp_path, settings())
     args = type("Args", (), {"invite": "smi-x"})()
     assert up.run_up(args) == 1
@@ -160,13 +160,13 @@ def test_a_machine_in_a_mesh_refuses_to_join_another(tmp_path: Path, monkeypatch
 
 
 def test_only_the_owners_machine_can_invite(tmp_path: Path, monkeypatch, capsys) -> None:
-    monkeypatch.setenv("SHARDMESH_UP_HOME", str(tmp_path))
+    monkeypatch.setenv("ISHARDED_UP_HOME", str(tmp_path))
     up.write_settings(tmp_path, settings())
     assert up.run_invite(type("Args", (), {"uses": 1, "hours": 1})()) == 1
     assert "Only the machine that made the mesh" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("system,suffix", [("Linux", "shardmesh.service"), ("Darwin", "ai.shardmesh.node.plist")])
+@pytest.mark.parametrize("system,suffix", [("Linux", "isharded.service"), ("Darwin", "ai.isharded.node.plist")])
 def test_autostart_files_run_up_for_this_user(system: str, suffix: str, tmp_path: Path) -> None:
     path, body = up.service_definition("/opt/venv/bin/python", system, tmp_path)
     assert path is not None and path.name == suffix and str(path).startswith(str(tmp_path))

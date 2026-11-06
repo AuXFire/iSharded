@@ -32,7 +32,7 @@ class FakeBroker:
     """Implements contracts.Broker with the real rules: deny by default, peers tainted."""
 
     def __init__(self) -> None:
-        from shardmesh.assistant.contracts import Capability
+        from isharded.assistant.contracts import Capability
 
         self.declared: dict[str, Capability] = {}
         self.handlers: dict[str, Any] = {}
@@ -53,7 +53,7 @@ class FakeBroker:
         return hashlib.sha256(json.dumps([call.capability, call.arguments], sort_keys=True).encode()).hexdigest()
 
     def check(self, call: Any, context: Any) -> Any:
-        from shardmesh.assistant.contracts import Decision, Verdict
+        from isharded.assistant.contracts import Decision, Verdict
 
         capability = self.declared.get(call.capability)
         if capability is None:
@@ -81,7 +81,7 @@ class FakeBroker:
         return True
 
     def invoke(self, call: Any, context: Any) -> Any:
-        from shardmesh.assistant.contracts import Verdict
+        from isharded.assistant.contracts import Verdict
 
         decision = self.check(call, context)
         if decision.verdict is not Verdict.ALLOW:
@@ -98,7 +98,7 @@ class EchoRouter:
         self.requests: list[Any] = []
 
     def complete(self, request: Any) -> Any:
-        from shardmesh.assistant.contracts import ModelReply
+        from isharded.assistant.contracts import ModelReply
 
         self.requests.append(request)
         return ModelReply(json.dumps(list(request.messages)), (), "echo-7b", "local", 3, 4, 0.01)
@@ -121,8 +121,8 @@ class FakeMemory:
 
 
 def build_assistant(home: str) -> Any:
-    from shardmesh.assistant.app import Assistant
-    from shardmesh.assistant.contracts import Capability, Effect, Provenance, Reach, ToolResult, Trust
+    from isharded.assistant.app import Assistant
+    from isharded.assistant.contracts import Capability, Effect, Provenance, Reach, ToolResult, Trust
 
     assistant = Assistant(home)
     assistant.broker = FakeBroker()
@@ -232,7 +232,7 @@ class Commands:
 
     @staticmethod
     def _item(fields: dict[str, Any]) -> Any:
-        from shardmesh.assistant.contracts import ContextItem, Provenance, Reach, Trust
+        from isharded.assistant.contracts import ContextItem, Provenance, Reach, Trust
 
         return ContextItem(fields["text"], Provenance(fields.get("source", "memory"), "row-1", "owner", Trust(fields.get("trust", "owner")), 0.0, Reach(fields["reach"])))
 
@@ -248,7 +248,7 @@ class Commands:
 
     def seal_altered(self, name: str, capability: str, signed_text: str, altered_text: str) -> dict[str, Any]:
         """Sign one message, then seal a different one under that signature."""
-        from shardmesh.assistant import federation as module
+        from isharded.assistant import federation as module
 
         peer = self.federation.named(name)
         now = time.time()
@@ -261,7 +261,7 @@ class Commands:
 
     def seal_signed_as(self, name: str, capability: str, kind: str) -> dict[str, Any]:
         """A request whose seal is right, signed as some other kind of message."""
-        from shardmesh.assistant import federation as module
+        from isharded.assistant import federation as module
 
         peer = self.federation.named(name)
         now = time.time()
@@ -294,7 +294,7 @@ class Commands:
 
 
 def node_main(home: str) -> None:
-    from shardmesh.assistant.federation import FederationError, FederationServer
+    from isharded.assistant.federation import FederationError, FederationServer
 
     assistant = build_assistant(home)
     server = FederationServer(assistant)
@@ -464,7 +464,7 @@ def test_an_invite_works_once_and_expires(world, tmp_path):
 
 def pairing_message(identity: Any, secret: str) -> dict[str, Any]:
     """What an install sends to accept an invite, built by hand."""
-    from shardmesh.assistant import federation as module
+    from isharded.assistant import federation as module
 
     message = {"v": 1, "invite": module._invite_id(secret), "signing": module._b64(identity.signing_public), "exchange": module._b64(identity.exchange_public), "address": ""}
     signature = module._b64(identity.sign("pair", module._pack(message)))
@@ -473,7 +473,7 @@ def pairing_message(identity: Any, secret: str) -> dict[str, Any]:
 
 def test_an_expired_invite_is_refused_by_the_install_that_made_it(fresh):
     """The other side checks the date too, but it is not the one to trust."""
-    from shardmesh.assistant import federation as module
+    from isharded.assistant import federation as module
 
     one, two = fresh
     fields = module.read_code(one.invite("two", seconds=-1.0))
@@ -483,8 +483,8 @@ def test_an_expired_invite_is_refused_by_the_install_that_made_it(fresh):
 
 
 def test_a_code_used_at_the_same_moment_still_works_once(fresh):
-    from shardmesh.assistant import federation as module
-    from shardmesh.assistant.federation import Identity
+    from isharded.assistant import federation as module
+    from isharded.assistant.federation import Identity
 
     one, _ = fresh
     secret = module.read_code(one.invite("racer"))["secret"]
@@ -501,8 +501,8 @@ def test_a_code_used_at_the_same_moment_still_works_once(fresh):
 
 def test_taking_an_invite_is_atomic(tmp_path):
     """The race above is down to timing, so the step that decides it is tested directly too."""
-    from shardmesh.assistant import federation as module
-    from shardmesh.assistant.federation import Refused
+    from isharded.assistant import federation as module
+    from isharded.assistant.federation import Refused
 
     assistant = build_assistant(str(tmp_path / "home"))
     code = assistant.federation.invite(address="http://127.0.0.1:9")
@@ -514,8 +514,8 @@ def test_taking_an_invite_is_atomic(tmp_path):
 
 
 def test_a_message_needs_the_code_as_well_as_the_invite_id(fresh):
-    from shardmesh.assistant import federation as module
-    from shardmesh.assistant.federation import Identity
+    from isharded.assistant import federation as module
+    from isharded.assistant.federation import Identity
 
     one, _ = fresh
     secret = module.read_code(one.invite("two"))["secret"]
@@ -530,7 +530,7 @@ def test_an_invite_proves_who_answered_it(fresh):
     """Someone in the middle cannot answer an invite with their own keys."""
     one, two = fresh
     code = one.invite("two")
-    from shardmesh.assistant import federation as module
+    from isharded.assistant import federation as module
 
     fields = module.read_code(code)
     fields["fingerprint"] = "f" * 32
@@ -826,7 +826,7 @@ def test_revoking_holds_when_they_cannot_be_told(fresh):
 
 
 def test_an_unsigned_claim_of_revocation_changes_nothing(tmp_path):
-    from shardmesh.assistant.federation import Identity
+    from isharded.assistant.federation import Identity
 
     assistant = build_assistant(str(tmp_path / "home"))
     other = Identity(os.urandom(32), os.urandom(32))
@@ -985,8 +985,8 @@ def test_peer_send_declares_its_effect(world):
     assert bob.audit_intact()
     broker = FakeBroker()
     assistant = type("A", (), {})()
-    from shardmesh.assistant.contracts import Effect
-    from shardmesh.assistant.federation import Federation
+    from isharded.assistant.contracts import Effect
+    from isharded.assistant.federation import Federation
 
     assistant.broker, assistant.store, assistant.audit, assistant.clock = broker, None, None, time.time
     Federation(assistant).broker()
@@ -1086,7 +1086,7 @@ class SilentListener:
 
 
 def silent_peer(assistant: Any, url: str) -> Any:
-    from shardmesh.assistant.federation import AWAITING_OWNER, Identity
+    from isharded.assistant.federation import AWAITING_OWNER, Identity
 
     other = Identity(os.urandom(32), os.urandom(32))
     peer = assistant.federation._save_peer(other.fingerprint, other.signing_public, other.exchange_public, url, AWAITING_OWNER, "silent")
@@ -1125,7 +1125,7 @@ def test_a_silent_peer_gives_a_bounded_answer_that_can_be_collected(tmp_path):
 
 
 def test_a_result_must_answer_this_request_from_this_peer(tmp_path):
-    from shardmesh.assistant.federation import Identity
+    from isharded.assistant.federation import Identity
 
     assistant = build_assistant(str(tmp_path / "home"))
     federation = assistant.federation
@@ -1133,7 +1133,7 @@ def test_a_result_must_answer_this_request_from_this_peer(tmp_path):
     peer = federation._save_peer(other.fingerprint, other.signing_public, other.exchange_public, "", "paired", "other")
 
     def reply(signer: Any, **changes: Any) -> httpx.Response:
-        from shardmesh.assistant import federation as module
+        from isharded.assistant import federation as module
 
         body = {"v": 1, "kind": "result", "from": other.fingerprint, "to": federation.identity.fingerprint, "request_hash": "h" * 64, "status": "ok", "output": "fine", **changes}
         text = module._pack(body)
@@ -1159,7 +1159,7 @@ def test_a_result_must_answer_this_request_from_this_peer(tmp_path):
 
 
 def test_keys_are_made_on_first_use_and_kept(tmp_path):
-    from shardmesh.assistant.app import Assistant
+    from isharded.assistant.app import Assistant
 
     home = tmp_path / "home"
     with Assistant(home) as assistant:
@@ -1176,7 +1176,7 @@ def test_keys_are_made_on_first_use_and_kept(tmp_path):
 
 
 def test_two_processes_starting_at_once_agree_on_one_identity(tmp_path):
-    script = "import sys; from pathlib import Path; from shardmesh.assistant.federation import load_identity; print(load_identity(Path(sys.argv[1])).fingerprint)"
+    script = "import sys; from pathlib import Path; from isharded.assistant.federation import load_identity; print(load_identity(Path(sys.argv[1])).fingerprint)"
     path = tmp_path / "shared" / "identity.key"
     environment = {**os.environ, "PYTHONPATH": str(ROOT)}
     processes = [subprocess.Popen([sys.executable, "-c", script, str(path)], stdout=subprocess.PIPE, text=True, env=environment) for _ in range(4)]
@@ -1185,7 +1185,7 @@ def test_two_processes_starting_at_once_agree_on_one_identity(tmp_path):
 
 
 def test_a_damaged_key_file_says_what_to_do(tmp_path):
-    from shardmesh.assistant.federation import FederationError, load_identity
+    from isharded.assistant.federation import FederationError, load_identity
 
     path = tmp_path / "identity.key"
     path.write_text("not keys", encoding="ascii")
@@ -1194,7 +1194,7 @@ def test_a_damaged_key_file_says_what_to_do(tmp_path):
 
 
 def test_the_fingerprint_covers_both_keys():
-    from shardmesh.assistant.federation import fingerprint_of
+    from isharded.assistant.federation import fingerprint_of
 
     assert fingerprint_of(b"a" * 32, b"b" * 32) != fingerprint_of(b"a" * 32, b"c" * 32)
     assert fingerprint_of(b"a" * 32, b"b" * 32) != fingerprint_of(b"c" * 32, b"b" * 32)
@@ -1212,7 +1212,7 @@ class Registry:
 
 
 def in_process_pair(tmp_path: Path) -> tuple[Any, Any, Any]:
-    from shardmesh.assistant.federation import FederationServer
+    from isharded.assistant.federation import FederationServer
 
     near, far = build_assistant(str(tmp_path / "near")), build_assistant(str(tmp_path / "far"))
     server = FederationServer(far)
@@ -1227,8 +1227,8 @@ def in_process_pair(tmp_path: Path) -> tuple[Any, Any, Any]:
 
 
 def test_a_peer_provider_serves_the_router_at_reach_peer(tmp_path):
-    from shardmesh.assistant.contracts import ModelRequest, Reach
-    from shardmesh.assistant.federation import FederationError
+    from isharded.assistant.contracts import ModelRequest, Reach
+    from isharded.assistant.federation import FederationError
 
     near, far, server = in_process_pair(tmp_path)
     try:
@@ -1252,7 +1252,7 @@ def test_a_peer_provider_serves_the_router_at_reach_peer(tmp_path):
 
 
 def test_a_peers_text_cannot_ask_for_a_tool(tmp_path):
-    from shardmesh.assistant.contracts import ModelReply, ModelRequest, Reach, ToolCall
+    from isharded.assistant.contracts import ModelReply, ModelRequest, Reach, ToolCall
 
     class Scheming(EchoRouter):
         def complete(self, request: Any) -> Any:
@@ -1277,8 +1277,8 @@ def test_without_a_registry_there_is_nothing_to_do(tmp_path):
 
 
 def test_without_a_broker_a_peer_gets_nothing(tmp_path):
-    from shardmesh.assistant.app import Assistant
-    from shardmesh.assistant.federation import FederationError, FederationServer
+    from isharded.assistant.app import Assistant
+    from isharded.assistant.federation import FederationError, FederationServer
 
     home = build_assistant(str(tmp_path / "home"))
     bare = Assistant(tmp_path / "bare")
@@ -1304,50 +1304,50 @@ def test_without_a_broker_a_peer_gets_nothing(tmp_path):
 # The commands, as an owner runs them
 
 
-def shardmesh(home: Path, *arguments: str, timeout: float = 60) -> subprocess.CompletedProcess:
+def isharded(home: Path, *arguments: str, timeout: float = 60) -> subprocess.CompletedProcess:
     environment = {**os.environ, "PYTHONPATH": str(ROOT), "PYTHONIOENCODING": "utf-8"}
-    command = [sys.executable, "-m", "shardmesh.cli", "assistant", "--home", str(home), *arguments]
+    command = [sys.executable, "-m", "isharded.cli", "assistant", "--home", str(home), *arguments]
     return subprocess.run(command, capture_output=True, text=True, encoding="utf-8", env=environment, timeout=timeout)
 
 
 def test_the_commands_pair_two_real_installs(tmp_path):
     one, two = tmp_path / "one", tmp_path / "two"
     environment = {**os.environ, "PYTHONPATH": str(ROOT), "PYTHONIOENCODING": "utf-8"}
-    command = [sys.executable, "-m", "shardmesh.cli", "assistant", "--home", str(one), "peer", "serve", "--port", "0"]
+    command = [sys.executable, "-m", "isharded.cli", "assistant", "--home", str(one), "peer", "serve", "--port", "0"]
     server = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", env=environment)
     try:
         line = server.stdout.readline()
         assert "Serving federation at http://127.0.0.1:" in line, line
-        invite = shardmesh(one, "peer", "invite", "--name", "two")
+        invite = isharded(one, "peer", "invite", "--name", "two")
         assert invite.returncode == 0, invite.stdout + invite.stderr
         code = invite.stdout.splitlines()[0]
 
-        accept = shardmesh(two, "peer", "accept", code, "--name", "one")
+        accept = isharded(two, "peer", "accept", code, "--name", "one")
         assert accept.returncode == 0, accept.stdout + accept.stderr
         assert "Their fingerprint" in accept.stdout
-        assert "awaiting_owner" in shardmesh(one, "peer", "list").stdout
+        assert "awaiting_owner" in isharded(one, "peer", "list").stdout
 
-        approve = shardmesh(one, "peer", "approve", "two")
+        approve = isharded(one, "peer", "approve", "two")
         assert approve.returncode == 0 and "two is paired" in approve.stdout
 
         # Nobody can call the second install, so it finds out by asking.
-        assert "paired" in shardmesh(two, "peer", "approve", "one").stdout
+        assert "paired" in isharded(two, "peer", "approve", "one").stdout
 
-        offer = shardmesh(one, "peer", "offer", "two", "models.complete", "--per-day", "5")
+        offer = isharded(one, "peer", "offer", "two", "models.complete", "--per-day", "5")
         assert offer.returncode == 0 and "models.complete (5/day)" in offer.stdout
         assert "Granted to their user here" in offer.stdout and "to nobody else" in offer.stdout
-        assert shardmesh(one, "peer", "offer", "two", "memory.search").returncode == 1
+        assert isharded(one, "peer", "offer", "two", "memory.search").returncode == 1
 
-        ask = shardmesh(two, "peer", "ask", "one", "models.complete", "--text", "hello")
+        ask = isharded(two, "peer", "ask", "one", "models.complete", "--text", "hello")
         assert ask.returncode == 1
         assert "broker" in ask.stdout and "Traceback" not in ask.stderr
 
-        revoke = shardmesh(one, "peer", "revoke", "two")
+        revoke = isharded(one, "peer", "revoke", "two")
         assert revoke.returncode == 0
         # Nobody can call the second install, so it learns on its next contact.
-        assert "paired" in shardmesh(two, "peer", "list").stdout
-        assert shardmesh(two, "peer", "offers", "one").returncode == 1
-        assert "revoked" in shardmesh(two, "peer", "list").stdout
+        assert "paired" in isharded(two, "peer", "list").stdout
+        assert isharded(two, "peer", "offers", "one").returncode == 1
+        assert "revoked" in isharded(two, "peer", "list").stdout
 
         keys = json.loads((one / "federation" / "identity.key").read_text())
         everything = invite.stdout + accept.stdout + approve.stdout + offer.stdout + revoke.stdout
@@ -1359,11 +1359,11 @@ def test_the_commands_pair_two_real_installs(tmp_path):
 
 
 def test_a_bad_command_tells_the_owner_what_to_do(tmp_path):
-    result = shardmesh(tmp_path / "home", "peer", "approve", "nobody")
+    result = isharded(tmp_path / "home", "peer", "approve", "nobody")
     assert result.returncode == 1
     assert "peer list" in result.stdout and "Traceback" not in result.stderr
-    assert "That is not an invite code" in shardmesh(tmp_path / "home", "peer", "accept", "smp1.notacode").stdout
-    assert "--address" in shardmesh(tmp_path / "home", "peer", "invite").stdout
+    assert "That is not an invite code" in isharded(tmp_path / "home", "peer", "accept", "smp1.notacode").stdout
+    assert "--address" in isharded(tmp_path / "home", "peer", "invite").stdout
 
 
 if __name__ == "__main__":

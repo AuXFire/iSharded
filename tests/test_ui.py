@@ -5,12 +5,12 @@ import re
 
 import pytest
 
-from shardmesh import orchestrator
+from isharded import orchestrator
 
 PACKAGE = Path(orchestrator.__file__).parent
 ROOT = PACKAGE.parent
 PAGES = ["chat.html", "dashboard.html"]
-MARKER = "/* shardmesh:ui.css */"
+MARKER = "/* isharded:ui.css */"
 STYLES = (PACKAGE / "ui.css").read_text(encoding="utf-8")
 # An XML namespace is a name, and nothing ever fetches it.
 NOT_FETCHED = {"http://www.w3.org/2000/svg"}
@@ -108,9 +108,9 @@ def test_the_pages_still_call_what_they_are_for():
 @pytest.mark.parametrize("name", PAGES)
 def test_the_key_stays_where_a_person_left_it(name):
     text = source(name)
-    assert text.count("'shardmesh-token'") >= 3  # read, kept, forgotten
+    assert text.count("'isharded-token'") >= 3  # read, kept, forgotten
     assert "history.replaceState" in text  # a link's key leaves the address bar
-    assert "localStorage.setItem('shardmesh-token'" not in text.replace("store.set('shardmesh-token'", "")
+    assert "localStorage.setItem('isharded-token'" not in text.replace("store.set('isharded-token'", "")
 
 
 @pytest.mark.parametrize("name", PAGES)

@@ -10,8 +10,8 @@ import pytest
 
 pytest.importorskip("cryptography")
 
-from shardmesh.access import AccessControl, ROLE_MEMBER, Caller, canonical
-from shardmesh.commons import (
+from isharded.access import AccessControl, ROLE_MEMBER, Caller, canonical
+from isharded.commons import (
     Commons,
     CommonsChecker,
     certificate_file,
@@ -23,9 +23,9 @@ from shardmesh.commons import (
     sign_vouch,
     write_policy,
 )
-from shardmesh.lanes import proposer
-from shardmesh.protocol import hosts_model
-from shardmesh.tickets import TicketMaker
+from isharded.lanes import proposer
+from isharded.protocol import hosts_model
+from isharded.tickets import TicketMaker
 
 
 def node(tmp_path: Path, label: str, joining: str = "vouched", quorum: int = 1, trust: list[str] | None = None) -> tuple[Path, str, Commons]:
@@ -188,7 +188,7 @@ def test_a_lane_never_overwrites_the_nodes_view(tmp_path: Path, monkeypatch) -> 
     folder, a, commons = node(tmp_path, "a")
     _, b, _ = node(tmp_path, "b")
     control(commons).add_signed(sign_vouch(folder, b))
-    monkeypatch.setenv("SHARDMESH_LANE", "small")
+    monkeypatch.setenv("ISHARDED_LANE", "small")
     lane = Commons(folder)
     AccessControl.load(None, None, identities=True, authority=lane)
     assert sorted(json.loads((folder / "members.json").read_text(encoding="utf-8"))["accepted"]) == sorted({a, b})

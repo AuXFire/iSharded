@@ -7,11 +7,11 @@ import random
 
 import pytest
 
-from shardmesh.assistant.app import Assistant
-from shardmesh.assistant.contracts import CallContext, Capability, Effect, ToolCall, Verdict
-from shardmesh.assistant.planner import plan_problems
-from shardmesh.assistant.schema import errors
-from shardmesh.assistant.tasks import normalised, plan_errors
+from isharded.assistant.app import Assistant
+from isharded.assistant.contracts import CallContext, Capability, Effect, ToolCall, Verdict
+from isharded.assistant.planner import plan_problems
+from isharded.assistant.schema import errors
+from isharded.assistant.tasks import normalised, plan_errors
 
 JUNK = [
     None, True, False, 0, -1, 1, 3.5, 1e308, float("inf"), float("nan"), "", "x", "{{steps.a.output}}", "{{inputs.nope}}", "{{",
