@@ -2321,7 +2321,9 @@ async def preview_plan(body: LoadModelRequest, authorization: str | None = Heade
     """Show where a model would go, without moving a byte of weights."""
     verify_admin(authorization)
     try:
-        target = await asyncio.to_thread(build_target, body, runtime.reuse_cached, runtime.peer_fetch)
+        # Bare file names resolve through the nodes holding them, as in a real load.
+        sources = await runtime.gguf_sources()
+        target = await asyncio.to_thread(build_target, body, runtime.reuse_cached, runtime.peer_fetch, sources, runtime.pool_token)
     except (UnsupportedModel, WeightSourceError, OSError, httpx.HTTPError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     await runtime.refresh_worker_metrics()
@@ -2631,10 +2633,10 @@ async def chat_completions(
     }
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the ShardMesh orchestrator")
-    parser.add_argument("--host", default=os.getenv("SHARDMESH_HOST", "0.0.0.0"))
-    parser.add_argument("--port", type=int, default=int(os.getenv("SHARDMESH_PORT", "8000")))
+    parser.add_argument("--host", default=os.getenv("SHARDMESH_HOST", "0.0.0.0"), help="address to listen on")
+    parser.add_argument("--port", type=int, default=int(os.getenv("SHARDMESH_PORT", "8000")), help="port to listen on")
     parser.add_argument("--no-reuse-cached", action="store_true", help="plan as if no worker held any shards")
     parser.add_argument("--no-peer-fetch", action="store_true", help="always download from the model host")
     parser.add_argument("--state-file", default=os.getenv("SHARDMESH_STATE_FILE"), help="where the running route is saved")
@@ -2645,7 +2647,11 @@ def main() -> None:
     parser.add_argument("--trusted-network", action="store_true", help="send pool credentials unencrypted, because nobody else can read this network")
     parser.add_argument("--open", action="store_true", help="serve a network with no credentials, trusting everyone on it")
     parser.add_argument("--audit-file", default=os.getenv("SHARDMESH_AUDIT_FILE"), help="where to record who did what")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
     os.environ["SHARDMESH_KEYS_FILE"] = args.keys_file or str(pool_home() / "access.json")
     os.environ["SHARDMESH_NODE_ID"] = args.node_id or ""
     os.environ["SHARDMESH_NODE_URL"] = args.advertise_url or ""

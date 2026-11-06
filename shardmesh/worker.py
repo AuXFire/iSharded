@@ -1767,22 +1767,22 @@ async def forward(
         raise HTTPException(status_code=500, detail=runtime.last_error) from exc
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a ShardMesh compute worker")
-    parser.add_argument("--host", default=os.getenv("SHARDMESH_HOST", "0.0.0.0"))
-    parser.add_argument("--port", type=int, default=int(os.getenv("SHARDMESH_PORT", "8100")))
-    parser.add_argument("--worker-id", default=os.getenv("SHARDMESH_WORKER_ID", socket.gethostname()))
+    parser.add_argument("--host", default=os.getenv("SHARDMESH_HOST", "0.0.0.0"), help="address to listen on")
+    parser.add_argument("--port", type=int, default=int(os.getenv("SHARDMESH_PORT", "8100")), help="port to listen on")
+    parser.add_argument("--worker-id", default=os.getenv("SHARDMESH_WORKER_ID", socket.gethostname()), help="unique name; use node-gpu, node-cpu, or node-memory so certificates match")
     parser.add_argument(
         "--orchestrator-url",
         default=os.getenv("SHARDMESH_ORCHESTRATOR_URL", "http://127.0.0.1:8000"),
         help="one or more control planes, comma separated; the rest are found from them",
     )
-    parser.add_argument("--advertise-url", default=os.getenv("SHARDMESH_ADVERTISE_URL"))
-    parser.add_argument("--device", default=os.getenv("SHARDMESH_DEVICE", "auto"))
-    parser.add_argument("--roles", default=os.getenv("SHARDMESH_ROLES", "inference"))
-    parser.add_argument("--cpu-threads", type=int, default=int(os.getenv("SHARDMESH_CPU_THREADS", "0")))
-    parser.add_argument("--ram-budget-gb", type=float, default=float(os.getenv("SHARDMESH_RAM_BUDGET_GB", "0")))
-    parser.add_argument("--gpu-memory-gb", type=float, default=float(os.getenv("SHARDMESH_GPU_MEMORY_GB", "0")))
+    parser.add_argument("--advertise-url", default=os.getenv("SHARDMESH_ADVERTISE_URL"), help="how other nodes reach this worker")
+    parser.add_argument("--device", default=os.getenv("SHARDMESH_DEVICE", "auto"), help="auto, cpu, cuda:0, mps, or xpu:0")
+    parser.add_argument("--roles", default=os.getenv("SHARDMESH_ROLES", "inference"), help="inference, or kv-cache,checkpoint for a memory worker")
+    parser.add_argument("--cpu-threads", type=int, default=int(os.getenv("SHARDMESH_CPU_THREADS", "0")), help="CPU threads; 0 uses half the cores for a stage")
+    parser.add_argument("--ram-budget-gb", type=float, default=float(os.getenv("SHARDMESH_RAM_BUDGET_GB", "0")), help="RAM for KV checkpoints, not weights")
+    parser.add_argument("--gpu-memory-gb", type=float, default=float(os.getenv("SHARDMESH_GPU_MEMORY_GB", "0")), help="VRAM budget per accelerator; 0 means auto")
     parser.add_argument("--weights-ram-gb", default=None, help="system RAM for model weights, or 'auto'")
     parser.add_argument("--weights-disk-gb", type=float, default=0, help="disk for memory-mapped model weights")
     parser.add_argument("--cache-dir", default=os.getenv("SHARDMESH_CACHE_DIR"), help="where fetched weights live")
@@ -1799,8 +1799,12 @@ def main() -> None:
         default="auto",
         help="auto is bfloat16; float32 runs this node at full precision",
     )
-    parser.add_argument("--standby", action="store_true", default=False)
-    args = parser.parse_args()
+    parser.add_argument("--standby", action="store_true", default=False, help="only use this worker when a model does not fit without it")
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
     os.environ["SHARDMESH_WORKER_ID"] = args.worker_id
     os.environ["SHARDMESH_ORCHESTRATOR_URL"] = args.orchestrator_url
     os.environ["SHARDMESH_ADVERTISE_URL"] = args.advertise_url or f"http://127.0.0.1:{args.port}"

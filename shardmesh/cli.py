@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import shutil
+import tempfile
 import json
 from typing import Any
 from pathlib import Path
@@ -32,7 +34,13 @@ def wait_for(url: str, timeout: float = 60.0) -> None:
 
 
 def run_demo(args: argparse.Namespace) -> int:
+    # A demo stands alone. A real pool's keys on this machine must not lock its
+    # owner out of it, and a saved route must not come back to life inside it.
+    scratch = Path(tempfile.mkdtemp(prefix="shardmesh-demo-"))
     base_env = os.environ.copy()
+    for name in ("SHARDMESH_POOL_TOKEN", "SHARDMESH_CA_FILE", "SHARDMESH_IDENTITY_CERT", "SHARDMESH_IDENTITY_KEY", "SHARDMESH_TLS_CERT", "SHARDMESH_TLS_KEY"):
+        base_env.pop(name, None)
+    base_env["SHARDMESH_POOL_TOKEN_FILE"] = str(scratch / "no-token")
     if args.pool_token:
         base_env["SHARDMESH_POOL_TOKEN"] = args.pool_token
     orchestrator_url = f"http://127.0.0.1:{args.port}"
@@ -41,7 +49,12 @@ def run_demo(args: argparse.Namespace) -> int:
     try:
         processes.append(
             subprocess.Popen(
-                [sys.executable, "-m", "shardmesh.orchestrator", "--host", "127.0.0.1", "--port", str(args.port)],
+                [
+                    sys.executable, "-m", "shardmesh.orchestrator", "--host", "127.0.0.1", "--port", str(args.port),
+                    "--keys-file", str(scratch / "access.json"),
+                    "--state-file", str(scratch / "state.json"),
+                    "--audit-file", str(scratch / "audit.jsonl"),
+                ],
                 env=base_env,
             )
         )
@@ -74,8 +87,9 @@ def run_demo(args: argparse.Namespace) -> int:
 
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
-            status = httpx.get(orchestrator_url + "/admin/status", headers=headers).json()
-            if len(status["workers"]) == args.workers:
+            answer = httpx.get(orchestrator_url + "/admin/status", headers=headers)
+            answer.raise_for_status()
+            if len(answer.json()["workers"]) == args.workers:
                 break
             time.sleep(0.5)
         else:
@@ -124,6 +138,7 @@ def run_demo(args: argparse.Namespace) -> int:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 process.kill()
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def run_load(args: argparse.Namespace) -> int:
@@ -265,23 +280,23 @@ def run_cordon(args: argparse.Namespace) -> int:
     return 0
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="shardmesh")
     subparsers = parser.add_subparsers(dest="command", required=True)
     demo = subparsers.add_parser("demo", help="run an orchestrator and local workers")
-    demo.add_argument("--workers", type=int, default=2)
-    demo.add_argument("--model", default="distilbert/distilgpt2")
-    demo.add_argument("--device", default="auto")
-    demo.add_argument("--port", type=int, default=8000)
-    demo.add_argument("--pool-token", default=os.getenv("SHARDMESH_POOL_TOKEN"))
+    demo.add_argument("--workers", type=int, default=2, help="how many workers to start")
+    demo.add_argument("--model", default="distilbert/distilgpt2", help="model to load once they are up")
+    demo.add_argument("--device", default="auto", help="auto, cpu, cuda:0, or another device")
+    demo.add_argument("--port", type=int, default=8000, help="control plane port; workers use the next hundred up")
+    demo.add_argument("--pool-token", default=os.getenv("SHARDMESH_POOL_TOKEN"), help="require this token")
     demo.set_defaults(handler=run_demo)
     pool = subparsers.add_parser("pool", help="create a pool's credentials")
     pool_commands = pool.add_subparsers(dest="pool_command", required=True)
     init = pool_commands.add_parser("init", help="make a pool token and a private authority")
     init.add_argument("--dir", required=True, help="keep this folder off the nodes: it signs their certificates")
     issue = pool_commands.add_parser("add-node", help="issue a node its certificate")
-    issue.add_argument("name")
-    issue.add_argument("--dir", required=True)
+    issue.add_argument("name", help="the node's --node-id")
+    issue.add_argument("--dir", required=True, help="the pool's secrets folder")
     issue.add_argument("--address", action="append", required=True, help="an address peers use for this node; repeatable")
     ask = pool_commands.add_parser("request-join", help="ask to join a pool; the owner decides")
     ask.add_argument("name", help="this node's --node-id")
@@ -290,32 +305,32 @@ def main() -> None:
     ask.add_argument("--url", required=True, help="any member's control address")
     ask.add_argument("--wait", action="store_true", help="wait for the owner's answer")
     listing = pool_commands.add_parser("requests", help="show who is asking to join")
-    listing.add_argument("--url", default="http://127.0.0.1:8000")
+    listing.add_argument("--url", default="http://127.0.0.1:8000", help="any node's control address")
     listing.add_argument("--token", required=True, help="an admin key")
     for name, summary in (("approve", "let a node join"), ("deny", "turn down a node's request")):
         answer = pool_commands.add_parser(name, help=summary)
-        answer.add_argument("name")
-        answer.add_argument("--dir", required=True)
-        answer.add_argument("--url", default="http://127.0.0.1:8000")
+        answer.add_argument("name", help="the node asking to join")
+        answer.add_argument("--dir", required=True, help="the pool's secrets folder")
+        answer.add_argument("--url", default="http://127.0.0.1:8000", help="any node's control address")
         answer.add_argument("--token", required=True, help="an admin key, to read the request")
     revoke = pool_commands.add_parser("revoke", help="throw a node out for good, signed by the pool authority")
-    revoke.add_argument("name")
-    revoke.add_argument("--dir", required=True)
+    revoke.add_argument("name", help="the node to throw out")
+    revoke.add_argument("--dir", required=True, help="the pool's secrets folder")
     revoke.add_argument("--url", default="http://127.0.0.1:8000", help="any node's control address")
 
     key = subparsers.add_parser("key", help="manage API keys")
     key_commands = key.add_subparsers(dest="key_command", required=True)
     create = key_commands.add_parser("create", help="add a key; it is shown once")
-    create.add_argument("name")
-    create.add_argument("--role", choices=["user", "admin"], default="user")
+    create.add_argument("name", help="who the key is for")
+    create.add_argument("--role", choices=["user", "admin"], default="user", help="what the key may do")
     create.add_argument("--file", help="the key file nodes read with --keys-file")
     create.add_argument("--dir", help="the pool's secrets folder: sign this with its authority and send it to --url")
     create.add_argument("--url", default="http://127.0.0.1:8000", help="any node's control address, with --dir")
     create.add_argument("--requests-per-minute", type=int, default=0, help="0 is no limit")
     remove = key_commands.add_parser("remove", help="remove a key for good, signed by the pool authority")
-    remove.add_argument("name")
-    remove.add_argument("--dir", required=True)
-    remove.add_argument("--url", default="http://127.0.0.1:8000")
+    remove.add_argument("name", help="the key's name")
+    remove.add_argument("--dir", required=True, help="the pool's secrets folder")
+    remove.add_argument("--url", default="http://127.0.0.1:8000", help="any node's control address")
 
     for name, summary in (("cordon", "move a node's share elsewhere, for maintenance"), ("uncordon", "put a node back in service")):
         change = subparsers.add_parser(name, help=summary)
@@ -332,10 +347,10 @@ def main() -> None:
     hashes.add_argument("--out", required=True, help="the file to write")
     hashes.set_defaults(handler=run_model_hash)
     load = subparsers.add_parser("load", help="load a model on a running pool")
-    load.add_argument("model")
-    load.add_argument("--url", default="http://127.0.0.1:8000", help="orchestrator address")
-    load.add_argument("--placement", choices=["spread", "compact"], default="spread")
-    load.add_argument("--context-tokens", type=int, default=4096)
+    load.add_argument("model", help="owner/repo, owner/repo:file.gguf, a local path, or a file name another node holds")
+    load.add_argument("--url", default="http://127.0.0.1:8000", help="any node's control address")
+    load.add_argument("--placement", choices=["spread", "compact"], default="spread", help="use every worker, or the fewest that fit")
+    load.add_argument("--context-tokens", type=int, default=4096, help="tokens each reply can hold")
     load.add_argument("--entry", help="worker to hold the entry stage")
     load.add_argument("--exit", help="worker to hold the exit stage")
     load.add_argument("--no-reuse-cached", action="store_true", help="plan as if no worker held any shards")
@@ -343,13 +358,18 @@ def main() -> None:
     load.add_argument("--no-draft", action="store_true", help="turn speculative decoding off")
     load.add_argument("--parallel", type=int, help="replies to run at once; each costs its own context memory")
     load.add_argument("--no-peer-fetch", action="store_true", help="download every shard from the model host")
-    load.add_argument("--pool-token", default=load_token())
+    load.add_argument("--token", "--pool-token", dest="pool_token", default=load_token(), help="an admin key; defaults to this machine's pool token")
     load.add_argument("--no-merge-passes", dest="merge_passes", action="store_false", help="make conversations take turns on each stage")
     load.add_argument("--hashes", default=None, help="file from `shardmesh model hash`: every node checks every unit against it")
     load.set_defaults(handler=run_load)
     node = subparsers.add_parser("node", help="contribute CPU, RAM, GPU, or any combination")
     add_node_arguments(node)
     node.set_defaults(handler=run_node)
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
     if args.command == "pool":
         from .pool import add_node, init_pool

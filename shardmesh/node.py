@@ -49,7 +49,7 @@ def local_code_root(source_root: Path) -> Path:
 
 
 def add_node_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--node-id", default=socket.gethostname())
+    parser.add_argument("--node-id", default=socket.gethostname(), help="this node's name; keep it stable, because the lowest name coordinates")
     parser.add_argument("--orchestrator-url", default=None, help="old name for --join")
     parser.add_argument("--join", default=None, help="any existing nodes, comma separated; omit on the first node")
     parser.add_argument("--control-port", type=int, default=None, help="port for this node's control plane; default is base port + 9")
@@ -65,14 +65,14 @@ def add_node_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--open", dest="open_pool", action="store_true", help="serve a network with no credentials, trusting everyone on it")
     parser.add_argument("--trusted-network", action="store_true", help="send pool credentials unencrypted, because nobody else can read this network")
     parser.add_argument("--model-dir", action="append", default=None, help="a folder of local models peers may ask this node to load; repeatable")
-    parser.add_argument("--bind-host", default="0.0.0.0")
+    parser.add_argument("--bind-host", default="0.0.0.0", help="address to listen on")
     parser.add_argument(
         "--advertise-host",
         default="auto",
         help="the address other nodes reach this one on; auto prefers Tailscale, then the LAN",
     )
-    parser.add_argument("--advertise-scheme", choices=["http", "https"], default="http")
-    parser.add_argument("--base-port", type=int, default=8200)
+    parser.add_argument("--advertise-scheme", choices=["http", "https"], default="http", help="set to https for you by --tls-cert")
+    parser.add_argument("--base-port", type=int, default=8200, help="first worker's port; later workers take the next ones")
     parser.add_argument(
         "--gpu-device",
         default="auto",
@@ -88,7 +88,7 @@ def add_node_arguments(parser: argparse.ArgumentParser) -> None:
         default="auto",
         help="precision for this node's VRAM and RAM; auto is bfloat16, float32 is full precision",
     )
-    parser.add_argument("--cpu-threads", type=int, default=0)
+    parser.add_argument("--cpu-threads", type=int, default=0, help="threads for CPU work; with no GPU, setting this adds a CPU worker")
     parser.add_argument("--cpu-active", action="store_true", help="place CPU on normal routes instead of standby")
     parser.add_argument(
         "--weights-ram-gb",

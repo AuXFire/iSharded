@@ -393,3 +393,22 @@ def test_oversized_requests_are_refused_unread(monkeypatch):
 
     client = forwarding(monkeypatch, "http://boss:9", handler)
     assert client.post("/v1/chat/completions", content=b"x" * (MAX_REQUEST_BYTES + 1)).status_code == 413
+
+
+def test_a_plan_can_use_a_file_only_a_node_holds(monkeypatch):
+    seen = {}
+    runtime = Orchestrator()
+
+    async def sources():
+        return {"model.gguf": ["http://holder:1"]}
+
+    def build(request, reuse, fetch, held=None, token=None):
+        seen["sources"] = held
+        raise orchestrator_module.WeightSourceError("stop here")
+
+    runtime.gguf_sources = sources
+    monkeypatch.setattr(orchestrator_module, "runtime", runtime)
+    monkeypatch.setattr(orchestrator_module, "build_target", build)
+    response = TestClient(orchestrator_module.app).post("/admin/plan", json={"model_id": "model.gguf"})
+    assert response.status_code == 400
+    assert seen["sources"] == {"model.gguf": ["http://holder:1"]}

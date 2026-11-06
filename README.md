@@ -1,14 +1,163 @@
 # ShardMesh
 
-ShardMesh runs one language model across multiple independently managed computers, using whatever memory each one has: VRAM, unified memory, system RAM, or disk. It has no central server. Every node runs the control plane, the nodes elect one to coordinate, and any node can serve the API. Each worker downloads only the tensors it will run, keeps its own per-layer state, and forwards activations directly to the next worker.
+ShardMesh runs one language model across several computers, using whatever memory each one has: VRAM, unified memory, system RAM, or disk. A model too big for any one of them can run across all of them. There is no central server. Every node runs the same software, the nodes elect one of themselves to coordinate, and any node can serve the API.
 
-It runs on a closed network, a LAN, across VLANs, over Tailscale, or across remote machines with TLS. See [Operating ShardMesh](docs/OPERATIONS.md) and [ShardMesh security](docs/SECURITY.md).
+It works on a closed network, a LAN, across VLANs, over Tailscale, or between remote machines with TLS. The API follows OpenAI's, so existing clients only need a new URL and key.
 
-This is execution sharding, not simulated work distribution. In a two-worker run of the included offline test model, worker 1 owns layer 0 and worker 2 owns layer 1. Token generation crosses both processes on every target-model pass.
+This is execution sharding, not simulated work distribution: each token really crosses every machine in the route. It has been tested on two machines. Its security has been reviewed by AI only, not by a person. [Current limits](#current-limits) says what that means for you.
+
+## Contents
+
+- [What it does](#what-it-does)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [How it works](#how-it-works)
+- [Using a pool](#using-a-pool)
+- [Recommended configuration](#recommended-configuration)
+- [Command reference](#command-reference)
+- [Environment variables](#environment-variables)
+- [HTTP API](#http-api)
+- [Models](#models)
+- [Memory and placement](#memory-and-placement)
+- [Precision](#precision)
+- [Networks and security](#networks-and-security)
+- [Running a pool](#running-a-pool)
+- [Troubleshooting](#troubleshooting)
+- [Measured performance](#measured-performance)
+- [Development](#development)
+- [Current limits](#current-limits)
+
+More detail lives in [Operating ShardMesh](docs/OPERATIONS.md) and [ShardMesh security](docs/SECURITY.md).
+
+## What it does
+
+- Splits a model's layers across machines, each holding only its share. Weights are never gathered on one machine.
+- Spans memory types: one node can hold layers in VRAM, RAM, and disk at once, and nodes do not have to match.
+- Runs GGUF models on stock llama.cpp, and safetensors models on its own PyTorch code. Qwen and GPT-2 families, including mixture-of-experts models.
+- Speeds up replies with a small draft model, reuses earlier conversation state, and lets conversations share a pass through each stage.
+- Serves OpenAI-shaped `/v1/chat/completions`, `/v1/completions`, and `/v1/models`, with streaming, plus a chat page and a live dashboard on every node.
+- Keeps replies going through failures: a crashed stage, a dead node, a dead coordinator, a silent link, or a split network.
+- Moves weights only when it must, shares them between nodes, and works with no internet at all.
+- Refuses to start exposed. Offers per-node certificates, signed membership, API keys with roles and rate limits, TLS, and an audit log.
+- Supports planned maintenance: cordon a node and its share moves elsewhere while replies finish.
+
+## Install
+
+You need Python 3.10 or newer, and PyTorch built for your hardware. Install PyTorch first, because the default package may not match your GPU. See [pytorch.org](https://pytorch.org/get-started/locally/) for CUDA, ROCm, and CPU builds.
+
+```bash
+git clone https://github.com/AuXFire/shardmesh.git
+```
+
+```bash
+cd shardmesh
+```
+
+```bash
+python -m pip install -e ".[pool]"
+```
+
+The `pool` extra adds `cryptography`, which you need to create a pool's credentials, and on every node in a pool that uses certificates. Other extras: `test` for the test suite.
+
+This installs `shardmesh`, `shardmesh-node`, `shardmesh-orchestrator`, and `shardmesh-worker`. From a checkout with the dependencies in place, `python -m shardmesh` works the same way without installing.
+
+For GGUF models, Windows nodes download a pinned, hash-checked llama.cpp build for their hardware to `%LOCALAPPDATA%\ShardMesh\llama`. Linux and macOS nodes need `--llama-dir` pointing at a build you supply. A closed network needs it everywhere.
+
+On a machine where antivirus intercepts HTTPS, `pip` may fail with a certificate error. Add `--use-feature=truststore` so it uses the system's trusted certificates.
+
+## Quick start
+
+### One machine
+
+```bash
+python -m shardmesh demo --workers 2
+```
+
+This starts a control plane on port 8000 and two workers on ports 8100 and 8101, then loads `distilbert/distilgpt2` across them. Open [http://127.0.0.1:8000/chat](http://127.0.0.1:8000/chat) to chat, or [http://127.0.0.1:8000/dashboard](http://127.0.0.1:8000/dashboard) to watch it work.
+
+With no network at all, build a tiny test model first:
+
+```bash
+python scripts/build_tiny_model.py .smoke-model
+```
+
+```bash
+python -m shardmesh demo --workers 2 --model .smoke-model --device cpu
+```
+
+That model is random, so its output means nothing. It proves that sharded and unsharded runs agree.
+
+### Two machines on Tailscale
+
+Tailscale encrypts the link, so a shared token is enough here. On the first machine, make the pool's credentials:
+
+```bash
+shardmesh pool init --dir pool-secrets
+```
+
+Copy `pool-secrets/pool.token` to `%LOCALAPPDATA%\ShardMesh\pool.token` on each Windows machine, or `~/.shardmesh/pool.token` elsewhere. Anyone holding it has full control of the pool. Then start the first node:
+
+```bash
+shardmesh node --node-id node-a --gguf-dir D:\models --weights-ram-gb auto
+```
+
+It prints the address it advertises, and its control plane listens on port 8209. Start the second node, naming the first:
+
+```bash
+shardmesh node --node-id node-b --join http://100.64.0.1:8209 --weights-ram-gb auto
+```
+
+Load a model from either machine. The `--url` matters, because `load` otherwise assumes the demo's port:
+
+```bash
+shardmesh load "unsloth/Qwen3.6-27B-GGUF:Qwen3.6-27B-Q4_K_M.gguf" --url http://100.64.0.1:8209
+```
+
+Open `http://100.64.0.1:8209/chat` and enter the token. A file already in a `--gguf-dir` folder is read locally, and a node without it reads only its share from the node that has it.
+
+### A pool with certificates
+
+Certificates give each node its own identity, so one can be thrown out without touching the others. On your own machine, which keeps the authority key:
+
+```bash
+shardmesh pool init --dir pool-secrets
+```
+
+```bash
+shardmesh key create root --role admin --file access.json
+```
+
+```bash
+shardmesh pool add-node --dir pool-secrets node-a --address 100.64.0.1
+```
+
+The second command prints an admin key, once. Copy `ca.pem`, `node-a.pem`, `node-a.key`, and `access.json` to node-a, and keep `ca.key` where it is. Start the node:
+
+```bash
+shardmesh node --node-id node-a --ca-file ca.pem --identity-cert node-a.pem --identity-key node-a.key --keys-file access.json
+```
+
+Other nodes ask to join, which keeps their private keys on their own machines:
+
+```bash
+shardmesh pool request-join node-b --dir node-identity --address 100.64.0.2 --url http://100.64.0.1:8209 --wait
+```
+
+```bash
+shardmesh pool requests --url http://100.64.0.1:8209 --token YOUR_ADMIN_KEY
+```
+
+```bash
+shardmesh pool approve node-b --dir pool-secrets --url http://100.64.0.1:8209 --token YOUR_ADMIN_KEY
+```
+
+Check the fingerprint with whoever is asking before you approve. Once approved, the waiting command saves the certificate. Start that node with its own files and `--join http://100.64.0.1:8209`.
+
+With certificates, the pool token stops working. Use your admin key, in the chat page and with `--token` on commands.
 
 ## How it works
 
-Each machine holds some of the model's layers, and any machine can answer a request. No server is in charge. The diagrams use the same line colors throughout: solid blue-green for a reply's data, dashed violet for control messages, and pink for anything signed by the owner.
+The diagrams use the same line colors throughout: solid blue-green for a reply's data, dashed violet for control messages, and pink for anything signed by the owner.
 
 The first six diagrams show what is built and tested on a two-machine pool. The right half of the last one is a proposal. A mesh runs one model at a time today.
 
@@ -96,85 +245,454 @@ An owned network runs without a central server, but one person decides who belon
 
 To redraw these diagrams, run `python scripts/build_diagrams.py`.
 
-## What works
+## Using a pool
 
-- A streaming chat page at `/chat` that shows where each layer of the model is running.
-- Qwen2, Qwen2.5, Qwen3, Qwen3.5, Qwen3.6, and Qwen3.8 text models, dense and mixture-of-experts, plus GPT-2.
-- Decentralized control: an elected coordinator, gossip membership, state copied to every node, and the API on any node.
-- Replies that survive failures: losing the coordinator does not touch a reply in progress, and a crashed stage restarts in place and replays.
-- Closed networks: nodes serve models to each other, so a pool needs no internet.
-- GGUF models split across nodes on llama.cpp's own kernels, with each node fetching only its own layers.
-- Speculative decoding across the pipeline, on by default for GGUF models with a matching draft.
-- Conversation reuse: later chat turns process only what is new, not the whole history.
-- Shard-only loading: each worker pulls just its tensors with HTTP range requests, straight from the model host.
-- Per-node memory pools. Any worker can mix VRAM, unified memory, RAM, and disk, and every node can differ.
-- BF16 by default, with FP32 available per node, and FP8 checkpoints for half the download and memory.
-- Contiguous transformer-layer sharding across one or more workers.
-- Direct worker-to-worker activation transfer using safetensors rather than pickle.
-- Per-worker, per-layer KV caches.
-- Bounded RAM contributors that retain incremental KV checkpoints for recovery.
-- One-command nodes that can contribute GPU inference, CPU inference, RAM, or any combination.
-- CUDA, ROCm, MPS, and CPU capability discovery with stage-boundary dtype conversion.
-- Worker heartbeats, epoch-versioned pipelines, and explicit rebalancing.
-- Automatic failover: quarantine a failed stage, repartition, replay the committed prefix, and resume.
-- Safe node joins: a worker registers as standby until `POST /admin/rebalance` activates a new epoch.
-- Nodes refuse to start exposed. Certificates or a pool token for nodes, named API keys with roles and rate limits for people, per-node revocation, TLS, and an audit log.
-- Planned maintenance: cordon a node and its share moves elsewhere while replies finish.
-- An owner can approve or deny nodes that ask to join, without their private keys or the owner's ever crossing the network.
-- Optional hash checks on every weight unit, from any source.
-- Prometheus metrics and readiness checks on every node.
-- OpenAI-shaped `/v1/completions`, `/v1/chat/completions`, and `/v1/models` endpoints, with streaming.
-- LAN, Tailscale IP, MagicDNS, or Tailscale Serve URLs.
+### Chat page and dashboard
 
-## Quick start on one machine
+Every node serves both, so any node's address works.
 
-Python 3.10+ is required.
+| Page | What it shows |
+|---|---|
+| `/chat` | A chat window. It asks for a key, shows where a model would run and how fast before anything downloads, and colors each layer by the memory holding it. |
+| `/dashboard` | The active pipeline, each node's state and hardware, latency, throughput, memory, recoveries, and events. Click a stage or worker for detail. |
 
-```powershell
-cd D:\project
-python -m pip install -r requirements.txt
-python -m shardmesh demo --workers 2
+If the node serving your chat dies mid-reply, the page asks before sending your key and conversation to another member, then restarts the reply there.
+
+### Calling the API
+
+Any node's control address works. With curl:
+
+```bash
+curl http://100.64.0.1:8209/v1/chat/completions -H "Authorization: Bearer YOUR_KEY" -H "Content-Type: application/json" -d "{\"messages\":[{\"role\":\"user\",\"content\":\"Say hello.\"}],\"max_tokens\":64}"
 ```
 
-When those dependencies are already installed, the checkout runs directly and the install command can be skipped. `python -m pip install -e .` additionally installs the three console commands, but is not required.
+With the OpenAI Python client:
 
-The default model is `distilbert/distilgpt2`. The demo starts an orchestrator on port 8000 and workers on ports 8100 and 8101.
+```python
+from openai import OpenAI
 
-Open [http://127.0.0.1:8000/chat](http://127.0.0.1:8000/chat), choose a model, and start chatting. The picker shows where a model would run and how fast before anything downloads, and the rail beside the conversation colors each layer by the memory holding it.
-
-Open the live control dashboard at [http://127.0.0.1:8000/dashboard](http://127.0.0.1:8000/dashboard). It visualizes the active layer pipeline, node states, hardware backends, control and compute latency, throughput, memory, recovery count, and control-plane activity. Click any stage or worker for detailed telemetry; **Rebalance** safely activates a new pipeline epoch.
-
-For a network-free functional test, build the deterministic two-layer model and run it on CPU:
-
-```powershell
-python scripts\build_tiny_model.py .smoke-model
-python -m shardmesh demo --workers 2 --model "$PWD\.smoke-model" --device cpu
+client = OpenAI(base_url="http://100.64.0.1:8209/v1", api_key="YOUR_KEY")
+model = client.models.list().data[0].id
+stream = client.chat.completions.create(
+    model=model,
+    messages=[{"role": "user", "content": "Say hello."}],
+    max_tokens=64,
+    stream=True,
+)
+for part in stream:
+    print(part.choices[0].delta.content or "", end="", flush=True)
 ```
 
-The offline `.smoke-model` is randomly initialized with a tiny vocabulary. Its output is intentionally not meaningful—repetition such as `time time time` only verifies that distributed and unsharded execution agree. Use a trained checkpoint such as DistilGPT-2 to evaluate generation quality. The dashboard labels this checkpoint as a **protocol test model**.
+If the connection to a node drops, retry against another node. Replies survive almost every other failure, but nothing can save a connection to a node that died. `/ready` answers 200 when a node can serve, which suits load balancers.
 
-Then send a request from another terminal:
+### Loading a model
 
-```powershell
-$body = @{
-  model = "distilbert/distilgpt2"
-  prompt = "Once upon a time"
-  max_tokens = 24
-  temperature = 0
-} | ConvertTo-Json
+`shardmesh load` starts a load, prints progress, and returns when the model is ready. The old model keeps serving until then.
 
-Invoke-RestMethod `
-  -Method Post `
-  -Uri http://127.0.0.1:8000/v1/completions `
-  -ContentType application/json `
-  -Body $body
+| A model id can be | Example | Comes from |
+|---|---|---|
+| A Hugging Face repo | `Qwen/Qwen3-8B` | Each worker fetches only its share |
+| A GGUF file in a repo | `owner/repo:file.gguf` | Each worker fetches only its share |
+| A local GGUF path | `D:\models\file.gguf` | That machine, then peers read from it |
+| A bare GGUF file name | `file.gguf` | Whichever node holds it, with no internet needed |
+| A local safetensors folder | `D:\models\qwen3-8b` | That machine. In a secured pool it must be in `--model-dir` |
+
+Only one model runs at a time, so loading another replaces the current one. To see where a model would go without moving anything, use `POST /admin/plan`, or the picker on the chat page.
+
+Gated models need `HF_TOKEN` set on each worker.
+
+## Recommended configuration
+
+### Start from your situation
+
+| Situation | Network | Identity | Load with |
+|---|---|---|---|
+| You and a friend, machines anywhere | Tailscale | Shared token | Defaults |
+| A few people sharing a pool | Tailscale or wired LAN | Certificates with tickets | `--parallel 4 --no-draft` |
+| Closed network, no internet | Wired LAN with `--trusted-network`, or TLS | Certificates | Bare file names, `--hashes` |
+| Remote machines across the internet | Tailscale, or TLS | Certificates | Defaults |
+| Machines running antivirus that scans HTTPS | Tailscale | Certificates with tickets | Defaults |
+| A model bigger than any one machine | Fastest link you have | Any | `--weights-ram-gb auto` on every node |
+
+### Node settings
+
+| Setting | Recommendation | Why |
+|---|---|---|
+| `--node-id` | A stable name. Give your most reliable machine the lowest | The lowest name alive coordinates |
+| `--gpu-memory-gb` | Card size minus about 1.5 GB on small cards, or 20% on large ones. 4.5 on a 6 GB card, 16 on a 20 GB card | It budgets weights only. KV cache, buffers, and a GPU context of about 0.7 GiB come on top |
+| `--weights-ram-gb` | `auto`, or a fixed size on a machine you also use | Lets a node hold layers beyond its VRAM |
+| `--weights-disk-gb` | 0 unless a model truly cannot fit otherwise | Disk is far slower than RAM |
+| `--cache-dir` | A fast SSD with room for twice the node's share | Units and stage files both live there |
+| `--cache-budget-gb` | Set it on a small disk | Evicts old models past this size |
+| `--ram-budget-gb` | 0 for GGUF hybrid models, a few GB otherwise | KV checkpoints speed up recovery where a model supports them. Hybrid Qwen models replay instead |
+| `--log-file` | Always | Nothing is kept otherwise |
+| `--gguf-dir` | Point it at LM Studio's or your own model folder | Files there are read locally, not downloaded |
+
+The entry node also carries the draft model, about 1.7 GiB of VRAM for the default one, and the planner does not reserve room for it. If you want it on a particular machine, pin that machine with `--entry`.
+
+### Load settings
+
+| Setting | Recommendation | Why |
+|---|---|---|
+| `--context-tokens` | The smallest that fits your use. 8192 is a good chat default | Each reply's context costs memory on every stage |
+| `--parallel` | Your expected concurrent conversations, up to about 4 | Each one costs its own context memory |
+| Draft model | Keep it for one or two users. Use `--no-draft` for three or more | See the table below |
+| `--placement` | Leave at `spread` | `compact` may skip workers, which only helps when a model fits on fewer of them |
+| `--hashes` | Use it when any node or mirror is less than fully trusted | Every node then checks every unit |
+
+Measured on the two-machine pool with Qwen3.6-27B Q4_K_M, total tokens per second across all conversations, at `--parallel 4`:
+
+| Conversations at once | No draft, merged passes | With a draft |
+|---:|---:|---:|
+| 1 | 14 | 10 |
+| 2 | 27 | 15 |
+| 3 | 32 | 20 |
+| 4 | 37 | 21 |
+
+A draft does far better at `--parallel 1`, where one conversation reached 19 to 33 tokens per second, because every stage keeps more memory and the draft's guesses are not competing.
+
+### Network
+
+Use wired links if you can: every token crosses every stage, so a pass costs at least one round trip per stage. Both test machines were on Wi-Fi with a 15 ms ping, and the desktop's 144 Mbps link limited model transfers to about 8 MiB/s. Fewer stages are faster, so do not add a slow machine unless the model needs its memory.
+
+### A worked example
+
+The test pool: a laptop with a 6 GB RTX 3060 and a desktop with a 20 GB RX 7900 XT, over Tailscale, running Qwen3.6-27B Q4_K_M. The planner gave the laptop layers 0 to 7 and the desktop layers 8 to 63.
+
+```bash
+shardmesh node --node-id node-a --join http://100.64.0.12:8300 --control-port 8000 --gpu-device cuda --gpu-memory-gb 4.5 --cpu-threads 4 --weights-ram-gb 6 --cache-dir D:\isharded-cache --ram-budget-gb 0.5 --gguf-dir I:\models --log-file D:\isharded-cache\node.log --ca-file ca.pem --identity-cert node-a.pem --identity-key node-a.key
 ```
 
-PowerShell users should prefer `ConvertTo-Json` plus `Invoke-RestMethod`. If using `curl.exe -d` directly, Windows paths must contain doubled backslashes inside the JSON string, and native-command quoting varies between PowerShell versions.
+```bash
+shardmesh node --node-id node-rocm --join http://100.64.0.11:8000 --control-port 8300 --base-port 8311 --gpu-memory-gb 16 --cpu-threads 8 --weights-ram-gb auto --gguf-dir J:\models --ca-file ca.pem --identity-cert node-rocm.pem --identity-key node-rocm.key
+```
 
-Inspect the virtual pool and exact layer placement at `http://127.0.0.1:8000/admin/status`.
+```bash
+shardmesh load lmstudio-community/Qwen3.6-27B-GGUF:Qwen3.6-27B-Q4_K_M.gguf --url http://100.64.0.12:8300 --context-tokens 8192 --parallel 2 --token YOUR_ADMIN_KEY
+```
 
-## Supported models
+## Command reference
+
+Every `--url` takes any node's control address. Commands default to `http://127.0.0.1:8000`, which is the demo's port. A node's control port is `--base-port` plus 9, so 8209 unless you change it.
+
+### shardmesh demo
+
+Starts a control plane and workers on this machine, and loads a model.
+
+| Option | Default | What it does |
+|---|---|---|
+| `--workers` | 2 | How many workers to start |
+| `--model` | `distilbert/distilgpt2` | Model to load once they are up |
+| `--device` | `auto` | `auto`, `cpu`, `cuda:0`, or another device |
+| `--port` | 8000 | Control plane port. Workers use the next hundred up |
+| `--pool-token` | `SHARDMESH_POOL_TOKEN` | Require this token |
+
+### shardmesh node
+
+Runs one machine's share of a pool: a control plane, plus workers for what it contributes, restarted if they stop.
+
+Joining and naming:
+
+| Option | Default | What it does |
+|---|---|---|
+| `--node-id` | Computer name | This node's name. Keep it stable, because the lowest name coordinates |
+| `--join` | None | Any existing nodes, comma separated. Omit on the first node |
+| `--orchestrator-url` | None | Old name for `--join` |
+| `--control-port` | `--base-port` + 9 | Port for this node's control plane |
+| `--no-control` | Off | Worker only: run no control plane here. Needs `--join` |
+
+Network:
+
+| Option | Default | What it does |
+|---|---|---|
+| `--bind-host` | `0.0.0.0` | Address to listen on |
+| `--advertise-host` | `auto` | Address other nodes reach this one on. `auto` prefers Tailscale, then the LAN |
+| `--advertise-scheme` | `http` | `http` or `https`. Set to `https` for you by `--tls-cert` |
+| `--base-port` | 8200 | First worker's port. Later workers take the next ones |
+
+Security:
+
+| Option | Default | What it does |
+|---|---|---|
+| `--pool-token-file` | `pool.token` in the ShardMesh folder | File holding the pool token |
+| `--ca-file` | None | Authority that signed the nodes' certificates. Turns on certificate identity |
+| `--identity-cert`, `--identity-key` | None | This node's certificate and key, to prove its name with tickets, without TLS |
+| `--tls-cert`, `--tls-key` | None | Certificate and key for this node's servers, for TLS |
+| `--keys-file` | `access.json` in the ShardMesh folder | Where this node keeps the pool's API keys |
+| `--open` | Off | Serve a network with no credentials, trusting everyone on it |
+| `--trusted-network` | Off | Send credentials unencrypted, because nobody else can read this network |
+
+Hardware and memory:
+
+| Option | Default | What it does |
+|---|---|---|
+| `--gpu-device` | `auto` | `auto` (every accelerator), `cuda:0`, `cuda:0,cuda:1`, `mps`, `xpu:0`, or `none`. ROCm uses PyTorch's cuda device names |
+| `--gpu-memory-gb` | 0 (auto) | VRAM budget per accelerator. A hard limit on CUDA and ROCm |
+| `--dtype`, `--gpu-dtype` | `auto` | `auto` (BF16), `bfloat16`, `float32`, or `float16`, for this node's VRAM and RAM |
+| `--cpu-threads` | 0 | Threads for CPU work. With no GPU, setting this adds a CPU worker |
+| `--cpu-active` | Off | Place a CPU worker on normal routes, instead of keeping it on standby |
+| `--weights-ram-gb` | None | System RAM for model weights, a size or `auto`. With a GPU, one worker spans both |
+| `--weights-disk-gb` | 0 | Disk for memory-mapped model weights |
+| `--ram-budget-gb` | 0 | RAM for KV-cache checkpoints, not weights. Adds a memory worker |
+
+Models and cache:
+
+| Option | Default | What it does |
+|---|---|---|
+| `--gguf-dir` | None | Folder to search for GGUF files already here, such as LM Studio's. Repeatable |
+| `--model-dir` | None | A folder of local models peers may ask this node to load. Repeatable |
+| `--llama-dir` | Downloaded on Windows | A llama.cpp build for GGUF models. Needed on Linux, macOS, and closed networks |
+| `--cache-dir` | `~/.cache/shardmesh/units` | Where fetched weights are kept. Put it on a fast disk |
+| `--cache-budget-gb` | 0 (no limit) | Evict old models past this size |
+| `--no-peer-fetch` | Off | Always download from the model host |
+| `--no-peer-serve` | Off | Do not send shards to other workers |
+
+Other:
+
+| Option | Default | What it does |
+|---|---|---|
+| `--log-file` | None | Write this node's output here. Over 64 MiB, the last one is kept as `.1` at the next start |
+| `--no-local-copy` | Off | Run workers from a network path as it is, instead of copying the code to local disk |
+
+A node contributes whatever you give it. With a GPU and weight memory, one worker spans them all. With no GPU, `--cpu-threads` or a weight budget adds a CPU worker. `--ram-budget-gb` adds a memory worker on the next port. A node that contributes nothing is refused.
+
+### shardmesh load
+
+Loads a model on a running pool and shows progress. `model` is any [model id](#loading-a-model).
+
+| Option | Default | What it does |
+|---|---|---|
+| `--url` | `http://127.0.0.1:8000` | Any node's control address |
+| `--token`, `--pool-token` | This machine's pool token | An admin key |
+| `--context-tokens` | 4096 | Tokens each reply can hold |
+| `--parallel` | 1 | Replies to run at once. Each costs its own context memory |
+| `--placement` | `spread` | `spread` uses every worker, `compact` the fewest that fit |
+| `--entry`, `--exit` | Chosen for speed | Worker to hold the entry or exit stage |
+| `--draft` | Chosen automatically | Small GGUF for speculative decoding |
+| `--no-draft` | Off | Turn speculative decoding off |
+| `--no-merge-passes` | Off | Make conversations take turns on each stage |
+| `--hashes` | None | File from `shardmesh model hash`. Every node checks every unit against it |
+| `--no-reuse-cached` | Off | Plan as if no worker held any shards |
+| `--no-peer-fetch` | Off | Download every shard from the model host |
+
+### shardmesh cordon and uncordon
+
+`cordon` moves a node's share elsewhere for maintenance, and `uncordon` puts the node back. Both take the node's name.
+
+| Option | Default | What it does |
+|---|---|---|
+| `--url` | `http://127.0.0.1:8000` | Any node's control address |
+| `--token` | This machine's pool token | An admin key |
+| `--force` | Off | `cordon` only: go ahead even if this moves over 2 GiB between nodes |
+
+### shardmesh model hash
+
+Hashes a model on a copy you trust, for `load --hashes`. It reads the whole model. `source` is a GGUF file or a safetensors folder.
+
+| Option | Default | What it does |
+|---|---|---|
+| `--out` | Required | The file to write |
+
+### shardmesh key
+
+`key create NAME` makes an API key and shows it once. `key remove NAME` removes one for good, and needs the authority.
+
+| Option | Applies to | Default | What it does |
+|---|---|---|---|
+| `--role` | create | `user` | `user` or `admin` |
+| `--requests-per-minute` | create | 0 (no limit) | Rate limit for this key |
+| `--file` | create | None | Add it to a key file, for nodes to read with `--keys-file` |
+| `--dir` | both | None | The pool's secrets folder. Sign the change with its authority and send it to `--url` |
+| `--url` | both | `http://127.0.0.1:8000` | Any node's control address, with `--dir` |
+
+### shardmesh pool
+
+Commands for a pool's credentials and members.
+
+| Command | What it does |
+|---|---|
+| `pool init --dir DIR` | Makes a pool token and authority in a new folder. Keep this folder off the nodes |
+| `pool add-node NAME --dir DIR --address ADDRESS` | Issues a node its certificate and key directly |
+| `pool request-join NAME --dir DIR --address ADDRESS --url URL` | Asks to join. The node's key stays in `--dir`. Add `--wait` to wait for the answer |
+| `pool requests --token KEY --url URL` | Shows who is asking to join |
+| `pool approve NAME --dir DIR --token KEY --url URL` | Lets a node in |
+| `pool deny NAME --dir DIR --token KEY --url URL` | Turns a node down. That key stays denied |
+| `pool revoke NAME --dir DIR --url URL` | Throws a node out for good. Bring a machine back under a new name |
+
+`--address` is one an address peers use for that node, and is repeatable. `--token` is an admin key.
+
+### Running the pieces by hand
+
+`shardmesh node` starts these for you. Start them directly only for unusual layouts, such as a control plane on a machine with no workers.
+
+`python -m shardmesh.orchestrator` runs a control plane:
+
+| Option | Default | What it does |
+|---|---|---|
+| `--host` | `0.0.0.0` | Address to listen on |
+| `--port` | 8000 | Port to listen on |
+| `--node-id` | None | This node's name in the mesh |
+| `--advertise-url` | None | How other nodes reach this one. Setting it joins the mesh |
+| `--join` | None | Any existing nodes, comma separated |
+| `--state-file` | `orchestrator-state.json` in the state folder | Where the running route is saved |
+| `--keys-file` | `access.json` in the ShardMesh folder | Where this node keeps the pool's API keys |
+| `--audit-file` | `audit.jsonl` in the state folder | Where to record who did what |
+| `--no-reuse-cached` | Off | Plan as if no worker held any shards |
+| `--no-peer-fetch` | Off | Always download from the model host |
+| `--open` | Off | Serve a network with no credentials |
+| `--trusted-network` | Off | Send credentials unencrypted, on a network nobody else can read |
+
+The state folder is `%LOCALAPPDATA%\ShardMesh` on Windows and `~/.cache/ShardMesh` elsewhere. The ShardMesh folder is `%LOCALAPPDATA%\ShardMesh` on Windows and `~/.shardmesh` elsewhere.
+
+`python -m shardmesh.worker` runs one worker:
+
+| Option | Default | What it does |
+|---|---|---|
+| `--host` | `0.0.0.0` | Address to listen on |
+| `--port` | 8100 | Port to listen on |
+| `--worker-id` | Computer name | Unique name. Use `node-gpu`, `node-cpu`, or `node-memory` so certificates match |
+| `--orchestrator-url` | `http://127.0.0.1:8000` | One or more control planes, comma separated. The rest are found from them |
+| `--advertise-url` | `http://127.0.0.1:PORT` | How other nodes reach this worker |
+| `--device` | `auto` | `auto`, `cpu`, `cuda:0`, `mps`, or `xpu:0` |
+| `--roles` | `inference` | `inference`, or `kv-cache,checkpoint` for a memory worker |
+| `--dtype` | `auto` | `auto` is BF16. `float32` runs this worker at full precision |
+| `--cpu-threads` | 0 | CPU threads. 0 uses half the cores for a stage |
+| `--gpu-memory-gb` | 0 (auto) | VRAM budget per accelerator |
+| `--weights-ram-gb` | None | System RAM for model weights, or `auto` |
+| `--weights-disk-gb` | 0 | Disk for memory-mapped model weights |
+| `--ram-budget-gb` | 0 | RAM for KV checkpoints, not weights |
+| `--cache-dir` | `~/.cache/shardmesh/units` | Where fetched weights live |
+| `--cache-budget-gb` | 0 (no limit) | Evict old models past this size |
+| `--gguf-dir` | None | Folder holding GGUF files. Repeatable |
+| `--llama-dir` | Downloaded on Windows | A llama.cpp build for GGUF models |
+| `--no-peer-fetch` | Off | Always download from the model host |
+| `--no-peer-serve` | Off | Do not send shards to other workers |
+| `--standby` | Off | Only use this worker when a model does not fit without it |
+| `--open` | Off | Serve a network with no credentials |
+| `--trusted-network` | Off | Send credentials unencrypted, on a network nobody else can read |
+
+## Environment variables
+
+A flag takes priority over its variable.
+
+| Variable | Same as, or what it does |
+|---|---|
+| `SHARDMESH_POOL_TOKEN` | The pool token, ahead of any token file |
+| `SHARDMESH_POOL_TOKEN_FILE` | `--pool-token-file` |
+| `SHARDMESH_CA_FILE` | `--ca-file` |
+| `SHARDMESH_IDENTITY_CERT`, `SHARDMESH_IDENTITY_KEY` | `--identity-cert`, `--identity-key` |
+| `SHARDMESH_TLS_CERT`, `SHARDMESH_TLS_KEY` | `--tls-cert`, `--tls-key` |
+| `SHARDMESH_KEYS_FILE` | `--keys-file` |
+| `SHARDMESH_STATE_FILE` | `--state-file` |
+| `SHARDMESH_AUDIT_FILE` | `--audit-file` |
+| `SHARDMESH_HOST`, `SHARDMESH_PORT` | `--host`, `--port` |
+| `SHARDMESH_NODE_ID`, `SHARDMESH_NODE_URL`, `SHARDMESH_JOIN` | The control plane's `--node-id`, `--advertise-url`, `--join` |
+| `SHARDMESH_WORKER_ID`, `SHARDMESH_ORCHESTRATOR_URL`, `SHARDMESH_ADVERTISE_URL` | The worker's `--worker-id`, `--orchestrator-url`, `--advertise-url` |
+| `SHARDMESH_DEVICE`, `SHARDMESH_ROLES`, `SHARDMESH_CPU_THREADS` | `--device`, `--roles`, `--cpu-threads` |
+| `SHARDMESH_GPU_MEMORY_GB`, `SHARDMESH_RAM_BUDGET_GB` | `--gpu-memory-gb`, `--ram-budget-gb` |
+| `SHARDMESH_CACHE_DIR`, `SHARDMESH_LLAMA_DIR` | `--cache-dir`, `--llama-dir` |
+| `SHARDMESH_MODEL_DIRS` | `--model-dir`, separated by the system's path separator |
+| `SHARDMESH_REUSE_CACHED`, `SHARDMESH_PEER_FETCH` | Set to `0` for the control plane's `--no-reuse-cached`, `--no-peer-fetch` |
+| `SHARDMESH_HOST_ID` | Which physical machine a worker is on. Defaults to the computer name, so workers sharing a host do not count its RAM twice |
+| `SHARDMESH_FETCH_CONCURRENCY` | Units a worker fetches at once. Default 4 |
+| `SHARDMESH_ACCESS_LOG` | Set to `1` to log every request while debugging. Off by default, because nodes poll each other constantly |
+| `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` | Hugging Face token, for gated models. Needed on each worker |
+| `HF_ENDPOINT` | Another Hugging Face address, such as a mirror |
+
+A worker's launcher also passes some flags through `SHARDMESH_WEIGHTS_RAM_GB`, `SHARDMESH_WEIGHTS_DISK_GB`, `SHARDMESH_CACHE_BUDGET_GB`, `SHARDMESH_PEER_SERVE`, `SHARDMESH_GGUF_DIRS`, `SHARDMESH_DTYPE`, and `SHARDMESH_STANDBY`. Use the flags for those, because they overwrite the variables. `SHARDMESH_STAGE_KEY` is internal.
+
+## HTTP API
+
+Send `Authorization: Bearer KEY`, except where it says none. Requests are limited to 16 MiB. Each node serves all of this, and passes `/admin` requests to the coordinator for you.
+
+### Endpoints
+
+| Method | Path | Needs | Purpose |
+|---|---|---|---|
+| `POST` | `/v1/chat/completions` | User key | Chat, streaming with `stream: true` |
+| `POST` | `/v1/completions` | User key | Text completion, one prompt per request |
+| `GET` | `/v1/models` | User key | The running model |
+| `GET` | `/admin/status` | User key | Workers, memory pools, route, epoch, mesh, and load progress |
+| `GET` | `/admin/catalog` | User key | Suggested models and supported architectures |
+| `POST` | `/admin/plan` | Admin key | Show where a model would run, without moving anything |
+| `POST` | `/admin/load` | Admin key | Load a model |
+| `POST` | `/admin/load/cancel` | Admin key | Stop a load. Finished units stay cached |
+| `POST` | `/admin/rebalance` | Admin key | Reconsider all live workers and apply a new layout |
+| `POST` | `/admin/nodes/{name}/cordon` | Admin key | Move a node's share elsewhere. `?force=true` allows a large transfer |
+| `POST` | `/admin/nodes/{name}/uncordon` | Admin key | Put a node back in service |
+| `POST` | `/admin/nodes/{name}/revoke` | Admin key | Throw a node out, in a pool without an authority |
+| `GET`, `POST` | `/admin/keys` | Admin key | List or create keys, in a pool without an authority |
+| `DELETE` | `/admin/keys/{name}` | Admin key | Remove a key, in a pool without an authority |
+| `POST` | `/access/entries` | A valid signature | Apply a change signed by the pool authority |
+| `POST` | `/join/requests` | None | Ask to join. Grants nothing |
+| `GET` | `/join/requests` | Admin key | List who is waiting |
+| `GET` | `/join/certificate/{name}` | None | Collect an approved node's certificate |
+| `GET` | `/ready` | None | 200 when this node can serve a reply, for load balancers |
+| `GET` | `/health` | None | The process is up. Says nothing else to strangers |
+| `GET` | `/metrics` | Admin key | Prometheus metrics |
+| `GET` | `/chat`, `/dashboard` | None | The pages. They ask for a key themselves |
+
+Routes under `/internal` are for nodes only. `GET /internal/mesh` shows a node's own view of the mesh, and `GET /internal/diag/tasks` shows where everything in a process is waiting, which is the place to look when a reply stalls.
+
+### Chat and completion requests
+
+| Field | Default | What it does |
+|---|---|---|
+| `messages` | Required for chat | List of `role` and `content` |
+| `prompt` | Required for completions | A string, or a list holding one string |
+| `model` | The running model | Must match it if given |
+| `max_tokens` | 32 | 1 to 32768 |
+| `temperature` | 0 | 0 to 5. 0 picks the most likely token |
+| `top_p` | 1 | Above 0, up to 1 |
+| `top_k` | 0 | 0 is off |
+| `seed` | None | For repeatable sampling, below 2^63 |
+| `stream` | `false` | Send tokens as server-sent events, ending with `data: [DONE]` |
+| `stop` | None | A string or list that ends the reply |
+| `enable_thinking` | None | Chat only: switches reasoning on models that support it |
+
+Prompts longer than the loaded context are refused with a 400. A reply that would overrun it is cut short.
+
+### Load requests
+
+`POST /admin/load` and `/admin/plan` take these fields. `shardmesh load` sets most of them for you.
+
+| Field | Default | What it does |
+|---|---|---|
+| `model_id` | `distilbert/distilgpt2` | Any [model id](#loading-a-model) |
+| `revision` | `main` | Branch, tag, or commit on the model host |
+| `control_model_id` | None | Read the description from here instead of `model_id` |
+| `worker_model_ids` | None | A local source per worker, as worker name to path |
+| `placement` | `spread` | `spread` or `compact` |
+| `context_tokens` | 4096 | 128 to 1048576 |
+| `parallel` | 1 | 1 to 32 |
+| `entry_worker`, `exit_worker` | None | Pin the ends of the route |
+| `draft_model` | `auto` | A GGUF id, `auto`, or `none` |
+| `draft_tokens` | 6 | Most guesses per pass, 1 to 16 |
+| `merge_passes` | `true` | Let conversations share a pass |
+| `model_hashes` | None | The contents of a `shardmesh model hash` file |
+| `reuse_cached`, `peer_fetch` | Pool default | Weigh cached shards, and copy from peers |
+| `wait` | `true` | `false` returns at once. Progress is in `/admin/status` |
+
+### Status codes
+
+| Code | Meaning |
+|---|---|
+| 400 | Bad request, or a prompt too long for the loaded context |
+| 401 | No valid key |
+| 403 | The key is valid but lacks the role, or a node is speaking for another |
+| 404 | No such model, key, or route |
+| 409 | No model is ready, or a change refused as unsafe. The message says which |
+| 411 | The request has no length |
+| 413 | The request is too large |
+| 426 | A node is on a different protocol version. Upgrade it |
+| 429 | A key's rate limit, or too many replies waiting. `Retry-After` says when |
+| 502 | A stage could not process this request |
+| 503 | No coordinator yet, or a stage restarting. Try again shortly |
+| 507 | The model does not fit in the pool |
+
+## Models
+
+### Supported families
 
 | Family | `model_type` | Examples | Notes |
 |---|---|---|---|
@@ -186,107 +704,66 @@ Inspect the virtual pool and exact layer placement at `http://127.0.0.1:8000/adm
 | Qwen3.5, 3.6, 3.8 | `qwen3_5` | `Qwen/Qwen3.5-4B`, `Qwen/Qwen3.8-27B` | Hybrid Gated DeltaNet and attention |
 | Qwen3.5, 3.6 MoE | `qwen3_5_moe` | `Qwen/Qwen3.6-35B-A3B` | Hybrid, with fused experts |
 
-Multimodal releases load as text models: the vision tower and multi-token-prediction head are skipped and never downloaded.
+Multimodal releases load as text models: the vision tower and multi-token-prediction head are skipped and never downloaded. Block-scaled FP8 releases work too, such as `Qwen/Qwen3.8-27B-FP8`. Not supported yet: AWQ, GPTQ, Qwen3-Next, and the experimental `qwen4_exp`. An unsupported model is refused with the reason before anything downloads.
 
-Block-scaled FP8 releases of these models work too, such as `Qwen/Qwen3.8-27B-FP8`. Not supported yet: AWQ, GPTQ, Qwen3-Next, and the experimental `qwen4_exp` in Qwen3.8-Flash-Next. An unsupported model is refused with the reason before anything downloads.
+Workers run these with their own forward pass instead of `transformers` classes, so a node's library versions do not limit which models it can run. Each adapter is tested against the reference `transformers` implementation.
 
-Workers run these models with their own forward pass instead of `transformers` classes, so a node's library versions do not limit which models it can run. Each adapter is tested against the reference `transformers` implementation.
-
-## GGUF models
+### GGUF models
 
 GGUF is the fast path. A quantized model runs on llama.cpp's kernels, which is what makes a 27B model practical on consumer GPUs, while ShardMesh still plans, fetches, and routes it.
 
-```powershell
-shardmesh load "ggml-org/Qwen3.8-27B-GGUF:Qwen3.8-27B-Q4_K_M.gguf"
-```
+Supported architectures are `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`, `qwen35`, `qwen35moe`, and `llama`. Real weights have been checked for `qwen3`, `qwen35`, and `qwen35moe`, where two stages matched the whole model, and `qwen35` and `qwen35moe` have run across real machines. The others share that code but are untested. Tokenizers are built from the GGUF itself, for `qwen2` and `qwen35` vocabularies. Split GGUF files (`-00001-of-00003`) are refused for now.
 
-A model id is `owner/repo:file.gguf`, or a path to a local `.gguf` file. Supported architectures are `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`, `qwen35`, `qwen35moe`, and `llama`. Real weights have been checked for `qwen3`, `qwen35`, and `qwen35moe`, where two stages matched the whole model; `qwen35` has also run across real machines. The others share that code but are untested. Tokenizers are built from the GGUF itself, for `qwen2` and `qwen35` vocabularies. Split GGUF files (`-00001-of-00003`) are refused for now.
+- A GGUF header lists every tensor's byte offset, so each worker fetches just its layers with range requests. llama.cpp's own RPC is not used, because that needs the whole file on one machine.
+- A worker assembles a stage file from its cached units: its layers renumbered from zero, with placeholders for anything it never evaluates. To llama.cpp this is a small complete model, so stock release builds work with no patches.
+- Hidden states enter through `llama_batch.embd` and leave through the eval callback at the stage's last layer. On Qwen3.6-27B, a two-stage split gives the same tokens and logits as the whole model, and the boundary costs under 3 ms a token.
+- Each stage runs in its own process. PyTorch and llama.cpp each load an OpenMP runtime and abort when they share one, and this way a native crash cannot take the worker down.
+- Stages read their weights once, unless some are on the disk tier, which needs the file mapped. Mapping kept the whole file in RAM even with the tensors in VRAM: 15.1 GiB against 1.0 GiB on a 15 GiB model, at the same speed.
+- Experts are placed separately from the rest of a layer, so a MoE can keep attention on the GPU and its experts in RAM.
 
-How it works:
-
-- A GGUF header lists every tensor's byte offset, so each worker fetches just its layers with range requests. The cache, peer sharing, and cached-shard planning are the same as for safetensors. Nothing about llama.cpp's own RPC is used, because that needs the whole file on one machine.
-- A worker assembles a **stage file** from its cached units: its layers renumbered from zero, with placeholders for anything it never evaluates. To llama.cpp this is a small complete model, so stock release builds work, with no patches.
-- Hidden states enter through `llama_batch.embd` and leave through the eval callback at the stage's last layer. Measured on Qwen3.6-27B, a two-stage split gives the same tokens and logits as the whole model, and the boundary costs under 3 ms a token.
-- Each stage runs in its own process. PyTorch and llama.cpp each load an OpenMP runtime and abort when they share one, and this way a native crash cannot take the worker down and unloading frees everything.
-- The planner's placement decides what sits in VRAM. Layers placed in RAM or on disk are pinned to the CPU, and llama.cpp memory-maps the file, so a node can run part of its stage from a GPU and part from RAM. Experts are placed separately from the rest of a layer, so a MoE can keep attention on the GPU and its experts in RAM.
-
-| Worker flag | Purpose |
-|---|---|
-| `--gguf-dir PATH` | Search a folder for GGUF files already on this machine, such as LM Studio's. A match on name and size is read locally instead of downloaded. Repeatable. |
-| `--llama-dir PATH` | Use this llama.cpp build. Otherwise a pinned, hash-checked Windows build for the node's backend is downloaded to `%LOCALAPPDATA%\ShardMesh\llama`. Linux and macOS need this flag. |
-
-The Windows ROCm release leaves out `hipblas.dll`. ShardMesh finds it in the node's PyTorch ROCm install, so the node needs that environment.
+The Windows ROCm release of llama.cpp leaves out `hipblas.dll`. ShardMesh finds it in the node's PyTorch ROCm install, so the node needs that environment.
 
 ### Speculative decoding
 
-A token's trip through the pipeline costs nearly the same whether it carries one token or six, so the entry worker runs a small draft model that guesses ahead, and the real model checks every guess in one pass. Each pass yields the guesses that held, plus one more token for free.
+A trip through the pipeline costs nearly the same whether it carries one token or six, so the entry worker runs a small draft model that guesses ahead, and the real model checks every guess in one pass. Each pass yields the guesses that held, plus one more token.
 
-For `qwen35` models the draft is chosen automatically (`Qwen3.5-0.8B`, which shares their vocabulary). Name another with `shardmesh load MODEL --draft owner/repo:file.gguf`, or turn this off with `--no-draft`. The same switches are `draft_model` and `draft_tokens` on `POST /admin/load`. A draft that cannot load leaves the model running without one. A named draft must have the same vocabulary as the model.
+For `qwen35` models the draft is chosen automatically (`Qwen3.5-0.8B`, which shares their vocabulary). Name another with `--draft`, or turn this off with `--no-draft`. A named draft must have the same vocabulary as the model, and a draft that cannot load leaves the model running without one.
 
 The number of guesses adapts as a reply goes, up to `draft_tokens`, because code rewards long guesses and open-ended prose does not. Sampling keeps the model's distribution exactly: a guess `g` is accepted with probability `q(g)`, and a rejection draws from `q` with `g` removed. At temperature 0, batched arithmetic rounds slightly differently from single-token arithmetic, so output can differ from a run without a draft where two tokens are nearly tied.
 
 ### Conversation reuse
 
-Every stage saves its state where a chat's settled history ends. If the next prompt starts with exactly those tokens, stages restore the checkpoint and process only the new text, so a long conversation stops costing more with every turn. Anything else, such as an edited history or a new route, falls back to reading the whole prompt. A restored stage matches a stage that never stopped, bit for bit. Processing a prompt in different pieces rounds slightly differently, so a reply can differ at a near-tie from one produced in a single pass.
+Every stage saves its state where a chat's settled history ends. If the next prompt starts with exactly those tokens, stages restore the checkpoint and process only the new text, so a long conversation stops costing more with every turn. Anything else, such as an edited history or a new route, falls back to reading the whole prompt. This covers GGUF chat.
 
 ### Several conversations at once
 
-`shardmesh load MODEL --parallel 3` gives every stage three independent sequences, each with its own context memory, which the planner counts. Replies from any node queue at the entry worker, and each conversation returns to the sequence holding its checkpoint. While one reply is away at the next stage, this stage works on another, so more of the pool is busy at once. Stages run sequences in turn, not merged into one batch, so each weight read still serves a single reply.
+`--parallel 3` gives every stage three independent sequences, each with its own context memory, which the planner counts. Replies from any node queue at the entry worker, and each conversation returns to the sequence holding its checkpoint. While one reply is away at the next stage, this stage works on another.
 
-### Measured performance
+Single-token steps from different conversations also share a pass through a stage, because reading the weights is what a pass costs. On one stage, four conversations went from 12 to 32 tokens per second. Across two stages the same load gained only 10%, from 34 to 37, because the stages stagger the conversations. Steps with speculative guesses do not merge, so a draft limits this. `--no-merge-passes` turns it off.
 
-Qwen3.6-27B Q4_K_M, split across an RX 7900 XT desktop and an RTX 3060 laptop, both on Wi-Fi with a 15 ms ping:
+Past `--parallel`, replies queue at the entry worker, and past 32 waiting they are refused with a 429.
 
-| Setup | Tokens per second |
-|---|---:|
-| Desktop alone, llama.cpp, no split (ceiling) | 35.2 |
-| Both nodes, llama.cpp's own RPC, whole file on one node | 13.6 |
-| Both nodes, ShardMesh, no draft | 14.6 |
-| Both nodes, ShardMesh with a draft, prose and lists | 19–21 |
-| Both nodes, ShardMesh with a draft, code | 33 |
-| Both nodes, ShardMesh with a draft, chat page settings, four-turn chat | 21.6 |
+### How a model loads
 
-Models that need or suit the split, on the same two machines at chat page settings with a draft:
-
-| Model | Placement | Tokens per second |
-|---|---|---:|
-| Qwen3.8-27B Q8_0, 26.6 GiB, too big for either machine | Desktop 14 GiB VRAM + 3.9 GiB RAM, laptop 3.1 GiB VRAM + 5.7 GiB RAM | 4.2–6.7 |
-| Qwen3.6-35B-A3B IQ2_XXS, a MoE | Laptop 1.2 GiB VRAM, desktop 8.8 GiB VRAM | 18–43 |
-
-Estimates from the planner leave out the draft and are rough. The figures above were measured.
-
-Three conversations at once on the same pair, `--parallel 3`, through both nodes' APIs: 24–29 tokens/s in total over five runs, against 13–14 for one conversation in the same layout. One earlier run reached only 13, unexplained. Each conversation slows to about 10–12 tokens/s.
-
-A 1,860-token first message took about 6.5 s to the first token. Later turns of that chat took 0.7 to 1.3 s, with over 2,000 tokens of history behind them. Downloads share the link: chat dropped to about 5 tokens/s while a new model downloaded over the desktop's Wi-Fi.
-
-## How a model loads
-
-1. The orchestrator reads `config.json`, the tokenizer, and each safetensors header. This costs a few megabytes and pins one commit for every node.
+1. The coordinator reads the model's description: a GGUF header, or `config.json`, the tokenizer, and each safetensors header. This costs a few megabytes and pins one revision for every node.
 2. It plans which worker runs which layers, and which memory holds each unit.
-3. Each worker receives an allowlist of tensors and pulls those byte ranges directly from the model host, into a local cache of small per-unit files.
-4. The current model keeps serving through all of this. The switch happens only when every stage has its shards, and waits for a request boundary.
-5. Each worker moves units into their pools one tensor at a time, so a checkpoint never has to fit in RAM to reach a GPU.
+3. Each worker fetches only its units into a local cache, trying its own disk, then peers, then a holder of the file or the model host. Interrupted transfers retry and resume.
+4. The current model keeps serving through all of this. Entry workers let replies finish, then stages load. A stage whose job did not change keeps its weights.
+5. The new route goes to every node by gossip.
 
-If a worker fails during a load, the orchestrator replans around it and finished units stay cached. A rebalance fetches only what moved. Interrupted downloads resume from the last byte received, and `POST /admin/load/cancel` stops a load.
+If a live node fails to load, it gets two retries. After that, a replan goes ahead only if it moves under 2 GiB. Otherwise the load stops, says why, and the old model keeps serving. A dead node is replanned around whatever that moves.
 
-Two behaviors keep downloads down, and both are on by default:
+Two behaviors keep transfers down, both on by default. Shards in place count, because each plan is charged its download time spread over 20,000 tokens, so a near-tie stays where the shards already are. And workers share shards, falling back to the host if a peer fails or sends the wrong size or header.
 
-- **Shards in place count.** Each plan is charged its download time spread over 20,000 tokens, so a near-tie stays where the shards already are, while a real speedup still earns its download.
-- **Workers share shards.** A worker asks other workers for a unit before going to the model host, and falls back to the host if a peer fails or sends the wrong size or header.
-
-| To turn off | For one load | As an orchestrator default | On one node |
+| To turn off | For one load | For a control plane | On one node |
 |---|---|---|---|
-| Weighing cached shards | `shardmesh load MODEL --no-reuse-cached` | `--no-reuse-cached` | |
-| Fetching from peers | `shardmesh load MODEL --no-peer-fetch` | `--no-peer-fetch` | `--no-peer-fetch` |
+| Weighing cached shards | `load --no-reuse-cached` | `--no-reuse-cached` | |
+| Fetching from peers | `load --no-peer-fetch` | `--no-peer-fetch` | `--no-peer-fetch` |
 | Serving shards to peers | | | `--no-peer-serve` |
 
-`shardmesh load` loads a model on a running pool and also takes `--entry`, `--exit`, `--placement`, and `--context-tokens`. The same switches are `reuse_cached` and `peer_fetch` on `POST /admin/load`. Peers authenticate with the pool token, so set one if the network is shared.
+To check every byte against a list you trust, see [Models in the security guide](docs/SECURITY.md#models).
 
-Gated models need `HF_TOKEN` set on each worker. A worker can also read from a local folder through `worker_model_ids`.
-
-The Hub only publishes checksums for whole files, which a partial reader cannot verify. ShardMesh pins the commit and checks every unit's exact size, which catches truncation and mismatched revisions but not corruption inside a range.
-
-## Memory pools
+## Memory and placement
 
 Every worker reports its own pools, and nodes do not have to match.
 
@@ -304,21 +781,29 @@ Each pool reports its budget, free space, precision, and measured bandwidth. The
 - Never spends the same physical memory twice, whether two workers share a host's RAM or a GPU shares it through unified memory.
 - Promotes standby workers only when a model does not fit without them.
 
-The ends of the pipeline are not equal: the exit reads the whole output head for every token, while the entry reads one embedding row. So the planner tries every order through the workers and keeps the fastest (up to four workers exhaustively, then a sample of orders). Pin the ends with `entry_worker` and `exit_worker` on a load, or in the chat page's picker, for example to keep prompts and replies on a machine you trust. Only the entry sees prompt tokens and only the exit sees generated tokens, though activations passing through other stages can still reveal information. One worker pinned to both ends runs the whole model, because a worker holds one stage. If a pinned worker is lost, recovery drops the pin and logs it.
+The ends of the pipeline are not equal: the exit reads the whole output head for every token, while the entry reads one embedding row. So the planner tries every order through the workers and keeps the fastest (up to four workers exhaustively, then a sample of orders). Pin the ends with `--entry` and `--exit`, or in the chat page's picker, for example to keep prompts and replies on a machine you trust. Only the entry sees prompt tokens and only the exit sees generated tokens, though activations passing through other stages can still reveal information. One worker pinned to both ends runs the whole model. If a pinned worker is lost, recovery drops the pin and logs it.
 
-`placement: spread` (the default) uses every preferred worker and minimizes total token time, because a request crosses stages one after another. `compact` may skip workers, which is usually faster for one user because each hop costs a network round trip.
+An explicit `--gpu-memory-gb` is a hard allocator limit on CUDA and ROCm. RAM and disk budgets are enforced by placement. Disk is a capacity tier: expect it to be far slower than RAM once a model outgrows the OS page cache.
 
-An explicit `--gpu-memory-gb` is a hard allocator limit on CUDA and ROCm. RAM and disk budgets are enforced by placement. Disk is a capacity tier: expect it to be far slower than RAM once a model outgrows the OS page cache, and use `POST /admin/plan` or the chat page's picker to see the estimate first.
+The dashboard's "Memory for weights" counts weights only. Real use is higher, because KV cache, compute buffers, a draft model, and each worker's GPU context come on top.
 
-Put `--cache-dir` on a fast drive with room for the worker's share of the model. Every fetched unit stays there so that rebalances are cheap, whichever pool it runs from. `--cache-budget-gb` evicts the least recently used units from other models past that size.
+### Mixed hardware
+
+Workers do not use NCCL, CUDA IPC, or remote device pointers. Each process loads a PyTorch build that suits its own host, and activations cross the network as plain tensors, so backends and driver versions can differ between nodes.
+
+| Hardware | Status | Notes |
+|---|---|---|
+| NVIDIA CUDA | Tested | Toolkit and driver versions may differ by node |
+| AMD ROCm | Tested on Windows | With an RX 7900 XT, in BF16 and with GGUF. PyTorch exposes the device as `cuda` |
+| CPU | Tested | Slow, but useful as a stage or for testing |
+| Apple MPS | Experimental | Reported as unified memory. Not covered by the test suite |
+| Intel XPU | Experimental | Discovered as VRAM. Not covered by the test suite |
+
+Differences between backends can change sampling when logits are nearly tied. Bit-for-bit identity is not promised between different kernels.
 
 ## Precision
 
-Workers run in BF16 by default. Add `--dtype float32` to a node to run its VRAM and RAM at full precision, which doubles the memory each layer takes. The planner accounts for that, so BF16 and FP32 nodes can share a route.
-
-Published Qwen checkpoints are BF16, so FP32 raises the precision of computation and not of the stored weights. The disk tier maps files as they are and always runs in the checkpoint's own dtype.
-
-### FP8 checkpoints
+Workers run in BF16 by default. Add `--dtype float32` to a node to run its VRAM and RAM at full precision, which doubles the memory each layer takes. The planner accounts for that, so BF16 and FP32 nodes can share a route. Published Qwen checkpoints are BF16, so FP32 raises the precision of computation and not of the stored weights. The disk tier always runs in the checkpoint's own dtype.
 
 An FP8 release halves the download. In memory, the planner chooses per unit between two forms:
 
@@ -327,185 +812,164 @@ An FP8 release halves the download. In memory, the planner chooses per unit betw
 | Expanded to BF16 at load | Twice the FP8 size | Full speed: 143 Gparam/s on GPU, 14.5 on CPU |
 | Compact, expanded on each use | FP8 size | 20 Gparam/s on GPU, 0.65 on CPU |
 
-Compact is several times slower because PyTorch has no fused FP8 kernel, and neither RTX 30 nor RDNA3 GPUs compute in FP8 natively. So the planner expands what fits and keeps only the overflow compact, preferring the GPU for it, since compact on a GPU still beats BF16 in RAM. On a CPU it is slower than disk reads of BF16, so it is the last resort.
+Compact is several times slower because PyTorch has no fused FP8 kernel, and neither RTX 30 nor RDNA3 GPUs compute in FP8 natively. So the planner expands what fits and keeps only the overflow compact. The gain comes from avoiding disk and fitting models BF16 cannot, not from faster reads. The expansion rates are constants measured on one machine, so plans for other hardware are estimates.
 
-The gain comes from avoiding disk and from fitting models that BF16 cannot, not from faster reads. A model that fits comfortably in BF16 runs at the same speed from either release.
+## Networks and security
 
-The expansion rates are fixed constants in `planner.py`, measured on one machine, so plans for other hardware are estimates.
+The full guide is [ShardMesh security](docs/SECURITY.md).
 
-## Contribute CPU, RAM, and GPU
-
-The `node` launcher turns one physical computer into independent ShardMesh services. Start the orchestrator first:
-
-```powershell
-python -m shardmesh.orchestrator --host 0.0.0.0 --port 8000
-```
-
-Then run this on a contributing computer, using its LAN or Tailscale IP or MagicDNS name for `--advertise-host`:
-
-```powershell
-python -m shardmesh node `
-  --node-id workstation-01 `
-  --orchestrator-url http://100.80.10.1:8000 `
-  --advertise-host 100.80.10.21 `
-  --base-port 8200 `
-  --gpu-device cuda:0 `
-  --gpu-memory-gb 4.5 `
-  --cpu-threads 8 `
-  --weights-ram-gb 12 `
-  --weights-disk-gb 100 `
-  --cache-dir D:\shardmesh `
-  --ram-budget-gb 2
-```
-
-This starts up to three isolated services on consecutive ports:
-
-| Contribution | Default behavior |
+| Network | What to set |
 |---|---|
-| GPU | Preferred inference executor on `--base-port`. With `--weights-ram-gb` or `--weights-disk-gb`, this one worker spans all of them and its stage holds layers in each. |
-| CPU | Without weight memory on a GPU worker, a standby inference executor on the next port, promoted if preferred executors fail. Add `--cpu-active` to let the planner place it on normal routes. |
-| KV cache | `--ram-budget-gb` runs a bounded LRU KV-checkpoint service. This is separate from `--weights-ram-gb`: it protects sessions and does not hold weights. |
+| Closed network, no internet | Put GGUF files on any node with `--gguf-dir` and load by file name. Give each node a llama.cpp build with `--llama-dir`, because automatic downloads need GitHub |
+| LAN | Use TLS, or pass `--trusted-network` if nobody else can read the network. Without either, a node refuses to start, because credentials would cross the LAN unencrypted |
+| VLANs | As for a LAN. Discovery does not use broadcast, so `--join` works across VLANs. Open the control port and worker ports between them |
+| Tailscale | Nothing special. Links are encrypted, and addresses work from anywhere on the tailnet. Restrict the ports to pool members with tailnet grants |
+| Remote machines over the internet | Use a pool authority and TLS on every node. Expect each extra stage to cost the round trip between those machines |
 
-If the project is on a network path or an RDP redirected drive, the node copies the `shardmesh` package to local disk and runs workers from there. Importing from such a path can add over 500 ms to every HTTP request. Turn this off with `--no-local-copy`. A worker started directly with `python -m shardmesh.worker` skips the copy, so start it from a local checkout.
+A pool can mix these, as long as every node can reach every other node's advertised address.
 
-Any subset is valid. Use `--gpu-device none` for CPU/RAM-only nodes. `--gpu-device auto` uses every accelerator on the host, each as its own pool. A node that contributes nothing is rejected.
+Who can do what:
 
-The checkpoint budget is a hard process-local LRU limit, and the CPU thread count is applied to PyTorch.
-
-When a compute stage fails, the orchestrator first tries to restore the committed per-layer KV tensors from the RAM service into the replacement route. It replays the token prefix only when no usable checkpoint exists. The dashboard exposes contribution budgets, cache occupancy, snapshot traffic, restore counts, and the active cache service.
-
-## A real LAN or Tailscale pool
-
-Install the project on every machine. Make the pool's credentials once, and give every machine the same token. A node will not listen on a network without them, and will not send them across a plain LAN unless you pass `--trusted-network`. [ShardMesh security](docs/SECURITY.md) covers certificates for pools that need them.
-
-```powershell
-shardmesh pool init --dir pool-secrets
-$env:SHARDMESH_POOL_TOKEN = Get-Content pool-secrets\pool.token
-```
-
-On the orchestration machine, bind to its LAN or Tailscale address:
-
-```powershell
-python -m shardmesh.orchestrator --host 100.80.10.1 --port 8000
-```
-
-On each worker, bind to that machine's own reachable address and advertise the same address:
-
-```powershell
-python -m shardmesh.worker `
-  --host 100.80.10.21 `
-  --port 8100 `
-  --worker-id office-3060 `
-  --orchestrator-url http://100.80.10.1:8000 `
-  --advertise-url http://100.80.10.21:8100 `
-  --device auto
-```
-
-Use a unique `--worker-id` and the correct local address on every node. MagicDNS names can replace the `100.x` addresses.
-
-After the workers appear in `/admin/status`, load and place a model:
-
-```powershell
-$headers = @{ Authorization = "Bearer $env:SHARDMESH_POOL_TOKEN" }
-Invoke-RestMethod `
-  -Method Post `
-  -Uri http://100.80.10.1:8000/admin/load `
-  -Headers $headers `
-  -ContentType application/json `
-  -Body '{"model_id":"distilbert/distilgpt2"}'
-```
-
-When another worker joins, it remains standby. Activate it at a safe request boundary:
-
-```powershell
-Invoke-RestMethod -Method Post -Uri http://100.80.10.1:8000/admin/rebalance -Headers $headers
-```
-
-Tailscale encrypts transport and supplies device identity. ShardMesh still owns pool membership, placement, cache state, and recovery. Apply tailnet grants so only pool members can reach the orchestration and worker ports. Tailscale recommends grants for new policy configurations; see its [policy syntax](https://tailscale.com/docs/reference/syntax/policy-file) and [device tags](https://tailscale.com/docs/features/tags).
-
-An alternative is to bind each process to `127.0.0.1` and expose it to the tailnet with [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve). Advertise the resulting HTTPS MagicDNS URL. Do not use Funnel; these endpoints are intended to remain private.
-
-## Mixed hardware and drivers
-
-Workers do not use NCCL, CUDA IPC, or remote device pointers. Each process loads a PyTorch build compatible with its own host, then the wire protocol carries CPU safetensors activations. The receiving stage converts the tensor to its local device and execution dtype. Inside one worker, activations cross between pools the same way, so a layer's attention can run on the GPU while its experts run on the CPU.
-
-| Worker | Prototype support | Notes |
-|---|---:|---|
-| NVIDIA CUDA | Yes | CUDA toolkit and driver versions may differ by node. |
-| AMD ROCm | Yes | Install a ROCm-compatible PyTorch build on that node; PyTorch still exposes the device as `cuda`. Tested on Windows with an RX 7900 XT in BF16 and with GGUF. |
-| CPU | Yes | Slow, but useful as a stage or for testing. |
-| Apple MPS | Experimental | Reported as unified memory. Not covered by the current Windows test suite. |
-| Intel XPU | Experimental | Discovered as VRAM. Not covered by the current test suite. |
-
-Cross-backend numerical differences can change sampling when logits are nearly tied. Greedy inference should normally agree, but bit-for-bit identity is not promised between different kernel implementations.
-
-## Execution and recovery
-
-```text
-client -> orchestrator -> entry worker -> compute worker(s) -> exit worker
-             control       embeddings     transformer blocks   norm/head
-                              |                  |                  |
-                              +---------- local KV caches ----------+
-                                                 |
-                                      incremental checkpoints
-                                                 |
-                                          RAM contributor
-```
-
-Whichever node a client asks runs the reply itself, straight to the entry worker, and the entry worker runs the token loop. The coordinator only plans, so it is on no reply's path. Each request carries a pipeline epoch. If a worker disappears:
-
-1. The upstream stage reports the failed worker.
-2. The orchestrator quarantines that worker and computes a new contiguous placement.
-3. Surviving stages fetch any layers they are missing, load their new assignments, and atomically advance the epoch.
-4. The new stages restore committed KV tensors from the RAM contributor when available.
-5. If restore is unavailable or incomplete, the orchestrator replays the committed token prefix. Hybrid Qwen models always take this path, because their recurrent state changes whole on every token and cannot be checkpointed incrementally.
-6. Generation resumes. Stale responses from the old epoch are rejected.
-
-The planner estimates token time from each pool's bandwidth and the bytes a token reads there. It never inserts more workers into a latency-critical route than there are layers.
-
-Recovery has to download whatever the survivors lack, so with a large model a failure can pause generation for as long as that takes.
-
-## API surface
-
-| Method | Path | Purpose |
+| Caller | Credential | Can do |
 |---|---|---|
-| `GET` | `/health` | Liveness check. |
-| `GET` | `/chat` | Chat page. |
-| `GET` | `/dashboard` | Mesh telemetry and controls. |
-| `GET` | `/admin/status` | Workers, memory pools, route, epoch, and load progress. |
-| `POST` | `/admin/plan` | Show where a model would run, without downloading it. |
-| `POST` | `/admin/load` | Load a model. `wait: false` returns at once; progress is in `/admin/status`. |
-| `POST` | `/admin/load/cancel` | Stop the running load. Finished units stay cached. |
-| `GET` | `/admin/catalog` | Suggested models and supported architectures. |
-| `POST` | `/admin/rebalance` | Reconsider all live workers and activate a new epoch. |
-| `POST` | `/admin/nodes/{name}/cordon` | Move a node's share elsewhere for maintenance. `uncordon` puts it back. |
-| `POST` | `/admin/nodes/{name}/revoke` | Throw a node out for good. |
-| `GET`, `POST` | `/admin/keys` | List or create API keys. `DELETE /admin/keys/{name}` removes one. |
-| `GET` | `/ready`, `/metrics` | Readiness for load balancers, and Prometheus metrics. |
-| `GET` | `/v1/models` | OpenAI-style model listing. |
-| `POST` | `/v1/completions` | Text completion, streaming with `stream: true`. |
-| `POST` | `/v1/chat/completions` | Chat completion, streaming with `stream: true`. `enable_thinking` switches reasoning on models that support it. |
+| Node, with a pool authority | Certificate, over TLS or as a ticket | Node routes only |
+| Node, without one | Pool token | Everything |
+| Admin | API key, role `admin` | Load models, cordon, read metrics, and all user actions. Manage keys and revoke nodes in a pool without an authority |
+| User | API key, role `user` | Chat, completions, read status |
+| Owner | The authority's private key | Add, remove, and revoke, in a pool with an authority |
 
-Send `Authorization: Bearer <key>` to every endpoint except `/health`, `/ready`, and the pages. `/health` tells strangers only that the node is up. Requests are limited to 16 MiB.
+Antivirus that scans HTTPS replaces certificates, which ends mutual TLS. Nodes refuse to trust it, so the failure is safe, and a node reports it plainly. Use Tailscale with tickets, which need no TLS at all, or exclude the pool's ports from scanning.
 
-## Verification
+## Running a pool
 
-```powershell
-python -m pip install "transformers>=4.42" pytest
-python -m pytest -q
+The full guide is [Operating ShardMesh](docs/OPERATIONS.md).
+
+**Start at boot.** On Windows, `scripts\install_node_task.ps1` registers a scheduled task. On Linux, use `packaging/shardmesh-node.service`, which has not been run on a real machine yet. A node restarts its own services, so these only have to start it once.
+
+**Maintenance.** `shardmesh cordon NAME` lets replies finish and moves that node's layers away. The node stays in the mesh. `shardmesh uncordon NAME` brings it back. A cordon is shared by every node and survives restarts. It is refused if the pool could not hold the model without that node, and if it would transfer over 2 GiB, unless you add `--force`.
+
+**Upgrades.** Nodes refuse peers on a different `PROTOCOL_VERSION`, and the refusal names both versions. Upgrade all nodes together when that number changes. Otherwise, restart them one at a time, and the mesh carries on around each one.
+
+**Backups.** Keep the authority folder safe and offline. Losing `ca.key` means reissuing every certificate, and anyone who gets it controls the pool. Route state is copied to every node, so it needs no backup.
+
+**Files.**
+
+| What | Where | Notes |
+|---|---|---|
+| Route state | `orchestrator-state.json` in the state folder | Copied to every node by gossip |
+| Keys and revocations | `access.json` in the ShardMesh folder | Copied to every node by gossip |
+| Audit log | `audit.jsonl` in the state folder | Rotates at 64 MiB, keeping one old file. Each node logs only what it served |
+| Node log | `--log-file` | Nothing is kept unless you set this |
+| Fetched shards | `--cache-dir` | Evicted past `--cache-budget-gb` |
+| Stage files | Inside the cache | Rebuilt from shards when a stage moves. Count double the node's share |
+
+**Metrics.** `/metrics` serves Prometheus format on every node, to an admin key. All names start with `shardmesh_`.
+
+| Metric | Meaning |
+|---|---|
+| `serving` | Whether this node can serve replies. Alert at 0 |
+| `workers_quarantined` | Workers held out of the route. Alert above 0 |
+| `workers_live`, `worker_live` | Workers heard from recently, overall and per worker |
+| `mesh_members` | Control planes reachable from here. Alert below the node count |
+| `mesh_term`, `coordinator`, `epoch` | Leadership term, whether this node coordinates, and the pipeline epoch |
+| `stream_fallbacks_total` | Replies that fell back to replay. Should stay near zero, because fallbacks hide trouble |
+| `stage_errors_total` | Requests a stage refused. Nobody is quarantined for these, so a real fault shows here |
+| `stage_restarts_total`, `worker_stage_restarts_total` | Replays after a stage restart, and stage processes restarted |
+| `recoveries_total` | Pipeline repairs during a reply |
+| `requests_total`, `tokens_generated_total`, `replies_in_flight` | Traffic through this node |
+| `token_latency_ms`, `worker_compute_ms` | Time per token, and compute per pass |
+| `worker_stages_kept_total` | Reconfigures that moved no weights |
+| `worker_draft_tokens_per_pass` | Tokens per speculative pass. Near 1 means the draft is not helping |
+
+## Troubleshooting
+
+| What you see | Cause | What to do |
+|---|---|---|
+| `reachable by other machines and this pool has no credentials` | No token or authority on a node listening on the network | Run `shardmesh pool init`, or pass `--open` on a network you trust completely |
+| `would carry the pool's credentials unencrypted` | The node would send credentials across a plain network | Use Tailscale or TLS, or pass `--trusted-network` |
+| The chat page keeps asking for a token | A wrong key, or a pool token in a pool with certificates | Use an API key. With certificates, the pool token does nothing |
+| `no model is ready; load one first` | Nothing is loaded, or a load is still running | Load a model, or check progress on the dashboard |
+| `shardmesh load` cannot connect | It assumes the demo's port | Pass `--url http://NODE:8209` |
+| A node shows as standby | Its share moved away after a failure, and the model still fits without it | `POST /admin/rebalance` when you want the layout back. It returns by itself when idle |
+| `failed to load, and replanning would move` | A live node could not load its stage, and moving its share would be large | Read the error after the colon. The old model keeps serving meanwhile |
+| `no node could send bytes` | A peer transfer failed after retries. The message ends with the reason | Check the link, and that the node holding the file is up |
+| `CERTIFICATE_VERIFY_FAILED`, or an event mentioning antivirus | Something replaced a certificate | Exclude the pool's ports from scanning, or use tickets over Tailscale |
+| A node reports HTTP 426 | Nodes are on different versions | Upgrade them together |
+| The ROCm build sees no GPU | `hipblas.dll` is missing | Use the node's PyTorch ROCm environment, which carries it |
+| Far slower than usual | VRAM spilled to shared memory, or a stray process holds the GPU | Check GPU memory per process. A stage with a large "shared" figure needs a reload |
+| A reply went quiet | A stage or link is stuck | Read `GET /internal/diag/tasks` on each node to see what everything is waiting on |
+| `the rest of the pool cannot hold this model` | A cordon would leave nowhere for that node's layers | Add memory, or load a smaller model first |
+
+## Measured performance
+
+Qwen3.6-27B Q4_K_M, split across an RX 7900 XT desktop and an RTX 3060 laptop, both on Wi-Fi with a 15 ms ping:
+
+| Setup | Tokens per second |
+|---|---:|
+| Desktop alone, llama.cpp, no split (ceiling) | 35.2 |
+| Both nodes, llama.cpp's own RPC, whole file on one node | 13.6 |
+| Both nodes, ShardMesh, no draft | 14.6 |
+| Both nodes, ShardMesh with a draft, prose and lists | 19–21 |
+| Both nodes, ShardMesh with a draft, code | 33 |
+| Both nodes, ShardMesh with a draft, chat page settings, four-turn chat | 21.6 |
+
+Models that need or suit the split, on the same two machines:
+
+| Model | Placement | Tokens per second |
+|---|---|---:|
+| Qwen3.8-27B Q8_0, 26.6 GiB, too big for either machine | Desktop 14 GiB VRAM + 3.9 GiB RAM, laptop 3.1 GiB VRAM + 5.7 GiB RAM | 4.2–6.7 |
+| Qwen3.6-35B-A3B IQ2_XXS, a MoE with 256 experts | Laptop 1.2 GiB VRAM, desktop 8.8 GiB VRAM | 27 for one conversation, 48 in total for three |
+
+A 1,860-token first message took about 6.5 s to the first token. Later turns of that chat took 0.7 to 1.3 s, with over 2,000 tokens of history behind them. Downloads share the link: chat dropped to about 5 tokens per second while a new model downloaded over the desktop's Wi-Fi.
+
+Planner estimates leave out the draft and are rough. The figures above were measured. For failure timings, see [What happens when something fails](#what-happens-when-something-fails).
+
+## Development
+
+```bash
+python -m pip install -e ".[test,pool]"
 ```
 
-Adapter tests compare every family with the reference `transformers` implementation, and skip families newer than the installed release. Run them under a current `transformers` as well to cover all of them.
-
-To compare any running local checkpoint with an unsharded reference using the same execution dtype:
-
-```powershell
-python scripts\verify_model.py --model D:\project\models\distilgpt2 --dtype float32
+```bash
+python -m pytest tests -q
 ```
+
+Adapter tests compare every family with the reference `transformers` implementation, and skip families newer than the installed release, so run them under a current `transformers` as well. TLS tests skip on a machine where antivirus intercepts loopback. `tests/test_readme.py` fails if an option, setting, endpoint, or metric is missing from this file.
+
+`scripts/ci_local.sh` runs what CI runs from a clean clone, which catches anything only your machine has.
+
+| Script | What it does |
+|---|---|
+| `scripts/build_tiny_model.py` | Builds the offline test model |
+| `scripts/verify_model.py` | Compares a running checkpoint with an unsharded reference |
+| `scripts/build_diagrams.py` | Redraws the diagrams in this file |
+| `scripts/ci_local.sh` | Runs the tests from a clean clone |
+| `scripts/install_node_task.ps1` | Starts a node at boot on Windows |
+| `scripts/launch_lan_node_55.py`, `scripts/launch_lan_node_55_rocm.py`, `scripts/bootstrap_remote_node_55.py`, `scripts/bootstrap_remote_rocm_node_55.py` | Launchers for the test pool, as examples |
+
+| Code | What it holds |
+|---|---|
+| `shardmesh/orchestrator.py` | The control plane: API, planning, repair, gossip handling |
+| `shardmesh/worker.py` | A worker: stages, the token loop, merged passes, fetching |
+| `shardmesh/node.py` | The launcher that supervises a node's services |
+| `shardmesh/mesh.py` | Membership and leader election, as pure logic |
+| `shardmesh/planner.py`, `shardmesh/memory.py` | Placement, and memory pool discovery |
+| `shardmesh/gguf.py`, `shardmesh/gguf_stage.py`, `shardmesh/llamacpp.py`, `shardmesh/llama_host.py` | GGUF parsing, stage files, the llama.cpp binding, and the stage process |
+| `shardmesh/weights.py` | Readers, the unit cache, and hash checks |
+| `shardmesh/access.py`, `shardmesh/pool.py`, `shardmesh/tickets.py`, `shardmesh/tls.py` | Keys, certificates, signed entries, tickets, and TLS |
 
 ## Current limits
 
-- Conversation reuse covers GGUF chat only. Other models reprocess the whole conversation each turn.
+Trust and status:
+
+- Two machines is the most this has run on. The longest test ran under an hour. No human has audited it, and reviews by AI do not show it is free of flaws.
+- A node in the route can read prompts and return wrong answers, and nothing detects that. Certificates limit who is in a pool. They do not make a hostile member safe.
+- An owned network has an owner. The ownerless version in the diagrams is a proposal, and is not built.
+- One model runs at a time.
+- GitHub Actions has not run yet, because the account's jobs do not start. The same steps pass locally on Linux and Windows.
+
+Behavior:
+
 - Prompts do not overlap across stages: one stage finishes before the next begins, so a long first message costs the sum of them.
 - Hybrid Qwen models on the PyTorch path process prompts token by token. This is exact, but slower than a chunked kernel on long prompts.
 - Long-context rope scaling (YaRN) and sliding-window attention are refused rather than run incorrectly.
@@ -515,13 +979,9 @@ python scripts\verify_model.py --model D:\project\models\distilgpt2 --dtype floa
 - A stage file duplicates that node's cached units on disk.
 - GGUF files are parsed by native code in the stage process, so load them only from sources you trust.
 - The planner uses measured memory bandwidth and a fixed cost per network hop, but not per-layer benchmarks or pairwise network telemetry. Its disk estimate assumes cold reads, so warm runs beat it.
-- Workers on one host split shared RAM evenly during planning, which can refuse a plan that an uneven split would allow.
-- There is one active RAM checkpoint service per route. Snapshots are sent in the background and are not yet replicated or compressed. If the store is behind when a stage fails, recovery replays the prompt instead.
-- With two nodes a split network leaves two coordinators until it heals. Nothing can be corrupted, but neither side can know it is the minority.
-- A reply is lost if the node its client is connected to dies. The chat page restarts it through another node, and API clients should do the same.
-- Single-token steps from different conversations share a pass through each stage, but steps with speculative guesses do not, so a draft model limits merging. With no draft, four conversations reached 32 tok/s on a stage that gave 12 taking turns. Across two stages the same load gained only 10%, from 34 to 37, because the stages stagger the conversations. `--no-merge-passes` turns it off. Past `--parallel` they queue at the entry worker, and past 32 waiting they are refused.
+- Workers on one host split shared RAM evenly during planning, which can refuse a plan an uneven split would allow.
+- There is one active RAM checkpoint service per route. Snapshots are not yet replicated or compressed. If the store is behind when a stage fails, recovery replays the prompt.
+- With two nodes, a split network leaves two coordinators until it heals. Nothing can be corrupted, but neither side can know it is the minority.
+- A reply is lost if the node its client is connected to dies.
 - Multi-turn reuse keeps one conversation per sequence, so more conversations than sequences push each other out and reread their history.
 - Mesh membership is meant for tens of nodes: every worker checks in with every control plane.
-- Prompt contents are visible to participating compute workers, and every node is fully trusted. See [ShardMesh security](docs/SECURITY.md).
-
-These boundaries are deliberate: the prototype validates exact layer execution, direct activation routing, heterogeneous memory and runtimes, KV ownership, joins, and failure recovery before adding more aggressive scheduling.
