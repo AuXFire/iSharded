@@ -48,6 +48,9 @@ PARTIAL = ".part"
 FLUSH_SECONDS = 10.0
 # States waiting for a slow disk stay in RAM, past its budget, up to this much.
 WRITE_BACKLOG_BYTES = 1024**3
+# Free disk that states leave alone, as a model's cache does, so that they can never
+# stop weights from loading. A state is only ever worth less than the weights.
+DISK_RESERVE_BYTES = 2 * 1024**3
 PREFIX = "prefix"
 HISTORY = "history"
 # Rows in one pass. Every stage has to use the same number, as cuts depend on it.
@@ -144,6 +147,7 @@ class StateStore:
         self.refused = 0
         self.damaged = 0
         self.write_failures = 0
+        self.disk_full = 0
         self.writes: queue.Queue[str | None] = queue.Queue()
         self.writer: threading.Thread | None = None
         if self.folder is not None:
@@ -167,6 +171,15 @@ class StateStore:
             path.unlink(missing_ok=True)
         except OSError:
             self.leftovers.add(path)
+
+    def has_room(self, size: int) -> bool:
+        """Whether a file this big leaves the disk its reserve."""
+        if self.folder is None:
+            return False
+        try:
+            return shutil.disk_usage(self.folder).free - size >= DISK_RESERVE_BYTES
+        except OSError:
+            return False
 
     def _clear_leftovers(self) -> None:
         for path in list(self.leftovers):
@@ -225,6 +238,9 @@ class StateStore:
             if entry is None or entry.on_disk or entry.data is None:
                 return
             data, kind, length = entry.data, entry.kind, entry.length
+        if not self.has_room(int(data.size)):
+            self.disk_full += 1
+            return  # it stays in RAM, and survives everything but a crash
         target = self._file(key)
         partial = target.with_suffix(PARTIAL)
         header = json.dumps({"length": length, "size": int(data.size), "kind": kind, "crc": zlib.crc32(data)}).encode()
@@ -394,6 +410,7 @@ class StateStore:
             "refused": self.refused,
             "damaged": self.damaged,
             "write_failures": self.write_failures,
+            "disk_full": self.disk_full,
         }
 
     def flush(self, seconds: float = FLUSH_SECONDS) -> bool:

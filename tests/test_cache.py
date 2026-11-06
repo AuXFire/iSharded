@@ -23,6 +23,7 @@ from isharded.statestore import (
     PASS_ROWS,
     PREFIX,
     PrefixIndex,
+    clear_other_stores,
     cut_points,
     keys_at,
     pass_ends,
@@ -411,10 +412,28 @@ def stage_runtime(tmp_path, handler, held=(), peers=("http://peer:1",)):
     runtime = worker.WorkerRuntime.__new__(worker.WorkerRuntime)
     runtime.gguf = SimpleNamespace(host=Host(held))
     runtime.namespace, runtime.state_peers, runtime.fetched, runtime.copies_fetched = "space", list(peers), set(), 0
-    runtime.pool_token, runtime.cache_dir = None, tmp_path
-    (tmp_path / "states" / "space").mkdir(parents=True)
+    runtime.pool_token, runtime.cache_dir, runtime.worker_id = None, tmp_path, "w1"
+    (runtime.state_root / "space").mkdir(parents=True)
     runtime.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     return runtime
+
+
+def test_workers_sharing_a_cache_never_clear_each_others_states(tmp_path):
+    """A node's workers share --cache-dir, and each clears whatever is not its own."""
+    first, second = (worker.WorkerRuntime.__new__(worker.WorkerRuntime) for _ in range(2))
+    first.cache_dir = second.cache_dir = tmp_path
+    first.worker_id, second.worker_id = "node-gpu", "node-cpu"
+    (first.state_root / "layers-0-14").mkdir(parents=True)
+    (second.state_root / "layers-14-28").mkdir(parents=True)
+    clear_other_stores(second.state_root, {"another-model"})
+    assert (first.state_root / "layers-0-14").is_dir()
+    assert first.state_root != second.state_root
+
+
+def test_a_worker_name_cannot_lead_out_of_the_cache(tmp_path):
+    runtime = worker.WorkerRuntime.__new__(worker.WorkerRuntime)
+    runtime.cache_dir, runtime.worker_id = tmp_path, "../../somewhere/else"
+    assert runtime.state_root.parent == tmp_path / "states"
 
 
 def test_a_stage_holding_a_state_fetches_nothing(tmp_path):
@@ -429,7 +448,7 @@ def test_a_stage_taking_over_fetches_its_copy(tmp_path):
     assert asyncio.run(runtime.ensure_state("abc"))
     assert runtime.gguf.host.adopted == ["abc"]
     assert "abc" in runtime.fetched and runtime.copies_fetched == 1
-    assert (tmp_path / "states" / "space" / "abc.part").read_bytes() == b"a state"
+    assert (runtime.state_root / "space" / "abc.part").read_bytes() == b"a state"
 
 
 def test_a_stage_tries_each_node_for_a_copy(tmp_path):
@@ -575,6 +594,40 @@ def test_nodes_that_are_down_keep_no_copies():
     held = registered("c", "m3")
     held.quarantined = True
     assert holders({"a": registered("a", "m1"), "b": gone, "c": held}, ["a"]) == {}
+
+
+def plane_with_caches(**caches):
+    plane = Orchestrator.__new__(Orchestrator)
+    plane.workers = {name: SimpleNamespace(health={"telemetry": {"cache": cache}}) for name, cache in caches.items()}
+    plane.route = [SimpleNamespace(worker_id=name) for name in caches]
+    return plane
+
+
+def test_the_saving_can_be_read_off_one_number():
+    cache = {"prompt_tokens_computed": 250, "tokens_reused": {"prefix_ram": 600, "history_disk": 150}, "ram_bytes": 10, "disk_bytes": 20, "held_bytes": 5}
+    summary = plane_with_caches(a=cache, b=cache).cache_summary()
+    assert summary["saved_percent"] == 75.0
+
+
+def test_a_token_is_counted_once_however_many_stages_ran_it():
+    cache = {"prompt_tokens_computed": 250, "tokens_reused": {"prefix_ram": 750}}
+    summary = plane_with_caches(a=cache, b=cache, c=cache).cache_summary()
+    assert (summary["prompt_tokens_computed"], summary["prompt_tokens_reused"]) == (250, 750)
+
+
+def test_bytes_held_add_up_across_nodes():
+    summary = plane_with_caches(a={"ram_bytes": 10, "held_bytes": 1}, b={"ram_bytes": 20, "held_bytes": 2}).cache_summary()
+    assert (summary["ram_bytes"], summary["held_bytes"]) == (30, 3)
+
+
+def test_with_nothing_run_yet_there_is_no_percentage():
+    assert plane_with_caches(a={}).cache_summary()["saved_percent"] is None
+
+
+def test_with_no_route_the_summary_is_still_a_summary():
+    plane = plane_with_caches(a={"ram_bytes": 10})
+    plane.route = []
+    assert plane.cache_summary()["prompt_tokens_computed"] == 0
 
 
 def test_both_ends_agree_on_what_a_store_is_called():

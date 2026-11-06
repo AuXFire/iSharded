@@ -232,6 +232,29 @@ def test_a_state_being_sent_can_still_be_replaced(tmp_path):
     store.close()
 
 
+def test_states_leave_the_disk_its_reserve(tmp_path, monkeypatch):
+    """States are worth less than weights, so they must never be what stops a model loading."""
+    store = filled(tmp_path)
+    usage = type("Usage", (), {"free": statestore.DISK_RESERVE_BYTES + 5})
+    monkeypatch.setattr(statestore.shutil, "disk_usage", lambda path: usage)
+    store.put("a", blob(10, 6), 1)
+    store.flush()
+    assert store.file_of("a") is None
+    assert store.stats()["disk_full"] == 1
+    assert store.get("a")[0].tolist() == [6] * 10, "it stays in RAM, and a reply never notices"
+    store.close()
+
+
+def test_a_disk_with_room_takes_states_as_usual(tmp_path, monkeypatch):
+    store = filled(tmp_path)
+    usage = type("Usage", (), {"free": statestore.DISK_RESERVE_BYTES + 50})
+    monkeypatch.setattr(statestore.shutil, "disk_usage", lambda path: usage)
+    store.put("a", blob(10), 1)
+    store.flush()
+    assert store.file_of("a") is not None
+    store.close()
+
+
 def test_one_bad_write_does_not_stop_the_ones_after_it(tmp_path, monkeypatch):
     store = filled(tmp_path)
     real_write = store._write

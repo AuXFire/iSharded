@@ -1191,8 +1191,8 @@ def stage_on_a_silent_link(tmp_path, url, host=None):
     runtime = worker.WorkerRuntime.__new__(worker.WorkerRuntime)
     runtime.gguf = SimpleNamespace(host=host or Host())
     runtime.namespace, runtime.state_peers, runtime.fetched, runtime.copies_fetched = "space", [url], set(), 0
-    runtime.pool_token, runtime.cache_dir = None, tmp_path
-    (tmp_path / "states" / "space").mkdir(parents=True)
+    runtime.pool_token, runtime.cache_dir, runtime.worker_id = None, tmp_path, "w1"
+    (runtime.state_root / "space").mkdir(parents=True)
     runtime.client = httpx.AsyncClient(trust_env=False)
     return runtime
 
@@ -1234,7 +1234,7 @@ def test_fetching_from_a_silent_holder_gives_up_and_leaves_nothing(tmp_path, mon
 
     ready, spent = timed_against_a_silent_peer(work)
     assert not ready and spent < 3
-    assert not (tmp_path / "states" / "space" / "abc.part").exists()
+    assert not list(tmp_path.rglob("*.part"))
 
 
 def test_a_copy_to_a_silent_holder_gives_up_and_costs_nothing_else(tmp_path, monkeypatch):

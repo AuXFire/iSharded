@@ -716,7 +716,8 @@ class WorkerRuntime:
 
     @property
     def state_root(self) -> Path:
-        return self.cache_dir / "states"
+        """This worker's own, because workers on a node share a cache and clear what is not theirs."""
+        return self.cache_dir / "states" / re.sub(r"[^A-Za-z0-9._-]", "_", self.worker_id)
 
     @staticmethod
     def state_namespace(request: ConfigureRequest) -> str:
@@ -1776,8 +1777,11 @@ async def receive_copy(
         raise HTTPException(status_code=400, detail=f"bad {META_HEADER} header") from exc
     if not NAME.fullmatch(str(namespace)) or not NAME.fullmatch(str(key)) or (replaces and not NAME.fullmatch(str(replaces))):
         raise HTTPException(status_code=400, detail="a state is named by a digest")
-    if int(request.headers.get("content-length", 0)) > runtime.held.disk_bytes:
+    size = int(request.headers.get("content-length", 0))
+    if size > runtime.held.disk_bytes:
         raise HTTPException(status_code=413, detail="this state is larger than this node keeps")
+    if not runtime.held.has_room(size):
+        raise HTTPException(status_code=507, detail="this node's disk is too full to keep a copy")
     name = f"{namespace}.{key}"
     partial = runtime.held.folder / (name + PARTIAL)
     try:

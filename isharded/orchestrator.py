@@ -1970,6 +1970,27 @@ class Orchestrator:
             self.embedding_tokens += sum(map(len, pack))
         return vectors, sum(lengths)
 
+    def cache_summary(self) -> dict[str, Any]:
+        """What reuse is saving. Every stage runs the same rows, so the entry speaks for the route.
+
+        Adding the stages up would count each token once per stage. Bytes are real on
+        each node, so those do add up. RAM and disk are mostly the same states twice.
+        """
+        caches = {name: ((record.health or {}).get("telemetry") or {}).get("cache") or {} for name, record in self.workers.items()}
+        entry = caches.get(self.route[0].worker_id, {}) if self.route else {}
+        computed = entry.get("prompt_tokens_computed", 0)
+        sources = entry.get("tokens_reused") or {}
+        reused = sum(sources.values())
+        return {
+            "prompt_tokens_computed": computed,
+            "prompt_tokens_reused": reused,
+            "tokens_reused": sources,
+            "saved_percent": round(100 * reused / (computed + reused), 1) if computed + reused else None,
+            "ram_bytes": sum(item.get("ram_bytes", 0) for item in caches.values()),
+            "disk_bytes": sum(item.get("disk_bytes", 0) for item in caches.values()),
+            "held_bytes": sum(item.get("held_bytes", 0) for item in caches.values()),
+        }
+
     def metrics_text(self) -> str:
         """This node's numbers in Prometheus format. Every node reports for itself."""
         lines: list[str] = []
@@ -1984,6 +2005,9 @@ class Orchestrator:
         add("requests_total", self.requests_total, "Replies started on this node", "counter")
         add("tokens_generated_total", self.tokens_generated, "Tokens produced for this node's clients", "counter")
         add("embedding_tokens_total", self.embedding_tokens, "Tokens embedded for this node's clients", "counter")
+        saving = self.cache_summary()
+        add("prompt_tokens_computed_total", saving["prompt_tokens_computed"], "Prompt tokens the route computed", "counter")
+        add("prompt_tokens_reused_total", saving["prompt_tokens_reused"], "Prompt tokens the route restored instead of computing", "counter")
         add("stream_fallbacks_total", self.stream_fallbacks, "Replies that fell back to replay; should stay near zero", "counter")
         add("stage_errors_total", self.stage_errors, "Requests a stage refused; nobody is quarantined for these", "counter")
         add("recoveries_total", self.recoveries_total, "Pipeline repairs during a reply", "counter")
@@ -2301,6 +2325,7 @@ class Orchestrator:
                 "tokens_per_second_ema": (
                     1000 / self.token_latency_ms_ema if self.token_latency_ms_ema else None
                 ),
+                "cache": self.cache_summary(),
             },
             "virtual_hardware": {
                 "workers": sum(record.live for record in self.workers.values()),
