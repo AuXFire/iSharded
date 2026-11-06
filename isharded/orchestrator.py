@@ -34,7 +34,7 @@ from .lanes import LaneDoor
 from .mcp_server import INVALID_REQUEST, McpHandler, MeshTools, RpcError, answer_http
 from .mesh import GOSSIP_SECONDS, ControlMesh
 from .models import Adapter, GgufAdapter, SUPPORTED_TYPES, UnsupportedModel, create_adapter
-from .planner import AMORTIZE_TOKENS, HOP_MS, Candidate, ModelProfile, PlacementError, memory_report, plan_placement
+from .planner import AMORTIZE_TOKENS, UNREACHABLE_LINK_MS, Candidate, ModelProfile, PlacementError, link_ms, memory_report, plan_placement
 from .protocol import (
     hosts_model,
     pass_seconds,
@@ -109,11 +109,10 @@ LOGGED_EVENTS = {"failure", "recovery", "mesh", "rebalance", "security"}
 ACTIVATE_RETRIES = 2
 ACTIVATE_RETRY_SECONDS = 5.0
 # How long a measured link is believed, how many tries make one measurement, and the
-# most a load waits for measuring. A link nobody could cross counts as this slow.
+# most a load waits for measuring.
 LINK_TTL_SECONDS = 600.0
 LINK_PROBE_ROUNDS = 3
 LINK_PROBE_SECONDS = 30.0
-UNREACHABLE_LINK_MS = 10_000.0
 # Replanning around a worker that is alive but failed may move this much at most.
 REPLAN_MOVE_LIMIT_BYTES = 2 * 1024**3
 # A restarted worker is back in seconds with its weights on disk, while moving them
@@ -451,7 +450,7 @@ def describe_plan(target: ModelTarget, route: list[StageAssignment]) -> dict[str
     # costs its kernel launches, and every stage boundary costs a network hop.
     milliseconds = sum(
         max(stage.estimated_ms_per_token, (stage.end_layer - stage.start_layer) * LAYER_FLOOR_MS) for stage in route
-    ) + HOP_MS * (len(route) - 1)
+    ) + sum(link_ms(runtime.links, left.worker_id, right.worker_id) for left, right in zip(route, route[1:]))
     download = sum(
         target.units[item.unit].nbytes
         for stage in route
@@ -1202,6 +1201,7 @@ class Orchestrator:
             self._with_holdings(standby, target),
             target.profile,
             spread=target.spread,
+            links=self.links,
             **pins,
         )
         if target.embedding and len(route) > 1:

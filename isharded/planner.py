@@ -20,15 +20,23 @@ blocks, so those models get a search over every worker order.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import permutations
 from typing import Any, Callable
 
 from .protocol import MemoryPool, StageAssignment, UnitPlacement, WeightUnit
 
-# Cost of one activation hop, in the same units as the rest of the estimate.
-# Measured round trip between two machines on Wi-Fi; a wired LAN is far lower.
+# Cost of one activation hop, in the same units as the rest of the estimate, for
+# two workers with no measured link. A stage waits for the next stage's reply, so
+# a hop costs its full round trip: on a mesh across countries, 713 of 794 ms a token.
 HOP_MS = 25.0
+# What a link that failed its measurement counts as. A route avoids one if it can.
+UNREACHABLE_LINK_MS = 10_000.0
+# A route that needs an unreachable link loses to any that does not, even one that
+# leaves VRAM open, so this outweighs every open layer a route could have.
+DEAD_LINK_PENALTY = 1_000_000
+# Up to this many workers, the shortest way through their links is worked out.
+MAX_LINKED_WORKERS = 12
 # Kept back on accelerators for activations and allocator overhead.
 WORKSPACE_BYTES = 256 * 1024**2
 WORKSPACE_SHARE = 0.1
@@ -53,8 +61,8 @@ PEER_FETCH_BYTES_PER_SECOND = 100e6
 # Up to this many workers, every order through them is tried.
 MAX_PERMUTED_WORKERS = 4
 # The same for models with a block rule, which have few places to cut. The work
-# doubles with each worker: 10 took about 0.3 s, and 12 about a second.
-MAX_SEARCHED_WORKERS = 10
+# more than doubles with each worker, since a hop depends on who came before.
+MAX_SEARCHED_WORKERS = 8
 # When a plan must use RAM and fast memory is as full either way, how much slower
 # the whole route may get to speed up its slowest stage. A judgment, not a
 # measurement.
@@ -82,6 +90,8 @@ class Candidate:
     cached: frozenset[str] = frozenset()
     peer_units: frozenset[str] = frozenset()
     fetch_bytes_per_second: float = 0.0
+    # Measured round trip in ms from this worker to others, by worker id.
+    links: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -399,6 +409,18 @@ def _capacities(candidates: list[Candidate], shrink: float, workspace: int = 0) 
     }
 
 
+def link_ms(links: dict[tuple[str, str], float], source: str, target: str) -> float:
+    """A hop's round trip, measured either way, or ``HOP_MS`` if nobody knows."""
+    known = links.get((source, target), links.get((target, source)))
+    return HOP_MS if known is None else known
+
+
+def _hop_ms(left: Candidate, right: Candidate) -> float:
+    """The round trip from one stage's worker to the next one's."""
+    known = left.links.get(right.worker_id, right.links.get(left.worker_id))
+    return HOP_MS if known is None else known
+
+
 class _Packer:
     """Packs stages for one set of capacities, for the searches to compare.
 
@@ -461,13 +483,17 @@ def _partition(
     # best[i][j]: lowest cost covering layers [0, j) using candidates [0, i).
     best = [[INFEASIBLE] * (layers + 1) for _ in range(count + 1)]
     choice: list[list[int | None]] = [[None] * (layers + 1) for _ in range(count + 1)]
+    # The worker that best path ends on, since the next hop starts there.
+    ending: list[list[Candidate | None]] = [[None] * (layers + 1) for _ in range(count + 1)]
     best[0][0] = 0.0
     for index in range(1, count + 1):
+        candidate = candidates[index - 1]
         for end in range(layers + 1):
-            skippable = not spread and candidates[index - 1].worker_id not in required
+            skippable = not spread and candidate.worker_id not in required
             if skippable and best[index - 1][end] < best[index][end]:
                 best[index][end] = best[index - 1][end]
                 choice[index][end] = end  # this worker is skipped
+                ending[index][end] = ending[index - 1][end]
             for start in range(0, end, profile.layer_step):
                 previous = best[index - 1][start]
                 if previous == INFEASIBLE:
@@ -475,10 +501,13 @@ def _partition(
                 cost = stage_cost(index - 1, start, end)
                 if cost == INFEASIBLE:
                     continue
-                total = previous + cost + BALANCE_WEIGHT * cost * cost + (HOP_MS if start else 0.0)
+                before = ending[index - 1][start]
+                hop = _hop_ms(before, candidate) if start and before else 0.0
+                total = previous + cost + BALANCE_WEIGHT * cost * cost + hop
                 if total < best[index][end]:
                     best[index][end] = total
                     choice[index][end] = start
+                    ending[index][end] = candidate
     if best[count][layers] == INFEASIBLE:
         return None
 
@@ -500,11 +529,12 @@ def _partition(
 _Score = tuple[int, int, float, float]
 
 
-def _extended(score: _Score, found: _Score, opening: bool) -> _Score:
-    """A route's score after one more stage."""
+def _extended(score: _Score, found: _Score, hop: float) -> _Score:
+    """A route's score after one more stage, reached over a hop of this many ms."""
     open_layers, slow, read, cost = found
-    total = score[3] + cost + BALANCE_WEIGHT * cost * cost + (0.0 if opening else HOP_MS)
-    return score[0] + open_layers, score[1] + slow, max(score[2], read), total
+    total = score[3] + cost + BALANCE_WEIGHT * cost * cost + hop
+    dead = DEAD_LINK_PENALTY if hop >= UNREACHABLE_LINK_MS else 0
+    return score[0] + open_layers + dead, score[1] + slow, max(score[2], read), total
 
 
 def _stage_scorer(
@@ -572,6 +602,8 @@ def _search_order(
     # best[i][cut]: the best way to reach this cut with the first i workers.
     best: list[list[_Score | None]] = [[None] * len(cuts) for _ in range(len(order) + 1)]
     came: dict[tuple[int, int], int] = {}
+    # The worker each best path ends on, since the next hop starts there.
+    ending: dict[tuple[int, int], Candidate] = {}
     best[0][0] = (0, 0, 0.0, 0.0)
     for index, candidate in enumerate(order):
         skippable = not spread and candidate.worker_id not in required
@@ -579,19 +611,24 @@ def _search_order(
             score = best[index][here]
             if score is None:
                 continue
+            before = ending.get((index, here))
             held = best[index + 1][here]
             if skippable and (held is None or rank(score) < rank(held)):
                 best[index + 1][here] = score
                 came[index + 1, here] = here
+                if before is not None:
+                    ending[index + 1, here] = before
+            hop = _hop_ms(before, candidate) if before is not None else 0.0
             for there in range(here + 1, last + 1):
                 found = stage(candidate, cuts[here], cuts[there])
                 if found is None or found[2] > slowest_allowed:
                     continue
-                reached = _extended(score, found, here == 0)
+                reached = _extended(score, found, hop)
                 held = best[index + 1][there]
                 if held is None or rank(reached) < rank(held):
                     best[index + 1][there] = reached
                     came[index + 1, there] = here
+                    ending[index + 1, there] = candidate
     final = best[len(order)][last]
     if final is None:
         return None
@@ -626,39 +663,43 @@ def _search_blocks(
     cuts = [*range(0, profile.num_layers, profile.layer_step), profile.num_layers]
     last = len(cuts) - 1
     everyone = (1 << len(candidates)) - 1
-    # best[spent][cut]: the best way to reach this cut with exactly these workers.
-    best: list[list[_Score | None]] = [[None] * len(cuts) for _ in range(everyone + 1)]
-    came: dict[tuple[int, int], tuple[int, int, int]] = {}
-    best[0][0] = (0, 0, 0.0, 0.0)
+    # best[spent, ending, cut]: the best way to reach this cut with exactly these
+    # workers, the last of them being ``ending``, since the next hop starts there.
+    best: dict[tuple[int, int, int], _Score] = {(0, -1, 0): (0, 0, 0.0, 0.0)}
+    came: dict[tuple[int, int, int], tuple[int, int, int]] = {}
     for spent in range(everyone + 1):  # adding a worker only ever raises this number
-        for here in range(last):
-            score = best[spent][here]
-            if score is None:
-                continue
-            for index, candidate in enumerate(candidates):
-                if spent >> index & 1 or (entry and not spent and candidate.worker_id != entry):
+        for ending in range(-1, len(candidates)):
+            for here in range(last):
+                position = (spent, ending, here)
+                score = best.get(position)
+                if score is None:
                     continue
-                for there in range(here + 1, last + 1):
-                    if exit_ and (candidate.worker_id == exit_) != (there == last):
+                for index, candidate in enumerate(candidates):
+                    if spent >> index & 1 or (entry and not spent and candidate.worker_id != entry):
                         continue
-                    found = stage(candidate, cuts[here], cuts[there])
-                    if found is None or found[2] > slowest_allowed:
-                        continue
-                    reached = _extended(score, found, here == 0)
-                    held = best[spent | 1 << index][there]
-                    if held is None or rank(reached) < rank(held):
-                        best[spent | 1 << index][there] = reached
-                        came[spent | 1 << index, there] = (spent, here, index)
+                    hop = _hop_ms(candidates[ending], candidate) if spent else 0.0
+                    for there in range(here + 1, last + 1):
+                        if exit_ and (candidate.worker_id == exit_) != (there == last):
+                            continue
+                        found = stage(candidate, cuts[here], cuts[there])
+                        if found is None or found[2] > slowest_allowed:
+                            continue
+                        reached = _extended(score, found, hop)
+                        target = (spent | 1 << index, index, there)
+                        held = best.get(target)
+                        if held is None or rank(reached) < rank(held):
+                            best[target] = reached
+                            came[target] = position
 
-    endings = [spent for spent in range(everyone + 1) if best[spent][last] and (spent == everyone or not spread)]
+    endings = [item for item in best if item[2] == last and (item[0] == everyone or not spread)]
     if not endings:
         return None
-    position = min(endings, key=lambda spent: rank(best[spent][last])), last  # type: ignore[arg-type]
+    position = min(endings, key=lambda item: rank(best[item]))
     ranges: list[tuple[Candidate, int, int]] = []
     while position in came:
-        spent, here, index = came[position]
-        ranges.append((candidates[index], cuts[here], cuts[position[1]]))
-        position = spent, here
+        previous = came[position]
+        ranges.append((candidates[position[1]], cuts[previous[2]], cuts[position[2]]))
+        position = previous
     ranges.reverse()
     return ranges
 
@@ -707,7 +748,8 @@ def _fill_fast_memory(
         return fullest
     slower = _route_cost(leaner, candidates, profile) - _route_cost(fullest, candidates, profile)
     moves_more = _moved_ms(leaner, candidates, profile) > _moved_ms(fullest, candidates, profile)
-    return fullest if moves_more or slower > sum(reads) * EVEN_STAGE_ALLOWANCE else leaner
+    hops_longer = _hops_ms(leaner, candidates) > _hops_ms(fullest, candidates)
+    return fullest if moves_more or hops_longer or slower > sum(reads) * EVEN_STAGE_ALLOWANCE else leaner
 
 
 def _best_speed(candidate: Candidate) -> float:
@@ -723,6 +765,52 @@ def _held_order(candidates: list[Candidate], profile: ModelProfile) -> list[Cand
         return not held, held[len(held) // 2] if held else 0
 
     return sorted(candidates, key=place)
+
+
+def _shortest_order(first: list[Candidate], middle: list[Candidate], last: list[Candidate]) -> list[Candidate]:
+    """``middle`` in the order with the fewest unreachable links, then the shortest hops.
+
+    On a mesh across countries the hops are most of a token's time, so this is the
+    order to start from, whatever the speeds say. Held-Karp: for each set of workers
+    and the one it ends on, the best way to have visited them.
+    """
+    count = len(middle)
+
+    def step(left: Candidate, right: Candidate) -> tuple[int, float]:
+        hop = _hop_ms(left, right)
+        return int(hop >= UNREACHABLE_LINK_MS), hop
+
+    def add(cost: tuple[int, float], more: tuple[int, float]) -> tuple[int, float]:
+        return cost[0] + more[0], cost[1] + more[1]
+
+    best = {(1 << index, index): step(first[0], item) if first else (0, 0.0) for index, item in enumerate(middle)}
+    came: dict[tuple[int, int], int] = {}
+    for spent in range(1, 1 << count):
+        for ending in range(count):
+            cost = best.get((spent, ending))
+            if cost is None:
+                continue
+            for index in range(count):
+                if not spent >> index & 1:
+                    reached = add(cost, step(middle[ending], middle[index]))
+                    target = (spent | 1 << index, index)
+                    if target not in best or reached < best[target]:
+                        best[target] = reached
+                        came[target] = ending
+    everyone = (1 << count) - 1
+
+    def finish(ending: int) -> tuple[int, float]:
+        cost = best[everyone, ending]
+        return add(cost, step(middle[ending], last[0])) if last else cost
+
+    ending = min(range(count), key=finish)
+    order = [ending]
+    spent = everyone
+    while (spent, order[-1]) in came:
+        previous = came[spent, order[-1]]
+        spent ^= 1 << order[-1]
+        order.append(previous)
+    return [middle[index] for index in reversed(order)]
 
 
 def _orders(
@@ -749,6 +837,9 @@ def _orders(
         # Too many to enumerate: try each worker at the exit, and both directions.
         arrangements = [middle, middle[::-1]]
         arrangements += [[*middle[:index], *middle[index + 1 :], middle[index]] for index in range(len(middle))]
+        if len(middle) <= MAX_LINKED_WORKERS and any(item.links for item in candidates):
+            shortest = _shortest_order(first, middle, last)
+            arrangements[:0] = [shortest, shortest[::-1]]
         if any(item.cached for item in middle):
             arrangements.insert(0, _held_order(middle, profile))
     return [[*first, *order, *last] for order in arrangements]
@@ -759,9 +850,21 @@ def _moved_ms(route: list[StageAssignment], candidates: list[Candidate], profile
     return sum(_download_ms(workers[stage.worker_id], profile, stage.start_layer, stage.end_layer) for stage in route)
 
 
+def _hops_ms(route: list[StageAssignment], candidates: list[Candidate]) -> float:
+    """What a token spends crossing a route's stage boundaries."""
+    workers = {candidate.worker_id: candidate for candidate in candidates}
+    return sum(_hop_ms(workers[left.worker_id], workers[right.worker_id]) for left, right in zip(route, route[1:]))
+
+
+def _dead_links(route: list[StageAssignment], candidates: list[Candidate]) -> int:
+    workers = {candidate.worker_id: candidate for candidate in candidates}
+    hops = (_hop_ms(workers[left.worker_id], workers[right.worker_id]) for left, right in zip(route, route[1:]))
+    return sum(hop >= UNREACHABLE_LINK_MS for hop in hops)
+
+
 def _route_cost(route: list[StageAssignment], candidates: list[Candidate], profile: ModelProfile) -> float:
     reads = sum(stage.estimated_ms_per_token for stage in route)
-    return reads + HOP_MS * (len(route) - 1) + _moved_ms(route, candidates, profile)
+    return reads + _hops_ms(route, candidates) + _moved_ms(route, candidates, profile)
 
 
 def _sampled(
@@ -872,13 +975,24 @@ def plan_placement(
     spread: bool = True,
     entry_worker: str | None = None,
     exit_worker: str | None = None,
+    links: dict[tuple[str, str], float] | None = None,
 ) -> list[StageAssignment]:
     """Plan a route, adding standby workers only if the model needs them.
 
     ``entry_worker`` and ``exit_worker`` pin which machines hold the two ends.
     A worker holds one stage, so pinning one worker to both ends means it runs
-    the whole model.
+    the whole model. ``links`` holds measured round trips in ms, from one worker to
+    another, and a hop that has none costs ``HOP_MS``.
     """
+
+    def linked(group: list[Candidate]) -> list[Candidate]:
+        return [
+            replace(item, links={target: ms for (source, target), ms in links.items() if source == item.worker_id})
+            for item in group
+        ]
+
+    if links:
+        preferred, standby = linked(preferred), linked(standby)
     usable = [candidate for candidate in preferred if candidate.pools]
     reserve = [candidate for candidate in standby if candidate.pools]
     if not usable and not reserve:
@@ -902,18 +1016,23 @@ def plan_placement(
         attempts = [by_speed(usable + pinned_standby)] if usable or pinned_standby else []
         if reserve:
             attempts.append(by_speed(everyone))
+    def rank(route: list[StageAssignment]) -> tuple[int, int]:
+        return _dead_links(route, everyone), _slow_bytes(route, everyone)
+
     best: list[StageAssignment] | None = None
     for group in attempts:
         route = _attempt(group, profile, spread, entry_worker, exit_worker)
-        if route is None and spread:
-            # Spreading demands a layer on every worker, which a worker with
-            # little memory can make impossible on its own.
-            route = _attempt(group, profile, False, entry_worker, exit_worker)
-        if route is not None and (best is None or _slow_bytes(route, everyone) < _slow_bytes(best, everyone)):
+        if spread and (route is None or _dead_links(route, everyone)):
+            # Spreading demands a layer on every worker, which a worker with little
+            # memory, or one nobody can reach, can make impossible on its own.
+            fewer = _attempt(group, profile, False, entry_worker, exit_worker)
+            if fewer is not None and (route is None or rank(fewer) < rank(route)):
+                route = fewer
+        if route is not None and (best is None or rank(route) < rank(best)):
             best = route
         # A standby worker with VRAM comes before RAM, like any other VRAM.
         standby_vram = any(pool.kind in FAST_MEMORY for candidate in reserve for pool in candidate.pools)
-        if best is not None and (not standby_vram or not _slow_bytes(best, everyone)):
+        if best is not None and (not standby_vram or not any(rank(best))):
             return best
     if best is not None:
         return best

@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from itertools import combinations, permutations
 import random
 from types import SimpleNamespace
@@ -1088,3 +1089,102 @@ def test_a_plan_is_not_swapped_for_one_that_gains_nothing() -> None:
         worker("c", pool("cuda:0", "vram", 16000 * MIB, 900, "c:vram")),
     ]
     assert layout_of(plan_placement(workers, [], model)) == [("c", 0, 8), ("b", 8, 12), ("a", 12, 16)]
+
+
+# Round trips in ms measured across a real mesh. The worker names stand for places,
+# and "e1" and "e2" share a site. The link from "a" to "b" failed.
+LINK_TABLE = {("a", "c"): 112, ("a", "e1"): 104, ("a", "e2"): 104, ("b", "c"): 111, ("b", "e1"): 96, ("b", "e2"): 96}
+LINK_TABLE |= {("c", "e1"): 42, ("c", "e2"): 42, ("e1", "e2"): 1, ("a", "b"): planner.UNREACHABLE_LINK_MS}
+LINKS = {**LINK_TABLE, **{(target, source): ms for (source, target), ms in LINK_TABLE.items()}}
+# In speed order this would zigzag: a card's speed says nothing about where it is.
+MESH_SPEEDS = {"a": 900, "b": 850, "c": 800, "e1": 750, "e2": 700}
+
+
+def mesh_cards(room_gib: float = 40, ram_gib: float = 0) -> list[Candidate]:
+    return [card(name, room_gib, speed, ram_gib) for name, speed in MESH_SPEEDS.items()]
+
+
+def hops_of(route) -> float:
+    return sum(LINKS[left.worker_id, right.worker_id] for left, right in zip(route, route[1:]))
+
+
+def order_is_good(route) -> bool:
+    names = [stage.worker_id for stage in route]
+    neighbours = set(zip(names, names[1:])) | set(zip(names[1:], names))
+    return ("a", "b") not in neighbours and ("e1", "e2") in neighbours
+
+
+@pytest.mark.parametrize("model", [block_profile([2.72] * 32), moe_profile()], ids=["block rule", "no block rule"])
+def test_a_route_follows_measured_links_and_not_card_speed(model) -> None:
+    route = plan_placement(mesh_cards(), [], model, links=LINKS)
+    assert len(route) == 5
+    assert order_is_good(route)
+    assert hops_of(route) == 251  # a, c, e, e, b, or the same backwards: the shortest there is
+
+
+def test_a_link_nobody_measured_costs_the_constant() -> None:
+    assert planner._hop_ms(worker("x"), worker("y")) == planner.HOP_MS
+    assert planner.link_ms({}, "x", "y") == planner.HOP_MS
+    assert planner.link_ms({("y", "x"): 7.0}, "x", "y") == 7.0
+
+
+def test_no_links_plan_as_a_table_of_nothing_does() -> None:
+    assert layout_of(plan_placement(mesh_cards(), [], moe_profile())) == layout_of(
+        plan_placement(mesh_cards(), [], moe_profile(), links={})
+    )
+
+
+def test_a_route_costs_its_real_hops() -> None:
+    model = block_profile([2.72] * 32)
+    workers = [
+        replace(item, links={target: ms for (source, target), ms in LINKS.items() if source == item.worker_id})
+        for item in mesh_cards()
+    ]
+    route = plan_placement(workers, [], model)
+    reads = sum(stage.estimated_ms_per_token for stage in route)
+    assert planner._route_cost(route, workers, model) == pytest.approx(reads + 251)
+
+
+def test_a_spread_gives_up_a_worker_rather_than_use_a_dead_link() -> None:
+    links = {("a", "b"): planner.UNREACHABLE_LINK_MS, ("b", "a"): planner.UNREACHABLE_LINK_MS}
+    route = plan_placement([card("a", 80, 900), card("b", 80, 850)], [], block_profile([2.72] * 16), links=links)
+    assert len(route) == 1
+
+
+def test_a_dead_link_outranks_open_vram() -> None:
+    # The card with room is behind a dead link, so this stays on one card and RAM.
+    links = {("a", "b"): planner.UNREACHABLE_LINK_MS, ("b", "a"): planner.UNREACHABLE_LINK_MS}
+    workers = [card("a", 30, 900, 64), card("b", 20, 850)]
+    route = plan_placement(workers, [], block_profile([2.72] * 16), links=links, spread=False)
+    assert [stage.worker_id for stage in route] == ["a"]
+
+
+def test_vram_still_comes_before_shorter_hops() -> None:
+    # Every card is needed to keep this model out of RAM, however long the hops.
+    route = plan_placement(mesh_cards(room_gib=36.5, ram_gib=64), [], moe_profile(), links=LINKS)
+    assert len(route) == 5
+    assert experts_in_ram(route) == 0
+    assert order_is_good(route)
+
+
+def test_equal_spill_goes_to_the_shortest_hops() -> None:
+    route = plan_placement(mesh_cards(room_gib=30, ram_gib=64), [], moe_profile(), links=LINKS)
+    assert order_is_good(route)
+    assert hops_of(route) == 251
+
+
+def test_a_held_layout_stays_unless_moving_it_earns_its_download() -> None:
+    # Not the shortest order, but all of it is held, and moving most of 180 GiB takes
+    # far longer than these hops save over the tokens it is spread across.
+    model = moe_profile(amortize=planner.AMORTIZE_TOKENS)
+    layout = [("a", 0, 19), ("e1", 19, 38), ("c", 38, 57), ("e2", 57, 76), ("b", 76, 94)]
+    workers = holding(mesh_cards(), layout)
+    route = plan_placement(workers, [], model, links=LINKS)
+    assert layout_of(route) == layout
+    assert moved_bytes(route, workers, model) == 0
+
+
+def test_pins_hold_with_links() -> None:
+    route = plan_placement(mesh_cards(), [], moe_profile(), links=LINKS, entry_worker="e1", exit_worker="c")
+    assert route[0].worker_id == "e1"
+    assert route[-1].worker_id == "c"
