@@ -1217,6 +1217,7 @@ On a model with one slot, background work competes with you. A question asked st
 - Federation was run between two installs on one machine over loopback, and in tests. It has not crossed a real network between two real owners.
 - The `container` and `namespace` sandbox levels have only had their command lines checked in tests. Neither has ever run a command for real, as this was built on Windows with no container service running.
 - Two processes on one install are safe to use, but only the task lease has been proven under a kill. Everything else relies on SQLite.
+- The page has been used only in Chrome, at desktop and phone widths, with a person's steps scripted. No other browser, and no screen reader, has been tried.
 - Speech has been run for real only with Windows' own voice, through `voice speak`. Transcribing has not been run on real speech: `faster-whisper` is installed here with no model, and nothing downloads one. `voice status` names the engine either way, so the first `voice transcribe` is what tells you a model is missing.
 
 **Known limits.**
