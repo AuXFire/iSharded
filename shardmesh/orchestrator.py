@@ -889,7 +889,7 @@ class Orchestrator:
         for worker_id, record in self.workers.items():
             contribution = record.registration.hardware.contribution
             usable = record.live and not record.quarantined and not self._cordoned(worker_id)
-            if usable and "inference" in contribution.roles and self._hosts(contribution):
+            if usable and "inference" in contribution.roles and self._hosts(contribution) and self._runs_on(record.registration.hardware):
                 group = standby if contribution.standby else preferred
                 group.append(self._candidate(worker_id, record))
         return preferred, standby
@@ -897,6 +897,11 @@ class Orchestrator:
     def _hosts(self, contribution: Any) -> bool:
         model = self.planning_model or self.model_id
         return not model or hosts_model(contribution.host_models, model)
+
+    def _runs_on(self, hardware: Any) -> bool:
+        """A GPU reached through Vulkan runs llama.cpp, so it can only take GGUF models."""
+        model = self.planning_model or self.model_id
+        return hardware.backend != "vulkan" or not model or ".gguf" in model.lower()
 
     def candidates(self) -> list[Candidate]:
         preferred, standby = self.candidate_groups()

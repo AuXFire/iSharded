@@ -38,6 +38,7 @@ More detail lives in [Operating ShardMesh](docs/OPERATIONS.md) and [ShardMesh se
 - Starts with one command, and adds a machine with an invite code. Hardware, addresses, and certificates are worked out for you.
 - Splits a model's layers across machines, each holding only its share. Weights are never gathered on one machine.
 - Spans memory types: one node can hold layers in VRAM, RAM, and disk at once, and nodes do not have to match.
+- Uses any GPU with a Vulkan driver for GGUF models, so nodes need no CUDA or ROCm.
 - Runs GGUF models on stock llama.cpp, and safetensors models on its own PyTorch code. Qwen and GPT-2 families, including mixture-of-experts models.
 - Speeds up replies with a small draft model, reuses earlier conversation state, and lets conversations share a pass through each stage.
 - Runs several models at once on the same mesh, and users choose between them.
@@ -67,7 +68,7 @@ curl -fsSL https://raw.githubusercontent.com/AuXFire/shardmesh/main/install.sh |
 
 Then `shardmesh doctor` checks the machine, and says what to fix if anything is missing.
 
-The installers pick a CUDA build of PyTorch where they find an NVIDIA GPU, and otherwise a CPU build on Windows. An AMD GPU on Windows needs a ROCm build of PyTorch, which you install [by hand](#by-hand).
+The installers pick a CUDA build of PyTorch where they find an NVIDIA GPU, and otherwise a CPU build on Windows. A GPU PyTorch cannot see, such as an AMD card on Windows, still works for GGUF models: the node finds it through llama.cpp's Vulkan build. See [Any GPU](#any-gpu).
 
 ### By hand
 
@@ -1047,6 +1048,20 @@ Workers do not use NCCL, CUDA IPC, or remote device pointers. Each process loads
 
 Differences between backends can change sampling when logits are nearly tied. Bit-for-bit identity is not promised between different kernels.
 
+### Any GPU
+
+A node uses PyTorch to find GPUs. If PyTorch sees none, the node asks llama.cpp's Vulkan build instead, in a process of its own, so a GPU with a working Vulkan driver takes part whatever its maker. `--gpu-device vulkan` chooses this on purpose. It downloads a pinned build the first time, as other builds do.
+
+Vulkan runs GGUF models only, because safetensors models run on PyTorch. The planner keeps those off such a node. It also cannot time the GPU's memory, so it assumes 300 GB/s when placing layers.
+
+On a 6 GB RTX 3060 with Qwen3-0.6B Q8_0, one reply at a time, all three gave the same text:
+
+| Backend | Tokens per second |
+|---|---|
+| CUDA | 104.1 |
+| Vulkan | 102.6 |
+| CPU, 4 threads | 21.9 |
+
 ## Precision
 
 Workers run in BF16 by default. Add `--dtype float32` to a node to run its VRAM and RAM at full precision, which doubles the memory each layer takes. The planner accounts for that, so BF16 and FP32 nodes can share a route. Published Qwen checkpoints are BF16, so FP32 raises the precision of computation and not of the stored weights. The disk tier always runs in the checkpoint's own dtype.
@@ -1214,7 +1229,7 @@ Adapter tests compare every family with the reference `transformers` implementat
 | `shardmesh/node.py` | The launcher that supervises a node's services |
 | `shardmesh/lanes.py` | Several models at once: the front door and each node's lanes |
 | `shardmesh/commons.py` | A network nobody owns: self-made identities, vouches, and each node's view |
-| `shardmesh/inventory.py` | What a node reports about itself beyond memory budgets |
+| `shardmesh/inventory.py`, `shardmesh/gpu_probe.py` | What a node reports about itself, and how it finds GPUs PyTorch cannot see |
 | `shardmesh/formats.py` | Anthropic's, OpenAI Responses', and Ollama's request and reply shapes |
 | `shardmesh/mesh.py` | Membership and leader election, as pure logic |
 | `shardmesh/planner.py`, `shardmesh/memory.py` | Placement, and memory pool discovery |

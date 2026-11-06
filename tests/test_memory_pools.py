@@ -232,3 +232,44 @@ def test_a_large_node_log_starts_over_and_keeps_the_last(tmp_path, monkeypatch) 
     assert (tmp_path / "node.log.1").read_bytes() == b"123456"
     assert path.read_bytes() == b""
     assert open_log(None) is None
+
+
+def test_a_vulkan_gpu_is_read_from_the_probe_and_software_devices_are_left_out(tmp_path) -> None:
+    import json
+    from types import SimpleNamespace
+
+    from shardmesh.memory import read_vulkan_devices
+
+    report = [
+        {"backend": "Vulkan0", "name": "Radeon RX 7900 XT", "integrated": False, "free_bytes": 18 * 1024**3, "total_bytes": 20 * 1024**3},
+        {"backend": "Vulkan1", "name": "Radeon Graphics", "integrated": True, "free_bytes": 1024**3, "total_bytes": 2 * 1024**3},
+        {"backend": "CUDA0", "name": "not this build's business", "integrated": False, "free_bytes": 1, "total_bytes": 1},
+    ]
+    answer = SimpleNamespace(returncode=0, stdout="some driver noise
+" + json.dumps(report))
+    first, second = read_vulkan_devices(tmp_path, run=lambda *_, **__: answer)
+    assert (first.device, first.kind, first.backend, first.name) == ("vulkan:0", "vram", "vulkan", "Radeon RX 7900 XT")
+    assert (second.device, second.kind) == ("vulkan:1", "unified")
+
+
+def test_a_crashing_driver_means_no_vulkan_gpu_and_no_crash(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from shardmesh.memory import read_vulkan_devices
+
+    assert read_vulkan_devices(tmp_path, run=lambda *_, **__: SimpleNamespace(returncode=3, stdout="")) == []
+    assert read_vulkan_devices(tmp_path, run=lambda *_, **__: SimpleNamespace(returncode=0, stdout="")) == []
+
+
+def test_vulkan_bandwidth_is_assumed_not_measured() -> None:
+    from shardmesh.memory import ASSUMED_VULKAN_GBPS, measure_bandwidth
+
+    assert measure_bandwidth("vulkan:0") == ASSUMED_VULKAN_GBPS
+
+
+def test_asking_for_vulkan_with_none_says_what_to_check(monkeypatch) -> None:
+    from shardmesh import memory
+
+    monkeypatch.setattr(memory, "vulkan_accelerators", lambda: ())
+    with pytest.raises(ValueError, match="no Vulkan GPU found"):
+        memory.discover_accelerators("vulkan")
