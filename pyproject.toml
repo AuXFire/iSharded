@@ -7,6 +7,7 @@ name = "shardmesh"
 version = "0.3.0"
 description = "Run one language model across a decentralized pool of machines"
 requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
 dependencies = [
   "fastapi>=0.110,<1",
   "httpx>=0.27,<1",

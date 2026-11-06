@@ -29,6 +29,7 @@ This is execution sharding, not simulated work distribution: each token really c
 - [Measured performance](#measured-performance)
 - [Development](#development)
 - [Current limits](#current-limits)
+- [License](#license)
 
 More detail lives in [Operating ShardMesh](docs/OPERATIONS.md) and [ShardMesh security](docs/SECURITY.md).
 
@@ -1222,3 +1223,7 @@ Behavior:
 - A reply is lost if the node its client is connected to dies.
 - Multi-turn reuse keeps one conversation per sequence, so more conversations than sequences push each other out and reread their history.
 - Mesh membership is meant for tens of nodes: every worker checks in with every control plane.
+
+## License
+
+ShardMesh is licensed under the [Apache License 2.0](LICENSE). Copyright 2026 AuXFire.
