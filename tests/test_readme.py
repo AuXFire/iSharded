@@ -19,7 +19,8 @@ def parsers():
         for action in parser._actions:
             if isinstance(action, argparse._SubParsersAction):
                 for command, child in action.choices.items():
-                    yield from walk(child, f"{name} {command}")
+                    if command != "assistant":  # docs/ASSISTANT.md documents those; see test_assistant_docs
+                        yield from walk(child, f"{name} {command}")
 
     yield from walk(cli.build_parser(), "shardmesh")
     yield "orchestrator", orchestrator.build_parser()
