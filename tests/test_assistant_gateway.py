@@ -368,15 +368,12 @@ def test_nobody_else_can_see_or_decide_an_approval(alice, bob, owner, assistant)
     assert assistant.broker.invocations == [] and assistant.broker.approved == set()
 
 
-def test_a_broker_with_no_way_to_approve_is_reported_and_nothing_runs(alice, assistant):
+def test_an_approval_that_was_withdrawn_is_reported_and_nothing_runs(alice, assistant):
     asking(assistant)
     chat(alice, "Email Ada")
-    del assistant.broker.__class__.approve  # restored below
-    try:
-        response = alice.post("/assistant/approvals/approval-1", json={"approve": True})
-    finally:
-        FakeBroker.approve = lambda self, approval_id, by="owner": self.approved.add(self.approvals[approval_id]["key"])
-    assert response.status_code == 501 and "nothing was run" in response.json()["detail"]
+    assistant.broker.asked["approval-1"]["status"] = "withdrawn"
+    response = alice.post("/assistant/approvals/approval-1", json={"approve": True})
+    assert response.status_code == 409 and "no longer waiting" in response.json()["detail"]
     assert assistant.broker.invocations == []
 
 
@@ -385,13 +382,8 @@ def test_approvals_without_a_broker_are_simply_empty(alice):
 
 
 def test_approvals_the_broker_holds_for_a_user_are_shown_only_to_them(alice, bob, assistant):
-    class Broker(FakeBroker):
-        def pending(self, user):
-            rows = [{"id": "task-approval", "user": "alice", "capability": "files.write", "arguments": {}, "reason": "a task wants this"}]
-            return [row for row in rows if row["user"] == user]
-
-    assistant.broker = Broker()
-    assistant.broker.approvals["task-approval"] = {"key": "k", "user": "alice", "capability": "files.write"}
+    assistant.broker = FakeBroker()
+    assistant.broker.asked["task-approval"] = {"key": "k", "user": "alice", "capability": "files.write", "arguments": {}, "reason": "a task wants this"}
     assert [row["approval_id"] for row in alice.get("/assistant/approvals").json()["approvals"]] == ["task-approval"]
     assert bob.get("/assistant/approvals").json()["approvals"] == []
     assert bob.post("/assistant/approvals/task-approval", json={"approve": True}).status_code == 404

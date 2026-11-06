@@ -509,7 +509,9 @@ class Builtins:
             raise Refusal("memory.remember needs the memory part, which is not installed.")
         # A tool call is a model or a task acting, never the person saying it.
         trust = Trust.EXTERNAL if context.tainted else Trust.MODEL
-        provenance = Provenance("tool", context.actor, context.actor, trust, self.clock())
+        # What is kept can be no freer than what it was written from, or a private file
+        # would only need to be remembered to travel.
+        provenance = Provenance("tool", context.actor, context.actor, trust, self.clock(), min(Reach.POOL, context.reach))
         row = memory.remember(context.user, arguments.get("kind", "semantic"), arguments["text"], provenance)
         return self.result("memory.remember", True, f"Remembered as {row}.", {"id": row})
 

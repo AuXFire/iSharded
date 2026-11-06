@@ -43,6 +43,7 @@ include = ["shardmesh*"]
 
 [tool.setuptools.package-data]
 shardmesh = ["dashboard.html", "chat.html"]
+"shardmesh.assistant" = ["assistant.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

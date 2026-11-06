@@ -36,7 +36,7 @@ class FakeBroker:
 
         self.declared: dict[str, Capability] = {}
         self.handlers: dict[str, Any] = {}
-        self.grants: set[tuple[str, str]] = set()
+        self.allowed: set[tuple[str, str]] = set()
         self.waiting: dict[str, str] = {}
         self.approved: set[str] = set()
         self.invoked: list[tuple[str, str, str, bool]] = []
@@ -60,13 +60,25 @@ class FakeBroker:
             return Decision(Verdict.DENY, "nothing declares that")
         if self._key(call) in self.approved:
             return Decision(Verdict.ALLOW, "approved")
-        if (context.user, call.capability) not in self.grants:
+        if (context.user, call.capability) not in self.allowed:
             return Decision(Verdict.DENY, f"no grant for {context.user}")
         if (context.tainted or context.actor.startswith("peer:")) and capability.consequential:
             approval = f"approval-{len(self.waiting) + 1}"
             self.waiting[approval] = self._key(call)
             return Decision(Verdict.ASK, "a person must approve this", approval_id=approval)
         return Decision(Verdict.ALLOW, "granted")
+
+    def add_grant(self, user: str, capability: str, scope: Any, by: str, expires_at: Any = None, uses: Any = None) -> str:
+        self.allowed.add((user, capability))
+        return f"{user}/{capability}"
+
+    def grants(self, user: Any = None, include_ended: bool = False) -> list[dict[str, Any]]:
+        return [{"id": f"{who}/{name}", "capability": name} for who, name in self.allowed if user in (None, who)]
+
+    def revoke_grant(self, grant_id: str, by: str) -> bool:
+        who, _, name = grant_id.partition("/")
+        self.allowed.discard((who, name))
+        return True
 
     def invoke(self, call: Any, context: Any) -> Any:
         from shardmesh.assistant.contracts import Verdict
@@ -197,10 +209,10 @@ class Commands:
         return list(self.federation.discover(name))
 
     def grant(self, user: str, capability: str) -> None:
-        self.assistant.broker.grants.add((user, capability))
+        self.assistant.broker.allowed.add((user, capability))
 
     def grant_peer(self, name: str, capability: str) -> None:
-        self.assistant.broker.grants.add((self.federation.named(name).actor, capability))
+        self.assistant.broker.allowed.add((self.federation.named(name).actor, capability))
 
     def owner_decides(self, approval: str) -> None:
         self.assistant.broker.approved.add(self.assistant.broker.waiting[approval])
@@ -704,10 +716,12 @@ def test_withdrawing_an_offer_works_at_once(world):
     assert "not offered" in bob.ask("alice", "plain.lookup", {"query": "x"})["output"]
 
 
-def test_an_offer_alone_does_not_get_past_the_broker(world):
+def test_a_peer_whose_grant_was_ended_is_stopped_by_the_broker(world):
+    """An offer brings a grant for the peer's own user. Without it, the owner's grant is no help."""
     alice, bob, _ = world
     bob.grant("owner", "peer.send")
     alice.offer("bob", "plain.lookup")
+    alice.assistant.broker.allowed.clear()
     alice.grant("owner", "plain.lookup")  # the owner's own grant must not cover the peer
     result = bob.ask("alice", "plain.lookup", {"query": "x"})
     assert result["data"]["status"] == "refused"
@@ -1091,7 +1105,7 @@ def test_a_silent_peer_gives_a_bounded_answer_that_can_be_collected(tmp_path):
     with SilentListener() as listener:
         assistant = build_assistant(str(tmp_path / "home"))
         silent_peer(assistant, listener.url)
-        assistant.broker.grants.add(("owner", "peer.send"))
+        assistant.broker.allowed.add(("owner", "peer.send"))
         assistant.federation.reply_seconds = 0.5
         assistant.federation.notice_seconds = 0.2
         started = time.monotonic()
@@ -1202,8 +1216,8 @@ def in_process_pair(tmp_path: Path) -> tuple[Any, Any, Any]:
     near.federation.accept(far.federation.invite("near"), "far")
     far.federation.approve("near")
     far.federation.offer("near", "models.complete")
-    far.broker.grants.add((far.federation.named("near").actor, "models.complete"))
-    near.broker.grants.add(("owner", "peer.send"))
+    far.broker.allowed.add((far.federation.named("near").actor, "models.complete"))
+    near.broker.allowed.add(("owner", "peer.send"))
     near.providers = Registry([])
     return near, far, server
 
@@ -1272,7 +1286,7 @@ def test_without_a_broker_a_peer_gets_nothing(tmp_path):
         home.federation.accept(bare.federation.invite("home"), "bare")
         bare.federation.approve("home")
         bare.federation.offer("home", "demo.echo")
-        home.broker.grants.add(("owner", "peer.send"))
+        home.broker.allowed.add(("owner", "peer.send"))
         result = home.federation.send("bare", "demo.echo", {"text": "x"})
         assert result.data["status"] == "refused"
         with pytest.raises(FederationError, match="no broker"):

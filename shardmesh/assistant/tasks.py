@@ -970,6 +970,7 @@ class DurableTasks:
                 "id": row["step_id"],
                 "kind": row["kind"],
                 "status": row["status"],
+                "capability": json.loads(row["spec"]).get("capability"),
                 "attempts": counts.get(row["step_id"], 0),
                 "failures": row["failures"],
                 "tier": row["tier"],
@@ -988,6 +989,8 @@ class DurableTasks:
             for row in self._steps(task_id)
         ]
         task["waiting_for"] = [step["approval_id"] for step in task["steps"] if step["wait"] == "approval"]
+        # One step reading a page is enough for the task's results to count as outside text.
+        task["tainted"] = bool(task["tainted"]) or any(step["tainted"] for step in task["steps"])
         return task
 
     def list_tasks(self, user: str | None = None, limit: int = 50, active_only: bool = False) -> list[dict[str, Any]]:
@@ -1603,7 +1606,8 @@ class DurableTasks:
             return Outcome(False, error="A tool step needs the broker part, which is not installed.", retryable=False)
         arguments, used = render(spec.get("arguments", {}), outputs, inputs)
         tainted = self._tainted(task, outputs, used)
-        context = CallContext(user=task["user"], actor=f"task:{task['id']}", tainted=tainted, task_id=task["id"])
+        limit = Reach(self._reach(task, outputs, used))
+        context = CallContext(user=task["user"], actor=f"task:{task['id']}", tainted=tainted, task_id=task["id"], reach=limit)
         result = broker.invoke(ToolCall(spec["capability"], arguments, f"{task['id']}/{step['step_id']}"), context)
         if result.provenance.source == "broker" and result.data.get("refused"):
             ask = result.data.get("verdict") == "ask"
@@ -1824,7 +1828,7 @@ def add_commands(commands: Any) -> None:
     task = commands.add_parser("task", help="run and manage durable tasks")
     actions = task.add_subparsers(dest="task_command", required=True)
     run = actions.add_parser("run", help="run a plan from a JSON file")
-    run.add_argument("plan", help="the plan file; see docs/assistant-parts/hands.md")
+    run.add_argument("plan", help="the plan file; see docs/ASSISTANT.md")
     run.add_argument("--user", default=DEFAULT_USER, help="who this runs for")
     run.add_argument("--detach", action="store_true", help="queue it and return, for an engine already running")
     run.set_defaults(run=run_task_run)

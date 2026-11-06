@@ -315,8 +315,8 @@ class TaintAwareBroker(FakeBroker):
             key = json.dumps([call.capability, call.arguments], sort_keys=True)
             if key in self.approved:
                 return Decision(Verdict.ALLOW, "a person approved this exact action")
-            approval = f"approval-{len(self.approvals) + 1}"
-            self.approvals[approval] = {"key": key, "user": context.user, "capability": call.capability}
+            approval = f"approval-{len(self.asked) + 1}"
+            self.asked[approval] = {"key": key, "user": context.user, "capability": call.capability}
             return Decision(Verdict.ASK, "untrusted text is in view", approval_id=approval)
         return Decision(Verdict.ALLOW, "standing grant")
 
@@ -557,24 +557,13 @@ def test_a_second_call_after_the_first_is_approved_asks_again(assistant):
     assert final.status == "done" and len(assistant.broker.invocations) == 2
 
 
-def test_a_decision_goes_to_the_broker_by_whichever_name_it_uses(assistant):
+def test_a_decision_reaches_the_broker_and_a_stale_one_is_reported(assistant):
     assistant.broker = FakeBroker()
     assistant.broker.add("mail.send", verdict=Verdict.ASK)
-    assistant.broker.approvals["a"] = {"key": "k", "user": "alice", "capability": "mail.send"}
+    assistant.broker.asked["a"] = {"key": "k", "user": "alice", "capability": "mail.send"}
     assert decide_approval(assistant, "a", True, "alice") is True and "k" in assistant.broker.approved
-    assert decide_approval(assistant, "a", False, "alice") is True and "k" in assistant.broker.declined
-
-    class Other:
-        def __init__(self):
-            self.calls = []
-
-        def decide(self, approval_id, approved, by):
-            self.calls.append((approval_id, approved, by))
-
-    assistant.broker = Other()
-    assert decide_approval(assistant, "b", True, "alice") is True
-    assert assistant.broker.calls == [("b", True, "alice")]
-    assistant.broker = object()
+    assert decide_approval(assistant, "a", False, "alice") is False  # it was already decided
+    assistant.broker = None
     assert decide_approval(assistant, "c", True, "alice") is False
 
 

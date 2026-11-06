@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 import hashlib
 import json
 import os
@@ -34,6 +35,7 @@ from pydantic import BaseModel, Field
 from shardmesh.pool import LOOPBACK
 from shardmesh.serving import BodyLimit, NoDelayHTTPProtocol
 
+from .broker import PEER_PREFIX
 from .context import TurnNotFound
 from .contracts import Provenance, Reach, Trust
 from .conversation import TurnResult, decide_approval
@@ -132,12 +134,14 @@ class RequireKey:
     """Refuses anything without a good key, before a route can run.
 
     Plain ASGI, so it also covers a route another part forgot to protect, and so
-    streams pass through untouched. A route reads ``request.state.user``.
+    streams pass through untouched. A route reads ``request.state.user``. A part
+    leaves a route open by listing it in its own ``PUBLIC_ROUTES``, as (method, path).
     """
 
-    def __init__(self, app: Any, users: Users) -> None:
+    def __init__(self, app: Any, users: Users, public_routes: frozenset[tuple[str, str]] = frozenset()) -> None:
         self.app = app
         self.users = users
+        self.public_routes = public_routes
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope["type"] == "lifespan":
@@ -146,6 +150,9 @@ class RequireKey:
         if scope["type"] != "http":
             return  # no other kind of connection is offered, so none is accepted
         if scope["path"] in PUBLIC_PATHS and scope["method"] in ("GET", "HEAD"):
+            await self.app(scope, receive, send)
+            return
+        if (scope["method"], scope["path"]) in self.public_routes:
             await self.app(scope, receive, send)
             return
         header = dict(scope["headers"]).get(b"authorization", b"").decode("latin-1")
@@ -304,9 +311,20 @@ class TaskRequest(BaseModel):
     plan: dict[str, Any]
 
 
+@asynccontextmanager
+async def running_tasks(app: FastAPI) -> AsyncIterator[None]:
+    """Nothing runs a task unless its host says so, and this server is the host."""
+    engine = getattr(app.state.assistant, "tasks", None)
+    if engine is not None:
+        engine.start()
+    yield
+    if engine is not None:
+        await asyncio.to_thread(engine.stop)
+
+
 def create_app(assistant: Any) -> FastAPI:
     users = Users(assistant)
-    app = FastAPI(title="ShardMesh assistant", docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(title="ShardMesh assistant", docs_url=None, redoc_url=None, openapi_url=None, lifespan=running_tasks)
     app.state.assistant = assistant
     app.state.users = users
 
@@ -473,67 +491,59 @@ def create_app(assistant: Any) -> FastAPI:
     def library_search(q: str, request: Request, limit: int = 8) -> dict[str, Any]:
         return {"results": [public_item(item) for item in assistant.library.search(me(request), q, min(limit, 50))]}
 
-    def broker_pending(user: str) -> list[dict[str, Any]]:
-        """What the broker itself is waiting on for this person, if it can say."""
+    def waiting_on(user: str, role: str) -> list[dict[str, Any]]:
+        """What the broker is asking this person. A peer has no key, so its owner answers for it."""
         broker = getattr(assistant, "broker", None)
-        lookup = next((getattr(broker, name) for name in ("pending", "pending_approvals") if hasattr(broker, name)), None)
-        if lookup is None:
+        if broker is None:
             return []
-        rows = lookup(user) or []
-        return [row for row in (dict(item) if not isinstance(item, dict) else item for item in rows) if row.get("user", user) == user]
+        rows = broker.approvals(user)
+        if role == "owner":
+            rows = rows + [row for row in broker.approvals() if row["user"].startswith(PEER_PREFIX)]
+        return rows
 
-    def approvals_of(user: str) -> list[dict[str, Any]]:
+    def approvals_of(user: str, role: str) -> list[dict[str, Any]]:
         held = assistant.conversation.pending(user)
         known = {row["approval_id"] for row in held}
-        extra = [row for row in broker_pending(user) if (row.get("approval_id") or row.get("id")) not in known]
-        return held + [{**row, "approval_id": row.get("approval_id") or row.get("id")} for row in extra]
+        extra = [{**row, "approval_id": row["id"]} for row in waiting_on(user, role) if row["id"] not in known]
+        return held + extra
 
     @api.get("/approvals")
     def approvals(request: Request) -> dict[str, Any]:
-        return {"approvals": approvals_of(me(request))}
+        return {"approvals": approvals_of(me(request), request.state.role)}
 
     @api.post("/approvals/{approval_id}")
     def decide(approval_id: str, body: DecisionRequest, request: Request) -> dict[str, Any]:
         user = me(request)
-        if approval_id not in {row["approval_id"] for row in approvals_of(user)}:
+        if approval_id not in {row["approval_id"] for row in approvals_of(user, request.state.role)}:
             raise HTTPException(404, f"Nothing is waiting on {approval_id} for you")
         told = decide_approval(assistant, approval_id, body.approve, user)
-        if body.approve and not told:
-            raise HTTPException(501, "This broker offers no way to approve from here, so nothing was run")
+        if not told and already_decided(approval_id) != ("approved" if body.approve else "denied"):
+            raise HTTPException(409, f"{approval_id} is no longer waiting, so nothing changed")
         turn = assistant.conversation.turn_for_approval(user, approval_id)
         if turn is None:
             return {"decided": True}
         return {"decided": True, "turn": public_result(assistant.conversation.resume(user, turn, approved=body.approve, learn="background"))}
+
+    def already_decided(approval_id: str) -> str | None:
+        """A person may have answered from the command line while a turn still waits here."""
+        decided = assistant.broker.approval(approval_id)
+        return decided["status"] if decided else None
 
     def owned_task(user: str, task_id: str) -> dict[str, Any]:
         engine = getattr(assistant, "tasks", None)
         if engine is None:
             raise HTTPException(404, "Tasks are not installed")
         try:
-            status = engine.status(task_id)
-        except Exception:
+            return engine.status(task_id, user)  # asked in the query, so a stranger's id finds nothing
+        except ValueError:
             raise HTTPException(404, f"There is no task {task_id}") from None
-        # Fail closed: a task that does not say whose it is belongs to whoever we recorded.
-        if status.get("user") != user and task_id not in assistant.conversation.tasks_of(user, 10_000):
-            raise HTTPException(404, f"There is no task {task_id}")
-        return status
 
     @api.get("/tasks")
-    def tasks(request: Request) -> dict[str, Any]:
-        user = me(request)
+    def tasks(request: Request, limit: int = 100) -> dict[str, Any]:
         engine = getattr(assistant, "tasks", None)
         if engine is None:
             return {"available": False, "tasks": []}
-        lister = next((getattr(engine, name) for name in ("list_for", "list") if hasattr(engine, name)), None)
-        ids = set(assistant.conversation.tasks_of(user))
-        found = []
-        if lister is not None:
-            try:
-                found = [row for row in (lister(user) or []) if isinstance(row, dict) and row.get("user") == user]
-            except TypeError:
-                found = []
-        ids -= {row.get("id") or row.get("task_id") for row in found}
-        return {"available": True, "tasks": found + [owned_task(user, task_id) for task_id in sorted(ids)]}
+        return {"available": True, "tasks": engine.list_tasks(me(request), min(limit, 500))}
 
     @api.post("/tasks")
     def task_submit(body: TaskRequest, request: Request) -> dict[str, Any]:
@@ -604,7 +614,8 @@ def create_app(assistant: Any) -> FastAPI:
     def page() -> HTMLResponse:
         return page_response()
 
-    app.add_middleware(RequireKey, users=users)
+    public_routes = frozenset(route for part in assistant.parts for route in getattr(part, "PUBLIC_ROUTES", ()))
+    app.add_middleware(RequireKey, users=users, public_routes=public_routes)
     app.add_middleware(BodyLimit, limit=MAX_REQUEST_BYTES)
     return app
 
@@ -798,6 +809,9 @@ def run_serve(assistant: Any, args: argparse.Namespace) -> int:
     options = {"ssl_certfile": args.tls_cert, "ssl_keyfile": args.tls_key} if args.tls_cert else {}
     scheme = "https" if args.tls_cert else "http"
     emit(f"{assistant.identity.name} is at {scheme}://{args.host}:{args.port}/")
+    federation = getattr(assistant, "federation", None)
+    if federation is not None:
+        federation.listening_at(args.host, f"{scheme}://{args.host}:{args.port}")
     uvicorn.run(create_app(assistant), host=args.host, port=args.port, http=NoDelayHTTPProtocol, access_log=False, log_level="warning", **options)
     return 0
 
@@ -811,6 +825,8 @@ def run_user_add(assistant: Any, args: argparse.Namespace) -> int:
     write_private(path, key + "\n")
     # The key goes to a file and not the screen, where it would stay in scrollback and logs.
     emit(f"Added {args.name}. Their key is in {path} and cannot be shown again.")
+    if args.name != LOCAL_USER:
+        emit(f"Commands on this machine act for {LOCAL_USER} unless given --user {args.name}, so grants for them need it too.")
     return 0
 
 
