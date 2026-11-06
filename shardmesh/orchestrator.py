@@ -24,6 +24,7 @@ from . import __version__
 from .access import INVITE_FIELDS, load_authority, NeedsAuthority, node_of, ROLE_ADMIN, ROLE_MEMBER, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, Caller
 from .gguf import parse_source
 from . import formats
+from .discovery import start_beacon
 from .lanes import LaneDoor
 from .mesh import GOSSIP_SECONDS, ControlMesh
 from .models import Adapter, GgufAdapter, SUPPORTED_TYPES, UnsupportedModel, create_adapter
@@ -414,6 +415,8 @@ class Orchestrator:
         self.background: set[asyncio.Task[Any]] = set()
         self.lanes = LaneDoor(self)
         self.round_trip_ms: dict[str, float] = {}
+        self.join_answers: dict[str, set[str]] = {}
+        self.beacon: Any = None
         self.lane_name = os.getenv("SHARDMESH_LANE") or None
         self.started_at = time.time()
         self.requests_total = 0
@@ -449,6 +452,8 @@ class Orchestrator:
         for task in (self.maintenance_task, self.gossip_task):
             if task is not None:
                 task.cancel()
+        if self.beacon is not None:
+            self.beacon.close()
         await self.client.aclose()
 
     def load_saved_state(self) -> None:
@@ -669,6 +674,16 @@ class Orchestrator:
         if self.lanes.active:
             self.lanes.restore()
             self.spawn(self.lanes.run())
+        if os.getenv("SHARDMESH_DISCOVERABLE") and not self.lane_name and self.mesh is not None:
+            self.spawn(self._start_beacon())
+
+    async def _start_beacon(self) -> None:
+        from .up import authority_hash
+
+        assert self.mesh is not None
+        pem = Path(os.environ["SHARDMESH_CA_FILE"]).read_text(encoding="utf-8")
+        mesh = self.mesh
+        self.beacon = await start_beacon(lambda: {"url": mesh.url, "authority": authority_hash(pem), "name": mesh.node_id})
 
     async def _maintain(self) -> None:
         while True:
@@ -2069,7 +2084,7 @@ async def lifespan(_: FastAPI):
         await runtime.close()
 
 
-app = FastAPI(title="ShardMesh orchestrator", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="ShardMesh orchestrator", version=__version__, lifespan=lifespan)
 
 
 def require(authorization: str | None, role: str) -> Caller:
@@ -2170,7 +2185,7 @@ async def forward_to_coordinator(request: Request, call_next: Any) -> Any:
         # httpx would resolve these, turning a forwarded path into any other.
         return JSONResponse(status_code=400, content={"detail": "bad path"})
     serves_locally = path.startswith(("/v1/", "/api/")) and bool(runtime.route)
-    own_choice = path in {"/admin/invites", "/admin/network"} or (runtime.access.ownerless and (path.startswith("/admin/keys") or path.endswith("/revoke")))
+    own_choice = path in {"/admin/invites", "/admin/network"} or path.startswith("/admin/join/") or (runtime.access.ownerless and (path.startswith("/admin/keys") or path.endswith("/revoke")))
     if mesh is None or mesh.is_leader or serves_locally or own_choice or not path.startswith(FORWARDED_PATHS):
         return await call_next(request)
     target = mesh.leader_url
@@ -2522,7 +2537,23 @@ async def request_to_join(body: dict[str, Any]) -> dict[str, str]:
 @app.get("/join/requests")
 async def join_requests(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     verify_admin(authorization)
-    return {"requests": list(runtime.access.join_requests.values())}
+    # What a person decided stays on this machine, for the signer beside it to act on.
+    return {"requests": [{**held, "approved": name in runtime.join_answers.get("approve", ()), "denied": name in runtime.join_answers.get("deny", ())} for name, held in runtime.access.join_requests.items()]}
+
+
+@app.post("/admin/join/{name}/{answer}")
+async def answer_join(name: str, answer: str, authorization: str | None = Header(default=None)) -> dict[str, str]:
+    """A person's decision. Only the machine holding the authority can act on it."""
+    verify_admin(authorization)
+    home = os.getenv("SHARDMESH_UP_HOME")
+    if answer not in {"approve", "deny"}:
+        raise HTTPException(status_code=404, detail="the answer is approve or deny")
+    if not home or not Path(home, "ca.key").is_file():
+        raise HTTPException(status_code=409, detail="only the machine that made this mesh can answer; open this page there")
+    if name not in runtime.access.join_requests:
+        raise HTTPException(status_code=404, detail=f"{name} is not asking to join")
+    runtime.join_answers.setdefault(answer, set()).add(name)
+    return {"status": answer}
 
 
 @app.get("/join/authority")
@@ -2530,7 +2561,7 @@ async def join_authority() -> dict[str, str]:
     """The mesh's public certificate, for a new machine to check against its invite."""
     if runtime.access.authority is None or runtime.access.ownerless:
         raise HTTPException(status_code=404, detail="this pool has no authority")
-    return {"authority": Path(os.environ["SHARDMESH_CA_FILE"]).read_text(encoding="utf-8")}
+    return {"authority": Path(os.environ["SHARDMESH_CA_FILE"]).read_text(encoding="utf-8"), "name": runtime.mesh.node_id if runtime.mesh else ""}
 
 
 @app.post("/admin/invites")

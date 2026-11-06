@@ -23,6 +23,12 @@ This suits a pool whose members trust each other. It is not a public mesh. A pub
 - Anyone holding a live code can join until it is used. Treat it like a password, and keep the time short.
 - `invites.json` on the owner's machine holds live secrets beside `ca.key`, and has the same protection.
 
+## Finding a mesh
+
+A mesh started with `shardmesh up` answers a UDP broadcast on port 8208, and serves its public certificate at `/join/authority`, so anyone on the network can learn that it exists, its name, and its address. `--no-discovery` turns the broadcast off.
+
+An answer proves nothing, and anyone can send one. A machine that finds a mesh only asks to join. A person on the owner's side approves it after comparing the key fingerprint both machines show, so nothing gets in by being found. Going the other way, a rogue answer can lure a new machine to ask a stranger, so a new machine shows the authority's hash and asks you before it does. `--find` skips that question, so use it only on a network you trust.
+
 ## A network nobody owns
 
 In this kind of network there is no pool authority and no owner. [The README shows how to run one](../README.md#a-network-nobody-owns). What changes:

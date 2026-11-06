@@ -175,3 +175,37 @@ def test_autostart_files_run_up_for_this_user(system: str, suffix: str, tmp_path
 
 def test_doctor_gives_a_fix_for_everything_it_flags() -> None:
     assert all(advice for good, _, advice in up.checks() if not good)
+
+
+def test_a_person_approving_needs_no_invite_and_a_denial_is_signed(tmp_path: Path) -> None:
+    home = owner(tmp_path)
+    asked = request_membership(str(tmp_path / "joiner"), "joiner", ["100.64.0.2"])
+    refused = request_membership(str(tmp_path / "other"), "other", ["100.64.0.3"])
+    waiting = request_membership(str(tmp_path / "waiter"), "waiter", ["100.64.0.4"])
+    requests = [
+        {**read_membership_request(asked), "request": asked, "approved": True},
+        {**read_membership_request(refused), "request": refused, "denied": True},
+        {**read_membership_request(waiting), "request": waiting},
+    ]
+    posted: list[dict[str, str]] = []
+    with transport(home, requests, posted) as client:
+        assert up.approve_invited(home, client, "http://a:1", "key") == ["joiner"]
+    assert sorted(item["entry"]["type"] for item in posted) == ["deny", "member"]
+    assert {item["entry"]["name"] for item in posted} == {"joiner", "other"}
+
+
+def test_nothing_joins_a_found_mesh_without_being_asked_to(capsys, monkeypatch) -> None:
+    found = [{"url": "http://a:1", "authority": "a" * 64, "name": "first"}]
+    args = type("Args", (), {"find": False})()
+    monkeypatch.setattr(up.sys.stdin, "isatty", lambda: False, raising=False)
+    assert up.choose_mesh(found, args) is None
+    assert "Starting a new mesh" in capsys.readouterr().out
+    assert up.choose_mesh([], args) is None
+
+
+def test_find_joins_the_only_mesh_and_refuses_to_guess_between_several() -> None:
+    one = {"url": "http://a:1", "authority": "a" * 64, "name": "first"}
+    args = type("Args", (), {"find": True})()
+    assert up.choose_mesh([one], args) == one
+    with pytest.raises(ValueError, match="use an invite"):
+        up.choose_mesh([one, {**one, "authority": "b" * 64}], args)
