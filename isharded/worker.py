@@ -154,6 +154,7 @@ MAX_WAITING_REPLIES = 32
 DRAIN_LIMIT_SECONDS = 180.0
 # A control plane this worker only heard about, and that stays silent, is forgotten.
 CONTROL_LINK_FAILURES = 60
+CHECK_IN_SECONDS = 5.0
 
 
 @dataclass(slots=True)
@@ -485,10 +486,17 @@ class WorkerRuntime:
                 self.revoked_nodes.add(str(entry.get("name")))
 
     async def registration_loop(self) -> None:
-        """Stay known to every control plane, so a new coordinator needs no introduction."""
+        """Stay known to every control plane, so a new coordinator needs no introduction.
+
+        Each link keeps its own time. Waiting for all of them let one flaky link hold
+        up every check-in, until this worker looked dead even to the node beside it.
+        """
+        running: dict[str, asyncio.Task[None]] = {}
         while True:
-            await asyncio.gather(*(self._check_in(url, link) for url, link in list(self.control_urls.items())))
-            await asyncio.sleep(5)
+            for url, link in list(self.control_urls.items()):
+                if url not in running or running[url].done():
+                    running[url] = asyncio.create_task(self._check_in(url, link))
+            await asyncio.sleep(CHECK_IN_SECONDS)
 
     def pool_status(self) -> list[dict[str, Any]]:
         """Live view of each pool, for the planner and the dashboard."""

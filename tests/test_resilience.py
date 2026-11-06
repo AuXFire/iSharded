@@ -1084,3 +1084,30 @@ def test_diagnostics_show_what_is_waiting():
     found = asyncio.run(scenario())
     assert any("scenario" in line for line in found["tasks"])
     assert found["threads"]
+
+
+def test_a_slow_control_plane_does_not_delay_check_ins_with_the_others(monkeypatch) -> None:
+    import asyncio
+
+    from isharded import worker as worker_module
+
+    runtime = worker_module.WorkerRuntime.__new__(worker_module.WorkerRuntime)
+    runtime.control_urls = {"http://slow": worker_module.ControlLink(), "http://fast": worker_module.ControlLink()}
+    calls = {"http://slow": 0, "http://fast": 0}
+
+    async def check_in(url, link):
+        calls[url] += 1
+        if url == "http://slow":
+            await asyncio.sleep(30)  # a link that hangs, far past the liveness window
+
+    runtime._check_in = check_in
+    monkeypatch.setattr(worker_module, "CHECK_IN_SECONDS", 0.01)
+
+    async def run():
+        task = asyncio.create_task(runtime.registration_loop())
+        await asyncio.sleep(0.2)
+        task.cancel()
+
+    asyncio.run(run())
+    assert calls["http://slow"] == 1  # still in flight, so not stacked up
+    assert calls["http://fast"] > 5
