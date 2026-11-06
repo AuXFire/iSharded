@@ -228,7 +228,93 @@ impl LlamaCompute {
     }
 }
 
+impl LlamaCompute {
+    fn rows_out(&self, rows: &[f32]) -> Output {
+        let bf16 = false; // one row per pass crosses exactly, as it does over HTTP
+        let mut data = Vec::with_capacity(rows.len() * 4);
+        rows.iter().for_each(|value| data.extend_from_slice(&value.to_le_bytes()));
+        Output::Rows { rows: 1, width: self.api.width as u32, bf16, data }
+    }
+
+    fn merged(&mut self, passes: &[Pass]) -> Result<Vec<Result<Output, Failure>>, Failure> {
+        let width = self.api.width as usize;
+        // llama.cpp gathers sequences in order, and its rows come back in that order.
+        let mut order: Vec<usize> = (0..passes.len()).collect();
+        order.sort_unstable_by_key(|index| passes[*index].slot);
+        let mut hidden = Vec::with_capacity(passes.len() * width);
+        for index in &order {
+            let pass = &passes[*index];
+            if let Some(keep) = pass.rollback_to {
+                // Safety: only the gate's holder touches the memory.
+                if !unsafe { (self.api.seq_rm)(self.api.memory, pass.slot as i32, keep as i32, -1) } {
+                    return Err(Failure { refusal: Refusal::Retry, message: "this model cannot rewind; replay instead".into() });
+                }
+            }
+            if pass.carries_tokens() {
+                self.embed(&pass.tokens)?;
+                hidden.extend_from_slice(&self.embedded);
+            } else {
+                self.read_rows(pass)?;
+                hidden.extend_from_slice(&self.input);
+            }
+        }
+        let count = passes.len();
+        self.positions.clear();
+        for _ in 0..3 {
+            self.positions.extend(order.iter().map(|index| passes[*index].position as i32));
+        }
+        self.positions.resize(count * 4, 0);
+        let slots: Vec<i32> = order.iter().map(|index| passes[*index].slot as i32).collect();
+        self.counts.clear();
+        self.counts.resize(count, 1);
+        self.owners.clear();
+        self.owners.extend(slots.iter().map(std::ptr::from_ref));
+        self.outputs.clear();
+        self.outputs.resize(count, 1);
+        let batch = Batch {
+            n_tokens: count as i32,
+            token: std::ptr::null(),
+            embd: hidden.as_ptr(),
+            pos: self.positions.as_ptr(),
+            n_seq_id: self.counts.as_ptr(),
+            seq_id: self.owners.as_ptr(),
+            logits: self.outputs.as_ptr(),
+        };
+        self.capture.begin();
+        // Safety: every array in the batch lives until this returns.
+        let status = unsafe { (self.api.decode)(self.api.context, batch) };
+        if status != 0 {
+            return Err(stage_error(format!("llama_decode failed with status {status}")));
+        }
+        let mut results: Vec<Option<Result<Output, Failure>>> = (0..count).map(|_| None).collect();
+        if self.api.last {
+            for (row, index) in order.iter().enumerate() {
+                let pass = &passes[*index];
+                let mut draws = Draws::new(pass.sampling.seed, pass.position);
+                let logits = self.logits(row as i32)?;
+                results[*index] = Some(Ok(Output::Tokens(vec![sample::choose(logits, &pass.sampling, &mut draws)])));
+            }
+        } else {
+            let rows = self.capture.rows.lock().clone();
+            if rows.len() != count * width {
+                return Err(stage_error("a merged pass did not produce one row per reply".into()));
+            }
+            for (row, index) in order.iter().enumerate() {
+                results[*index] = Some(Ok(self.rows_out(&rows[row * width..(row + 1) * width])));
+            }
+        }
+        Ok(results.into_iter().flatten().collect())
+    }
+}
+
 impl Compute for LlamaCompute {
+    fn run_merged(&mut self, passes: &[Pass]) -> Vec<Result<Output, Failure>> {
+        match self.merged(passes) {
+            Ok(results) => results,
+            Err(failure) => passes.iter().map(|_| Err(Failure { refusal: failure.refusal, message: failure.message.clone() })).collect(),
+        }
+    }
+
     fn run(&mut self, pass: &Pass) -> Result<Output, Failure> {
         if let Some(keep) = pass.rollback_to {
             // Safety: only the gate's holder touches the memory.

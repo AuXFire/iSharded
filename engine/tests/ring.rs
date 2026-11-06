@@ -233,6 +233,35 @@ fn a_busy_stage_is_not_taken_for_dead() {
 }
 
 #[test]
+fn passes_that_wait_share_a_trip_and_each_still_gets_its_own_answer() {
+    let mut ring = ring(2, true, Duration::from_millis(30), 2000);
+    let total: u64 = 12;
+    for id in 1..=total {
+        let mut item = pass(id, id as u32, 3);
+        item.slot = id as u32;
+        ring.client.send(&item.encode()).unwrap();
+    }
+    let mut answers: Vec<_> = (0..total).map(|_| answer(&mut ring)).collect();
+    answers.sort_by_key(|item| item.id);
+    for (index, item) in answers.iter().enumerate() {
+        let id = index as u32 + 1;
+        assert_eq!(item.tokens[0], (id * 10 + 1) * 10 + 2, "reply {id} got another reply's result");
+    }
+}
+
+#[test]
+fn passes_on_one_sequence_never_share_a_trip() {
+    let mut ring = ring(2, true, Duration::from_millis(5), 2000);
+    for id in 1..=20 {
+        ring.client.send(&pass(id, 1, id as u32).encode()).unwrap();
+    }
+    for id in 1..=20 {
+        assert_eq!(answer(&mut ring).tokens[1], id as u32);
+    }
+    assert_eq!(ring.nodes[0].stats().merged_passes, 0);
+}
+
+#[test]
 fn nobody_reaches_the_local_door_without_its_key() {
     let node = Node::new().unwrap();
     let door = listening(&node);

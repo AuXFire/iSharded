@@ -29,6 +29,8 @@ const PING_EVERY: Duration = Duration::from_millis(1000);
 const WATCH_EVERY: Duration = Duration::from_millis(50);
 const DIAL_ATTEMPT: Duration = Duration::from_secs(5);
 const DIAL_RETRY: Duration = Duration::from_millis(250);
+/// The most replies that share one trip through the model.
+const MAX_MERGED: usize = 64;
 
 /// What a stage does with a pass. `Rows` go on to the next stage, and `Tokens` are the answer.
 pub enum Output {
@@ -43,6 +45,18 @@ pub struct Failure {
 
 pub trait Compute: Send {
     fn run(&mut self, pass: &Pass) -> Result<Output, Failure>;
+
+    /// Several one-row passes from different replies, in one trip through the model.
+    /// Reading the weights is what a pass costs, so sharing it costs little more than one.
+    fn run_merged(&mut self, passes: &[Pass]) -> Vec<Result<Output, Failure>> {
+        passes.iter().map(|pass| self.run(pass)).collect()
+    }
+}
+
+/// Whether a pass can share a trip through the model with others. A verify pass has rows
+/// that belong together, and a rewind has to finish before the sequence runs again.
+fn can_merge(pass: &Pass) -> bool {
+    pass.row_count() == 1 && !pass.verifying()
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,6 +111,8 @@ pub struct Listening {
 pub struct Stats {
     pub passes: u64,
     pub rows: u64,
+    pub merged_passes: u64,
+    pub merged_rows: u64,
     pub answers: u64,
     pub refusals: u64,
     pub compute_us: u64,
@@ -113,6 +129,8 @@ pub struct Stats {
 struct Counters {
     passes: AtomicU64,
     rows: AtomicU64,
+    merged_passes: AtomicU64,
+    merged_rows: AtomicU64,
     answers: AtomicU64,
     refusals: AtomicU64,
     compute_us: AtomicU64,
@@ -317,6 +335,8 @@ impl Node {
         Stats {
             passes: counters.passes.load(Ordering::Relaxed),
             rows: counters.rows.load(Ordering::Relaxed),
+            merged_passes: counters.merged_passes.load(Ordering::Relaxed),
+            merged_rows: counters.merged_rows.load(Ordering::Relaxed),
             answers: counters.answers.load(Ordering::Relaxed),
             refusals: counters.refusals.load(Ordering::Relaxed),
             compute_us: counters.compute_us.load(Ordering::Relaxed),
@@ -612,20 +632,41 @@ fn peer_lost(inner: &Inner, ring: &Ring, peer: &Peer, why: &str) {
 
 fn compute_loop(inner: &Arc<Inner>) {
     loop {
-        let job = {
+        let batch = {
             let mut jobs = inner.jobs.lock();
             loop {
                 if inner.stopping.load(Ordering::Acquire) {
                     return;
                 }
                 if let Some(job) = jobs.pop_front() {
-                    break job;
+                    break take_batch(job, &mut jobs);
                 }
                 inner.ready.wait(&mut jobs);
             }
         };
-        handle(inner, job);
+        handle(inner, batch);
     }
+}
+
+/// A job, and whatever waiting behind it can share its trip. There is no window to wait
+/// out: passes gather while the stage is busy, so a lone reply goes straight through.
+fn take_batch(first: Job, jobs: &mut VecDeque<Job>) -> Vec<Job> {
+    let mut batch = vec![first];
+    if !can_merge(&batch[0].pass) {
+        return batch;
+    }
+    while batch.len() < MAX_MERGED {
+        let fits = jobs.front().is_some_and(|job| {
+            can_merge(&job.pass) && job.pass.epoch == batch[0].pass.epoch && batch.iter().all(|item| item.pass.slot != job.pass.slot)
+        });
+        if !fits {
+            break;
+        }
+        if let Some(job) = jobs.pop_front() {
+            batch.push(job);
+        }
+    }
+    batch
 }
 
 fn refuse(inner: &Inner, ring: &Ring, pass: &Pass, refusal: Refusal, message: String) {
@@ -634,36 +675,52 @@ fn refuse(inner: &Inner, ring: &Ring, pass: &Pass, refusal: Refusal, message: St
     send_back(inner, ring, &nack.encode());
 }
 
-fn handle(inner: &Arc<Inner>, job: Job) {
+fn handle(inner: &Arc<Inner>, jobs: Vec<Job>) {
     let Some(ring) = inner.ring.read().clone() else {
         // No route: the link that carried this has nothing to do any more. Say so at the entry.
-        let nack = Nack { id: job.pass.id, epoch: job.pass.epoch, refusal: Refusal::Epoch, stage: 0, message: "no route here".into() };
-        to_local(inner, &nack.encode());
+        for job in &jobs {
+            let nack = Nack { id: job.pass.id, epoch: job.pass.epoch, refusal: Refusal::Epoch, stage: 0, message: "no route here".into() };
+            to_local(inner, &nack.encode());
+        }
         return;
     };
-    let pass = job.pass;
-    if pass.epoch != ring.epoch {
-        refuse(inner, &ring, &pass, Refusal::Epoch, format!("this stage is on route {}", ring.epoch));
+    if jobs[0].pass.epoch != ring.epoch {
+        for job in &jobs {
+            refuse(inner, &ring, &job.pass, Refusal::Epoch, format!("this stage is on route {}", ring.epoch));
+        }
         return;
     }
-    average(&inner.counters.wait_us, job.arrived.elapsed().as_micros() as u64);
+    average(&inner.counters.wait_us, jobs[0].arrived.elapsed().as_micros() as u64);
+    let passes: Vec<Pass> = jobs.into_iter().map(|job| job.pass).collect();
     inner.gate.lock();
     let started = Instant::now();
-    let result = match inner.compute.lock().as_mut() {
-        Some(compute) => compute.run(&pass),
-        None => Err(Failure { refusal: Refusal::Retry, message: "this stage has nothing loaded".into() }),
+    let results = match inner.compute.lock().as_mut() {
+        Some(compute) if passes.len() > 1 => compute.run_merged(&passes),
+        Some(compute) => vec![compute.run(&passes[0])],
+        None => passes.iter().map(|_| Err(Failure { refusal: Refusal::Retry, message: "this stage has nothing loaded".into() })).collect(),
     };
     average(&inner.counters.compute_us, started.elapsed().as_micros() as u64);
     // Safety: taken just above, on this thread.
     unsafe { inner.gate.unlock() };
-    inner.counters.passes.fetch_add(1, Ordering::Relaxed);
-    inner.counters.rows.fetch_add(pass.row_count() as u64, Ordering::Relaxed);
+    let counters = &inner.counters;
+    counters.passes.fetch_add(passes.len() as u64, Ordering::Relaxed);
+    counters.rows.fetch_add(passes.iter().map(|pass| pass.row_count() as u64).sum(), Ordering::Relaxed);
+    if passes.len() > 1 {
+        counters.merged_passes.fetch_add(1, Ordering::Relaxed);
+        counters.merged_rows.fetch_add(passes.len() as u64, Ordering::Relaxed);
+    }
+    for (pass, result) in passes.into_iter().zip(results) {
+        finish(inner, &ring, pass, result);
+    }
+}
+
+fn finish(inner: &Arc<Inner>, ring: &Arc<Ring>, pass: Pass, result: Result<Output, Failure>) {
     match result {
-        Err(failure) => refuse(inner, &ring, &pass, failure.refusal, failure.message),
+        Err(failure) => refuse(inner, ring, &pass, failure.refusal, failure.message),
         Ok(Output::Tokens(tokens)) => {
             inner.counters.answers.fetch_add(1, Ordering::Relaxed);
             let frame = Answer { id: pass.id, epoch: pass.epoch, tokens }.encode();
-            answer(inner, &ring, &frame);
+            answer(inner, ring, &frame);
         }
         Ok(Output::Rows { rows, width, bf16, data }) => {
             let mut flags = pass.flags & !(FLAG_TOKENS | FLAG_BF16);
@@ -671,7 +728,7 @@ fn handle(inner: &Arc<Inner>, job: Job) {
                 flags |= FLAG_BF16;
             }
             let onward = Pass { flags, tokens: Vec::new(), rows, width, data, ..pass };
-            forward(inner, &ring, &onward);
+            forward(inner, ring, &onward);
         }
     }
 }
