@@ -527,7 +527,7 @@ class Words:
     """A tokenizer where the marker is one token."""
 
     stop_token_ids = {0}
-    chat_template = "<|image_pad|>"
+    chat_template = tool_template = "<|image_pad|>"
 
     def encode(self, text):
         return [7 if word == "<|image_pad|>" else 1 for word in text.split()]

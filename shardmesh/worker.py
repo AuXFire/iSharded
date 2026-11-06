@@ -68,7 +68,7 @@ from .protocol import (
 from .gguf import parse_source
 from .gguf_stage import INITIAL_GUESSES, DraftModel, GgufStage, ImageEncoder, PromptPlan, next_guess_count, plan_prompt
 from . import __version__
-from .llamacpp import LlamaError, StageLost, ensure_build, pick_build, rocm_library_paths
+from .llamacpp import LlamaError, StageLost, ensure_build, pick_build, rocm_library_paths, step_random
 from .pool import check_exposure, load_token
 from .serving import MAX_STAGE_BYTES, BodyLimit, serve, where_everything_is
 from .slots import SlotGate
@@ -943,7 +943,7 @@ class WorkerRuntime:
                 probabilities /= probabilities.sum()
             if request.seed is not None:
                 generator = torch.Generator(device=probabilities.device)
-                generator.manual_seed(request.seed + self.caches[request.session_id].length)
+                generator.manual_seed(int(step_random(request.seed, self.caches[request.session_id].length).integers(2**63)))
                 return int(torch.multinomial(probabilities, 1, generator=generator).item())
             return int(torch.multinomial(probabilities, 1).item())
 

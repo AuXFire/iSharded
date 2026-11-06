@@ -20,6 +20,7 @@ This is execution sharding, not simulated work distribution: each token really c
 - [Command reference](#command-reference)
 - [Environment variables](#environment-variables)
 - [HTTP API](#http-api)
+- [MCP](#mcp)
 - [Models](#models)
 - [Embeddings](#embeddings)
 - [Vision](#vision)
@@ -45,7 +46,8 @@ More detail lives in [Operating ShardMesh](docs/OPERATIONS.md) and [ShardMesh se
 - Runs GGUF models on stock llama.cpp, and safetensors models on its own PyTorch code. Qwen and GPT-2 families, including mixture-of-experts models.
 - Speeds up replies with a small draft model, reuses earlier conversation state, and lets conversations share a pass through each stage.
 - Runs several models at once on the same mesh, and users choose between them.
-- Serves OpenAI-shaped `/v1/chat/completions`, `/v1/completions`, and `/v1/models`, with streaming, plus a chat page and a live dashboard on every node.
+- Serves OpenAI-shaped `/v1/chat/completions`, `/v1/completions`, and `/v1/models`, with streaming and tool calling, plus a chat page and a live dashboard on every node.
+- Speaks MCP both ways: MCP clients can use a mesh, and models on a mesh can use the tools of MCP servers.
 - Keeps replies going through failures: a crashed stage, a dead node, a dead coordinator, a silent link, or a split network.
 - Moves weights only when it must, shares them between nodes, and works with no internet at all.
 - Runs as a network one person owns, or as one nobody owns, where each node decides who it accepts and what it hosts.
@@ -774,6 +776,22 @@ Commands for a pool's credentials and members.
 
 `--address` is one an address peers use for that node, and is repeatable. `--token` is an admin key.
 
+### shardmesh mcp
+
+`shardmesh mcp` serves a mesh to an MCP client over stdio. `shardmesh mcp run PROMPT` gives a model on the mesh the tools of MCP servers, and prints its answer. [MCP](#mcp) has the details.
+
+| Option | Applies to | Default | What it does |
+|---|---|---|---|
+| `--url` | both | `http://127.0.0.1:8000` | Any node's control address |
+| `--token` | both | This machine's pool token | A user key |
+| `--model` | run | Required | The model to use. It must support [tool calling](#tool-calling) |
+| `--server` | run | Required | The command that starts an MCP stdio server. Repeatable |
+| `--allow` | run | None | A tool that may run without asking. Repeatable |
+| `--pass-env` | run | None | An environment variable servers may see, beyond the basics. Repeatable |
+| `--max-turns` | run | 8 | Most times the model may be asked before giving up |
+| `--max-tokens` | run | The API's default | Longest reply on each turn |
+| `--tool-timeout` | run | 60 | Seconds a tool may take |
+
 ### Running the pieces by hand
 
 `shardmesh node` starts these for you. Start them directly only for unusual layouts, such as a control plane on a machine with no workers.
@@ -867,10 +885,11 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 
 | Method | Path | Needs | Purpose |
 |---|---|---|---|
-| `POST` | `/v1/chat/completions` | User key | Chat, streaming with `stream: true` |
+| `POST` | `/v1/chat/completions` | User key | Chat, streaming with `stream: true`, and [tool calling](#tool-calling) |
 | `POST` | `/v1/completions` | User key | Text completion, one prompt per request |
 | `POST` | `/v1/embeddings` | User key | Vectors for text, from an embedding model. See [Embeddings](#embeddings) |
 | `GET` | `/v1/models` | User key | Every running model, and what each is for |
+| `POST` | `/mcp` | User key | [MCP](#mcp) over Streamable HTTP. `GET` and `DELETE` answer 405, since there is no stream or session |
 | `GET` | `/admin/status` | User key | Workers, memory pools, route, epoch, mesh, and load progress |
 | `GET` | `/admin/catalog` | User key | Suggested models and supported architectures |
 | `POST` | `/admin/plan` | Admin key | Show where a model would run, without moving anything |
@@ -905,10 +924,11 @@ Routes under `/internal` are for nodes only. `GET /internal/mesh` shows a node's
 
 | Field | Default | What it does |
 |---|---|---|
-| `messages` | Required for chat | List of `role` and `content`. `content` is a string, or a list of `text` and `image_url` parts. See [Vision](#vision) |
+| `messages` | Required for chat | List of `role` and `content`. `content` is a string, or a list of `text` and `image_url` parts. See [Vision](#vision). An assistant message may carry `tool_calls` and no content, and a `tool` message answers one with `tool_call_id`. `name` is optional |
 | `prompt` | Required for completions | A string, or a list holding one string |
 | `model` | The running model | Must match it if given |
-| `max_tokens` | 32 | 1 to 32768 |
+| `max_tokens` | 32, or 4096 with tools in play | 1 to 32768 |
+| `max_completion_tokens` | None | Chat only: the same limit under OpenAI's newer name, and it wins if both are sent |
 | `temperature` | 0 | 0 to 5. 0 picks the most likely token |
 | `top_p` | 1 | Above 0, up to 1 |
 | `top_k` | 0 | 0 is off |
@@ -916,8 +936,90 @@ Routes under `/internal` are for nodes only. `GET /internal/mesh` shows a node's
 | `stream` | `false` | Send tokens as server-sent events, ending with `data: [DONE]` |
 | `stop` | None | A string or list that ends the reply |
 | `enable_thinking` | None | Chat only: switches reasoning on models that support it |
+| `tools` | None | Chat only: functions the model may call. See [tool calling](#tool-calling) |
+| `tool_choice` | `auto` | Chat only: `auto`, `none`, `required`, or a named function |
+| `parallel_tool_calls` | `true` | Chat only: `false` keeps only the first call in a reply |
 
 Prompts longer than the loaded context are refused with a 400. A reply that would overrun it is cut short.
+
+### Tool calling
+
+`/v1/chat/completions` takes OpenAI's tool fields and answers in OpenAI's shape, so existing clients work unchanged. A reply with calls has `tool_calls` with ids, and `finish_reason: "tool_calls"`. Send the result back as a `tool` message with the call's `tool_call_id`.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://NODE:8209/v1", api_key="KEY")
+tools = [{"type": "function", "function": {"name": "get_weather", "parameters": {
+    "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
+messages = [{"role": "user", "content": "What is the weather in Paris?"}]
+
+message = client.chat.completions.create(model=MODEL, messages=messages, tools=tools).choices[0].message
+messages.append(message)
+for call in message.tool_calls or []:
+    messages.append({"role": "tool", "tool_call_id": call.id, "content": '{"temperature_c": 17}'})
+print(client.chat.completions.create(model=MODEL, messages=messages, tools=tools).choices[0].message.content)
+```
+
+Tools go through the model's own chat template, which is how it was trained to see them. The template also decides how replies are read, so a fine-tune of a family needs nothing configured. A template with no format listed here is refused with a 400, because tools pasted into a prompt the model was not trained on would only look as if they worked.
+
+| Family | How it writes a call | Status here |
+|---|---|---|
+| Qwen3 | `<tool_call>` around JSON | Run on a real model, see below |
+| Qwen3.5 | `<function=name><parameter=key>` in XML | Run on a real model, see below |
+| Qwen2.5 | `<tool_call>` around JSON | Not run on a model. Its real template renders a tool conversation, and its calls read back |
+| Qwen3-Coder | `<function=name><parameter=key>` in XML | The same |
+| Hermes 2 and 3 | `<tool_call>` around JSON, through their `tool_use` template | The same, and they cannot load here yet: they are built on Llama |
+| Llama 3.1, 3.2 | `{"name": ..., "parameters": ...}`, sometimes after `<\|python_tag\|>` | The same, and they cannot load here yet. Their templates take one call per message, so a conversation holding parallel calls is refused |
+| Mistral 7B v0.3 | `[TOOL_CALLS]` and a JSON list | The same, and it cannot load here yet |
+| Mistral Small 3.2 | `[TOOL_CALLS]name[ARGS]{...}` | The same, and it cannot load here yet |
+
+"Cannot load here yet" means the parser is ready and the mesh is not: GGUF tokenizers cover `qwen2` and `qwen35` vocabularies only, and neither family is on the PyTorch path. See [Supported families](#supported-families). Other families, such as GLM and DeepSeek, are refused rather than guessed at.
+
+What comes back:
+
+- A call counts when it names a function that was offered and its arguments are a JSON object. Anything else comes back in `content` exactly as the model wrote it, because a client can use that, and a call made up from it could do harm.
+- A call cut off by the token limit comes back as text, with `finish_reason: "length"`. The default limit is 4096 with tools in play, since clients following OpenAI send none, and the usual 32 would cut a call in half.
+- Reasoning stays in `content` inside `<think>`, as in any reply, and is never read as a call. Templates take it out again when the message is sent back.
+- XML writes every value as text, so values are converted using the tool's schema. One that does not fit stays as written, for your own checks to catch.
+- A stream holds back text that might be a call until it is one or clearly is not, so markup never reaches a client as content. A call is sent once it has been read whole, as one delta with the id and name and one with the arguments, so arguments do not arrive token by token.
+- Replies with tools work through lanes, followers, and failover like any others.
+
+`tool_choice` sets what the model must do:
+
+| Value | What happens |
+|---|---|
+| `auto` | The model decides |
+| `none` | Tools stay out of the prompt, and nothing is read as a call |
+| `required` | The prompt ends with the start of a call, so the model has begun one before it writes a word |
+| `{"type": "function", "function": {"name": "f"}}` | The same, with the function already named, and only one call is kept |
+
+A forced call skips reasoning whatever `enable_thinking` says, and works on any route with no change to the workers. It is only half a constraint: the start is forced, and the arguments are still the model's own, so check them against your schema. There is no grammar here. If the model still writes no usable call, the reply says so plainly in `content` with `finish_reason: "stop"`, and no call is made up.
+
+Small models were measured on a real node, on CPU with four threads, through the official `openai` client with five tools offered. Each of 24 prompts ran whole and streamed. A full loop means the right tool, the right arguments, and then a final answer that uses the result. Default settings are what a client gets by sending nothing, which is temperature 0. Sampled means temperature 0.6, `top_p` 0.95, and `top_k` 20.
+
+| Model | Format | Settings | Right tool | Right arguments | Full loop | Time per loop |
+|---|---|---|---:|---:|---:|---:|
+| Qwen3-0.6B Q8_0 | JSON | Default | 47 of 47 | 47 of 47 | 39 of 47 | 14 s |
+| Qwen3-0.6B Q8_0 | JSON | Sampled | 48 of 48 | 47 of 48 | 43 of 48 | 16 s |
+| Qwen3.5-0.8B Q8_0 | XML | Default | 48 of 48 | 48 of 48 | 46 of 48 | 3 s |
+| Qwen3.5-0.8B Q8_0 | XML | Sampled | 48 of 48 | 48 of 48 | 45 of 48 | 4 s |
+
+| Model | Full loops with `required` | Full loops with a named function |
+|---|---:|---:|
+| Qwen3-0.6B Q8_0 | 48 of 48 | 48 of 48 |
+| Qwen3.5-0.8B Q8_0 | 45 of 48 | 45 of 48 |
+
+- Neither model called a tool on any of its 16 prompts that needed none.
+- Forced calls named the right tool in all 192 runs. Full loops count both settings.
+- Nearly every failure came after a correct call. The model answered without using the result, called again, or, with Qwen3, never finished reasoning and gave no answer at all.
+- At default settings, whole and streamed replies were identical on every prompt.
+- One Qwen3 run is left out of the table, because other tests were starving the node of CPU and it failed for that reason.
+- Qwen3 is slower because it reasons first. Forced calls skip that, and took it about 6 s.
+- These prompts are easy: one step and one call, and several name the tool. They say little about longer tasks, and larger models were not measured.
+- Neither model wrote two different calls in one reply, so true parallel calls have only run with scripted replies.
+
+On two nodes on one machine, the same loop ran through the coordinator, a follower, and a lane, whole and streamed. A worker was then killed while the model was still reasoning, first the one holding most of the layers, then the entry worker. Both times the route repaired itself and the client still got the call.
 
 ### Load requests
 
@@ -951,16 +1053,72 @@ Prompts longer than the loaded context are refused with a 400. A reply that woul
 |---|---|
 | 400 | Bad request, or a prompt too long for the loaded context |
 | 401 | No valid key |
-| 403 | The key is valid but lacks the role, or a node is speaking for another |
+| 403 | The key is valid but lacks the role, a node is speaking for another, or a web page from elsewhere reached `/mcp` |
 | 404 | No such model, key, or route |
+| 405 | `GET` or `DELETE` on `/mcp` |
+| 406 | A `/mcp` request that does not accept both JSON and event streams |
 | 409 | No model is ready, or a change refused as unsafe. The message says which |
 | 411 | The request has no length |
 | 413 | The request is too large |
+| 415 | A `/mcp` request that is not `application/json` |
 | 426 | A node is on a different protocol version. Upgrade it |
 | 429 | A key's rate limit, or too many replies waiting. `Retry-After` says when |
 | 502 | A stage could not process this request |
 | 503 | No coordinator yet, or a stage restarting. Try again shortly |
 | 507 | The model does not fit in the pool |
+
+## MCP
+
+[MCP](https://modelcontextprotocol.io), the Model Context Protocol, is how AI applications connect to tools. ShardMesh speaks it in both directions. It follows the current revision, 2026-07-28, which has no `initialize` and no sessions, and also the older revisions back to 2024-11-05, which many clients still use. How a client opens decides which it gets.
+
+### The mesh as an MCP server
+
+Over stdio, give your MCP client this command:
+
+```json
+{"mcpServers": {"mesh": {"command": "shardmesh", "args": ["mcp", "--url", "http://NODE:8209", "--token", "KEY"]}}}
+```
+
+Over HTTP, point it at `http://NODE:8209/mcp` with `Authorization: Bearer KEY`. Every control plane serves this, behind the same keys as `/v1`.
+
+| Tool | What it does |
+|---|---|
+| `chat` | Asks a model and returns its answer, without its reasoning. Takes `prompt`, and optionally `image` (a `data:` URL, for a model that can see), `system`, `model`, `max_tokens` (1024 unless set), `temperature`, and `enable_thinking` |
+| `embed` | Turns `text` into a vector with an embedding model. `model` is optional |
+| `list_models` | The models running now |
+| `mesh_status` | Whether the mesh can answer, what it runs, and which nodes hold which stages |
+
+Each tool is a call to the node's own API with your key, so a reply reached this way takes the normal path, through lanes, followers, and failover. Rate limits and the audit log apply to it, and a key can do nothing here that it could not do there.
+
+- Requests each stand alone, on any node. There are no sessions and no event streams, so replies arrive whole, with no progress updates. Over stdio, `notifications/cancelled` stops a reply.
+- A web page may only reach `/mcp` from this machine or from a member of the mesh, because a page from elsewhere could otherwise use DNS rebinding to reach a node on your own network.
+- Bad arguments come back as a tool error a model can read, with `isError: true`. An unknown tool is a protocol error.
+- `/mcp` replies are chunked, with no `Content-Length`. AVG's network filter corrupts any reply that has one to a request that looks like MCP, even on loopback, so that no client can read it.
+- Resources, prompts, and subscriptions are not offered.
+
+The official `mcp` Python package, version 2.3.0, has used this as a client in both eras, over both stdio and HTTP. In the current era that included a reply from a real model.
+
+### MCP tools for models on the mesh
+
+`shardmesh mcp run` is an agent loop. It starts MCP stdio servers, gives the model their tools, runs the calls it asks for, and prints its answer to stdout. Everything else goes to stderr.
+
+```bash
+shardmesh mcp run --url http://NODE:8209 --token KEY --model MODEL \
+  --server "python my_server.py" --server "other-server --flag" --allow search \
+  "What changed in the release notes?"
+```
+
+A tool with no read-only annotation stops and asks at the terminal, showing its arguments, unless `--allow NAME` names it. With no terminal to ask at, the answer is no, and the model is told so. If two servers offer the same name, the later one is prefixed with its server's name.
+
+**A server's annotations are its own claim.** `readOnlyHint` is what a server says about itself, and nothing checks it. A tool that says it is read-only runs without asking, even if it deletes your files, so only run servers you trust. The same goes for what a tool returns: it is text a stranger chose, and it reaches the model. It can talk the model into asking for another tool, and that call still has to pass the same check.
+
+Servers are programs running as you. They see a short list of environment variables, such as `PATH`, and anything else only through `--pass-env`, so your keys do not reach them by accident. Your key goes to the mesh and never to a server.
+
+Do not take a model's word that a tool ran. Each run goes to stderr as `Calling NAME`, and that is the record. In testing, Qwen3-0.6B reported a note as saved after the call had been refused, and the note did not exist.
+
+Stdio servers only: `mcp run` does not connect to HTTP MCP servers. It offers servers no sampling and no roots. The whole command has run with both models [measured above](#tool-calling), against a test server of each era, through a read-only tool, a refused tool, and `--allow`. Its client has also listed and called tools on a server built with the official `mcp` package, without a model. How well a run does depends on the model.
+
+The assistant has its own MCP client, in `shardmesh/assistant/plugins.py`, which adds its broker and sandbox. See [the assistant's guide](docs/ASSISTANT.md).
 
 ## Models
 
@@ -1322,6 +1480,12 @@ The full guide is [Operating ShardMesh](docs/OPERATIONS.md).
 | `no node has memory left under the limits its owner set` | The main model uses all that owners gave | Give nodes more with `--gpu-memory-gb` or `--weights-ram-gb`, or load a smaller main model |
 | In a network nobody owns, a node never appears | The others do not accept it yet | Have a node they accept run `shardmesh net vouch`, or use `--joining open` |
 | `nobody can replace what this network runs` | In a network nobody owns, the running model stays | Load yours beside it with `--lane` |
+| `this model's chat template has no tool format` | The template shows no way of calling tools, or one ShardMesh cannot read | Send `tool_choice: "none"`, or load a model the [table](#tool-calling) lists |
+| `does not fit the model's chat template` | The template refused the conversation. The message ends with its reason, such as parallel calls on Llama | Change the conversation to suit the model |
+| A tool call comes back as text | The model wrote something that is not a call to an offered tool | Read `content` to see what it wrote. Small models do this often, so retry or use a larger one |
+| A model answers without calling a tool | `auto` leaves that to the model | Send `tool_choice: "required"` |
+| `shardmesh mcp run` says `Refused`, with no question | There is no terminal to ask at | Name the tool with `--allow` |
+| An MCP server cannot find a key or setting | Servers see only a short list of environment variables | Pass it with `--pass-env` |
 
 ## Measured performance
 
@@ -1357,7 +1521,7 @@ python -m pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-Adapter tests compare every family with the reference `transformers` implementation, and skip families newer than the installed release, so run them under a current `transformers` as well. TLS tests skip on a machine where antivirus intercepts loopback. `tests/test_readme.py` fails if an option, setting, endpoint, or metric is missing from this file.
+Adapter tests compare every family with the reference `transformers` implementation, and skip families newer than the installed release, so run them under a current `transformers` as well. TLS tests skip on a machine where antivirus intercepts loopback. `tests/test_readme.py` fails if an option, setting, endpoint, or metric is missing from this file. `tests/test_mcp.py` also tries the official `mcp` package when `SHARDMESH_TEST_MCP_PYTHON` names a Python that has it, and uses port 9531.
 
 `scripts/ci_local.sh` runs what CI runs from a clean clone, which catches anything only your machine has.
 
@@ -1378,6 +1542,8 @@ Adapter tests compare every family with the reference `transformers` implementat
 | `shardmesh/up.py`, `shardmesh/discovery.py` | One-command setup: settings, invites, finding a mesh, `doctor`, and `service` |
 | `shardmesh/node.py` | The launcher that supervises a node's services |
 | `shardmesh/lanes.py` | Several models at once: the front door and each node's lanes |
+| `shardmesh/toolcalls.py` | Tool calling: what a template offers, and finding calls in replies |
+| `shardmesh/mcp_server.py`, `shardmesh/mcp_client.py` | The mesh as an MCP server, and the agent loop for `shardmesh mcp run` |
 | `shardmesh/commons.py` | A network nobody owns: self-made identities, vouches, and each node's view |
 | `shardmesh/inventory.py`, `shardmesh/gpu_probe.py` | What a node reports about itself, and how it finds GPUs PyTorch cannot see |
 | `shardmesh/audit.py` | Comparing routes that serve the same model |
@@ -1418,6 +1584,9 @@ Behavior:
 - A reply is lost if the node its client is connected to dies.
 - Multi-turn reuse keeps one conversation per sequence, so more conversations than sequences push each other out and reread their history.
 - Mesh membership is meant for tens of nodes: every worker checks in with every control plane.
+- Tool arguments are not constrained to a schema, even for a forced call. Only the start of a call is forced, and a client should check what it receives.
+- A streamed tool call arrives once it is complete, not token by token.
+- Llama, Mistral, and Hermes calls are read and rendered correctly as far as their real templates show, but no such model can load on a mesh yet, so none has run here.
 
 ## License
 

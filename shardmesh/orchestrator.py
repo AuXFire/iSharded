@@ -15,11 +15,13 @@ from contextlib import aclosing, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 import numpy as np
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from jinja2.exceptions import TemplateError
 from starlette.background import BackgroundTask
 
 from . import __version__
@@ -29,6 +31,7 @@ from .gguf import GgufHeader, parse_source
 from . import audit
 from .discovery import start_beacon
 from .lanes import LaneDoor
+from .mcp_server import INVALID_REQUEST, McpHandler, MeshTools, RpcError, answer_http
 from .mesh import GOSSIP_SECONDS, ControlMesh
 from .models import Adapter, GgufAdapter, SUPPORTED_TYPES, UnsupportedModel, create_adapter
 from .planner import AMORTIZE_TOKENS, HOP_MS, Candidate, ModelProfile, PlacementError, plan_placement
@@ -54,12 +57,24 @@ from .protocol import (
     WorkerRegistration,
     auth_headers,
 )
-from .pool import check_exposure, home as pool_home, load_token, read_membership_request
-from .serving import BodyLimit, serve, where_everything_is
+from .pool import LOOPBACK, check_exposure, home as pool_home, load_token, read_membership_request
+from .serving import BodyLimit, ChunkedResponses, serve, where_everything_is
 from .mesh import clean_url
 from .tickets import PREFIX as TICKET_PREFIX, NodeTickets, TicketChecker, TicketIdentity, client_auth, make_checker, reply_audience
 from .tls import BEHALF, BEHALF_HEADER, FORWARD_MARK, INTERCEPTED, intercepted, PEER, client_verify
 from .tokenizer import ChatTokenizer, IncrementalText, load_tokenizer
+from .toolcalls import (
+    MARKER_TOKENS,
+    ReplyScanner,
+    ToolRequestError,
+    forced_opening,
+    opens_in_thought,
+    plan_tools,
+    reply_limit,
+    template_messages,
+    tool_deltas,
+    uses_tools,
+)
 from .vision import ImageRefused, chat_images, expand_prompt, image_id, projector_marker
 from .weights import apply_model_hashes, Manifest, WeightSourceError, build_manifest
 
@@ -1950,11 +1965,13 @@ class Orchestrator:
         stop: str | list[str] | None,
         history: str | None = None,
         images: list[bytes] | None = None,
+        keep_markers: bool = False,
     ) -> AsyncIterator[dict[str, Any]]:
         """Yield text as it is generated, then one final summary.
 
         Text is held back while it could still be the start of a stop string,
-        or while it ends inside a multi-byte character.
+        or while it ends inside a multi-byte character. ``keep_markers`` keeps
+        the special tokens a tool call is written with.
         """
         if not self.tokenizer or not self.model_id:
             raise HTTPException(status_code=409, detail="no model loaded")
@@ -1979,7 +1996,8 @@ class Orchestrator:
         started = time.perf_counter()
         first_token_at: float | None = None
 
-        decoder = IncrementalText(tokenizer)
+        reader = tokenizer.keeping(MARKER_TOKENS) if keep_markers else tokenizer
+        decoder = IncrementalText(reader)
         self.replies_in_flight += 1
         try:
             source = self.token_stream(session, max_tokens, temperature, top_p, top_k, seed, boundary)
@@ -2010,7 +2028,7 @@ class Orchestrator:
             # awaiting here would be cancelled along with it.
             self.spawn(self.clear_session(session.session_id))
 
-        text = tokenizer.decode(generated)
+        text = reader.decode(generated)
         hits = [text.index(marker) for marker in markers if marker in text]
         if hits:
             text = text[: min(hits)]
@@ -2438,6 +2456,7 @@ async def audit_requests(request: Request, call_next: Any) -> Any:
 # Added last, so it runs first: nothing oversized is read, forwarded or parsed.
 app.add_middleware(TicketIdentity)
 app.add_middleware(BodyLimit)
+app.add_middleware(ChunkedResponses, path="/mcp")
 
 
 @app.get("/ready")
@@ -2958,12 +2977,25 @@ async def event_stream(
     tokens: AsyncIterator[dict[str, Any]],
     envelope: dict[str, Any],
     to_choice: Any,
+    first_delta: dict[str, Any] | None = None,
 ) -> AsyncIterator[str]:
     """Wrap generated text in OpenAI-style server-sent events."""
+
+    def delta_event(delta: dict[str, Any]) -> str:
+        return server_sent({**envelope, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]})
+
+    calls = 0
     try:
+        if first_delta:
+            yield delta_event(first_delta)
         async for item in tokens:
             if "text" in item:
                 yield server_sent({**envelope, "choices": [to_choice(item["text"], None)]})
+                continue
+            if "tool_call" in item:
+                for delta in tool_deltas(item["tool_call"], calls):
+                    yield delta_event(delta)
+                calls += 1
                 continue
             usage = {
                 "prompt_tokens": item["prompt_tokens"],
@@ -3064,6 +3096,51 @@ async def completions(
     }
 
 
+def render_prompts(
+    tokenizer: Any, messages: list[dict[str, Any]], thinking: bool | None, tools: list[dict[str, Any]] | None
+) -> tuple[str, str]:
+    """The prompt, and the settled history inside it, through the model's own template."""
+    options = {"tools": tools} if tools else {}
+    try:
+        return (
+            tokenizer.render_chat(messages, thinking, **options),
+            tokenizer.render_chat(messages, thinking, add_generation_prompt=False, **options),
+        )
+    except (TemplateError, TypeError) as exc:
+        raise ToolRequestError(f"this conversation does not fit the model's chat template: {exc}") from exc
+
+
+async def scanned(tokens: AsyncIterator[dict[str, Any]], scanner: ReplyScanner) -> AsyncIterator[dict[str, Any]]:
+    """A reply with its tool calls taken out of the text."""
+    async with aclosing(tokens) as source:
+        async for item in source:
+            if "text" in item:
+                for found in scanner.feed(item["text"]):
+                    yield found
+                continue
+            for found in scanner.finish(item["finish_reason"] == "length"):
+                yield found
+            yield {**item, "finish_reason": "tool_calls"} if scanner.calls else item
+
+
+async def whole_reply(items: AsyncIterator[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The assistant message a reply comes to, and its summary."""
+    pieces: list[str] = []
+    calls: list[dict[str, Any]] = []
+    summary: dict[str, Any] = {}
+    async for item in items:
+        if "text" in item:
+            pieces.append(item["text"])
+        elif "tool_call" in item:
+            calls.append(item["tool_call"])
+        else:
+            summary = item
+    text = "".join(pieces)
+    if calls:
+        return {"role": "assistant", "content": text or None, "tool_calls": calls}, summary
+    return {"role": "assistant", "content": text}, summary
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(
     body: ChatCompletionRequest,
@@ -3074,33 +3151,52 @@ async def chat_completions(
     if lane:
         return await runtime.lanes.forward(lane, "/v1/chat/completions", body.model_dump(exclude_none=True), caller)
     await check_request(body.model)
+    assert runtime.tokenizer is not None
     try:
-        messages, images = chat_images([message.model_dump() for message in body.messages])
+        plain, images = chat_images([message.model_dump() for message in body.messages])
     except ImageRefused as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if images and not (runtime.active and runtime.active.projector):
         raise HTTPException(status_code=400, detail=f"{runtime.model_id} has no image projector, so it cannot see images; load it with --mmproj FILE")
-    assert runtime.tokenizer is not None
-    prompt = await asyncio.to_thread(runtime.tokenizer.render_chat, messages, body.enable_thinking)
-    history = await asyncio.to_thread(runtime.tokenizer.render_chat, messages, body.enable_thinking, add_generation_prompt=False)
-    options = (body.max_tokens, body.temperature, body.top_p, body.top_k, body.seed, body.stop, history, images)
+    try:
+        plan = plan_tools(body.tools, body.tool_choice, body.parallel_tool_calls, runtime.tokenizer.tool_template)
+        messages = template_messages([message.model_copy(update={"content": item["content"]}) for message, item in zip(body.messages, plain)])
+        # A forced call starts straight away. Told nothing, Qwen3 took one for its
+        # reasoning, closed that, and wrote the call a second time.
+        thinking = False if plan and plan.forced is not None else body.enable_thinking
+        prompt, history = await asyncio.to_thread(render_prompts, runtime.tokenizer, messages, thinking, plan.tools if plan else None)
+    except ToolRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    limit = reply_limit(body.max_tokens, body.max_completion_tokens, uses_tools(body.tools, body.messages))
+    scanner = None
+    if plan:
+        opening = forced_opening(plan)
+        in_thought = opens_in_thought(prompt)
+        # Some templates open reasoning whatever they are told.
+        prompt += ("\n</think>\n\n" if opening and in_thought else "") + opening
+        scanner = ReplyScanner(plan, in_thought and not opening, opening)
+    options = (limit, body.temperature, body.top_p, body.top_k, body.seed, body.stop, history, images)
+    items = runtime.stream_tokens(prompt, *options, keep_markers=scanner is not None)
+    if scanner:
+        items = scanned(items, scanner)
     identifier = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     if body.stream:
         envelope = {"id": identifier, "object": "chat.completion.chunk", "created": created, "model": runtime.model_id}
         return StreamingResponse(
             event_stream(
-                runtime.stream_tokens(prompt, *options),
+                items,
                 envelope,
                 lambda text, reason: {
                     "index": 0,
                     "delta": {"content": text} if text else {},
                     "finish_reason": reason,
                 },
+                {"role": "assistant"},
             ),
             media_type="text/event-stream",
         )
-    text, prompt_count, completion_count, finish_reason = await runtime.generate(prompt, *options)
+    message, summary = await whole_reply(items)
     return {
         "id": identifier,
         "object": "chat.completion",
@@ -3109,16 +3205,68 @@ async def chat_completions(
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": finish_reason,
+                "message": message,
+                "finish_reason": summary["finish_reason"],
             }
         ],
         "usage": {
-            "prompt_tokens": prompt_count,
-            "completion_tokens": completion_count,
-            "total_tokens": prompt_count + completion_count,
+            "prompt_tokens": summary["prompt_tokens"],
+            "completion_tokens": summary["completion_tokens"],
+            "total_tokens": summary["prompt_tokens"] + summary["completion_tokens"],
         },
     }
+
+
+def origin_is_ours(origin: str | None) -> bool:
+    """Whether a browser page may reach /mcp. No Origin means no browser.
+
+    Matching the Host header would prove nothing: under DNS rebinding the
+    attacker's page and its Host are the same name.
+    """
+    if origin is None:
+        return True
+    name = urlsplit(origin).hostname
+    return name in LOOPBACK or (runtime.mesh is not None and origin.rstrip("/") in runtime.mesh.known_urls())
+
+
+def own_api(request: Request, authorization: str | None) -> httpx.AsyncClient:
+    """This node's own API, as the caller reaches it.
+
+    Going back in at the top means MCP inherits everything /v1 does for lanes,
+    followers, keys, limits, and the audit log, and cannot drift from it.
+    """
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False, client=(request.client.host, request.client.port) if request.client else ("unknown", 0))
+    headers = {"Authorization": authorization} if authorization else {}
+    return httpx.AsyncClient(transport=transport, base_url="http://this-node", headers=headers, timeout=None)
+
+
+@app.post("/mcp")
+async def mcp_endpoint(request: Request, authorization: str | None = Header(default=None)) -> Response:
+    """MCP over Streamable HTTP. Stateless: each request stands alone, on any node."""
+    if not origin_is_ours(request.headers.get("origin")):
+        return JSONResponse(status_code=403, content=RpcError(INVALID_REQUEST, "This Origin may not use this endpoint").body(None))
+    try:
+        require(authorization, ROLE_USER)
+    except HTTPException as exc:
+        if exc.status_code == 401:
+            raise HTTPException(status_code=401, detail=exc.detail, headers={"WWW-Authenticate": "Bearer"}) from exc
+        raise
+
+    def charge(method: str) -> None:
+        # tools/call pays when it reaches /v1, which is enough.
+        if method != "tools/call":
+            verify_user(authorization)
+
+    async with own_api(request, authorization) as client:
+        status, reply = await answer_http(McpHandler(MeshTools(client), stateless=True), request.headers, await request.body(), charge)
+    return Response(status_code=status) if reply is None else JSONResponse(status_code=status, content=reply)
+
+
+@app.get("/mcp")
+@app.delete("/mcp")
+async def mcp_elsewhere() -> Response:
+    """There is no stream to open and no session to end."""
+    return Response(status_code=405, headers={"Allow": "POST"})
 
 
 def build_parser() -> argparse.ArgumentParser:

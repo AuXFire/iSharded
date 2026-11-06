@@ -364,6 +364,43 @@ def run_cordon(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_mcp(args: argparse.Namespace) -> int:
+    """Serve a mesh to an MCP client over stdio. Stdout belongs to the protocol."""
+    import asyncio
+
+    from .mcp_server import run_server
+
+    asyncio.run(run_server(args.url, args.token))
+    return 0
+
+
+def run_mcp_agent(args: argparse.Namespace) -> int:
+    from .mcp_client import run_agent
+
+    return run_agent(args)
+
+
+def add_mcp_commands(subparsers: Any) -> None:
+    mcp = subparsers.add_parser("mcp", help="serve a mesh to MCP clients over stdio, or give a model the tools of MCP servers")
+    mcp.add_argument("--url", default="http://127.0.0.1:8000", help="any node's control address")
+    mcp.add_argument("--token", default=load_token(), help="a user key; defaults to this machine's pool token")
+    mcp.set_defaults(handler=run_mcp)
+    actions = mcp.add_subparsers(dest="mcp_command")
+    run = actions.add_parser("run", help="let a model on the mesh use the tools of MCP stdio servers, and print its answer")
+    run.add_argument("prompt", help="what to ask the model")
+    # Unset here means the value given before `run` stands.
+    run.add_argument("--url", default=argparse.SUPPRESS, help="any node's control address")
+    run.add_argument("--token", default=argparse.SUPPRESS, help="a user key; defaults to this machine's pool token")
+    run.add_argument("--model", required=True, help="the model to use; it must support tool calling")
+    run.add_argument("--server", action="append", required=True, help="the command that starts an MCP stdio server; repeatable")
+    run.add_argument("--allow", action="append", default=[], help="a tool that may run without asking; repeatable")
+    run.add_argument("--pass-env", action="append", default=[], help="an environment variable servers may see, beyond the basics; repeatable")
+    run.add_argument("--max-turns", type=int, default=8, help="most times the model may be asked before giving up")
+    run.add_argument("--max-tokens", type=int, default=None, help="longest reply on each turn")
+    run.add_argument("--tool-timeout", type=float, default=60.0, help="seconds a tool may take")
+    run.set_defaults(handler=run_mcp_agent)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="shardmesh")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -495,6 +532,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_node_arguments(node)
     node.set_defaults(handler=run_node)
     add_up_arguments(subparsers)
+    add_mcp_commands(subparsers)
     assistant = subparsers.add_parser("assistant", help="a persistent assistant that uses the mesh; see docs/ASSISTANT.md")
     add_assistant_arguments(assistant)
     assistant.set_defaults(handler=run_assistant)

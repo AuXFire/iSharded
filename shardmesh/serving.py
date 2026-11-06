@@ -83,6 +83,33 @@ class BodyLimit:
         await send({"type": "http.response.body", "body": body})
 
 
+class ChunkedResponses:
+    """Send one path's responses chunked, by leaving their length out.
+
+    AVG's network filter inspects requests that look like MCP, even on loopback.
+    A response to one that has a Content-Length comes out with the length removed
+    and ``transfer-encoding: chunked`` added, around a body that is not chunked,
+    so no client can read it. Measured with a bare app on a raw socket. Responses
+    that really are chunked pass unharmed, and AVG still sees all of them.
+    """
+
+    def __init__(self, app: Any, path: str) -> None:
+        self.app = app
+        self.path = path
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http" or scope["path"] != self.path:
+            await self.app(scope, receive, send)
+            return
+
+        async def without_length(message: Any) -> None:
+            if message["type"] == "http.response.start":
+                message = {**message, "headers": [item for item in message["headers"] if item[0].lower() != b"content-length"]}
+            await send(message)
+
+        await self.app(scope, receive, without_length)
+
+
 def where_everything_is() -> dict[str, Any]:
     """Each task's and thread's innermost frames. Stalls show up here and nowhere else."""
     tasks = []
