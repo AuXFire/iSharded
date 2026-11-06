@@ -329,6 +329,15 @@ class StagePlan:
 STUB_VOCAB = 4
 
 
+def holds_both_kinds(start: int, end: int, interval: int) -> bool:
+    """A hybrid stage needs both kinds of layer: llama.cpp cannot load a stage with only one.
+
+    Every ``interval``th layer is full attention and the rest recurrent. Zero means
+    the model does not mix them.
+    """
+    return not interval or (end - start >= 2 and end // interval > start // interval)
+
+
 def plan_stage(header: GgufHeader, start: int, end: int, *, last: bool) -> StagePlan:
     """Describe a stage file for layers ``start`` to ``end - 1``.
 
@@ -340,9 +349,9 @@ def plan_stage(header: GgufHeader, start: int, end: int, *, last: bool) -> Stage
     if not 0 <= start < end <= header.layer_count:
         raise GgufError(f"layers {start}..{end - 1} are outside 0..{header.layer_count - 1}")
     arch = header.architecture
-    interval = header.arch_key("full_attention_interval")
-    if interval and start % int(interval):
-        raise GgufError(f"{arch} stages must start on a multiple of {interval}, not {start}")
+    interval = int(header.arch_key("full_attention_interval") or 0)
+    if not holds_both_kinds(start, end, interval):
+        raise GgufError(f"a {arch} stage needs a full attention layer and a recurrent one, and {start}..{end - 1} does not have both")
 
     block_key = f"{arch}.block_count"
     source_blocks = int(header.get(block_key))
@@ -359,6 +368,13 @@ def plan_stage(header: GgufHeader, start: int, end: int, *, last: bool) -> Stage
         for key, entry in header.keys.items()
         if not key.startswith("tokenizer.") and key != SKELETON_VOCAB
     ]
+    recurrent_key = f"{arch}.attention.recurrent_layers"
+    if interval and start % interval and recurrent_key not in header.keys:
+        # llama.cpp counts the pattern from a file's first layer, so a stage that starts
+        # part way through a block has to say which of its layers are which.
+        flags = [int((layer + 1) % interval != 0) for layer in range(start, end)]
+        raw = struct.pack("<IQ", T_UINT32, len(flags)) + struct.pack(f"<{len(flags)}I", *flags)
+        keys.append(KeyValue(recurrent_key, T_ARRAY, raw, len(flags), T_UINT32))
     tensors: list[tuple[str, TensorInfo]] = []
     for layer in range(start, end):
         for tensor in header.layer_tensors(layer):

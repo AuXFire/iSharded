@@ -1258,3 +1258,16 @@ def test_pins_hold_with_links() -> None:
     route = plan_placement(mesh_cards(), [], moe_profile(), links=LINKS, entry_worker="e1", exit_worker="c")
     assert route[0].worker_id == "e1"
     assert route[-1].worker_id == "c"
+
+
+def test_a_hybrid_model_can_be_cut_off_its_blocks_but_each_stage_holds_both_kinds() -> None:
+    from isharded.gguf import holds_both_kinds
+
+    model = profile(layers=16)
+    model.attention_interval = 4
+    # 16 layers of 100 MiB. Blocks of four would strand a card with room for 7 layers.
+    workers = [worker(name, pool(f"{name}-gpu", "vram", int(size * MIB), 500)) for name, size in (("a", 1000), ("b", 800), ("c", 300))]
+    route = plan_placement(workers, [], model)
+    assert [stage.start_layer for stage in route][0] == 0 and route[-1].end_layer == 16
+    assert all(holds_both_kinds(stage.start_layer, stage.end_layer, 4) for stage in route)
+    assert any(stage.start_layer % 4 for stage in route)

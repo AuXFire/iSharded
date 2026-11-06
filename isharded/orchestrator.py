@@ -322,7 +322,7 @@ def build_target(
         stage_workspace_bytes=GGUF_STAGE_WORKSPACE_BYTES if isinstance(adapter, GgufAdapter) else 0,
         entry_extra_bytes=(draft.file_size + DRAFT_WORKSPACE_BYTES if draft else 0)
         + (projector.file_size + PROJECTOR_WORKSPACE_BYTES if projector else 0),
-        layer_step=max(getattr(adapter, "interval", 1), 1),
+        attention_interval=getattr(adapter, "interval", 0),
     )
     hosted_copy = manifest.revision.startswith("local-") and control_source != request.model_id
     return ModelTarget(

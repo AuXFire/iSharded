@@ -24,6 +24,7 @@ from dataclasses import dataclass, field, replace
 from itertools import permutations
 from typing import Any, Callable
 
+from .gguf import holds_both_kinds
 from .protocol import MemoryPool, StageAssignment, UnitPlacement, WeightUnit
 
 # Cost of one activation hop, in the same units as the rest of the estimate, for
@@ -108,8 +109,10 @@ class ModelProfile:
     tied_embeddings: bool = False
     # Fast memory a stage needs beyond weights and context, for compute buffers.
     stage_workspace_bytes: int = 0
-    # Stages may only start on a multiple of this, for hybrid attention patterns.
+    # Stages may only start on a multiple of this.
     layer_step: int = 1
+    # Every this many layers is full attention, and each stage needs one of those and a recurrent one.
+    attention_interval: int = 0
     # What the entry stage must also hold, such as a draft model.
     entry_extra_bytes: int = 0
     # Tokens a plan has to earn back its download over. Zero ignores downloads.
@@ -441,6 +444,8 @@ class _Packer:
             self.shapes = [seen.setdefault(size, len(seen)) for size in profile.layer_sizes()]
 
     def pack(self, candidate: Candidate, start: int, end: int) -> tuple[list[UnitPlacement], float] | None:
+        if not holds_both_kinds(start, end, self.profile.attention_interval):
+            return None
         if self.shapes is None:
             return self._fresh(candidate, start, end)
         key = (candidate.worker_id, start == 0, end == self.profile.num_layers, tuple(self.shapes[start:end]))

@@ -1449,7 +1449,7 @@ Each pool reports its budget, free space, precision, and measured bandwidth. The
 - Never spends the same physical memory twice, whether two workers share a host's RAM or a GPU shares it through unified memory.
 - Promotes standby workers only when a model does not fit without them.
 
-Hybrid Qwen GGUF models can only start a stage on a multiple of 4 layers, so a card takes whole blocks and the rest of it can go unused. If a worker also offers RAM, a stage can be larger than its card: its layers stay whole, and routed experts sit in that worker's RAM one layer's worth at a time. For these models the planner tries every order through up to 8 workers.
+Hybrid Qwen GGUF models mix one full attention layer with three recurrent ones. A stage can start on any layer, but llama.cpp stops on an assertion loading a stage with only one kind, so every stage holds at least one of each. In practice that means no stage of a single layer, and no stage that falls between two attention layers. If a worker also offers RAM, a stage can be larger than its card: its layers stay whole, and routed experts sit in that worker's RAM one layer's worth at a time.
 
 For any model, VRAM comes first: a layer goes to RAM only when no worker has room for a whole layer in the VRAM it offered, and that ranks above speed and download time. A plan from `POST /admin/plan` has a `memory` field, with what each pool was offered and what the plan used, spilled, and left unused, and `memory.stages` gives each stage's spill.
 

@@ -171,10 +171,20 @@ def test_skeleton_round_trip_drops_only_the_tokenizer():
     assert copy.tensors["blk.2.ffn_up.weight"].nbytes == header.tensors["blk.2.ffn_up.weight"].nbytes
 
 
-def test_hybrid_stage_must_start_on_the_attention_pattern():
+@pytest.mark.parametrize(("start", "end"), [(0, 2), (3, 4), (4, 7), (1, 2)])
+def test_a_hybrid_stage_with_one_kind_of_layer_is_refused(start, end):
+    """Real llama.cpp stops on an assertion loading these."""
+    with pytest.raises(GgufError, match="both"):
+        plan_stage(header_of(build_file(interval=4)), start, end, last=False)
+
+
+def test_a_hybrid_stage_can_start_anywhere_and_says_which_layers_are_which():
     header = header_of(build_file(interval=4))
-    with pytest.raises(GgufError, match="multiple of 4"):
-        plan_stage(header, 2, 8, last=True)
+    aligned = plan_stage(header, 4, 8, last=False)
+    assert "qwen35.attention.recurrent_layers" not in {entry.key for entry in aligned.keys}
+    keys = {entry.key: entry for entry in plan_stage(header, 2, 7, last=False).keys}
+    assert read_numbers(keys["qwen35.attention.recurrent_layers"]) == [1, 0, 1, 1, 1]
+
 
 
 def test_layers_outside_the_stack_are_refused():
@@ -422,6 +432,54 @@ def test_tokenizer_matches_llama_cpp():
     assert tokenizer.stop_token_ids
     assert tokenizer.chat_template
     lib.llama_model_free(model)
+
+
+@needs_real_model
+@pytest.mark.parametrize("cuts", [(12,), (10, 13), (5, 9, 14, 16), (6, 8, 15, 20), (21,)], ids=str)
+def test_stages_cut_anywhere_match_the_whole_model(tmp_path, cuts):
+    """A hybrid model cut off its block boundaries, including stages of one layer of each kind."""
+    from isharded.gguf import file_reader, read_file_header
+    from isharded.llama_host import StageHost
+
+    header = read_file_header(MODEL)
+    reader = file_reader(MODEL)
+    edges = [0, *cuts, header.layer_count]
+    table = header.tensors["token_embd.weight"]
+    embed = {"path": MODEL, "offset": header.data_start + table.offset, "length": table.nbytes, "ggml_type": table.ggml_type}
+    common = {"folder": BUILD, "extra_paths": [], "context_tokens": 256, "gpu_layers": -1, "threads": 4, "cpu_tensors": []}
+    tokens = [9707, 11, 1246, 525, 498]
+    whole = StageHost()
+    hosts = []
+    try:
+        whole.call("load", path=MODEL, last=True, table=embed, **common)
+        rows = whole.call("embed", tokens=tokens)[1]
+        expected = np.frombuffer(whole.call("forward", rows, position=0)[1], dtype=np.float32)
+        following = np.frombuffer(whole.call("forward", whole.call("embed", tokens=[1234])[1], position=len(tokens))[1], dtype=np.float32)
+        step = whole.call("embed", tokens=[1234])[1]
+        whole.close()
+        for index, (start, end) in enumerate(zip(edges, edges[1:])):
+            path = tmp_path / f"stage{index}.gguf"
+            last = end == header.layer_count
+            with path.open("wb") as out:
+                write_stage(header, plan_stage(header, start, end, last=last), out, reader)
+            host = StageHost()
+            hosts.append(host)
+            host.call("load", path=str(path), last=last, table=None, **common)
+
+        def through(data, position):
+            for host in hosts:
+                data = host.call("forward", data, position=position)[1]
+            return np.frombuffer(data, dtype=np.float32)
+
+        got = through(rows, 0)
+        then = through(step, len(tokens))  # a second pass reads the state the first one left
+    finally:
+        for host in hosts:
+            host.close()
+    assert int(np.argmax(got)) == int(np.argmax(expected))
+    assert np.allclose(got, expected, atol=1e-2)
+    assert int(np.argmax(then)) == int(np.argmax(following))
+    assert np.allclose(then, following, atol=1e-2)
 
 
 @needs_real_model
