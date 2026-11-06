@@ -48,6 +48,8 @@ A pool can mix these, as long as every node can reach every other node's adverti
 
 A file on one node is enough. Other nodes read the parts they need from it, the header and tokenizer included, and fall back to other holders if one fails. Files are identified by a fingerprint of their content, so every node agrees on what a file is whatever its path. Speculative decoding needs its draft file on some node too; without it, the model runs without a draft.
 
+A CPU worker normally runs llama.cpp's CPU build and never touches a GPU. With `--llama-dir` it runs whatever build you give it, and a GPU build borrows the GPU for prompts even on a stage with no GPU layers. On Qwen3-0.6B Q8_0 with a CUDA build on 4 threads, that took 518 MiB of VRAM that no budget counts, and read 512 tokens in 0.15 s instead of 2.3 s. Leave room for it in `--gpu-memory-gb`, or give that worker a CPU build.
+
 ## What happens when something fails
 
 The rule is that a failure or a pool change must not drop a reply, and that weights move only when they must.
