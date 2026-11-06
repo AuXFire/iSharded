@@ -6,9 +6,9 @@ It is a separate process that each person runs for themselves, `shardmesh assist
 
 ## Quick start
 
-Everything here was run in this order, from a clean install, on Windows, against a real model on a real mesh. It needs a model to talk to, and any OpenAI-compatible server will do in place of the mesh.
+Steps 2 to 7 were run in this order on Windows, from outside the repository, against a real model on a real mesh. It needs a model to talk to, and any OpenAI-compatible server will do in place of the mesh.
 
-**1. Install it,** from a checkout of this repository.
+**1. Install it,** from a checkout of this repository. It fetches `setuptools` 69 or later to build, if you have an older one. This step alone was not run as written: the machine had an older `setuptools` and no downloading was allowed, so the same files were copied by the rules in `pyproject.toml`.
 
 ```sh
 python -m pip install .
@@ -20,13 +20,13 @@ python -m pip install .
 shardmesh up --gguf-dir FOLDER --no-browser
 ```
 
-Then load a model by its full path, or from the chat page `up` printed:
+Once it says it is up, load a model by its file name, from the second terminal or from the chat page `up` printed. Point `SHARDMESH_POOL_TOKEN_FILE` at `admin.key` first, which keeps the key off the command line. In PowerShell that is `$env:SHARDMESH_POOL_TOKEN_FILE = "ADMIN_KEY_FILE"` on a line of its own. A 0.6B model took about 20 seconds.
 
 ```sh
-shardmesh load FOLDER/Qwen3-0.6B-Q8_0.gguf --url http://127.0.0.1:8209 --token KEY_FROM_ADMIN_KEY
+SHARDMESH_POOL_TOKEN_FILE=ADMIN_KEY_FILE shardmesh load Qwen3-0.6B-Q8_0.gguf --url http://127.0.0.1:8209
 ```
 
-`up --model` with a bare file name did not work here: it can ask before the node is ready, and a name alone is refused until another node holds that file.
+Do not use `up --model` for this yet. It asks once while the node is still starting, is told `no coordinator yet`, and does not ask again, so no model loads.
 
 **3. Add it as a provider.** The assistant holds only the path to the key, never the key. The mesh's address is the one `up` printed.
 
@@ -35,7 +35,7 @@ shardmesh assistant provider add mesh http://127.0.0.1:8209 --mesh --key-file AD
 shardmesh assistant provider list
 ```
 
-**4. Talk to it.** A chat in the terminal is `chat`, and one line is `say`. It keeps what is worth keeping, and shows who answered.
+**4. Talk to it.** A chat in the terminal is `chat`, and one line is `say`. It keeps what is worth keeping, and each reply ends with who answered and which tools really ran.
 
 ```sh
 shardmesh assistant say "My name is Sam and I keep bees on my roof."
@@ -57,6 +57,8 @@ shardmesh assistant say "Use the files.read tool to read NOTES_FOLDER/notes.txt,
 shardmesh assistant why
 shardmesh assistant audit --limit 10
 ```
+
+Look for `used files.read` at the end of the reply. A small model sometimes skips the tool and makes up what the file says, in the same confident words, and that line is how you tell. [Here is how often.](#how-a-small-model-does)
 
 `why` shows what the model saw, and `audit` shows every decision the broker made. What it read is marked as outside text, so from then on that conversation cannot use a grant for anything with consequences without asking you. `approvals list` shows what is waiting, and `approvals approve ID` then `resume TURN` carries on.
 
@@ -208,6 +210,8 @@ The mesh's chat API takes plain strings and has no tool calling, so tools go in 
 
 Models write tool calls in many shapes, and all of these are understood: a ` ```tool ` or ` ```json ` fence, `<tool_call>` tags, no fence at all, single quotes, trailing commas, and arguments as a string. Only tools that were offered count. Text in reasoning never counts, and neither does code. A call with no fence must end the reply. A call cut off by the token limit is never run, because a truncated argument is a different argument.
 
+A person never watches a call arrive. While tools are offered, a stream holds anything that could still be a call, from its opening `{`, and releases it as soon as it cannot be one. So a `{` that never closes shows only when the reply ends.
+
 Silence is handled as failure. Every read has a limit, a failure sent inside a stream is seen, and a stream that ends without finishing is a failure and not a short answer.
 
 A pool with its own authority is verified against `SHARDMESH_CA_FILE`, as nodes are. If a certificate cannot be verified, the error says antivirus may be replacing it, since some antivirus re-signs HTTPS even on loopback.
@@ -250,7 +254,7 @@ The record of a turn holds no text, so a forgotten memory does not survive in a 
 | Command | Does |
 |---|---|
 | `chat` | Talks in the terminal, and asks you about approvals. `--conversation` continues one. `/new` starts over and `/quit` leaves |
-| `say TEXT` | Says one thing and prints the reply. `--conversation`, and `--no-learn` proposes no memories |
+| `say TEXT` | Says one thing and prints the reply, then who answered, which tools really ran as `used files.read`, and `tainted` if it read outside text. `--conversation`, and `--no-learn` proposes no memories |
 | `resume TURN` | Carries on a turn that was waiting. `--decline` ends it without acting |
 
 What a person said is stored before anything else can fail. A model is offered only the tools this person holds a grant for, read-only ones first, within a quarter of the budget, and a tool call for anything else is just words. The loop runs at most 6 rounds of tools, then the model has to answer. Tool output is EXTERNAL whatever the tool claims, makes the rest of the turn tainted, and tightens its reach. It is cut for the model at a quarter of the budget and kept whole in the record.
@@ -1118,7 +1122,7 @@ Only the newest user message in a chat request is new. A client's earlier messag
 
 A turn runs on its own thread and belongs to the assistant, so a client that disconnects does not lose the reply. A failure partway keeps what arrived and says so.
 
-The page is `assistant.html`, built on the same `ui.css` as the mesh's chat page and dashboard, which is inlined when it is served. It has no external resources, and a content security policy with a fresh nonce on each load. Text only ever reaches it as text. A key is kept in the tab's session storage and goes when the tab closes. It shows the conversation, what is waiting for you, memory with where each piece came from, tasks, earlier conversations, and the audit record, and for any reply what the model saw.
+The page is `assistant.html`, built on the same `ui.css` as the mesh's chat page and dashboard, which is inlined when it is served. It has no external resources, and a content security policy with a fresh nonce on each load. Text only ever reaches it as text. A key is kept in the tab's session storage and goes when the tab closes. It shows the conversation, what is waiting for you, memory with where each piece came from, tasks, earlier conversations, and the audit record, and for any reply what the model saw. Signing out, or a key that stops working, clears the page, so the next person to sign in sees nothing of the last. `tests/test_assistant_page.py` checks these in real Chrome, and skips itself without it.
 
 ### Backups
 
@@ -1179,19 +1183,25 @@ A tool that stores or sends text reads `CallContext.reach`, which says how far t
 
 ### How a small model does
 
-This is Qwen3-0.6B at Q8, on 2 CPU threads, on a mesh of one, with everything real from the assistant down. It is a floor, and a useful one: what works here should work on anything larger.
+This is Qwen3-0.6B at Q8, on 2 CPU threads, on a mesh of one, with everything real from the assistant down. No larger model has been through the assistant, so how much better one does is not known.
 
 | Tried | What happened |
 |---|---|
-| Plain conversation | Works, at 1 to 2 s a reply, and about 6.5 s for a turn with a tool in it. It keeps its name and manner, and it mixes up "I" and "you" |
-| Proposing memories | From one sentence it proposed three. "Sam keeps bees on his roof" was right. "Sam is helpful and kind" was invented. That is why these are kept as MODEL, and not as what you said |
-| Recalling in a new session | Worked, and it said "I keep bees on my roof" |
-| Reading a file with a tool | 8 of 10 tries read the right file through the broker and answered correctly from it. The other 2 answered without reading, and were wrong |
+| Plain conversation | Works, at about 20 tokens a second. Over five turns, 0.6 to 6 s a reply, median 2.3 s. It got simple facts and 7 times 8 right, and kept its name and manner. It mixes up "I" and "you" |
+| Proposing memories | From one sentence it proposed one to three. "Sam keeps bees on his roof" was right. "Sam's bees are a good way to keep his roof healthy and clean" was invented. That is why these are kept as MODEL, and not as what you said |
+| Recalling in a new session | 4 of 5, saying "What I keep on my roof are bees". The fifth invented plants and flowers |
+| Reading a file, offered one tool | 8 of 10 read the right file through the broker and answered from it, at a median of 6.1 s |
+| Reading a file, offered two tools | 5 of 10, from the same request with `files.write` granted as well |
+| What it said when it did not read | Every miss, in both tests, said it had read the file and made up what was in it. A miss shows no `used files.read`, and that line is the only sign |
 | Reading, then writing, in one request | 0 of 5. It says what it will do, and stops. No tool ran, so nothing was held for approval either |
-| Writing a plan | Refused all three tries, over 200 s. It wrote real JSON, with tool names where step kinds belong, and software turned each one down, which is what that check is for |
-| Running a plan a person wrote | Finished, including a model step that summarized the file correctly and a mechanical check that passed |
+| Writing a plan | 2 of 3 passed software's checks, at 171 and 199 s. The third was refused after 376 s, as it never wrote complete JSON. An earlier run had all three refused. Passing means well formed, and not good: both plans used `shell.run`, which was not granted, and one had the command `shell.run` and a path. They would stop at `missing_grants`, and nothing ran |
+| Running a plan a person wrote | Finished in 1.2 s, including a model step and a mechanical check that passed |
 
-What it can do depends heavily on how tools are described, so this was measured. Shown each tool's JSON schema, it called nothing in 10 tries. Shown a placeholder example, it copied the placeholder word for word. Shown short signatures and an example built from a real tool, it made the right call 10 times in 10, on most wordings. One wording still got 1 in 10 in the same test, so do not expect a model this small to be dependable. Use one for a demo, and a larger one for work.
+So a model this small can talk, remember, and run plans a person writes. It cannot be trusted to use a tool, or to say when it did not. Use one for a demo, and check the `used` line.
+
+How tools are described matters a great deal. In an earlier run, shown each tool's JSON schema, it called nothing in 10 tries. Shown a placeholder example, it copied the placeholder word for word. Shown short signatures and an example built from a real tool, it made the right call 10 times in 10, on most wordings, and 1 in 10 on one wording.
+
+On a model with one slot, background work competes with you. A question asked straight after a turn showed its first text at 3.2 s, because memories were being proposed, and the same kind of question after a 15 s pause at 0.6 s.
 
 **What the `process` sandbox cannot stop.** On Windows this is the only level, as there is no docker, podman, or bubblewrap here to use, and on any machine it is what is left when nothing stronger is present. It is a memory limit and a process tree that dies together, and it is not a wall:
 
