@@ -251,3 +251,159 @@ Each run is counted, or reported with `record_run(version, ok)`. Once a new vers
 | Setting | Means |
 |---|---|
 | `SHARDMESH_ASSISTANT_SKILL_AUTO_PROMOTE` | `1`, `true`, `yes`, or `on` allows automatic promotion as above. Off by default |
+
+## Coding
+
+`assistant.coder` makes supervised code changes. A run works on a new branch, `assistant/<slug>`, in a git worktree under the assistant's home at `coder/<slug>/tree`. It never touches the owner's checkout or any existing branch, and git hooks, line-ending rewriting, and `GIT_*` settings are switched off for its own git commands.
+
+### A run
+
+```
+shardmesh assistant code start --repo PATH "Fix the rounding in invoices"
+shardmesh assistant code show ID
+shardmesh assistant code approve ID
+```
+
+| State | Means |
+|---|---|
+| `created`, `inspecting` | Making the worktree, finding languages and the test command, and running the tests once as a baseline |
+| `proposing` | Asking the `coding` role for changes |
+| `applying` | The reply is saved. Applying it in the worktree |
+| `testing` | Running the tests in the sandbox |
+| `reviewing` | The tests pass. The `verification` role reads the diff |
+| `ready` | Waiting for the owner |
+| `committed`, `pushed` | Done, through the broker |
+| `stopped` | It reached its limit, or found no test command. The reason is shown |
+| `rejected` | Thrown away |
+
+The state is in the database, and each step saves what it needs before moving on. After a crash or outage, `code resume ID` carries on: a coding reply already saved is not asked for again, and the tree is rebuilt from the base and the last applied diff, so a half-finished step cannot leave anything behind. If a model or the sandbox is down, the run waits where it is.
+
+Failures go back to the `coding` role, up to `--rounds` times, then it stops and reports. A reviewer asking for changes also uses a round. A review is shown to the owner and decides nothing: with no rounds left, the run is `ready` with the reviewer's objection on it.
+
+### What a model can and cannot do
+
+A model replies in text, with no tools. Changes come as a whole file or a unified diff:
+
+```
+<<<FILE path/from/the/root
+the whole new content
+>>>FILE
+
+<<<DIFF
+a unified diff
+>>>DIFF
+```
+
+A fenced `diff` block, or a reply that is only a diff, also works. A change is refused, and the model told why, if it would touch `.git` in any spelling, leave the tree, go through a symbolic link, use a reserved Windows name or a hidden stream, or create a symbolic link, submodule, or binary file. These are checked on the paths git itself reads from the diff, and again on what git says actually changed.
+
+Repository text and test output are labelled as data. By default they stay at reach `POOL`, and `--reach` lets the owner say otherwise.
+
+### Where code runs
+
+Generated code never runs in the assistant's process. The coder only reads and writes files as text and runs git. With no sandbox it refuses to start, and never falls back to running anything itself.
+
+Tests run through `assistant.sandbox`, with the network off, on a further copy at `coder/<slug>/copy` that has no `.git`. So nothing that runs there can reach the repository or change what gets committed, and the copy is removed afterwards. A test command that needs git cannot work there.
+
+A pass means the command exited 0. A test run that finds no tests, or times out, is not a pass.
+
+### Decisions
+
+`code show` gives the diff, each test run with how strong its sandbox was, the review, and which models contributed. It also warns when a change touched what decides whether tests pass, or what runs by itself: tests changed or removed, test or build configuration, and automation such as `.github`.
+
+`code approve` commits through the broker's `git.commit`. It refuses unless the tree still matches, by hash, what was tested. It also refuses if the change writes into a relative `core.hooksPath`, as git would run that outside the sandbox at commit. The call is not tainted, because a person read this exact diff and asked for this exact commit, but it still needs a grant. If the broker asks for approval, the run says so: approve it through the broker, then run `code approve` again. Afterwards it compares what landed with what was tested, and says so loudly if they differ.
+
+`git.commit` runs in the worktree, outside the sandbox, so it should commit with hooks off: a `pre-commit` hook that runs tests would run generated code on this machine.
+
+`code push` uses `git.push`, which is denied unless granted, and only ever pushes the run's own branch. `code reject` removes the worktree and the branch. If the run was already committed, the branch stays, as that was the owner's decision.
+
+There is deliberately no capability for approving or pushing, so no model, task, or peer can reach them. Calls name their arguments from what `git.commit` and `git.push` declare in `input_schema`: `repo` (or `repository`, `path`, `cwd`, `workdir`), `message` (or `msg`), `branch` (or `ref`), and `remote`. The worktree is the repository named, so a scoped grant must cover the assistant's `coder` folder.
+
+### Working on ShardMesh itself
+
+The same path applies, with nothing extra allowed: a candidate branch, tests, and approval. When the repository is ShardMesh, `coder/<slug>/HEALTH_AND_ROLLBACK.md` is written beside the worktree and shown by `code show`. It holds the base commit, what the change affects, a health check, and how to roll back. It is not part of the diff.
+
+The coder never deploys or restarts anything. That stays a person's decision.
+
+### Commands
+
+`code` takes `--user U` before the subcommand, for another user's runs.
+
+| Command | Does |
+|---|---|
+| `code start --repo PATH GOAL [--test CMD] [--rounds N] [--timeout S] [--reach R]` | Starts a run and works until it is ready or stops. `--test` overrides the detected test command. `--rounds` is 3 by default. `--timeout` is seconds for the tests, 600 by default. `--reach` is `machine`, `pool`, `peer`, or `cloud`, and is `pool` by default |
+| `code list` | Every run |
+| `code show ID [--output]` | The diff, tests, models, review, and warnings. `--output` adds the last test output |
+| `code resume ID [--rounds N]` | Carries on. `--rounds` gives a stopped run more tries |
+| `code approve ID [--message M]` | Commits this exact diff. `--message` replaces the default, which names the goal, tests, and models |
+| `code push ID [--remote R]` | Pushes the run's branch. `--remote` is `origin` by default |
+| `code reject ID [--reason R]` | Discards the work |
+
+Test commands are detected from `pyproject.toml`, `pytest.ini`, `tox.ini`, `setup.py`, `setup.cfg`, or `test_*.py` files (`python -m pytest -q`), a real `test` script in `package.json` (`npm test --silent`), `Cargo.toml` (`cargo test --quiet`), `go.mod` (`go test ./...`), and a `test` target in a `Makefile` (`make test`).
+
+## Voice
+
+`assistant.voice` is speech in and out. It is optional and local: nothing leaves this machine, and nothing needs the internet. `voice status` says what works here, and when an engine is missing, the error names the package to install.
+
+### Transcribing
+
+`transcribe(audio_path)` returns the words in an audio file.
+
+1. It uses `faster-whisper` if installed, on the CPU, as the GPU belongs to the mesh. The model comes from local files only and is never downloaded by itself.
+2. Otherwise it uses a whisper.cpp binary if `SHARDMESH_ASSISTANT_WHISPER_CPP` is set. That needs 16 kHz WAV input.
+
+Transcribed text is trust `EXTERNAL`: what a recording says is data, whoever seems to be speaking in it.
+
+### Speaking
+
+`speak(text, voice=None, out_path=None)` writes a WAV file and returns `{"path", "engine", "voice"}`. It does not play anything: the interface decides whether and where to.
+
+1. It uses piper if installed, or `SHARDMESH_ASSISTANT_PIPER` if set, and only with a voice model in `SHARDMESH_ASSISTANT_PIPER_MODEL`.
+2. Otherwise it uses the system voice: Windows SAPI through PowerShell, `say` on macOS, or `espeak-ng`.
+
+The text always travels through a file or a pipe, never inside a command, so nothing it says can run. Speech left in `voice/speech` is removed after an hour. The caller keeps what it needs.
+
+### Personas
+
+If `assistant.identity` has a `voice`, as a string, a mapping with `name`, or a callable, that picks how speech sounds. It changes presentation only: no capability, grant, or decision depends on it. It is a name and never a path. Letters, digits, spaces, dots, dashes, and underscores are accepted, anything else is ignored, and for piper it picks a `.onnx` file beside the configured model.
+
+### The broker
+
+If a broker is present, these are declared to it, and the routes and commands go through it:
+
+| Capability | Effect | Notes |
+|---|---|---|
+| `voice.transcribe` | `READ` | Scoped by `audio_path` |
+| `voice.speak` | `WRITE_LOCAL` | So text from a tainted context needs a person before it is spoken |
+
+With no broker, they are local tools on the owner's own machine.
+
+### Routes
+
+`routes(assistant)` gives these. They take the user from `request.state.user`, set by a gateway, or treat a caller on this machine as the owner, and refuse anyone else with 401. A path from outside is never opened.
+
+| Route | Takes | Gives |
+|---|---|---|
+| `POST /assistant/voice/transcribe` | Audio as the body, at most 64 MiB, with an `audio/*` or `application/octet-stream` `Content-Type` | `{"text": ..., "trust": "external"}` |
+| `POST /assistant/voice/speak` | `{"text": ..., "voice": optional}` as `application/json` | `audio/wav`, with the engine in `X-Voice-Engine` |
+
+Those content types are required because a web page cannot send them without asking first, so a page the owner visits cannot call these behind their back. A missing engine is 503, a broker refusal is 403 with `approval_id` if a person can allow it, and a wrong type is 415.
+
+### Commands
+
+`voice` takes `--user U` before the subcommand, for who is asking.
+
+| Command | Does |
+|---|---|
+| `voice status` | Which engines work here, and what to install |
+| `voice transcribe AUDIO` | Prints the words in an audio file |
+| `voice speak TEXT [--voice NAME] [--out PATH]` | Writes speech to a WAV file. `--voice` is a voice name, and the persona's by default. `--out` says where |
+
+### Settings
+
+| Setting | Means |
+|---|---|
+| `SHARDMESH_ASSISTANT_WHISPER_MODEL` | A faster-whisper model name found locally, or a folder holding a converted model. Default `base` |
+| `SHARDMESH_ASSISTANT_WHISPER_CPP` | The whisper.cpp binary |
+| `SHARDMESH_ASSISTANT_WHISPER_CPP_MODEL` | Its model file |
+| `SHARDMESH_ASSISTANT_PIPER` | The piper binary, if not on the path |
+| `SHARDMESH_ASSISTANT_PIPER_MODEL` | Its voice model, a `.onnx` file |
