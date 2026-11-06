@@ -34,15 +34,19 @@ More detail lives in [Operating ShardMesh](docs/OPERATIONS.md) and [ShardMesh se
 
 ## What it does
 
+- Starts with one command, and adds a machine with an invite code. Hardware, addresses, and certificates are worked out for you.
 - Splits a model's layers across machines, each holding only its share. Weights are never gathered on one machine.
 - Spans memory types: one node can hold layers in VRAM, RAM, and disk at once, and nodes do not have to match.
 - Runs GGUF models on stock llama.cpp, and safetensors models on its own PyTorch code. Qwen and GPT-2 families, including mixture-of-experts models.
 - Speeds up replies with a small draft model, reuses earlier conversation state, and lets conversations share a pass through each stage.
+- Runs several models at once on the same mesh, and users choose between them.
 - Serves OpenAI-shaped `/v1/chat/completions`, `/v1/completions`, and `/v1/models`, with streaming, plus a chat page and a live dashboard on every node.
 - Keeps replies going through failures: a crashed stage, a dead node, a dead coordinator, a silent link, or a split network.
 - Moves weights only when it must, shares them between nodes, and works with no internet at all.
+- Runs as a network one person owns, or as one nobody owns, where each node decides who it accepts and what it hosts.
 - Refuses to start exposed. Offers per-node certificates, signed membership, API keys with roles and rate limits, TLS, and an audit log.
 - Supports planned maintenance: cordon a node and its share moves elsewhere while replies finish.
+- Reports each node's disks, GPU temperature and power, load, and battery, where the machine exposes them.
 
 ## Install
 
@@ -61,6 +65,8 @@ curl -fsSL https://raw.githubusercontent.com/AuXFire/shardmesh/main/install.sh |
 ```
 
 Then `shardmesh doctor` checks the machine, and says what to fix if anything is missing.
+
+The installers pick a CUDA build of PyTorch where they find an NVIDIA GPU, and otherwise a CPU build on Windows. An AMD GPU on Windows needs a ROCm build of PyTorch, which you install [by hand](#by-hand).
 
 ### By hand
 
@@ -1054,7 +1060,7 @@ Antivirus that scans HTTPS replaces certificates, which ends mutual TLS. Nodes r
 
 The full guide is [Operating ShardMesh](docs/OPERATIONS.md).
 
-**Start at boot.** On Windows, `scripts\install_node_task.ps1` registers a scheduled task. On Linux, use `packaging/shardmesh-node.service`, which has not been run on a real machine yet. A node restarts its own services, so these only have to start it once.
+**Start at boot.** A node started with `shardmesh up` needs only `shardmesh service install`, which starts it when you log in. To start at boot instead, on Windows, `scripts\install_node_task.ps1` registers a scheduled task. On Linux, use `packaging/shardmesh-node.service`, which has not been run on a real machine yet. A node restarts its own services, so these only have to start it once.
 
 **Maintenance.** `shardmesh cordon NAME` lets replies finish and moves that node's layers away. The node stays in the mesh. `shardmesh uncordon NAME` brings it back. A cordon is shared by every node and survives restarts. It is refused if the pool could not hold the model without that node, and if it would transfer over 2 GiB, unless you add `--force`.
 
@@ -1109,6 +1115,17 @@ The full guide is [Operating ShardMesh](docs/OPERATIONS.md).
 | Far slower than usual | VRAM spilled to shared memory, or a stray process holds the GPU | Check GPU memory per process. A stage with a large "shared" figure needs a reload |
 | A reply went quiet | A stage or link is stuck | Read `GET /internal/diag/tasks` on each node to see what everything is waiting on |
 | `the rest of the pool cannot hold this model` | A cordon would leave nowhere for that node's layers | Add memory, or load a smaller model first |
+| `libgomp.so.1: cannot open shared object file` | A minimal Linux install lacks a library llama.cpp needs | `sudo apt-get install libgomp1` |
+| A browser warns about the certificate | `shardmesh up` used TLS with the mesh's own certificate, off Tailscale | Accept it once, or use Tailscale, which needs no warning |
+| `nobody signed this request` | The owner's machine is off, or the invite ran out | Start `shardmesh up` on the owner's machine, and make a new invite |
+| `is not the mesh this invite is for` | The address in the invite answers with a different mesh | Stop, and ask the owner for a new code. Something else is at that address |
+| `another machine already uses the name` | Two machines have the same name | Run `shardmesh up --invite CODE --name another-name` |
+| `This machine already belongs to a mesh` | `shardmesh up` has settings from an earlier mesh | Remove the folder it names to join another |
+| `only the machine that made this mesh can invite` | The authority's key is on the owner's machine | Run `shardmesh invite` or open the page there |
+| A lane stays on `starting` | A firewall blocks its ports, which are 1000 per lane above the node's own | Open them between nodes, then remove the lane and load it again |
+| `no node has memory left under the limits its owner set` | The main model uses all that owners gave | Give nodes more with `--gpu-memory-gb` or `--weights-ram-gb`, or load a smaller main model |
+| In a network nobody owns, a node never appears | The others do not accept it yet | Have a node they accept run `shardmesh net vouch`, or use `--joining open` |
+| `nobody can replace what this network runs` | In a network nobody owns, the running model stays | Load yours beside it with `--lane` |
 
 ## Measured performance
 
@@ -1137,7 +1154,7 @@ Planner estimates leave out the draft and are rough. The figures above were meas
 ## Development
 
 ```bash
-python -m pip install -e ".[test,pool]"
+python -m pip install -e ".[test]"
 ```
 
 ```bash
@@ -1150,6 +1167,7 @@ Adapter tests compare every family with the reference `transformers` implementat
 
 | Script | What it does |
 |---|---|
+| `install.sh`, `install.ps1` | Install for one user, picking a PyTorch build |
 | `scripts/build_tiny_model.py` | Builds the offline test model |
 | `scripts/verify_model.py` | Compares a running checkpoint with an unsharded reference |
 | `scripts/build_diagrams.py` | Redraws the diagrams in this file |
@@ -1161,7 +1179,11 @@ Adapter tests compare every family with the reference `transformers` implementat
 |---|---|
 | `shardmesh/orchestrator.py` | The control plane: API, planning, repair, gossip handling |
 | `shardmesh/worker.py` | A worker: stages, the token loop, merged passes, fetching |
+| `shardmesh/up.py` | One-command setup: settings, invites, `doctor`, and `service` |
 | `shardmesh/node.py` | The launcher that supervises a node's services |
+| `shardmesh/lanes.py` | Several models at once: the front door and each node's lanes |
+| `shardmesh/commons.py` | A network nobody owns: self-made identities, vouches, and each node's view |
+| `shardmesh/inventory.py` | What a node reports about itself beyond memory budgets |
 | `shardmesh/mesh.py` | Membership and leader election, as pure logic |
 | `shardmesh/planner.py`, `shardmesh/memory.py` | Placement, and memory pool discovery |
 | `shardmesh/gguf.py`, `shardmesh/gguf_stage.py`, `shardmesh/llamacpp.py`, `shardmesh/llama_host.py` | GGUF parsing, stage files, the llama.cpp binding, and the stage process |
@@ -1178,6 +1200,8 @@ Trust and status:
 - A network nobody owns has run on three processes on one machine, not between strangers. Identities are free, so `--joining open` lets one person run many nodes, and a low name can be ground out to win coordination. A coordinator can stall a route. Traffic is not encrypted, so run it over a network that is, such as Tailscale. Use `--joining vouched` with a quorum unless you accept all of that.
 - Several models run in lanes with fixed memory shares. The main model's planner does not see a lane's memory, so moving layers after a failure can run a node short. Workers started with `--no-control` do not join lanes.
 - GitHub Actions has not run yet, because the account's jobs do not start. The same steps pass locally on Linux and Windows.
+- Linux has run real nodes on CPU only, in WSL. A Linux GPU, and macOS, have not been run at all, although their builds are pinned and download by themselves.
+- Adding a machine with an invite needs the owner's machine running at that moment. The mesh keeps working without it.
 
 Behavior:
 
