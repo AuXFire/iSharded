@@ -481,6 +481,13 @@ def test_a_notification_is_accepted_with_no_body(site):
     assert answer.status_code == 202 and answer.content == b""
 
 
+def test_a_modern_notification_needs_no_mirrored_headers(site):
+    # The specification leaves these undefined, so a notification is not refused for lacking them.
+    message = {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1}}
+    answer = site.client.post("/mcp", json=message, headers={"Accept": WANTS, "MCP-Protocol-Version": MODERN})
+    assert answer.status_code == 202 and answer.content == b""
+
+
 @pytest.mark.parametrize("method", ["get", "delete"])
 def test_there_is_no_stream_and_no_session_to_end(site, method):
     answer = getattr(site.client, method)("/mcp")
@@ -1005,27 +1012,58 @@ async def main():
     python, cwd, url, token_file = sys.argv[1:5]
     env = {"SHARDMESH_POOL_TOKEN_FILE": token_file, "PYTHONUTF8": "1", "SYSTEMROOT": sys.argv[5]}
     parameters = StdioServerParameters(command=python, args=["-m", "shardmesh", "mcp", "--url", url], env=env, cwd=cwd)
-    async with Client(stdio_client(parameters)) as client:
-        stdio = await exercise(client)
-    async with Client(url + "/mcp") as client:
-        http = await exercise(client)
-    print(json.dumps({"stdio": stdio, "http": http}))
+    results = {}
+    for mode in ("auto", "legacy"):
+        async with Client(stdio_client(parameters), mode=mode) as client:
+            results["stdio " + mode] = await exercise(client)
+        async with Client(url + "/mcp", mode=mode) as client:
+            results["http " + mode] = await exercise(client)
+    print(json.dumps(results))
 
 asyncio.run(main())
+"""
+OFFICIAL_SERVER = """
+from mcp.server import MCPServer
+
+server = MCPServer("official-test")
+
+@server.tool()
+def multiply(a: int, b: int) -> int:
+    "Multiply two numbers"
+    return a * b
+
+server.run("stdio")
 """
 
 
 @needs_official
-def test_the_official_client_works_over_both_transports(real_socket, tmp_path):
+def test_the_official_client_works_in_both_eras_over_both_transports(real_socket, tmp_path):
     script = tmp_path / "official.py"
     script.write_text(OFFICIAL_SCRIPT, encoding="utf-8")
     command = [OFFICIAL_PYTHON, str(script), sys.executable, str(ROOT), real_socket, str(tmp_path / "no-token"), os.environ.get("SYSTEMROOT", "")]
-    done = subprocess.run(command, capture_output=True, text=True, timeout=180)
+    done = subprocess.run(command, capture_output=True, text=True, timeout=240)
     assert done.returncode == 0, done.stderr[-1500:]
     results = json.loads(done.stdout.strip().splitlines()[-1])
-    for result in results.values():
-        assert result["protocol"] == MODERN
-        assert result["tools"] == ["chat", "list_models", "mesh_status"]
-        assert result["models_error"] is False
-        assert result["bad_error"] is True and "prompt is required" in result["bad_text"]
-        assert "Unknown tool" in result["unknown"]
+    assert len(results) == 4
+    for name, result in results.items():
+        assert result["protocol"] == (MODERN if name.endswith("auto") else LEGACY_VERSIONS[0]), name
+        assert result["tools"] == ["chat", "list_models", "mesh_status"], name
+        assert result["models_error"] is False, name
+        assert result["bad_error"] is True and "prompt is required" in result["bad_text"], name
+        assert "Unknown tool" in result["unknown"], name
+
+
+@needs_official
+def test_our_client_works_with_an_official_server(tmp_path):
+    script = tmp_path / "official_server.py"
+    script.write_text(OFFICIAL_SERVER, encoding="utf-8")
+    server = StdioServer(f'"{OFFICIAL_PYTHON}" "{script}"', server_environment([]))
+    try:
+        server.start()
+        assert server.modern_version == MODERN
+        toolbox = Toolbox([server])
+        assert list(toolbox.tools) == ["multiply"]
+        assert toolbox.call("multiply", {"a": 6, "b": 7}, 30) == "42"
+        assert "error" in toolbox.call("multiply", {"a": "six", "b": 7}, 30).lower()
+    finally:
+        server.close()

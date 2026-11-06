@@ -593,6 +593,37 @@ def test_a_stream_has_the_openai_shape(mesh):
     assert events[-1]["usage"]["completion_tokens"] > 0
 
 
+class HidesSpecialTokens(Scripted):
+    """Like a real tokenizer: decoding drops [TOOL_CALLS] unless told to keep it."""
+
+    def decode(self, ids):
+        return super().decode(ids).replace("[TOOL_CALLS]", "")
+
+    def keeping(self, markers):
+        assert "[TOOL_CALLS]" in markers
+        return SimpleNamespace(decode=lambda ids: Scripted.decode(self, ids))
+
+
+def special_token_reply(mesh, *pieces: str) -> None:
+    """A reply in whole tokens, since a special token is never split."""
+    mesh.use(MISTRAL)
+    chat = mesh.node.tokenizer
+    chat.__class__ = HidesSpecialTokens
+    chat.pieces += pieces
+    mesh.tokens = [*range(1, len(pieces) + 1), STOP]
+
+
+def test_a_call_written_with_a_special_token_is_seen_through_the_real_token_loop(mesh):
+    special_token_reply(mesh, "[TOOL_CALLS]", ' [{"name": "get_weather", ', '"arguments": {"city": "Paris"}}]')
+    choice = ask(mesh, tools=[WEATHER]).json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls" and choice["message"]["content"] is None
+
+
+def test_replies_without_tools_decode_as_they_always_did(mesh):
+    special_token_reply(mesh, "before ", "[TOOL_CALLS]", "after")
+    assert ask(mesh).json()["choices"][0]["message"]["content"] == "before after"
+
+
 def test_a_stream_numbers_parallel_calls(mesh):
     one = '<tool_call>{"name": "get_weather", "arguments": {"city": "%s"}}</tool_call>'
     mesh.use(QWEN3, one % "A" + "\n" + one % "B")
@@ -624,6 +655,13 @@ def test_required_says_so_in_the_stream_too(mesh):
     words = "".join(event["choices"][0]["delta"].get("content", "") for event in events)
     assert "no tool was called" in words and "I cannot do that." in words
     assert events[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_a_prompt_that_opens_in_reasoning_makes_the_reply_reasoning_until_it_closes(mesh):
+    reply = "maybe <function=get_weather>\n<parameter=city>\nX\n</parameter>\n</function> or not\n</think>\n\nSunny."
+    mesh.use(QWEN35, reply)
+    choice = ask(mesh, tools=[WEATHER], enable_thinking=True).json()["choices"][0]
+    assert choice["finish_reason"] == "stop" and choice["message"] == {"role": "assistant", "content": reply}
 
 
 def test_a_forced_call_is_written_after_the_template_prompt(mesh):

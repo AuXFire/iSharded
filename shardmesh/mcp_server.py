@@ -332,7 +332,7 @@ async def answer_http(
     if version not in SUPPORTED_VERSIONS:
         return 400, unsupported(version).body(identifier)
     modern = version in MODERN_VERSIONS
-    if modern:
+    if modern and "id" in message:  # the specification sets no header rules for notifications
         try:
             check_modern_headers(headers, message, version)
         except RpcError as exc:
