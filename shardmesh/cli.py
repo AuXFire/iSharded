@@ -182,9 +182,12 @@ def run_load(args: argparse.Namespace) -> int:
     while True:
         time.sleep(2)
         try:
-            status = httpx.get(base + "/admin/status", headers=headers, timeout=30.0).json()
+            answer = httpx.get(base + "/admin/status", headers=headers, timeout=30.0)
+            status = answer.json()
         except (httpx.HTTPError, ValueError):
             continue  # a busy or changing coordinator is no reason to give up on the load
+        if answer.status_code >= 500:
+            continue  # nobody coordinates this moment, so this is not a status
         job = status.get("load_job")
         if job is None and not args.lane:
             continue

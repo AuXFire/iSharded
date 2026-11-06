@@ -63,3 +63,28 @@ def test_a_lane_with_a_route_stops_holding_the_nodes_it_does_not_use() -> None:
     settled = door.settled(lanes)
     assert list(settled["one"]["budgets"]) == ["beta"]
     assert list(settled["new"]["budgets"]) == ["gamma"]  # still starting, so it keeps what it asked for
+
+
+def test_a_door_learns_a_lanes_route_from_its_coordinator_before_a_follower_hears() -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    import httpx
+
+    route = [{"worker_id": "gamma-cpu", "start_layer": 0, "end_layer": 28}]
+    replies = {
+        "http://follower/internal/lane": {"leader_url": "http://leader", "route": []},
+        "http://leader/internal/lane": {"leader_url": "http://leader", "route": route, "load_job": {"phase": "ready"}},
+    }
+
+    async def get(url, **_):
+        return httpx.Response(200, json=replies[url], request=httpx.Request("GET", url))
+
+    door = LaneDoor.__new__(LaneDoor)
+    door.seen = {}
+    door.runtime = SimpleNamespace(client=SimpleNamespace(get=get), pool_token=None, access=SimpleNamespace(authority=None))
+    door._sibling = lambda name: "http://follower"
+    asyncio.run(door._look("one"))
+    budget = {"gpu_gb": 0.0, "ram_gb": 2.0}
+    held = door.settled({"one": {"slot": 1, "budgets": {"beta": budget, "gamma": budget}, "by": ""}})
+    assert list(held["one"]["budgets"]) == ["gamma"]  # beta is free for the next lane

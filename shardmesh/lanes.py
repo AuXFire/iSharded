@@ -191,9 +191,13 @@ class LaneDoor:
             leader = str(info.get("leader_url") or "").rstrip("/")
             if leader and leader != url:
                 # A load runs on the lane's coordinator, so only it knows how one went.
+                # A follower hears of the route seconds later, and until then this door
+                # would count the lane as holding every node it asked for.
                 answer = await self.runtime.client.get(leader + "/internal/lane", headers=self._node_headers(), timeout=5.0)
                 if answer.status_code == 200:
-                    info["load_job"] = answer.json().get("load_job")
+                    fresh = answer.json()
+                    info["load_job"] = fresh.get("load_job")
+                    info["route"] = fresh.get("route") or info.get("route", [])
             self.seen[name] = info
         except (httpx.HTTPError, ValueError):
             self.seen.pop(name, None)
