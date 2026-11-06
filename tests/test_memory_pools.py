@@ -245,8 +245,7 @@ def test_a_vulkan_gpu_is_read_from_the_probe_and_software_devices_are_left_out(t
         {"backend": "Vulkan1", "name": "Radeon Graphics", "integrated": True, "free_bytes": 1024**3, "total_bytes": 2 * 1024**3},
         {"backend": "CUDA0", "name": "not this build's business", "integrated": False, "free_bytes": 1, "total_bytes": 1},
     ]
-    answer = SimpleNamespace(returncode=0, stdout="some driver noise
-" + json.dumps(report))
+    answer = SimpleNamespace(returncode=0, stdout="some driver noise\n" + json.dumps(report))
     first, second = read_vulkan_devices(tmp_path, run=lambda *_, **__: answer)
     assert (first.device, first.kind, first.backend, first.name) == ("vulkan:0", "vram", "vulkan", "Radeon RX 7900 XT")
     assert (second.device, second.kind) == ("vulkan:1", "unified")
