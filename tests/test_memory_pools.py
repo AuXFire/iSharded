@@ -178,11 +178,7 @@ def test_kv_checkpoint_memory_stays_separate_from_weight_memory(monkeypatch) -> 
     assert flag(store, "--roles") == "kv-cache,checkpoint"
 
 
-def test_rocm_launcher_contributes_gpu_cpu_and_ram_as_one_worker(monkeypatch) -> None:
-    source = (Path(__file__).parents[1] / "scripts" / "launch_lan_node_55_rocm.py").read_text(encoding="utf-8")
-    assert 'weights_ram_gb="auto"' in source
-    assert "cpu_threads=8" in source
-    assert 'gpu_dtype="auto"' in source
+def test_a_gpu_node_contributes_gpu_cpu_and_ram_as_one_worker(monkeypatch) -> None:
     monkeypatch.setattr("torch.cuda.is_available", lambda: True)  # CI machines have no GPU
     commands = launched(monkeypatch, gpu_device="auto", cpu_threads=8, weights_ram_gb="auto", gpu_memory_gb=16.0)
     assert len(commands) == 1

@@ -1533,7 +1533,6 @@ Adapter tests compare every family with the reference `transformers` implementat
 | `scripts/build_diagrams.py` | Redraws the diagrams in this file |
 | `scripts/ci_local.sh` | Runs the tests from a clean clone |
 | `scripts/install_node_task.ps1` | Starts a node at boot on Windows |
-| `scripts/launch_lan_node_55.py`, `scripts/launch_lan_node_55_rocm.py`, `scripts/bootstrap_remote_node_55.py`, `scripts/bootstrap_remote_rocm_node_55.py` | Example launchers. They read `ISHARDED_NODE_ID`, `ISHARDED_JOIN`, `ISHARDED_ADVERTISE_HOST`, and `ISHARDED_GGUF_DIR` |
 
 | Code | What it holds |
 |---|---|
