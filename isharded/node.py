@@ -511,7 +511,7 @@ def run_node(args: argparse.Namespace) -> int:
 
     env = os.environ.copy()
     if args.bind_host in {"0.0.0.0", "::"}:  # loopback reaches this node's services only then
-        env[OWN_ADDRESS] = args.advertise_host
+        env.setdefault(OWN_ADDRESS, args.advertise_host)
     # When iSharded is launched directly from a checkout (including an RDP
     # redirected drive), the supervisor can import this package because its
     # launcher amended sys.path, but fresh ``python -m isharded.worker`` child

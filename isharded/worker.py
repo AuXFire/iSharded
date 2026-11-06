@@ -76,7 +76,7 @@ from .slots import SlotGate
 from .access import load_authority
 from .inventory import inventory
 from .tickets import TicketIdentity, client_auth
-from .tls import client_verify, PEER, stay_on_this_machine_async
+from .tls import client_verify, node_transport, PEER, stay_on_this_machine_async
 from .vision import PromptPart, PromptRows, lay_out
 from .weights import FetchProgress, LoadedUnit, UnitCache, WeightSourceError, gguf_reader, load_unit, map_unit
 
@@ -363,7 +363,7 @@ class WorkerRuntime:
         self.caches: dict[str, CacheEntry] = {}
         self.lock = asyncio.Lock()
         # A disk-tier prompt can take minutes, and a slow hop is not a failure.
-        self.client = httpx.AsyncClient(event_hooks={"request": [stay_on_this_machine_async]}, timeout=httpx.Timeout(1800.0, connect=10.0), verify=client_verify(), auth=client_auth())
+        self.client = httpx.AsyncClient(transport=node_transport(), event_hooks={"request": [stay_on_this_machine_async]}, timeout=httpx.Timeout(1800.0, connect=10.0), verify=client_verify(), auth=client_auth())
         self.registration_task: asyncio.Task[None] | None = None
         self.inference_calls = 0
         self.tokens_processed = 0
@@ -505,6 +505,9 @@ class WorkerRuntime:
 
     def start_prepare(self, request: PrepareRequest) -> FetchProgress:
         """Begin downloading in the background. Serving is not interrupted."""
+        running = self.prepare_jobs.get(request.job_id)
+        if running is not None:
+            return running  # asked twice, as a retry after a lost reply would
         progress = FetchProgress(request.job_id)
         self.prepare_jobs[request.job_id] = progress
         while len(self.prepare_jobs) > 8:

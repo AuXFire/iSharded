@@ -61,7 +61,7 @@ from .pool import LOOPBACK, check_exposure, home as pool_home, load_token, read_
 from .serving import BodyLimit, ChunkedResponses, serve, where_everything_is
 from .mesh import clean_url
 from .tickets import PREFIX as TICKET_PREFIX, NodeTickets, TicketChecker, TicketIdentity, client_auth, make_checker, reply_audience
-from .tls import BEHALF, BEHALF_HEADER, FORWARD_MARK, INTERCEPTED, intercepted, PEER, client_verify, stay_on_this_machine_async
+from .tls import BEHALF, BEHALF_HEADER, FORWARD_MARK, INTERCEPTED, intercepted, PEER, client_verify, node_transport, stay_on_this_machine_async
 from .tokenizer import ChatTokenizer, IncrementalText, load_tokenizer
 from .toolcalls import (
     MARKER_TOKENS,
@@ -468,7 +468,7 @@ class Orchestrator:
         self.active_cache_url: str | None = None
         self.epoch = 0
         self.job: LoadJob | None = None
-        self.client = httpx.AsyncClient(event_hooks={"request": [stay_on_this_machine_async]}, timeout=httpx.Timeout(3600.0, connect=10.0), verify=client_verify(), auth=client_auth())
+        self.client = httpx.AsyncClient(transport=node_transport(), event_hooks={"request": [stay_on_this_machine_async]}, timeout=httpx.Timeout(3600.0, connect=10.0), verify=client_verify(), auth=client_auth())
         authority = load_authority()
         self.access = AccessControl.load(
             self.pool_token,
@@ -1163,7 +1163,7 @@ class Orchestrator:
                 job.workers[stage.worker_id] = response.json()
                 pending[stage.worker_id] = stage
             except httpx.HTTPError as exc:
-                failed[stage.worker_id] = f"could not start download: {exc}"
+                failed[stage.worker_id] = f"could not start download: {str(exc) or type(exc).__name__}"
 
         missed = dict.fromkeys(pending, 0)
         while pending and not failed and not job.cancelled:

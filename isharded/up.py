@@ -472,7 +472,7 @@ def make_ownerless(home: Path, settings: dict[str, Any], joining: str, trust: li
 
 def become_member(home: Path, settings: dict[str, Any], invite: dict[str, Any]) -> None:
     settings["tls"] = any(url.startswith("https") for url in invite["urls"])
-    os.environ[OWN_ADDRESS] = settings["address"]  # a mesh reached through this machine's own address
+    os.environ.setdefault(OWN_ADDRESS, settings["address"])  # a mesh reached through this machine's own address
     answered = join_mesh(home, invite, settings["name"], settings["address"])
     settings["join"] = list(dict.fromkeys([answered, *invite["urls"]]))
     write_settings(home, settings)

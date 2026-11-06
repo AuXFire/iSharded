@@ -884,7 +884,7 @@ A flag takes priority over its variable.
 | `ISHARDED_STATE_FILE` | `--state-file` |
 | `ISHARDED_AUDIT_FILE` | `--audit-file` |
 | `ISHARDED_HOST`, `ISHARDED_PORT` | `--host`, `--port` |
-| `ISHARDED_OWN_ADDRESS` | Set by a node for its own services, so a request for its public address goes over loopback. Many networks will not loop a machine's public address back to it |
+| `ISHARDED_OWN_ADDRESS` | Set by a node for its own services, so a request for its public address goes over loopback. Many networks will not loop a machine's public address back to it. Behind a relay that other nodes share, set it to a list of `host:port` |
 | `ISHARDED_NODE_ID`, `ISHARDED_NODE_URL`, `ISHARDED_JOIN` | The control plane's `--node-id`, `--advertise-url`, `--join` |
 | `ISHARDED_WORKER_ID`, `ISHARDED_ORCHESTRATOR_URL`, `ISHARDED_ADVERTISE_URL` | The worker's `--worker-id`, `--orchestrator-url`, `--advertise-url` |
 | `ISHARDED_DEVICE`, `ISHARDED_ROLES`, `ISHARDED_CPU_THREADS` | `--device`, `--roles`, `--cpu-threads` |

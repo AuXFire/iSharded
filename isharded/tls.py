@@ -25,6 +25,10 @@ BEHALF_HEADER = "x-isharded-on-behalf"
 
 
 OWN_ADDRESS = "ISHARDED_OWN_ADDRESS"
+# Measured from a home connection to five data centers: about 1 in 10 new connections
+# failed, against none between the data centers. A failed connect never reached the
+# other side, so trying again is always safe.
+CONNECT_RETRIES = 3
 
 
 def stay_on_this_machine(request: Any) -> None:
@@ -33,14 +37,24 @@ def stay_on_this_machine(request: Any) -> None:
     Most NAT, cloud networks and home routers included, will not loop a machine's
     public address back to it, so a worker could never reach the control plane
     beside it. Certificates cover 127.0.0.1, and the Host header stays as it was.
+
+    The setting is a host, or for a node behind a relay it is a list of host:port,
+    as other nodes can share that host.
     """
-    own = os.getenv(OWN_ADDRESS)
-    if own and request.url.host == own:
+    own = {item.strip() for item in os.getenv(OWN_ADDRESS, "").split(",") if item.strip()}
+    if request.url.host in own or f"{request.url.host}:{request.url.port}" in own:
         request.url = request.url.copy_with(host="127.0.0.1")
 
 
 async def stay_on_this_machine_async(request: Any) -> None:
     stay_on_this_machine(request)
+
+
+def node_transport() -> Any:
+    """How one node reaches another: it tries a failed connection again."""
+    import httpx
+
+    return httpx.AsyncHTTPTransport(retries=CONNECT_RETRIES, verify=client_verify())
 
 
 def client_verify() -> Any:

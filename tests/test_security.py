@@ -890,3 +890,6 @@ def test_a_node_reaches_itself_over_loopback_and_everyone_else_as_named(monkeypa
     assert (request.url.host, request.url.port, request.url.scheme) == ("127.0.0.1", 9000, "https")
     assert request.headers["host"] == "203.0.113.5:9000"
     assert sent("https://203.0.113.6:9000/health").url.host == "203.0.113.6"
+    monkeypatch.setenv(OWN_ADDRESS, "203.0.113.5:9000,203.0.113.5:9001")  # behind a relay, sharing its host
+    assert sent("https://203.0.113.5:9001/health").url.host == "127.0.0.1"
+    assert sent("https://203.0.113.5:9002/health").url.host == "203.0.113.5"
