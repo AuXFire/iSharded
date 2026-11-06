@@ -73,6 +73,7 @@ from .llamacpp import LlamaError, StageLost, ensure_build, pick_build, rocm_libr
 from .pool import check_exposure, load_token
 from .serving import MAX_STAGE_BYTES, BodyLimit, serve, where_everything_is
 from .slots import SlotGate
+from .statestore import HISTORY, PrefixIndex
 from .access import load_authority
 from .inventory import inventory
 from .tickets import TicketIdentity, client_auth
@@ -85,6 +86,8 @@ SUPPORTED_DTYPES = ["bfloat16", "float32", "float16"]
 # Snapshots waiting to send. Past this the store is too slow to keep up, and
 # recovery falls back to replaying the prompt.
 MAX_PENDING_CHECKPOINTS = 32
+# Times a reply plans again after a stage turns out not to hold a state.
+PLAN_ATTEMPTS = 3
 
 
 def choose_dtype_name(requested: str) -> str:
@@ -340,8 +343,13 @@ class WorkerRuntime:
         self.gate = SlotGate(1)
         self.waiting = 0
         self.drain_timer: asyncio.TimerHandle | None = None
-        # Per sequence, the conversation prefix the stages can restore: key and tokens.
-        self.checkpoints: dict[int, tuple[str, list[int]]] = {}
+        # What the stages can restore, on an entry worker. Any sequence can take any state.
+        self.prefix = PrefixIndex()
+        self.prompt_cache = True
+        self.state_ram_bytes = int(float(os.getenv("ISHARDED_STATE_RAM_GB", "1")) * 1024**3)
+        self.prompt_tokens_computed = 0
+        self.tokens_reused: dict[str, int] = {}
+        self.state_misses = 0
         self.slot_used_at: dict[int, float] = {}
         self.gguf_signature: tuple[Any, ...] | None = None
         self.stages_kept = 0
@@ -654,6 +662,7 @@ class WorkerRuntime:
             tuple(sorted(request.unit_hashes.items())),
             request.embedding,
             request.projector.file if request.projector and stage.start_layer == 0 else None,
+            request.prompt_cache,
         )
 
     async def hold_gate(self, seconds: float) -> bool:
@@ -676,16 +685,23 @@ class WorkerRuntime:
             self.drain_timer = None
             await self.gate.resume()
 
-    def choose_slot(self, free: set[int], prompt: list[int]) -> int:
-        """Prefer the sequence holding this conversation, then the one idle longest."""
-        best, reach = None, -1
-        for slot in free:
-            held = self.checkpoints.get(slot)
-            if held and len(held[1]) > reach and len(held[1]) < len(prompt) and prompt[: len(held[1])] == held[1]:
-                best, reach = slot, len(held[1])
-        if best is not None:
-            return best
+    def choose_slot(self, free: set[int]) -> int:
+        """The sequence idle longest. A saved state can go on any of them."""
         return min(free, key=lambda slot: self.slot_used_at.get(slot, 0.0))
+
+    def cache_report(self) -> dict[str, Any]:
+        """What the cache saved and holds. ``tokens_reused`` says where each came from."""
+        held = self.gguf.states if self.gguf is not None else {}
+        return {
+            "prompt_tokens_computed": self.prompt_tokens_computed,
+            "tokens_reused": dict(self.tokens_reused),
+            "state_misses": self.state_misses,
+            "states": held.get("states", 0),
+            "ram_bytes": held.get("ram_bytes", 0),
+            "disk_bytes": held.get("disk_bytes", 0),
+            "saved_bytes": held.get("saved_bytes", 0),
+            "evicted": held.get("evicted", 0),
+        }
 
     def _materialize_gguf(self, request: ConfigureRequest, adapter: GgufAdapter) -> None:
         """Assemble this stage's file from cached units and load it into llama.cpp."""
@@ -698,7 +714,8 @@ class WorkerRuntime:
         on_vulkan = any(pool.device.startswith("vulkan") for pool in self.pools.values())
         folder = self.llama_dir or str(ensure_build(pick_build("vulkan" if on_vulkan else self.requested_device)))
         threads = self.cpu_threads or max((os.cpu_count() or 4) // 2, 1)
-        self.gguf = GgufStage(folder, rocm_library_paths(), self.unit_cache, request, adapter, self.pools, threads)
+        ram = 0 if request.embedding or not request.prompt_cache else self.state_ram_bytes
+        self.gguf = GgufStage(folder, rocm_library_paths(), self.unit_cache, request, adapter, self.pools, threads, None, ram, 0)
         self._load_draft(request, folder, threads)
         self._load_projector(request, adapter, folder, threads)
         used: dict[str, int] = {}
@@ -715,7 +732,6 @@ class WorkerRuntime:
             self.stages_kept += 1
             return
         self._close_gguf()
-        self.checkpoints = {}
         if isinstance(adapter, GgufAdapter):
             self._materialize_gguf(request, adapter)
             self.gguf_signature = signature
@@ -772,7 +788,7 @@ class WorkerRuntime:
         """
         self._close_gguf()
         self.gguf_signature = None
-        self.checkpoints = {}
+        self.prefix.clear()
         for key in list(self.loaded):
             self.loaded.pop(key).release()
         self.unit_weights = {}
@@ -811,6 +827,8 @@ class WorkerRuntime:
         self.route = request.route
         self.cache_url = request.cache_url.rstrip("/") if request.cache_url else None
         self.caches.clear()
+        self.prefix.clear()  # the stages behind this one may have changed
+        self.prompt_cache = request.prompt_cache
         self.merge_passes = request.merge_passes
         if self.gate.size != request.slots:
             self.gate.resize(request.slots)
@@ -838,12 +856,15 @@ class WorkerRuntime:
             if self.gguf is not None:
                 if restoring:
                     try:
-                        self.gguf.restore(request.checkpoint_key, request.slot)
+                        tier = self.gguf.restore(request.checkpoint_key, request.slot)
                     except StageLost:
                         raise
                     except LlamaError as exc:
-                        raise HTTPException(status_code=503, detail={"retry": True, "message": str(exc)}) from exc
+                        detail = {"retry": True, "missing": request.checkpoint_key, "message": str(exc)}
+                        raise HTTPException(status_code=503, detail=detail) from exc
                     entry.length = request.restore_length
+                    source = f"{request.restore_kind or HISTORY}_{tier}"
+                    self.tokens_reused[source] = self.tokens_reused.get(source, 0) + request.reused_rows
                 else:
                     self.gguf.clear(request.slot)
                 # A new session takes over its sequence from whoever had it.
@@ -895,7 +916,7 @@ class WorkerRuntime:
                     slot=request.slot,
                 )
             else:
-                output = self.gguf.forward(rows, entry.length, request.slot, places)
+                output = self.gguf.forward(rows, entry.length, request.slot, places, request.cuts, request.saves)
                 if self.gguf.last:
                     self.gguf_logits = torch.from_numpy(output.copy())
                 else:
@@ -917,10 +938,10 @@ class WorkerRuntime:
                 _synchronize(hidden.device)
         # An image's rows take fewer positions than rows, so the pass says where it ended.
         entry.length = entry.length + tokens if request.next_position is None else request.next_position
-        if request.save_checkpoint and self.gguf is not None:
-            self.gguf.save(request.save_checkpoint, request.slot)
         self.inference_calls += 1
         self.tokens_processed += tokens
+        if request.prompt_rows:
+            self.prompt_tokens_computed += tokens
         self.compute_ms_ema = self._ema(self.compute_ms_ema, (time.perf_counter() - started) * 1000)
         return hidden
 
@@ -1070,8 +1091,6 @@ class WorkerRuntime:
         self._record("compute", started)
         if next_stage is None and request.verify:
             return {"token_ids": self.gguf_choices}
-        if next_stage is None and request.prefill_only:
-            return {"token_id": -1}
         if next_stage is None:
             started = time.perf_counter()
             result = {"token_id": await asyncio.to_thread(self._sample, hidden, request)}
@@ -1086,7 +1105,7 @@ class WorkerRuntime:
             self.merge_passes
             and self.gguf is not None
             and hidden.shape[1] == 1
-            and not (request.verify or request.reset or request.prefill_only or request.save_checkpoint)
+            and not (request.verify or request.reset or request.prompt_rows)
             and request.restore_length is None
             and request.next_position is None
         )
@@ -1197,7 +1216,9 @@ class WorkerRuntime:
         headers["content-type"] = "application/x-safetensors"
         # A batch of FP32 rows outgrows a cold TCP window and costs extra round
         # trips. Single tokens stay exact; llama.cpp stages turn BF16 back to FP32.
-        if self.gguf is not None and hidden.shape[1] > 1 and self.dtype_name != "float32":
+        # Prompt rows always go as BF16, or a restored state that left one row to run
+        # would not match a run that read the whole prompt.
+        if self.gguf is not None and (hidden.shape[1] > 1 or request.prompt_rows) and self.dtype_name != "float32":
             hidden = hidden.to(torch.bfloat16)
         payload = encode_activation(hidden, None if places is None else torch.from_numpy(places))
         self._record("encode", started)
@@ -1331,6 +1352,7 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
             "draft_passes": runtime.draft_passes,
             "draft_tokens_per_pass": round(runtime.draft_accepted / runtime.draft_passes, 2) if runtime.draft_passes else None,
             "checkpoints_dropped": runtime.checkpoints_dropped,
+            "cache": runtime.cache_report(),
             "phases_ms": runtime.phases,
         },
     }
@@ -1685,22 +1707,35 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
         return result
 
     async def first_token(request: InferRequest, plan: PromptPlan, rows: PromptRows | None = None) -> int:
-        """Run what the stages have not seen, stopping to checkpoint if asked."""
+        """Run what the stages have not seen, in one trip along the route.
+
+        Each stage stops at the same cuts and saves at the same places, so saving
+        costs no extra pass and no extra hop.
+        """
         prompt, start = body.input_ids, plan.start
-        restored = rows.position_at(start) if rows else start
-        where: dict[str, Any] = {"reset": not start, "restore_length": restored or None, "checkpoint_key": plan.key}
-
-        async def run(stop: int, **changes: Any) -> dict[str, Any]:
-            part = rows.part(start, stop) if rows else None
-            update = {**where, "input_ids": prompt[start:stop], "next_position": part.after if part else None, **changes}
-            return await step(request.model_copy(update=update), part)
-
-        if plan.mark is not None:
-            await run(plan.mark, save_checkpoint=plan.new_key, prefill_only=True)
-            runtime.checkpoints[request.slot] = (plan.new_key, prompt[: plan.mark])
-            start = plan.mark
-            where = {"reset": False, "restore_length": None, "checkpoint_key": None}
-        return (await run(len(prompt)))["token_id"]
+        part = rows.part(start, len(prompt)) if rows else None
+        result = await step(
+            request.model_copy(
+                update={
+                    "input_ids": prompt[start:],
+                    "reset": not start,
+                    "restore_length": (rows.position_at(start) if rows else start) or None,
+                    "checkpoint_key": plan.key,
+                    "reused_rows": start,
+                    "restore_kind": plan.kind,
+                    "prompt_rows": True,
+                    "cuts": plan.cuts,
+                    "saves": plan.saves,
+                    "next_position": part.after if part else None,
+                }
+            ),
+            part,
+        )
+        for save in plan.saves:
+            if save.replaces:
+                runtime.prefix.drop(save.replaces)
+            runtime.prefix.add(save.key, save.length, save.kind)
+        return result["token_id"]
 
     async def plain(request: InferRequest, plan: PromptPlan, rows: PromptRows | None = None) -> AsyncIterator[int]:
         token = await first_token(request, plan, rows)
@@ -1770,10 +1805,10 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             position += len(accepted)
 
     async def tokens() -> AsyncIterator[bytes]:
-        request = InferRequest(**body.model_dump(exclude={"max_tokens", "stop_token_ids", "checkpoint_at", "images"}))
+        request = InferRequest(**body.model_dump(exclude={"max_tokens", "stop_token_ids", "checkpoint_at", "cut_token", "images"}))
         runtime.waiting += 1
         try:
-            slot = await runtime.gate.acquire(lambda free: runtime.choose_slot(free, body.input_ids))
+            slot = await runtime.gate.acquire(runtime.choose_slot)
         finally:
             runtime.waiting -= 1
         request = request.model_copy(update={"slot": slot})
@@ -1781,25 +1816,35 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             if body.epoch != runtime.epoch:
                 yield json.dumps({"error": f"pipeline epoch mismatch; worker has {runtime.epoch}"}).encode() + b"\n"
                 return
-            held = runtime.checkpoints.get(slot) if runtime.gguf is not None else None
-            plan = plan_prompt(held, body.input_ids, body.checkpoint_at)
             # A draft reads text, so it cannot follow a prompt with images in it.
             use_draft = runtime.draft is not None and runtime.speculate_tokens and not body.images
-            try:
-                rows = await runtime.prompt_rows(body.input_ids, body.images) if body.images else None
-                source = speculative(request, plan) if use_draft else plain(request, plan, rows)
-                async for token in source:
-                    yield json.dumps({"token_id": token}).encode() + b"\n"
-                return
-            except HTTPException as exc:
-                failure: Any = exc.detail
-            except StageLost as exc:
-                failure = (await runtime.replace_stage(exc)).detail
-            except Exception as exc:
-                runtime.last_error = f"{type(exc).__name__}: {exc}"
-                failure = runtime.last_error
-            # A stage may have lost the checkpoint, and a replay needs no help from it.
-            runtime.checkpoints.pop(slot, None)
+            caching = runtime.gguf is not None and runtime.prompt_cache
+            rows: PromptRows | None = None
+            answered = False
+            failure: Any = None
+            for _ in range(PLAN_ATTEMPTS):
+                plan = plan_prompt(runtime.prefix, body.input_ids, body.cut_token, body.checkpoint_at, caching)
+                try:
+                    if body.images and rows is None:
+                        rows = await runtime.prompt_rows(body.input_ids, body.images)
+                    source = speculative(request, plan) if use_draft else plain(request, plan, rows)
+                    async for token in source:
+                        answered = True
+                        yield json.dumps({"token_id": token}).encode() + b"\n"
+                    return
+                except HTTPException as exc:
+                    failure = exc.detail
+                except StageLost as exc:
+                    failure = (await runtime.replace_stage(exc)).detail
+                except Exception as exc:
+                    runtime.last_error = f"{type(exc).__name__}: {exc}"
+                    failure = runtime.last_error
+                # A stage that no longer holds a state is no failure: plan without it.
+                missing = failure.get("missing") if isinstance(failure, dict) else None
+                if missing is None or answered:
+                    break
+                runtime.prefix.drop(missing)
+                runtime.state_misses += 1
             yield json.dumps({"error": failure}).encode() + b"\n"
         finally:
             runtime.slot_used_at[slot] = time.monotonic()

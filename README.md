@@ -712,6 +712,7 @@ Loads a model on a running pool and shows progress. `model` is any [model id](#l
 | `--draft` | Chosen automatically | Small GGUF for speculative decoding |
 | `--no-draft` | Off | Turn speculative decoding off |
 | `--no-merge-passes` | Off | Make conversations take turns on each stage |
+| `--no-prompt-cache` | Off | Read every prompt in full instead of reusing saved states. See [Conversation reuse](#conversation-reuse) |
 | `--hashes` | None | File from `isharded model hash`. Every node checks every unit against it |
 | `--no-reuse-cached` | Off | Plan as if no worker held any shards |
 | `--no-peer-fetch` | Off | Download every shard from the model host |
@@ -889,6 +890,7 @@ A flag takes priority over its variable.
 | `ISHARDED_WORKER_ID`, `ISHARDED_ORCHESTRATOR_URL`, `ISHARDED_ADVERTISE_URL` | The worker's `--worker-id`, `--orchestrator-url`, `--advertise-url` |
 | `ISHARDED_DEVICE`, `ISHARDED_ROLES`, `ISHARDED_CPU_THREADS` | `--device`, `--roles`, `--cpu-threads` |
 | `ISHARDED_GPU_MEMORY_GB`, `ISHARDED_RAM_BUDGET_GB` | `--gpu-memory-gb`, `--ram-budget-gb` |
+| `ISHARDED_STATE_RAM_GB` | RAM each stage keeps for saved prompt states. Default 1 |
 | `ISHARDED_CACHE_DIR`, `ISHARDED_LLAMA_DIR` | `--cache-dir`, `--llama-dir` |
 | `ISHARDED_LANE`, `ISHARDED_LANES_FILE` | Set by `isharded node`: which lane a process is, and where a node keeps the lanes it should run |
 | `ISHARDED_OWNERLESS` | `--ownerless` |
@@ -1073,6 +1075,7 @@ On two nodes on one machine, the same loop ran through the coordinator, a follow
 | `draft_model` | `auto` | A GGUF id, `auto`, or `none` |
 | `draft_tokens` | 6 | Most guesses per pass, 1 to 16 |
 | `merge_passes` | `true` | Let conversations share a pass |
+| `prompt_cache` | `true` | Reuse saved prompt states |
 | `model_hashes` | None | The contents of an `isharded model hash` file |
 | `embedding` | `false` | This is an embedding model. See [Embeddings](#embeddings) |
 | `mmproj` | None | A projector GGUF for images. See [Vision](#vision) |
@@ -1197,7 +1200,13 @@ The number of guesses adapts as a reply goes, up to `draft_tokens`, because code
 
 ### Conversation reuse
 
-Every stage saves its state where a chat's settled history ends. If the next prompt starts with exactly those tokens, stages restore the checkpoint and process only the new text, so a long conversation stops costing more with every turn. Anything else, such as an edited history or a new route, falls back to reading the whole prompt. This covers GGUF chat.
+The same tokens are computed once per stage and reused. Every stage saves its state in two places: where a chat's system prompt and tool list end, which other conversations share, and where its settled history ends, which is where the conversation picks up next turn. If a prompt starts with exactly those tokens, stages restore the state and process only what is new. Anything else, such as an edited history, reads the whole prompt. This covers GGUF models.
+
+A state holds attention and recurrent state alike, so this works on hybrid models. A hybrid model can only resume where a state was saved, because recurrent state cannot be cut back to an earlier token. llama.cpp's own sequence copy is not used: copying part of a sequence aborts a stage process, and on a shared cache it leaves a hybrid model with the wrong recurrent state and no error.
+
+Prompts are cut into passes at the same places whether or not anything is cached, because where a prompt is cut changes the arithmetic. A cut falls before each turn, at least 64 tokens after the last one. That is what makes a reply at temperature 0 the same with the cache on or off. Replies running at once share passes in whatever order they arrive, so this holds for replies one at a time. Two conversations that start together each compute what they share, since neither has saved it yet.
+
+`--no-prompt-cache` on a load turns this off.
 
 ### Several conversations at once
 
@@ -1524,6 +1533,10 @@ A node started with `isharded up` keeps its route state, keys, and audit log in 
 | `token_latency_ms`, `worker_compute_ms` | Time per token, and compute per pass |
 | `worker_stages_kept_total` | Reconfigures that moved no weights |
 | `worker_draft_tokens_per_pass` | Tokens per speculative pass. Near 1 means the draft is not helping |
+| `worker_prompt_tokens_computed_total` | Prompt tokens a stage computed |
+| `worker_tokens_reused_total` | Prompt tokens a stage restored instead of computing. `source` is `prefix` for a shared prefix or `history` for a conversation, then the tier it came from |
+| `worker_state_misses_total` | Saved states a stage did not hold when asked. Each costs a reread, and nothing else |
+| `worker_cache_bytes` | Bytes of saved state a stage holds, by `tier` |
 
 ## Troubleshooting
 

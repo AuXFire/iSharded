@@ -714,7 +714,7 @@ def test_a_restored_checkpoint_continues_exactly():
     try:
         host.call(
             "load", folder=BUILD, extra_paths=[], path=MODEL, last=True, context_tokens=256,
-            gpu_layers=-1, threads=4, table=embed, cpu_tensors=[], rollback_tokens=4,
+            gpu_layers=-1, threads=4, table=embed, cpu_tensors=[], rollback_tokens=4, state_ram_bytes=1024**3,
         )
 
         def rows(tokens):
@@ -725,42 +725,17 @@ def test_a_restored_checkpoint_continues_exactly():
 
         history = [9707, 11, 1246, 525, 498]
         logits(history, 0)
-        size = host.call("save", key="history")[0]["bytes"]
-        assert size > 0
+        assert host.call("save", key="history", length=len(history))[0]["states"]["ram_bytes"] > 0
         expected = logits([3351, 30], len(history))
 
         logits([100, 200, 300], len(history) + 2)  # the conversation carries on
-        host.call("restore", key="history")
+        assert host.call("restore", key="history")[0]["tier"] == "ram"
         assert np.array_equal(logits([3351, 30], len(history)), expected)
 
-        with pytest.raises(LlamaError, match="no checkpoint"):
+        with pytest.raises(LlamaError, match="no saved state"):
             host.call("restore", key="another conversation of the same length")
     finally:
         host.close()
-
-
-def test_a_prompt_reuses_only_the_conversation_it_continues():
-    from isharded.gguf_stage import checkpoint_key, plan_prompt
-
-    held = (checkpoint_key([1, 2, 3]), [1, 2, 3])
-    plan = plan_prompt(held, [1, 2, 3, 4, 5, 6], 5)
-    assert (plan.start, plan.key, plan.mark) == (3, held[0], 5)
-    assert plan.new_key == checkpoint_key([1, 2, 3, 4, 5])
-
-    other = plan_prompt(held, [9, 2, 3, 4, 5, 6], 5)
-    assert other.start == 0 and other.key is None, "same length, different words: no reuse"
-
-
-def test_a_checkpoint_needs_something_left_to_run():
-    from isharded.gguf_stage import plan_prompt
-
-    assert plan_prompt(("k", [1, 2, 3]), [1, 2, 3], None).start == 0
-
-
-def test_no_new_checkpoint_before_the_old_one_ends():
-    from isharded.gguf_stage import plan_prompt
-
-    assert plan_prompt(("k", [1, 2, 3]), [1, 2, 3, 4], 3).mark is None
 
 
 class Holder:

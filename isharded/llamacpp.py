@@ -20,13 +20,14 @@ import shutil
 import sys
 import tarfile
 import threading
-from typing import Any
+from typing import Any, Callable, Sequence
 import zipfile
 
 import httpx
 import numpy as np
 
 from .embedding import PASS_SEQUENCES
+from .statestore import PASS_ROWS
 
 PINNED_BUILD = "b12119"
 RELEASE_URL = f"https://github.com/ggml-org/llama.cpp/releases/download/{PINNED_BUILD}/"
@@ -501,7 +502,14 @@ class LlamaLibrary:
 
 
 class LlamaStage:
-    """A loaded stage file with its own KV and recurrent state, for one sequence."""
+    """A loaded stage file with its own KV and recurrent state, for each sequence.
+
+    Saved states are the one way a sequence is shared, and they work for attention
+    and recurrent state alike. ``llama_memory_seq_cp`` is no use for this: with a cache
+    per sequence, as stages have, copying part of a sequence aborts the process, and
+    with a shared cache a hybrid model keeps its newest recurrent state and gives
+    wrong answers without any error. ``llama_memory_seq_rm`` refuses to rewind one.
+    """
 
     def __init__(
         self,
@@ -512,7 +520,7 @@ class LlamaStage:
         context_tokens: int = 4096,
         gpu_layers: int = -1,
         threads: int = 4,
-        batch_tokens: int = 512,
+        batch_tokens: int = PASS_ROWS,
         cpu_tensors: list[str] | None = None,
         rollback_tokens: int = 0,
         sequences: int = 1,
@@ -704,23 +712,37 @@ class LlamaStage:
             lib.llama_memory_seq_rm(self.memory, scratch, -1, -1)
         return guesses
 
-    def forward(self, hidden: np.ndarray, position: int, slot: int = 0, places: np.ndarray | None = None) -> np.ndarray:
+    def forward(
+        self,
+        hidden: np.ndarray,
+        position: int,
+        slot: int = 0,
+        places: np.ndarray | None = None,
+        cuts: Sequence[int] = (),
+        reached: Callable[[int], None] | None = None,
+    ) -> np.ndarray:
         """Run hidden states [tokens, width]. Returns hidden states, or the last row's logits.
 
         ``places`` gives every row's position by section, for rows that do not simply
-        follow ``position``, as an image's do not.
+        follow ``position``, as an image's do not. A pass never runs across one of
+        ``cuts``, and ``reached`` hears the row count wherever a pass stops.
         """
         hidden = np.ascontiguousarray(hidden, dtype=np.float32)
         pieces = []
-        for start in range(0, hidden.shape[0], self.batch_tokens):
-            chunk = hidden[start : start + self.batch_tokens]
-            part = None if places is None else places[:, start : start + self.batch_tokens]
-            self._captured = None
-            self._decode(chunk.shape[0], position + start, not self.last, hidden=chunk, sequence_id=slot, places=part)
-            if not self.last:
-                if self._captured is None:
-                    raise LlamaError("the stage output tensor was never produced")
-                pieces.append(self._captured.reshape(-1, self.hidden_size))
+        edges = [0, *cuts, hidden.shape[0]]
+        for first, end in zip(edges, edges[1:]):
+            for start in range(first, end, self.batch_tokens):
+                stop = min(start + self.batch_tokens, end)
+                chunk = hidden[start:stop]
+                part = None if places is None else places[:, start:stop]
+                self._captured = None
+                self._decode(chunk.shape[0], position + start, not self.last, hidden=chunk, sequence_id=slot, places=part)
+                if not self.last:
+                    if self._captured is None:
+                        raise LlamaError("the stage output tensor was never produced")
+                    pieces.append(self._captured.reshape(-1, self.hidden_size))
+                if reached is not None:
+                    reached(stop)
         if self.last:
             return self.logits_at(-1).copy()
         return np.concatenate(pieces) if len(pieces) > 1 else pieces[0]

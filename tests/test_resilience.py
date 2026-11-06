@@ -527,14 +527,14 @@ def test_shrinking_slots_forgets_the_ones_gone():
     asyncio.run(scenario())
 
 
-def test_a_conversation_returns_to_the_sequence_that_holds_it():
+def test_a_reply_takes_the_sequence_idle_longest():
+    """A saved state can go on any sequence, so nothing ties a conversation to one."""
     from isharded import worker
 
     runtime = worker.WorkerRuntime.__new__(worker.WorkerRuntime)
-    runtime.checkpoints = {0: ("a", [1, 2]), 1: ("b", [7, 8, 9])}
     runtime.slot_used_at = {0: 5.0, 1: 9.0, 2: 1.0}
-    assert runtime.choose_slot({0, 1, 2}, [7, 8, 9, 10]) == 1
-    assert runtime.choose_slot({0, 1, 2}, [5, 5]) == 2, "otherwise the one idle longest"
+    assert runtime.choose_slot({0, 1, 2}) == 2
+    assert runtime.choose_slot({0, 1}) == 0
 
 
 def test_repairs_are_rate_limited():
@@ -990,7 +990,7 @@ def test_merged_passes_stay_off_unless_asked_for():
 
     from isharded.worker import WorkerRuntime
 
-    step = SimpleNamespace(verify=False, reset=False, prefill_only=False, save_checkpoint=None, restore_length=None, next_position=None)
+    step = SimpleNamespace(verify=False, reset=False, prompt_rows=False, restore_length=None, next_position=None)
     hidden = torch.zeros(1, 1, 4)
     held = SimpleNamespace(merge_passes=False, gguf=object())
     assert not WorkerRuntime._can_merge(held, hidden, step)

@@ -153,6 +153,7 @@ def run_load(args: argparse.Namespace) -> int:
         "placement": args.placement,
         "context_tokens": args.context_tokens,
         "merge_passes": args.merge_passes,
+        "prompt_cache": args.prompt_cache,
         "model_hashes": json.loads(Path(args.hashes).read_text(encoding="utf-8")) if args.hashes else None,
     }
     if args.entry:
@@ -484,6 +485,7 @@ def build_parser() -> argparse.ArgumentParser:
     load.add_argument("--no-peer-fetch", action="store_true", help="download every shard from the model host")
     load.add_argument("--token", "--pool-token", dest="pool_token", default=load_token(), help="an admin key; defaults to this machine's pool token")
     load.add_argument("--no-merge-passes", dest="merge_passes", action="store_false", help="make conversations take turns on each stage")
+    load.add_argument("--no-prompt-cache", dest="prompt_cache", action="store_false", help="read every prompt in full instead of reusing saved states")
     load.add_argument("--lane", default=None, help="load beside the running model, in a lane of this name")
     load.add_argument("--lane-gpu-gb", type=float, default=None, help="most VRAM per node for this lane; default is what is spare")
     load.add_argument("--lane-ram-gb", type=float, default=None, help="most RAM per node for this lane; default is what is spare")

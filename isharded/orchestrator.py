@@ -1237,6 +1237,7 @@ class Orchestrator:
                 term=self.mesh.term if self.mesh else 0,
                 slots=target.slots,
                 merge_passes=target.merge_passes,
+                prompt_cache=target.request is None or target.request.prompt_cache,
                 embedding=target.embedding,
                 projector=target.projector,
                 unit_hashes={
@@ -1611,6 +1612,7 @@ class Orchestrator:
                 top_k=top_k,
                 seed=seed,
                 images=session.images if must_replay else [],
+                prompt_rows=must_replay,
             )
             entry = self.route[0]
             try:
@@ -1689,6 +1691,8 @@ class Orchestrator:
         """
         produced = 0
         stops = self.tokenizer.stop_token_ids if self.tokenizer else set()
+        # Whatever opens the reply opens every other turn too, so it marks the cuts.
+        cut_token = None if boundary is None else session.tokens[boundary]
         for _ in range(STREAM_ATTEMPTS):
             if not self.route:
                 break
@@ -1706,6 +1710,7 @@ class Orchestrator:
                 max_tokens=max_tokens - produced,
                 stop_token_ids=sorted(stops),
                 checkpoint_at=None if produced else boundary,
+                cut_token=cut_token,
                 images=session.images,
             )
             started = time.perf_counter()
@@ -1921,6 +1926,13 @@ class Orchestrator:
             add("worker_stages_kept_total", telemetry.get("stages_kept"), "Reconfigures that moved no weights", "counter", worker=worker_id)
             if telemetry.get("draft_tokens_per_pass") is not None:
                 add("worker_draft_tokens_per_pass", telemetry["draft_tokens_per_pass"], "Tokens per speculative pass", worker=worker_id)
+            cache = telemetry.get("cache") or {}
+            add("worker_prompt_tokens_computed_total", cache.get("prompt_tokens_computed"), "Prompt tokens this stage computed", "counter", worker=worker_id)
+            for source, count in (cache.get("tokens_reused") or {}).items():
+                add("worker_tokens_reused_total", count, "Prompt tokens this stage restored instead of computing", "counter", worker=worker_id, source=source)
+            add("worker_state_misses_total", cache.get("state_misses"), "Saved states a stage did not hold when asked", "counter", worker=worker_id)
+            for tier in ("ram", "disk"):
+                add("worker_cache_bytes", cache.get(f"{tier}_bytes"), "Bytes of saved state held", worker=worker_id, tier=tier)
         return "\n".join(lines) + "\n"
 
     def _fit_context(self, prompt_tokens: int, max_tokens: int) -> int:
