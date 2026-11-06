@@ -73,7 +73,7 @@ from .protocol import (
     encode_tensors,
 )
 from .gguf import parse_source
-from .gguf_stage import INITIAL_GUESSES, DraftModel, GgufStage, ImageEncoder, PromptPlan, next_guess_count, plan_prompt
+from .gguf_stage import INITIAL_GUESSES, DraftChoice, DraftModel, GgufStage, ImageEncoder, PromptPlan, next_guess_count, plan_prompt
 from . import __version__
 from .llamacpp import PINNED_BUILD, LlamaError, StageLost, ensure_build, pick_build, rocm_library_paths, step_random
 from .pool import check_exposure, load_token
@@ -308,6 +308,7 @@ class WorkerRuntime:
         self.control_urls: dict[str, ControlLink] = {url: ControlLink() for url in self.seed_urls}
         self.term = 0
         self.advertised_url = os.getenv("ISHARDED_ADVERTISE_URL", "http://127.0.0.1:8100").rstrip("/")
+        self.draft_choice = DraftChoice()
         self.ring_live = False
         self.ring_epoch: int | None = None
         self.ring_door: dict[str, Any] | None = None
@@ -992,6 +993,7 @@ class WorkerRuntime:
             raise ValueError(f"order from term {request.term}, but term {self.term} already took over")
         self.term = request.term
         self.ring_stop()
+        self.draft_choice = DraftChoice()  # a new route can change which way is faster
         adapter = create_adapter(request.architecture)
         if not (0 <= request.assignment.start_layer < request.assignment.end_layer <= adapter.num_layers):
             raise ValueError("invalid layer interval")
@@ -2187,29 +2189,34 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
         ahead = min(INITIAL_GUESSES, runtime.speculate_tokens)
         while produced < body.max_tokens and token not in stops:
             room = body.max_tokens - produced
-            started = time.perf_counter()
-            try:
-                guesses = await asyncio.to_thread(draft.guess, history, min(ahead, room), request.slot)
-            except LlamaError as exc:
-                await runtime.replace_draft(exc)
-                raise RuntimeError("the draft model was lost; replaying without it") from exc
-            runtime._record("draft", started)
+            began = time.perf_counter()
+            drafting = runtime.draft_choice.use_draft()
+            if drafting:
+                started = time.perf_counter()
+                try:
+                    guesses = await asyncio.to_thread(draft.guess, history, min(ahead, room), request.slot)
+                except LlamaError as exc:
+                    await runtime.replace_draft(exc)
+                    raise RuntimeError("the draft model was lost; replaying without it") from exc
+                runtime._record("draft", started)
             result = await step(
                 request.model_copy(
                     update={
-                        "input_ids": [token, *guesses],
+                        "input_ids": [token, *guesses] if drafting else [token],
                         "reset": False,
                         "restore_length": None,
                         "checkpoint_key": None,
-                        "verify": True,
+                        "verify": drafting,
                         "rollback_to": position,
                     }
                 )
             )
-            accepted = result["token_ids"]
-            runtime.draft_passes += 1
-            runtime.draft_accepted += len(accepted)
-            ahead = next_guess_count(ahead, len(accepted) - 1, runtime.speculate_tokens)
+            accepted = result["token_ids"] if drafting else [result["token_id"]]
+            if drafting:
+                runtime.draft_passes += 1
+                runtime.draft_accepted += len(accepted)
+                ahead = next_guess_count(ahead, len(accepted) - 1, runtime.speculate_tokens)
+            runtime.draft_choice.note(drafting, len(accepted), time.perf_counter() - began)
             for token in accepted[:room]:
                 yield token
                 produced += 1

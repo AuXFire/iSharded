@@ -116,7 +116,7 @@ ACTIVATE_RETRY_SECONDS = 5.0
 RING_RETRY_SECONDS = 30.0
 RING_CALL_SECONDS = 30.0
 LINK_TTL_SECONDS = 600.0
-LINK_PROBE_ROUNDS = 3
+LINK_PROBE_ROUNDS = 5
 LINK_PROBE_SECONDS = 30.0
 # Replanning around a worker that is alive but failed may move this much at most.
 REPLAN_MOVE_LIMIT_BYTES = 2 * 1024**3
@@ -483,6 +483,13 @@ def describe_plan(target: ModelTarget, route: list[StageAssignment]) -> dict[str
         "exit_worker": route[-1].worker_id,
         "estimated_tokens_per_second": round(1000 / milliseconds, 1) if milliseconds else None,
     }
+
+
+def link_cost(measured: dict[str, float]) -> float:
+    """What a link costs a token. A link that swings is charged for it, because a reply
+    waits for the slow passes too, so a steady link beats a jittery one of the same median."""
+    median = float(measured["median_ms"])
+    return median + (float(measured.get("max_ms", median)) - median) / 2
 
 
 class Orchestrator:
@@ -1281,7 +1288,7 @@ class Orchestrator:
                     timeout=10.0,
                 )
                 response.raise_for_status()
-                self.links[source, target] = float(response.json()["100"]["median_ms"])
+                self.links[source, target] = link_cost(response.json()["100"])
             except (httpx.HTTPError, KeyError, TypeError, ValueError):
                 self.links[source, target] = UNREACHABLE_LINK_MS
             self.links_checked[source, target] = now

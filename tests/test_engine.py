@@ -17,6 +17,7 @@ import pytest
 from isharded import engine as native
 from isharded import worker as worker_module
 from isharded.engine import EngineClient, EngineRefusal, find_library, library_name, pass_frame
+from isharded.gguf_stage import DRAFT_TRIAL_TOKENS, DraftChoice
 from isharded.orchestrator import Orchestrator
 from isharded.protocol import InferRequest, StageAssignment
 
@@ -364,3 +365,34 @@ def test_a_real_engine_refuses_a_stale_library_version_check(monkeypatch) -> Non
     library = ctypes.CDLL(str(find_library()))
     library.isharded_engine_abi.restype = ctypes.c_uint32
     assert library.isharded_engine_abi() == native.ABI_VERSION
+
+
+def test_a_draft_that_loses_is_set_aside_and_tried_again_later() -> None:
+    choice = DraftChoice()
+    assert choice.use_draft() is True  # each way gets a turn first
+    choice.note(True, 3, 0.15)  # 20 tokens/s
+    assert choice.use_draft() is False
+    choice.note(False, 1, 0.036)  # 28 tokens/s
+    for _ in range(DRAFT_TRIAL_TOKENS - 1):
+        assert choice.use_draft() is False
+        choice.note(False, 1, 0.036)
+    assert choice.use_draft() is True  # time for a trial
+    choice.note(True, 3, 0.15)
+    assert choice.use_draft() is False  # it lost again, so back to the faster way
+
+
+def test_a_draft_that_wins_is_kept_and_a_change_in_the_route_can_turn_it_around() -> None:
+    choice = DraftChoice()
+    choice.note(True, 3, 0.24)  # 12.5 tokens/s across countries
+    choice.note(False, 1, 0.102)  # 9.8 tokens/s
+    assert choice.use_draft() is True
+    for _ in range(20):
+        choice.note(False, 1, 0.02)  # the slow link went away
+    assert choice.best() is False
+
+
+def test_a_steady_link_costs_less_than_a_jittery_one_of_the_same_median() -> None:
+    from isharded.orchestrator import link_cost
+
+    assert link_cost({"median_ms": 40.0, "max_ms": 41.0}) < link_cost({"median_ms": 40.0, "max_ms": 120.0})
+    assert link_cost({"median_ms": 40.0}) == 40.0

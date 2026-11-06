@@ -23,6 +23,9 @@ from .weights import file_sha256, UnitCache, _read_unit_header, iter_unit_tensor
 
 FAST_POOLS = {"vram", "unified"}
 INITIAL_GUESSES = 3
+# How many tokens go by between trials of the slower way, and how fast its rate adapts.
+DRAFT_TRIAL_TOKENS = 96
+DRAFT_RATE_WEIGHT = 0.25
 FEWEST_GUESSES = 2
 
 
@@ -375,6 +378,35 @@ def plan_prompt(
             replaces = plan.key if kind == HISTORY and plan.kind == HISTORY else None
             plan.saves.append(SavePoint(at=at - plan.start, length=at, key=keys[at], kind=kind, replaces=replaces))
     return plan
+
+
+@dataclass(slots=True)
+class DraftChoice:
+    """Keeps to whichever way of making tokens has been faster lately.
+
+    Guessing is not always a win. On a mixture of experts each extra row reads more experts,
+    so inside one site 4 rows cost about 3.4 times one row, and a draft ran at 70% of plain
+    decoding. Across countries the network dominates, and the same draft ran 26% faster. So
+    this is measured and not configured, and the other way gets a short trial now and then,
+    because a route or a reply can change which one wins.
+    """
+
+    rates: dict[bool, float] = field(default_factory=lambda: {True: 0.0, False: 0.0})
+    since_trial: int = 0
+
+    def best(self) -> bool:
+        return self.rates[True] >= self.rates[False]
+
+    def use_draft(self) -> bool:
+        if not self.rates[True] or not self.rates[False]:
+            return not self.rates[True]
+        return self.best() != (self.since_trial >= DRAFT_TRIAL_TOKENS)
+
+    def note(self, drafted: bool, tokens: int, seconds: float) -> None:
+        sample = tokens / max(seconds, 1e-6)
+        known = self.rates[drafted]
+        self.rates[drafted] = known * (1 - DRAFT_RATE_WEIGHT) + sample * DRAFT_RATE_WEIGHT if known else sample
+        self.since_trial = 0 if drafted != self.best() else self.since_trial + tokens
 
 
 def next_guess_count(current: int, right: int, limit: int) -> int:

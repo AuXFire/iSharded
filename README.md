@@ -560,7 +560,7 @@ The entry node also carries the draft model, about 1.7 GiB of VRAM for the defau
 | `--context-tokens` | The smallest that fits your use. 8192 is a good chat default | Each reply's context costs memory on every stage |
 | `--parallel` | Your expected concurrent conversations, up to about 4 | Each one costs its own context memory |
 | Draft model | Keep it for one or two users. Use `--no-draft` for three or more | See the table below |
-| `--placement` | Leave at `spread` | `compact` may skip workers, which only helps when a model fits on fewer of them |
+| `--placement` | Leave at `auto` | `auto` takes the fastest, steadiest route through the fewest close workers that hold the model in VRAM. `spread` forces every worker in, however far away |
 | `--hashes` | Use it when any node or mirror is less than fully trusted | Every node then checks every unit |
 
 Measured on the test pool with Qwen3.6-27B Q4_K_M, total tokens per second across all conversations, at `--parallel 4`:
@@ -743,7 +743,7 @@ Loads a model on a running pool and shows progress. `model` is any [model id](#l
 | `--token`, `--pool-token` | This machine's pool token | An admin key |
 | `--context-tokens` | 4096 | Tokens each reply can hold |
 | `--parallel` | 1 | Replies to run at once. Each costs its own context memory |
-| `--placement` | `spread` | `spread` uses every worker, `compact` the fewest that fit |
+| `--placement` | `auto` | `auto` picks the fastest route, `spread` uses every worker, `compact` the fewest that fit |
 | `--entry`, `--exit` | Chosen for speed | Worker to hold the entry or exit stage |
 | `--draft` | Chosen automatically | Small GGUF for speculative decoding |
 | `--no-draft` | Off | Turn speculative decoding off |
@@ -1113,7 +1113,7 @@ On two nodes on one machine, the same loop ran through the coordinator, a follow
 | `revision` | `main` | Branch, tag, or commit on the model host |
 | `control_model_id` | None | Read the description from here instead of `model_id` |
 | `worker_model_ids` | None | A local source per worker, as worker name to path |
-| `placement` | `spread` | `spread` or `compact` |
+| `placement` | `auto` | `auto`, `spread`, or `compact` |
 | `context_tokens` | 4096 | 128 to 1048576 |
 | `parallel` | 1 | 1 to 32 |
 | `entry_worker`, `exit_worker` | None | Pin the ends of the route |
