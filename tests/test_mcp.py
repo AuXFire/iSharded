@@ -821,7 +821,7 @@ def test_servers_see_only_the_basics_unless_told_otherwise(started, monkeypatch)
     assert server_environment(["WANTED_BY_SERVER"])["WANTED_BY_SERVER"] == "yes"
     seen = Toolbox([started()]).call("environment", {}, 10)
     assert "SOME_API_KEY" not in seen and "ISHARDED_POOL_TOKEN" not in seen
-    assert {name.upper() for name in json.loads(seen)} - {name.upper() for name in SAFE_ENVIRONMENT} <= {"LC_CTYPE", "SYSTEMROOT", "PYTHONIOENCODING", "COMSPEC", "WINDIR"}
+    assert {name.upper() for name in json.loads(seen)} - {name.upper() for name in SAFE_ENVIRONMENT} <= {"LC_CTYPE", "__CF_USER_TEXT_ENCODING", "SYSTEMROOT", "PYTHONIOENCODING", "COMSPEC", "WINDIR"}
 
 
 def test_a_tool_list_is_offered_to_the_model_as_openai_functions(started):

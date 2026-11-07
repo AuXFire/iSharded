@@ -62,6 +62,7 @@ KEPT_FOR_CLIENT = ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDAT
 NETWORK_NOT_BLOCKED = "[sandbox] network=False was not enforced: the process level cannot block the network on this machine."
 SAME_USER = "The process level runs as this user, so the command can read and change whatever this user can."
 NO_FILE_WALL = "unshare gives no file system wall, so the command can read and change whatever this user can."
+MEMORY_NOT_LIMITED = "[sandbox] the memory limit was not enforced: macOS ignores the address limit the process level sets."
 
 
 @dataclass(frozen=True)
@@ -580,9 +581,10 @@ class LocalSandbox:
         enforced = walls.level != "process"
         if walls.level == "process":
             notes.append(SAME_USER)
-            if not network:
-                notes.append(NETWORK_NOT_BLOCKED)
-                err = f"{err}\n{NETWORK_NOT_BLOCKED}" if err else NETWORK_NOT_BLOCKED
+            gaps = [NETWORK_NOT_BLOCKED] if not network else []
+            gaps += [MEMORY_NOT_LIMITED] if sys.platform == "darwin" else []
+            notes += gaps
+            err = "\n".join(filter(None, [err, *gaps]))
         if walls.tool == "unshare":
             notes.append(NO_FILE_WALL)
         return SandboxRun(exit_code, out, err, timed_out, walls.level, enforced and not network, stopped, tuple(notes))

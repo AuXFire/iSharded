@@ -205,7 +205,19 @@ def test_a_connection_between_requests_is_left_to_keep_alive(monkeypatch):
                 piece = kept.recv(4096)
                 assert piece, "the connection was closed between requests"
                 reply += piece
-            time.sleep(0.35)  # a reply just before the watch fires must not count against the next
+            time.sleep(0.7)  # longer than the watch, because quiet after a reply is keep-alive's to end
+
+
+def test_half_a_second_request_is_still_a_stall(monkeypatch):
+    monkeypatch.setattr(serving, "STALL_SECONDS", 0.3)
+    with serving_at(answers_at_once) as port, socket.create_connection(("127.0.0.1", port)) as kept:
+        kept.settimeout(5)
+        kept.sendall(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+        reply = b""
+        while not reply.endswith(b"ok"):
+            reply += kept.recv(4096)
+        kept.sendall(b"GET / HT")
+        assert closed_by_server(kept), "a request that stops halfway must not hold its place"
 
 
 def test_a_node_has_a_keep_alive_timeout_and_a_connection_limit(monkeypatch):

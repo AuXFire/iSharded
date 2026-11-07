@@ -87,10 +87,14 @@ class NoDelayHTTPProtocol(AutoHTTPProtocol):  # type: ignore[misc, valid-type]
         # Reading paused means this side is behind, and the client is not to blame.
         return cycle.more_body and not self.flow.read_paused
 
+    def _between_requests(self) -> bool:
+        """A finished reply and nothing since is keep-alive's to end, however long it lasts."""
+        return self.cycle is not None and self.cycle.response_complete and not self.heard_bytes
+
     def _check_stalled(self) -> None:
         if self.transport.is_closing():
             return
-        if self._waiting_on_client() and self.heard_bytes < STALL_BYTES:
+        if self._waiting_on_client() and self.heard_bytes < STALL_BYTES and not self._between_requests():
             self.transport.close()
             return
         self._watch_again()

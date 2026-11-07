@@ -19,6 +19,7 @@ from isharded.assistant import sandbox as sandbox_part
 from isharded.assistant.app import Assistant
 from isharded.assistant.sandbox import (
     LocalSandbox,
+    MEMORY_NOT_LIMITED,
     NETWORK_NOT_BLOCKED,
     ProcessTree,
     bubblewrap_command,
@@ -155,9 +156,13 @@ def test_output_is_capped_and_a_flood_does_not_block_the_command(tmp_path):
     assert "output cut" in result.stdout
 
 
-def test_the_memory_limit_is_real(tmp_path):
+def test_the_memory_limit_is_real_or_says_it_is_not(tmp_path):
     small = LocalSandbox(prefer="process", memory_mb=256)  # room for Python itself under a Linux address limit
     result = small.run(python("data = bytearray(1024 * 1024 * 1024); print('allocated', len(data))"), tmp_path, timeout=60)
+    if sys.platform == "darwin":
+        assert MEMORY_NOT_LIMITED in result.notes and MEMORY_NOT_LIMITED in result.stderr
+        return
+    assert MEMORY_NOT_LIMITED not in result.notes
     assert result.exit_code != 0
     assert "allocated" not in result.stdout
     assert "MemoryError" in result.stderr

@@ -1294,7 +1294,7 @@ The same tries through both ways of offering tools, with a harmless note to read
 
 Native wins clearly on a small model, because the mesh's template does the work a small model cannot. On the large one the two are level: 7 and 6 of 10 is too few tries to separate them, and native took 11.7 s and 12.9 s to read a file where the prompt took 10.4 s and 10.7 s. So native is the default. All tries ran one at a time, and neither way stops a model claiming a write it never made, so read the `used` line.
 
-**What the `process` sandbox cannot stop.** On Windows this is the only level, as there is no docker, podman, or bubblewrap here to use, and on any machine it is what is left when nothing stronger is present. It is a memory limit and a process tree that dies together, and it is not a wall:
+**What the `process` sandbox cannot stop.** On macOS its memory limit does nothing, because macOS ignores that limit, and each run's notes say so. On Windows this is the only level, as there is no docker, podman, or bubblewrap here to use, and on any machine it is what is left when nothing stronger is present. It is a memory limit and a process tree that dies together, and it is not a wall:
 
 - It cannot block the network. `network: false` means nothing here, and each result says so in `network_blocked` and `notes`.
 - It cannot stop a file being read or changed. A command can reach whatever this user can, including the assistant's own folder, its keys, and its database, which file tools never touch.

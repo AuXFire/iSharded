@@ -46,7 +46,8 @@ SETTINGS = (
     "ISHARDED_ASSISTANT_PIPER_MODEL",
 )
 HAS_SYSTEM_VOICE = bool(shutil.which("powershell") if os.name == "nt" else shutil.which("say") or shutil.which("espeak-ng"))
-needs_system_voice = pytest.mark.skipif(not HAS_SYSTEM_VOICE, reason="this machine has no system voice")
+# GitHub's macOS machines have say but no voice for it, so it writes a header and no speech.
+needs_system_voice = pytest.mark.skipif(not HAS_SYSTEM_VOICE or (sys.platform == "darwin" and bool(os.environ.get("CI"))), reason="this machine has no system voice")
 
 
 class FakeBroker:

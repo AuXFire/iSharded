@@ -391,7 +391,8 @@ fn passes_on_one_sequence_never_share_a_trip() {
 
 #[test]
 fn a_rewind_clears_what_is_queued_past_it() {
-    let mut ring = ring(2, true, Duration::from_millis(30), 2000);
+    // Long passes, so waiting behind eight of them stands well clear of a slow machine's noise.
+    let mut ring = ring(2, true, Duration::from_millis(120), 4000);
     for id in 1..=8 {
         ring.client.send(&pass(id, 1, 100 + id as u32).encode()).unwrap();
     }
@@ -404,7 +405,8 @@ fn a_rewind_clears_what_is_queued_past_it() {
         seen.push(answer(&mut ring).id);
     }
     assert!(seen.len() < 5, "{seen:?}");
-    assert!(began.elapsed() < Duration::from_millis(250), "the rewind waited behind passes nobody wants");
+    let took = began.elapsed();
+    assert!(took < Duration::from_millis(840), "the rewind waited behind passes nobody wants: {took:?}");
     assert!(ring.nodes[0].stats().dropped >= 5);
 }
 
