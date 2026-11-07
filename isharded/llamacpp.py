@@ -194,6 +194,9 @@ LLAMA_FUNCTIONS = {
     "llama_memory_clear": (None, C.c_void_p, C.c_bool),
     "llama_memory_seq_rm": (C.c_bool, C.c_void_p, C.c_int32, C.c_int32, C.c_int32),
     "llama_memory_seq_cp": (None, C.c_void_p, C.c_int32, C.c_int32, C.c_int32, C.c_int32),
+    "llama_memory_seq_pos_max": (C.c_int32, C.c_void_p, C.c_int32),
+    "llama_model_is_recurrent": (C.c_bool, C.c_void_p),
+    "llama_model_is_hybrid": (C.c_bool, C.c_void_p),
     "llama_state_seq_get_size": (C.c_size_t, C.c_void_p, C.c_int32),
     "llama_state_seq_get_data": (C.c_size_t, C.c_void_p, C.c_void_p, C.c_size_t, C.c_int32),
     "llama_state_seq_set_data": (C.c_size_t, C.c_void_p, C.c_void_p, C.c_size_t, C.c_int32),
@@ -647,6 +650,9 @@ class LlamaStage:
             raise LlamaError("llama.cpp could not create a context")
         self.memory = lib.llama_get_memory(self.context)
         self.output_width = lib.llama_model_n_embd_out(self.model)
+        self.recurrent = bool(lib.llama_model_is_recurrent(self.model) or lib.llama_model_is_hybrid(self.model))
+        # Batches and rows run so far, so a test can tell a miss that reads text again from one that does not.
+        self.decodes = self.decoded_rows = 0
 
     def _on_eval(self, tensor: int, ask: bool, _: Any) -> bool:
         base = self.library.ggml_base
@@ -738,6 +744,8 @@ class LlamaStage:
             logits=outputs.ctypes.data,
         )
         status = self.library.llama.llama_decode(self.context, batch)
+        self.decodes += 1
+        self.decoded_rows += count
         if status != 0:
             raise LlamaError(f"llama_decode failed with status {status}")
 
@@ -782,7 +790,8 @@ class LlamaStage:
         scratch: int = 1,
         fresh: Sequence[int] = (),
         restart: bool = True,
-    ) -> list[int]:
+        catch_up: int | None = None,
+    ) -> list[int] | None:
         """Guess ``count`` tokens after a draft model's text.
 
         Confirmed text lives on ``slot``, and anything unconfirmed on ``scratch``, because
@@ -790,6 +799,11 @@ class LlamaStage:
         ``commit`` goes on ``slot`` in one batch, and ``scratch`` starts again as a copy of it.
         Otherwise the chain on ``scratch`` is still good, and ``position`` is where it ends.
         ``fresh`` then extends it, so a guess costs one decode however long the text.
+
+        A draft with no recurrent state need not start again. ``catch_up`` says where ``slot``
+        ends: ``scratch`` is cut at ``position``, and ``slot`` takes the cells between as a copy,
+        which in a shared cache moves no data. If ``scratch`` does not end where the text says,
+        nothing is guessed and the answer is None, so the caller starts again.
         """
         lib = self.library.llama
         if restart:
@@ -797,6 +811,11 @@ class LlamaStage:
             self.decode_tokens(commit, position, sequence_id=slot)
             lib.llama_memory_seq_cp(self.memory, slot, scratch, -1, -1)
             position += len(commit)
+        elif catch_up is not None:
+            cut = lib.llama_memory_seq_rm(self.memory, scratch, position, -1)
+            if not cut or lib.llama_memory_seq_pos_max(self.memory, scratch) != position - 1:
+                return None
+            lib.llama_memory_seq_cp(self.memory, scratch, slot, catch_up, position)
         self.decode_tokens(list(fresh), position, sequence_id=scratch)
         position += len(fresh)
         guesses = [self.best_token()]

@@ -231,7 +231,7 @@ class _Host:
         )
         self.scratch = slots
         self.states = StateStore(None, DRAFT_STATE_BYTES, 0)
-        return {}, b""
+        return {"rewinds": not self.stage.recurrent}, b""
 
     def load_projector(self, meta: dict[str, Any], _: bytes) -> Reply:
         from .mtmd import Projector
@@ -257,10 +257,18 @@ class _Host:
     def guess(self, meta: dict[str, Any], _: bytes) -> Reply:
         assert self.stage is not None
         slot = meta.get("slot", 0)
+        before = self.stage.decodes, self.stage.decoded_rows
         tokens = self.stage.guess(
-            meta["commit"], meta["position"], meta["count"], slot, self.scratch + slot, meta.get("fresh", ()), meta.get("restart", True)
+            meta["commit"],
+            meta["position"],
+            meta["count"],
+            slot,
+            self.scratch + slot,
+            meta.get("fresh", ()),
+            meta.get("restart", True),
+            meta.get("catch_up"),
         )
-        return {"tokens": tokens}, b""
+        return {"tokens": tokens, "decodes": self.stage.decodes - before[0], "decoded_rows": self.stage.decoded_rows - before[1]}, b""
 
     @property
     def engine(self) -> Any:
