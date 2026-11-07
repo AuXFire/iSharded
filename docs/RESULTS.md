@@ -37,6 +37,19 @@ Qwen3-235B-A22B Instruct at Q5_K_M, 155 GiB and 94 layers, on four rented A40s i
 | One machine holding the whole model | Stages take about 33 ms a token between them, so one machine decoding plainly would reach about 30 tokens/s. No single A40 can hold the model | Estimated | 2026-11-06 | e00c99f |
 | Lane citations of the same runs | 27.6 plain, 40 overlapped, 62 for eight replies at `--parallel 4`, 82 on counting text; local compute there 33 ms, 30 tokens/s (the 30 is the estimate in the row above). Not rerun by the lanes | Measured, 30 tokens/s estimated | 2026-11-06 | Round 1 design and stress lanes, quoting the README at 08fd071 |
 
+### Mid-size model on single-GPU pods
+
+Qwen3.6-27B Q4_K_M, 64 layers, on rented NVIDIA A40 pods with one GPU each, all in one data center, code at 5c06cd0 with the native engine, context 4096. Unless a row says otherwise: three prompts of 29 to 30 tokens, three rounds, 128 tokens a reply at temperature 0, every reply ran to its full 128 tokens, and ms a token is the median of the 9 replies, worked out from the coordinator's own decode tokens/s, so the prompt is left out.
+
+| What | Setup | Result | Kind | Date | Source |
+|---|---|---|---|---|---|
+| One A40 holding the whole model (ceiling) | Stock llama.cpp `llama-bench` from b12119 (build 6f1e65437, the build the stages run), all layers on the GPU, three different cards, one run each. No server, HTTP or sampling | tg128 with flash attention 31.057, 31.068 and 31.094 tokens/s (32.16 to 32.20 ms a token); without flash attention 30.88 to 31.00. pp512 1441 to 1461 tokens/s | Measured | 2026-11-07 | GPU run 1 |
+| iSharded, plain, 1, 2 and 3 stages | 1 to 3 pods, draft none, 1 slot. Routes by layer 0-64; 0-43/43-64; 0-25/25-43/43-64 | 33.37 / 36.64 / 39.17 ms a token, 30.0 / 27.3 / 25.5 tokens/s. The 3-stage maximum of 50.38 ms was one outlier | Measured | 2026-11-07 | GPU run 1 |
+| iSharded, plain, 4 stages | 4 pods, a different set from the row above, one stage on each, draft none, 1 slot, split 0-18/18-35/35-53/53-64 | 39.14 ms a token, 25.5 tokens/s (min 38.23, max 40.31). This equals the 3-stage 39.17 from the other pods, so the cost of a stage does not add up cleanly at this noise level | Measured | 2026-11-07 | GPU run 1 |
+| Split against one GPU | Ratios of the medians above | Against iSharded's own 1 stage (same server, HTTP and sampling): 1.10x at 2 stages, 1.17x at 3, 1.17x at 4. Against the `llama-bench` ceiling of 32.2 ms, which has no server: 1.04x at 1 stage, 1.14x at 2, 1.22x at 3, 1.22x at 4 | Estimated (ratios of measured figures) | 2026-11-07 | GPU run 1 |
+| 3 stages on a lopsided split | The pod set of the 4-stage run, draft none, 1 slot; the planner chose 0-18/18-20/20-64, so the middle stage held 2 layers | 36.66 ms a token (min 36.24, max 37.49), the same as 2 stages. Not a fair 3-stage figure; see [Guessing ahead](#default-load-on-single-gpu-pods) for what it was run for | Measured | 2026-11-07 | GPU run 1 |
+| Default load and chat settings, 1, 2 and 3 stages | As the plain row, with a Qwen3.5-0.8B draft loaded and iSharded choosing its way. Chat: temperature 0.7, top-p 0.9, top-k 40. The 2-stage default split was 0-34/34-64, and the 3-stage default ran 2 slots on 0-18/18-43/43-64 | Default 33.21 / 42.57 / 43.59 ms a token; chat 34.57 / 45.15 / 46.77. Splits and slots differ from the plain runs, so compare default with plain only through the same-split row under [Guessing ahead](#default-load-on-single-gpu-pods) | Measured | 2026-11-07 | GPU run 1 |
+
 ### Across countries
 
 | What | Setup | Result | Kind | Date | Source |
@@ -106,6 +119,7 @@ The native engine carries hidden states directly between stages. [The native eng
 | First token, new short prompt | 235B on the Sweden A40s; two-country route with Romania about 40 ms away | 0.4 s in one data center, 1.1 s across two countries | Measured | 2026-11-06 | e00c99f |
 | First token, new prompt of about 3,400 tokens | 235B on the Sweden A40s | 2.8 s, against 7.5 s with the prompt sent whole | Measured | 2026-11-06 | e00c99f |
 | First token, a prompt seen before | 235B on the Sweden A40s | 0.4 s | Measured | 2026-11-06 | e00c99f |
+| First token, new short prompt, single-GPU pods | Qwen3.6-27B Q4_K_M on 1 to 4 single-A40 pods in one data center, 5c06cd0, plain, prompts of 29 to 30 tokens, median of the first round's 3 replies | 0.09 s at 1 stage, 0.12 s at 2, 0.15 s at 3, 0.16 s at 4 | Measured | 2026-11-07 | GPU run 1 |
 | Long first message and later turns | Test pool, Qwen3.6-27B | A 1,860-token first message took about 6.5 s to the first token. Later turns 0.7 to 1.3 s with over 2,000 tokens of history | Measured | 2026-11-05 | bac5ed8, 3e0b931 |
 | A returning conversation from a saved state | Qwen3-0.6B over two stages | 11.5 s to first token and 1,450 tokens computed became 1.3 s and about 100, same text from RAM and from disk | Measured | 2026-11-06 | 0903bdf |
 | Cutting prompts the same way every time | CPU, nothing saved, 1,770 tokens in 49 short messages | 17.6 s where it took 13.5 s before | Measured | 2026-11-06 | 360e8e4, [guide](GUIDE.md#current-limits) |
@@ -128,6 +142,7 @@ The native engine carries hidden states directly between stages. [The native eng
 |---|---|---|---|---|---|
 | Eight replies at `--parallel 4` | 235B on the Sweden A40s | 62 tokens/s in all | Measured | 2026-11-06 | e00c99f |
 | Seven-machine mesh at `--parallel 4` | The 1.26 tokens/s mesh, Python path | 5.37 tokens/s in all against 1.03 at `--parallel 1`, each reply no slower | Measured | 2026-11-06 | Project notes |
+| 4 and 16 replies at once, 3 stages | Qwen3.6-27B Q4_K_M on 3 single-A40 pods in one data center, 5c06cd0, default load (2 slots), 128 tokens at temperature 0, two runs each | 34.32 and 35.46 tokens/s in all at 4; 33.56 and 33.31 at 16. Every reply had the same text as its prompt sent alone, 0 failed | Measured | 2026-11-07 | GPU run 1 |
 | Conversations at once, `--parallel 4` | Test pool, Qwen3.6-27B Q4_K_M, before recurrent models could pipeline; not measured since | Total tokens/s, no draft merged / with draft: 1 conversation 14 / 10; 2: 27 / 15; 3: 32 / 20; 4: 37 / 21. At `--parallel 1` one conversation reached 19 to 33 with a draft | Measured | 2026-11-05 | 3e0b931, [guide](GUIDE.md#load-settings) |
 | Merged passes | Four conversations; one stage, then across the test pool | One stage 12 to 32 tokens/s; across two stages only 10%, from 34 to 37 | Measured | 2026-11-05 | a33b6cf, c3b8757, [guide](GUIDE.md#several-conversations-at-once) |
 | Slots on a shared route | CPU stage plus GPU stage, trip of 1.8 rows; two stages on one GPU; CPU stages on one machine | Two replies 65 to 112 tokens/s on one slot and 58 on two. Two stages on one GPU 128 tokens/s for two replies, 70 with two slots. CPU stages: eight replies went from 14 to 22 tokens/s to 27 to 30 at `--parallel 8`, first tokens in 1 s and not 15, each reply about four times slower. An earlier guide figure of 70 was replaced by the measured 65 to 112 | Measured | 2026-11-07 | 136d097, 342c4cf, 442d6e2, 10b7202, e380b41 |
@@ -164,6 +179,15 @@ A draft guesses several tokens and the route checks them in one pass. Prompt loo
 | Draft cost and accuracy | 235B, 0.6B draft on the entry A40 | About 11 ms a guess, which sets the pace. About 4 guesses in 10 were wrong on open-ended prose, each costing a full trip | Measured | 2026-11-06 | e00c99f |
 | Replay of real draft hits against real pipelined runs | 11 replies, 74% hits, A = 3.83, through pipeline timing at R = 36 and 86 ms, g = 11 | Replay 56.9 and 32.6 tokens/s; real runs gave 40 and 23 (ratio 0.70-0.73). A stress lane found the real runs fit A = 2.71 and g = 18.6 ms, not g = 11. Laptop RTX 3060 step: 3.9 ms alone, 7.2 ms beside another as threads, 9.2 ms as processes. Hop software about 0.75 ms (36 minus 33 ms over 4 edges). `draft_tokens` 16: +13 to 18% at R of 189 or more; 64 adds under 3%. Removing the eval callback +0.35 ms a pass | Replay simulated; real runs and step times measured | 2026-11-06 | Round 1 engine design and stress lanes |
 | Speculation on the 235B, worked out | 714 ms network + 64 ms x the MoE row ratio + serial draft, against 15.6 tokens/s local | Fixed L=8: 3.43 a pass, 3.8 tokens/s, 24%. L=16: 3.73, 3.7, 24%. Tree of 64 with 0.8B: 5.07, 4.0 to 4.7, 26-30%. 9B L=16: 5.71, 4.8, 31%. 9B tree of 64 with a hidden draft: 7.88, 7.3, 47%. Code and context at L=32 about 8, about 7, about 45%. Parity needs 11.2 accepted at 714 ms, 5.5 at 350 ms, 1.6 at 100 ms; a stress lane says these leave out compute and should be 12.2, 6.5 and 2.6. Several passes in flight 5.4 against 4.8 tokens/s at 0.7 s (replay). The later real run did gain from passes in flight: 40 against 27.6 | Estimated | 2026-11-06 | Round 1 speculation and stress lanes |
+
+### Default load on single-GPU pods
+
+Qwen3.6-27B Q4_K_M on rented single-A40 pods in one data center, code at 5c06cd0, a Qwen3.5-0.8B draft loaded, three prompts x three rounds x 128 tokens at temperature 0. The plain runs are under [Mid-size model on single-GPU pods](#mid-size-model-on-single-gpu-pods).
+
+| What | Setup | Result | Kind | Date | Source |
+|---|---|---|---|---|---|
+| Default against plain, same split and slots | 3 stages on one pod set, the planner's split 0-18/18-20/20-64 in both runs, 1 slot in both (`--parallel 1` forced for default) | Plain 36.66 ms a token; default 43.59 (min 41.96, max 49.00), 1.19x slower. Default chose the plain way on all 9 replies and made 0 draft passes, but ran 24 pipelined probe tokens on every reply (48 on the first), at 14.18 to 14.71 tokens/s against 27.13 to 27.82 plain. The probes account for about 6.2 to 6.3 of the 6.9 ms gap (estimated: 24 tokens at 14.4 tokens/s and 104 at 27.6 make 42.5 ms a token against 36.2) | Measured, probe share estimated | 2026-11-07 | GPU run 1 |
+| The same pattern on the first pod set | 2 and 3 stages, default and chat settings, splits and slots as in the speed rows | Every reply ran pipelined probe tokens (24 on most, 48 on the first default reply, 29 on some chat replies) and then chose plain decoding, at 2 and at 3 stages; 0 draft passes | Measured | 2026-11-07 | GPU run 1 |
 
 ### Draft accuracy and cost on smaller models
 
@@ -240,6 +264,7 @@ Linux `tc netem` in WSL2 on the desktop, or a delay relay on Windows. These meas
 | Planning a 397B | Planner, Qwen3.5-397B-A17B on cards of 44, 44, 29, 29, 21 and 21 GiB | Was refused with 188 GiB offered for 166.5 GiB; now plans with 2.57 GiB in one node's RAM, down from 5.14 GiB across two | Estimated (planner output) | 2026-11-06 | 7d0886d |
 | Planning at 200 workers | Loop planner, 200 simulated workers | Retries 2.0 and 3.0 s against 0.6 and 0.9 s with the fix; 200 workers plan in under 2 s even when a model needs 63 | Measured on synthetic pools | 2026-11-06 | 44f6acf, 717abcb |
 | A GGUF stage's reserve | 8192 tokens, 2 slots, on an A40 | 1.375 GiB planned with context, against 1.4 GiB measured | Measured | 2026-11-06 | 3468170 |
+| Splits the planner chose on single-GPU pods | Qwen3.6-27B Q4_K_M, 64 layers, single-A40 pods in one data center, 5c06cd0, plain ms a token from [Mid-size model on single-GPU pods](#mid-size-model-on-single-gpu-pods) | 2 stages: 0-43/43-64 plain, 0-34/34-64 default. 3 stages: 0-25/25-43/43-64 on the first pod set (39.17 ms), 0-18/18-20/20-64 on the second (36.66 ms, the same as 2 stages). 4 stages: 0-18/18-35/35-53/53-64 (39.14 ms, the same as the first 3-stage run). Speed followed the split and the pods as much as the stage count. No load option forces a split | Measured | 2026-11-07 | GPU run 1 |
 
 ## Failures during a reply
 
@@ -271,6 +296,19 @@ Each row gives the longest pause and whether the text matched an unbroken run. [
 | Weights moved after restarts | Planner, 7 workers, Qwen3-235B, 180 GiB | Speeds that moved 2% moved 74 to 116 GiB of 180; the held order is now always tried, which moved 0 GiB in 32 re-measured restarts | Measured | 2026-11-06 | 3468170 |
 | A drained worker leaving the route | Live pool | Replies queued behind its drain waited up to 180 s (fixed) | Measured | 2026-11-05 | 392c767 |
 | Connections from a home link | Seven-machine mesh | About 1 in 10 new connections from a home link failed, and one dropped attempt ended a whole load (fixed with retries) | Measured | 2026-11-06 | bb1d272 |
+| A worker killed mid-reply, single-GPU pods | Qwen3.6-27B Q4_K_M on 3 single-A40 pods in one data center, 5c06cd0, 3 stages (0-18/18-43/43-64) under the default load, a 256-token reply at temperature 0; the last stage's worker and its stage process killed with SIGKILL | Finished all 256 tokens, same text as an undisturbed reply, longest gap 18.5 s, 1 recovery, re-planned to 2 stages (0-34/34-64) | Measured | 2026-11-07 | GPU run 1 |
+
+### Joins, cordons and planned shutdown
+
+One stream of replies, one at a time, on Qwen3.6-27B Q4_K_M on rented single-A40 pods in one data center, code at 5c06cd0: draft none, 1 slot, prompt lookup off, 128 tokens at temperature 0, three prompts in turn, status sampled once a second. Times run from the moment each action was sent, on the owner's clock. With one stream nothing queues, so these are the pauses the events themselves cause. The cordon row on the test pool above is the earlier figure.
+
+| What | Setup | Result | Kind | Date | Source |
+|---|---|---|---|---|---|
+| A node joins a 2-stage route | Start on 2 pods, split 0-36/36-64; a third pod joins, then `rebalance` is called | The node was up 13.4 s after it was started, and the route did not take it in by itself within 71 s. The rebalance call blocked 8.8 s; the 3-stage route (0-35/35-37/37-64) was ready 9.6 s after the call, with about 6 s of no route. Worst first-token wait 7.24 s, worst gap inside a reply 2.27 s; the reply running when rebalance was sent paused 1.25 s | Measured | 2026-11-07 | GPU run 1 |
+| Cordon (force) of that node | 3 stages as above | The call answered in 0.7 s. The route left the node 13.9 s after the cordon was sent. Status said not ready for 12.5 s, of which 7.0 s with no route at all. Worst first-token wait 7.93 s, pause inside a reply 0.73 s | Measured | 2026-11-07 | GPU run 1 |
+| Uncordon, no rebalance | As above | The coordinator re-planned to 3 stages by itself, ready 12.5 s after the uncordon. Worst first-token wait 7.13 s, pause inside a reply 1.08 s | Measured | 2026-11-07 | GPU run 1 |
+| Planned shutdown, 3 stages to 2 | `isharded stop` on the middle node | The node kept serving and exited 61.5 s after the command; the command returned at 62.3 s. The 2-stage route was ready 13.5 s after the exit. The running reply paused 17.76 s inside and finished all its tokens. Its prompt gives the same text on every split measured, so this does not show text kept across a route change | Measured | 2026-11-07 | GPU run 1 |
+| The whole stream, and after the events | 82 replies through the four events above | 0 failed. Decode afterwards unchanged: 36.64 ms a token on 2 stages before the join, 38.06 on the 3-stage route, 36.46 on 2 stages after the leave. After the leave, the status call slowed and stayed slow: the 1 Hz sampler's median interval went from 1.00 s to 1.52 s for the rest of the stream, and every gap between replies was 3.0 s (8 replies). Cause not found | Measured | 2026-11-07 | GPU run 1 |
 
 ### Freezes
 
@@ -285,6 +323,7 @@ Each row gives the longest pause and whether the text matched an unbroken run. [
 | Cost of a call deadline | 3,000 round trips, 4 KiB, three rounds each way, busy laptop, Python path | Median 215 to 247 us on the base, 261 to 285 us with a poll, so about 30 to 45 us a call. After the pipe-size fix, a call with a row over 4 KiB goes from about 230-260 us to 460-800 us; the ring path is unaffected | Measured | 2026-11-07 | cedd9c6 |
 | A hung engine looks healthy (pre-fix) | Real engine at 08fd071, compute stuck, stand-in model | Acks and pings continued: nothing heard in 6x the limit, next link marked up. The entry would wait 186 s, then hold the slot up to 186 s more (read from code). Hop silence did work: a refusal at 0.74-1.0x the limit | Measured, waits read from code | 2026-11-06 | Round 1 stress lane |
 | The status page with stalled or dead workers | Real orchestrator, three CPU workers, three timed GETs each | Before: 0.01 s all up, 3.01 to 3.03 s one worker suspended, 9.66 to 9.71 s one killed, 9.70 to 9.74 s both. After: 0.01, 3.00 to 3.02, 3.01 to 3.03, 3.02 to 3.03 s. Verifier, new: 0.01, 3.01-3.02, 3.01-3.02, 3.01-3.03; old (c117641): 0.01, 3.01-3.03, 9.65-9.69, 9.63-9.66 s. A refused connect on Windows takes 2.03 s on a raw socket, 2.05 s with httpx | Measured | 2026-11-07 | Round 5 fixes lane |
+| A stage frozen for 20 s, single-GPU pods | Qwen3.6-27B Q4_K_M on 3 single-A40 pods in one data center, 5c06cd0, 3 stages (0-18/18-43/43-64) under the default load, a 256-token reply at temperature 0; a stage that does not own the reply stopped with SIGSTOP for 20 s | Finished all 256 tokens, same text as an undisturbed reply. Longest gap 25.8 s, 5.8 s more than the stop. 0 recoveries, but the epoch changed: a re-plan to the same route during the stall | Measured | 2026-11-07 | GPU run 1 |
 | Watchdog on macOS runners | GitHub macOS runners | Runners slept 100 ms ticks for more than twice that, so the watchdog saw a hung pass run less than half as long | Measured | 2026-11-07 | c117641 |
 
 ### Silent and lost links
@@ -351,6 +390,11 @@ Every comparison count on record, newest work last within each group.
 | Forced tool calls | Qwen3, forced call | 96 of 96 forced loops complete with no repeats, where it was 15 of 16 with 9 repeats | Measured | 2026-11-06 | 248abe4 |
 | Nearby seeds | Tool-call measurement, consecutive seeds | One draw put the same rare token into 11 of 72 replies (fixed) | Measured | 2026-11-06 | 2f9c5fe |
 | Silent relays and kills on the ring | See [Silent and lost links](#silent-and-lost-links) | Same text on every run listed there | Measured | 2026-11-07 | Round 4 ring lane |
+| Plain replies on single-GPU pods, round to round and split to split | Qwen3.6-27B Q4_K_M on single-A40 pods in one data center, 5c06cd0, draft none, 1 slot, 3 prompts x 3 rounds x 128 tokens at temperature 0, 1 to 4 stages | Each prompt gave the same text in every round on every route (9 of 9 at 4 stages, 18 of 18 over the two same-split 3-stage runs). Across splits the first prompt's text changed with the split, while the other two gave the same text on every split and stage count measured | Measured | 2026-11-07 | GPU run 1 |
+| Draft used at 1 stage, single-GPU pods | As above, 1 stage, default load with a Qwen3.5-0.8B draft | Not identical. Two of the three prompts changed text from round to round, and none of the first prompt's three replies matched plain | Measured | 2026-11-07 | GPU run 1 |
+| Default with 0 draft passes against plain, 3 stages | As above, same split and 1 slot in both runs | 9 of 9 default replies equal to plain's text; the draft never chose a token | Measured | 2026-11-07 | GPU run 1 |
+| Many at once, a freeze and a kill, single-GPU pods | See [Many replies at once](#many-replies-at-once), [Freezes](#freezes) and [Kills](#kills) | Every reply at 4 and 16 at once matched its prompt alone; the frozen and the killed reply each matched an undisturbed one | Measured | 2026-11-07 | GPU run 1 |
+| Joins, cordons and a planned shutdown | See [Joins, cordons and planned shutdown](#joins-cordons-and-planned-shutdown); references keyed by route, slots and draft | 82 replies: 6 references and 69 equal, 0 differ; 7 replies spanned a route change. Those crossing a live change used prompts whose text is the same on every split, so text kept across a route change is shown only for those | Measured | 2026-11-07 | GPU run 1 |
 | Replies when passes merge | The round-five slots runs, temperature 0, from 4 replies at once | Not identical. Once passes merged, the same prompt gave different text from round to round, in every sweep and in the verifier's rerun; never with nothing merged. A merged pass rounds differently from single passes | Measured | 2026-11-07 | Round 5 slots lane and its verifier, [guide](GUIDE.md#several-conversations-at-once) |
 
 ## Security probes
@@ -512,6 +556,7 @@ Failures:
 - The 10 s pulse limit under heavy paging, a cold first pass on a slow disk, a late pass after a replay clears.
 - A truly dead hop (new connections also silent) cannot meet 5 s plus twice the round trip (9.38 s measured once, not rerun). The ring's 10 s floor on answers may raise false alarms on slow healthy stages, and a direct closing link silent in one direction is not caught (a 62 s wait on two stages): both reasoned, not measured. A 60 s stop where the ring never looked whole is unexplained.
 - Ring tests hang under CPU load on old and new code; the cause was never found.
+- Text kept across a live route change, for a prompt whose text depends on the split: GPU run 1's replies that crossed a join, cordon or leave used prompts that give the same text on every split. Why the status call stayed at about 1.5 s after a node left was not found.
 - Native links have not carried a real model over the Python ring path since the links fixes.
 - A hop redial with a round trip over about 600 ms may fail its 2 s handshake deadline. A flood from many addresses can still fill 64 places.
 
@@ -526,11 +571,13 @@ Speed:
 - No Qwen3-235B and 0.6B draft pair existed locally, so acceptance figures come from proxy pairs; the real 0.6B accepted length on the mesh is unknown. A stronger draft such as Qwen3-8B has not run on the 235B, and no draft ladder of 0.6B, 4B and 8B was run. No honest draft against lookup comparison: only a copy of the model as draft. EAGLE-3, multi-token drafts and DFlash, QUIC, and T=1.0 are unmeasured.
 - Draft timing alone on an A40 (the 8.5-11 ms mesh figure) was not re-measured, and the draft-apart comparison never ran on a real mesh.
 - Tree checks only on Qwen3-0.6B; GPU bit-exactness of hedge rows is untested. Long-context cost of kv_unified is unmeasured. The row cost curve from 1 to 64 rows on a real 235B stage has only the 4-row point (3.4x).
-- No real pipelined reply on GPU stages for recurrent models, and the loss of a guessed way on GPU stages is unmeasured. The Qwen3.6-27B slots table predates the recurrent change.
+- No whole pipelined reply on GPU stages for recurrent models: GPU run 1 ran only the default load's 24-token probes there, at 14.2 to 14.7 tokens/s against 27.1 to 27.8 plain. The loss of a guessed way on GPU stages is unmeasured. The Qwen3.6-27B slots table predates the recurrent change.
 - Auto slots on a large model, with kv_unified, and with a draft sweep on real stages. The merged-pass gain without a draft was not shown base against branch. `--parallel 8` with a draft against planned VRAM was not checked on a GPU.
 - The bias in choosing the draft (round five) is neither fixed nor disproved. A merged-step retry was not tested on hybrid Qwen3.5.
 - Real row transfer time on a slow link; the sized link probe and the status page's new link fields were tested only with mock transports.
 - Most speed-lane benchmark figures were not rerun by the verifier, and neither were the recurrent snapshot costs.
+- GPU run 1's ceiling is `llama-bench`, with no server, HTTP or sampling; stock `llama-server` on one A40 was not measured. At 4 stages only plain decoding ran: no default load, chat settings, links, many at once or failures. No even 3-stage split was measured on the 4-stage pods, as no load option forces a split.
+- The default load's pipelined probes cost about 6 ms a token on single-GPU pods at 2 and 3 stages while it chooses plain anyway; whether a draft ever wins there was not measured, and the draft's changing text at temperature 0 on 1 stage was not rerun.
 - Mixed versions: an old engine without the keep flag, a null `draft_tokens`, and protocol version bumps (6 to 7, 7 to 8) were not exercised.
 
 Security and features:
