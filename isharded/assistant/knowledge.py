@@ -599,23 +599,6 @@ class Library:
                 return match["text"]
         return None
 
-    def read(self, user: str, root: int | str, relative: str) -> str:
-        """One file's text, which never leaves the root or opens a secret."""
-        row = self._root(user, root)
-        parts = Path(relative).parts
-        if Path(relative).is_absolute() or ".." in parts:
-            raise LibraryRefused(f"{relative} is outside {row['path']}")
-        if any(is_secret(part) or part.casefold() in SKIPPED_FOLDERS for part in parts):
-            raise LibraryRefused(f"{relative} is not something the library will open")
-        full = os.path.join(row["path"], relative)
-        if not inside(row["path"], full):
-            raise LibraryRefused(f"{relative} leads outside {row['path']}")
-        with open(full, "rb") as file:
-            text = decode(file.read(MAX_FILE_BYTES))
-        if text is None:
-            raise LibraryRefused(f"{relative} is a binary file")
-        return text
-
 
 def attach(assistant: Any) -> None:
     assistant.library = Library(assistant)

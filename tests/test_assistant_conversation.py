@@ -735,7 +735,8 @@ def test_full_work_goes_to_the_task_engine_when_attached(assistant):
     assert result.status == "task" and result.task_id == "task-1" and "task-1" in result.text
     assert assistant.tasks.submitted[0][0] == "alice" and router.requests == []
     assert assistant.tasks.submitted[0][1]["goal"].startswith("Check the backups")
-    assert assistant.conversation.tasks_of("alice") == ["task-1"] and assistant.conversation.tasks_of("bob") == []
+    handed = assistant.store.query("SELECT task_id, user FROM handed_tasks")
+    assert [(row["task_id"], row["user"]) for row in handed] == [("task-1", "alice")]
 
 
 def test_a_forced_task_does_not_carry_its_prefix(assistant):

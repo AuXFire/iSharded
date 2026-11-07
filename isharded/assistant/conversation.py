@@ -512,10 +512,6 @@ class Conversation:
             words.append("Nothing is running tasks yet. `isharded assistant serve` or `task work` will run it.")
         return " ".join(words)
 
-    def tasks_of(self, user: str, limit: int = 100) -> list[str]:
-        rows = self.store.query("SELECT task_id FROM handed_tasks WHERE user = ? ORDER BY created_at DESC LIMIT ?", (user, limit))
-        return [row["task_id"] for row in rows]
-
     # Learning
 
     def _learn_after(self, result: TurnResult, said: str, learn: str) -> None:

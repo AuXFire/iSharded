@@ -401,20 +401,6 @@ def test_a_root_given_as_a_link_is_resolved_when_authorized(assistant, folder, t
     assert assistant.library.roots("alice")[0]["path"] == str(folder.resolve()) and root
 
 
-def test_reading_a_file_cannot_leave_the_root(assistant, folder, tmp_path):
-    write(tmp_path / "outside.txt", "outside")
-    write(folder / "inside.txt", "inside")
-    write(folder / ".env", "API=1")
-    write(folder / "sub" / "x.txt", "x")
-    link_to(folder / "escape", tmp_path)
-    root = assistant.library.add("alice", folder)
-    assert assistant.library.read("alice", root, "inside.txt") == "inside"
-    assert assistant.library.read("alice", root, "sub/x.txt") == "x"
-    for path in ("../outside.txt", "sub/../../outside.txt", str(tmp_path / "outside.txt"), "escape/outside.txt", ".env", ".git/config"):
-        with pytest.raises(LibraryRefused):
-            assistant.library.read("alice", root, path)
-
-
 # Users are separated
 
 
@@ -427,7 +413,6 @@ def test_one_users_folder_is_invisible_to_another(assistant, folder):
     assert assistant.library.chunk_text("bob", f"{folder / 'a.txt'}:1") is None
     assert assistant.library.index("bob").added == 0
     for attempt in (
-        lambda: assistant.library.read("bob", root, "a.txt"),
         lambda: assistant.library.remove("bob", root),
         lambda: assistant.library.index("bob", root),
     ):

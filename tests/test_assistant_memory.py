@@ -174,23 +174,6 @@ def test_expired_memories_leave_search(assistant, clock):
     assert assistant.memory.entries("alice") == []
 
 
-def test_supersede_obeys_the_same_rule(assistant):
-    owner = assistant.memory.remember("alice", "user", "Trust me on this", said())
-    with pytest.raises(MemoryRefused, match="cannot replace it"):
-        assistant.memory.supersede("alice", owner, "A model says otherwise", said(Trust.MODEL))
-    assert assistant.memory.get("alice", owner)["superseded_by"] is None
-    newer = assistant.memory.supersede("alice", owner, "A newer statement", said())
-    assert assistant.memory.get("alice", owner)["superseded_by"] == int(newer)
-    assert texts(assistant.memory.search("alice", "statement")) == ["A newer statement"]
-
-
-def test_a_replaced_memory_cannot_be_replaced_again(assistant):
-    old = assistant.memory.remember("alice", "user", "one", said())
-    assistant.memory.supersede("alice", old, "two", said())
-    with pytest.raises(MemoryRefused, match="already replaced"):
-        assistant.memory.supersede("alice", old, "three", said())
-
-
 # Confirming
 
 
@@ -353,7 +336,6 @@ def test_one_user_cannot_reach_anothers_memory_by_any_method(assistant):
         lambda: assistant.memory.history("bob", secret),
         lambda: assistant.memory.confirm("bob", secret),
         lambda: assistant.memory.forget("bob", secret),
-        lambda: assistant.memory.supersede("bob", secret, "replaced", said(author="bob")),
         lambda: assistant.memory.forget_conversation("bob", "shared-id"),
     ):
         with pytest.raises(MemoryNotFound):
@@ -398,7 +380,7 @@ def test_every_statement_that_reads_or_changes_user_data_names_the_user(assistan
     memory.entries("alice", include_superseded=True)
     memory.get("alice", first)
     memory.history("alice", second)
-    memory.supersede("alice", second, "alpha four", said())
+    memory.remember("alice", "user", "alpha four", said(), subject="s")
     memory.confirm("alice", third)
     memory.export("alice")
     memory.forget("alice", third)

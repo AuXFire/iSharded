@@ -257,23 +257,6 @@ class MemoryStore:
         self.store.execute("UPDATE memories SET superseded_by = ? WHERE id = ? AND user = ?", (new_id, old_id, user))
         self.store.execute("UPDATE memories SET superseded_by = NULL WHERE id = ? AND user = ?", (new_id, user))
 
-    def supersede(self, user: str, memory_id: str | int, text: str, provenance: Provenance) -> str:
-        """Replace one named memory, which only something as trustworthy may do."""
-        with self.store.transaction():
-            old = self._row(user, memory_id)
-            if old["superseded_by"] is not None:
-                raise MemoryRefused(f"Memory {old['id']} was already replaced by {old['superseded_by']}. Replace that one instead")
-            if not self._outranks(provenance.trust, old):
-                raise MemoryRefused(
-                    f"Memory {old['id']} has trust {old['trust']} and a {provenance.trust.value} fact cannot replace it. "
-                    "Say it yourself, or `confirm` the new fact"
-                )
-            if old["subject"] is not None:
-                return self.remember(user, old["kind"], text, provenance, subject=old["subject"], expires_at=old["expires_at"])
-            new_id = self.remember(user, old["kind"], text, provenance, expires_at=old["expires_at"])
-            self.store.execute("UPDATE memories SET superseded_by = ? WHERE id = ? AND user = ?", (int(new_id), old["id"], user))
-            return new_id
-
     def confirm(self, user: str, memory_id: str | int) -> None:
         """A person vouches for what a model inferred, which makes it theirs."""
         with self.store.transaction():
