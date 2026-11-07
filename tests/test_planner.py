@@ -2517,3 +2517,18 @@ def test_the_draft_setting_is_off_by_default(monkeypatch) -> None:
     monkeypatch.setenv("ISHARDED_DRAFT_SHARES_DEVICE", "1")
     assert orchestrator_module.draft_reads(draft) == 600 * MIB
     assert orchestrator_module.draft_reads(None) == 0
+
+
+def test_applying_first_measures_new_links_and_proposes_again(monkeypatch) -> None:
+    runtime, calls = applying_pool(monkeypatch)
+    proposed = []
+
+    async def measured(row=0):
+        runtime.links["a", "spare"] = 3.0  # a node that joined since the load
+
+    async def kept():
+        proposed.append(True)
+
+    runtime.measure_links, runtime.keep_proposal = measured, kept
+    asyncio.run(runtime.apply_proposal())
+    assert proposed == [True]

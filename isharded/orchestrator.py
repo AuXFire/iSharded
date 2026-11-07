@@ -1894,8 +1894,16 @@ class Orchestrator:
         are kept for a later try. Replies that arrive during the switch wait for it, as they
         do for any rebalance. Returns whether the route moved.
         """
+        if not self.apply_loop or not self.coordinating or not self.route or self.replies_in_flight or self.control_lock.locked():
+            return False
+        # A node that joined since the load has no measured links, and only measured links count.
+        # Only links never measured, or ten minutes old, are probed.
+        before = dict(self.links)
+        await self.measure_links(self.link_row_bytes)
+        if self.links != before:
+            await self.keep_proposal()
         kept = self.latest_proposal()
-        if not self.apply_loop or not self.coordinating or kept is None or self.replies_in_flight or self.control_lock.locked():
+        if kept is None or self.replies_in_flight or self.control_lock.locked():
             return False
         if kept["break_even_tokens"] > self.apply_loop_tokens or time.monotonic() - self.applied_at < APPLY_LOOP_SECONDS:
             return False
