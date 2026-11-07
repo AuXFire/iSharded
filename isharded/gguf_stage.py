@@ -38,6 +38,11 @@ def draft_apart() -> bool:
     return os.environ.get("ISHARDED_DRAFT_APART") == "1"
 
 
+def entry_seeds() -> bool:
+    """Whether the entry gives a sampled reply with no seed one of its own. See ``coupled_choice``."""
+    return os.environ.get("ISHARDED_ENTRY_SEED") != "0"
+
+
 def load_on(host: Channel, operation: str, settings: dict[str, Any]) -> dict[str, Any]:
     """Has a host do this load, and gives its answer. One that failed it does not stay."""
     try:
@@ -542,13 +547,16 @@ class DraftModel:
             else:
                 text.stale = True
 
-    def guess(self, fresh: list[int], count: int, slot: int = 0) -> list[int]:
-        """Guess what follows the text so far and ``fresh``, the tokens this draft has not seen."""
+    def guess(self, fresh: list[int], count: int, slot: int = 0, sampling: dict[str, Any] | None = None) -> list[int]:
+        """Guess what follows the text so far and ``fresh``, the tokens this draft has not seen.
+
+        ``sampling`` is the reply's, for guesses at what a pipelined pass draws. See ``coupled_choice``.
+        """
         text = self.text[slot]
         if text.stale:
             commit, fresh = text.chain + fresh[:1], fresh[1:]
             rows = len(commit) + len(fresh) + count
-            answer = self._ask(rows=rows, commit=commit, position=text.committed, count=count, slot=slot, fresh=fresh)
+            answer = self._ask(rows=rows, commit=commit, position=text.committed, count=count, slot=slot, fresh=fresh, sampling=sampling)
             text.committed += len(commit)
             text.chain = []
             text.stale = False
@@ -557,11 +565,11 @@ class DraftModel:
             catch_up = text.committed if text.cut else None
             rows = len(fresh) + count
             answer = self._ask(
-                rows=rows, commit=[], position=self.seen(slot), count=count, slot=slot, fresh=fresh, restart=False, catch_up=catch_up
+                rows=rows, commit=[], position=self.seen(slot), count=count, slot=slot, fresh=fresh, restart=False, catch_up=catch_up, sampling=sampling
             )
             if answer["tokens"] is None:
                 text.cut, text.stale = False, True  # scratch was not what the text said: start again
-                return self.guess(fresh, count, slot)
+                return self.guess(fresh, count, slot, sampling)
             if text.cut:
                 text.committed += len(text.chain)
                 text.chain = []

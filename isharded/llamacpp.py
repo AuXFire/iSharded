@@ -212,6 +212,8 @@ LLAMA_FUNCTIONS = {
 # Nucleus sampling keeps the head of the distribution, so a full sort of a
 # quarter-million logits per row would be wasted work.
 NUCLEUS_CANDIDATES = 4096
+# A token this many temperatures below the best holds under 1e-13 of the mass.
+FAINT = 30.0
 # The arithmetic of the engine's generator.
 GOLDEN = 0x9E3779B97F4A7C15
 WORD = 2**64 - 1
@@ -316,6 +318,25 @@ def filtered_distribution(logits: np.ndarray, temperature: float, top_p: float, 
         ids, probabilities = ids[keep], probabilities[keep]
         probabilities = probabilities / probabilities.sum()
     return ids, probabilities
+
+
+def coupled_choice(logits: np.ndarray, temperature: float, top_p: float, top_k: int, generator: Draws) -> int:
+    """The token the exit would draw with ``generator`` if these were its logits.
+
+    A draft that guesses its best token lands only as often as the model happens to draw that
+    token. With the exit's own filter and draw, a draft lands whenever its distribution and the
+    model's put the draw on the same token, which is much more often when the two are close.
+    """
+    if top_k or top_p < 1.0:
+        ids, chances = filtered_distribution(logits, temperature, top_p, top_k)
+        return draw(ids, chances, generator)
+    # With no filter the exit walks the whole vocabulary in id order. Faint tokens move the walk
+    # by less than rounding does, and leaving them out makes this a fraction of a millisecond.
+    best = float(logits.max())
+    ids = np.flatnonzero(logits > best - FAINT * temperature)
+    weights = np.cumsum(np.exp((logits[ids].astype(np.float64) - best) / temperature))
+    index = int(np.searchsorted(weights, generator.random() * weights[-1], side="right"))
+    return int(ids[min(index, ids.size - 1)])
 
 
 def speculative_choice(
@@ -758,6 +779,12 @@ class LlamaStage:
     def best_token(self) -> int:
         return int(np.argmax(self.logits_at(-1)))
 
+    def next_token(self, row: int, sampling: dict[str, Any] | None) -> int:
+        """A guess at what the exit makes of ``row``: its own draw when that is known, its best token if not."""
+        if not sampling or not sampling["temperature"] or sampling.get("seed") is None:
+            return self.best_token()
+        return coupled_choice(self.logits_at(-1), sampling["temperature"], sampling["top_p"], sampling["top_k"], Draws(sampling["seed"], row))
+
     def decode_tokens(self, tokens: list[int], position: int, *, sequence_id: int = 0) -> None:
         """Run token ids through a whole model, in chunks the batch can hold."""
         ids = np.array(tokens, dtype=np.int32)
@@ -791,6 +818,7 @@ class LlamaStage:
         fresh: Sequence[int] = (),
         restart: bool = True,
         catch_up: int | None = None,
+        sampling: dict[str, Any] | None = None,
     ) -> list[int] | None:
         """Guess ``count`` tokens after a draft model's text.
 
@@ -804,6 +832,8 @@ class LlamaStage:
         ends: ``scratch`` is cut at ``position``, and ``slot`` takes the cells between as a copy,
         which in a shared cache moves no data. If ``scratch`` does not end where the text says,
         nothing is guessed and the answer is None, so the caller starts again.
+
+        ``sampling`` makes each guess the exit's own draw. See ``coupled_choice``.
         """
         lib = self.library.llama
         if restart:
@@ -818,10 +848,11 @@ class LlamaStage:
             lib.llama_memory_seq_cp(self.memory, scratch, slot, catch_up, position)
         self.decode_tokens(list(fresh), position, sequence_id=scratch)
         position += len(fresh)
-        guesses = [self.best_token()]
+        # The exit draws for a row with the row's own position, which is the token before the guess.
+        guesses = [self.next_token(position - 1, sampling)]
         for offset in range(count - 1):
             self.decode_tokens(guesses[-1:], position + offset, sequence_id=scratch)
-            guesses.append(self.best_token())
+            guesses.append(self.next_token(position + offset, sampling))
         return guesses
 
     def forward(

@@ -267,6 +267,7 @@ class _Host:
             meta.get("fresh", ()),
             meta.get("restart", True),
             meta.get("catch_up"),
+            meta.get("sampling"),
         )
         return {"tokens": tokens, "decodes": self.stage.decodes - before[0], "decoded_rows": self.stage.decoded_rows - before[1]}, b""
 
