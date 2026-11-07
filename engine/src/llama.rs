@@ -369,47 +369,59 @@ impl LlamaCompute {
         Ok(unsafe { std::slice::from_raw_parts(pointer, self.api.vocab as usize) })
     }
 
-    fn merged(&mut self, passes: &[Pass]) -> Result<Vec<Result<Output, Failure>>, Failure> {
-        let width = self.api.width as usize;
-        // llama.cpp gathers sequences in order, and its rows come back in that order.
-        let mut order: Vec<usize> = (0..passes.len()).collect();
-        order.sort_unstable_by_key(|index| passes[*index].slot);
-        self.hidden.clear();
-        for index in &order {
-            self.load(&passes[*index])?;
+    /// Runs loaded passes in one batch, and answers in the order given.
+    fn merged(&mut self, passes: &[Pass], order: &[usize]) -> Vec<Result<Output, Failure>> {
+        let rows = order.iter().map(|index| (passes[*index].position as i32, passes[*index].slot as i32));
+        if let Err(failure) = self.decode(rows, true) {
+            // llama.cpp refuses a whole batch over one bad row. Alone, only that row is refused.
+            return match order {
+                [_] => vec![Err(failure)],
+                _ => order.iter().map(|index| self.run(&passes[*index])).collect(),
+            };
         }
-        let count = passes.len();
-        self.decode(order.iter().map(|index| (passes[*index].position as i32, passes[*index].slot as i32)), true)?;
-        passes.iter().for_each(|pass| self.keep_state(pass));
-        let mut results: Vec<Option<Result<Output, Failure>>> = (0..count).map(|_| None).collect();
+        order.iter().for_each(|index| self.keep_state(&passes[*index]));
         if self.api.last {
-            for (row, index) in order.iter().enumerate() {
+            let choose = |(row, index): (usize, &usize)| {
                 let pass = &passes[*index];
                 let mut draws = Draws::new(pass.sampling.seed, pass.position);
-                let logits = self.logits(row as i32)?;
-                results[*index] = Some(Ok(Output::Tokens(vec![sample::choose(logits, &pass.sampling, &mut draws)])));
-            }
-        } else {
-            let rows = self.capture.rows.lock();
-            if rows.len() != count * width {
-                return Err(stage_error("a merged pass did not produce one row per reply".into()));
-            }
-            for (row, index) in order.iter().enumerate() {
-                // One row per pass crosses exactly, as it does over HTTP.
-                let data = to_wire(&rows[row * width..(row + 1) * width], false);
-                results[*index] = Some(Ok(Output::Rows { rows: 1, width: width as u32, bf16: false, data }));
-            }
+                self.logits(row as i32).map(|logits| Output::Tokens(vec![sample::choose(logits, &pass.sampling, &mut draws)]))
+            };
+            return order.iter().enumerate().map(choose).collect();
         }
-        Ok(results.into_iter().flatten().collect())
+        let width = self.api.width as usize;
+        let rows = self.capture.rows.lock();
+        if rows.len() != order.len() * width {
+            let failure = stage_error("a merged pass did not produce one row per reply".into());
+            return order.iter().map(|_| Err(failure.clone())).collect();
+        }
+        // One row per pass crosses exactly, as it does over HTTP.
+        let output = |row: &[f32]| Ok(Output::Rows { rows: 1, width: width as u32, bf16: false, data: to_wire(row, false) });
+        rows.chunks_exact(width).map(output).collect()
     }
 }
 
 impl Compute for LlamaCompute {
     fn run_merged(&mut self, passes: &[Pass]) -> Vec<Result<Output, Failure>> {
-        match self.merged(passes) {
-            Ok(results) => results,
-            Err(failure) => passes.iter().map(|_| Err(failure.clone())).collect(),
+        let mut results: Vec<Option<Result<Output, Failure>>> = (0..passes.len()).map(|_| None).collect();
+        // llama.cpp gathers sequences in order, and its rows come back in that order.
+        let mut order: Vec<usize> = (0..passes.len()).collect();
+        order.sort_unstable_by_key(|index| passes[*index].slot);
+        self.hidden.clear();
+        // A pass that cannot load is refused here. The others still share the trip.
+        order.retain(|index| {
+            let filled = self.hidden.len();
+            let Err(failure) = self.load(&passes[*index]) else {
+                return true;
+            };
+            self.hidden.truncate(filled);
+            results[*index] = Some(Err(failure));
+            false
+        });
+        if !order.is_empty() {
+            let answers = self.merged(passes, &order);
+            order.iter().zip(answers).for_each(|(index, answer)| results[*index] = Some(answer));
         }
+        results.into_iter().flatten().collect()
     }
 
     fn run(&mut self, pass: &Pass) -> Result<Output, Failure> {
@@ -462,6 +474,9 @@ mod tests {
         saves: usize,
         refuse_saves: bool,
         refuse_restores: bool,
+        /// Refuses any batch with a row of this slot, as llama.cpp does a row it cannot place.
+        refused_slot: Option<i32>,
+        refusals: usize,
     }
 
     #[derive(Debug, PartialEq)]
@@ -475,6 +490,10 @@ mod tests {
     unsafe extern "C" fn fake_decode(context: *mut c_void, batch: Batch) -> i32 {
         let fake = &mut *context.cast::<Fake>();
         let count = batch.n_tokens as usize;
+        if (0..count).any(|row| Some(**batch.seq_id.add(row)) == fake.refused_slot) {
+            fake.refusals += 1;
+            return 1;
+        }
         let hidden = std::slice::from_raw_parts(batch.embd, count * WIDTH).to_vec();
         fake.batches.push(Seen {
             positions: std::slice::from_raw_parts(batch.pos, count * 4).to_vec(),
@@ -650,13 +669,52 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_merge_refuses_every_pass_in_it() {
+    fn a_pass_that_cannot_load_is_refused_alone_and_the_rest_of_its_merge_runs() {
         let mut fake = Fake::default();
         let mut compute = stage(&mut fake, false, &[]);
         let wrong = Pass { width: 1, rows: 2, ..rows_pass(2, 7, &[3.0, 4.0]) };
-        let got = compute.run_merged(&[rows_pass(5, 20, &[1.0, 2.0]), wrong]);
-        assert!(got.iter().all(|item| matches!(item, Err(failure) if failure.message == "rows are 1 wide and this stage takes 2")));
-        assert!(fake.batches.is_empty());
+        let mut got = compute.run_merged(&[rows_pass(5, 20, &[1.0, 2.0]), wrong, rows_pass(1, 9, &[5.0, 6.0])]);
+        assert_eq!(floats(got.pop().unwrap()), (1, false, bytes(&[10.0, 12.0])));
+        assert!(matches!(got.pop().unwrap(), Err(failure) if failure.message == "rows are 1 wide and this stage takes 2"));
+        assert_eq!(floats(got.pop().unwrap()), (1, false, bytes(&[2.0, 4.0])));
+        assert_eq!(fake.batches.len(), 1);
+        assert_eq!(fake.batches[0].slots, vec![1, 5]);
+        assert_eq!(fake.batches[0].hidden, vec![5.0, 6.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn a_token_outside_the_table_takes_its_half_built_row_with_it() {
+        let table = [1.0, 1.5, 2.0, 2.5];
+        let mut fake = Fake::default();
+        let mut compute = stage(&mut fake, true, &table);
+        let token = |slot, id| Pass { flags: FLAG_TOKENS, tokens: vec![id], rows: 0, width: 0, data: vec![], ..rows_pass(slot, 4, &[]) };
+        let got = compute.run_merged(&[token(0, 9), token(1, 1)]);
+        assert!(matches!(&got[0], Err(failure) if failure.message == "token 9 is outside the embedding table"));
+        assert!(matches!(&got[1], Ok(Output::Tokens(tokens)) if *tokens == vec![1]));
+        assert_eq!(fake.batches[0].hidden, vec![2.0, 2.5]);
+    }
+
+    #[test]
+    fn a_batch_llama_cpp_refuses_runs_again_row_by_row_so_only_the_bad_row_is_refused() {
+        let mut fake = Fake { refused_slot: Some(2), ..Fake::default() };
+        let mut compute = stage(&mut fake, false, &[]);
+        let mut got = compute.run_merged(&[rows_pass(5, 20, &[1.0, 2.0]), rows_pass(2, 7, &[3.0, 4.0]), rows_pass(1, 9, &[5.0, 6.0])]);
+        assert_eq!(floats(got.pop().unwrap()), (1, false, bytes(&[10.0, 12.0])));
+        assert!(matches!(got.pop().unwrap(), Err(failure) if failure.message.contains("llama_decode failed")));
+        assert_eq!(floats(got.pop().unwrap()), (1, false, bytes(&[2.0, 4.0])));
+        // Nothing of the refused batch ran, and each good row ran once.
+        assert_eq!(fake.slots[&1].1, vec![9]);
+        assert_eq!(fake.slots[&5].1, vec![20]);
+    }
+
+    #[test]
+    fn a_lone_row_llama_cpp_refuses_is_refused_once() {
+        let mut fake = Fake { refused_slot: Some(2), ..Fake::default() };
+        let mut compute = stage(&mut fake, false, &[]);
+        let wrong = Pass { width: 1, rows: 2, ..rows_pass(5, 20, &[1.0, 2.0]) };
+        let got = compute.run_merged(&[wrong, rows_pass(2, 7, &[3.0, 4.0])]);
+        assert!(got.iter().all(Result::is_err));
+        assert_eq!(fake.refusals, 1);
     }
 
     fn plain(slot: u32, position: u32) -> Pass {
@@ -798,12 +856,14 @@ mod tests {
     }
 
     #[test]
-    fn a_merge_with_a_rewind_nothing_reaches_refuses_every_pass_in_it() {
+    fn a_rewind_nothing_reaches_is_refused_alone_and_the_other_reply_goes_on() {
         let mut fake = Fake::default();
         let mut compute = recurrent(&mut fake, 10);
         runs(&mut compute, 1, 10..12);
-        let got = compute.run_merged(&[kept(0, 10), rewound(1, 10)]);
-        assert!(got.into_iter().all(refused));
+        let mut got = compute.run_merged(&[kept(0, 10), rewound(1, 10)]);
+        assert!(refused(got.pop().unwrap()));
+        assert!(got.pop().unwrap().is_ok());
+        assert_eq!(fake.slots[&0], (11, vec![10]));
     }
 
     #[test]
