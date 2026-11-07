@@ -240,6 +240,11 @@ impl Link {
         self.room.notify_all();
     }
 
+    /// Whether a write stalled or failed, as opposed to the far end closing the link.
+    pub fn write_failed(&self) -> bool {
+        self.failure.lock().is_some()
+    }
+
     /// Closes the link, and keeps the reason if this is what closed it.
     fn fail(&self, kind: io::ErrorKind) {
         let mut failure = self.failure.lock();
@@ -537,6 +542,7 @@ pub fn dial(address: &str, fingerprint: Option<&str>, key: &[u8], role: Role, ep
     let target = address.to_socket_addrs()?.next().ok_or(LinkError::Refused("the address resolved to nothing"))?;
     let mut socket = TcpStream::connect_timeout(&target, timeout)?;
     prepare(&socket)?;
+    socket.set_read_timeout(Some(timeout.min(Duration::from_secs(HANDSHAKE_SECONDS))))?;
     let tls = match fingerprint {
         None => None,
         Some(fingerprint) => {
