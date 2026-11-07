@@ -1933,7 +1933,8 @@ class Orchestrator:
             while self.replies_in_flight and time.monotonic() - began < APPLY_QUIET_SECONDS:
                 await asyncio.sleep(0.25)
             if self.replies_in_flight or self.route != old:
-                self.add_event("rebalance", "Shorter loop not applied", "replies kept running, so the fetched units wait for a later try")
+                why = "replies kept running, so the fetched units wait for a later try" if self.route == old else "the route changed meanwhile"
+                self.add_event("rebalance", "Shorter loop not applied", why)
                 return self.route
             failed = await self._activate(target, route)
         if not failed:
