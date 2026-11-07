@@ -255,7 +255,13 @@ def run_plan(args: argparse.Namespace) -> int:
     """Show where a model would go, and any shorter loop for the route already running."""
     base = args.url.rstrip("/")
     headers = bearer_headers(args.pool_token)
-    model = args.model or httpx.get(base + "/admin/status", headers=headers, timeout=30.0).json().get("model")
+    model = args.model
+    if not model:
+        status = httpx.get(base + "/admin/status", headers=headers, timeout=30.0)
+        if status.status_code >= 400:
+            print(f"Refused: {status.text}", file=sys.stderr)
+            return 1
+        model = status.json().get("model")
     if not model:
         print("No model is running, so name one.", file=sys.stderr)
         return 1

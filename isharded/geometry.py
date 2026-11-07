@@ -9,6 +9,7 @@ and what it would move, and nothing here changes a route.
 from __future__ import annotations
 
 from dataclasses import replace
+from itertools import combinations
 from math import ceil
 from typing import Any
 
@@ -103,13 +104,13 @@ def _orders(
         middle = [item for item in route if item not in first and item not in last]
         return [[*first, *_shortest_order(first, middle, last, profile.ring), *last]] if middle else []
     loop = tour(route, links, profile.ring)
-    if not profile.ring:
-        return [loop, loop[::-1]]
-    start = loop.index(route[0])
-    turns = [loop[start + index :] + loop[: start + index] for index in range(len(loop))]
-    fitting = [turn for turn in turns if holds_entry(turn[0], profile)] or turns[:1]
-    both_ways = [way for turn in fitting[:MAX_ENTRIES] for way in (turn, [turn[0], *turn[:0:-1]])]
-    return [way for way in both_ways if (not first or way[0] in first) and (not last or way[-1] in last)]
+    ways = [loop, loop[::-1]]
+    if profile.ring:
+        start = loop.index(route[0])
+        turns = [loop[start + index :] + loop[: start + index] for index in range(len(loop))]
+        fitting = [turn for turn in turns if holds_entry(turn[0], profile)] or turns[:1]
+        ways = [way for turn in fitting[:MAX_ENTRIES] for way in (turn, [turn[0], *turn[:0:-1]])]
+    return [way for way in ways if (not first or way[0] in first) and (not last or way[-1] in last)]
 
 
 def _times(route: list[StageAssignment], links: Links, profile: ModelProfile, tokens_per_miss: float) -> dict[str, Any]:
@@ -141,12 +142,15 @@ def propose(
     profile = replace(profile, tokens_per_miss=tokens_per_miss)
     workers = {item.worker_id: item for item in with_links(candidates, links)}
     names = [stage.worker_id for stage in route]
-    measured = any((left, right) in links for left in names for right in names)
+    # A link nobody measured counts as a guess, which is no reason to move weights.
+    measured = all((left, right) in links or (right, left) in links for left, right in combinations(names, 2))
     if len(route) < 2 or not measured or any(name not in workers for name in names):
         return None
     members = [workers[name] for name in names]
     found = plan_through(_orders(members, links, profile, entry, exit_), members, profile)
-    if found is None or [stage.worker_id for stage in found] == names or route_faults(found, members) > route_faults(route, members):
+    if found is None or [stage.worker_id for stage in found] == names:
+        return None
+    if any(then > now for then, now in zip(route_faults(found, members), route_faults(route, members))):
         return None
     current, proposed = _times(route, links, profile, tokens_per_miss), _times(found, links, profile, tokens_per_miss)
     saved = current["ms_per_token"] - proposed["ms_per_token"]

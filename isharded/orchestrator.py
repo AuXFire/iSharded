@@ -1430,6 +1430,8 @@ class Orchestrator:
         if active is None or not self.route or active.model_id != target.model_id:
             return None
         await self.refresh_holdings(active)
+        if active is not self.active:
+            return None  # a load landed while the nodes answered, and the route is another model's
         preferred, standby = self.candidate_groups()
         workers = self._with_holdings(preferred + standby, active)
         extra = sum(item.file_size for item in (active.draft, active.projector) if item)

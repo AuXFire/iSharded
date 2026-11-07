@@ -1809,7 +1809,7 @@ A plan, and `active_plan` in `/admin/status`, shows these. All are estimates fro
 
 ### A shorter loop
 
-A route keeps the order it loaded with, even when a better one exists, because weights must not move or reload unless they must. So iSharded only proposes. `POST /admin/plan` for the model that is running has a `proposal` field, and [isharded plan](#isharded-plan) prints it. It is `null` if the model is not running, if no link between the route's nodes has been measured, if a node on the route has left, or if no order of the same nodes saves at least 1% of a token's time.
+A route keeps the order it loaded with, even when a better one exists, because weights must not move or reload unless they must. So iSharded only proposes. `POST /admin/plan` for the model that is running has a `proposal` field, and [isharded plan](#isharded-plan) prints it. It is `null` if the model is not running, if any link between the route's nodes has not been measured, if a node on the route has left, or if no order of the same nodes saves at least 1% of a token's time.
 
 To find one, nodes with a link of 15 ms or less are grouped as a site, and the route's nodes are toured with the closing link counted. A dozen nodes or fewer get the exact shortest tour. More go site by site, and then uncross. Any node of a loop can be the entry for the same network time, so the entry goes where what it carries fits: a draft needs that much VRAM. The current entry stands if nothing is gained. Pins on the entry and exit stay. A proposal never needs more failed links, or more weights outside VRAM, than the route it would replace.
 

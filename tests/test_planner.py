@@ -1622,11 +1622,18 @@ def test_with_no_draft_only_the_loop_counts() -> None:
     assert planner.ms_per_token(250, 90) == 250
 
 
-@pytest.mark.parametrize("model", [block_profile([2.72] * 32), moe_profile()], ids=["block rule", "no block rule"])
-def test_a_route_with_nothing_measured_plans_as_it_did(model) -> None:
-    assert layout_of(plan_placement(mesh_cards(), [], model, links=LINKS)) == layout_of(
-        plan_placement(mesh_cards(), [], model, links=LINKS, tokens_per_miss=1.0)
-    )
+@pytest.mark.parametrize(
+    "model, before",
+    [
+        (block_profile([2.72] * 32), [("b", 0, 8), ("e1", 8, 12), ("e2", 12, 16), ("c", 16, 20), ("a", 20, 32)]),
+        (moe_profile(), [("b", 0, 20), ("e2", 20, 34), ("e1", 34, 54), ("c", 54, 74), ("a", 74, 94)]),
+    ],
+    ids=["block rule", "no block rule"],
+)
+def test_a_route_with_nothing_measured_plans_as_it_did(model, before) -> None:
+    # These layouts came from the planner as it was before the law.
+    assert layout_of(plan_placement(mesh_cards(), [], model, links=LINKS)) == before
+    assert layout_of(plan_placement(mesh_cards(), [], model, links=LINKS, tokens_per_miss=1.0)) == before
 
 
 @pytest.mark.parametrize("model", [block_profile([2.72] * 32), moe_profile()], ids=["block rule", "no block rule"])
@@ -1969,3 +1976,45 @@ def test_the_plan_command_needs_a_model_from_somewhere(monkeypatch, capsys) -> N
     fake, _ = answers({}, {"model": None})
     monkeypatch.setattr(cli, "httpx", fake)
     assert cli.run_plan(plan_args()) == 1
+
+
+def test_a_proposal_never_buys_a_working_link_with_spill(monkeypatch) -> None:
+    model = ring_model()
+    route, workers = zigzag(model)
+    monkeypatch.setattr(geometry, "route_faults", lambda found, _: (1, 0) if found is route else (0, 1))
+    assert geometry.propose(route, workers, LINKS, model) is None
+
+
+def test_a_link_nobody_measured_is_no_reason_to_propose() -> None:
+    model = ring_model()
+    route, workers = zigzag(model)
+    assert geometry.propose(route, workers, LINKS, model) is not None
+    guessed = {hop: milliseconds for hop, milliseconds in LINKS.items() if set(hop) != {"a", "b"}}
+    assert geometry.propose(route, workers, guessed, model) is None
+
+
+def test_pins_stay_past_a_dozen_nodes_off_a_ring() -> None:
+    names = [f"n{index:02d}" for index in range(planner.MAX_LINKED_WORKERS + 2)]
+    links = {(left, right): 5.0 + abs(index - other) for index, left in enumerate(names) for other, right in enumerate(names) if left != right}
+    members = [ram_worker(name) for name in reversed(names)]
+    orders = geometry._orders(members, links, profile(), names[3], None)
+    assert all(order[0].worker_id == names[3] for order in orders)
+
+
+def test_a_load_that_lands_during_a_proposal_ends_it(monkeypatch) -> None:
+    runtime = running_pool(monkeypatch)
+    others = SimpleNamespace(model_id="m")
+
+    async def swapped(target):
+        runtime.active = others
+
+    runtime.refresh_holdings = swapped
+    assert asyncio.run(runtime.propose_order(SimpleNamespace(model_id="m"))) is None
+
+
+def test_the_plan_command_says_when_it_was_refused(monkeypatch, capsys) -> None:
+    refused = SimpleNamespace(status_code=401, text="bad key", json=lambda: {"detail": "bad key"})
+    monkeypatch.setattr(cli, "httpx", SimpleNamespace(get=lambda url, **kwargs: refused))
+    assert cli.run_plan(plan_args()) == 1
+    said = capsys.readouterr().err
+    assert "bad key" in said and "No model is running" not in said
