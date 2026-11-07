@@ -7,6 +7,8 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable
 import functools
+import json
+import os
 import re
 import sqlite3
 import sys
@@ -25,10 +27,17 @@ STOP_WORDS = frozenset(
     "which who why will with would you your".split()
 )
 MAX_SEARCH_WORDS = 32
+JSON_ATTEMPTS = 64  # bounded, so a reply of nested braces costs little
+MACHINE_ACTORS = ("skill:", "peer:", "task:", "model")  # none of these may commit, push, or promote
 
 
 def actor(user: str) -> str:
     return f"user:{user}"
+
+
+def owner_of(assistant: Any) -> str:
+    identity = getattr(assistant, "identity", None)
+    return getattr(identity, "owner", None) or os.environ.get("ISHARDED_ASSISTANT_USER") or "owner"
 
 
 def emit(text: str = "", end: str = "\n", stream: TextIO | None = None) -> None:
@@ -66,6 +75,22 @@ def plainly(run: Callable[[Any, argparse.Namespace], int]) -> Callable[[Any, arg
     return wrapped
 
 
+def printing(refusal: type[Exception]) -> Callable[[Callable[[Any, Any], int]], Callable[[Any, Any], int]]:
+    """A command that prints this kind of refusal, and exits 1, instead of raising it."""
+
+    def wrap(run: Callable[[Any, Any], int]) -> Callable[[Any, Any], int]:
+        def guarded(assistant: Any, args: Any) -> int:
+            try:
+                return run(assistant, args)
+            except refusal as error:
+                print(error)
+                return 1
+
+        return guarded
+
+    return wrap
+
+
 def reach_named(name: str | Reach) -> Reach:
     if isinstance(name, Reach):
         return name
@@ -95,6 +120,20 @@ def search_terms(text: str) -> str:
     words = list(dict.fromkeys(word.casefold() for word in WORD.findall(text)))
     useful = [word for word in words if word not in STOP_WORDS] or words
     return " OR ".join(f'"{word}"' for word in useful[:MAX_SEARCH_WORDS])
+
+
+def first_json_object(text: str) -> dict[str, Any] | None:
+    """The first JSON object in a model's reply, fenced or not."""
+    decoder = json.JSONDecoder()
+    start = text.find("{")
+    for _ in range(JSON_ATTEMPTS):
+        if start == -1:
+            break
+        try:
+            return decoder.raw_decode(text, start)[0]
+        except (RecursionError, ValueError):
+            start = text.find("{", start + 1)
+    return None
 
 
 def table(rows: list[dict[str, Any]], columns: list[str]) -> str:

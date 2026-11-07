@@ -52,7 +52,7 @@ MAX_BACKOFF = 3600.0
 DEFAULT_WORKERS = 8
 DEFAULT_ESCALATION = ("planning",)
 GATE_CAPABILITY = "task.approval"
-NOT_A_PERSON = ("peer:", "skill:", "task:", "model:", "plugin:", "conversation")
+NOT_A_PERSON = ("peer:", "skill:", "task:", "model:", "plugin:", "conversation")  # the broker's list; importing it would make tasks need the broker part
 
 TASK_ENDED = ("done", "partial", "failed", "cancelled", "missed")
 STEP_ENDED = ("done", "failed", "skipped", "cancelled")
@@ -310,13 +310,12 @@ def _stopping(task: TaskView) -> bool:
 def _skips(task: TaskView) -> list[Action]:
     by_id = {step.id: step for step in task.steps}
     stopping = _stopping(task)
-    actions = []
-    for step in task.steps:
-        if step.status == "pending" and (stopping or any(by_id[name].status in STEP_DEAD for name in step.depends_on)):
-            actions.append(Action("skip", step.id))
-        elif step.status == "waiting" and stopping:
-            actions.append(Action("skip", step.id))
-    return actions
+    return [
+        Action("skip", step.id)
+        for step in task.steps
+        if (stopping and step.status in ("pending", "waiting"))
+        or (step.status == "pending" and any(by_id[name].status in STEP_DEAD for name in step.depends_on))
+    ]
 
 
 def _starts(task: TaskView) -> list[Action]:
@@ -424,7 +423,7 @@ def _check_errors(spec: Any, where: str, ids: set[str], own_output: bool = False
     if not isinstance(spec, Mapping):
         return [f"{where} must be an object with a type."]
     kind = spec.get("type")
-    if not isinstance(kind, str) or kind not in CHECK_TYPES:
+    if kind not in CHECK_TYPES:
         return [f"{where} has type {kind!r}; use one of {', '.join(CHECK_TYPES)}."]
     found = []
     target = spec.get("step")
@@ -499,11 +498,9 @@ def _step_errors(step: Any, index: int, ids: set[str], inputs: set[str], capacit
     name = step.get("id", index + 1)
     where = f"Step {name}"
     kind = step.get("kind")
-    if not isinstance(kind, str) or kind not in STEP_KINDS:
+    if kind not in STEP_KINDS:
         return [f"{where} has kind {kind!r}; use one of {', '.join(STEP_KINDS)}."]
-    found = []
-    for extra in sorted(set(step) - COMMON_FIELDS - KIND_FIELDS[kind]):
-        found.append(f"{where} has a field {extra!r} that a {kind} step does not take.")
+    found = [f"{where} has a field {extra!r} that a {kind} step does not take." for extra in sorted(set(step) - COMMON_FIELDS - KIND_FIELDS[kind])]
     found += _kind_errors(step, where, ids, capacity, depth)
     found += _control_errors(step, where, ids, capacity)
     for reference in references_in(step_inputs(step)):
@@ -524,7 +521,7 @@ def _control_errors(step: Mapping[str, Any], where: str, ids: set[str], capacity
     backoff = step.get("backoff_seconds", DEFAULT_BACKOFF)
     if not is_number(backoff) or backoff < 0:
         found.append(f"{where}: backoff_seconds must be zero or more.")
-    if not isinstance(step.get("on_failure", "stop"), str) or step.get("on_failure", "stop") not in ON_FAILURE:
+    if step.get("on_failure", "stop") not in ON_FAILURE:
         found.append(f"{where}: on_failure must be one of {', '.join(ON_FAILURE)}.")
     if not isinstance(step.get("priority", 0), int):
         found.append(f"{where}: priority must be a whole number.")
@@ -567,7 +564,7 @@ def _top_errors(plan: Mapping[str, Any]) -> list[str]:
     every = plan.get("every_seconds")
     if every is not None and (not is_number(every) or every < 1):
         found.append("every_seconds must be at least 1.")
-    if not isinstance(plan.get("on_missed", "run_once"), str) or plan.get("on_missed", "run_once") not in ON_MISSED:
+    if plan.get("on_missed", "run_once") not in ON_MISSED:
         found.append(f"on_missed must be one of {', '.join(ON_MISSED)}.")
     if not isinstance(plan.get("priority", 0), int):
         found.append("priority must be a whole number.")
@@ -655,8 +652,7 @@ def is_review(step: Mapping[str, Any]) -> bool:
     return step.get("kind") == "model" and (bool(step.get("review")) or step.get("role") == "verification")
 
 
-def _reaches(steps: list[dict[str, Any]], start: str, goal: str) -> bool:
-    graph = {step["id"]: step["depends_on"] for step in steps}
+def _reaches(graph: Mapping[str, list[str]], start: str, goal: str) -> bool:
     seen, waiting = set(), [start]
     while waiting:
         name = waiting.pop()
@@ -670,10 +666,12 @@ def _reaches(steps: list[dict[str, Any]], start: str, goal: str) -> bool:
 
 def _checks_before_review(steps: list[dict[str, Any]]) -> None:
     """Mechanical checks come first: no model reviews what a check can already reject."""
+    graph = {step["id"]: step["depends_on"] for step in steps}  # the same lists, so it sees what is added here
+    checks = [step["id"] for step in steps if step["kind"] == "check"]
     for review in (step for step in steps if is_review(step)):
-        for check in (step for step in steps if step["kind"] == "check"):
-            if check["id"] not in review["depends_on"] and not _reaches(steps, check["id"], review["id"]):
-                review["depends_on"].append(check["id"])
+        for check in checks:
+            if check not in review["depends_on"] and not _reaches(graph, check, review["id"]):
+                review["depends_on"].append(check)
 
 
 # References.
@@ -717,16 +715,19 @@ def render(
     """
     used: set[str] = set()
 
+    def fetch(reference: str) -> tuple[Any, str | None]:
+        found, name = _lookup(reference, outputs, inputs)
+        if name:
+            used.add(name)
+        return found, name
+
     def text(template: str) -> Any:
         whole = REFERENCE.fullmatch(template.strip())
         if whole and fence is None:
-            found, name = _lookup(whole.group(1), outputs, inputs)
-            used.update({name} if name else set())
-            return found
+            return fetch(whole.group(1))[0]
 
         def replace(match: re.Match[str]) -> str:
-            found, name = _lookup(match.group(1), outputs, inputs)
-            used.update({name} if name else set())
+            found, name = fetch(match.group(1))
             shown = _as_text(found)
             return fence(shown, name) if fence and name and outputs[name].get("tainted") else shown
 
@@ -861,6 +862,13 @@ def ladder(spec: Mapping[str, Any]) -> list[str]:
     return roles
 
 
+# Only what a pass can act on. For the rest next_actions would answer nothing, ten times a second.
+DUE_TASKS = (
+    f"SELECT * FROM tasks WHERE status NOT IN {TASK_ENDED} AND (cancel_requested IS NOT NULL OR "
+    "(status NOT IN ('paused', 'blocked') AND (status != 'pending' OR run_at IS NULL OR run_at <= ?)))"
+)
+
+
 class DurableTasks:
     """Implements contracts.TaskEngine."""
 
@@ -878,6 +886,10 @@ class DurableTasks:
         self.stopping = threading.Event()
         self.holding = False
         self.store.migrate("tasks", SCHEMA)
+
+    @property
+    def broker(self) -> Any:
+        return getattr(self.assistant, "broker", None)
 
     # Taking work in.
 
@@ -965,37 +977,38 @@ class DurableTasks:
             for row in self.store.query("SELECT step_id, COUNT(*) AS attempts FROM task_attempts WHERE task_id = ? GROUP BY step_id", (task_id,))
         }
         task["inputs"] = json.loads(task["inputs"])
-        task["steps"] = [
-            {
-                "id": row["step_id"],
-                "kind": row["kind"],
-                "status": row["status"],
-                "capability": json.loads(row["spec"]).get("capability"),
-                "attempts": counts.get(row["step_id"], 0),
-                "failures": row["failures"],
-                "tier": row["tier"],
-                "role": ladder(json.loads(row["spec"]))[row["tier"]] if row["kind"] == "model" else None,
-                "output": row["output"],
-                "data": json.loads(row["data"]) if row["data"] else {},
-                "ok": None if row["ok"] is None else bool(row["ok"]),
-                "tainted": bool(row["tainted"]),
-                "trust": row["trust"],
-                "error": row["error"],
-                "wait": row["wait"],
-                "approval_id": row["approval_id"],
-                "subtask_id": row["subtask_id"],
-                "not_before": row["not_before"],
-            }
-            for row in self._steps(task_id)
-        ]
+        task["steps"] = [self._step_status(row, counts.get(row["step_id"], 0)) for row in self._steps(task_id)]
         task["waiting_for"] = [step["approval_id"] for step in task["steps"] if step["wait"] == "approval"]
         # One step reading a page is enough for the task's results to count as outside text.
         task["tainted"] = bool(task["tainted"]) or any(step["tainted"] for step in task["steps"])
         return task
 
+    @staticmethod
+    def _step_status(row: Mapping[str, Any], attempts: int) -> dict[str, Any]:
+        spec = json.loads(row["spec"])
+        return {
+            "id": row["step_id"],
+            "kind": row["kind"],
+            "status": row["status"],
+            "capability": spec.get("capability"),
+            "attempts": attempts,
+            "failures": row["failures"],
+            "tier": row["tier"],
+            "role": ladder(spec)[row["tier"]] if row["kind"] == "model" else None,
+            "output": row["output"],
+            "data": json.loads(row["data"]) if row["data"] else {},
+            "ok": None if row["ok"] is None else bool(row["ok"]),
+            "tainted": bool(row["tainted"]),
+            "trust": row["trust"],
+            "error": row["error"],
+            "wait": row["wait"],
+            "approval_id": row["approval_id"],
+            "subtask_id": row["subtask_id"],
+            "not_before": row["not_before"],
+        }
+
     def list_tasks(self, user: str | None = None, limit: int = 50, active_only: bool = False) -> list[dict[str, Any]]:
-        ended = ", ".join(f"'{status}'" for status in TASK_ENDED)
-        active = f"AND status NOT IN ({ended})" if active_only else ""
+        active = f"AND status NOT IN {TASK_ENDED}" if active_only else ""
         rows = self.store.query(
             f"SELECT id, user, title, status, priority, run_at, created_at, parent_task FROM tasks "
             f"WHERE (? IS NULL OR user = ?) {active} ORDER BY created_at DESC, id LIMIT ?",
@@ -1083,9 +1096,13 @@ class DurableTasks:
                 self._event(name, None, "task.resumed", {"by": by})
             self.audit.record(by, "task.resume", task_id, {}, task_id)
 
-    def _settle_blocked(self, task_id: str, by: str, step_id: str, happened: bool | None) -> None:
+    @staticmethod
+    def _require_person(by: str) -> None:
         if not is_person(by):
             raise ValueError(f"{by or 'Nobody'} is not a person, and only a person can decide this.")
+
+    def _settle_blocked(self, task_id: str, by: str, step_id: str, happened: bool | None) -> None:
+        self._require_person(by)
         if happened is None:
             raise ValueError("Say what happened: --as done, or --as failed.")
         step = self._step(task_id, step_id)
@@ -1113,8 +1130,7 @@ class DurableTasks:
 
     def retry(self, task_id: str, by: str, step: str | None = None) -> int:
         """Run failed or undecided steps again. Returns how many will run."""
-        if not is_person(by):
-            raise ValueError(f"{by or 'Nobody'} is not a person, and only a person can decide this.")
+        self._require_person(by)
         task = self._task(task_id)
         if task["status"] == "paused":
             raise ValueError(f"Task {task_id} is paused. Resume it first.")
@@ -1236,10 +1252,9 @@ class DurableTasks:
             if not self.acquire():
                 return 0
             free = self._free()
-            ended = ", ".join(f"'{status}'" for status in TASK_ENDED)
-            rows = self.store.query(f"SELECT * FROM tasks WHERE status NOT IN ({ended})")
+            now = self.clock()
             changed = 0
-            for task in order_tasks(rows, self.clock()):
+            for task in order_tasks(self.store.query(DUE_TASKS, (now,)), now):
                 for action in next_actions(self._view(task, free)):
                     changed += self._apply(task, action, free)
             return changed
@@ -1252,10 +1267,9 @@ class DurableTasks:
         return free
 
     def _capability(self, name: str | None) -> Any | None:
-        broker = getattr(self.assistant, "broker", None)
-        if broker is None or name is None:
+        if self.broker is None or name is None:
             return None
-        return next((capability for capability in broker.capabilities() if capability.name == name), None)
+        return next((capability for capability in self.broker.capabilities() if capability.name == name), None)
 
     def _needs(self, spec: Mapping[str, Any]) -> tuple[tuple[str, int], ...]:
         wanted = parse_resources(spec.get("resources", []))
@@ -1272,28 +1286,25 @@ class DurableTasks:
         views = []
         for row in self._steps(task["id"]):
             spec = json.loads(row["spec"])
-            needs = self._needs(spec)
+            # Only a pending step can start, and only a waiting one has anything to look up.
+            needs = self._needs(spec) if row["status"] == "pending" else ()
+            waiting = row["status"] == "waiting"
             for name, _ in needs:
                 free.setdefault(name, self.capacity.get(name, 1))
             views.append(
                 StepView(
                     id=row["step_id"],
-                    kind=row["kind"],
                     status=row["status"],
                     depends_on=tuple(spec["depends_on"]),
-                    on_failure=spec.get("on_failure", "stop"),
                     priority=spec.get("priority", 0),
                     position=row["position"],
                     not_before=row["not_before"],
                     needs=needs,
                     wait=row["wait"],
-                    approval=self._approval_status(row["approval_id"]),
-                    subtask=self._subtask_status(row["subtask_id"]),
+                    approval=self._approval_status(row["approval_id"]) if waiting else None,
+                    subtask=self._subtask_status(row["subtask_id"]) if waiting else None,
                     failures=row["failures"],
-                    retries=spec.get("retries", 0),
-                    backoff=spec.get("backoff_seconds", DEFAULT_BACKOFF),
-                    tier=row["tier"],
-                    tiers=len(ladder(spec)) if row["kind"] == "model" else 1,
+                    **self._failure_terms(row, spec),
                 )
             )
         return TaskView(
@@ -1308,8 +1319,20 @@ class DurableTasks:
             on_missed=task["on_missed"],
         )
 
+    @staticmethod
+    def _failure_terms(row: Mapping[str, Any], spec: Mapping[str, Any]) -> dict[str, Any]:
+        """What decides where a failure leads, for a StepView."""
+        return {
+            "kind": row["kind"],
+            "on_failure": spec.get("on_failure", "stop"),
+            "retries": spec.get("retries", 0),
+            "backoff": spec.get("backoff_seconds", DEFAULT_BACKOFF),
+            "tier": row["tier"],
+            "tiers": len(ladder(spec)) if row["kind"] == "model" else 1,
+        }
+
     def _approval_status(self, approval_id: str | None) -> str | None:
-        lookup = getattr(getattr(self.assistant, "broker", None), "approval", None)
+        lookup = getattr(self.broker, "approval", None)
         if not approval_id or lookup is None:
             return None
         found = lookup(approval_id)
@@ -1322,7 +1345,9 @@ class DurableTasks:
         return row["status"] if row else "missing"
 
     def _apply(self, task: Mapping[str, Any], action: Action, free: dict[str, int]) -> int:
-        return getattr(self, f"_do_{action.kind}")(task, action, free)
+        if action.kind == "start":
+            return self._do_start(task, action, free)
+        return getattr(self, f"_do_{action.kind}")(task, action)
 
     def _end(self, task_id: str, status: str) -> bool:
         """A task ends once, whichever process gets there first."""
@@ -1330,21 +1355,21 @@ class DurableTasks:
             updated = connection.execute(f"UPDATE tasks SET status = ?, finished_at = ? WHERE id = ? AND status NOT IN {TASK_ENDED}", (status, self.clock(), task_id))
         return updated.rowcount == 1
 
-    def _do_begin(self, task: Mapping[str, Any], action: Action, free: dict[str, int]) -> int:
+    def _do_begin(self, task: Mapping[str, Any], action: Action) -> int:
         with self.store.transaction():
             self.store.execute("UPDATE tasks SET status = 'running', started_at = ? WHERE id = ? AND status = 'pending'", (self.clock(), task["id"]))
             self._event(task["id"], None, "task.started", {"note": action.note})
             self.audit.record(f"task:{task['id']}", "task.start", task["id"], {"note": action.note}, task["id"])
         return 1
 
-    def _do_reschedule(self, task: Mapping[str, Any], action: Action, free: dict[str, int]) -> int:
+    def _do_reschedule(self, task: Mapping[str, Any], action: Action) -> int:
         with self.store.transaction():
             self.store.execute("UPDATE tasks SET run_at = ?, queued_at = ? WHERE id = ?", (action.at, action.at, task["id"]))
             self._event(task["id"], None, "task.missed", {"note": action.note, "next": action.at})
             self.audit.record("tasks", "task.missed", task["id"], {"note": action.note}, task["id"])
         return 1
 
-    def _do_miss(self, task: Mapping[str, Any], action: Action, free: dict[str, int]) -> int:
+    def _do_miss(self, task: Mapping[str, Any], action: Action) -> int:
         with self.store.transaction():
             if not self._end(task["id"], "missed"):
                 return 0
@@ -1353,7 +1378,7 @@ class DurableTasks:
             self.audit.record("tasks", "task.missed", task["id"], {"note": action.note}, task["id"])
         return 1
 
-    def _do_block(self, task: Mapping[str, Any], action: Action, free: dict[str, int]) -> int:
+    def _do_block(self, task: Mapping[str, Any], action: Action) -> int:
         reason = self._step(task["id"], action.step)["error"]
         with self.store.transaction():
             self.store.execute("UPDATE tasks SET status = 'blocked', blocked_reason = ? WHERE id = ?", (reason, task["id"]))
@@ -1361,7 +1386,7 @@ class DurableTasks:
             self.audit.record("tasks", "task.block", task["id"], {"step": action.step}, task["id"])
         return 1
 
-    def _do_finish(self, task: Mapping[str, Any], action: Action, free: dict[str, int]) -> int:
+    def _do_finish(self, task: Mapping[str, Any], action: Action) -> int:
         with self.store.transaction():
             if not self._end(task["id"], action.note):
                 return 0
@@ -1373,22 +1398,20 @@ class DurableTasks:
     def _schedule_next(self, task: Mapping[str, Any]) -> None:
         """The next run exists only once this one ends, so a job can never overlap itself."""
         every = task["every_seconds"]
-        ended = ", ".join(f"'{status}'" for status in TASK_ENDED)
-        waiting = self.store.one(f"SELECT 1 FROM tasks WHERE series = ? AND id != ? AND status NOT IN ({ended}) LIMIT 1", (task["series"], task["id"]))
+        waiting = self.store.one(f"SELECT 1 FROM tasks WHERE series = ? AND id != ? AND status NOT IN {TASK_ENDED} LIMIT 1", (task["series"], task["id"]))
         if not every or waiting:  # a retried run must not start a second chain
             return
-        now = self.clock()
-        due = next_slot(task["run_at"] if task["run_at"] is not None else task["created_at"], every, now)
+        due = next_slot(task["run_at"] if task["run_at"] is not None else task["created_at"], every, self.clock())
         self._insert(task["user"], json.loads(task["plan"]), series=task["series"], run_at=due, priority=task["priority"])
 
-    def _do_halt(self, task: Mapping[str, Any], action: Action, free: dict[str, int]) -> int:
+    def _do_halt(self, task: Mapping[str, Any], action: Action) -> int:
         self._stop_sandbox(task["id"])
         return 0  # it only asks, so this alone is not progress
 
-    def _do_cancel_step(self, task: Mapping[str, Any], action: Action, free: dict[str, int]) -> int:
+    def _do_cancel_step(self, task: Mapping[str, Any], action: Action) -> int:
         return self._leave_step(task, action.step, "cancelled")
 
-    def _do_skip(self, task: Mapping[str, Any], action: Action, free: dict[str, int]) -> int:
+    def _do_skip(self, task: Mapping[str, Any], action: Action) -> int:
         return self._leave_step(task, action.step, "skipped")
 
     def _leave_step(self, task: Mapping[str, Any], step_id: str, status: str) -> int:
@@ -1401,14 +1424,14 @@ class DurableTasks:
                 (status, self.clock(), task["id"], step_id),
             )
             self._event(task["id"], step_id, f"step.{status}", {})
-            withdraw = getattr(getattr(self.assistant, "broker", None), "withdraw", None)
+            withdraw = getattr(self.broker, "withdraw", None)
             if step["approval_id"] and withdraw:
                 withdraw(step["approval_id"], f"Task {task['id']} no longer needs this.")
         if step["subtask_id"] and self._subtask_status(step["subtask_id"]) not in TASK_ENDED:
             self.cancel(step["subtask_id"], f"task:{task['id']}")
         return 1
 
-    def _do_cancelled(self, task: Mapping[str, Any], action: Action, free: dict[str, int]) -> int:
+    def _do_cancelled(self, task: Mapping[str, Any], action: Action) -> int:
         with self.store.transaction():
             if not self._end(task["id"], "cancelled"):
                 return 0
@@ -1416,14 +1439,14 @@ class DurableTasks:
             self.audit.record(f"task:{task['id']}", "task.finish", task["id"], {"status": "cancelled"}, task["id"])
         return 1
 
-    def _do_waited(self, task: Mapping[str, Any], action: Action, free: dict[str, int]) -> int:
+    def _do_waited(self, task: Mapping[str, Any], action: Action) -> int:
         self._complete(task["id"], action.step, Outcome(True, "The wait is over.", tainted=False, trust=Trust.VERIFIED.value))
         return 1
 
-    def _do_approved(self, task: Mapping[str, Any], action: Action, free: dict[str, int]) -> int:
+    def _do_approved(self, task: Mapping[str, Any], action: Action) -> int:
         step = self._step(task["id"], action.step)
         if step["kind"] == "approval":
-            decided = self.assistant.broker.approval(step["approval_id"])
+            decided = self.broker.approval(step["approval_id"])
             self._complete(task["id"], action.step, Outcome(True, f"Approved by {decided['decided_by']}.", trust=Trust.OWNER.value))
             return 1
         with self.store.transaction():  # the attempt that follows spends the approval
@@ -1433,20 +1456,15 @@ class DurableTasks:
             self._event(task["id"], action.step, "step.approved", {"approval": step["approval_id"]})
         return 1
 
-    def _do_refused(self, task: Mapping[str, Any], action: Action, free: dict[str, int]) -> int:
-        with self.store.transaction():
-            self._fail(task["id"], action.step, "A person refused this action.", retryable=False)
-        return 1
+    def _do_refused(self, task: Mapping[str, Any], action: Action) -> int:
+        return self._give_up(task["id"], action.step, "A person refused this action.")
 
-    def _do_subtask_ended(self, task: Mapping[str, Any], action: Action, free: dict[str, int]) -> int:
+    def _do_subtask_ended(self, task: Mapping[str, Any], action: Action) -> int:
         step = self._step(task["id"], action.step)
-        child = self._task(step["subtask_id"])
-        outcome = self._subtask_outcome(child)
-        if outcome.ok:
-            self._complete(task["id"], action.step, outcome)
-        else:
-            with self.store.transaction():
-                self._fail(task["id"], action.step, outcome.error, retryable=False)
+        outcome = self._subtask_outcome(self._task(step["subtask_id"]))
+        if not outcome.ok:
+            return self._give_up(task["id"], action.step, outcome.error)
+        self._complete(task["id"], action.step, outcome)
         return 1
 
     def _subtask_outcome(self, child: Mapping[str, Any]) -> Outcome:
@@ -1475,35 +1493,30 @@ class DurableTasks:
         try:
             return starters[spec["kind"]](task, step, spec)
         except ValueError as error:  # a reference that came out empty fails the step, not the engine
-            with self.store.transaction():
-                self._fail(task["id"], step["step_id"], str(error), retryable=False)
-            return 1
+            return self._give_up(task["id"], step["step_id"], str(error))
+
+    def _start_waiting(self, task_id: str, step_id: str, wait: str, column: str, value: Any, label: str) -> None:
+        self.store.execute(
+            f"UPDATE task_steps SET status = 'waiting', wait = ?, {column} = ?, started_at = ? WHERE task_id = ? AND step_id = ?",
+            (wait, value, self.clock(), task_id, step_id),
+        )
+        self._event(task_id, step_id, "step.waiting", {label: value})
 
     def _start_wait(self, task: Mapping[str, Any], step: Mapping[str, Any], spec: Mapping[str, Any]) -> int:
         until = parse_time(spec["until"]) if "until" in spec else self.clock() + float(spec["seconds"])
         with self.store.transaction():
-            self.store.execute(
-                "UPDATE task_steps SET status = 'waiting', wait = 'time', not_before = ?, started_at = ? WHERE task_id = ? AND step_id = ?",
-                (until, self.clock(), task["id"], step["step_id"]),
-            )
-            self._event(task["id"], step["step_id"], "step.waiting", {"until": until})
+            self._start_waiting(task["id"], step["step_id"], "time", "not_before", until, "until")
         return 1
 
     def _start_gate(self, task: Mapping[str, Any], step: Mapping[str, Any], spec: Mapping[str, Any]) -> int:
-        request = getattr(getattr(self.assistant, "broker", None), "request_approval", None)
+        request = getattr(self.broker, "request_approval", None)
         if request is None:
-            with self.store.transaction():
-                self._fail(task["id"], step["step_id"], "An approval step needs the broker part, which is not installed.", retryable=False)
-            return 1
+            return self._give_up(task["id"], step["step_id"], "An approval step needs the broker part, which is not installed.")
         message, _ = render(spec.get("message", ""), self._outputs(task["id"]), json.loads(task["inputs"]))
         arguments = {"task": task["id"], "step": step["step_id"], "message": message}
         with self.store.transaction():
             approval = request(task["user"], GATE_CAPABILITY, arguments, f"task:{task['id']}", task["id"], str(message))
-            self.store.execute(
-                "UPDATE task_steps SET status = 'waiting', wait = 'approval', approval_id = ?, started_at = ? WHERE task_id = ? AND step_id = ?",
-                (approval, self.clock(), task["id"], step["step_id"]),
-            )
-            self._event(task["id"], step["step_id"], "step.waiting", {"approval": approval})
+            self._start_waiting(task["id"], step["step_id"], "approval", "approval_id", approval, "approval")
         return 1
 
     def _start_subtask(self, task: Mapping[str, Any], step: Mapping[str, Any], spec: Mapping[str, Any]) -> int:
@@ -1515,11 +1528,7 @@ class DurableTasks:
             child = self._insert(
                 task["user"], spec["plan"], parent=(task["id"], step["step_id"]), tainted=tainted, inputs=inputs, priority=task["priority"], reach_limit=limit
             )
-            self.store.execute(
-                "UPDATE task_steps SET status = 'waiting', wait = 'subtask', subtask_id = ?, started_at = ? WHERE task_id = ? AND step_id = ?",
-                (child, self.clock(), task["id"], step["step_id"]),
-            )
-            self._event(task["id"], step["step_id"], "step.waiting", {"subtask": child})
+            self._start_waiting(task["id"], step["step_id"], "subtask", "subtask_id", child, "subtask")
         return 1
 
     def _start_attempt(self, task: Mapping[str, Any], step: Mapping[str, Any], spec: Mapping[str, Any], free: dict[str, int]) -> int:
@@ -1600,14 +1609,13 @@ class DurableTasks:
         return min([task["reach"], *(outputs[name]["reach"] for name in used if outputs[name]["reach"] is not None)])
 
     def _perform_tool(self, task: Any, step: Any, spec: Mapping[str, Any], outputs: Any, inputs: Any) -> Outcome:
-        broker = getattr(self.assistant, "broker", None)
-        if broker is None:
+        if self.broker is None:
             return Outcome(False, error="A tool step needs the broker part, which is not installed.", retryable=False)
         arguments, used = render(spec.get("arguments", {}), outputs, inputs)
         tainted = self._tainted(task, outputs, used)
-        limit = Reach(self._reach(task, outputs, used))
-        context = CallContext(user=task["user"], actor=f"task:{task['id']}", tainted=tainted, task_id=task["id"], reach=limit)
-        result = broker.invoke(ToolCall(spec["capability"], arguments, f"{task['id']}/{step['step_id']}"), context)
+        limit = self._reach(task, outputs, used)
+        context = CallContext(user=task["user"], actor=f"task:{task['id']}", tainted=tainted, task_id=task["id"], reach=Reach(limit))
+        result = self.broker.invoke(ToolCall(spec["capability"], arguments, f"{task['id']}/{step['step_id']}"), context)
         if result.provenance.source == "broker" and result.data.get("refused"):
             ask = result.data.get("verdict") == "ask"
             return Outcome(False, error=result.output, tainted=tainted, retryable=False, approval_id=result.data.get("approval_id") if ask else None)
@@ -1618,7 +1626,7 @@ class DurableTasks:
             dict(result.data),
             "" if result.ok else result.output,
             tainted or trust is Trust.EXTERNAL,
-            min(self._reach(task, outputs, used), int(result.provenance.reach)),
+            min(limit, int(result.provenance.reach)),
             trust.value,
         )
 
@@ -1712,21 +1720,17 @@ class DurableTasks:
         )
         self._event(task_id, step_id, f"step.{status}", {})
 
+    def _give_up(self, task_id: str, step_id: str, error: str) -> int:
+        """A failure that trying again cannot help."""
+        with self.store.transaction():
+            self._fail(task_id, step_id, error, retryable=False)
+        return 1
+
     def _fail(self, task_id: str, step_id: str, error: str, retryable: bool) -> None:
         row = self._step(task_id, step_id)
         spec = json.loads(row["spec"])
         failures = row["failures"] + 1
-        view = StepView(
-            id=step_id,
-            kind=row["kind"],
-            on_failure=spec.get("on_failure", "stop"),
-            failures=failures,
-            retries=spec.get("retries", 0),
-            backoff=spec.get("backoff_seconds", DEFAULT_BACKOFF),
-            tier=row["tier"],
-            tiers=len(ladder(spec)) if row["kind"] == "model" else 1,
-        )
-        decided = after_failure(view, self.clock(), retryable)
+        decided = after_failure(StepView(id=step_id, failures=failures, **self._failure_terms(row, spec)), self.clock(), retryable)
         self.store.execute("UPDATE task_steps SET failures = ?, error = ?, wait = NULL, held = NULL WHERE task_id = ? AND step_id = ?", (failures, error, task_id, step_id))
         if decided.kind == "retry":
             self.store.execute("UPDATE task_steps SET status = 'pending', not_before = ? WHERE task_id = ? AND step_id = ?", (decided.at, task_id, step_id))

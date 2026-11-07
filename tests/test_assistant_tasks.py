@@ -1469,7 +1469,7 @@ def test_a_task_that_ended_keeps_its_ending(assistant, engine):
     tool(assistant, "demo.first")
     task = run(engine, plan_of(tool_step("a", "demo.first")))
     row = engine.store.one("SELECT * FROM tasks WHERE id = ?", (task,))
-    assert engine._do_cancelled(row, Action("cancelled"), {}) == 0  # a late cancel from another process
+    assert engine._do_cancelled(row, Action("cancelled")) == 0  # a late cancel from another process
     assert status(engine, task) == "done"
 
 

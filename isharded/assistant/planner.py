@@ -143,9 +143,9 @@ def plan_problems(plan: Any, known: Mapping[str, Capability], capacity: Mapping[
 
 
 def describe(capability: Capability) -> str:
-    properties = capability.input_schema.get("properties", {}) if isinstance(capability.input_schema, dict) else {}
-    required = set(capability.input_schema.get("required", [])) if isinstance(capability.input_schema, dict) else set()
-    fields = ", ".join(f"{name}{'' if name in required else '?'}" for name in properties)
+    schema = capability.input_schema if isinstance(capability.input_schema, dict) else {}
+    required = set(schema.get("required", []))
+    fields = ", ".join(f"{name}{'' if name in required else '?'}" for name in schema.get("properties", {}))
     return f"- {capability.name}({fields}): {capability.summary}"
 
 
@@ -269,7 +269,7 @@ class Planner:
         wanted: dict[tuple[str, str | None], dict[str, Any]] = {}
         for step in walk_steps(plan):
             capability = known.get(step.get("capability", ""))
-            if step.get("kind") != "tool" or capability is None or broker is None:
+            if step.get("kind") != "tool" or capability is None:  # with no broker, nothing is known
                 continue
             arguments = step.get("arguments", {})
             scope = arguments.get(capability.scope_field) if capability.scope_field else None
@@ -307,9 +307,10 @@ class Planner:
         """One yes from a person for what a plan needs: exact scopes, a limited time, limited uses."""
         broker = self.assistant.broker
         now = self.assistant.clock()
+        known = self._known()
         granted, left = [], []
         for entry in plan.get("missing_grants", []):
-            capability = self._known().get(entry["capability"])
+            capability = known.get(entry["capability"])
             if capability is None or Effect.PHYSICAL in capability.effects or (capability.scope_field and entry["scope"] is None):
                 left.append(entry["capability"])
                 continue
