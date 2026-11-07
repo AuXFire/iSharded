@@ -1537,6 +1537,23 @@ These guesses go out only on a pipeline, one row at a time, so a reply is the sa
 
 A lookup searches the newest 65,536 tokens of a reply. It holds 0.5 MiB for each reply on a pipeline, and a search reads the window once, and only when no match is being followed. Measured under load, a search took 69 microseconds on a full window and 16 on 2,000 tokens, and following a match about 1. A reply that matches nothing sends no guesses, runs one pass at a time, and pays for those searches and, on a recurrent model, a snapshot per pass. The measuring above then decides between that and plain decoding like anything else.
 
+This was measured on two CPU stages of Qwen3-0.6B on one laptop, with a copy of the model as the draft, which makes the draft as slow as the model and right almost every time. Text that repeats asked for a Python file back with one change and for a passage copied out; text that does not asked for a story, an explanation and a meal plan. Each figure is tokens per second over 12 replies of 96 tokens, greedy and seeded.
+
+| Route | No guesses | Draft | Lookup | Both |
+|---|---|---|---|---|
+| Local, repeating text | 31.5 | 33.2 | 42.2 | 32.5 |
+| Local, fresh text | 32.6 | 32.3 | 32.9 | 31.8 |
+| 50 ms added to each link, repeating text | 7.6 | 30.0 | 21.0 | 28.0 |
+| 50 ms added to each link, fresh text | 7.7 | 19.4 | 7.9 | 19.3 |
+
+Lookup alone tripled repeating text on the far route and cost nothing on fresh text. With a draft this good it added nothing, and over several runs on a busy machine both was sometimes ahead of the draft alone and sometimes behind. A real draft is smaller than its model and wrong more often, which this could not measure. On Qwen3.5-0.8B, with recurrent layers, lookup took repeating text from 6.5 to 17.0 tokens per second on the far route, and fresh text from 6.1 to 6.4.
+
+Replies with guesses matched replies with none on every run, 12 of 12, as long as the load split the layers the same way. A load with free memory to spare can split them differently, and those replies differ with no guess involved, as above. On the recurrent model, plain decoding and lookup on the very same load matched in 24 of 24.
+
+Sixteen guesses pay only on a far route and a long run of matches. With 200 ms on each link and replies of 192 tokens, repeating text went from 7.3 tokens per second at 6 guesses to 8.6 and 9.1 at 16, and depth reached 16. On replies of 96 tokens they made no difference.
+
+Eight replies at once with lookup, at 64 tokens each: with 50 ms on each link each reply went from 3.15 to 3.42 tokens per second on repeating text and 3.14 to 3.32 on fresh text, against dividing depth by the replies. With 200 ms on each link repeating text went from 1.75 to 2.30, and fresh text from 1.73 to 1.63. Several replies at once on the native path share passes, and a shared pass rounds differently, so these replies can differ from run to run with or without guesses.
+
 `prompt_lookup` is on by default. Turn it off with `--no-lookup`. On a model with recurrent layers and no draft it costs what a draft would: every stage holds `draft_tokens` copies of its recurrent state for each slot. Images turn it off for that reply, as they do a draft.
 
 For `qwen3`, `qwen3moe`, `qwen35`, and `qwen35moe` models the draft is chosen automatically (`Qwen3-0.6B` or `Qwen3.5-0.8B`, which share their vocabulary). Name another with `--draft`, or turn this off with `--no-draft`. A named draft must have the same vocabulary as the model, and a draft that cannot load leaves the model running without one.
