@@ -24,6 +24,7 @@ from .contracts import ContextItem, Provenance, Reach, Trust, is_tainted, lowest
 from .memory import MemoryNotFound
 from .mind import actor, add_user_option, emit, LOCAL_USER, plainly, reach_named
 from .providers import estimate_tokens
+from .skills import SkillError
 
 DEFAULT_BUDGET_TOKENS = 6144
 HISTORY_MESSAGES = 40
@@ -344,9 +345,24 @@ class Context:
         if source in ("conversation", "tool") and memory and source_id.startswith("message:"):
             row = memory.message(user, int(source_id.partition(":")[2]))
             return row["content"] if row else None
+        if source == "skill":
+            return self._skill_text(user, source_id)
+        if source == "peer":
+            # Only a hash of the request is kept, as nothing here holds what a peer said.
+            return f"An answer from a peer, to request {source_id}. Its text was not kept."
         if source == "identity":
             return "Who the assistant is: its name, style, promises, and its relationship with this person."
         return query_text if source == "user" else None
+
+    def _skill_text(self, user: str, version_id: str) -> str | None:
+        skills = getattr(self.assistant, "skills", None)
+        if skills is None:
+            return None
+        try:
+            version = skills.version(version_id)
+        except SkillError:  # gone, or changed behind the store, so it is not what the model saw
+            return None
+        return version.instructions if version.user == user else None
 
     def why(self, user: str, turn_id: str) -> dict[str, Any]:
         """What a model saw on a turn, what was left out, and who answered."""

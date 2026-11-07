@@ -418,3 +418,49 @@ def test_why_and_context_commands(tmp_path, capsys):
 def test_why_with_no_turns_says_so(tmp_path, capsys):
     assert run_cli(tmp_path, "why") == 1
     assert "no turns yet" in capsys.readouterr().out
+
+
+# What "why" can show of a skill or a peer
+
+
+def noted(assistant, source: str, source_id: str, user: str = "alice") -> dict:
+    built = assistant.context.build(user, "hello")
+    origin = Provenance(source, source_id, "someone", Trust.MODEL, 0.0, Reach.POOL)
+    assistant.context.note_tool(user, built.turn_id, ContextItem("what the model saw", origin))
+    return next(item for item in assistant.context.why(user, built.turn_id)["seen"] if item["source"] == source)
+
+
+def real_skill(assistant, user: str = "alice"):
+    tests = [{"name": "greets", "input": "hi", "checks": [{"kind": "contains", "value": "hello"}]}]
+    return assistant.skills.propose("greeter", "Say hello first.", tests=tests, user=user)
+
+
+def test_why_shows_a_skill_that_is_held(assistant):
+    assert noted(assistant, "skill", real_skill(assistant).id)["text"] == "Say hello first."
+
+
+def test_why_shows_nothing_of_a_skill_that_is_gone_or_changed(assistant):
+    assert noted(assistant, "skill", "no-such-version")["text"] is None
+    version = real_skill(assistant)
+    assistant.store.execute("UPDATE skill_versions SET content = '{}' WHERE id = ?", (version.id,))
+    assert noted(assistant, "skill", version.id)["text"] is None
+
+
+def test_why_shows_nothing_of_someone_elses_skill(assistant):
+    assert noted(assistant, "skill", real_skill(assistant, "bob").id)["text"] is None
+
+
+def test_why_says_what_a_peers_answer_was_and_that_its_text_was_not_kept(assistant):
+    text = noted(assistant, "peer", "abc123")["text"]
+    assert "peer" in text and "abc123" in text and "not kept" in text
+
+
+def test_why_on_the_command_line_shows_a_held_skill_as_held(assistant, tmp_path, capsys):
+    version = real_skill(assistant, "owner")
+    noted(assistant, "skill", version.id, "owner")
+    assistant.close()
+    parser = argparse.ArgumentParser()
+    add_arguments(parser)
+    assert run(parser.parse_args(["--home", str(tmp_path / "home"), "why"])) == 0
+    line = next(line for line in capsys.readouterr().out.splitlines() if version.id in line)
+    assert line.endswith("Say hello first.")
