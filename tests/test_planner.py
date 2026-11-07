@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 import httpx
 import pytest
 
-from isharded import cli, planner
+from isharded import cli, geometry, planner
 from isharded import orchestrator as orchestrator_module
 from isharded.gguf import holds_both_kinds
 from isharded.orchestrator import Orchestrator
@@ -1698,3 +1698,182 @@ def test_a_plan_shows_its_loop_and_pace(monkeypatch) -> None:
     assert plan["tokens_per_miss"] == 2.5
     assert plan["ms_per_token"] == pytest.approx((loop + 1.5 * pace) / 2.5, abs=0.01)
     assert plan["estimated_tokens_per_second"] == pytest.approx(1000 / loop, abs=0.05)  # as it always was
+
+
+ZIGZAG = ["a", "e1", "b", "e2", "c"]
+
+
+def zigzag(model: ModelProfile, order: list[str] = ZIGZAG, workers: list[Candidate] | None = None, links=LINKS):
+    """A route that runs in this order, its nodes holding what they run."""
+    workers = planner.with_links(workers or mesh_cards(), links)
+    by_name = {item.worker_id: item for item in workers}
+    route = planner.plan_through([[by_name[name] for name in order]], [by_name[name] for name in order], model)
+    assert names_of(route) == order
+    held = {stage.worker_id: frozenset(item.unit.name for item in planner._stage_items(model, stage.start_layer, stage.end_layer)) for stage in route}
+    return route, [replace(item, cached=held.get(item.worker_id, frozenset()), fetch_bytes_per_second=50e6) for item in workers]
+
+
+def ring_model(**fields) -> ModelProfile:
+    return replace(moe_profile(amortize=20_000), ring=True, **fields)
+
+
+def test_nodes_group_by_their_shortest_links() -> None:
+    groups = geometry.nearest_groups(list(MESH_SPEEDS), LINKS)
+    assert sorted(map(sorted, groups)) == [["a"], ["b"], ["c"], ["e1", "e2"]]
+
+
+def test_a_chain_of_short_links_is_one_group() -> None:
+    assert geometry.nearest_groups(["x", "y", "z"], {("x", "y"): 3.0, ("y", "z"): 4.0}) == [["x", "y", "z"]]
+
+
+def test_a_failed_or_unmeasured_link_groups_nothing() -> None:
+    links = {("x", "y"): planner.UNREACHABLE_LINK_MS}
+    assert geometry.nearest_groups(["x", "y", "z"], links) == [["x"], ["y"], ["z"]]
+
+
+def loop_of(names: list[str]) -> tuple[int, float]:
+    """Failed forward links, then the time around, the closing edge included."""
+    forward = list(zip(names, names[1:]))
+    dead = sum(LINKS[hop] >= planner.UNREACHABLE_LINK_MS for hop in forward)
+    walked = sum(LINKS[hop] / 2 for hop in forward)
+    closing = LINKS[names[-1], names[0]]
+    return dead, walked + (walked if closing >= planner.UNREACHABLE_LINK_MS else closing / 2)
+
+
+def test_a_tour_counts_the_edge_that_closes_it() -> None:
+    order = geometry.tour(with_mesh_links(mesh_cards()), LINKS)
+    best = min(loop_of(["a", *rest]) for rest in permutations(["b", "c", "e1", "e2"]))
+    assert loop_of(names_of_workers(order)) == best
+
+
+def names_of_workers(workers: list[Candidate]) -> list[str]:
+    return [item.worker_id for item in workers]
+
+
+def test_past_a_dozen_nodes_a_tour_goes_site_by_site() -> None:
+    sites = {name: name[0] for name in (f"{site}{index}" for site in "xyz" for index in range(5))}
+    links = {(left, right): (1.0 if sites[left] == sites[right] else 80.0) for left in sites for right in sites if left != right}
+    workers = planner.with_links([ram_worker(name) for name in sorted(sites, key=lambda name: name[1])], links)
+    assert len(workers) > planner.MAX_LINKED_WORKERS
+    order = [sites[name] for name in names_of_workers(geometry.tour(workers, links))]
+    assert sorted(order) == sorted(sites.values())
+    assert sum(left != right for left, right in zip(order, order[1:] + order[:1])) == 3
+
+
+def test_a_proposal_is_a_better_order_of_the_same_nodes() -> None:
+    model = ring_model()
+    route, workers = zigzag(model)
+    proposal = geometry.propose(route, workers, LINKS, model)
+    assert sorted(proposal["proposed"]["order"]) == sorted(ZIGZAG)
+    assert proposal["current"]["order"] == ZIGZAG
+    assert proposal["proposed"]["loop_ms"] < proposal["current"]["loop_ms"]
+    assert proposal["saved_ms_per_token"] == pytest.approx(proposal["current"]["ms_per_token"] - proposal["proposed"]["ms_per_token"], abs=0.01)
+    stages = proposal["proposed"]["stages"]
+    assert [stage["worker_id"] for stage in stages] == proposal["proposed"]["order"]
+    assert stages[0]["start_layer"] == 0 and stages[-1]["end_layer"] == model.num_layers
+    assert ["e1", "e2"] in map(sorted, proposal["groups"])
+
+
+def test_a_proposal_says_what_would_move_and_how_long_it_takes() -> None:
+    model = ring_model()
+    route, workers = zigzag(model)
+    proposal = geometry.propose(route, workers, LINKS, model)
+    held = {item.worker_id: item.cached for item in workers}
+    by_worker = {
+        stage["worker_id"]: sum(
+            item.unit.nbytes
+            for item in planner._stage_items(model, stage["start_layer"], stage["end_layer"])
+            if item.unit.name not in held[stage["worker_id"]]
+        )
+        for stage in proposal["proposed"]["stages"]
+    }
+    assert proposal["moved_bytes"] == sum(by_worker.values()) > 0
+    assert proposal["move_seconds"] == pytest.approx(max(by_worker.values()) / 50e6, abs=0.05)
+    assert proposal["break_even_tokens"] == pytest.approx(proposal["move_seconds"] * 1000 / proposal["saved_ms_per_token"], rel=0.01)
+    assert proposal["stages_changed"] > 0
+
+
+def test_a_proposal_changes_nothing_it_was_given() -> None:
+    model = ring_model()
+    route, workers = zigzag(model)
+    before = [stage.model_dump() for stage in route]
+    geometry.propose(route, workers, LINKS, model)
+    assert [stage.model_dump() for stage in route] == before
+
+
+def test_the_shortest_loop_has_nothing_to_propose() -> None:
+    model = ring_model()
+    shortest = names_of_workers(geometry.tour(with_mesh_links(mesh_cards()), LINKS))
+    route, workers = zigzag(model, shortest)
+    assert geometry.propose(route, workers, LINKS, model) is None
+
+
+def test_with_no_measured_link_there_is_nothing_to_propose() -> None:
+    model = ring_model()
+    route, workers = zigzag(model, links={})
+    assert geometry.propose(route, workers, {}, model) is None
+
+
+def test_a_node_that_left_ends_the_proposal() -> None:
+    model = ring_model()
+    route, workers = zigzag(model)
+    assert geometry.propose(route, [item for item in workers if item.worker_id != "c"], LINKS, model) is None
+
+
+def test_one_stage_has_no_loop_to_shorten() -> None:
+    model = ring_model()
+    route, workers = zigzag(model, ["a"], [card("a", 500, 900)])
+    assert geometry.propose(route, workers, LINKS, model) is None
+
+
+def test_a_saving_inside_a_links_swing_is_not_worth_showing() -> None:
+    names = ["a", "b", "c", "d"]
+    links = {(left, right): 20.0 for left in names for right in names if left != right}
+    links["a", "b"] = links["b", "a"] = 20.3
+    model = ring_model()
+    route, workers = zigzag(model, names, [card(name, 60, 800) for name in names], links)
+    assert geometry.propose(route, workers, links, model) is None
+
+
+def test_a_proposal_never_adds_spill(monkeypatch) -> None:
+    model = ring_model()
+    route, workers = zigzag(model)
+    monkeypatch.setattr(geometry, "route_faults", lambda found, _: (0, 0 if found is route else 1))
+    assert geometry.propose(route, workers, LINKS, model) is None
+
+
+def test_pins_stay_where_they_are() -> None:
+    model = ring_model()
+    route, workers = zigzag(model)
+    proposal = geometry.propose(route, workers, LINKS, model, entry="a", exit_="c")
+    assert proposal["proposed"]["order"][0] == "a"
+    assert proposal["proposed"]["order"][-1] == "c"
+
+
+def draft_cards(room: tuple[str, ...]) -> list[Candidate]:
+    return [card(name, 70 if name in room else 48, speed) for name, speed in MESH_SPEEDS.items()]
+
+
+def test_the_entry_stays_put_if_turning_the_loop_gains_nothing() -> None:
+    model = ring_model(entry_extra_bytes=50 * GIB)
+    route, workers = zigzag(replace(model, entry_extra_bytes=0), workers=draft_cards(("a", "c")))
+    proposal = geometry.propose(route, workers, LINKS, model, entry_bytes=5 * GIB)
+    assert proposal["proposed"]["order"][0] == "a"
+
+
+def test_the_entry_goes_where_the_draft_fits() -> None:
+    model = ring_model(entry_extra_bytes=50 * GIB)
+    route, workers = zigzag(replace(model, entry_extra_bytes=0), workers=draft_cards(("e1",)))
+    assert route[0].worker_id == "a"
+    without = geometry.propose(route, workers, LINKS, replace(model, entry_extra_bytes=0))
+    proposal = geometry.propose(route, workers, LINKS, model, entry_bytes=5 * GIB)
+    assert proposal["proposed"]["order"][0] == "e1"
+    assert proposal["moved_bytes"] > 5 * GIB
+    assert without["proposed"]["order"][0] == "a"
+
+
+def test_a_draft_that_follows_the_entry_counts_as_moved() -> None:
+    model = moe_profile()
+    route, workers = zigzag(model)
+    assert planner.moved_weights(route, workers, model) == (0, 0.0)
+    assert planner.moved_weights(route, workers, model, 5 * 10**8) == (5 * 10**8, 10.0)

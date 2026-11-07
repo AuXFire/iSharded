@@ -1062,6 +1062,43 @@ def _attempt(
     return None if fastest is None else _fill_fast_memory(fastest, search, candidates, profile)
 
 
+def plan_through(orders: list[list[Candidate]], candidates: list[Candidate], profile: ModelProfile) -> list[StageAssignment] | None:
+    """The best route that keeps to one of these orders and uses every worker in it.
+
+    VRAM comes before speed here as everywhere, and on a tie the earliest order stands.
+    """
+    paced = _paced(profile)
+
+    def worth(route: list[StageAssignment]) -> tuple[int, int, float]:
+        return *route_faults(route, candidates), _route_cost(route, candidates, profile)
+
+    for shrink in PACKING_RETRIES:
+        packer = _Packer(profile, _capacities(candidates, shrink, profile.stage_workspace_bytes))
+        stage = _stage_scorer(profile, packer)
+        walks = (_walk_order(order, profile, stage, True, set(), lambda score: (score[1], paced(score))) for order in orders)
+        routes = [route for walk in walks if walk and (route := _build_route(walk[1], profile, packer.capacities))]
+        if routes:
+            return min(routes, key=worth)
+    return None
+
+
+def moved_weights(route: list[StageAssignment], candidates: list[Candidate], profile: ModelProfile, entry_bytes: int = 0) -> tuple[int, float]:
+    """What a route would fetch, and the seconds that takes with nodes fetching side by side.
+
+    ``entry_bytes`` is what its first worker would also need, such as a draft model.
+    """
+    workers = {candidate.worker_id: candidate for candidate in candidates}
+    fetches = [_fetch(workers[stage.worker_id], profile, stage.start_layer, stage.end_layer) for stage in route]
+    first = workers[route[0].worker_id]
+    fetches[0] = fetches[0][0] + entry_bytes, fetches[0][1] + entry_bytes / (first.fetch_bytes_per_second or DEFAULT_FETCH_BYTES_PER_SECOND)
+    return sum(size for size, _ in fetches), max(seconds for _, seconds in fetches)
+
+
+def holds_entry(candidate: Candidate, profile: ModelProfile) -> bool:
+    """Whether what the entry stage carries, such as a draft, fits this worker's VRAM."""
+    return _fast_room(candidate, profile.stage_workspace_bytes) >= profile.entry_extra_bytes
+
+
 def _build_route(
     ranges: list[tuple[Candidate, int, int]],
     profile: ModelProfile,
