@@ -121,6 +121,10 @@ def reply_tokens(asked: Any) -> int:
     return min(asked, MOST_REPLY_TOKENS) if isinstance(asked, int) and asked > 0 else MOST_REPLY_TOKENS
 
 
+def a_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
 def picked(source: dict[str, Any], *names: str) -> dict[str, Any]:
     return {name: source[name] for name in names if source.get(name) is not None}
 
@@ -233,7 +237,10 @@ def anthropic_image(block: dict[str, Any]) -> dict[str, Any]:
 
 
 def anthropic_result(block: dict[str, Any]) -> dict[str, Any]:
-    text = block_text(block.get("content") or "")
+    content = block.get("content") or ""
+    if not isinstance(content, str) and any(part["type"] != "text" for part in content):
+        raise refuse("a tool_result here holds text only, since anything else in one would never reach the model")
+    text = block_text(content)
     return {"role": "tool", "tool_call_id": block["tool_use_id"], "content": f"Error: {text}" if block.get("is_error") else text}
 
 
@@ -348,7 +355,7 @@ async def anthropic_stream(items: AsyncIterator[dict[str, Any]], opening: dict[s
 
 async def anthropic_reply(node: Node, request: Request, authorization: str | None) -> Any:
     body = await json_body(request)
-    if not isinstance(body.get("max_tokens"), int) or body["max_tokens"] < 1:
+    if not a_count(body.get("max_tokens")):
         raise refuse("max_tokens: a whole number above 0 is required")
     chat = translate(anthropic_chat, body)
     items = await reply(node.chat, chat, authorization)
@@ -413,8 +420,10 @@ def responses_messages(body: dict[str, Any]) -> list[dict[str, Any]]:
             messages[-1].setdefault("tool_calls", []).append(called(item["call_id"], item["name"], item["arguments"]))
         elif kind == "function_call_output":
             output = item["output"]
-            text = output if isinstance(output, str) else "".join(part.get("text", "") for part in output)
-            messages.append({"role": "tool", "tool_call_id": item["call_id"], "content": text})
+            parts = [{"type": "text", "text": output}] if isinstance(output, str) else [response_part(part) for part in output]
+            if any(part["type"] != "text" for part in parts):
+                raise refuse("a function_call_output here holds text only, since anything else in one would never reach the model")
+            messages.append({"role": "tool", "tool_call_id": item["call_id"], "content": "".join(part["text"] for part in parts)})
         elif kind != "reasoning":
             raise refuse(f"an input item of type {kind!r} is not supported here; send messages, function_call and function_call_output")
     return messages
@@ -432,7 +441,9 @@ def responses_chat(body: dict[str, Any]) -> ChatCompletionRequest:
             raise refuse(f"{name} is refused: iSharded keeps no replies, so send the whole conversation in input")
     if body.get("background"):
         raise refuse("background is refused: iSharded keeps no replies to collect later; use stream instead")
-    if (body.get("text") or {}).get("format", {}).get("type", "text") != "text":
+    if body.get("max_output_tokens") is not None and not a_count(body["max_output_tokens"]):
+        raise refuse("max_output_tokens: a whole number above 0 is required")
+    if ((body.get("text") or {}).get("format") or {}).get("type", "text") != "text":
         raise refuse("text.format is refused: the chat path cannot hold a reply to a format, so only plain text is honest")
     choice = body.get("tool_choice")
     if isinstance(choice, dict) and choice.get("type") == "function":
@@ -706,7 +717,7 @@ async def ollama_answer(node: Node, call: Any, request: Any, body: dict[str, Any
     started = time.perf_counter()
     items = await reply(call, request, authorization)
     frame = {"model": answering_model(node, request)}
-    if body.get("stream", True):
+    if body.get("stream") is not False:  # Ollama streams unless told not to, and null tells it nothing
         return StreamingResponse(ollama_stream(items, frame, shape, started), media_type="application/x-ndjson")
     message, summary = await whole_reply(items)
     return {**frame, "created_at": ollama_time(), **shape(message["content"] or "", message.get("tool_calls", [])), **ollama_timing(summary, started)}

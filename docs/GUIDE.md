@@ -1207,7 +1207,7 @@ Other tools usually read `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`. The key m
 |---|---|
 | `max_tokens` | Required, as it is at Anthropic |
 | `system` | A string or a list of text blocks |
-| `messages` | `content` is a string or a list of `text`, `image`, `tool_use`, and `tool_result` blocks. `thinking` blocks sent back are dropped. An image comes as base64, and a URL is refused as in [Vision](#vision). A `tool_result` with `is_error` reaches the model starting with `Error:` |
+| `messages` | `content` is a string or a list of `text`, `image`, `tool_use`, and `tool_result` blocks. `thinking` blocks sent back are dropped. An image comes as base64, and a URL is refused as in [Vision](#vision). A `tool_result` with `is_error` reaches the model starting with `Error:`, and one holding anything but text is refused |
 | `temperature`, `top_p`, `top_k` | As on the [chat route](#chat-and-completion-requests) |
 | `stop_sequences` | Ends the reply, as `stop` does |
 | `stream` | Sends `message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, and `message_stop`. Tool calls come as `tool_use` blocks with `input_json_delta`, each one whole in a single delta. The prompt's token count arrives in `message_delta`, since `message_start` goes out before it is known |
@@ -1228,7 +1228,7 @@ print(client.responses.create(model=MODEL, input="Say hello.", max_output_tokens
 
 | Field | What happens to it |
 |---|---|
-| `input` | A string, or a list of items: messages with a role of `user`, `assistant`, `system`, or `developer`, then `function_call` and `function_call_output`. `reasoning` items are dropped. Parts are `input_text`, `output_text`, and `input_image` with a data URL in `image_url` |
+| `input` | A string, or a list of items: messages with a role of `user`, `assistant`, `system`, or `developer`, then `function_call` and `function_call_output`. `reasoning` items are dropped. Parts are `input_text`, `output_text`, and `input_image` with a data URL in `image_url`. A `function_call_output` holding anything but text is refused |
 | `instructions` | The system message |
 | `max_output_tokens` | The reply limit. A reply that reaches it ends with `status: "incomplete"` |
 | `temperature`, `top_p` | As on the [chat route](#chat-and-completion-requests) |

@@ -187,6 +187,13 @@ def test_a_claude_reply_with_a_call(mesh):
     assert call["type"] == "tool_use" and call["name"] == "get_weather" and call["input"] == {"city": "Paris"} and call["id"]
 
 
+def test_a_tool_result_holding_more_than_text_is_refused_rather_than_lost(plain):
+    image = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": PIXEL}}
+    turns = [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [image]}]}]
+    reply = claude(plain, messages=turns)
+    assert reply.status_code == 400 and "text only" in reply.json()["error"]["message"]
+
+
 def test_tools_anthropic_runs_are_refused(plain):
     answer = claude(plain, tools=[{"type": "web_search_20250305", "name": "web_search"}])
     assert answer.status_code == 400 and "web_search_20250305" in answer.json()["error"]["message"]
@@ -296,6 +303,27 @@ def test_a_response_has_the_published_shape(plain):
 def test_a_response_with_no_limit_runs_until_the_model_stops(plain):
     assert responses(plain).json()["status"] == "completed"
     assert plain.seen[-1]["max_tokens"] == compat.MOST_REPLY_TOKENS
+
+
+@pytest.mark.parametrize("limit", [0, -1, "64", True, 1.5])
+def test_a_reply_limit_that_is_no_number_is_refused_rather_than_unlimited(plain, limit):
+    reply = plain.client.post("/v1/responses", json={"model": "scripted", "input": "hi", "max_output_tokens": limit})
+    assert reply.status_code == 400 and "max_output_tokens" in reply.json()["error"]["message"]
+    assert claude(plain, max_tokens=limit).status_code == 400
+
+
+def test_a_format_left_null_is_plain_text(plain):
+    assert plain.client.post("/v1/responses", json={"model": "scripted", "input": "hi", "text": {"format": None}}).status_code == 200
+
+
+def test_a_function_output_holding_more_than_text_is_refused_rather_than_lost(plain):
+    output = [{"type": "input_image", "image_url": f"data:image/png;base64,{PIXEL}"}]
+    items = [{"type": "function_call_output", "call_id": "c1", "output": output}]
+    reply = plain.client.post("/v1/responses", json={"model": "scripted", "input": items})
+    assert reply.status_code == 400 and "text only" in reply.json()["error"]["message"]
+    items[0]["output"] = [{"type": "input_text", "text": "17C"}]
+    call = {"type": "function_call", "call_id": "c1", "name": "get_weather", "arguments": "{}"}
+    assert plain.client.post("/v1/responses", json={"model": "scripted", "input": [{"role": "user", "content": "hi"}, call, *items]}).status_code == 200
 
 
 def test_a_response_cut_short_says_so(plain):
@@ -439,6 +467,11 @@ def test_ollama_streams_by_default_as_json_lines(plain):
     assert final["done"] is True and final["done_reason"] == "stop" and final["message"]["content"] == ""
     assert final["prompt_eval_count"] > 0 and final["eval_count"] > 0
     assert final["total_duration"] >= final["prompt_eval_duration"] and final["load_duration"] == 0 and final["eval_duration"] >= 0
+
+
+def test_ollama_streams_when_stream_is_null(plain):
+    reply = plain.client.post("/api/chat", json={"model": "scripted", "messages": SAY["messages"], "stream": None})
+    assert reply.headers["content-type"].startswith("application/x-ndjson") and lines_of(reply.text)[-1]["done"]
 
 
 def test_a_whole_ollama_chat(plain):
