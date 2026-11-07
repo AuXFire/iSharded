@@ -3321,9 +3321,13 @@ async def event_stream(
     first_delta: dict[str, Any] | None = None,
 ) -> AsyncIterator[str]:
     """Wrap generated text in OpenAI-style server-sent events."""
+    opening = json.dumps(envelope)[:-1]  # the same for every token, so it is written once
+
+    def choice_event(choice: dict[str, Any]) -> str:
+        return f'data: {opening}, "choices": [{json.dumps(choice)}]}}\n\n'
 
     def delta_event(delta: dict[str, Any]) -> str:
-        return server_sent({**envelope, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]})
+        return choice_event({"index": 0, "delta": delta, "finish_reason": None})
 
     calls = 0
     try:
@@ -3331,7 +3335,7 @@ async def event_stream(
             yield delta_event(first_delta)
         async for item in tokens:
             if "text" in item:
-                yield server_sent({**envelope, "choices": [to_choice(item["text"], None)]})
+                yield choice_event(to_choice(item["text"], None))
                 continue
             if "tool_call" in item:
                 for delta in tool_deltas(item["tool_call"], calls):
