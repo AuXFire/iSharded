@@ -544,3 +544,15 @@ def test_one_clients_limit_cannot_take_a_model_from_everyone(assistant, alice, b
     assert alice.post("/v1/chat/completions", json={**body, "max_tokens": 10**9}).status_code == 200
     assert assistant.store.one("SELECT count(*) AS total FROM model_health")["total"] == 0
     assert bob.post("/v1/chat/completions", json=body).json()["choices"][0]["message"]["content"] == "ok"
+
+
+def test_a_key_pasted_where_a_key_file_goes_is_refused_and_not_kept(assistant, owner):
+    answer = owner.post("/assistant/providers", json={"name": "x", "url": "http://example.com:8000", "key_file": "sk-live-abcdef"})
+    assert answer.status_code == 400, answer.text
+    assert assistant.store.one("SELECT count(*) AS total FROM providers WHERE name = 'x'")["total"] == 0
+
+
+def test_a_key_file_is_still_kept_as_a_reference(assistant, owner, tmp_path):
+    path = str(tmp_path / "key.txt")
+    assert owner.post("/assistant/providers", json={"name": "x", "url": "http://example.com:8000", "key_file": path}).status_code == 200
+    assert assistant.store.one("SELECT key_reference FROM providers WHERE name = 'x'")["key_reference"] == f"file:{path}"

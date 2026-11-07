@@ -277,7 +277,8 @@ def routes(assistant: Any) -> APIRouter:
     def provider_add(body: ProviderRequest, request: Request) -> dict[str, Any]:
         if body.key_env and body.key_file:
             raise HTTPException(400, "Give one of key_env and key_file")
-        key = f"env:{body.key_env}" if body.key_env else f"file:{body.key_file}" if body.key_file else None
+        # A file stays bare, so a pasted key meets the same refusal as on the command line.
+        key = f"env:{body.key_env}" if body.key_env else body.key_file
         added = part("providers").add(
             body.name, body.url, mesh=body.mesh, key=key, reach=body.reach, tool_mode=body.tools,
             daily_tokens=body.daily_tokens, read_seconds=body.read_seconds, model=body.model, by=me(request),
