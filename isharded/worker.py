@@ -2766,7 +2766,7 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
         following = request.model_copy(update=GOING_ON)
         if draft and following.seed is None and following.temperature and entry_seeds() and runtime.ring_pipelines(following):
             # A draft can guess the exit's own draw only if it knows the seed. A seed from the
-            # system's generator draws as the system would, and a replay on these links repeats it.
+            # system's generator draws as the system would, so the reply means the same.
             following = following.model_copy(update={"seed": secrets.randbelow(2**63)})
         sampling = {"temperature": following.temperature, "top_p": following.top_p, "top_k": following.top_k, "seed": following.seed}
 
