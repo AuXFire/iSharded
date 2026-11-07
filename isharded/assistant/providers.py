@@ -54,6 +54,9 @@ TOOL_MODES = ("auto", "native", "prompt")
 TOOL_FENCE_TAGS = frozenset({"", "tool", "tools", "tool_call", "tool_calls", "toolcall", "json", "json5", "javascript", "js"})
 LOOPBACK_NAMES = frozenset({"localhost"})
 NO_TOOLS_STATUSES = (400, 404, 422, 501)
+# What one request can get wrong by itself. The rest of the 4xx range is about the key, the
+# address, or a rate limit, and those stay wrong for everyone until someone fixes them.
+REQUEST_FAULT_STATUSES = (400, 413, 422)
 
 SCHEMA = [
     """
@@ -76,6 +79,10 @@ SCHEMA = [
 
 class ProviderError(Exception):
     """A provider failed. The message is safe to show and never holds a key."""
+
+
+class RequestRefused(ProviderError):
+    """A provider turned down this one request. That says nothing about the provider, so nobody else pays for it."""
 
 
 class ProviderRefused(ValueError):
@@ -619,7 +626,8 @@ class OpenAICompatible:
         return ProviderError(f"{self.name} {what}: {type(error).__name__}")
 
     def _failed(self, response: httpx.Response) -> ProviderError:
-        return ProviderError(f"{self.name} answered HTTP {response.status_code}: {self._clean(response.text)}")
+        kind = RequestRefused if response.status_code in REQUEST_FAULT_STATUSES else ProviderError
+        return kind(f"{self.name} answered HTTP {response.status_code}: {self._clean(response.text)}")
 
     def _post(self, path: str, body: dict[str, Any], read: float, doing: str) -> httpx.Response:
         try:
@@ -1005,3 +1013,5 @@ def run_remove(assistant: Any, args: argparse.Namespace) -> int:
     assistant.providers.remove(args.name)
     emit(f"Removed {args.name}.")
     return 0
+
+

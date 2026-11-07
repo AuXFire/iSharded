@@ -230,7 +230,7 @@ A request first loses every candidate it may not use: reach, then back-off, then
 
 A candidate counts as untested until it has 3 runs. Strictly zero would let one passing fault score nothing, and a good model would then never be tried again while anything else worked.
 
-A failure backs off for 15 s, doubling to at most 5 minutes, and that survives a restart. A budget reserves the most a call could cost, so it is not overrun. A stream can move to another model only before any text has gone out.
+A failure backs off for 15 s, doubling to at most 5 minutes, and that survives a restart. Only the provider's own failure counts: a 5xx, a timeout, a lost connection, or a key, address, or rate limit it refuses. A 400, 413, or 422 turns down that one request, so it moves on to the next model and costs this one nothing, in its back-off or in its record, since models are shared and one member's bad request must not take one from everyone. The same goes for a reply the token limit ended before it said anything. The audit trail has it as `router.request_refused`. A budget reserves the most a call could cost, so it is not overrun. A stream can move to another model only before any text has gone out.
 
 `assistant.router.record_outcome(reply, role, success)` feeds back what checking the work found. A reply counts as a success when it arrives, and a failed check takes that back, so the rate means work that held up. It also takes the model name with `provider=`. A reply that names itself differently from the candidate that gave it, as a peer's does, is counted under that candidate while this process runs.
 

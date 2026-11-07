@@ -14,12 +14,14 @@ from isharded.assistant import conversation, providers
 from isharded.assistant.app import Assistant
 from isharded.assistant.cli import add_arguments, run
 from isharded.assistant.contracts import Capability, Effect, ModelReply, ModelRequest, Reach, ToolCall
+from isharded.assistant.router import AllFailed
 from isharded.assistant.providers import (
     MeshProvider,
     OpenAICompatible,
     OpenValue,
     ProviderError,
     ProviderRefused,
+    RequestRefused,
     VisibleText,
     api_root,
     estimate_tokens,
@@ -860,6 +862,91 @@ def test_a_mesh_reads_tool_calls_from_the_stream_and_falls_back_when_it_has_none
     refuse["now"] = True
     reply = mesh.complete(request, "m")  # this model has no tool calling, so the prompt takes over
     assert reply.text == "plain" and mesh.tool_mode == "prompt"
+
+
+# Whose failure it was
+
+
+def backed_off(assistant) -> int:
+    return assistant.store.one("SELECT count(*) AS total FROM model_health")["total"]
+
+
+def through_the_router(assistant, server, mesh: bool, **options):
+    assistant.providers.add("only", server.url, mesh=mesh, model="fake-model", reach="pool", **options)
+    assistant.router.set_route("conversation", ["only"])
+    return assistant.router
+
+
+@pytest.mark.parametrize("mesh", [False, True], ids=["whole", "streamed"])
+@pytest.mark.parametrize("status", [400, 413, 422])
+def test_a_request_turned_down_for_what_it_sent_costs_the_model_nothing(assistant, mesh, status):
+    with FakeModelServer([Reply(status=status)]) as server:
+        router = through_the_router(assistant, server, mesh)
+        with pytest.raises(AllFailed, match=str(status)):
+            router.complete(request())
+        assert backed_off(assistant) == 0 and router.stats() == []
+        assert router.complete(request()).text == "Hello."  # the next person gets it, at once
+
+
+@pytest.mark.parametrize("mesh", [False, True], ids=["whole", "streamed"])
+@pytest.mark.parametrize("status", [401, 403, 404, 408, 429, 500, 502, 503])
+def test_a_failure_of_the_provider_itself_still_backs_it_off(assistant, mesh, status):
+    with FakeModelServer([Reply(status=status)]) as server:
+        router = through_the_router(assistant, server, mesh)
+        with pytest.raises(AllFailed):
+            router.complete(request())
+        assert backed_off(assistant) == 1 and router.stats()[0]["successes"] == 0
+
+
+def test_a_lost_connection_and_a_silent_link_still_back_a_model_off(assistant):
+    with FakeModelServer([Reply(cut_after=1), Reply(silent=True)]) as server:
+        router = through_the_router(assistant, server, True, read_seconds=0.3)
+        with pytest.raises(AllFailed):
+            router.complete(request())
+        assert backed_off(assistant) == 1
+        assistant.store.execute("DELETE FROM model_health")
+        with pytest.raises(AllFailed, match="silent"):
+            router.complete(request())
+        assert backed_off(assistant) == 1
+
+
+def test_a_request_turned_down_still_moves_on_to_the_next_model(assistant):
+    with FakeModelServer([Reply(status=400)]) as first, FakeModelServer([Reply(text="From the second.")]) as second:
+        assistant.providers.add("first", first.url, model="m", reach="pool")
+        assistant.providers.add("second", second.url, model="m", reach="pool")
+        assistant.router.set_route("conversation", ["first", "second"])
+        assert assistant.router.complete(request()).text == "From the second."
+    assert backed_off(assistant) == 0
+    assert [row["action"] for row in assistant.audit.read() if row["action"].startswith("router.")] == ["router.request_refused"]
+
+
+@pytest.mark.parametrize("mesh", [False, True], ids=["whole", "streamed"])
+def test_a_limit_too_small_for_any_words_is_the_requests_doing(assistant, mesh):
+    """Asking for one token can leave a reply with nothing in it, and only the one who asked pays."""
+    with FakeModelServer([Reply(text="", finish="length")]) as server:
+        router = through_the_router(assistant, server, mesh)
+        with pytest.raises(AllFailed, match="replied with nothing"):
+            router.complete(request(max_tokens=1))
+        assert backed_off(assistant) == 0
+
+
+def test_an_empty_reply_the_limit_did_not_end_is_still_the_models_fault(assistant):
+    with FakeModelServer([Reply(text="")]) as server:
+        with pytest.raises(AllFailed):
+            through_the_router(assistant, server, False).complete(request())
+    assert backed_off(assistant) == 1
+
+
+def test_only_a_request_can_be_turned_down_this_way():
+    with FakeModelServer([Reply(status=400), Reply(status=503)]) as server:
+        provider = OpenAICompatible("other", server.url)
+        with pytest.raises(RequestRefused):
+            provider.complete(request(), "m")
+        with pytest.raises(ProviderError) as caught:
+            provider.complete(request(), "m")
+    assert not isinstance(caught.value, RequestRefused)
+
+
 # How a reply ended
 
 
