@@ -1674,7 +1674,7 @@ A draft keeps confirmed text on one sequence and its guesses on a scratch sequen
 
 ### Conversation reuse
 
-The same tokens are computed once per stage and reused. Every stage saves its state in two places: where a chat's system prompt and tool list end, which other conversations share, and where its settled history ends, which is where the conversation picks up next turn. If a prompt starts with exactly those tokens, stages restore the state and process only what is new. An image counts as tokens, by a digest of its bytes, so the same words about a different image share nothing past that image. Anything else, such as an edited history, reads the whole prompt. Plain text sent to `/v1/completions` has no turns to go by, so it is saved once two prompts turn out to share 512 tokens or more, and a third can reuse them. This covers GGUF models.
+The same tokens are computed once per stage and reused. Every stage saves its state in two places: where a chat's system prompt and tool list end, which other conversations share, and where its settled history ends, which is where the conversation picks up next turn. If a prompt starts with exactly those tokens, stages restore the state and process only what is new. The entry asks every later stage to restore it as the reply starts, all at once, rather than each stage when the first pass reaches it. On three CPU stages of Qwen3-0.6B, a conversation of 1,947 tokens seen before came back from disk in 0.870 s instead of 0.968 s. Only the pass it was restored for runs on a state restored this way. Anything else that reaches that sequence is replayed, and a stage that could not restore it says so when the pass comes, as it always did. An image counts as tokens, by a digest of its bytes, so the same words about a different image share nothing past that image. Anything else, such as an edited history, reads the whole prompt. Plain text sent to `/v1/completions` has no turns to go by, so it is saved once two prompts turn out to share 512 tokens or more, and a third can reuse them. This covers GGUF models.
 
 A state holds attention and recurrent state alike, so this works on hybrid models. A hybrid model can only resume where a state was saved, because recurrent state cannot be cut back to an earlier token. llama.cpp's own sequence copy is not used: copying part of a sequence aborts a stage process, and on a shared cache it leaves a hybrid model with the wrong recurrent state and no error.
 
@@ -1961,6 +1961,16 @@ A plan, and `active_plan` in `/admin/status`, shows these. All are estimates fro
 | `pace_ms` | `p` |
 | `tokens_per_miss` | `L`, or 1 if nothing was measured |
 | `ms_per_token` | Time per token by the law |
+
+### What a prompt costs
+
+A text prompt goes out a pass at a time, and each part leaves a stage as soon as that stage has run the one before it. So the stages read at once, and with S stages of equal speed the first token waits for
+
+```text
+prompt time = (sum of all parts) + (S - 1) x (largest part)
+```
+
+plus the hops and whatever comes before the first pass. A pass ends at a cut, or 512 rows after one, so no part is longer than 512 rows. A short pass before a cut, such as a 300-token system prompt, goes as a part of its own and not with the pass after it. A prompt of one pass gains nothing from parts. On three CPU stages of Qwen3-0.6B sharing one laptop, a 300-token system prompt and a 3,400-token turn went from 1.642 to 1.548 s to the first token, and with a 200-token turn from 0.311 to 0.301 s. By the formula, stages on machines of their own would save more, about 11% and 28% of the compute time, an estimate. See [the results](RESULTS.md#first-token-and-long-prompts).
 
 ### A shorter loop
 
@@ -2328,7 +2338,7 @@ Trust and status:
 
 Behavior:
 
-- A text prompt goes out in parts, so stages read it at the same time. A prompt with images still crosses the stages whole, one stage after another.
+- A text prompt goes out in parts, one pass to a part, so stages read it at the same time. A prompt with images still crosses the stages whole, one stage after another.
 - Hybrid Qwen models on the PyTorch path process prompts token by token. This is exact, but slower than a chunked kernel on long prompts.
 - Long-context rope scaling (YaRN) and sliding-window attention are refused rather than run incorrectly.
 - Expert placement is per layer, not per expert: frequently used experts are not promoted to faster memory.
