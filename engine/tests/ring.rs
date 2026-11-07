@@ -420,6 +420,19 @@ fn a_rewind_leaves_other_replies_and_earlier_places_alone() {
 }
 
 #[test]
+fn stopping_frees_a_nodes_ports_at_once() {
+    let mut ring = ring(2, true, Duration::ZERO, 2000);
+    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+    answer(&mut ring);
+    for (node, door) in ring.nodes.iter().zip(&ring.doors) {
+        node.stop();
+        for port in [door.port, door.local_port] {
+            TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|error| panic!("port {port} is still held: {error}"));
+        }
+    }
+}
+
+#[test]
 fn nobody_reaches_the_local_door_without_its_key() {
     let node = Node::new().unwrap();
     let door = listening(&node);

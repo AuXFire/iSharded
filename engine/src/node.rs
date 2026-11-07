@@ -10,6 +10,7 @@
 //! proven: a reply replays, and a lost worker is replaced.
 
 use std::collections::VecDeque;
+use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use crate::wire::{self, Ack, Answer, Hello, Kind, Nack, Pass, Refusal, Role, FLA
 const MAX_STRANGERS: usize = 16;
 const PING_EVERY: Duration = Duration::from_millis(1000);
 const WATCH_EVERY: Duration = Duration::from_millis(50);
+const ACCEPT_EVERY: Duration = Duration::from_millis(20);
 const DIAL_ATTEMPT: Duration = Duration::from_secs(5);
 const DIAL_RETRY: Duration = Duration::from_millis(250);
 /// The most replies that share one trip through the model.
@@ -212,6 +214,7 @@ struct Inner {
     strangers: AtomicUsize,
     counters: Counters,
     listening: Mutex<Option<Listening>>,
+    accepting: Mutex<Vec<thread::JoinHandle<()>>>,
     connect: Mutex<String>,
 }
 
@@ -234,6 +237,7 @@ impl Node {
             strangers: AtomicUsize::new(0),
             counters: Counters::default(),
             listening: Mutex::new(None),
+            accepting: Mutex::new(Vec::new()),
             connect: Mutex::new("idle".to_string()),
         });
         let worker = inner.clone();
@@ -273,11 +277,11 @@ impl Node {
         let text = serde_json::to_vec(&answer).map_err(|error| error.to_string())?;
         *self.inner.listening.lock() = Some(answer);
         for (listener, encrypted) in [(data, true), (local, false)] {
+            // Nothing wakes a blocking accept, and this loop must see the node stopping.
+            listener.set_nonblocking(true).map_err(|error| error.to_string())?;
             let inner = self.inner.clone();
-            thread::Builder::new()
-                .name("isharded-accept".into())
-                .spawn(move || accept_loop(&inner, &listener, encrypted))
-                .map_err(|error| error.to_string())?;
+            let thread = spawn("isharded-accept", move || accept_loop(&inner, &listener, encrypted)).map_err(|error| error.to_string())?;
+            self.inner.accepting.lock().push(thread);
         }
         Ok(text)
     }
@@ -356,6 +360,10 @@ impl Node {
         if let Some(local) = self.inner.local.lock().take() {
             local.close();
         }
+        // The ports are free once these end, and whoever stopped this may want them back.
+        for thread in std::mem::take(&mut *self.inner.accepting.lock()) {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -363,6 +371,12 @@ impl Drop for Node {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+fn spawn(name: &str, work: impl FnOnce() + Send + 'static) -> io::Result<thread::JoinHandle<()>> {
+    #[cfg(test)]
+    tests::spend_a_spawn()?;
+    thread::Builder::new().name(name.into()).spawn(work)
 }
 
 fn connect(inner: &Arc<Inner>, links: &Links) -> Result<bool, String> {
@@ -398,20 +412,27 @@ fn dial_with_retry(target: &Address, ring: &Ring, role: Role, patience: Duration
 }
 
 fn accept_loop(inner: &Arc<Inner>, listener: &TcpListener, encrypted: bool) {
-    for connection in listener.incoming() {
-        if inner.stopping.load(Ordering::Acquire) {
-            return;
+    while !inner.stopping.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((socket, _)) => admit(inner, socket, encrypted),
+            Err(_) => thread::sleep(ACCEPT_EVERY),
         }
-        let Ok(socket) = connection else {
-            continue;
-        };
-        if inner.strangers.fetch_add(1, Ordering::AcqRel) >= MAX_STRANGERS {
-            inner.strangers.fetch_sub(1, Ordering::AcqRel);
-            continue;
-        }
-        let inner = inner.clone();
-        let spawned = thread::Builder::new().name("isharded-link".into()).spawn(move || serve(&inner, socket, encrypted));
-        drop(spawned);
+    }
+}
+
+/// Gives a connection a thread, if there is room for another stranger.
+fn admit(inner: &Arc<Inner>, socket: TcpStream, encrypted: bool) {
+    // On some systems a socket takes this from the listener, and links block.
+    if socket.set_nonblocking(false).is_err() {
+        return;
+    }
+    if inner.strangers.fetch_add(1, Ordering::AcqRel) >= MAX_STRANGERS {
+        inner.strangers.fetch_sub(1, Ordering::AcqRel);
+        return;
+    }
+    let serving = inner.clone();
+    if spawn("isharded-link", move || serve(&serving, socket, encrypted)).is_err() {
+        inner.strangers.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -754,5 +775,42 @@ fn forward(inner: &Inner, ring: &Ring, pass: &Pass) {
     peer.unacked.lock().push_back((pass.id, Instant::now()));
     if let Err(error) = peer.link.send(&pass.encode()) {
         peer_lost(inner, ring, &peer, &error.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        static SPAWNS_LEFT: Cell<u32> = const { Cell::new(u32::MAX) };
+    }
+
+    /// A test cannot really run the machine out of threads, so it says when that happens.
+    pub(super) fn spend_a_spawn() -> io::Result<()> {
+        let left = SPAWNS_LEFT.get();
+        if left == 0 {
+            return Err(io::Error::other("no threads left"));
+        }
+        SPAWNS_LEFT.set(left - 1);
+        Ok(())
+    }
+
+    fn with_spawns<T>(left: u32, work: impl FnOnce() -> T) -> T {
+        SPAWNS_LEFT.set(left);
+        let done = work();
+        SPAWNS_LEFT.set(u32::MAX);
+        done
+    }
+
+    #[test]
+    fn a_connection_with_no_thread_gives_its_place_back() {
+        let node = Node::new().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _far = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        with_spawns(0, || admit(&node.inner, socket, false));
+        assert_eq!(node.inner.strangers.load(Ordering::Acquire), 0);
     }
 }
