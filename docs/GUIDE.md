@@ -953,6 +953,7 @@ A flag takes priority over its variable.
 | `ISHARDED_REUSE_CACHED`, `ISHARDED_PEER_FETCH` | Set to `0` for the control plane's `--no-reuse-cached`, `--no-peer-fetch` |
 | `ISHARDED_ENGINE` | Set to `0` to run without the native engine, on the Python path |
 | `ISHARDED_ENGINE_LIB` | The native engine's library, if it is not in `isharded/native` |
+| `ISHARDED_DRAFT_APART` | Set to `1` on the entry worker to run the draft in a process of its own, not beside the entry stage. Use it to compare the two on a real mesh |
 | `ISHARDED_RING` | Set to `0` on the coordinator to keep replies off the direct links between stages |
 | `ISHARDED_PROMPT_PARTS` | Set to `0` on the entry worker to send each prompt whole instead of in parts |
 | `ISHARDED_DATA_PORT` | The port for direct links between stages. It must be reachable from the other stages. Default: any free port |
@@ -1244,6 +1245,7 @@ Supported architectures are `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`, `qwen35`, 
 - A worker assembles a stage file from its cached units: its layers renumbered from zero, with placeholders for anything it never evaluates. To llama.cpp this is a small complete model, so stock release builds work with no patches.
 - Hidden states enter through `llama_batch.embd` and leave through the eval callback at the stage's last layer. On Qwen3.6-27B, a two-stage split gives the same tokens and logits as the whole model, and the boundary costs under 3 ms a token.
 - Each stage runs in its own process. PyTorch and llama.cpp each load an OpenMP runtime and abort when they share one, and this way a native crash cannot take the worker down.
+- The draft model runs in the entry stage's process, on a thread of its own. Two processes on one GPU take turns on it, and this way the draft and the stage share one CUDA context and run at once. It also means a crash in either stops both. The worker restarts the stage, and the draft comes back with it. `ISHARDED_DRAFT_APART=1` keeps the draft in a process of its own, as a worker with no stage process always does.
 - Stages read their weights once, unless some are on the disk tier, which needs the file mapped. Mapping kept the whole file in RAM even with the tensors in VRAM: 15.1 GiB against 1.0 GiB on a 15 GiB model, at the same speed.
 - Experts are placed separately from the rest of a layer, so a MoE can keep attention on the GPU and its experts in RAM.
 

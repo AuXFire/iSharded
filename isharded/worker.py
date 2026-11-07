@@ -85,6 +85,7 @@ from .gguf_stage import (
     GgufStage,
     ImageEncoder,
     PromptPlan,
+    draft_apart,
     next_guess_count,
     plan_prompt,
 )
@@ -664,7 +665,8 @@ class WorkerRuntime:
         self.draft_request = (request, folder, threads)
         try:
             path = self._draft_file(request.draft)
-            self.draft = DraftModel(folder, rocm_library_paths(), path, request.context_tokens, threads, request.slots)
+            beside = None if self.gguf is None or draft_apart() else self.gguf.host
+            self.draft = DraftModel(folder, rocm_library_paths(), path, request.context_tokens, threads, request.slots, beside)
         except (LlamaError, WeightSourceError, httpx.HTTPError, OSError, ValueError) as exc:
             self.last_error = f"draft model unavailable, running without it: {exc}"
 
@@ -711,17 +713,27 @@ class WorkerRuntime:
                 self.last_error = f"stage would not restart: {exc}"
                 return HTTPException(status_code=500, detail=self.last_error)
             self.stage_restarts += 1
+        if self.draft_request is not None and not draft_apart():
+            await self.replace_draft(lost)  # it lived in that process
         return retry
 
-    async def replace_draft(self, reason: Exception) -> RuntimeError:
-        """A draft is only an accelerator: lose it, try for another, and replay without it."""
-        self.last_error = f"draft model lost: {reason}"
-        draft, self.draft = self.draft, None
-        if draft is not None:
-            await asyncio.to_thread(draft.close)
-        if self.draft_request is not None:
-            await asyncio.to_thread(self._load_draft, *self.draft_request)
-        return RuntimeError("the draft model was lost; replaying without it")
+    async def replace_draft(self, reason: Exception, failed: DraftModel | None = None) -> RuntimeError:
+        """A draft is only an accelerator: lose it, try for another, and replay without it.
+
+        Every reply on a dead draft ends up here, and only the first should load a new one.
+        A draft that shares a stage's process holds memory there until it is closed.
+        """
+        lost = RuntimeError("the draft model was lost; replaying without it")
+        async with self.replacing:
+            if failed is not None and failed is not self.draft:
+                return lost
+            self.last_error = f"draft model lost: {reason}"
+            draft, self.draft = self.draft, None
+            if draft is not None:
+                await asyncio.to_thread(draft.close)
+            if self.draft_request is not None:
+                await asyncio.to_thread(self._load_draft, *self.draft_request)
+        return lost
 
     @staticmethod
     def _stage_signature(request: ConfigureRequest) -> tuple[Any, ...]:
@@ -2345,7 +2357,7 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
         try:
             await prepared
         except LlamaError as exc:
-            raise await runtime.replace_draft(exc) from exc
+            raise await runtime.replace_draft(exc, draft) from exc
         history = [*body.input_ids, token]
         produced = 1
         ahead = min(INITIAL_GUESSES, runtime.speculate_tokens)
@@ -2356,7 +2368,7 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             try:
                 guesses = await asyncio.to_thread(draft.guess, fresh, count, request.slot)
             except LlamaError as exc:
-                raise await runtime.replace_draft(exc) from exc
+                raise await runtime.replace_draft(exc, draft) from exc
             runtime._record("draft", started)
             return guesses
 

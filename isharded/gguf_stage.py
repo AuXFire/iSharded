@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
+import os
 from pathlib import Path
 import threading
 from typing import Any, Iterable, Sequence
@@ -12,7 +13,7 @@ from typing import Any, Iterable, Sequence
 import numpy as np
 
 from .gguf import GgufHeader, TensorInfo, plan_stage, write_stage
-from .llama_host import StageHost
+from .llama_host import Channel, StageHost
 from .llamacpp import LlamaError, StageLost
 from .models.gguf import GgufAdapter
 from .protocol import ConfigureRequest, MemoryPool, SavePoint, UnitPlacement
@@ -32,14 +33,24 @@ DRAFT_MEMORY = 0.9
 FEWEST_GUESSES = 2
 
 
-def start_host(operation: str, settings: dict[str, Any]) -> StageHost:
-    """A stage process that has done this load. One that failed it does not stay."""
-    host = StageHost()
+def draft_apart() -> bool:
+    """Whether a draft keeps a process of its own, so the two ways can be compared on a mesh."""
+    return os.environ.get("ISHARDED_DRAFT_APART") == "1"
+
+
+def load_on(host: Channel, operation: str, settings: dict[str, Any]) -> None:
+    """Has a host do this load. One that failed it does not stay."""
     try:
         host.call(operation, **settings)
     except LlamaError:
         host.close()
         raise
+
+
+def start_host(operation: str, settings: dict[str, Any]) -> StageHost:
+    """A stage process that has done this load."""
+    host = StageHost()
+    load_on(host, operation, settings)
     return host
 
 
@@ -442,14 +453,26 @@ class DraftText:
 
 
 class DraftModel:
-    """A small whole model on the entry worker, kept in step with the real text."""
+    """A small whole model on the entry worker, kept in step with the real text.
+
+    It runs in the entry stage's process when given ``beside``, and in one of its own if not.
+    """
 
     def __init__(
-        self, folder: str, extra_paths: tuple[str, ...], path: Path, context_tokens: int, threads: int, slots: int = 1
+        self,
+        folder: str,
+        extra_paths: tuple[str, ...],
+        path: Path,
+        context_tokens: int,
+        threads: int,
+        slots: int = 1,
+        beside: StageHost | None = None,
     ) -> None:
         self.slots = slots
         self.text: dict[int, DraftText] = {}
-        self.host = start_host(
+        self.host: Channel = StageHost() if beside is None else beside.channel()
+        load_on(
+            self.host,
             "load_draft",
             {
                 "folder": folder,

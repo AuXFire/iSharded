@@ -811,10 +811,39 @@ def test_draft_settings_keep_the_cache_the_size_it_was(monkeypatch):
     assert made["context_tokens"] * made["sequences"] == 4096 * 5
 
 
-def real_draft(slots=1):
+@pytest.mark.parametrize(("apart", "stage", "shared"), [(None, True, True), ("1", True, False), (None, False, False)])
+def test_a_draft_joins_the_entry_stage_unless_it_cannot(monkeypatch, tmp_path, apart, stage, shared):
+    from types import SimpleNamespace
+
+    from isharded import worker
+
+    if apart is None:
+        monkeypatch.delenv("ISHARDED_DRAFT_APART", raising=False)
+    else:
+        monkeypatch.setenv("ISHARDED_DRAFT_APART", apart)
+    seen = []
+    monkeypatch.setattr(worker, "DraftModel", lambda *args: seen.append(args[-1]))
+    host = object()
+    request = SimpleNamespace(speculate_tokens=4, draft=object(), assignment=SimpleNamespace(start_layer=0), context_tokens=64, slots=1)
+    runtime = SimpleNamespace(gguf=SimpleNamespace(host=host) if stage else None, _draft_file=lambda _: tmp_path, last_error=None)
+    worker.WorkerRuntime._load_draft(runtime, request, "folder", 2)
+    assert seen == [host if shared else None]
+
+
+def real_stage(host):
+    """Loads the whole model as one stage."""
+    from isharded.gguf import read_file_header
+
+    header = read_file_header(MODEL)
+    table = header.tensors["token_embd.weight"]
+    embed = {"path": MODEL, "offset": header.data_start + table.offset, "length": table.nbytes, "ggml_type": table.ggml_type}
+    host.call("load", path=MODEL, last=True, table=embed, folder=BUILD, extra_paths=[], context_tokens=256, gpu_layers=-1, threads=2, cpu_tensors=[])
+
+
+def real_draft(slots=1, beside=None):
     from isharded.gguf_stage import DraftModel
 
-    return DraftModel(BUILD, (), Path(MODEL), 256, 2, slots)
+    return DraftModel(BUILD, (), Path(MODEL), 256, 2, slots, beside)
 
 
 # Plain English in this model family's tokens, so the next token is rarely a near tie.
@@ -860,6 +889,79 @@ def test_guesses_after_a_rewind_match_a_fresh_run():
     finally:
         draft.close()
         reference.close()
+
+
+@needs_real_model
+def test_a_draft_beside_a_stage_works_while_the_stage_does():
+    from concurrent.futures import ThreadPoolExecutor
+
+    import psutil
+
+    from isharded.gguf_stage import PromptPlan
+    from isharded.llama_host import StageHost
+
+    def guesses(draft):
+        draft.prepare(REAL_PROMPT[:-1], PromptPlan())
+        made, fed = [], REAL_PROMPT[-1:]
+        for _ in range(24):
+            fed = draft.guess(fed, 1)
+            made += fed
+        return made
+
+    def passes(rows):
+        answers = []
+        for _ in range(6):
+            host.call("clear", slot=0)
+            answers.append(host.call("forward", rows, position=0)[1])
+        return answers
+
+    apart = real_draft()
+    alone = guesses(apart)
+    apart.close()
+    host = StageHost()
+    try:
+        real_stage(host)
+        rows = host.call("embed", tokens=REAL_PROMPT)[1]
+        expected = passes(rows)[0]
+        draft = real_draft(beside=host)
+        assert draft.host.process is host.process
+        with ThreadPoolExecutor(2) as pool:
+            guessed, stage_passes = pool.submit(guesses, draft), pool.submit(passes, rows)
+            assert guessed.result() == alone
+            assert all(answer == expected for answer in stage_passes.result())
+        # A draft replaced in a live process must leave nothing behind, and the stage goes on.
+        draft.close()
+        memory = psutil.Process(host.process.pid)
+        settled = memory.memory_info().rss
+        for _ in range(3):
+            draft = real_draft(beside=host)
+            assert guesses(draft) == alone
+            draft.close()
+        assert memory.memory_info().rss - settled < Path(MODEL).stat().st_size
+        assert passes(rows)[0] == expected
+    finally:
+        host.close()
+
+
+@needs_real_model
+def test_a_stage_that_dies_takes_its_draft_and_says_so():
+    from isharded.gguf_stage import PromptPlan
+    from isharded.llama_host import StageHost
+    from isharded.llamacpp import StageLost
+
+    host = StageHost()
+    try:
+        real_stage(host)
+        draft = real_draft(beside=host)
+        draft.prepare(REAL_PROMPT[:-1], PromptPlan())
+        draft.guess(REAL_PROMPT[-1:], 1)
+        host.process.kill()
+        host.process.wait()
+        with pytest.raises(StageLost):
+            draft.guess([5], 1)
+        draft.close()  # a replacement closes the old one first, and that must not fail
+    finally:
+        host.close()
 
 
 def test_a_draft_needs_a_matching_vocabulary(local_model, tmp_path, monkeypatch):

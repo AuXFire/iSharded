@@ -612,6 +612,12 @@ class LlamaStage:
             self._parts.append(captured)
         return False  # stop here: the output norm and LM head are not needed
 
+    def close(self) -> None:
+        """Frees the model, for one that shares a process that will outlive it."""
+        lib = self.library.llama
+        lib.llama_free(self.context)
+        lib.llama_model_free(self.model)
+
     def clear(self, slot: int | None = None) -> None:
         if slot is None:
             self.library.llama.llama_memory_clear(self.memory, True)

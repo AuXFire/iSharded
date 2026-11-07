@@ -1066,13 +1066,98 @@ def test_a_dead_stage_is_only_restarted_once():
             self.host = object()
 
     async def scenario():
-        worker = SimpleNamespace(replacing=asyncio.Lock(), gguf=Stage(), last_error=None, caches={}, stage_restarts=0)
+        worker = SimpleNamespace(replacing=asyncio.Lock(), gguf=Stage(), last_error=None, caches={}, stage_restarts=0, draft_request=None)
         lost = [StageLost("gone", current), StageLost("gone", current)]
         return await asyncio.gather(*(WorkerRuntime.replace_stage(worker, item) for item in lost))
 
     answers = asyncio.run(scenario())
     assert len(started) == 1
     assert all(answer.status_code == 503 for answer in answers)
+
+
+class FakeDraft:
+    def __init__(self) -> None:
+        self.closed = 0
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+class RestartingStage:
+    host = object()
+
+    def respawn(self):
+        self.host = object()
+
+
+def draft_worker(gguf=None):
+    """A worker that can load a draft, and counts how often it does."""
+    from types import SimpleNamespace
+
+    from isharded.worker import WorkerRuntime
+
+    worker = SimpleNamespace(replacing=asyncio.Lock(), gguf=gguf, last_error=None, caches={}, stage_restarts=0, draft=None, draft_request=("request",), loads=[])
+
+    def load(_):
+        worker.loads.append(FakeDraft())
+        worker.draft = worker.loads[-1]
+
+    worker._load_draft = load
+    worker.replace_draft = lambda *args: WorkerRuntime.replace_draft(worker, *args)
+    return worker
+
+
+def test_a_stage_that_restarts_brings_back_the_draft_that_lived_in_it(monkeypatch):
+    from isharded.llamacpp import StageLost
+    from isharded.worker import WorkerRuntime
+
+    monkeypatch.delenv("ISHARDED_DRAFT_APART", raising=False)
+
+    async def scenario():
+        worker = draft_worker(RestartingStage())
+        worker.draft = dead = FakeDraft()
+        await WorkerRuntime.replace_stage(worker, StageLost("gone", worker.gguf.host))
+        return worker, dead
+
+    worker, dead = asyncio.run(scenario())
+    assert dead.closed == 1
+    assert worker.draft is worker.loads[0]
+
+
+def test_a_draft_in_its_own_process_outlives_a_stage_restart(monkeypatch):
+    from isharded.llamacpp import StageLost
+    from isharded.worker import WorkerRuntime
+
+    monkeypatch.setenv("ISHARDED_DRAFT_APART", "1")
+
+    async def scenario():
+        worker = draft_worker(RestartingStage())
+        worker.draft = alive = FakeDraft()
+        await WorkerRuntime.replace_stage(worker, StageLost("gone", worker.gguf.host))
+        return worker, alive
+
+    worker, alive = asyncio.run(scenario())
+    assert alive.closed == 0
+    assert worker.draft is alive
+    assert not worker.loads
+
+
+def test_replies_on_one_dead_draft_load_one_new_draft():
+    """A draft sharing a stage's process would stay in its memory if a second load replaced the first."""
+    from isharded.worker import WorkerRuntime
+
+    async def scenario():
+        worker = draft_worker()
+        worker.draft = dead = FakeDraft()
+        answers = await asyncio.gather(*(WorkerRuntime.replace_draft(worker, RuntimeError("gone"), dead) for _ in range(3)))
+        return worker, dead, answers
+
+    worker, dead, answers = asyncio.run(scenario())
+    assert dead.closed == 1
+    assert len(worker.loads) == 1
+    assert worker.draft is worker.loads[0]
+    assert worker.loads[0].closed == 0
+    assert all(isinstance(answer, RuntimeError) for answer in answers)
 
 
 def test_diagnostics_show_what_is_waiting():
