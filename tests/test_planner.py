@@ -109,6 +109,26 @@ def test_a_card_reported_full_is_passed_over() -> None:
     assert [stage.worker_id for stage in route] == ["spare"]
 
 
+def test_a_stage_publishes_what_it_reads_per_token() -> None:
+    route = plan_placement([worker("gpu", pool("cuda:0", "vram", 8 * GIB, 300))], [], profile(experts=200 * MIB))
+    assert route[0].model_dump()["read_bytes"] == {"dense": 800 * MIB, "experts": round(1600 * MIB * 0.03), "embedding": 50 * MIB, "head": 50 * MIB}
+
+
+def test_read_bytes_follow_the_stages_and_the_size_a_pool_holds() -> None:
+    route = plan_placement([worker("a", pool("cuda:0", "vram", GIB, 300)), worker("b", pool("cuda:1", "vram", GIB, 300))], [], profile())
+    first, last = route[0].read_bytes, route[-1].read_bytes
+    assert len(route) == 2 and first.dense + last.dense == 800 * MIB
+    assert (first.embedding, first.head, last.embedding, last.head) == (50 * MIB, 0, 0, 50 * MIB)
+
+    wide = plan_placement([worker("gpu", pool("cuda:0", "vram", 8 * GIB, 300, dtype="float32"))], [], profile())
+    assert wide[0].read_bytes.dense == 1600 * MIB
+
+
+def test_a_tied_head_is_counted_once() -> None:
+    route = plan_placement([worker("gpu", pool("cuda:0", "vram", 8 * GIB, 300))], [], profile(tied=True))
+    assert (route[0].read_bytes.embedding, route[0].read_bytes.head) == (0, 50 * MIB)
+
+
 def test_spread_gives_faster_workers_more_layers() -> None:
     route = plan_placement(
         [worker("gpu", pool("cuda:0", "vram", 2 * GIB, 300)), worker("cpu", pool("ram", "ram", 2 * GIB, 30))],

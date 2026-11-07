@@ -104,6 +104,15 @@ class UnitPlacement(BaseModel):
     compact: bool = False
 
 
+class StageReads(BaseModel):
+    """Bytes a stage reads per token, at the size its pools hold them."""
+
+    dense: int = 0
+    experts: int = 0  # already multiplied by the share of experts a token uses
+    embedding: int = 0  # the whole table, though a token touches only one row of it
+    head: int = 0
+
+
 class StageAssignment(BaseModel):
     worker_id: str
     url: str
@@ -111,6 +120,7 @@ class StageAssignment(BaseModel):
     end_layer: int
     placements: list[UnitPlacement] = Field(default_factory=list)
     estimated_ms_per_token: float = 0.0
+    read_bytes: StageReads = Field(default_factory=StageReads)
 
 
 def _plain_name(value: str) -> str:

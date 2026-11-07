@@ -26,7 +26,7 @@ from itertools import pairwise, permutations
 from typing import Any
 
 from .gguf import holds_both_kinds
-from .protocol import MemoryPool, StageAssignment, UnitPlacement, WeightUnit
+from .protocol import MemoryPool, StageAssignment, StageReads, UnitPlacement, WeightUnit
 
 # Cost of one activation hop, in the same units as the rest of the estimate, for
 # two workers with no measured link. A stage waits for the next stage's reply, so
@@ -1096,9 +1096,23 @@ def _build_route(
                 end_layer=end,
                 placements=placements,
                 estimated_ms_per_token=round(milliseconds, 2),
+                read_bytes=_stage_reads(profile, start, end, placements),
             )
         )
     return route
+
+
+def _stage_reads(profile: ModelProfile, start: int, end: int, placements: list[UnitPlacement]) -> StageReads:
+    """What a stage reads per token, for anyone modelling a route from outside."""
+    held = {item.unit: item.bytes for item in placements}
+    layers = range(start, end)
+    experts = sum(held[profile.experts[layer].name] for layer in layers if layer in profile.experts)
+    return StageReads(
+        dense=sum(held[profile.dense[layer].name] for layer in layers),
+        experts=round(experts * profile.expert_active_fraction),
+        embedding=held.get(profile.embed.name, 0),
+        head=held.get(profile.head.name, 0),
+    )
 
 
 def with_links(group: list[Candidate], links: dict[tuple[str, str], float] | None) -> list[Candidate]:
