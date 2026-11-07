@@ -1947,3 +1947,30 @@ def test_resume_says_how_to_settle_a_blocked_step(assistant, engine):
         engine.resume(task, "ann", "a", None)
     with pytest.raises(ValueError, match="not a person"):
         engine.resume(task, "skill:x", "a", True)
+
+
+# What a task reports about itself
+
+
+def test_status_gives_the_goal_and_the_type_a_plan_states(engine):
+    task = engine.submit("ann", {"title": "Short", "goal": "The whole goal", "task_type": "backups", "steps": [{"id": "w", "kind": "wait", "seconds": 1}]})
+    shown = engine.status(task)
+    assert (shown["goal"], shown["task_type"]) == ("The whole goal", "backups")
+
+
+def test_with_no_stated_type_the_tools_a_plan_uses_most_decide(assistant, engine):
+    for name in ("files.read", "files.list", "shell.run"):
+        tool(assistant, name)
+    steps = [tool_step("a", "shell.run"), tool_step("b", "files.read"), tool_step("c", "files.list")]
+    assert engine.status(engine.submit("ann", {"title": "Mixed", "steps": steps}))["task_type"] == "files"
+
+
+def test_a_plan_with_no_tools_is_general_and_its_title_is_its_goal(engine):
+    shown = engine.status(engine.submit("ann", {"title": "Think", "steps": [{"id": "a", "kind": "wait", "seconds": 1}]}))
+    assert (shown["task_type"], shown["goal"]) == ("general", "Think")
+
+
+@pytest.mark.parametrize("value", ["Has Spaces", "", "x" * 65, 7])
+def test_a_bad_task_type_is_refused(engine, value):
+    with pytest.raises(ValueError, match="task_type"):
+        engine.submit("ann", {"task_type": value, "steps": [{"id": "a", "kind": "wait", "seconds": 1}]})

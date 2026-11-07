@@ -27,6 +27,7 @@ from isharded.assistant.skills import (
     REJECTED,
     RETIRED,
     SkillError,
+    applies,
     check_passes,
     is_vacuous,
 )
@@ -892,3 +893,69 @@ def test_a_command_tells_the_owner_what_to_do(tmp_path, capsys):
         assert "needs the tasks part" in capsys.readouterr().out
         bare.tasks = engine  # closing stops it
 
+
+# Reflecting on a real task
+
+
+REAL_DRAFT = json.dumps(
+    {"name": "reader", "instructions": "Read the notes.", "tests": [{"name": "reads", "input": "notes", "checks": [{"kind": "contains", "value": "read"}]}]}
+)
+
+
+def drafting() -> ScriptedRouter:
+    router = ScriptedRouter()
+    router.on("role:worker", REAL_DRAFT)
+    router.on("role:verification", json.dumps({"verdict": "accept", "notes": ""}))
+    return router
+
+
+@pytest.fixture
+def real(tmp_path):
+    with Assistant(tmp_path / "real") as built:
+        yield built
+
+
+def finished(real: Any, tmp_path: Any, **fields: Any) -> str:
+    notes = tmp_path / "notes.txt"
+    notes.write_text("hello", encoding="utf-8")
+    real.broker.add_grant("owner", "files.read", str(tmp_path), "owner")
+    step = {"id": "read", "kind": "tool", "capability": "files.read", "arguments": {"path": str(notes)}}
+    task = real.tasks.submit("owner", {"title": "Short title", "steps": [step], **fields})
+    assert real.tasks.run_until_idle(30)
+    return task
+
+
+def test_a_real_task_is_reflected_on_with_its_real_type(real, tmp_path):
+    record = real.skills.reflect(finished(real, tmp_path), propose=False)
+    assert record["task_type"] == "files"
+
+
+def test_a_type_a_plan_states_is_what_a_reflection_records(real, tmp_path):
+    assert real.skills.reflect(finished(real, tmp_path, task_type="notes"), propose=False)["task_type"] == "notes"
+
+
+def test_repeated_failures_of_real_tasks_show_under_their_own_type(real, tmp_path):
+    for _ in range(2):
+        step = {"id": "read", "kind": "tool", "capability": "files.read", "arguments": {"path": str(tmp_path / "missing.txt")}}
+        real.broker.add_grant("owner", "files.read", str(tmp_path), "owner")
+        task = real.tasks.submit("owner", {"title": "Read", "steps": [step]})
+        assert real.tasks.run_until_idle(30)
+        real.skills.reflect(task, propose=False)
+    assert [gap["task_type"] for gap in real.skills.gaps()] == ["files"]
+
+
+def test_a_draft_is_told_the_goal_and_the_type(real, tmp_path):
+    router = real.router = drafting()
+    real.skills.reflect(finished(real, tmp_path, goal="Read the whole of my notes"))
+    asked = json.dumps(list(router.requests[0].messages))
+    assert "Read the whole of my notes" in asked and "files" in asked
+
+
+def test_a_draft_that_sets_no_rules_still_reaches_a_turn(real, tmp_path):
+    """Every turn is of type general, so a skill typed only by its task would never be seen."""
+    real.router = drafting()
+    record = real.skills.reflect(finished(real, tmp_path))
+    version = real.skills.version(record["candidate"])
+    assert version.task_type == "files"
+    assert applies(version.applicability, "anything", "general") and applies(version.applicability, "anything", "files")
+    assert not applies(version.applicability, "anything", "deploy")

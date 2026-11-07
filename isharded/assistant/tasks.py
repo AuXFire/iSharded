@@ -16,6 +16,7 @@ is what lets a restart tell a crashed attempt from one that is still running.
 """
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -67,9 +68,10 @@ KIND_FIELDS = {
     "wait": {"seconds", "until"},
     "subtask": {"plan", "inputs"},
 }
-PLAN_FIELDS = {"title", "priority", "run_at", "every_seconds", "on_missed", "tainted", "reach", "inputs", "steps", "goal", "missing_grants", "checks_added"}
+PLAN_FIELDS = {"title", "priority", "run_at", "every_seconds", "on_missed", "tainted", "reach", "inputs", "steps", "goal", "task_type", "missing_grants", "checks_added"}
 CHECK_TYPES = ("exit_code", "ok", "regex", "json_schema", "file_exists")
 STEP_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+TASK_TYPE = re.compile(r"^[a-z0-9_-]{1,64}$")
 REFERENCE = re.compile(r"\{\{\s*((?:steps|inputs)\.[^{}]*?)\s*\}\}")
 STEP_REFERENCE = re.compile(r"^steps\.([A-Za-z0-9_-]+)\.(output|ok|data(?:\.[A-Za-z0-9_-]+)*)$")
 INPUT_REFERENCE = re.compile(r"^inputs\.([A-Za-z0-9_-]+)$")
@@ -570,10 +572,18 @@ def _top_errors(plan: Mapping[str, Any]) -> list[str]:
         found.append("priority must be a whole number.")
     if not isinstance(plan.get("inputs", {}), Mapping):
         found.append("inputs must be an object.")
+    if "task_type" in plan and not TASK_TYPE.fullmatch(str(plan["task_type"])):
+        found.append("task_type must be a short lowercase word: letters, digits, dashes, or underscores.")
     reach = plan.get("reach", Reach.POOL.name.lower())
     if str(reach).upper() not in Reach.__members__:
         found.append(f"reach must be one of {', '.join(name.lower() for name in Reach.__members__)}.")
     return found
+
+
+def task_type_of(plan: Mapping[str, Any]) -> str:
+    """What kind of work a plan is. A plan may say. Otherwise the tools it uses most do."""
+    families = Counter(step["capability"].split(".")[0] for step in plan["steps"] if step.get("kind") == "tool")
+    return plan.get("task_type") or (families.most_common(1)[0][0] if families else "general")
 
 
 def count_steps(plan: Any) -> int:
@@ -971,7 +981,9 @@ class DurableTasks:
 
     def status(self, task_id: str, user: str | None = None) -> dict[str, Any]:
         task = dict(self._task(task_id, user))
-        task.pop("plan")
+        plan = json.loads(task.pop("plan"))
+        task["goal"] = plan.get("goal") or task["title"]
+        task["task_type"] = task_type_of(plan)
         counts = {
             row["step_id"]: row["attempts"]
             for row in self.store.query("SELECT step_id, COUNT(*) AS attempts FROM task_attempts WHERE task_id = ? GROUP BY step_id", (task_id,))
