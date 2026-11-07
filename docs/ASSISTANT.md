@@ -1176,7 +1176,7 @@ A chat request's `tools` and `functions` are a 400, as is any `tool_choice` or `
 
 Only the newest user message in a chat request is new. A client's earlier messages and system prompt are not believed, since the assistant keeps its own record and its own identity. The OpenAI `user` field changes nothing. The real model is in the `assistant` object on the reply, or in the last event of a stream.
 
-A turn runs on its own thread and belongs to the assistant, so a client that disconnects does not lose the reply. A failure partway keeps what arrived and says so.
+A turn runs on its own thread and belongs to the assistant, so a client that disconnects does not lose the reply. A failure partway keeps what arrived and says so. A turn stopped from outside, by Ctrl-C at `say` or `chat` or by closing `assistant.conversation.stream`, keeps what arrived too, and ends in the audit trail as `conversation.cancelled`.
 
 The page is `assistant.html`, built on the same `ui.css` as the mesh's chat page and dashboard, which is inlined when it is served. It has no external resources, and a content security policy with a fresh nonce on each load. Text only ever reaches it as text. A key is kept in the tab's session storage and goes when the tab closes. It shows the conversation, what is waiting for you, memory with where each piece came from, tasks, earlier conversations, and the audit record, and for any reply what the model saw. Signing out, or a key that stops working, clears the page, so the next person to sign in sees nothing of the last. `tests/test_assistant_page.py` checks these in real Chrome, and skips itself without it.
 
