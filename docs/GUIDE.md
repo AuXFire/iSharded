@@ -1797,7 +1797,7 @@ Trust and status:
 
 Behavior:
 
-- Prompts do not overlap across stages: one stage finishes before the next begins, so a long first message costs the sum of them.
+- A text prompt goes out in parts, so stages read it at the same time. A prompt with images still crosses the stages whole, one stage after another.
 - Hybrid Qwen models on the PyTorch path process prompts token by token. This is exact, but slower than a chunked kernel on long prompts.
 - Long-context rope scaling (YaRN) and sliding-window attention are refused rather than run incorrectly.
 - Expert placement is per layer, not per expert: frequently used experts are not promoted to faster memory.
