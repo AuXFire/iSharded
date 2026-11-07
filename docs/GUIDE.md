@@ -571,11 +571,11 @@ The entry node also carries the draft model, about 1.7 GiB of VRAM for the defau
 |---|---|---|
 | `--context-tokens` | The smallest that fits your use. 8192 is a good chat default | Each reply's context costs memory on every stage |
 | `--parallel` | Your expected concurrent conversations, up to about 4 | Each one costs its own context memory |
-| Draft model | Keep it. On a model with recurrent layers, keep it for one or two users and use `--no-draft` for three or more | A busy route stops guessing by itself, except on recurrent models. See the table below |
+| Draft model | Keep it. On a model with recurrent layers, keep it for one or two users and use `--no-draft` for three or more | A busy route stops guessing by itself, unless a recurrent model is checking guesses in one pass, as it does on one stage or with no native engine. See the table below |
 | `--placement` | Leave at `auto` | `auto` takes the fastest, steadiest route through the fewest close workers that hold the model in VRAM. `spread` forces every worker in, however far away |
 | `--hashes` | Use it when any node or mirror is less than fully trusted | Every node then checks every unit |
 
-Measured on the test pool with Qwen3.6-27B Q4_K_M, a model with recurrent layers, total tokens per second across all conversations, at `--parallel 4`:
+Measured on the test pool with Qwen3.6-27B Q4_K_M, a model with recurrent layers, total tokens per second across all conversations, at `--parallel 4`. This was before recurrent models could use a pipeline, and it has not been measured since:
 
 | Conversations at once | No draft, merged passes | With a draft |
 |---:|---:|---:|
@@ -1257,7 +1257,13 @@ So a guess can only save time. Each pass is one row at its own position, which i
 
 The entry keeps just enough passes out to fill the route, up to `draft_tokens`, and fewer when guesses are landing badly. Other replies fill a route too, so a busy route gets no guesses at all.
 
-Models with recurrent layers cannot rewind past a finished pass, so they check guesses another way: several guesses go out as rows of one pass, and the real model checks them together. The number of guesses adapts as a reply goes, up to `draft_tokens`. Sampling keeps the model's distribution exactly: a guess `g` is accepted with probability `q(g)`, and a rejection draws from `q` with `g` removed. At temperature 0, batched arithmetic rounds slightly differently from single-token arithmetic, so output can differ from a run without a draft where two tokens are nearly tied.
+A model with recurrent layers cannot rewind past a finished pass by itself, so its passes also ask each stage to keep a snapshot. After such a pass a stage saves that slot's recurrent state, and a rewind restores the snapshot of the right position and then cuts attention back as usual. A stage holds `draft_tokens` + 2 snapshots for each slot, in RAM, and a slot's snapshots go when it is cleared. If a rewind finds none, the reply replays. Attention models keep no snapshots and pay nothing.
+
+A snapshot leaves attention out, so its size does not grow with the reply: 19.3 MiB for the whole of Qwen3.5-0.8B. It does cost time on every pass. On a laptop RTX 3060 it took 11 ms beside an 8 ms pass, and on a CPU 3 ms beside a 68 ms pass, so it can cost more than it saves on a small, fast model. The measuring described below is what decides.
+
+This was checked on real stages of Qwen3.5-0.8B, on CPU, with a draft. Greedy and seeded replies, one at a time and two at a time, came out identical to replies with no draft in all 36 comparisons, over 86 wrong guesses, with no refusals. Half of those runs had wrong guesses forced into them, because that draft was a copy of the model and rarely missed on a greedy reply. It was not faster there: a recurrent draft has to read its text again after each miss.
+
+On one stage, or with no native engine, a recurrent model checks guesses another way: several guesses go out as rows of one pass, and the real model checks them together. The number of guesses adapts as a reply goes, up to `draft_tokens`. Sampling keeps the model's distribution exactly: a guess `g` is accepted with probability `q(g)`, and a rejection draws from `q` with `g` removed. At temperature 0, batched arithmetic rounds slightly differently from single-token arithmetic, so output can differ from a run without a draft where two tokens are nearly tied.
 
 Guessing does not always pay, so the entry measures. It keeps whichever way has been fastest lately, by total tokens over total time, and gives the others a short trial now and then, because a route or a reply can change which one wins.
 
@@ -1802,6 +1808,7 @@ Behavior:
 - Long-context rope scaling (YaRN) and sliding-window attention are refused rather than run incorrectly.
 - Expert placement is per layer, not per expert: frequently used experts are not promoted to faster memory.
 - The planner does not reserve VRAM for a draft model. It loads into what is left on the entry node, and if it does not fit the model runs without it.
+- The planner does not count the snapshots a recurrent model keeps while guessing: up to `draft_tokens` + 2 copies of a stage's recurrent state for each slot, in RAM.
 - Multi-token batches cross between GGUF stages as BF16, and single tokens as FP32. A node set to `--dtype float32` keeps everything in FP32.
 - A stage file duplicates that node's cached units on disk.
 - GGUF files are parsed by native code in the stage process, so load them only from sources you trust.
