@@ -11,7 +11,8 @@ So a guess can only save time. Each pass is still one row at its own position, w
 plain decoding runs, so every token is the one plain decoding gives, seed and all. One row also
 matters on a mixture of experts, where a pass of 4 rows costs about 3.4 times a pass of one.
 
-Stages keep no state for this. A stage runs what reaches it in order, and a rewind clears
+Stages keep nothing for this but the snapshots recurrent state needs to rewind, and only when a
+pass asks. A stage runs what reaches it in order, and a rewind clears
 whatever is queued past it, so a thrown-away pass only ever uses a stage that had nothing better
 to do, and the pass that replaces it does not wait behind it.
 """
