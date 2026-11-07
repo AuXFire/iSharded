@@ -34,6 +34,8 @@ import threading
 import time
 from typing import Any, Callable
 
+from .pool import read_membership_request
+
 ROLE_USER = "user"
 # In a network nobody owns, another node's operator: they may propose, not command.
 ROLE_MEMBER = "member"
@@ -63,6 +65,20 @@ def node_of(worker_id: str) -> str:
 
 def digest(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()
+
+
+def new_key() -> str:
+    return "isk-" + secrets.token_urlsafe(32)
+
+
+def _check_role(role: str) -> None:
+    if role not in {ROLE_USER, ROLE_ADMIN}:
+        raise ValueError(f"role must be {ROLE_USER} or {ROLE_ADMIN}")
+
+
+def _request_lifetime(request: dict[str, Any] | None) -> int:
+    """How long a join request lasts. One carrying an invite's proof is answered in seconds."""
+    return INVITED_REQUEST_SECONDS if request and request.get("proof") else JOIN_REQUEST_SECONDS
 
 
 def canonical(entry: dict[str, Any]) -> bytes:
@@ -156,7 +172,7 @@ class AccessControl:
         path: str | None,
         identities: bool = False,
         authority: Any = None,
-    ) -> "AccessControl":
+    ) -> AccessControl:
         control = cls(pool_token=pool_token, path=Path(path) if path else None, identities=identities, authority=authority)
         if control.path and control.path.is_file():
             document = json.loads(control.path.read_text(encoding="utf-8"))
@@ -220,8 +236,6 @@ class AccessControl:
             if not isinstance(held, dict) or not isinstance(held.get("request"), str):
                 continue
             try:
-                from .pool import read_membership_request
-
                 details = read_membership_request(held["request"])
             except (ImportError, ValueError):
                 continue  # each node checks for itself, since gossip proves nothing
@@ -262,9 +276,7 @@ class AccessControl:
             return True  # the commons works out what vouches add up to
         if kind == "remove_key" and name:
             self.removed_names.add(name)
-            for hashed in [hashed for hashed, caller in self.keys.items() if caller.name == name]:
-                del self.keys[hashed]
-                self.removed.add(hashed)
+            self._drop_keys(name)
             return True
         if kind == "revoke" and name:
             self.revoked.add(name)
@@ -287,8 +299,7 @@ class AccessControl:
         """Drop requests nobody is waiting on. Any stranger can make one, so none lasts."""
         now = self.wall_clock()
         for name, held in list(self.join_requests.items()):
-            lifetime = INVITED_REQUEST_SECONDS if held.get("proof") else JOIN_REQUEST_SECONDS
-            if now - float(held.get("asked_at", now)) >= lifetime:
+            if now - float(held.get("asked_at", now)) >= _request_lifetime(held):
                 del self.join_requests[name]
 
     def _room_for(self, invite: dict[str, str] | None) -> bool:
@@ -327,8 +338,7 @@ class AccessControl:
         held = self.join_requests.get(name)
         if held is not None and float(held.get("asked_at", 0)) > asked:
             return "waiting"  # the newest ask wins, on every node alike
-        lifetime = INVITED_REQUEST_SECONDS if invite and invite.get("proof") else JOIN_REQUEST_SECONDS
-        if not now - asked < lifetime:  # a NaN lands here too
+        if not now - asked < _request_lifetime(invite):  # a NaN lands here too
             return "expired"
         if held is None and not self._room_for(invite):
             return "busy"
@@ -346,17 +356,15 @@ class AccessControl:
     def _merge_with_authority(self, document: dict[str, Any]) -> bool:
         mine = self.document()
         changed = self._take_signed(document)
-        if self.ownerless:
-            # Only signed vouches travel. Each node keeps its own keys, blocks, and cordons.
-            if changed:
-                self._save()
-            return changed
-        self._take_join_requests(document)
-        if self._rank(document) > self._rank(mine):
-            cordoned = set(document.get("cordoned_nodes", []))
-            changed = changed or cordoned != self.cordoned
-            self.cordoned = cordoned
-            self.version = max(self.version, int(document.get("version", 0)))
+        # Where nobody owns the network only signed vouches travel. Each node keeps its
+        # own keys, blocks, and cordons.
+        if not self.ownerless:
+            self._take_join_requests(document)
+            if self._rank(document) > self._rank(mine):
+                cordoned = set(document.get("cordoned_nodes", []))
+                changed = changed or cordoned != self.cordoned
+                self.cordoned = cordoned
+                self.version = max(self.version, int(document.get("version", 0)))
         if changed:
             self._save()
         return changed
@@ -425,26 +433,29 @@ class AccessControl:
 
     def add_key(self, name: str, role: str, requests_per_minute: int = 0) -> str:
         self._refuse_with_authority("a new key")
-        if role not in {ROLE_USER, ROLE_ADMIN}:
-            raise ValueError(f"role must be {ROLE_USER} or {ROLE_ADMIN}")
+        _check_role(role)
         if any(caller.name == name for caller in self.keys.values()):
             raise ValueError(f"a key named {name!r} already exists")
         from .statements import key_verifier
 
-        key = "isk-" + secrets.token_urlsafe(32)
+        key = new_key()
         self.keys[digest(key)] = Caller(name, role, requests_per_minute, verifier=key_verifier(key))
         self._changed()
         return key
 
-    def remove_key(self, name: str) -> bool:
-        self._refuse_with_authority("removing a key")
+    def _drop_keys(self, name: str) -> bool:
         found = [hashed for hashed, caller in self.keys.items() if caller.name == name]
         for hashed in found:
             del self.keys[hashed]
             self.removed.add(hashed)
+        return bool(found)
+
+    def remove_key(self, name: str) -> bool:
+        self._refuse_with_authority("removing a key")
+        found = self._drop_keys(name)
         if found:
             self._changed()
-        return bool(found)
+        return found
 
     def revoke_node(self, name: str) -> None:
         self._refuse_with_authority("revoking a node")
@@ -516,15 +527,14 @@ class AccessControl:
 
 def create_key(path: str, name: str, role: str, requests_per_minute: int = 0) -> str:
     """Add a key to a key file and return it. It cannot be read back afterwards."""
-    if role not in {ROLE_USER, ROLE_ADMIN}:
-        raise ValueError(f"role must be {ROLE_USER} or {ROLE_ADMIN}")
+    _check_role(role)
     file = Path(path)
     data = json.loads(file.read_text(encoding="utf-8")) if file.is_file() else {"keys": []}
     if any(item["name"] == name for item in data["keys"]):
         raise ValueError(f"a key named {name!r} already exists")
     from .statements import key_verifier
 
-    key = "isk-" + secrets.token_urlsafe(32)
+    key = new_key()
     data["keys"].append({"name": name, "role": role, "sha256": digest(key), "requests_per_minute": requests_per_minute, "verifier": key_verifier(key)})
     file.parent.mkdir(parents=True, exist_ok=True)
     file.write_text(json.dumps(data, indent=2), encoding="utf-8")
