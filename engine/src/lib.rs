@@ -14,6 +14,7 @@ pub mod watchdog;
 pub mod wire;
 
 use std::ffi::{c_char, c_void, CStr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use llama::{Capture, LlamaCompute, Snapshots, StageApi, TensorApi};
@@ -31,6 +32,14 @@ pub struct Engine {
     snapshots: Arc<Snapshots>,
     watchdog: Arc<Watchdog>,
     node: Node,
+}
+
+/// Folds a sample into a running average that leans on recent ones, so a figure follows the
+/// route as it is now and not as it was an hour ago.
+pub(crate) fn average(slot: &AtomicU64, sample: u64) {
+    let current = slot.load(Ordering::Relaxed);
+    let value = if current == 0 { sample } else { (current * 7 + sample) / 8 };
+    slot.store(value, Ordering::Relaxed);
 }
 
 fn write_text(text: &[u8], out: *mut c_char, capacity: usize) -> i32 {

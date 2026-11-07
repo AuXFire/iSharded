@@ -26,6 +26,7 @@ use parking_lot::lock_api::RawMutex as _;
 use parking_lot::{Condvar, Mutex, RawMutex, RwLock};
 use serde::{Deserialize, Serialize};
 
+use crate::average;
 use crate::link::{self, Frames, Identity, Link, LinkError};
 use crate::wire::{self, Ack, Answer, Hello, Kind, Nack, Pass, Refusal, Role, FLAG_BF16, FLAG_TOKENS, HEADER_BYTES, MAC_BYTES};
 
@@ -182,10 +183,27 @@ pub struct Stats {
     /// Answers at the last stage still waiting for the entry's acknowledgement.
     pub answers_held: u64,
     pub compute_us: u64,
+    /// Microseconds of compute since the ring opened, and the batches that took them, so a
+    /// reader can tell how busy the stage was between two looks.
+    pub compute_us_total: u64,
+    pub batches_total: u64,
+    /// The hop trace, each an average of local times, as no two stages share a clock. From a
+    /// pass's compute ending to its frame being queued on the link onward.
+    pub queue_us: u64,
+    /// From that frame being queued to its last byte reaching the socket.
+    pub write_us: u64,
+    /// From a pass's frame being read whole to it being queued for compute.
+    pub enqueue_us: u64,
+    /// From being queued for compute to compute starting.
     pub wait_us: u64,
     pub link_rtt_us: u64,
     /// A pass's trip to the next stage and its acknowledgement's trip back.
     pub hop_us: u64,
+    /// At the last stage: picking a token from the logits, inside compute.
+    pub sample_us: u64,
+    /// At the entry: from an answer reaching the worker to the worker's next pass for that
+    /// reply arriving, which is the worker's own turnaround and the local link both ways.
+    pub turnaround_us: u64,
     pub next_up: bool,
     pub closing_up: bool,
     pub epoch: Option<u64>,
@@ -205,15 +223,14 @@ struct Counters {
     forged: AtomicU64,
     resent: AtomicU64,
     compute_us: AtomicU64,
+    compute_us_total: AtomicU64,
+    batches_total: AtomicU64,
+    queue_us: AtomicU64,
+    enqueue_us: AtomicU64,
     wait_us: AtomicU64,
     link_rtt_us: AtomicU64,
     hop_us: AtomicU64,
-}
-
-fn average(slot: &AtomicU64, sample: u64) {
-    let current = slot.load(Ordering::Relaxed);
-    let value = if current == 0 { sample } else { (current * 7 + sample) / 8 };
-    slot.store(value, Ordering::Relaxed);
+    turnaround_us: AtomicU64,
 }
 
 struct Job {
@@ -393,6 +410,8 @@ struct Inner {
     stopping: AtomicBool,
     strangers: Mutex<Strangers>,
     counters: Counters,
+    /// At the entry: when each slot's newest answer went to the worker, and for which reply.
+    answered: Mutex<HashMap<u32, (u64, Instant)>>,
     listening: Mutex<Option<Listening>>,
     accepting: Mutex<Vec<thread::JoinHandle<()>>>,
     connect: Mutex<String>,
@@ -418,6 +437,7 @@ impl Node {
             stopping: AtomicBool::new(false),
             strangers: Mutex::default(),
             counters: Counters::default(),
+            answered: Mutex::default(),
             listening: Mutex::new(None),
             accepting: Mutex::new(Vec::new()),
             connect: Mutex::new("idle".to_string()),
@@ -474,6 +494,8 @@ impl Node {
             return Err("these keys do not fit this place in the route".to_string());
         }
         self.inner.merging.store(plan.merge_passes, Ordering::Release);
+        self.inner.counters.compute_us_total.store(0, Ordering::Relaxed);
+        self.inner.counters.batches_total.store(0, Ordering::Relaxed);
         let ring = Arc::new(Ring {
             epoch: plan.epoch,
             index: plan.index,
@@ -553,9 +575,16 @@ impl Node {
             resent: counters.resent.load(Ordering::Relaxed),
             answers_held: ring.as_ref().map_or(0, |item| item.answers.lock().len() as u64),
             compute_us: counters.compute_us.load(Ordering::Relaxed),
+            compute_us_total: counters.compute_us_total.load(Ordering::Relaxed),
+            batches_total: counters.batches_total.load(Ordering::Relaxed),
+            queue_us: counters.queue_us.load(Ordering::Relaxed),
+            write_us: ring.as_ref().and_then(|item| item.next.lock().clone().or_else(|| item.closing.lock().clone())).map_or(0, |peer| peer.link.write_us()),
+            enqueue_us: counters.enqueue_us.load(Ordering::Relaxed),
             wait_us: counters.wait_us.load(Ordering::Relaxed),
             link_rtt_us: counters.link_rtt_us.load(Ordering::Relaxed),
             hop_us: counters.hop_us.load(Ordering::Relaxed),
+            sample_us: crate::sample::average_us(),
+            turnaround_us: counters.turnaround_us.load(Ordering::Relaxed),
             next_up: ring.as_ref().is_some_and(|item| item.next.lock().is_some() || item.next_dialling.load(Ordering::Acquire)),
             closing_up: ring.as_ref().is_some_and(|item| item.closing.lock().is_some() || item.entry_closing.lock().is_some()),
             epoch: ring.as_ref().map(|item| item.epoch),
@@ -788,13 +817,18 @@ fn serve_passes(inner: &Inner, link: &Link, mut frames: Frames, acknowledge: boo
     while let Ok((kind, body)) = frames.next() {
         match kind {
             Kind::Pass => {
+                let complete = Instant::now();
                 let Ok(pass) = Pass::decode(body) else {
                     return;
                 };
                 if acknowledge && link.beat(&Ack { id: pass.id }.encode()).is_err() {
                     return;
                 }
+                if !acknowledge {
+                    note_turnaround(inner, &pass, complete);
+                }
                 enqueue(inner, pass);
+                average(&inner.counters.enqueue_us, complete.elapsed().as_micros() as u64);
             }
             Kind::Ack if acknowledge => {
                 let Ok(ack) = Ack::decode(body) else {
@@ -806,6 +840,27 @@ fn serve_passes(inner: &Inner, link: &Link, mut frames: Frames, acknowledge: boo
             Kind::Pad => {}
             _ => return,
         }
+    }
+}
+
+/// At the entry: how long the worker took to send a reply's next pass after its answer.
+/// Only the same reply counts, as the next reply on a slot may start minutes later.
+fn note_turnaround(inner: &Inner, pass: &Pass, arrived: Instant) {
+    let answered = inner.take_answered(pass.slot);
+    if let Some((generation, at)) = answered {
+        if generation == pass.generation {
+            average(&inner.counters.turnaround_us, arrived.saturating_duration_since(at).as_micros() as u64);
+        }
+    }
+}
+
+impl Inner {
+    fn take_answered(&self, slot: u32) -> Option<(u64, Instant)> {
+        self.answered.lock().remove(&slot)
+    }
+
+    fn answered_now(&self, slot: u32, generation: u64) {
+        self.answered.lock().insert(slot, (generation, Instant::now()));
     }
 }
 
@@ -880,6 +935,7 @@ fn receive_answer(inner: &Inner, ring: &Ring, link: &Link, frame: &[u8]) {
     let counter = if fresh { &inner.counters.answers } else { &inner.counters.dropped };
     counter.fetch_add(1, Ordering::Relaxed);
     if fresh {
+        inner.answered_now(answer.slot, answer.generation);
         to_local(inner, frame);
     }
 }
@@ -1156,10 +1212,14 @@ fn handle(inner: &Arc<Inner>, jobs: Vec<Job>) {
         Some(compute) => vec![compute.run(&passes[0])],
         None => passes.iter().map(|_| Err(Failure { refusal: Refusal::Retry, message: "this stage has nothing loaded".into() })).collect(),
     };
-    average(&inner.counters.compute_us, started.elapsed().as_micros() as u64);
+    let spent = started.elapsed().as_micros() as u64;
+    let done = Instant::now();
     // Safety: taken just above, on this thread.
     unsafe { inner.gate.unlock() };
     let counters = &inner.counters;
+    average(&counters.compute_us, spent);
+    counters.compute_us_total.fetch_add(spent, Ordering::Relaxed);
+    counters.batches_total.fetch_add(1, Ordering::Relaxed);
     counters.passes.fetch_add(passes.len() as u64, Ordering::Relaxed);
     counters.rows.fetch_add(passes.iter().map(|pass| pass.row_count() as u64).sum(), Ordering::Relaxed);
     if passes.len() > 1 {
@@ -1167,11 +1227,12 @@ fn handle(inner: &Arc<Inner>, jobs: Vec<Job>) {
         counters.merged_rows.fetch_add(passes.len() as u64, Ordering::Relaxed);
     }
     for (pass, result) in passes.into_iter().zip(results) {
-        finish(inner, &ring, pass, result);
+        finish(inner, &ring, pass, result, done);
     }
 }
 
-fn finish(inner: &Arc<Inner>, ring: &Arc<Ring>, pass: Pass, result: Result<Output, Failure>) {
+/// `done` is when compute ended, for the hop trace.
+fn finish(inner: &Arc<Inner>, ring: &Arc<Ring>, pass: Pass, result: Result<Output, Failure>, done: Instant) {
     match result {
         Err(failure) => refuse(inner, ring, &pass, failure.refusal, failure.message),
         Ok(Output::Tokens(tokens)) => {
@@ -1182,7 +1243,7 @@ fn finish(inner: &Arc<Inner>, ring: &Arc<Ring>, pass: Pass, result: Result<Outpu
                 None => made, // the entry is the last stage too, and nothing crosses a link
             }
             .encode();
-            answer(inner, ring, pass.id, frame);
+            answer(inner, ring, &pass, frame, done);
         }
         Ok(Output::Rows { rows, width, bf16, data }) => {
             let mut flags = pass.flags & !(FLAG_TOKENS | FLAG_BF16);
@@ -1190,19 +1251,21 @@ fn finish(inner: &Arc<Inner>, ring: &Arc<Ring>, pass: Pass, result: Result<Outpu
                 flags |= FLAG_BF16;
             }
             let onward = Pass { flags, tokens: Vec::new(), rows, width, data, ..pass };
-            forward(inner, ring, &onward);
+            forward(inner, ring, &onward, done);
         }
     }
 }
 
 /// An answer lives until the entry acknowledges it.
-fn answer(inner: &Arc<Inner>, ring: &Arc<Ring>, id: u64, frame: Vec<u8>) {
+fn answer(inner: &Arc<Inner>, ring: &Arc<Ring>, pass: &Pass, frame: Vec<u8>, done: Instant) {
     if ring.is_entry() && ring.is_last() {
+        inner.answered_now(pass.slot, pass.generation);
         to_local(inner, &frame);
         return;
     }
-    ring.answers.lock().push_back(Held { id, frame: frame.clone(), sent: Instant::now() });
+    ring.answers.lock().push_back(Held { id: pass.id, frame: frame.clone(), sent: Instant::now() });
     carry_answer(inner, ring, &frame);
+    average(&inner.counters.queue_us, done.elapsed().as_micros() as u64);
 }
 
 fn carry_answer(inner: &Arc<Inner>, ring: &Arc<Ring>, frame: &[u8]) {
@@ -1221,7 +1284,7 @@ fn resend_answers(inner: &Arc<Inner>, ring: &Arc<Ring>) {
     }
 }
 
-fn forward(inner: &Arc<Inner>, ring: &Arc<Ring>, pass: &Pass) {
+fn forward(inner: &Arc<Inner>, ring: &Arc<Ring>, pass: &Pass, done: Instant) {
     let order = ring.forwarding.lock();
     let peer = ring.next.lock().clone();
     if peer.is_none() && !ring.next_dialling.load(Ordering::Acquire) {
@@ -1232,10 +1295,12 @@ fn forward(inner: &Arc<Inner>, ring: &Arc<Ring>, pass: &Pass) {
     let frame = pass.encode();
     ring.sent.lock().push_back(Held { id: pass.id, frame: frame.clone(), sent: Instant::now() });
     // With no link, this waits with the rest for the one being dialled.
-    let failed = peer.and_then(|peer| peer.link.send(&frame).err().map(|error| (peer, error)));
+    let sent = peer.map(|peer| (peer.link.send(&frame), peer));
     drop(order);
-    if let Some((peer, error)) = failed {
-        peer_lost(inner, ring, &peer, &error.to_string(), matches!(error, LinkError::Io(_)));
+    match sent {
+        Some((Err(error), peer)) => peer_lost(inner, ring, &peer, &error.to_string(), matches!(error, LinkError::Io(_))),
+        Some((Ok(()), _)) => average(&inner.counters.queue_us, done.elapsed().as_micros() as u64),
+        None => {}
     }
 }
 

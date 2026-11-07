@@ -332,6 +332,33 @@ fn a_pass_runs_every_stage_in_order_and_the_answer_reaches_the_entry() {
 }
 
 #[test]
+fn stages_count_their_compute_and_the_entry_times_the_workers_turnaround() {
+    let mut ring = ring(3, true, Duration::from_millis(2), 2000);
+    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+    answer(&mut ring);
+    // The worker thinks for a while before its next pass.
+    thread::sleep(Duration::from_millis(40));
+    ring.client.send(&pass(2, 5, 10).encode()).unwrap();
+    answer(&mut ring);
+    for node in &ring.nodes {
+        let stats = node.stats();
+        assert_eq!(stats.batches_total, 2);
+        assert!(stats.compute_us_total >= 4000, "{}", stats.compute_us_total);
+    }
+    let turnaround = ring.nodes[0].stats().turnaround_us;
+    assert!((40_000..2_000_000).contains(&turnaround), "{turnaround}");
+    // The next reply on the slot starts long after, and that wait is no turnaround.
+    thread::sleep(Duration::from_millis(300));
+    ring.client.send(&Pass { generation: 2, ..pass(3, 5, 0) }.encode()).unwrap();
+    answer(&mut ring);
+    assert_eq!(ring.nodes[0].stats().turnaround_us, turnaround);
+    // A new route starts the totals again, so a reader can tell busy time on this one.
+    ring.nodes[1].open(Plan { epoch: 8, index: 1, count: 3, keys: keys_for(1, 3), ack_timeout_ms: 2000, silence_timeout_ms: 2000, merge_passes: true }).unwrap();
+    let stats = ring.nodes[1].stats();
+    assert_eq!((stats.batches_total, stats.compute_us_total), (0, 0));
+}
+
+#[test]
 fn without_a_closing_link_the_answer_walks_back() {
     let mut ring = ring(3, false, Duration::ZERO, 2000);
     ring.client.send(&pass(1, 5, 9).encode()).unwrap();

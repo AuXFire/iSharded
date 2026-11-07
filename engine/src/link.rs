@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -182,6 +182,10 @@ struct Outbox {
     beats: VecDeque<Vec<u8>>,
     frames: VecDeque<Vec<u8>>,
     bytes: usize,
+    /// When each real frame was queued, oldest first. Padding and beats have none.
+    queued: VecDeque<Instant>,
+    /// When the frame `take` last gave out was queued, if it was a real one.
+    taken: Option<Instant>,
 }
 
 impl Outbox {
@@ -192,6 +196,7 @@ impl Outbox {
     fn take(&mut self) -> Option<Vec<u8>> {
         let beat = self.beats.pop_front();
         if beat.is_some() {
+            self.taken = None;
             return beat;
         }
         // Padding only warms a link nothing uses yet. A real frame queued behind it warms the
@@ -207,6 +212,7 @@ impl Outbox {
         }
         let frame = self.frames.pop_front()?;
         self.bytes -= frame.len();
+        self.taken = if wire::is_pad(&frame) { None } else { self.queued.pop_front() };
         Some(frame)
     }
 }
@@ -225,6 +231,8 @@ pub struct Link {
     /// Why the writer stopped, for every sender after it to hear. It stays, so a beat that
     /// hears it first cannot hide it from the watcher that would report the link lost.
     failure: Mutex<Option<io::ErrorKind>>,
+    /// The average from a real frame being queued to its last byte reaching the socket.
+    write_us: AtomicU64,
 }
 
 impl Link {
@@ -237,6 +245,7 @@ impl Link {
             room: Condvar::new(),
             closed: AtomicBool::new(false),
             failure: Mutex::new(None),
+            write_us: AtomicU64::new(0),
         })
     }
 
@@ -255,6 +264,10 @@ impl Link {
     }
 
     /// Whether a write stalled or failed, as opposed to the far end closing the link.
+    pub fn write_us(&self) -> u64 {
+        self.write_us.load(Ordering::Relaxed)
+    }
+
     pub fn write_failed(&self) -> bool {
         self.failure.lock().is_some()
     }
@@ -303,6 +316,9 @@ impl Link {
             return Err(self.closed_error());
         }
         outbox.bytes += frame.len();
+        if !wire::is_pad(frame) {
+            outbox.queued.push_back(Instant::now());
+        }
         outbox.frames.push_back(frame.to_vec());
         self.work.notify_one();
         Ok(())
@@ -331,20 +347,21 @@ impl Link {
 
     fn write_out(&self) {
         let mut sealed = Vec::new();
-        while let Some(frame) = self.next_frame() {
-            if let Err(error) = self.write_frame(&frame, &mut sealed) {
+        while let Some((frame, queued)) = self.next_frame() {
+            match self.write_frame(&frame, &mut sealed) {
                 // Part of the frame may have gone, and nothing after it could be read.
-                self.fail(error.kind());
+                Err(error) => self.fail(error.kind()),
+                Ok(()) => queued.into_iter().for_each(|at| crate::average(&self.write_us, at.elapsed().as_micros() as u64)),
             }
         }
     }
 
-    fn next_frame(&self) -> Option<Vec<u8>> {
+    fn next_frame(&self) -> Option<(Vec<u8>, Option<Instant>)> {
         let mut outbox = self.outbox.lock();
         while !self.is_closed() {
             if let Some(frame) = outbox.take() {
                 self.room.notify_all();
-                return Some(frame);
+                return Some((frame, outbox.taken.take()));
             }
             self.work.wait(&mut outbox);
         }
