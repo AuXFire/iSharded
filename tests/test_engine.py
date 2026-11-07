@@ -333,7 +333,7 @@ def ring_worker(**fields):
         return {"engine": False}
 
     closed = []
-    item = runtime(term=5, ring_term=5, ring_door={}, revoked_nodes=set(), gguf=SimpleNamespace(ring_call=ring_call), **fields)
+    item = runtime(term=5, ring_term=5, ring_door={}, revoked_nodes=set(), merge_passes=True, gguf=SimpleNamespace(ring_call=ring_call), **fields)
     item.ring_client = SimpleNamespace(alive=True, close=lambda: closed.append(True))
     return item, asked, closed
 
