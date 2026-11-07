@@ -642,7 +642,7 @@ The entry node also carries the draft model, about 1.7 GiB of VRAM for the defau
 | Setting | Recommendation | Why |
 |---|---|---|
 | `--context-tokens` | The smallest that fits your use. 8192 is a good chat default | Each reply's context costs memory on every stage |
-| `--parallel` | Your expected concurrent conversations, up to about 4 | Each one costs its own context memory |
+| `--parallel` | Leave it out across machines, and the load [chooses](#several-conversations-at-once). On one machine, set it to your expected concurrent conversations | Each one costs its own context memory |
 | Draft model | Keep it. On a model with recurrent layers, keep it for one or two users and use `--no-draft` for three or more | A busy route stops guessing by itself, unless a recurrent model is checking guesses in one pass, as it does on one stage or with no native engine. See the table below |
 | `--placement` | Leave at `auto` | `auto` takes the fastest, steadiest route through the fewest close workers that hold the model in VRAM. `spread` forces every worker in, however far away |
 | `--hashes` | Use it when any node or mirror is less than fully trusted | Every node then checks every unit |
@@ -833,7 +833,7 @@ Loads a model on a running pool and shows progress. `model` is any [model id](#l
 | `--url` | `http://127.0.0.1:8000` | Any node's control address |
 | `--token`, `--pool-token` | This machine's pool token | An admin key |
 | `--context-tokens` | 4096 | Tokens each reply can hold |
-| `--parallel` | 1 | Replies to run at once. Each costs its own context memory |
+| `--parallel` | Chosen at load | Replies to run at once, up to 64. Each costs its own context memory. See [how the load chooses](#several-conversations-at-once) |
 | `--placement` | `auto` | `auto` picks the fastest route, `spread` uses every worker, `compact` the fewest that fit |
 | `--entry`, `--exit` | Chosen for speed | Worker to hold the entry or exit stage |
 | `--draft` | Chosen automatically | Small GGUF for speculative decoding |
@@ -1126,7 +1126,7 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `POST` | `/api/pull`, `/api/push`, `/api/create`, `/api/copy` | User key | Refused with a 400 that says to load models through iSharded |
 | `DELETE` | `/api/delete` | User key | The same |
 | `POST` | `/mcp` | User key | [MCP](#mcp) over Streamable HTTP. `GET` and `DELETE` answer 405, since there is no stream or session |
-| `GET` | `/admin/status` | User key | Workers and their `country`, memory pools, route, measured [`links`](#what-a-route-costs), epoch, mesh, lanes, load progress, and the last answer check |
+| `GET` | `/admin/status` | User key | Workers and their `country`, memory pools, route, measured [`links`](#what-a-route-costs), epoch, mesh, lanes, load progress, the last answer check, and how many [replies run at once](#several-conversations-at-once) and why |
 | `GET` | `/admin/catalog` | User key | Suggested models and supported architectures |
 | `POST` | `/admin/plan` | Admin key | Show where a model would run, without moving anything |
 | `POST` | `/admin/load` | Admin key | Load a model |
@@ -1276,7 +1276,7 @@ On two nodes on one machine, the same loop ran through the coordinator, a follow
 | `worker_model_ids` | None | A local source per worker, as worker name to path |
 | `placement` | `auto` | `auto`, `spread`, or `compact` |
 | `context_tokens` | 4096 | 128 to 1048576 |
-| `parallel` | 1 | 1 to 32 |
+| `parallel` | None | 1 to 64. None lets the load choose |
 | `entry_worker`, `exit_worker` | None | Pin the ends of the route |
 | `draft_model` | `auto` | A GGUF id, `auto`, or `none` |
 | `draft_tokens` | 6 | Most guesses out at once, 1 to 16 |
@@ -1567,7 +1567,19 @@ No reply waits for a copy to be sent. A newer turn replaces one still queued, so
 
 `--parallel 3` gives every stage three independent sequences, each with its own context memory, which the planner counts. Replies from any node queue at the entry worker, and take the sequence idle longest. Any sequence can take any saved state, so conversations past `--parallel` wait their turn and do not reread their history. While one reply is away at the next stage, this stage works on another.
 
-Single-token steps from different conversations also share a pass through a stage, because reading the weights is what a pass costs. On one stage, four conversations went from 12 to 32 tokens per second. Across two stages the same load gained only 10%, from 34 to 37, because the stages stagger the conversations. Steps with speculative guesses do not merge, so a draft limits this. `--no-merge-passes` turns it off.
+Leave `--parallel` out and the load chooses, as `min(ceil(R / T), fits)`, kept between 1 and 64:
+
+| Part | What it is |
+|---|---|
+| `R` | A row's whole trip round the route: every stage's time at its memory's measured speed, and the measured links |
+| `T` | The time the busiest device spends on one row. Stages that share a device add up on it |
+| `fits` | The most slots the same workers can hold without moving more weights out of the fastest memory. The draft's cache counts on the entry |
+
+Stages that all run on one device stay at 1, because they can only take turns on it: two stages on one GPU went from 128 tokens per second for two replies to 70 with two slots. A link nobody has measured also means 1. `--parallel` always wins.
+
+`active_plan.parallel` in `/admin/status` is the number, and `active_plan.parallel_choice` says why, with `reason`, `round_trip_ms`, `row_ms`, `devices`, and `wanted`. `POST /admin/plan` shows what a load would choose. Slots are part of what a stage is, so changing them restarts it. The choice therefore stands through repairs, a coordinator restart, and the same load again. It is made afresh only by another load, or when the pool has lost so much that the model would not fit at it.
+
+Single-token steps from different conversations also share a pass through a stage, because reading the weights is what a pass costs. On one stage, four conversations went from 12 to 32 tokens per second. Across two stages the same load gained only 10%, from 34 to 37, because the stages stagger the conversations. A merge takes every waiting step it can, wherever it sits in the queue, and a reply's own steps still run in order. A step a stage refuses is refused alone, and the rest of its merge runs. Steps with speculative guesses do not merge, so a draft limits this. `--no-merge-passes` turns it off.
 
 Past `--parallel`, replies queue at the entry worker, and past 32 waiting they are refused with a 429.
 
