@@ -387,12 +387,13 @@ def test_the_token_limit_applies_across_a_recovery() -> None:
     assert len(replays) == 1
 
 
-def gguf_orchestrator(context_tokens: int, speculate_tokens: int = 0) -> Orchestrator:
+def gguf_orchestrator(context_tokens: int, speculate_tokens: int = 0, lookup_guesses: int = 0) -> Orchestrator:
     class Target:
         adapter = GgufAdapter.__new__(GgufAdapter)
         profile = type("Profile", (), {"context_tokens": context_tokens})()
 
     Target.speculate_tokens = speculate_tokens
+    Target.lookup_guesses = lookup_guesses
     orchestrator = Orchestrator()
     orchestrator.active = Target()
     return orchestrator
@@ -411,6 +412,12 @@ def test_generation_stops_at_the_context_with_room_for_guesses() -> None:
     orchestrator = gguf_orchestrator(100, speculate_tokens=6)
     assert orchestrator._fit_context(50, 10) == 10
     assert orchestrator._fit_context(90, 10) == 3
+    asyncio.run(orchestrator.close())
+
+
+def test_guesses_from_the_text_take_no_room_from_a_reply() -> None:
+    orchestrator = gguf_orchestrator(100, speculate_tokens=16, lookup_guesses=16)
+    assert orchestrator._fit_context(90, 10) == 9, "the same as a route that makes no guesses"
     asyncio.run(orchestrator.close())
 
 

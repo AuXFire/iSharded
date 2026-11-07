@@ -571,6 +571,7 @@ def control(monkeypatch):
         adapter=gguf_adapter(),
         profile=SimpleNamespace(context_tokens=24),
         speculate_tokens=0,
+        lookup_guesses=0,
     )
     monkeypatch.setattr(runtime, "active", active)
     monkeypatch.setattr(runtime, "client", httpx.AsyncClient(transport=httpx.MockTransport(entry)))

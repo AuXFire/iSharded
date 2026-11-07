@@ -251,6 +251,9 @@ class ModelTarget:
     draft: DraftModel | None = None
     speculate_tokens: int = 0
     rewinds: bool = False
+    prompt_lookup: bool = False
+    # What ``speculate_tokens`` is on a route of two stages or more, when only lookup guesses.
+    lookup_guesses: int = 0
     request: LoadModelRequest | None = None
     # Workers that hold the whole GGUF, for a pool that cannot reach a model host.
     file_sources: list[str] = field(default_factory=list)
@@ -337,7 +340,8 @@ def build_target(
     draft = resolve_draft(request, manifest, adapter, sources, token)
     projector, image_marker = resolve_projector(request, adapter, sources, token)
     rewinds = not any(adapter.recurrent_state_bytes(index) for index in range(adapter.num_layers))
-    speculate_tokens = guess_limit(request, rewinds) if draft else 0
+    prompt_lookup = request.prompt_lookup and isinstance(adapter, GgufAdapter) and not request.embedding
+    speculate_tokens = guess_limit(request, rewinds) if draft or prompt_lookup else 0
     slots = request.parallel if isinstance(adapter, GgufAdapter) and not request.embedding else 1
     kv_share = KV_TYPES[request.kv_type if isinstance(adapter, GgufAdapter) else "f16"][1]
     units = adapter.partition(manifest.tensors)
@@ -381,6 +385,8 @@ def build_target(
         draft=draft,
         speculate_tokens=speculate_tokens,
         rewinds=rewinds,
+        prompt_lookup=prompt_lookup,
+        lookup_guesses=0 if draft else speculate_tokens,
         request=request,
         file_sources=holders,
         slots=slots,
@@ -1546,6 +1552,8 @@ class Orchestrator:
         route: list[StageAssignment],
     ) -> dict[str, str]:
         """Move fetched units into memory and switch to the new route."""
+        if target.lookup_guesses:  # one stage has nothing to overlap, so it keeps its memory
+            target.speculate_tokens = target.lookup_guesses if len(route) > 1 else 0
         # KV checkpoints append to a snapshot. Recurrent state changes whole
         # every token, so hybrid models recover by replaying the prompt.
         cache_url = self.choose_cache_url(route) if target.adapter.supports_kv_snapshots else None
@@ -1567,6 +1575,7 @@ class Orchestrator:
                 context_tokens=target.profile.context_tokens,
                 speculate_tokens=target.speculate_tokens,
                 rewinds=target.rewinds,
+                prompt_lookup=target.prompt_lookup,
                 draft=target.draft,
                 term=self.mesh.term if self.mesh else 0,
                 slots=target.slots,
@@ -2327,6 +2336,7 @@ class Orchestrator:
             if pipeline.get("tokens"):
                 add("worker_pipeline_tokens", pipeline["tokens"], "Tokens made with passes overlapping on the route", kind="counter")
                 add("worker_pipeline_misses", pipeline["misses"], "Guesses that sent a pipeline back", kind="counter")
+                add("worker_pipeline_lookups", pipeline.get("lookups", 0), "Guesses a pipeline took from the text", kind="counter")
             if telemetry.get("draft_tokens_per_pass") is not None:
                 add("worker_draft_tokens_per_pass", telemetry["draft_tokens_per_pass"], "Tokens per speculative pass", worker=worker_id)
             cache = telemetry.get("cache") or {}
@@ -2346,12 +2356,13 @@ class Orchestrator:
 
         llama.cpp fails a pass that overruns its context, and a failed pass looks
         like a dead worker. Too much text must not cost a healthy node its place.
-        Guesses need room too, since a pass runs them all before checking any.
+        A draft's guesses need room too, since a pass of several rows runs them all before
+        checking any. Guesses from the text only ever go one row at a time inside the reply.
         """
         if self.active is None or not isinstance(self.active.adapter, GgufAdapter):
             return max_tokens
         limit = self.active.profile.context_tokens
-        room = limit - prompt_tokens - self.active.speculate_tokens - 1
+        room = limit - prompt_tokens - (0 if self.active.lookup_guesses else self.active.speculate_tokens) - 1
         if room < 1:
             raise HTTPException(
                 status_code=400,

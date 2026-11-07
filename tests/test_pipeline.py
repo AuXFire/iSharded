@@ -13,7 +13,7 @@ import pytest
 
 from isharded import worker as worker_module
 from isharded import pipeline as pipeline_module
-from isharded.pipeline import Pipeline, RowClock
+from isharded.pipeline import LOOKUP_BEATS_DRAFT, LOOKUP_SHORTEST, LOOKUP_WINDOW, Pipeline, PromptLookup, RowClock
 from isharded.protocol import GenerateRequest, InferRequest, SavePoint
 from isharded.statestore import pass_ends, prompt_parts
 
@@ -436,6 +436,232 @@ def test_the_draft_hears_only_what_it_has_not_seen(right: float) -> None:
     assert (pipe.misses == 0) == (right == 1.0)
 
 
+def looked_up(text: list[int], shortest: int = LOOKUP_SHORTEST) -> int | None:
+    return PromptLookup(text).guess(shortest)
+
+
+def test_lookup_reads_on_from_where_the_newest_tokens_came_before() -> None:
+    assert looked_up([1, 2, 3, 4, 9, 1, 2, 3]) == 4
+
+
+def test_lookup_needs_a_match_long_enough() -> None:
+    assert looked_up([1, 2, 3, 4, 9, 2, 3]) is None
+    assert looked_up([5, 6, 7]) is None
+    assert looked_up([7]) is None
+
+
+def test_lookup_takes_the_longest_match_then_the_latest() -> None:
+    assert looked_up([1, 2, 3, 4, 7, 2, 3, 4, 8, 2, 3, 4, 5, 9, 1, 2, 3, 4]) == 7, "the longest"
+    assert looked_up([2, 3, 4, 7, 2, 3, 4, 8, 9, 2, 3, 4]) == 8, "and the latest of equals"
+
+
+def test_lookup_follows_a_match_without_searching_again(monkeypatch) -> None:
+    lookup = PromptLookup([1, 2, 3, 4, 5, 6, 9, 1, 2, 3])
+    assert lookup.guess(LOOKUP_SHORTEST) == 4
+    monkeypatch.setattr(lookup, "_search", lambda: pytest.fail("searched while a match held"))
+    lookup.put(4, 10)
+    assert lookup.guess(LOOKUP_SHORTEST) == 5
+    lookup.put(5, 11)
+    assert lookup.matched == 5
+
+
+def test_lookup_drops_a_match_the_text_left_and_one_a_rewind_took_away() -> None:
+    lookup = PromptLookup([1, 2, 3, 4, 5, 6, 9, 1, 2, 3])
+    assert lookup.guess(LOOKUP_SHORTEST) == 4
+    lookup.put(8, 10)
+    assert lookup.source < 0
+    lookup.put(4, 10)  # a rewind: the model said 4 goes where 8 was
+    assert lookup.end == 11
+    assert lookup.guess(LOOKUP_SHORTEST) == 5
+
+
+def test_lookup_holds_a_bounded_window_however_long_the_text_gets() -> None:
+    size = LOOKUP_WINDOW + 100
+    lookup = PromptLookup(list(range(size)))
+    assert lookup.text.size == 2 * LOOKUP_WINDOW
+    assert lookup.base == 100
+    for position in range(size, size + 3 * LOOKUP_WINDOW):
+        lookup.put(position, position)
+    assert lookup.text.size == 2 * LOOKUP_WINDOW
+    assert lookup.end <= lookup.text.size
+    newest = size + 3 * LOOKUP_WINDOW - 1
+    assert lookup.text[lookup.end - 1] == newest and lookup.base + lookup.end == newest + 1
+
+
+def test_lookup_forgets_what_slides_out_of_the_window() -> None:
+    text = [1, 2, 3, 4, *range(10, 10 + 2 * LOOKUP_WINDOW - 6), 1, 2, 3]
+    lookup = PromptLookup([])
+    for position, token in enumerate(text):
+        lookup.put(token, position)
+    assert lookup.guess(LOOKUP_SHORTEST) is None
+
+
+def test_lookup_follows_a_match_across_a_slide() -> None:
+    quote = list(range(50, 58))
+    filler = range(1000, 1000 + 2 * LOOKUP_WINDOW - 12)
+    text = [*filler[: LOOKUP_WINDOW + 10], *quote, *filler[LOOKUP_WINDOW + 10 :], *quote[:4]]
+    lookup = PromptLookup([])
+    for position, token in enumerate(text):
+        lookup.put(token, position)
+    assert lookup.guess(LOOKUP_SHORTEST) == quote[4]
+    assert lookup.end == lookup.text.size
+    lookup.put(quote[4], len(text))
+    assert lookup.end == LOOKUP_WINDOW + 1, "the window slid"
+    assert lookup.guess(LOOKUP_SHORTEST) == quote[5]
+
+
+class Quoting(Route):
+    """A route whose model repeats the prompt word for word, then writes what ``model`` says."""
+
+    def __init__(self, text: list[int], quote: list[int], at: int, length: int = 4) -> None:
+        super().__init__(text, length)
+        self.quote, self.at = quote, at
+
+    def truth(self, text: list[int]) -> int:
+        offset = len(text) - self.at
+        return self.quote[offset] if 0 <= offset < len(self.quote) else model(text)
+
+    async def run(self) -> None:
+        while self.waiting:
+            while self.clock < self.waiting[0][4]:
+                self.clock += 1
+                await asyncio.sleep(0)
+            answer, token, rollback_to, position, _ = self.waiting.popleft()
+            if rollback_to is not None:
+                del self.held[rollback_to:]
+            assert len(self.held) == position, "a pass ran at the wrong place"
+            self.held.append(token)
+            if not answer.cancelled():
+                answer.set_result([self.truth(self.held)])
+            await asyncio.sleep(0)
+        self.work = None
+
+
+QUOTE = [(index * 37 + 11) % 400 for index in range(60)]
+
+
+async def quoted_reply(draft: Draft | None, count: int = 120, stops=(), lookup: bool = True) -> tuple[list[int], list[int], Quoting, Pipeline]:
+    """A reply that quotes its prompt. Returns it and what the same route says with no guesses."""
+    prompt = [*QUOTE, 450, 451, *QUOTE[:4]]
+    route = Quoting(prompt, QUOTE, len(prompt))
+    first = route.truth(prompt)
+    history = [*prompt, first]
+
+    async def wait(answer: asyncio.Future[list[int]]) -> int:
+        return (await answer)[0]
+
+    pipe = Pipeline(history, count - 1, stops, 4, 6, route.send, wait, draft.guess if draft else None, draft.rewind if draft else None, lookup=lookup)
+    made = [first]
+    while pipe.room > 0:
+        before = len(made)
+        async for token in pipe.tokens(24):
+            made.append(token)
+        if made[-1] in stops or len(made) == before:
+            break
+    await pipe.close()
+    text = list(prompt)
+    truth = []
+    while len(truth) < count:
+        truth.append(route.truth(text))
+        text.append(truth[-1])
+        if truth[-1] in stops:
+            break
+    return made, truth, route, pipe
+
+
+def test_lookup_alone_runs_a_pipeline_and_changes_nothing() -> None:
+    made, truth, route, pipe = asyncio.run(quoted_reply(None))
+    assert made == truth
+    assert route.most_out > 1, "with no draft, the text alone filled the route"
+    assert pipe.lookups > 40
+    assert pipe.misses <= 3
+
+
+def test_a_reply_that_repeats_nothing_goes_one_pass_at_a_time() -> None:
+    async def run() -> tuple[list[int], list[int], Route, Pipeline]:
+        prompt = [7, 8, 9]
+        first = model(prompt)
+        route = Route(prompt)
+        history = [*prompt, first]
+
+        async def wait(answer: asyncio.Future[list[int]]) -> int:
+            return (await answer)[0]
+
+        pipe = Pipeline(history, 80, (), 4, 6, route.send, wait, None, None, lookup=True)
+        made = [first]
+        async for token in pipe.tokens(80):
+            made.append(token)
+        await pipe.close()
+        await pipe.land()
+        return made, plain(prompt, first, 81), route, pipe
+
+    made, truth, route, pipe = asyncio.run(run())
+    assert made == truth
+    assert pipe.misses == pipe.lookups
+    assert route.sent == 80 + pipe.lookups, "only what the text suggested went out beside the model's own"
+
+
+def test_a_short_match_leaves_the_guessing_to_the_draft() -> None:
+    made, truth, route, pipe = asyncio.run(quoted_reply(Draft(0.5), count=4))
+    assert made == truth
+    assert pipe.lookups <= 4
+    lookup = PromptLookup([*QUOTE, 450, *QUOTE[: LOOKUP_BEATS_DRAFT - 1]])
+    assert lookup.guess(LOOKUP_BEATS_DRAFT) is None
+    assert lookup.guess(LOOKUP_SHORTEST) == QUOTE[LOOKUP_BEATS_DRAFT - 1]
+
+
+@pytest.mark.parametrize("right", [0.0, 0.5, 1.0])
+def test_a_long_match_beats_the_draft_and_the_draft_still_ends_up_with_the_right_text(right: float) -> None:
+    async def run() -> tuple[list[int], list[int], Draft, Pipeline]:
+        draft = Draft(right)
+        made, truth, _, pipe = await quoted_reply(draft, count=90)
+        await pipe.land()
+        return made, truth, draft, pipe
+
+    made, truth, draft, pipe = asyncio.run(run())
+    assert made == truth
+    assert pipe.lookups > 20
+    assert draft.calls < len(made), "the draft was left alone while the text did the guessing"
+    assert draft.text == pipe.history[: len(draft.text)], "and what it missed reached it in order"
+
+
+def test_a_long_match_does_not_wait_for_a_slow_draft() -> None:
+    class Slow(Draft):
+        async def guess(self, fresh: list[int]) -> int:
+            for _ in range(200):
+                await asyncio.sleep(0)
+            return await super().guess(fresh)
+
+    async def run() -> tuple[list[int], list[int], Slow, Quoting, Pipeline]:
+        draft = Slow(0.5)
+        made, truth, route, pipe = await quoted_reply(draft, count=50)
+        await pipe.land()
+        return made, truth, draft, route, pipe
+
+    made, truth, draft, route, pipe = asyncio.run(run())
+    assert made == truth
+    assert route.most_out > 1
+    assert draft.calls <= 3, "the text kept the route full while the draft thought"
+    assert draft.text == pipe.history[: len(draft.text)]
+
+
+def test_a_stop_in_the_text_ends_the_guessing_like_a_draft_expecting_the_end() -> None:
+    stop = QUOTE[20]
+    made, truth, route, pipe = asyncio.run(quoted_reply(None, stops={stop}))
+    assert made == truth
+    assert made[-1] == stop
+    assert route.furthest <= len(QUOTE) + 6 + 20, "nothing went past where the text says the reply ends"
+
+
+def test_landing_a_reply_with_no_draft_needs_nothing_to_rewind() -> None:
+    async def run() -> Pipeline:
+        made, truth, route, pipe = await quoted_reply(None, count=10)
+        await pipe.land()
+        return pipe
+
+    assert asyncio.run(run()).flights == deque()
+
+
 def test_a_prompt_divides_where_a_whole_prompt_would_stop() -> None:
     assert prompt_parts([], 100) == [(0, 100)]
     assert prompt_parts([], 1500) == [(0, 512), (512, 1024), (1024, 1500)]
@@ -766,3 +992,57 @@ def test_a_draft_goes_on_from_the_whole_reply_after_a_resume(entry, monkeypatch)
     assert draft.prompt == [1, 2], "it reads the prompt, and the rest as text it has not seen"
     assert draft.texts[0] == [7, 8, 303]
     assert entry[3].rollback_to == 4, "the next pass goes after everything already written"
+
+
+@pytest.fixture
+def lookup_only(entry, monkeypatch):
+    """The entry of a two-stage route with no draft, where lookup is on."""
+    runtime = worker_module.runtime
+    monkeypatch.setattr(runtime, "route", [1, 2])
+    monkeypatch.setattr(runtime, "speculate_tokens", 4)
+    monkeypatch.setattr(runtime, "prompt_lookup", True)
+    monkeypatch.setattr(runtime, "draft_choice", worker_module.DraftChoice())
+    monkeypatch.setattr(worker_module, "PIPELINE_STRETCH", 4)
+    return entry
+
+
+# The first token is 301, which makes the end of the text match its start.
+QUOTING_PROMPT = [5, 6, 301, 7, 8, 9, 4, 5, 6]
+
+
+def test_lookup_runs_a_pipeline_on_a_route_with_no_draft(lookup_only, monkeypatch) -> None:
+    ring = Ring()
+    on_ring(monkeypatch, ring)
+    body = GenerateRequest(session_id="s", epoch=1, input_ids=QUOTING_PROMPT, max_tokens=4, reset=True)
+    tokens = asyncio.run(stream_of(body))
+    assert tokens[0] == 301 and len(tokens) == 4
+    assert ring.sent[:2] == [(301, 9, 9), (7, 10, None)], "a guess from the text goes out behind the model's own token"
+    assert worker_module.runtime.pipeline_lookups > 0
+
+
+def test_a_guess_from_the_text_never_rides_in_a_pass_of_several_rows(lookup_only) -> None:
+    # Rows checked together round differently from a row alone, and that would change a reply.
+    body = GenerateRequest(session_id="s", epoch=1, input_ids=QUOTING_PROMPT, max_tokens=4, reset=True)
+    assert asyncio.run(stream_of(body)) == [301, 302, 303, 304]
+    assert [item.input_ids for item in lookup_only[1:]] == [[301], [302], [303]]
+    assert not any(item.verify for item in lookup_only)
+
+
+@pytest.mark.parametrize("route, lookup", [([1], True), ([1, 2], False)])
+def test_a_reply_with_nothing_to_guess_with_runs_as_it_always_did(lookup_only, monkeypatch, route, lookup) -> None:
+    monkeypatch.setattr(worker_module.runtime, "route", route)
+    monkeypatch.setattr(worker_module.runtime, "prompt_lookup", lookup)
+    body = GenerateRequest(session_id="s", epoch=1, input_ids=QUOTING_PROMPT, max_tokens=2, reset=True)
+    assert asyncio.run(stream_of(body)) == [301, 302]
+    assert lookup_only[1].rollback_to is None, "this is the plain path"
+
+
+def test_the_choice_can_leave_a_lookup_pipeline_and_come_back(lookup_only, monkeypatch) -> None:
+    ring = Ring()
+    on_ring(monkeypatch, ring)
+    choice = worker_module.runtime.draft_choice
+    choice.note("plain", 100, 1.0)
+    choice.note("pipelined", 10, 1.0)
+    body = GenerateRequest(session_id="s", epoch=1, input_ids=QUOTING_PROMPT, max_tokens=4, reset=True)
+    assert len(asyncio.run(stream_of(body))) == 4
+    assert ring.sent == [], "plain was faster, so nothing guessed"

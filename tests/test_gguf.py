@@ -1471,3 +1471,13 @@ def test_a_load_that_names_a_guess_limit_keeps_it():
 def test_no_load_goes_past_the_guess_cap(value):
     with pytest.raises(ValueError):
         load_settings(draft_tokens=value)
+
+
+def test_lookup_is_on_unless_a_load_or_the_command_line_says_not(monkeypatch):
+    from isharded import cli
+
+    assert load_settings().prompt_lookup
+    parser = cli.build_parser()
+    assert "prompt_lookup" not in cli.load_body(parser.parse_args(["load", "m"]))
+    assert cli.load_body(parser.parse_args(["load", "m", "--no-lookup"]))["prompt_lookup"] is False
+    assert cli.load_body(parser.parse_args(["load", "m", "--no-draft"]))["draft_model"] == "none"

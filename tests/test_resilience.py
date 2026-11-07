@@ -1,6 +1,7 @@
 import asyncio
 import json
 from pathlib import Path
+import re
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -1886,6 +1887,48 @@ def test_a_lane_is_only_ready_when_it_is_serving(monkeypatch):
     assert asyncio.run(orchestrator_module.lane_status(None))["ready"] is False
     orchestrator.workers["w1"].health = {"status": "ok", "epoch": 3}
     assert asyncio.run(orchestrator_module.lane_status(None))["ready"] is True
+    done(orchestrator)
+
+
+def test_metrics_say_how_many_guesses_came_from_the_text():
+    pipeline = {"tokens": 9, "misses": 1, "depth": 2, "lookups": 5}
+    orchestrator = pool(w1=record("w1", health={"status": "ok", "telemetry": {"pipeline": pipeline}}))
+    assert re.search(r"^isharded_worker_pipeline_lookups\S* 5", orchestrator.metrics_text(), re.M)
+    done(orchestrator)
+
+
+def lookup_target(guesses: int) -> MagicMock:
+    target = MagicMock()
+    target.adapter.supports_kv_snapshots = False
+    target.lookup_guesses = guesses
+    target.speculate_tokens = guesses
+    return target
+
+
+@pytest.mark.parametrize(
+    "guesses, stages, expected",
+    [(16, 2, 16), (16, 1, 0), (0, 1, 7)],
+    ids=["two stages can overlap", "one stage keeps its memory", "a draft guesses on one stage too"],
+)
+def test_lookup_alone_asks_for_guess_room_only_where_a_pipeline_can_run(monkeypatch, guesses, stages, expected):
+    orchestrator = pool(w1=record("w1"), w2=record("w2"))
+    orchestrator.tokenizer = object()
+    orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json={})))
+    made = MagicMock(return_value=MagicMock(model_dump=dict))
+    monkeypatch.setattr(orchestrator_module, "ConfigureRequest", made)
+    orchestrator.save_state = lambda target: None
+    target = lookup_target(guesses)
+    if not guesses:
+        target.speculate_tokens = expected
+
+    async def scenario():
+        await orchestrator._activate(target, [stage(f"w{index + 1}") for index in range(stages)])
+        await asyncio.gather(*orchestrator.background, return_exceptions=True)
+        await orchestrator.client.aclose()
+
+    asyncio.run(scenario())
+    assert target.speculate_tokens == expected
+    assert made.call_args.kwargs["speculate_tokens"] == expected
     done(orchestrator)
 
 

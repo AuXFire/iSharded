@@ -7,6 +7,9 @@ stage samples exactly as it does for a plain pass. If its answer is the guess, t
 was already right and already on its way. If not, whatever followed is thrown away and the reply
 goes on from the model's own token.
 
+Guesses come from a draft, from the text itself, or both. Text often repeats what came before,
+as code and quoted documents do, and finding that costs no model at all.
+
 So a guess can only save time. Each pass is still one row at its own position, which is what
 plain decoding runs, so every token is the one plain decoding gives, seed and all. One row also
 matters on a mixture of experts, where a pass of 4 rows costs about 3.4 times a pass of one.
@@ -27,6 +30,8 @@ import math
 import time
 from typing import Any
 
+import numpy as np
+
 # A guess this unlikely to count is not worth sending, however idle the stages are.
 WORTH_SENDING = 0.03
 WORTH_LOG = math.log(WORTH_SENDING)
@@ -37,6 +42,77 @@ FIRST_RIGHT = 0.6
 STEP_WEIGHT = 0.2
 # The fastest trip is forgotten slowly, because a route can get slower.
 TRIP_DRIFT = 1.02
+# How much text a lookup searches. It holds up to twice this, at 4 bytes a token, and one search
+# reads it once, so this sets both its memory and the most a token can cost.
+LOOKUP_WINDOW = 1 << 16
+# The fewest matching tokens worth a guess, and the most a search compares.
+LOOKUP_SHORTEST = 3
+LOOKUP_LONGEST = 8
+# A match this long has been right more often than a draft, and takes no time to make.
+LOOKUP_BEATS_DRAFT = 5
+
+
+class PromptLookup:
+    """Guesses by finding the last few tokens earlier in the text, and reading on from there.
+
+    A search runs only when no match is being followed, so a run of good guesses costs almost
+    nothing, and it searches a fixed window, so a long prompt costs no more than a short one.
+    """
+
+    def __init__(self, text: list[int]) -> None:
+        recent = text[-LOOKUP_WINDOW:]
+        self.text = np.zeros(2 * LOOKUP_WINDOW, dtype=np.int32)
+        self.text[: len(recent)] = recent
+        self.end = len(recent)
+        # Where text[0] is in the reply.
+        self.base = len(text) - len(recent)
+        # Where the match being followed reads next, and how long it is so far.
+        self.source = -1
+        self.matched = 0
+
+    def put(self, token: int, position: int) -> None:
+        """The text now has ``token`` at ``position``, and nothing after it."""
+        at = position - self.base
+        if at < self.end:
+            self.end, self.source = at, -1
+        if self.end == self.text.size:
+            self._slide()
+        self.text[self.end] = token
+        self.end += 1
+        if self.source >= 0 and self.text[self.source] == token:
+            self.source += 1
+            self.matched += 1
+        else:
+            self.source = -1
+
+    def _slide(self) -> None:
+        """Forgets the oldest half. Each token moves once per window, so this costs next to nothing."""
+        self.text[:LOOKUP_WINDOW] = self.text[-LOOKUP_WINDOW:]
+        self.end = LOOKUP_WINDOW
+        self.base += self.text.size - LOOKUP_WINDOW
+        self.source = self.source - LOOKUP_WINDOW if self.source >= LOOKUP_WINDOW else -1
+
+    def _search(self) -> None:
+        """Finds the longest match for the newest tokens, and the latest among those."""
+        newest = self.end - 1
+        hits = np.flatnonzero(self.text[:newest] == self.text[newest])
+        length = 1
+        while hits.size and length < min(LOOKUP_LONGEST, newest + 1):
+            hits_before = hits[hits >= length]
+            longer = hits_before[self.text[hits_before - length] == self.text[newest - length]]
+            if not longer.size:
+                break
+            hits, length = longer, length + 1
+        if hits.size and length >= LOOKUP_SHORTEST:
+            self.source, self.matched = int(hits[-1]) + 1, length
+
+    def guess(self, shortest: int) -> int | None:
+        """What comes next, if a match of at least ``shortest`` tokens says so."""
+        if self.source < 0 and self.end > 1:
+            self._search()
+        return int(self.text[self.source]) if self.source >= 0 and self.matched >= shortest else None
+
+
 class RowClock:
     """How long one row takes on a route, measured like a pipeline's step, between answers.
 
@@ -70,7 +146,8 @@ class Pipeline:
     """One reply's passes on a route. ``history`` is the reply so far, and grows here.
 
     ``guess`` hears only the tokens the draft has not seen, and ``told`` is how much it had
-    seen at the start, so a guess costs the same however long the reply is.
+    seen at the start, so a guess costs the same however long the reply is. With no draft,
+    ``guess`` and ``rewind`` are None and every guess comes from ``lookup``.
     """
 
     def __init__(
@@ -82,10 +159,11 @@ class Pipeline:
         limit: int,
         send: Callable[[int, int, int | None], asyncio.Future[Any]],
         wait: Callable[[asyncio.Future[Any]], Awaitable[int]],
-        guess: Callable[[list[int]], Awaitable[int]],
-        rewind: Callable[[int], Awaitable[None]],
+        guess: Callable[[list[int]], Awaitable[int]] | None,
+        rewind: Callable[[int], Awaitable[None]] | None,
         sharing: Callable[[], int] = lambda: 1,
         told: int = 0,
+        lookup: bool = False,
         clock: RowClock | None = None,
     ) -> None:
         self.history = history
@@ -99,6 +177,7 @@ class Pipeline:
         self.rewind = rewind
         self.sharing = sharing
         self.told = told
+        self.lookup = PromptLookup(history) if lookup else None
         self.clock = clock or RowClock()
         self.flights: deque[Flight] = deque()
         self.right = FIRST_RIGHT
@@ -116,6 +195,7 @@ class Pipeline:
         self.ending = False
         self.tokens_made = 0
         self.misses = 0
+        self.lookups = 0
 
     def _priced(self) -> int:
         """The most passes this reply may keep out, now that other replies want the route too.
@@ -143,6 +223,8 @@ class Pipeline:
 
     def _launch(self, token: int, position: int, rollback_to: int | None = None) -> None:
         answer = self.send(token, position, rollback_to)
+        if self.lookup is not None:
+            self.lookup.put(token, position)
         self.flights.append(Flight(token, position, answer, time.perf_counter(), not self.flights))
 
     def _fresh(self) -> list[int]:
@@ -154,16 +236,40 @@ class Pipeline:
         return self.history[told:] + [flight.token for flight in self.flights if flight.position >= max(known, told)]
 
     async def _next_guess(self, fresh: list[int]) -> int:
+        assert self.guess is not None and self.rewind is not None
         if self.wrong_from is not None:
             keep, self.wrong_from = self.wrong_from, None
             await self.rewind(keep)
         return await self.guess(fresh)
 
+    def _send_guess(self, guess: int) -> None:
+        if guess in self.stops:
+            self.ending = True
+        else:
+            self._launch(guess, self.flights[-1].position + 1)
+
+    def _looked_up(self) -> int | None:
+        """A guess from the text, if there is one the draft would not do better than."""
+        if self.lookup is None:
+            return None
+        return self.lookup.guess(LOOKUP_SHORTEST if self.guess is None else LOOKUP_BEATS_DRAFT)
+
     def _guess_on(self) -> None:
-        """Starts the next guess, if the route has room for one."""
-        if self.guessing is None and not self.ending and len(self.flights) < min(self.depth(), self.room):
-            self.guessing_for = (self.misses, self.flights[-1].position)
-            self.guessing = asyncio.ensure_future(self._next_guess(self._fresh()))
+        """Starts the next guess, while the route has room for one.
+
+        A guess from the text is there at once, so several can go out here, and none waits for a
+        slow draft. The draft is not told about them. They reach it with the rest of what it has
+        not seen, next time it is asked, and a guess it was making for that place is thrown away.
+        """
+        while not self.ending and len(self.flights) < min(self.depth(), self.room):
+            guess = self._looked_up()
+            if guess is None:
+                if self.guess is not None and self.guessing is None:
+                    self.guessing_for = (self.misses, self.flights[-1].position)
+                    self.guessing = asyncio.ensure_future(self._next_guess(self._fresh()))
+                return
+            self.lookups += 1
+            self._send_guess(guess)
 
     def _take_guess(self) -> None:
         assert self.guessing is not None
@@ -171,10 +277,7 @@ class Pipeline:
         self.guessing = None
         if self.guessing_for != (self.misses, self.flights[-1].position):
             return  # the reply moved on while it was being made
-        if guess in self.stops:
-            self.ending = True
-        else:
-            self._launch(guess, self.flights[-1].position + 1)
+        self._send_guess(guess)
 
     async def _answer(self, flight: Flight) -> int:
         """Keeps guessing until the oldest pass is back, or ``wait`` gives up on it."""
@@ -246,7 +349,8 @@ class Pipeline:
         self._abandon()
         await self.close()
         known = len(self.history)
-        await self.rewind(known if self.wrong_from is None else min(self.wrong_from, known))
+        if self.rewind is not None:
+            await self.rewind(known if self.wrong_from is None else min(self.wrong_from, known))
         self.wrong_from = None
 
     async def close(self) -> None:
