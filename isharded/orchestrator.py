@@ -1825,38 +1825,57 @@ class Orchestrator:
     async def _fit_slots(self, target: ModelTarget, route: list[StageAssignment], links: dict[tuple[str, str], float]) -> dict[str, Any]:
         """As many slots as the route wants and can hold, on the same workers, with no more spilled.
 
+        Each slot's cache can push layers onto a slower device of the same workers, which spills
+        nothing but makes a row longer. So each count is judged by the route it would get.
         A row's time from memory speed is the best a device can do, and on a laptop CPU real ones
-        took two to four times as long. So until the model has run on these devices, a load takes half of what that
-        wants, and a later load uses what the stages measured.
+        took two to four times as long. So until the model has run on these devices, a load takes
+        half of what that wants, and a later load uses what the stages measured.
         """
         preferred, standby = self.candidate_groups()
-        devices = stage_devices(route, preferred + standby)
-        wanted = wanted_slots(route, devices, links, target.profile.ring, self.measured_rows(target, route, devices))
-        if wanted is None:
+
+        def wants(plan: list[StageAssignment]) -> dict[str, Any] | None:
+            devices = stage_devices(plan, preferred + standby)
+            return wanted_slots(plan, devices, links, target.profile.ring, self.measured_rows(target, plan, devices))
+
+        def goal(choice: dict[str, Any]) -> int:
+            return choice["wanted"] if choice["measured"] else max(choice["wanted"] // 2, 1)
+
+        chosen = wants(route)
+        if chosen is None:
             return {"auto": True, "slots": 1, "reason": "a link on this route has not been measured, so nothing says more would help"}
-        goal = wanted["wanted"] if wanted["measured"] else max(wanted["wanted"] // 2, 1)
         workers = {stage.worker_id for stage in route}
         spilled = self.plan_memory(target, route)["spilled_bytes"]
+        crowded: set[int] = set()  # counts that would fit, but on a route that wants fewer
 
-        async def fits(slots: int) -> bool:
+        async def judged(slots: int) -> dict[str, Any] | None:
+            """What the route at this many slots wants, if it holds them as it should."""
             await asyncio.sleep(0)  # a plan on a big pool takes seconds, and heartbeats must not wait for several
             with_slots(target, slots)
             plan = self._route_or_none(target, links)
-            return plan is not None and {stage.worker_id for stage in plan} == workers and self.plan_memory(target, plan)["spilled_bytes"] <= spilled
+            if plan is None or {stage.worker_id for stage in plan} != workers or self.plan_memory(target, plan)["spilled_bytes"] > spilled:
+                return None
+            choice = wants(plan)
+            if choice is not None and slots <= goal(choice):
+                return choice
+            crowded.add(slots)
+            return None
 
-        low, high = (goal, goal + 1) if await fits(goal) else (1, goal)
+        low, high = 1, goal(chosen) + 1
         while high - low > 1:
             middle = (low + high) // 2
-            low, high = (middle, high) if await fits(middle) else (low, middle)
+            choice = await judged(middle)
+            low, high, chosen = (middle, high, choice) if choice is not None else (low, middle, chosen)
         with_slots(target, low)
-        trip = f"a {wanted['round_trip_ms']:.1f} ms round trip at {wanted['row_ms']:.1f} ms a row"
-        if wanted["devices"] == 1:
+        trip = f"a {chosen['round_trip_ms']:.1f} ms round trip at {chosen['row_ms']:.1f} ms a row"
+        if chosen["devices"] == 1:
             trip = "every stage runs on one device, so replies could only take turns on it"
-        elif wanted["measured"]:
-            trip = f"{trip}, as this model measured on these devices, wants {goal}"
+        elif chosen["measured"]:
+            trip = f"{trip}, as this model measured on these devices, wants {goal(chosen)}"
         else:
-            trip = f"{trip}, from memory speeds, would want {wanted['wanted']}; with nothing measured yet a load takes {goal}"
-        return {"auto": True, "slots": low, **wanted, "reason": trip if low == goal else f"{trip}, and {low} fit in memory"}
+            trip = f"{trip}, from memory speeds, would want {chosen['wanted']}; with nothing measured yet a load takes {goal(chosen)}"
+        if low < goal(chosen):
+            trip += f", and {low + 1} would put layers on slower devices" if low + 1 in crowded else f", and {low} fit in memory"
+        return {"auto": True, "slots": low, **chosen, "reason": trip}
 
     def plan_or_refuse(self, target: ModelTarget, **options: Any) -> list[StageAssignment]:
         try:

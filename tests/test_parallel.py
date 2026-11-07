@@ -280,6 +280,26 @@ def test_a_pool_that_already_spills_may_spill_no_more(pool):
     assert pool.plan_memory(wanted, pool.plan(wanted))["spilled_bytes"] <= spilled
 
 
+def test_slots_that_push_layers_onto_a_slower_device_are_left_out(pool):
+    # The GPU worker has nothing slower of its own, so each slot's cache moves layers to the CPU worker.
+    gpu, cpu = worker("a", 1200 * MIB), worker("b", 0)
+    pool.offered = [Candidate("a", "http://a", gpu.pools[:1]), Candidate("b", "http://b", cpu.pools[1:])]
+    wanted = target()
+
+    def goal():
+        route = pool.plan(wanted)
+        return wanted_slots(route, stage_devices(route, pool.offered), pool.links, True)["wanted"] // 2
+
+    with_slots(wanted, 1)
+    alone = goal()
+    choose(pool, wanted)
+    assert 1 < wanted.slots < alone, "the route at one slot wants far more than the route it would get"
+    assert wanted.slots <= goal()
+    with_slots(wanted, wanted.slots + 1)
+    assert wanted.slots > goal()
+    assert "would put layers on slower devices" in wanted.parallel["reason"]
+
+
 def test_slots_never_pull_in_another_worker(pool):
     pool.offered = [worker("a", 876 * MIB), worker("b", 876 * MIB), worker("c", 876 * MIB)]
     pool.links |= {("a", "c"): 200.0, ("b", "c"): 200.0}
