@@ -7,6 +7,7 @@ import re
 import pytest
 
 from isharded import orchestrator
+from isharded.assistant.gateway import page_response
 
 PACKAGE = Path(orchestrator.__file__).parent
 ROOT = PACKAGE.parent
@@ -225,6 +226,21 @@ def test_a_page_inlines_the_shared_drawing_once(name):
     page = served(name)
     assert SCRIPT_MARKER not in page and SCRIPT in page
     assert '"ui.js"' in (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+
+def test_the_assistant_page_inlines_both_shared_files_once():
+    template = (PACKAGE / "assistant" / "assistant.html").read_text(encoding="utf-8")
+    assert template.count(SCRIPT_MARKER) == 1 and template.count(MARKER) == 1
+    page = page_response().body.decode("utf-8")
+    assert SCRIPT_MARKER not in page and SCRIPT in page and STYLES in page
+
+
+def test_the_assistant_page_keeps_inside_its_policy():
+    template = (PACKAGE / "assistant" / "assistant.html").read_text(encoding="utf-8")
+    assert 'style="' not in template and "url(" not in template  # style-src refuses a style attribute, even through innerHTML
+    assert not re.search(r"#[0-9a-fA-F]{6}", template)
+    assert not re.search(r"\bon[a-z]+=", template)  # script-src refuses an inline handler
+    assert re.search(r"<script nonce", template) and "<script>" not in template
 
 
 def test_the_shared_drawing_works_under_the_assistants_policy():
