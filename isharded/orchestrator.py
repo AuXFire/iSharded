@@ -12,7 +12,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import AsyncIterator
-from contextlib import aclosing, asynccontextmanager, nullcontext
+from contextlib import aclosing, asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -203,6 +203,22 @@ class WorkerRecord:
         return time.monotonic() - self.last_seen < 15.0
 
 
+def worker_url(record: WorkerRecord) -> str:
+    return str(record.registration.advertised_url).rstrip("/")
+
+
+def telemetry_of(record: WorkerRecord | None) -> dict[str, Any]:
+    return ((record.health if record else None) or {}).get("telemetry") or {}
+
+
+def reported_pools(record: WorkerRecord) -> dict[str, dict[str, Any]]:
+    return {item["pool_id"]: item for item in (record.health or {}).get("memory_pools", [])}
+
+
+def authority_pem() -> str:
+    return Path(os.environ["ISHARDED_CA_FILE"]).read_text(encoding="utf-8")
+
+
 @dataclass(slots=True)
 class ModelTarget:
     """A model resolved far enough to plan and fetch it."""
@@ -261,8 +277,9 @@ class LoadJob:
     cancelled: bool = False
 
     def snapshot(self) -> dict[str, Any]:
-        wanted = sum(item.get("bytes_total", 0) for item in self.workers.values())
-        done = sum(item.get("bytes_done", 0) for item in self.workers.values())
+        def total(key: str) -> int:
+            return sum(item.get(key, 0) for item in self.workers.values())
+
         return {
             "job_id": self.job_id,
             "model": self.model_id,
@@ -271,11 +288,11 @@ class LoadJob:
             "started_at": int(self.started_at),
             "elapsed_seconds": round((self.finished_at or time.time()) - self.started_at, 1),
             "model_bytes": self.total_bytes,
-            "bytes_total": wanted,
-            "bytes_done": done,
-            "bytes_reused": sum(item.get("bytes_reused", 0) for item in self.workers.values()),
-            "bytes_from_peers": sum(item.get("bytes_from_peers", 0) for item in self.workers.values()),
-            "bytes_per_second": sum(item.get("bytes_per_second", 0) for item in self.workers.values()),
+            "bytes_total": total("bytes_total"),
+            "bytes_done": total("bytes_done"),
+            "bytes_reused": total("bytes_reused"),
+            "bytes_from_peers": total("bytes_from_peers"),
+            "bytes_per_second": total("bytes_per_second"),
             "workers": self.workers,
             "route": [stage.model_dump() for stage in self.route],
         }
@@ -395,9 +412,10 @@ def resolve_draft(
             raise UnsupportedModel("speculative decoding needs a GGUF model")
         return None
     choice = request.draft_model if named else AUTO_DRAFTS.get(adapter.architecture)
-    if not choice or parse_source(choice) == parse_source(request.model_id):
+    if not choice:
         return None
-    if (parse_source(choice) or ("", ""))[1] == (parse_source(request.model_id) or ("", ""))[1]:
+    located = parse_source(choice)
+    if (located or ("", ""))[1] == (parse_source(request.model_id) or ("", ""))[1]:
         return None  # the same file under another name would only guess at itself
     try:
         holders = holders_of(sources or {}, choice)
@@ -408,7 +426,6 @@ def resolve_draft(
         if named:
             raise
         return None
-    located = parse_source(choice)
     assert located is not None
     return DraftModel(
         source=choice,
@@ -521,7 +538,8 @@ class Orchestrator:
             identities=authority is not None,
             authority=authority,
         )
-        self.audit = AuditLog(os.getenv("ISHARDED_AUDIT_FILE"), os.getenv("ISHARDED_NODE_ID") or socket.gethostname())
+        node_name = os.getenv("ISHARDED_NODE_ID") or socket.gethostname()
+        self.audit = AuditLog(os.getenv("ISHARDED_AUDIT_FILE"), node_name)
         self.control_lock = asyncio.Lock()
         self.generation_lock = asyncio.Lock()
         # Survives a restart: what was running, so the pool can be picked back up.
@@ -550,7 +568,7 @@ class Orchestrator:
         seen_as = os.getenv("ISHARDED_NODE_URL")
         if seen_as:
             seeds = tuple(url.strip() for url in os.getenv("ISHARDED_JOIN", "").split(",") if url.strip())
-            self.mesh = ControlMesh(os.getenv("ISHARDED_NODE_ID") or socket.gethostname(), seen_as, seeds)
+            self.mesh = ControlMesh(node_name, seen_as, seeds)
         self.background: set[asyncio.Task[Any]] = set()
         self.lanes = LaneDoor(self)
         self.statements = Statements()
@@ -578,13 +596,16 @@ class Orchestrator:
         if kind in LOGGED_EVENTS:
             # Events live in memory, so the reason for a failure would die with
             # this process. It is usually the one thing someone needs afterwards.
-            try:
+            with suppress(OSError, ValueError):  # a full disk or an odd console must not fail what is being logged
                 print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {kind}: {title}: {detail}", flush=True)
-            except (OSError, ValueError):
-                pass  # a full disk or an odd console must not fail what is being logged
         self.events.appendleft(
             {"id": uuid.uuid4().hex[:10], "at": int(time.time()), "kind": kind, "title": title, "detail": detail}
         )
+
+    async def _tell(self, url: str, **options: Any) -> None:
+        """Post something that need not arrive. Each caller says why it need not."""
+        with suppress(httpx.HTTPError):
+            await self.client.post(url, headers=auth_headers(self.pool_token), **options)
 
     def spawn(self, work: Any) -> asyncio.Task[Any]:
         task = asyncio.ensure_future(work)
@@ -773,7 +794,7 @@ class Orchestrator:
         """Which workers hold which whole GGUF files right now."""
 
         async def ask(record: WorkerRecord) -> tuple[str, list[str]]:
-            url = str(record.registration.advertised_url).rstrip("/")
+            url = worker_url(record)
             try:
                 response = await self.client.get(
                     url + "/internal/gguf/index", headers=auth_headers(self.pool_token), timeout=30.0
@@ -842,7 +863,7 @@ class Orchestrator:
         from .up import authority_hash
 
         assert self.mesh is not None
-        pem = Path(os.environ["ISHARDED_CA_FILE"]).read_text(encoding="utf-8")
+        pem = authority_pem()
         mesh = self.mesh
         self.beacon = await start_beacon(lambda: {"url": mesh.url, "authority": authority_hash(pem), "name": mesh.node_id})
 
@@ -914,12 +935,11 @@ class Orchestrator:
     def _absent_from_route(self) -> set[str]:
         absent = set()
         for stage in self.route:
-            record = self.workers.get(stage.worker_id)
-            if record is None or not record.live or record.quarantined or self._cordoned(stage.worker_id):
+            if not self._usable(stage.worker_id):
                 absent.add(stage.worker_id)
                 continue
             # Restarted workers come back live but empty, having lost their stage.
-            health = record.health or {}
+            health = self.workers[stage.worker_id].health or {}
             if health.get("status") == "ok" and health.get("epoch") != self.epoch:
                 self.need_reconfigure.add(stage.worker_id)
             else:
@@ -939,11 +959,7 @@ class Orchestrator:
         self.absent_since = {worker: self.absent_since.get(worker, now) for worker in missing}
         absent = {worker for worker, since in self.absent_since.items() if now - since >= REPAIR_GRACE_SECONDS}
         self.lost_from_route |= absent
-        returned = {
-            worker_id
-            for worker_id in self.lost_from_route
-            if (record := self.workers.get(worker_id)) and record.live and not record.quarantined and not self._cordoned(worker_id)
-        }
+        returned = set(filter(self._usable, self.lost_from_route))
         if not absent and not returned and not self.need_reconfigure:
             return
         waited = time.monotonic() - self.last_repair_at
@@ -1005,10 +1021,9 @@ class Orchestrator:
         Memory already holding this pool's weights counts as free, because a
         new placement replaces those weights.
         """
-        pools = record.registration.hardware.memory_pools
-        reported = {item["pool_id"]: item for item in (record.health or {}).get("memory_pools", [])}
+        reported = reported_pools(record)
         live: list[MemoryPool] = []
-        for pool in pools:
+        for pool in record.registration.hardware.memory_pools:
             status = reported.get(pool.pool_id)
             if status is None:
                 live.append(pool)
@@ -1018,14 +1033,14 @@ class Orchestrator:
         return live
 
     def _candidate(self, worker_id: str, record: WorkerRecord) -> Candidate:
-        return Candidate(
-            worker_id=worker_id,
-            url=str(record.registration.advertised_url),
-            pools=self._live_pools(record),
-        )
+        return Candidate(worker_id=worker_id, url=str(record.registration.advertised_url), pools=self._live_pools(record))
 
     def _cordoned(self, worker_id: str) -> bool:
         return worker_id in self.access.cordoned or node_of(worker_id) in self.access.cordoned
+
+    def _usable(self, worker_id: str) -> bool:
+        record = self.workers.get(worker_id)
+        return record is not None and record.live and not record.quarantined and not self._cordoned(worker_id)
 
     def cost_of_losing(self, name: str) -> int | None:
         """Bytes the pool must transfer if this node leaves, or None if it cannot cope."""
@@ -1034,11 +1049,16 @@ class Orchestrator:
         held = self.access.cordoned
         self.access.cordoned = held | {name}
         try:
-            return int(describe_plan(self.active, self.plan(self.active))["download_bytes"])
-        except PlacementError:
-            return None
+            return self._move_cost(self.active)
         finally:
             self.access.cordoned = held
+
+    def _move_cost(self, target: ModelTarget) -> int | None:
+        """Bytes a fresh plan would transfer, or None if nothing could hold the model."""
+        try:
+            return int(describe_plan(target, self.plan(target))["download_bytes"])
+        except PlacementError:
+            return None
 
     async def move_off(self) -> None:
         """Carry out a cordon: replies finish first, and only that node's share moves."""
@@ -1051,8 +1071,7 @@ class Orchestrator:
         standby: list[Candidate] = []
         for worker_id, record in self.workers.items():
             contribution = record.registration.hardware.contribution
-            usable = record.live and not record.quarantined and not self._cordoned(worker_id)
-            if usable and "inference" in contribution.roles and self._hosts(contribution) and self._runs_on(record.registration.hardware):
+            if self._usable(worker_id) and "inference" in contribution.roles and self._hosts(contribution) and self._runs_on(record.registration.hardware):
                 group = standby if contribution.standby else preferred
                 group.append(self._candidate(worker_id, record))
         return preferred, standby
@@ -1089,7 +1108,7 @@ class Orchestrator:
                 item[1].registration.hardware.contribution.ram_budget_bytes,
             ),
         )
-        return str(record.registration.advertised_url).rstrip("/")
+        return worker_url(record)
 
     def copy_holders(self, route: list[StageAssignment]) -> dict[str, str]:
         """One node to keep a copy of each stage's saved states.
@@ -1111,14 +1130,14 @@ class Orchestrator:
             for name in [*offered, *order[index + 1 :], *order[:index], *others]:
                 holder = live.get(name)
                 if holder is not None and holder.registration.hardware.host_id != own_machine:
-                    holders[stage.worker_id] = str(holder.registration.advertised_url).rstrip("/")
+                    holders[stage.worker_id] = worker_url(holder)
                     break
         return holders
 
     def state_peers(self, worker_id: str) -> list[str]:
         """Who to ask for a copy, which may be any node, as the holder may have changed."""
         urls = [
-            str(record.registration.advertised_url).rstrip("/")
+            worker_url(record)
             for name, record in self.workers.items()
             if record.live and not record.quarantined and name != worker_id
         ]
@@ -1131,19 +1150,9 @@ class Orchestrator:
             stage_namespace(PINNED_BUILD, target.model_id, target.manifest.revision, stage.start_layer, stage.end_layer, target.speculate_tokens, kv_type)
             for stage in route
         ]
-
-        async def tell(record: WorkerRecord) -> None:
-            try:
-                await self.client.post(
-                    str(record.registration.advertised_url).rstrip("/") + "/internal/state/keep",
-                    json={"namespaces": wanted},
-                    headers=auth_headers(self.pool_token),
-                    timeout=5.0,
-                )
-            except httpx.HTTPError:
-                pass  # eviction gets to them in the end
-
-        await asyncio.gather(*(tell(record) for record in self.workers.values() if record.live))
+        # Eviction gets to any that miss this in the end.
+        keep = {"namespaces": wanted}
+        await asyncio.gather(*(self._tell(worker_url(record) + "/internal/state/keep", json=keep, timeout=5.0) for record in self.workers.values() if record.live))
 
     async def refresh_holdings(self, target: ModelTarget) -> None:
         """Ask every worker which of this model's units are on its disk."""
@@ -1151,7 +1160,7 @@ class Orchestrator:
         async def ask(worker_id: str, record: WorkerRecord) -> tuple[str, set[str], bool]:
             try:
                 response = await self.client.get(
-                    str(record.registration.advertised_url).rstrip("/") + "/internal/shards/index",
+                    worker_url(record) + "/internal/shards/index",
                     params={"model_id": target.model_id, "revision": target.manifest.revision},
                     headers=auth_headers(self.pool_token),
                     timeout=10.0,
@@ -1185,7 +1194,7 @@ class Orchestrator:
             for other, finished in target.held.items():
                 record = self.workers.get(other)
                 if other != worker_id and other in target.serving and unit.name in finished and record and record.live:
-                    peers.setdefault(unit.name, []).append(str(record.registration.advertised_url).rstrip("/"))
+                    peers.setdefault(unit.name, []).append(worker_url(record))
         return peers
 
     def _with_holdings(self, group: list[Candidate], target: ModelTarget) -> list[Candidate]:
@@ -1216,13 +1225,11 @@ class Orchestrator:
             return
         last = len(self.route) - 1
         for index, stage in enumerate(self.route):
-            record = self.workers.get(stage.worker_id)
-            telemetry = ((record.health if record else None) or {}).get("telemetry") or {}
+            telemetry = telemetry_of(self.workers.get(stage.worker_id))
             ring = telemetry.get("ring")
-            if index == 0 and telemetry.get("ring_live") is False:
-                self.ring_epoch = None
             # Nothing to say means the stage was busy, which is no sign of trouble.
-            elif ring and (ring.get("epoch") != self.epoch or (index < last and not ring.get("next_up"))):
+            ring_broke = ring and (ring.get("epoch") != self.epoch or (index < last and not ring.get("next_up")))
+            if ring_broke or (index == 0 and telemetry.get("ring_live") is False):
                 self.ring_epoch = None
 
     async def _start_ring(self) -> None:
@@ -1280,7 +1287,7 @@ class Orchestrator:
         that would send, and a link that fails stays on record so that no route needs it.
         """
         urls = {
-            worker_id: str(record.registration.advertised_url).rstrip("/")
+            worker_id: worker_url(record)
             for worker_id, record in self.workers.items()
             if record.live and not record.quarantined
         }
@@ -1346,6 +1353,12 @@ class Orchestrator:
             # sequences, so a stage boundary has nothing correct to pass along.
             raise PlacementError(f"{target.model_id} would take {len(route)} stages here, and an embedding model cannot be split; it needs one worker that can hold it all")
         return route
+
+    def plan_or_refuse(self, target: ModelTarget, **options: bool) -> list[StageAssignment]:
+        try:
+            return self.plan(target, **options)
+        except PlacementError as exc:
+            raise HTTPException(status_code=507, detail=str(exc)) from exc
 
     def _keep_stages(
         self, target: ModelTarget, preferred: list[Candidate], standby: list[Candidate], available: set[str], pins: dict[str, str | None]
@@ -1552,19 +1565,9 @@ class Orchestrator:
             if (record := self.workers.get(stage.worker_id)) is not None and record.live
         }
         self.drained = entries
-
-        async def drain(url: str) -> None:
-            try:
-                await self.client.post(
-                    url.rstrip("/") + "/internal/drain",
-                    json={"seconds": DRAIN_WAIT_SECONDS},
-                    headers=auth_headers(self.pool_token),
-                    timeout=DRAIN_WAIT_SECONDS + 5,
-                )
-            except httpx.HTTPError:
-                pass  # a dead entry has nothing left to protect
-
-        await asyncio.gather(*(drain(url) for url in entries))
+        # A dead entry has nothing left to protect.
+        wait = {"seconds": DRAIN_WAIT_SECONDS}
+        await asyncio.gather(*(self._tell(url.rstrip("/") + "/internal/drain", json=wait, timeout=DRAIN_WAIT_SECONDS + 5) for url in entries))
 
     async def _release_entries(self) -> None:
         """Let drained entry workers go, once the route has moved on.
@@ -1572,16 +1575,10 @@ class Orchestrator:
         A worker leaving the route gets no configure to release it, and replies
         queued there would otherwise sit until its timer ran out: seen as 178 s of
         silence. Released, they find their epoch is gone and move to the new route.
+        One that misses this still has its own timer.
         """
-
-        async def release(url: str) -> None:
-            try:
-                await self.client.post(url.rstrip("/") + "/internal/release", headers=auth_headers(self.pool_token), timeout=5.0)
-            except httpx.HTTPError:
-                pass  # its own timer still covers it
-
         drained, self.drained = self.drained, set()
-        await asyncio.gather(*(release(url) for url in drained))
+        await asyncio.gather(*(self._tell(url.rstrip("/") + "/internal/release", timeout=5.0) for url in drained))
 
     async def wait_for_route(self) -> None:
         """A reply arriving during a move waits for it, rather than being turned away."""
@@ -1602,10 +1599,7 @@ class Orchestrator:
             await self.refresh_worker_metrics()
             await self.refresh_holdings(target)
             await self.measure_links()
-            try:
-                route = self.plan(target)
-            except PlacementError as exc:
-                raise HTTPException(status_code=507, detail=str(exc)) from exc
+            route = self.plan_or_refuse(target)
             job.route = route
             job.workers = {}
             job.phase = "fetching"
@@ -1651,10 +1645,7 @@ class Orchestrator:
         for worker_id in alive:
             self.workers[worker_id].quarantined = True
         try:
-            route = self.plan(target)
-            moved = describe_plan(target, route)["download_bytes"]
-        except PlacementError:
-            moved = None
+            moved = self._move_cost(target)
         finally:
             for worker_id, state in held.items():
                 self.workers[worker_id].quarantined = state
@@ -1696,12 +1687,9 @@ class Orchestrator:
             target = await self._resolve(request)
         except (UnsupportedModel, WeightSourceError, OSError, httpx.HTTPError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=f"could not load model: {exc}") from exc
-        try:
-            await self.refresh_worker_metrics()
-            await self.refresh_holdings(target)
-            self.plan(target, honor_pins_strictly=True)  # a bad pin should fail now, loudly
-        except PlacementError as exc:
-            raise HTTPException(status_code=507, detail=str(exc)) from exc
+        await self.refresh_worker_metrics()
+        await self.refresh_holdings(target)
+        self.plan_or_refuse(target, honor_pins_strictly=True)  # a bad pin should fail now, loudly
         route = await self.deploy(target, job, generation_lock_held=False)
         self.add_event("model", "Model loaded", f"{request.model_id} across {len(route)} stage(s)")
         return route
@@ -1736,10 +1724,7 @@ class Orchestrator:
         assert self.active is not None
         while self._absent_from_route() and time.monotonic() < deadline:
             await self.refresh_holdings(self.active)
-            try:
-                moved = describe_plan(self.active, self.plan(self.active))["download_bytes"]
-            except PlacementError:
-                moved = None  # nothing could take the model without it
+            moved = self._move_cost(self.active)
             if moved is not None and moved <= REPLAN_MOVE_LIMIT_BYTES:
                 return
             await asyncio.sleep(WORKER_RETURN_CHECK_SECONDS)
@@ -1792,24 +1777,16 @@ class Orchestrator:
 
     async def _report_worker(self, worker_id: str, reason: str) -> None:
         url = self.mesh.leader_url if self.mesh else None
-        if url is None:
-            return
-        try:
-            await self.client.post(
-                url + "/internal/report",
-                json={"worker_id": worker_id, "reason": f"reported by {self.mesh.node_id}: {reason}"},
-                headers=auth_headers(self.pool_token),
-                timeout=5.0,
-            )
-        except httpx.HTTPError:
-            pass  # if the coordinator is gone too, the next one finds this for itself
+        if url is not None:
+            # If the coordinator is gone too, the next one finds this for itself.
+            await self._tell(url + "/internal/report", json={"worker_id": worker_id, "reason": f"reported by {self.mesh.node_id}: {reason}"}, timeout=5.0)
 
     async def _answers(self, worker_id: str) -> bool:
         record = self.workers.get(worker_id)
         if record is None:
             return False
         try:
-            url = str(record.registration.advertised_url).rstrip("/") + "/health"
+            url = worker_url(record) + "/health"
             response = await self.client.get(url, headers=auth_headers(self.pool_token), timeout=3.0)
             return response.status_code == 200
         except httpx.HTTPError:
@@ -1830,22 +1807,12 @@ class Orchestrator:
 
     @staticmethod
     def _failed_worker(response: httpx.Response, entry_worker: str) -> str:
-        try:
-            detail = response.json().get("detail")
-            if isinstance(detail, dict) and detail.get("failed_worker"):
-                return str(detail["failed_worker"])
-        except (ValueError, AttributeError):
-            pass
-        return entry_worker
+        detail = reply_detail(response)
+        return str(detail["failed_worker"]) if isinstance(detail, dict) and detail.get("failed_worker") else entry_worker
 
     @staticmethod
     def _asks_for_replay(response: httpx.Response) -> bool:
-        if response.status_code != 503:
-            return False
-        try:
-            detail = response.json().get("detail")
-        except (ValueError, AttributeError):
-            return False
+        detail = reply_detail(response) if response.status_code == 503 else None
         return isinstance(detail, dict) and bool(detail.get("retry"))
 
     def _refused_request(self, response: httpx.Response | None) -> bool:
@@ -2177,7 +2144,7 @@ class Orchestrator:
         Adding the stages up would count each token once per stage. Bytes are real on
         each node, so those do add up. RAM and disk are mostly the same states twice.
         """
-        caches = {name: ((record.health or {}).get("telemetry") or {}).get("cache") or {} for name, record in self.workers.items()}
+        caches = {name: telemetry_of(record).get("cache") or {} for name, record in self.workers.items()}
         entry = caches.get(self.route[0].worker_id, {}) if self.route else {}
         computed = entry.get("prompt_tokens_computed", 0)
         sources = entry.get("tokens_reused") or {}
@@ -2225,7 +2192,7 @@ class Orchestrator:
         add("workers_live", len(live), "Workers heard from recently")
         add("workers_quarantined", sum(record.quarantined for record in self.workers.values()), "Workers held out of the route")
         for worker_id, record in self.workers.items():
-            telemetry = (record.health or {}).get("telemetry") or {}
+            telemetry = telemetry_of(record)
             add("worker_live", 1 if record.live else 0, "Whether a worker is reachable", worker=worker_id)
             add("worker_compute_ms", telemetry.get("compute_ms_ema"), "Moving average of compute per pass", worker=worker_id)
             add("worker_stage_restarts_total", telemetry.get("stage_restarts"), "Stage processes restarted", "counter", worker=worker_id)
@@ -2377,24 +2344,17 @@ class Orchestrator:
 
     async def clear_session(self, session_id: str) -> None:
         async def clear(url: str) -> None:
-            try:
-                await self.client.delete(
-                    url.rstrip("/") + f"/internal/sessions/{session_id}",
-                    headers=auth_headers(self.pool_token),
-                    timeout=5.0,
-                )
-            except httpx.HTTPError:
-                pass
+            with suppress(httpx.HTTPError):
+                await self.client.delete(url + f"/internal/sessions/{session_id}", headers=auth_headers(self.pool_token), timeout=5.0)
 
-        urls = {str(record.registration.advertised_url) for record in self.workers.values() if record.live}
-        await asyncio.gather(*(clear(url) for url in urls))
+        await asyncio.gather(*map(clear, {worker_url(record) for record in self.workers.values() if record.live}))
 
     async def node_inventory(self) -> dict[str, Any]:
         """Each node's own report, from one of its workers, with how far away it is."""
         chosen: dict[str, str] = {}
         for worker_id, record in self.workers.items():
             if record.live:
-                chosen.setdefault(node_of(worker_id), str(record.registration.advertised_url).rstrip("/"))
+                chosen.setdefault(node_of(worker_id), worker_url(record))
 
         async def ask(url: str) -> dict[str, Any]:
             try:
@@ -2432,7 +2392,7 @@ class Orchestrator:
         for record in self.workers.values():
             if not record.live:
                 continue
-            reported = {item["pool_id"]: item for item in (record.health or {}).get("memory_pools", [])}
+            reported = reported_pools(record)
             for pool in record.registration.hardware.memory_pools:
                 group = groups.setdefault(pool.capacity_group, {"kind": pool.kind, "budget": 0, "used": 0})
                 group["budget"] = max(int(group["budget"]), pool.budget_bytes)
@@ -2559,7 +2519,7 @@ class Orchestrator:
             started = time.perf_counter()
             try:
                 response = await self.client.get(
-                    str(record.registration.advertised_url).rstrip("/") + "/health",
+                    worker_url(record) + "/health",
                     headers=auth_headers(self.pool_token),
                     timeout=3.0,
                 )
@@ -2860,13 +2820,7 @@ async def register(
         runtime.add_event("failure", f"{body.worker_id} refused", detail)
         raise HTTPException(status_code=426, detail=detail)
     runtime.register(body)
-    return {
-        "status": "registered",
-        "active_epoch": runtime.epoch,
-        "controls": control_urls(),
-        "revoked_nodes": sorted(runtime.access.revoked),
-        "signed_revocations": runtime.access.signed_revocations(),
-    }
+    return {"status": "registered", "active_epoch": runtime.epoch, **pool_news()}
 
 
 @app.post("/internal/heartbeat")
@@ -2875,16 +2829,16 @@ async def heartbeat(body: Heartbeat, authorization: str | None = Header(default=
     verify_worker_name(body.worker_id)
     if not runtime.heartbeat(body.worker_id):
         raise HTTPException(status_code=404, detail="worker must register")
+    return {"status": "ok", **pool_news()}
+
+
+def pool_news() -> dict[str, Any]:
+    """What a worker hears on every call: who coordinates, and who is not to be trusted."""
     return {
-        "status": "ok",
-        "controls": control_urls(),
+        "controls": sorted(runtime.mesh.alive().values()) if runtime.mesh else [],
         "revoked_nodes": sorted(runtime.access.revoked),
         "signed_revocations": runtime.access.signed_revocations(),
     }
-
-
-def control_urls() -> list[str]:
-    return sorted(runtime.mesh.alive().values()) if runtime.mesh else []
 
 
 @app.post("/internal/gossip")
@@ -2988,10 +2942,7 @@ async def preview_plan(body: LoadModelRequest, authorization: str | None = Heade
     await runtime.refresh_worker_metrics()
     await runtime.refresh_holdings(target)
     await runtime.measure_links()
-    try:
-        route = runtime.plan(target, honor_pins_strictly=True)
-    except PlacementError as exc:
-        raise HTTPException(status_code=507, detail=str(exc)) from exc
+    route = runtime.plan_or_refuse(target, honor_pins_strictly=True)
     return {**describe_plan(target, route), "memory": runtime.plan_memory(target, route)}
 
 
@@ -3067,6 +3018,14 @@ def address_of(request: Request) -> str:
     return client_address(request.client.host if request.client else None)
 
 
+def authority_home(action: str) -> Path:
+    """This machine's home, if it holds the key that makes the mesh's decisions."""
+    home = os.getenv("ISHARDED_UP_HOME")
+    if not home or not Path(home, "ca.key").is_file():
+        raise HTTPException(status_code=409, detail=f"only the machine that made this mesh can {action}; open this page there")
+    return Path(home)
+
+
 @app.post("/join/requests")
 async def request_to_join(request: Request, body: dict[str, Any]) -> dict[str, str]:
     """Anyone may ask. Asking grants nothing until the owner signs an answer."""
@@ -3100,11 +3059,9 @@ async def join_requests(authorization: str | None = Header(default=None)) -> dic
 async def answer_join(name: str, answer: str, authorization: str | None = Header(default=None)) -> dict[str, str]:
     """A person's decision. Only the machine holding the authority can act on it."""
     verify_admin(authorization)
-    home = os.getenv("ISHARDED_UP_HOME")
     if answer not in {"approve", "deny"}:
         raise HTTPException(status_code=404, detail="the answer is approve or deny")
-    if not home or not Path(home, "ca.key").is_file():
-        raise HTTPException(status_code=409, detail="only the machine that made this mesh can answer; open this page there")
+    authority_home("answer")
     if name not in runtime.access.join_requests:
         raise HTTPException(status_code=404, detail=f"{name} is not asking to join")
     runtime.join_answers.setdefault(answer, set()).add(name)
@@ -3116,21 +3073,19 @@ async def join_authority() -> dict[str, str]:
     """The mesh's public certificate, for a new machine to check against its invite."""
     if runtime.access.authority is None or runtime.access.ownerless:
         raise HTTPException(status_code=404, detail="this pool has no authority")
-    return {"authority": Path(os.environ["ISHARDED_CA_FILE"]).read_text(encoding="utf-8")}
+    return {"authority": authority_pem()}
 
 
 @app.post("/admin/invites")
 async def make_invite(body: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, Any]:
     """A code that adds a machine. Only the machine holding the authority can honor one."""
     verify_admin(authorization)
-    home = os.getenv("ISHARDED_UP_HOME")
-    if not home or not Path(home, "ca.key").is_file():
-        raise HTTPException(status_code=409, detail="only the machine that made this mesh can invite; open this page there")
+    home = authority_home("invite")
     from .up import create_invite
 
     assert runtime.mesh is not None
     urls = [runtime.mesh.url, *sorted(peer.url for peer in runtime.mesh.peers.values())]
-    return create_invite(Path(home), urls, int(body.get("uses", 1)), float(body.get("hours", 24)))
+    return create_invite(home, urls, int(body.get("uses", 1)), float(body.get("hours", 24)))
 
 
 @app.get("/join/certificate/{name}")
@@ -3139,7 +3094,7 @@ async def join_certificate(name: str) -> dict[str, str]:
     certificate = runtime.access.certificates.get(name)
     if certificate is None:
         raise HTTPException(status_code=404, detail="not approved yet")
-    return {"certificate": certificate, "authority": Path(os.environ["ISHARDED_CA_FILE"]).read_text(encoding="utf-8")}
+    return {"certificate": certificate, "authority": authority_pem()}
 
 
 @app.post("/access/entries")
