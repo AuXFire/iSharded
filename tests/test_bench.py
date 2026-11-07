@@ -588,6 +588,8 @@ def test_compare_calls_overlapping_ranges_noise():
     far = {"median": 20.0, "min": 19.0, "max": 21.0, "samples": 3}
     assert bench.change(wide, far, True)["verdict"] == "better" and bench.change(wide, far, False)["verdict"] == "worse"
     assert bench.change(None, far, True) is None and bench.change(wide, None, True) is None
+    alone = {"median": 20.0, "min": 20.0, "max": 20.0, "samples": 1}
+    assert bench.change(wide, alone, True)["verdict"] == "within noise" and bench.change(alone, wide, True)["verdict"] == "within noise"
 
 
 def test_compare_warns_when_the_runs_measured_different_things(tmp_path, capsys):

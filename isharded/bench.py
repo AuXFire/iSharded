@@ -653,7 +653,7 @@ def change(old: dict[str, Any] | None, new: dict[str, Any] | None, higher_is_bet
     if not old or not new:
         return None
     percent = round((new["median"] - old["median"]) / old["median"] * 100, 1) if old["median"] else None
-    overlap = old["min"] <= new["max"] and new["min"] <= old["max"]
+    overlap = old["min"] <= new["max"] and new["min"] <= old["max"] or min(old.get("samples", 2), new.get("samples", 2)) < 2  # one sample has no range
     better = new["median"] > old["median"] if higher_is_better else new["median"] < old["median"]
     verdict = "within noise" if overlap or new["median"] == old["median"] else "better" if better else "worse"
     return {"old": old["median"], "new": new["median"], "percent": percent, "verdict": verdict}
@@ -702,7 +702,7 @@ def compared_rows(comparison: dict[str, Any]) -> tuple[list[str], list[list[str]
     return headers, rows, differs
 
 
-COMPARE_RULE = "Each cell is the old median, then the new one. A change counts only if the two runs' lowest-to-highest ranges do not overlap."
+COMPARE_RULE = "Each cell is the old median, then the new one. A change counts only if the two runs' lowest-to-highest ranges do not overlap, and a single sample has no range."
 
 
 def comparison_text(comparison: dict[str, Any]) -> str:
