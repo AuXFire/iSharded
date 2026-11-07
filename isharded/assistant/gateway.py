@@ -145,25 +145,21 @@ class RequireKey:
         self.public_routes = public_routes
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-        if scope["type"] == "lifespan":
-            await self.app(scope, receive, send)
-            return
-        if scope["type"] != "http":
+        if scope["type"] not in ("http", "lifespan"):
             return  # no other kind of connection is offered, so none is accepted
-        if scope["path"] in PUBLIC_PATHS and scope["method"] in ("GET", "HEAD"):
-            await self.app(scope, receive, send)
-            return
-        if (scope["method"], scope["path"]) in self.public_routes:
-            await self.app(scope, receive, send)
-            return
-        header = dict(scope["headers"]).get(b"authorization", b"").decode("latin-1")
-        who = self.users.identify(header[7:].strip()) if header.startswith("Bearer ") else None
-        if who is None:
-            await self._refuse(send)
-            return
-        state = scope.setdefault("state", {})
-        state["user"], state["role"] = who
+        if scope["type"] == "http" and not self._public(scope):
+            header = dict(scope["headers"]).get(b"authorization", b"").decode("latin-1")
+            who = self.users.identify(header[7:].strip()) if header.startswith("Bearer ") else None
+            if who is None:
+                await self._refuse(send)
+                return
+            state = scope.setdefault("state", {})
+            state["user"], state["role"] = who
         await self.app(scope, receive, send)
+
+    def _public(self, scope: Any) -> bool:
+        method, path = scope["method"], scope["path"]
+        return (path in PUBLIC_PATHS and method in ("GET", "HEAD")) or (method, path) in self.public_routes
 
     @staticmethod
     async def _refuse(send: Any) -> None:
@@ -222,6 +218,14 @@ def public_result(result: TurnResult) -> dict[str, Any]:
     }
 
 
+def usage_of(result: TurnResult) -> dict[str, int]:
+    return {
+        "prompt_tokens": result.prompt_tokens,
+        "completion_tokens": result.completion_tokens,
+        "total_tokens": result.prompt_tokens + result.completion_tokens,
+    }
+
+
 def text_of(content: Any) -> str:
     """OpenAI clients send a string, or a list of typed parts."""
     if isinstance(content, str):
@@ -243,7 +247,7 @@ def server_sent(payload: dict[str, Any] | str) -> str:
     return f"data: {payload if isinstance(payload, str) else json.dumps(payload)}\n\n"
 
 
-def turn_in_background(assistant: Any, user: str, text: str, conversation_id: str) -> "queue.Queue[Any]":
+def turn_in_background(assistant: Any, user: str, text: str, conversation_id: str) -> queue.Queue[Any]:
     """Run a turn on its own thread, handing text over as it comes.
 
     The turn belongs to the assistant and not to the connection. If a client goes
@@ -265,7 +269,7 @@ def turn_in_background(assistant: Any, user: str, text: str, conversation_id: st
     return items
 
 
-async def next_item(items: "queue.Queue[Any]") -> Any:
+async def next_item(items: queue.Queue[Any]) -> Any:
     while True:
         try:
             return items.get_nowait()
@@ -360,46 +364,35 @@ def create_app(assistant: Any) -> FastAPI:
         if body.stream:
             items = turn_in_background(assistant, user, text, conversation_id)
             return StreamingResponse(events(items, identifier, created), media_type="text/event-stream")
-        result = await asyncio.to_thread(say_on_thread, user, text, conversation_id)
+        result = await asyncio.to_thread(assistant.conversation.say, user, text, conversation_id, learn="background")
         return {
             "id": identifier,
             "object": "chat.completion",
             "created": created,
             "model": persona(),
             "choices": [{"index": 0, "message": {"role": "assistant", "content": result.text}, "finish_reason": "stop"}],
-            "usage": {
-                "prompt_tokens": result.prompt_tokens,
-                "completion_tokens": result.completion_tokens,
-                "total_tokens": result.prompt_tokens + result.completion_tokens,
-            },
+            "usage": usage_of(result),
             "assistant": public_result(result),
         }
 
-    def say_on_thread(user: str, text: str, conversation_id: str | None) -> TurnResult:
-        return assistant.conversation.say(user, text, conversation_id, learn="background")
-
-    async def events(items: "queue.Queue[Any]", identifier: str, created: int) -> AsyncIterator[str]:
+    async def events(items: queue.Queue[Any], identifier: str, created: int) -> AsyncIterator[str]:
         envelope = {"id": identifier, "object": "chat.completion.chunk", "created": created, "model": persona()}
+
+        def words(text: str) -> str:
+            return server_sent({**envelope, "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]})
+
         sent = ""
-        while True:
-            item = await next_item(items)
-            if item is None:
-                break
+        while (item := await next_item(items)) is not None:
             if isinstance(item, Exception):
                 yield server_sent({"error": {"message": str(item)}})
             elif isinstance(item, TurnResult):
                 rest = item.text[len(sent) :] if item.text.startswith(sent) else ""
                 if rest:  # a notice that came after the model's words
-                    yield server_sent({**envelope, "choices": [{"index": 0, "delta": {"content": rest}, "finish_reason": None}]})
-                usage = {
-                    "prompt_tokens": item.prompt_tokens,
-                    "completion_tokens": item.completion_tokens,
-                    "total_tokens": item.prompt_tokens + item.completion_tokens,
-                }
-                yield server_sent({**envelope, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": usage, "assistant": public_result(item)})
+                    yield words(rest)
+                yield server_sent({**envelope, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": usage_of(item), "assistant": public_result(item)})
             else:
                 sent += item
-                yield server_sent({**envelope, "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}]})
+                yield words(item)
         yield server_sent("[DONE]")
 
     # The assistant's own API
@@ -530,10 +523,14 @@ def create_app(assistant: Any) -> FastAPI:
         decided = assistant.broker.approval(approval_id)
         return decided["status"] if decided else None
 
-    def owned_task(user: str, task_id: str) -> dict[str, Any]:
+    def task_engine() -> Any:
         engine = getattr(assistant, "tasks", None)
         if engine is None:
             raise HTTPException(404, "Tasks are not installed")
+        return engine
+
+    def owned_task(user: str, task_id: str) -> dict[str, Any]:
+        engine = task_engine()
         try:
             return engine.status(task_id, user)  # asked in the query, so a stranger's id finds nothing
         except ValueError:
@@ -548,10 +545,7 @@ def create_app(assistant: Any) -> FastAPI:
 
     @api.post("/tasks")
     def task_submit(body: TaskRequest, request: Request) -> dict[str, Any]:
-        engine = getattr(assistant, "tasks", None)
-        if engine is None:
-            raise HTTPException(404, "Tasks are not installed")
-        return {"id": engine.submit(me(request), body.plan)}
+        return {"id": task_engine().submit(me(request), body.plan)}
 
     @api.get("/tasks/{task_id}")
     def task_status(task_id: str, request: Request) -> dict[str, Any]:
@@ -586,28 +580,7 @@ def create_app(assistant: Any) -> FastAPI:
 
     add_routes(app, api)
     include_parts(app, assistant)
-
-    @app.exception_handler(MemoryNotFound)
-    async def not_found(_: Request, error: MemoryNotFound) -> Any:
-        return plain_error(404, error)
-
-    @app.exception_handler(TurnNotFound)
-    async def turn_not_found(_: Request, error: TurnNotFound) -> Any:
-        return plain_error(404, error)
-
-    @app.exception_handler(MemoryRefused)
-    async def refused(_: Request, error: MemoryRefused) -> Any:
-        return plain_error(409, error)
-
-    @app.exception_handler(ValueError)
-    async def bad_value(_: Request, error: ValueError) -> Any:
-        return plain_error(400, error)
-
-    @app.exception_handler(sqlite3.OperationalError)
-    async def busy(_: Request, error: sqlite3.OperationalError) -> Any:
-        if "locked" not in str(error):
-            raise error
-        return JSONResponse({"detail": "Something else is busy writing to the assistant's data. Try again in a moment."}, status_code=503, headers={"Retry-After": "2"})
+    add_error_handlers(app)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -625,9 +598,22 @@ def create_app(assistant: Any) -> FastAPI:
     return app
 
 
-def plain_error(status: int, error: Exception) -> JSONResponse:
-    detail = error.args[0] if error.args else str(error)
-    return JSONResponse({"detail": str(detail)}, status_code=status)
+def add_error_handlers(app: FastAPI) -> None:
+    def plain_error(status: int) -> Any:
+        async def handle(_: Request, error: Exception) -> JSONResponse:
+            detail = error.args[0] if error.args else str(error)
+            return JSONResponse({"detail": str(detail)}, status_code=status)
+
+        return handle
+
+    for kind, status in ((MemoryNotFound, 404), (TurnNotFound, 404), (MemoryRefused, 409), (ValueError, 400)):
+        app.add_exception_handler(kind, plain_error(status))
+
+    @app.exception_handler(sqlite3.OperationalError)
+    async def busy(_: Request, error: sqlite3.OperationalError) -> Any:
+        if "locked" not in str(error):
+            raise error
+        return JSONResponse({"detail": "Something else is busy writing to the assistant's data. Try again in a moment."}, status_code=503, headers={"Retry-After": "2"})
 
 
 def add_routes(app: Any, router: Any) -> None:
@@ -641,7 +627,7 @@ def add_routes(app: Any, router: Any) -> None:
 
 def include_parts(app: Any, assistant: Any) -> None:
     """Add every part's routes. A path already taken keeps its first owner."""
-    taken = {(path, method) for route in app.routes for path in [getattr(route, "path", "")] for method in getattr(route, "methods", None) or ()}
+    taken = {(route.path, method) for route in app.routes for method in getattr(route, "methods", None) or ()}
     for part in assistant.parts:
         make = getattr(part, "routes", None)
         if make is None:

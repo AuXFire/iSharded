@@ -62,6 +62,7 @@ CONNECT_SECONDS = 5.0
 RESULT_SECONDS = 7 * DAY
 STALE_SECONDS = 3600.0
 STRANGER_AUDITS_PER_MINUTE = 30  # the record must not be a way to fill someone's disk
+BAD_INVITE = "that invite is not valid, was already used, or has expired"
 
 AWAITING_OWNER = "awaiting_owner"  # they accepted; this owner has not approved yet
 AWAITING_PEER = "awaiting_peer"  # this owner accepted; they have not approved yet
@@ -365,6 +366,11 @@ def _proof(key: bytes, label: bytes, value: Any) -> str:
     return _b64(hmac.new(key, label + b"\0" + _pack(value), hashlib.sha256).digest())
 
 
+def _tls_for(url: str) -> ssl.SSLContext | bool:
+    """The OS store, as antivirus re-signing breaks certifi alone."""
+    return ssl.create_default_context() if url.startswith("https:") else False
+
+
 def _check_address(address: str) -> str:
     address = address.strip().rstrip("/")
     if not address:
@@ -390,11 +396,8 @@ def _too_near(reach: Any) -> bool:
 
 def _peer_text(arguments: dict[str, Any]) -> list[dict[str, str]]:
     """Only what the peer sent reaches the model. Nothing of this install is added."""
-    messages = arguments.get("messages")
-    if messages is None:
-        prompt = arguments.get("prompt")
-        if not isinstance(prompt, str) or not prompt:
-            raise ValueError("Send a prompt, or a list of messages.")
+    messages, prompt = arguments.get("messages"), arguments.get("prompt")
+    if messages is None and isinstance(prompt, str) and prompt:
         messages = [{"role": "user", "content": prompt}]
     if not isinstance(messages, list) or not messages:
         raise ValueError("Send a prompt, or a list of messages.")
@@ -588,10 +591,10 @@ class Federation:
             raise Refused("this install is already paired or pairing with you")
         row = self.store.one("SELECT * FROM federation_invites WHERE id = ?", (fields["invite"],))
         if row is None or row["used_at"] is not None or row["expires_at"] <= self.clock():
-            raise Refused("that invite is not valid, was already used, or has expired")
+            raise Refused(BAD_INVITE)
         proof_key = _unb64(row["proof_key"])
         if not hmac.compare_digest(_proof(proof_key, b"accept", fields), str(message.get("proof"))):
-            raise Refused("that invite is not valid, was already used, or has expired")
+            raise Refused(BAD_INVITE)
         self._use_invite(fields["invite"])
         peer = self._save_peer(fingerprint, signing, exchange, fields["address"], AWAITING_OWNER, row["name"])
         self.audit.record(peer.actor, "federation.pair_requested", peer.name, {"peer": fingerprint})
@@ -623,7 +626,7 @@ class Federation:
                 "UPDATE federation_invites SET used_at = ?, proof_key = '' WHERE id = ? AND used_at IS NULL", (self.clock(), invite)
             )
             if cursor.rowcount != 1:
-                raise Refused("that invite is not valid, was already used, or has expired")
+                raise Refused(BAD_INVITE)
 
     def _free_name(self, wanted: str | None, fingerprint: str) -> str:
         base = wanted or f"peer-{fingerprint[:8]}"
@@ -874,19 +877,16 @@ class Federation:
         nonce: str | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """A signed, sealed request and its hash."""
-        now = self.clock()
-        body = {
-            "v": PROTOCOL,
-            "kind": REQUEST,
-            "from": self.identity.fingerprint,
-            "to": to or peer.fingerprint,
-            "nonce": nonce or secrets.token_hex(16),
-            "issued_at": now,
-            "expires_at": now + ttl,
-            "capability": capability,
-            "arguments": arguments,
-        }
+        body = {**self._stamped(REQUEST, to or peer.fingerprint, ttl, nonce), "capability": capability, "arguments": arguments}
         return self._wrap(REQUEST, body, peer.exchange_key)
+
+    def _addressed(self, kind: str, to: str) -> dict[str, Any]:
+        return {"v": PROTOCOL, "kind": kind, "from": self.identity.fingerprint, "to": to}
+
+    def _stamped(self, kind: str, to: str, ttl: float = DEFAULT_TTL, nonce: str | None = None) -> dict[str, Any]:
+        """Addressed, and good once within its time."""
+        now = self.clock()
+        return {**self._addressed(kind, to), "nonce": nonce or secrets.token_hex(16), "issued_at": now, "expires_at": now + ttl}
 
     def _wrap(self, kind: str, body: dict[str, Any], recipient: bytes) -> tuple[str, dict[str, Any]]:
         """The signature covers the exact bytes, so nobody has to agree on how JSON is written."""
@@ -967,10 +967,10 @@ class Federation:
             text = outer["body"].encode()
             signature = _unb64(outer["signature"])
             body = json.loads(text)
+            if not isinstance(body, dict):
+                raise ValueError("not an object")
         except (AttributeError, KeyError, RecursionError, TypeError, ValueError) as error:
             raise Refused("this message could not be opened") from error
-        if not isinstance(body, dict):
-            raise Refused("this message could not be opened")
         return text, signature, body
 
     def collect(self, peer: str, request_hash: str) -> ToolResult:
@@ -1001,7 +1001,7 @@ class Federation:
         except Refused as refusal:
             outcome = {"status": "refused", "reason": str(refusal)}
         self._record_received(peer, body, request_hash, outcome)
-        return HTTP_STATUS[outcome["status"]], self._reply(peer, body, request_hash, outcome)
+        return HTTP_STATUS[outcome["status"]], self._reply(peer, request_hash, outcome)
 
     def _open(self, sealed: Any, kind: str) -> tuple[Peer, dict[str, Any], str]:
         try:
@@ -1022,7 +1022,7 @@ class Federation:
         with self._lock:
             start, recorded, skipped = self._strangers
             if now - start >= 60:
-                start, recorded, skipped = now, 0, skipped
+                start, recorded = now, 0
             write = recorded < STRANGER_AUDITS_PER_MINUTE
             self._strangers = [start, recorded + 1 if write else recorded, 0 if write else skipped + 1]
         if write:
@@ -1114,7 +1114,7 @@ class Federation:
         broker = self.broker()
         if broker is None:
             raise Refused("this install is not accepting work")
-        self._save_inbound(request_hash, peer, capability, arguments, "running", {})
+        self._save_inbound(request_hash, peer, capability, arguments)
         call = ToolCall(capability, arguments, call_id=request_hash)
         context = CallContext(user=peer.actor, actor=peer.actor, tainted=True)
         decision = broker.check(call, context)
@@ -1129,7 +1129,7 @@ class Federation:
     def _invoke(self, broker: Any, call: ToolCall, context: CallContext, capability: str) -> dict[str, Any]:
         try:
             result = broker.invoke(call, context)
-        except Exception as error:  # noqa: BLE001 - a peer must never see why, and this install must stay up
+        except Exception as error:  # a peer must never see why, and this install must stay up
             self.audit.record(context.actor, "federation.failed", capability, {"error": type(error).__name__, "detail": str(error)[:500]})
             return {"status": "failed", "output": "It failed on this install.", "produced_by": {"kind": "tool", "name": capability}}
         output = result.output[:MAX_MESSAGE_BYTES]
@@ -1142,12 +1142,12 @@ class Federation:
             return {"kind": "model", "name": str(model), "provider": str(result.data.get("provider", ""))}
         return {"kind": "tool", "name": capability}
 
-    def _save_inbound(self, request_hash: str, peer: Peer, capability: str, arguments: dict[str, Any], status: str, outcome: dict[str, Any]) -> None:
+    def _save_inbound(self, request_hash: str, peer: Peer, capability: str, arguments: dict[str, Any]) -> None:
         now = self.clock()
         self.store.execute(
             "INSERT INTO federation_inbound (request_hash, fingerprint, capability, arguments, status, outcome, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_hash) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at",
-            (request_hash, peer.fingerprint, capability, _pack(arguments).decode(), status, _pack(outcome).decode(), now, now),
+            "VALUES (?, ?, ?, ?, 'running', '{}', ?, ?) ON CONFLICT(request_hash) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at",
+            (request_hash, peer.fingerprint, capability, _pack(arguments).decode(), now, now),
         )
 
     def _hold(self, request_hash: str, approval_id: str | None) -> None:
@@ -1212,13 +1212,10 @@ class Federation:
         )
         self.store.execute("DELETE FROM federation_inbound WHERE updated_at < ?", (self.clock() - RESULT_SECONDS,))
 
-    def _reply(self, peer: Peer, body: dict[str, Any], request_hash: str, outcome: dict[str, Any]) -> dict[str, Any]:
+    def _reply(self, peer: Peer, request_hash: str, outcome: dict[str, Any]) -> dict[str, Any]:
         reply = {
             **outcome,
-            "v": PROTOCOL,
-            "kind": RESULT,
-            "from": self.identity.fingerprint,
-            "to": peer.fingerprint,
+            **self._addressed(RESULT, peer.fingerprint),
             "issued_at": self.clock(),
             "request_hash": request_hash,
             "revoked": peer.state == REVOKED,  # how an install nobody can call finds out
@@ -1267,18 +1264,7 @@ class Federation:
         return response.status_code == 200
 
     def _notice(self, peer: Peer, notice: str) -> tuple[str, dict[str, Any]]:
-        now = self.clock()
-        body = {
-            "v": PROTOCOL,
-            "kind": NOTICE,
-            "notice": notice,
-            "from": self.identity.fingerprint,
-            "to": peer.fingerprint,
-            "nonce": secrets.token_hex(16),
-            "issued_at": now,
-            "expires_at": now + DEFAULT_TTL,
-        }
-        return self._wrap(NOTICE, body, peer.exchange_key)
+        return self._wrap(NOTICE, {**self._stamped(NOTICE, peer.fingerprint), "notice": notice}, peer.exchange_key)
 
     def _ask_state(self, peer: Peer) -> str:
         notice_hash, sealed = self._notice(peer, "state")
@@ -1301,14 +1287,7 @@ class Federation:
             self.audit.record(peer.actor, "federation.notice_refused", "", {"reason": str(refusal)})
             raise
         state = self._apply_notice(peer, body.get("notice"))
-        reply = {
-            "v": PROTOCOL,
-            "kind": NOTICE_REPLY,
-            "from": self.identity.fingerprint,
-            "to": peer.fingerprint,
-            "notice_hash": notice_hash,
-            "state": state,
-        }
+        reply = {**self._addressed(NOTICE_REPLY, peer.fingerprint), "notice_hash": notice_hash, "state": state}
         return 200, self._wrap(NOTICE_REPLY, reply, peer.exchange_key)[1]
 
     def _apply_notice(self, peer: Peer, notice: Any) -> str:
@@ -1326,18 +1305,16 @@ class Federation:
     def _post(self, url: str, payload: dict[str, Any], seconds: float) -> httpx.Response:
         timeout = httpx.Timeout(seconds, connect=min(seconds, CONNECT_SECONDS))
         deadline = time.monotonic() + seconds
-        # The OS store, as antivirus re-signing breaks certifi alone, and no proxy on closed networks.
-        verify = ssl.create_default_context() if url.startswith("https:") else False
-        with httpx.Client(timeout=timeout, trust_env=False, verify=verify) as client:
-            with client.stream("POST", url, json=payload) as response:
-                body = b""
-                for chunk in response.iter_bytes():  # one deadline in all, so dripped bytes cannot hold anything up
-                    body += chunk
-                    if len(body) > 4 * MAX_MESSAGE_BYTES:
-                        raise httpx.ReadError("the reply was too large")
-                    if time.monotonic() > deadline:
-                        raise httpx.ReadTimeout("the reply took too long")
-                return httpx.Response(response.status_code, content=body)
+        # No proxy, as closed networks have none.
+        with httpx.Client(timeout=timeout, trust_env=False, verify=_tls_for(url)) as client, client.stream("POST", url, json=payload) as response:
+            body = b""
+            for chunk in response.iter_bytes():  # one deadline in all, so dripped bytes cannot hold anything up
+                body += chunk
+                if len(body) > 4 * MAX_MESSAGE_BYTES:
+                    raise httpx.ReadError("the reply was too large")
+                if time.monotonic() > deadline:
+                    raise httpx.ReadTimeout("the reply took too long")
+            return httpx.Response(response.status_code, content=body)
 
     @staticmethod
     def _json(response: httpx.Response) -> dict[str, Any]:
@@ -1353,7 +1330,7 @@ class Federation:
             return f"{peer.name} is {peer.state}"
         if not peer.address:
             return f"{peer.name} has no address"
-        verify = ssl.create_default_context() if peer.address.startswith("https:") else False
+        verify = _tls_for(peer.address)
         try:
             with httpx.Client(timeout=CONNECT_SECONDS, trust_env=False, verify=verify) as client:
                 response = client.get(f"{peer.address}/federation/identity")
@@ -1368,7 +1345,7 @@ class Federation:
     def sync_providers(self) -> list[str]:
         """Offer the router the peers known to offer models. No registry means nothing to do."""
         providers = getattr(self.assistant, "providers", None)
-        register = getattr(providers, "register", None) or getattr(providers, "add", None)
+        register = getattr(providers, "register", None)
         if register is None:
             return []
         added = []
@@ -1604,57 +1581,48 @@ def add_commands(commands: Any) -> None:
     peer = commands.add_parser("peer", help="work with another owner's install, by agreement")
     actions = peer.add_subparsers(dest="peer_command", required=True)
 
-    invite = actions.add_parser("invite", help="make a one-time code for the other owner")
+    def command(word: str, run: Callable[[Any, Any], int], summary: str, named: bool = True) -> Any:
+        parser = actions.add_parser(word, help=summary)
+        if named:
+            parser.add_argument("name", help="the peer's name here")
+        parser.set_defaults(run=_guarded(run))
+        return parser
+
+    invite = command("invite", run_invite, "make a one-time code for the other owner", named=False)
     invite.add_argument("--name", default=None, help="what to call them here; default is peer- and the start of their fingerprint")
     invite.add_argument("--address", default=None, help="where they can reach this install, such as http://100.64.0.2:9300")
     invite.add_argument("--minutes", type=float, default=INVITE_SECONDS / 60, help="how long the code works")
-    invite.set_defaults(run=_guarded(run_invite))
 
-    accept = actions.add_parser("accept", help="agree to pair, using the other owner's code")
+    accept = command("accept", run_accept, "agree to pair, using the other owner's code", named=False)
     accept.add_argument("code", help="the code from `peer invite`")
     accept.add_argument("--name", default=None, help="what to call them here; default is peer- and the start of their fingerprint")
     accept.add_argument("--address", default=None, help="where they can reach this install; without one, they cannot call it")
-    accept.set_defaults(run=_guarded(run_accept))
 
-    approve = actions.add_parser("approve", help="agree to pair, after comparing fingerprints with the other owner")
-    approve.add_argument("name", help="the peer's name here")
+    approve = command("approve", run_approve, "agree to pair, after comparing fingerprints with the other owner")
     approve.add_argument("--fingerprint", default=None, help="the fingerprint they read to you; refuses if it does not match")
-    approve.set_defaults(run=_guarded(run_approve))
 
-    listing = actions.add_parser("list", help="show this install's fingerprint, its peers, and what each is offered")
-    listing.set_defaults(run=_guarded(run_list))
+    command("list", run_list, "show this install's fingerprint, its peers, and what each is offered", named=False)
 
-    offer = actions.add_parser("offer", help="let a peer call one capability; with no capability, show its offers")
-    offer.add_argument("name", help="the peer's name here")
+    offer = command("offer", run_offer, "let a peer call one capability; with no capability, show its offers")
     offer.add_argument("capability", nargs="?", default=None, help="such as models.complete, which shares models and no memory")
     offer.add_argument("--per-day", type=int, default=None, help=f"calls allowed in any 24 hours; default {DEFAULT_PER_DAY}")
     offer.add_argument("--scope", default=None, help="a folder, host, or glob, for a capability that has a scope; * allows everything, on purpose")
     offer.add_argument("--withdraw", action="store_true", help="stop offering it, and end the grant that came with it")
-    offer.set_defaults(run=_guarded(run_offer))
 
-    revoke = actions.add_parser("revoke", help="end a pairing at once, and tell them if they can be reached")
-    revoke.add_argument("name", help="the peer's name here")
-    revoke.set_defaults(run=_guarded(run_revoke))
+    command("revoke", run_revoke, "end a pairing at once, and tell them if they can be reached")
 
-    ask = actions.add_parser("ask", help="call something a peer offers; goes through this install's broker as peer.send")
-    ask.add_argument("name", help="the peer's name here")
+    ask = command("ask", run_ask, "call something a peer offers; goes through this install's broker as peer.send")
     ask.add_argument("capability", help="what to call, such as models.complete")
     ask.add_argument("--text", default=None, help="sent as the prompt argument")
     ask.add_argument("--args", default=None, help="the arguments, as a JSON object")
     ask.add_argument("--user", default=None, help="who is asking; default is the owner")
-    ask.set_defaults(run=_guarded(run_ask))
 
-    collect = actions.add_parser("collect", help="fetch an answer that was pending or lost on the way")
-    collect.add_argument("name", help="the peer's name here")
+    collect = command("collect", run_collect, "fetch an answer that was pending or lost on the way")
     collect.add_argument("request", help="the request hash `peer ask` printed")
-    collect.set_defaults(run=_guarded(run_collect))
 
-    offers = actions.add_parser("offers", help="ask a peer what it offers this install")
-    offers.add_argument("name", help="the peer's name here")
-    offers.set_defaults(run=_guarded(run_offers))
+    command("offers", run_offers, "ask a peer what it offers this install")
 
-    serve = actions.add_parser("serve", help="answer peers without the gateway")
+    serve = command("serve", run_serve, "answer peers without the gateway", named=False)
     serve.add_argument("--host", default="127.0.0.1", help="the address to listen on")
     serve.add_argument("--port", type=int, default=9300, help="the port to listen on; 0 picks a free one")
     serve.add_argument("--address", default=None, help="where peers reach this install, if not the listening address")
-    serve.set_defaults(run=_guarded(run_serve))

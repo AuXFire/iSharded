@@ -71,7 +71,7 @@ class Assistant:
                 detach(self)
         self.store.close()
 
-    def __enter__(self) -> "Assistant":
+    def __enter__(self) -> Assistant:
         return self
 
     def __exit__(self, *_: Any) -> None:

@@ -163,8 +163,9 @@ class Identity:
 
     def system_prompt(self, user: str) -> str:
         """Who the assistant is to this person. Nothing here names a model."""
+        name = self.name
         lines = [
-            f"You are {self.name}, a persistent assistant. You are the same {self.name} whichever model is running you, "
+            f"You are {name}, a persistent assistant. You are the same {name} whichever model is running you, "
             "and you carry your memory, your promises, and your history from one conversation to the next.",
             f"How you speak: {self.style}",
             f"You are talking with {user}.",

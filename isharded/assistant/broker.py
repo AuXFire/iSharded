@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import fnmatch
+from functools import partial
 import hashlib
 import json
 import os
@@ -49,6 +50,7 @@ PATH_SUFFIXES = ("path", "dir", "file", "folder")
 URL_SUFFIXES = ("url", "uri")
 SECRET_NAME = re.compile(r"pass|secret|token|key|auth|cookie|credential", re.IGNORECASE)
 HOST_REFUSED = re.compile(r"[\\\s\x00-\x1f]")
+LIVE_GRANT = "revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?) AND (uses_left IS NULL OR uses_left > 0)"
 
 SCHEMA = [
     """
@@ -170,9 +172,13 @@ def scope_covers(capability: Capability, scope: str, arguments: dict[str, Any]) 
         return True
     if field is None or field not in arguments:
         return False  # nothing to compare, so a narrow grant cannot be said to cover it
-    value = arguments[field]
+    kind, value = scope_kind(capability), arguments[field]
     values = value if isinstance(value, (list, tuple)) else [value]
-    return bool(values) and all(value_covered(scope_kind(capability), scope, item) for item in values)
+    return bool(values) and all(value_covered(kind, scope, item) for item in values)
+
+
+def _approval_row(row: Any) -> dict[str, Any]:
+    return {**dict(row), "arguments": json.loads(row["arguments"])}
 
 
 class CapabilityBroker:
@@ -220,9 +226,9 @@ class CapabilityBroker:
             self._record("invoke", call, context, decision)
         if decision.verdict is not Verdict.ALLOW:
             return self._refusal(call, decision)
-        capability, handler = self.registered[call.capability]
+        handler = self.registered[call.capability][1]
         try:
-            result = self._normal(handler(arguments, context), call, context)
+            result = self._normal(handler(arguments, context), call)
         except Exception as error:  # a tool must never be able to take the assistant down
             self._outcome(call, context, False, type(error).__name__)
             return ToolResult(False, f"{call.capability} failed: {type(error).__name__}: {error}", self._provenance(call))
@@ -251,24 +257,20 @@ class CapabilityBroker:
         if refusal:
             return Decision(Verdict.DENY, refusal), {}
         arguments = self._resolved(capability, call.arguments)
-        physical = Effect.PHYSICAL in capability.effects
-        grant = None if physical else self._grant(capability, context.user, call.arguments)
+        grant = self._grant(capability, context.user, call.arguments)
         approval = self._approved(call, context, arguments)
         if context.actor.startswith(SKILL_PREFIX) and grant is None:
             return self._denied(capability, context, "A skill gets only what a grant already covers."), {}
-        if physical:
-            return (self._by_approval(approval, spend) if approval else self._ask(call, context, "physical", arguments)), arguments
-        tainted = context.tainted or context.actor.startswith(PEER_PREFIX)
-        if capability.consequential and tainted:
-            if approval:
-                return self._by_approval(approval, spend), arguments
-            if grant is None:
-                return self._denied(capability, context, "Nothing covers this, and it came from a tainted context."), {}
-            return self._ask(call, context, "tainted", arguments), arguments
         if approval:
             return self._by_approval(approval, spend), arguments
+        if Effect.PHYSICAL in capability.effects:
+            return self._ask(call, context, "physical", arguments), arguments
+        steered = capability.consequential and (context.tainted or context.actor.startswith(PEER_PREFIX))
         if grant is None:
-            return self._denied(capability, context, "No grant covers this."), {}
+            why = "Nothing covers this, and it came from a tainted context." if steered else "No grant covers this."
+            return self._denied(capability, context, why), {}
+        if steered:
+            return self._ask(call, context, "tainted", arguments), arguments
         return self._by_grant(grant, spend), arguments
 
     def _malformed(self, call: ToolCall, capability: Capability, context: CallContext) -> str | None:
@@ -376,7 +378,7 @@ class CapabilityBroker:
         data = {"refused": True, "verdict": decision.verdict.value, "approval_id": decision.approval_id}
         return ToolResult(False, decision.reason, provenance, data)
 
-    def _normal(self, result: Any, call: ToolCall, context: CallContext) -> ToolResult:
+    def _normal(self, result: Any, call: ToolCall) -> ToolResult:
         """Nothing a tool returns is believed unless it proved it, by a check or signature."""
         if not isinstance(result, ToolResult):
             text = result if isinstance(result, str) else json.dumps(result, default=str)
@@ -390,8 +392,7 @@ class CapabilityBroker:
 
     def _live_grants(self, user: str, capability: str) -> list[Any]:
         return self.store.query(
-            "SELECT * FROM grants WHERE user = ? AND capability = ? AND revoked_at IS NULL "
-            "AND (expires_at IS NULL OR expires_at > ?) AND (uses_left IS NULL OR uses_left > 0) "
+            f"SELECT * FROM grants WHERE user = ? AND capability = ? AND {LIVE_GRANT} "
             "ORDER BY uses_left IS NOT NULL, granted_at, id",  # spend a limited grant only if nothing else covers it
             (user, capability, self.clock()),
         )
@@ -441,8 +442,11 @@ class CapabilityBroker:
             return ANY_SCOPE
         if not scope:
             raise ValueError(f"{capability.name} needs a scope for {capability.scope_field}. To allow everything, say * on purpose.")
-        if scope == ANY_SCOPE or scope_kind(capability) != "path":
-            if scope != ANY_SCOPE and scope_kind(capability) == "url" and url_host(scope) is None:
+        kind = scope_kind(capability)
+        if scope == ANY_SCOPE or kind == "glob":
+            return scope
+        if kind == "url":
+            if url_host(scope) is None:
                 raise ValueError(f"{scope} is not a host name.")
             return scope
         real = real_path(scope)
@@ -467,14 +471,13 @@ class CapabilityBroker:
         return sum(self.revoke_grant(row["id"], by) for row in rows)
 
     def grants(self, user: str | None = None, include_ended: bool = False) -> list[dict[str, Any]]:
-        now = self.clock()
         clauses, parameters = [], []
         if user is not None:
             clauses.append("user = ?")
             parameters.append(user)
         if not include_ended:
-            clauses.append("revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?) AND (uses_left IS NULL OR uses_left > 0)")
-            parameters.append(now)
+            clauses.append(LIVE_GRANT)
+            parameters.append(self.clock())
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         return [dict(row) for row in self.store.query(f"SELECT * FROM grants {where} ORDER BY granted_at, id", parameters)]
 
@@ -523,7 +526,7 @@ class CapabilityBroker:
 
     def approval(self, approval_id: str) -> dict[str, Any] | None:
         row = self.store.one("SELECT * FROM approvals WHERE id = ?", (approval_id,))
-        return {**dict(row), "arguments": json.loads(row["arguments"])} if row else None
+        return _approval_row(row) if row else None
 
     def approvals(self, user: str | None = None, status: str | None = "pending") -> list[dict[str, Any]]:
         clauses, parameters = [], []
@@ -535,7 +538,7 @@ class CapabilityBroker:
             parameters.append(status)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self.store.query(f"SELECT * FROM approvals {where} ORDER BY requested_at, id", parameters)
-        return [{**dict(row), "arguments": json.loads(row["arguments"])} for row in rows]
+        return [_approval_row(row) for row in rows]
 
     def withdraw(self, approval_id: str, why: str) -> bool:
         """The asker no longer needs this, so no person should be left deciding it."""
@@ -598,11 +601,11 @@ def add_commands(commands: Any) -> None:
     pending.add_argument("--user", default=None, help="only this user")
     pending.add_argument("--all", action="store_true", help="include decided and used approvals")
     pending.set_defaults(run=run_approvals_list)
-    for name, handler, words in (("approve", run_approvals_approve, "allow this one exact action, once"), ("deny", run_approvals_deny, "refuse it")):
+    for name, approved, words in (("approve", True, "allow this one exact action, once"), ("deny", False, "refuse it")):
         choice = choices.add_parser(name, help=words)
         choice.add_argument("id", help="the approval, from approvals list")
         choice.add_argument("--by", default=DEFAULT_USER, help="the person deciding, for the record")
-        choice.set_defaults(run=handler)
+        choice.set_defaults(run=partial(_decide_from_command, approved=approved))
 
 
 def _when(moment: float | None) -> str:
@@ -668,11 +671,3 @@ def _decide_from_command(assistant: Any, args: Any, approved: bool) -> int:
         return 1
     print(f"{'Approved' if approved else 'Denied'} {args.id}." if changed else f"{args.id} is not waiting for a decision. See: isharded assistant approvals list --all")
     return 0 if changed else 1
-
-
-def run_approvals_approve(assistant: Any, args: Any) -> int:
-    return _decide_from_command(assistant, args, True)
-
-
-def run_approvals_deny(assistant: Any, args: Any) -> int:
-    return _decide_from_command(assistant, args, False)
