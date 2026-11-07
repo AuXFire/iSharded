@@ -27,7 +27,6 @@ from typing import Any
 import httpx
 import numpy as np
 import psutil
-import torch
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette.requests import ClientDisconnect
@@ -46,6 +45,7 @@ from .engine import REFUSE_EPOCH, REFUSE_STAGE_ERROR, EngineClient, EngineRefusa
 from .geo import country_code, node_country
 from .models import Adapter, GgufAdapter, create_adapter
 from .models.base import layer_unit
+from .optional import NO_TORCH, has_torch, torch, torch_loaded
 from .protocol import (
     host_model_patterns,
     hosts_model,
@@ -68,10 +68,13 @@ from .protocol import (
     auth_headers,
     decode_meta,
     decode_pass,
+    decode_rows,
     decode_tensors,
     encode_activation,
     encode_meta,
+    encode_rows,
     encode_tensors,
+    needs_pytorch,
 )
 from .gguf import parse_source
 from .gguf_stage import (
@@ -174,6 +177,7 @@ def hardware_info(
         ram_total_bytes=ram().total,
         accelerator_name=" + ".join(item.name for item in accelerators) or None,
         accelerator_memory_bytes=accelerator_memory,
+        pytorch=has_torch(),
         contribution=ResourceContribution(
             roles=sorted(roles),
             cpu_threads=cpu_threads,
@@ -217,7 +221,7 @@ def epoch_error(epoch: int) -> HTTPException:
 
 def free_memory() -> None:
     gc.collect()
-    if torch.cuda.is_available():
+    if torch_loaded() and torch.cuda.is_available():
         torch.cuda.empty_cache()
 
 
@@ -467,7 +471,7 @@ class WorkerRuntime:
         if self.hardware is not None:
             return
         self.held = StateStore(self.state_root / HELD_FOLDER, 0, self.state_disk_bytes)
-        if self.cpu_threads:
+        if self.cpu_threads and has_torch():
             torch.set_num_threads(self.cpu_threads)
         computes = "inference" in self.roles
         accelerators = discover_accelerators(self.requested_device) if computes else []
@@ -1043,6 +1047,8 @@ class WorkerRuntime:
         self.ring_stop()
         self.draft_choice = DraftChoice()  # a new route can change which way is faster
         adapter = create_adapter(request.architecture)
+        if not isinstance(adapter, GgufAdapter) and not has_torch():
+            raise ValueError(NO_TORCH)
         if not (0 <= request.assignment.start_layer < request.assignment.end_layer <= adapter.num_layers):
             raise ValueError("invalid layer interval")
         try:
@@ -1279,14 +1285,14 @@ class WorkerRuntime:
         if self.gguf is not None:
             self._session(request)
             if part is None:
-                return torch.from_numpy(self.gguf.embed(request.input_ids).copy()).unsqueeze(0)
+                return self.gguf.embed(request.input_ids).copy()[None]
             tokens = np.array(request.input_ids, dtype=np.int64)
             rows = np.empty((tokens.size, self.gguf.width), dtype=np.float32)
             text = tokens >= 0
             if text.any():
                 rows[text] = self.gguf.embed(tokens[text].tolist())
             rows[part.images] = part.vectors
-            return torch.from_numpy(rows).unsqueeze(0)
+            return rows[None]
         if self.adapter is None or "embed" not in self.unit_weights:
             raise ValueError("this worker is not the entry stage")
         entry = self._session(request)
@@ -1311,7 +1317,7 @@ class WorkerRuntime:
         entry = self._pass_entry(request)
         tokens = hidden.shape[1]
         if self.gguf is not None:
-            rows = hidden[0].float().numpy()
+            rows = np.asarray(hidden[0], dtype=np.float32)
             if self.gguf.last and request.verify:
                 self.gguf_choices = self.gguf.verify(
                     rows,
@@ -1326,9 +1332,9 @@ class WorkerRuntime:
             else:
                 output = self.gguf.forward(rows, entry.length, request.slot, places, request.cuts, request.saves)
                 if self.gguf.last:
-                    self.gguf_logits = torch.from_numpy(output.copy())
+                    self.gguf_logits = output.copy()
                 else:
-                    hidden = torch.from_numpy(output.copy()).unsqueeze(0)
+                    hidden = output.copy()[None]
         else:
             positions = torch.arange(entry.length, entry.length + tokens, dtype=torch.long)
             with torch.inference_mode():
@@ -1358,16 +1364,20 @@ class WorkerRuntime:
             logits = self.gguf_logits
         if logits is None and (self.adapter is None or "head" not in self.unit_weights):
             raise ValueError("route ended on a worker without the output head")
+        if self.gguf is not None:
+            # A reply leaves the ring for this path when a stage fails, so a seed has
+            # to draw here what it draws there.
+            rows = np.asarray(logits)
+            if request.temperature == 0:
+                return int(np.argmax(rows))
+            position = 0 if request.seed is None else self.caches[request.session_id].length - 1
+            draws = step_draws(request.seed, position)
+            return speculative_choice(lambda _: rows, [], request.temperature, request.top_p, request.top_k, draws)[0]
         with torch.inference_mode():
             if logits is None:
                 logits = self.adapter.logits(self.unit_weights["head"], hidden[:, -1:, :])[0, -1].float()
             if request.temperature == 0:
                 return int(torch.argmax(logits).item())
-            if self.gguf is not None and request.seed is not None:
-                # A reply leaves the ring for this path when a stage fails, so a seed has
-                # to draw here what it draws there.
-                draws = step_draws(request.seed, self.caches[request.session_id].length - 1)
-                return speculative_choice(lambda _: logits.numpy(), [], request.temperature, request.top_p, request.top_k, draws)[0]
             if request.top_k:
                 cutoff = torch.topk(logits, min(request.top_k, logits.numel())).values[-1]
                 logits = logits.masked_fill(logits < cutoff, float("-inf"))
@@ -1591,17 +1601,17 @@ class WorkerRuntime:
                 results[index] = exc
         ready.sort(key=lambda item: item[1].request.slot)
         if ready:
-            rows = np.concatenate([step.hidden[0].float().numpy() for _, step, _ in ready])
+            rows = np.concatenate([np.asarray(step.hidden[0], dtype=np.float32) for _, step, _ in ready])
             output = self.gguf.forward_many(rows, [entry.length for _, _, entry in ready], [step.request.slot for _, step, _ in ready])
             for row, (index, step, entry) in zip(output, ready):
                 entry.length += 1
                 if self.gguf.last:
                     try:
-                        results[index] = {"token_id": self._sample(step.hidden, step.request, torch.from_numpy(row.copy()))}
+                        results[index] = {"token_id": self._sample(step.hidden, step.request, row.copy())}
                     except (RuntimeError, ValueError) as exc:
                         results[index] = exc  # one reply's sampling is no reason to fail the others
                 else:
-                    results[index] = torch.from_numpy(row.copy()).reshape(1, 1, -1)
+                    results[index] = row.copy().reshape(1, 1, -1)
             self.merged_passes += 1
             self.merged_rows += len(ready)
             self.inference_calls += len(ready)
@@ -1695,9 +1705,10 @@ class WorkerRuntime:
         # trips. Single tokens stay exact; llama.cpp stages turn BF16 back to FP32.
         # Prompt rows always go as BF16, or a restored state that left one row to run
         # would not match a run that read the whole prompt.
-        if self.gguf is not None and (hidden.shape[1] > 1 or request.prompt_rows) and self.dtype_name != "float32":
-            hidden = hidden.to(torch.bfloat16)
-        payload = encode_activation(hidden, None if places is None else torch.from_numpy(places))
+        if self.gguf is not None:
+            payload = encode_rows(hidden, places, (hidden.shape[1] > 1 or request.prompt_rows) and self.dtype_name != "float32")
+        else:
+            payload = encode_activation(hidden, None if places is None else torch.from_numpy(places))
         self._record("encode", started)
         self.activation_bytes_sent += len(payload)
         started = time.perf_counter()
@@ -1887,6 +1898,8 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
 async def prepare(body: PrepareRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     verify_token(authorization)
     verify_source(body.source)
+    if needs_pytorch(body.model_id) and not has_torch():
+        raise HTTPException(status_code=400, detail=NO_TORCH)  # before it downloads what it cannot run
     return runtime.start_prepare(body).snapshot()
 
 
@@ -1993,7 +2006,7 @@ async def diag_runtime(authorization: str | None = Header(default=None)) -> dict
         "busiest_threads_percent_of_core": busy[:6],
         "python_thread_frames": frames,
         "top_cpu_processes": sorted(((round(value, 1), name) for name, value in consumers.items()), reverse=True)[:8],
-        "torch_threads": torch.get_num_threads(),
+        "torch_threads": torch.get_num_threads() if has_torch() else None,
         "versions": versions,
         "env": {key: value for key, value in os.environ.items() if key.startswith(("OMP_", "MKL_", "HIP_", "HSA_", "PYTHON", "ROC"))},
     }
@@ -2616,12 +2629,14 @@ async def forward(
     arrived = time.perf_counter()
     try:
         meta = InferRequest.model_validate(decode_meta(x_isharded_meta))
-        hidden, places = decode_pass(await request.body())
+        # A stage with no PyTorch has only one way to read, even before it has a model.
+        decode = decode_rows if runtime.gguf is not None or not torch_loaded() else decode_pass
+        hidden, places = decode(await request.body())
     except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     runtime._record("receive", arrived)
     try:
-        result = await runtime.execute(hidden, meta, None if places is None else places.numpy())
+        result = await runtime.execute(hidden, meta, None if places is None else np.asarray(places))
         runtime._record("handler", arrived)
         return result
     except HTTPException:
