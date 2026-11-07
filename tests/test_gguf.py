@@ -1840,6 +1840,17 @@ def test_lookup_is_on_unless_a_load_or_the_command_line_says_not(monkeypatch):
     assert cli.load_body(parser.parse_args(["load", "m", "--no-draft"]))["draft_model"] == "none"
 
 
+def test_exact_replies_are_asked_for_only_by_a_flag_and_are_off_by_default():
+    from isharded import cli
+    from isharded.protocol import ConfigureRequest, LoadModelRequest
+
+    parser = cli.build_parser()
+    assert "exact" not in cli.load_body(parser.parse_args(["load", "m"]))
+    assert cli.load_body(parser.parse_args(["load", "m", "--exact"]))["exact"] is True
+    assert LoadModelRequest().exact is False
+    assert ConfigureRequest.model_fields["exact"].default is False
+
+
 def test_the_entry_reserves_a_drafts_cache_for_every_slot(local_model, tmp_path, monkeypatch):
     """Measured by what ``load_draft`` asks for: one context per slot, and one more for guesses."""
     from isharded import orchestrator

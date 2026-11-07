@@ -55,7 +55,7 @@ ENCODED_IMAGE_BYTES = 128 * 1024 * 1024
 # States a draft model keeps. It is small, and a draft that loses one just reads more.
 DRAFT_STATE_BYTES = 256 * 1024 * 1024
 # Operations that touch only the engine's links, and so need not wait for a running pass.
-UNGATED = {"load", "ring_open", "ring_connect", "ring_close", "ring_stats"}
+UNGATED = {"load", "ring_open", "ring_connect", "ring_close", "ring_stats", "exactness"}
 # These put a sequence on another history, which the engine's snapshots cannot follow.
 NEW_HISTORY = {"clear", "restore", "truncate"}
 # A load takes as long as the disk takes, so nothing here can say it has hung.
@@ -87,6 +87,8 @@ class _Host:
         self.scratch = 1
         self.projector: Any = None
         self.encoded: OrderedDict[str, tuple[dict[str, Any], bytes]] = OrderedDict()
+        # What the load's probe found about merged passes. None means nothing was probed.
+        self.found: dict[str, Any] | None = None
 
     def load(self, meta: dict[str, Any], _: bytes) -> Reply:
         self.library = LlamaLibrary.load(meta["folder"], tuple(meta["extra_paths"]))
@@ -123,7 +125,18 @@ class _Host:
                 C.cast(found.to_float, C.c_void_p).value if found and found.to_float else None,
                 meta.get("rollback_tokens", 0) + 2,
             )
+            self.found = self._probe(meta.get("slots", 1))
         return {"hidden_size": self.stage.hidden_size, "vocab_size": self.stage.vocab_size, "engine": self.stage.engine is not None}, b""
+
+    def _probe(self, slots: int) -> dict[str, Any]:
+        """Runs before the worker can send this stage anything, which the probe needs."""
+        try:
+            return self.stage.engine.probe(slots)
+        except OSError as exc:
+            return {"exact_merge_limit": 0, "verify_exact": False, "error": str(exc)}
+
+    def exactness(self, _: dict[str, Any], __: bytes) -> Reply:
+        return {"found": self.found}, b""
 
     def embed(self, meta: dict[str, Any], _: bytes) -> Reply:
         if self.embedding is None:
@@ -276,7 +289,7 @@ class _Host:
         # The engine's watchdog holds a pass to what this process holds a call to.
         limits = (meta.get("pass_ms", PASS_MS), meta.get("row_ms", ROW_MS))
         keys = {name: bytes.fromhex(key) for name, key in meta["keys"].items() if key is not None}
-        self.engine.open(meta["epoch"], meta["index"], meta["count"], keys, meta["ack_timeout_ms"], meta["silence_timeout_ms"], *limits, merge_passes=meta.get("merge_passes", True))
+        self.engine.open(meta["epoch"], meta["index"], meta["count"], keys, meta["ack_timeout_ms"], meta["silence_timeout_ms"], *limits, merge_passes=meta.get("merge_passes", True), merge_most=meta.get("merge_most"))
         return {"engine": True, **door}, b""
 
     def ring_connect(self, meta: dict[str, Any], _: bytes) -> Reply:

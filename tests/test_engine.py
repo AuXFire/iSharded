@@ -333,7 +333,7 @@ def ring_worker(**fields):
         return {"engine": False}
 
     closed = []
-    item = runtime(term=5, ring_term=5, ring_door={}, revoked_nodes=set(), merge_passes=True, gguf=SimpleNamespace(ring_call=ring_call), **fields)
+    item = runtime(term=5, ring_term=5, ring_door={}, revoked_nodes=set(), merge_passes=True, exact=False, exactness=None, gguf=SimpleNamespace(ring_call=ring_call), **fields)
     item.ring_client = SimpleNamespace(alive=True, close=lambda: closed.append(True))
     return item, asked, closed
 
@@ -878,7 +878,7 @@ needs_real_stage = pytest.mark.skipif(not (BUILD and MODEL and find_library()), 
 PROMPT = [151644, 872, 198, 9707, 1879, 11, 3838, 374, 279, 6722, 315, 9625, 30]
 
 
-def real_stage():
+def real_stage(slots=2, threads=4):
     from isharded.gguf import read_file_header
     from isharded.llama_host import StageHost
 
@@ -887,8 +887,8 @@ def real_stage():
     embed = {"path": MODEL, "offset": header.data_start + table.offset, "length": table.nbytes, "ggml_type": table.ggml_type}
     host = StageHost()
     host.call(
-        "load", folder=BUILD, extra_paths=[], path=MODEL, last=True, context_tokens=256, gpu_layers=0, threads=4,
-        table=embed, cpu_tensors=[], rollback_tokens=4, slots=2,
+        "load", folder=BUILD, extra_paths=[], path=MODEL, last=True, context_tokens=256, gpu_layers=0, threads=threads,
+        table=embed, cpu_tensors=[], rollback_tokens=4, slots=slots,
     )  # fmt: skip
     return host, bool(header.arch_key("ssm.state_size"))
 
@@ -903,11 +903,41 @@ async def real_ring(host, **limits) -> EngineClient:
     return await EngineClient.open(door["local_port"], bytes(door["local_key"]))
 
 
-def real_pass(client, tokens, position, rollback_to=None, keep=False, temperature=0.0, seed=None, top_k=0):
+def real_pass(client, tokens, position, rollback_to=None, keep=False, temperature=0.0, seed=None, top_k=0, slot=0):
     return client.send(
-        epoch=1, slot=0, position=position, rollback_to=rollback_to, tokens=tokens, guesses=[], verify=False,
+        epoch=1, slot=slot, position=position, rollback_to=rollback_to, tokens=tokens, guesses=[], verify=False,
         temperature=temperature, top_p=1.0, top_k=top_k, seed=seed, keep=keep,
     )  # fmt: skip
+
+
+@needs_real_stage
+def test_a_real_stage_probes_at_load_and_leaves_every_slot_as_it_found_it() -> None:
+    """The probe runs passes on every slot. A reply after it must not see any of them."""
+
+    async def replies(host) -> list[list[int]]:
+        client = await real_ring(host)
+        try:
+            made = []
+            for slot in (0, 3):
+                tokens = [(await real_pass(client, PROMPT, 0, slot=slot))[0]]
+                for position in range(len(PROMPT), len(PROMPT) + 8):
+                    tokens += await real_pass(client, tokens[-1:], position, slot=slot)
+                made.append(tokens)
+            return made
+        finally:
+            client.close()
+
+    host, _ = real_stage(slots=4)
+    try:
+        found = host.call("exactness")[0]["found"]
+        assert set(found) == {"exact_merge_limit", "verify_exact"}
+        assert 0 <= found["exact_merge_limit"] <= 3 and isinstance(found["verify_exact"], bool)
+        after_probe = asyncio.run(replies(host))
+        host.call("ring_close")
+        host.call("clear")
+        assert asyncio.run(replies(host)) == after_probe
+    finally:
+        host.close()
 
 
 @needs_real_stage
@@ -1014,13 +1044,14 @@ def test_a_real_pass_past_its_limit_refuses_and_ends_the_process() -> None:
         client = await real_ring(host, pass_ms=1, row_ms=0)
         try:
             with pytest.raises(EngineRefusal) as caught:
-                # Enough rows to outlast the watchdog's first look on any machine.
-                await client.run(60, epoch=1, slot=0, position=0, rollback_to=None, tokens=PROMPT * 16, guesses=[], verify=False, temperature=0.0, top_p=1.0, top_k=0, seed=None)
+                # Enough rows to outlast the watchdog's first look on any machine. llama.cpp runs a
+                # pass of 32 rows or more on a GPU if there is one, which is fast once it is warm.
+                await client.run(60, epoch=1, slot=0, position=0, rollback_to=None, tokens=(PROMPT * 3)[:31], guesses=[], verify=False, temperature=0.0, top_p=1.0, top_k=0, seed=None)
             return caught.value
         finally:
             client.close()
 
-    host, _ = real_stage()
+    host, _ = real_stage(threads=1)
     try:
         refused = asyncio.run(run(host))
         assert refused.refusal == native.REFUSE_FAILED_STAGE and "hung" in refused.message

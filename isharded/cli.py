@@ -144,6 +144,8 @@ def load_body(args: argparse.Namespace) -> dict[str, object]:
     for field, value in (("entry_worker", args.entry), ("exit_worker", args.exit), ("parallel", args.parallel), ("mmproj", args.mmproj)):
         if value:
             body[field] = value
+    if args.exact:
+        body["exact"] = True
     if args.no_reuse_cached:
         body["reuse_cached"] = False
     if args.no_peer_fetch:
@@ -536,6 +538,7 @@ def add_load_command(subparsers: Any, token: str | None) -> None:
     load.add_argument("--no-peer-fetch", action="store_true", help="download every shard from the model host")
     add_token(load, token, "an admin key; defaults to this machine's pool token")
     load.add_argument("--no-merge-passes", dest="merge_passes", action="store_false", help="make conversations take turns on each stage")
+    load.add_argument("--exact", action="store_true", help="keep every reply identical to plain decoding at any load, merging only what rounds the same")
     load.add_argument("--no-prompt-cache", dest="prompt_cache", action="store_false", help="read every prompt in full instead of reusing saved states")
     load.add_argument("--kv-type", choices=["f16", "q8_0"], default="f16", help="how a GGUF model keeps attention KV; q8_0 takes about half the memory")
     load.add_argument("--lane", default=None, help="load beside the running model, in a lane of this name")
