@@ -2502,3 +2502,66 @@ def test_a_worker_that_comes_back_is_measured_afresh() -> None:
     measure(orchestrator, handler, 0)
     assert set(orchestrator.links) == {("one", "two"), ("two", "one")}
     done(orchestrator)
+
+
+def warming_pool(handler):
+    orchestrator = pool(one=record("one"))
+    orchestrator.route = [stage("one", 0, 1)]
+    orchestrator.epoch = 5
+    orchestrator.active = SimpleNamespace(embedding=False)
+    orchestrator.tokenizer = SimpleNamespace(encode=lambda text: [7, 8])
+    orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return orchestrator
+
+
+def test_a_new_route_runs_one_short_reply_and_clears_it_away() -> None:
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path, json.loads(request.content) if request.content else None))
+        return httpx.Response(200, text='{"token_id": 1}\n')
+
+    async def run():
+        orchestrator = warming_pool(handler)
+        await orchestrator._warm_route(5)
+        await orchestrator.close()
+
+    asyncio.run(run())
+    (method, path, body), (cleared, gone, _) = seen
+    assert (method, path) == ("POST", "/v1/generate")
+    assert (body["input_ids"], body["max_tokens"], body["epoch"]) == ([7, 8], 1, 5)
+    assert (cleared, gone) == ("DELETE", f"/internal/sessions/{body['session_id']}")
+
+
+@pytest.mark.parametrize("failure", [httpx.ConnectError("refused"), httpx.ReadTimeout("slow")])
+def test_a_warm_pass_that_fails_blames_nobody(failure) -> None:
+    def handler(request):
+        raise failure
+
+    async def run():
+        orchestrator = warming_pool(handler)
+        await orchestrator._warm_route(5)
+        await orchestrator.close()
+        return orchestrator.workers["one"]
+
+    assert not asyncio.run(run()).quarantined
+
+
+@pytest.mark.parametrize(("epoch", "embedding", "replying"), [(4, False, 0), (5, True, 0), (5, False, 1)])
+def test_there_is_nothing_to_warm_on_some_routes(epoch, embedding, replying) -> None:
+    """One that moved on, one that makes no replies, and one a real reply is already warming."""
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200)
+
+    async def run():
+        orchestrator = warming_pool(handler)
+        orchestrator.active.embedding = embedding
+        orchestrator.replies_in_flight = replying
+        await orchestrator._warm_route(epoch)
+        await orchestrator.close()
+
+    asyncio.run(run())
+    assert not seen

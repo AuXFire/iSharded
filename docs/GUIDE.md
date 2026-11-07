@@ -535,6 +535,8 @@ If the connection to a node drops, retry against another node. Replies survive a
 | A split GGUF, by any part | `owner/repo:Q6_K/model-00001-of-00004.gguf` | Each worker fetches only its share, from whichever parts hold it |
 | A local safetensors folder | `D:\models\qwen3-8b` | That machine. In a secured pool it must be in `--model-dir` |
 
+Once a route is up, the coordinator runs a one-token reply through it, so that the first real reply does not pay for first use. On two local stages of a 0.6B model that took the first reply from 355 to 242 ms on CPU. A stage restart gets no such pass, because it showed no such gain.
+
 Loading a model replaces the main one. To run another beside it, see [Several models at once](#several-models-at-once). To see where a model would go without moving anything, use `POST /admin/plan`, or the picker on the chat page.
 
 Gated models need `HF_TOKEN` set on each worker.
