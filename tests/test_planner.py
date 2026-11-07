@@ -6,10 +6,12 @@ import random
 import time
 from types import SimpleNamespace
 
+from fastapi.testclient import TestClient
 import httpx
 import pytest
 
 from isharded import cli, planner
+from isharded import orchestrator as orchestrator_module
 from isharded.gguf import holds_both_kinds
 from isharded.orchestrator import Orchestrator
 from isharded.planner import Candidate, ModelProfile, PlacementError, keep_layers, memory_report, plan_placement, stored_bytes
@@ -1596,3 +1598,103 @@ def test_less_ram_decides_between_plans_with_the_same_room_open() -> None:
 def test_auto_is_the_default_placement() -> None:
     assert LoadModelRequest(model_id="m").placement == "auto"
     assert cli.build_parser().parse_args(["load", "m"]).placement == "auto"
+
+
+def with_mesh_links(workers: list[Candidate]) -> list[Candidate]:
+    return planner.with_links(workers, LINKS)
+
+
+def uneven_pool() -> list[Candidate]:
+    """One card three times as fast as the other, so the quickest loop is the most lopsided."""
+    return [card("fast", 300, 900), card("slow", 300, 300)]
+
+
+def reads_of(route) -> list[float]:
+    return [stage.estimated_ms_per_token for stage in route]
+
+
+def test_the_law_gives_the_runs_it_was_fitted_to() -> None:
+    assert 1000 / planner.ms_per_token(36, 12, 2.5, 9) == pytest.approx(39.7, abs=0.05)
+    assert 1000 / planner.ms_per_token(86, 12, 2.5, 9) == pytest.approx(22.1, abs=0.05)
+
+
+def test_with_no_draft_only_the_loop_counts() -> None:
+    assert planner.ms_per_token(250, 90) == 250
+
+
+@pytest.mark.parametrize("model", [block_profile([2.72] * 32), moe_profile()], ids=["block rule", "no block rule"])
+def test_a_route_with_nothing_measured_plans_as_it_did(model) -> None:
+    assert layout_of(plan_placement(mesh_cards(), [], model, links=LINKS)) == layout_of(
+        plan_placement(mesh_cards(), [], model, links=LINKS, tokens_per_miss=1.0)
+    )
+
+
+@pytest.mark.parametrize("model", [block_profile([2.72] * 32), moe_profile()], ids=["block rule", "no block rule"])
+def test_a_measured_draft_trades_some_loop_for_an_evener_pace(model) -> None:
+    quickest = plan_placement(uneven_pool(), [], model)
+    paced = plan_placement(uneven_pool(), [], model, tokens_per_miss=6)
+    assert sum(reads_of(paced)) > sum(reads_of(quickest))
+    assert max(reads_of(paced)) < max(reads_of(quickest))
+    law = [planner.ms_per_token(sum(reads_of(route)), max(reads_of(route)), 6) for route in (quickest, paced)]
+    assert law[1] < law[0]
+
+
+def test_a_route_cost_follows_the_law_and_still_charges_a_move_in_full() -> None:
+    model = replace(moe_profile(amortize=20_000), tokens_per_miss=2.5)
+    workers = with_mesh_links(mesh_cards())
+    route = plan_placement(workers, [], model)
+    reads = reads_of(route)
+    loop = sum(reads) + planner._hops_ms(route, workers, model)
+    moved = planner._moved_ms(route, workers, model)
+    assert moved > 0
+    assert planner._route_cost(route, workers, model) == pytest.approx((loop + 1.5 * max(reads)) / 2.5 + moved)
+
+
+def test_a_tie_on_a_pool_of_equals_keeps_the_earlier_worker() -> None:
+    route = plan_placement([ram_worker("a", 4 * GIB), ram_worker("b", 4 * GIB)], [], profile(), spread=False)
+    assert names_of(route) == ["a"]
+
+
+def law_runtime(telemetry: dict, model: str = "m") -> Orchestrator:
+    runtime = Orchestrator()
+    runtime.active = SimpleNamespace(model_id=model)
+    runtime.route = plan_placement([ram_worker("a")], [], profile())
+    runtime.workers = {"a": SimpleNamespace(health={"telemetry": telemetry})}
+    return runtime
+
+
+@pytest.mark.parametrize(
+    "counts, expected",
+    [
+        ({"tokens": 1000, "misses": 400}, 2.5),
+        ({"tokens": 300, "misses": 0}, 300),
+        ({"tokens": 100, "misses": 40}, 1.0),  # too few to believe
+        ({"tokens": 300, "misses": 400}, 1.0),  # a miss can come with no token
+        ({}, 1.0),
+    ],
+)
+def test_tokens_per_miss_comes_from_the_entry_stage(counts, expected) -> None:
+    assert law_runtime({"pipeline": counts}).tokens_per_miss(SimpleNamespace(model_id="m")) == expected
+
+
+def test_another_model_has_measured_nothing() -> None:
+    runtime = law_runtime({"pipeline": {"tokens": 1000, "misses": 400}})
+    assert runtime.tokens_per_miss(SimpleNamespace(model_id="other")) == 1.0
+
+
+def test_a_plan_shows_its_loop_and_pace(monkeypatch) -> None:
+    model = moe_profile()
+    runtime = law_runtime({"pipeline": {"tokens": 1000, "misses": 400}})
+    runtime.links = dict(LINKS)
+    monkeypatch.setattr(orchestrator_module, "runtime", runtime)
+    route = plan_placement(mesh_cards(), [], model, links=LINKS)
+    adapter = SimpleNamespace(config={}, num_layers=model.num_layers)
+    units = {item.name: item for item in model.units}
+    target = SimpleNamespace(model_id="m", adapter=adapter, profile=model, units=units, held={}, draft=None, embedding=False, projector=None)
+    plan = orchestrator_module.describe_plan(target, route)
+    loop, pace = planner.route_times(route, LINKS, model.ring)
+    assert plan["loop_ms"] == pytest.approx(loop, abs=0.01)
+    assert plan["pace_ms"] == pytest.approx(pace, abs=0.01)
+    assert plan["tokens_per_miss"] == 2.5
+    assert plan["ms_per_token"] == pytest.approx((loop + 1.5 * pace) / 2.5, abs=0.01)
+    assert plan["estimated_tokens_per_second"] == pytest.approx(1000 / loop, abs=0.05)  # as it always was

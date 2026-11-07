@@ -60,6 +60,8 @@ AUTO_SLACK = (0, 2, 6)
 # Kept back on accelerators for activations and allocator overhead.
 WORKSPACE_BYTES = 256 * 1024**2
 WORKSPACE_SHARE = 0.1
+# Least time a layer takes on a GPU, measured at 0.5 to 0.75 ms on an RX 7900 XT.
+LAYER_FLOOR_MS = 0.5
 # Reading the embedding touches one row per token, which is effectively free.
 EMBEDDING_ACTIVE_FRACTION = 0.0
 # Rate at which FP8 weights can be expanded per use, in GB of FP8 per second.
@@ -141,6 +143,9 @@ class ModelProfile:
     # Whether stages pass tokens around a closed loop, instead of each waiting for
     # the next stage's reply. It sets what a route's network time is.
     ring: bool = False
+    # Tokens a reply makes per wrong guess, as measured on a route. One means nothing
+    # has been measured, and then only the time around the loop counts.
+    tokens_per_miss: float = 1.0
 
     def __post_init__(self) -> None:
         # The layer search asks for the same sizes thousands of times, and a
@@ -384,17 +389,23 @@ def _spilled_bytes(placements: list[UnitPlacement], pools: list[MemoryPool]) -> 
     return sum(item.bytes for item in placements if item.pool_id in below)
 
 
+def _fetch(candidate: Candidate, profile: ModelProfile, start: int, end: int) -> tuple[int, float]:
+    """The bytes a stage would have to fetch onto this worker, and the seconds that takes."""
+    rate = candidate.fetch_bytes_per_second or DEFAULT_FETCH_BYTES_PER_SECOND
+    peer_rate = max(rate, PEER_FETCH_BYTES_PER_SECOND)
+    size, seconds = 0, 0.0
+    for item in _stage_items(profile, start, end):
+        if item.unit.name not in candidate.cached:
+            size += item.unit.nbytes
+            seconds += item.unit.nbytes / (peer_rate if item.unit.name in candidate.peer_units else rate)
+    return size, seconds
+
+
 def _download_ms(candidate: Candidate, profile: ModelProfile, start: int, end: int) -> float:
     """A stage's download time, spread across the tokens it must pay back over."""
     if not profile.amortize_tokens:
         return 0.0
-    rate = candidate.fetch_bytes_per_second or DEFAULT_FETCH_BYTES_PER_SECOND
-    peer_rate = max(rate, PEER_FETCH_BYTES_PER_SECOND)
-    seconds = 0.0
-    for item in _stage_items(profile, start, end):
-        if item.unit.name not in candidate.cached:
-            seconds += item.unit.nbytes / (peer_rate if item.unit.name in candidate.peer_units else rate)
-    return seconds * 1000 / profile.amortize_tokens
+    return _fetch(candidate, profile, start, end)[1] * 1000 / profile.amortize_tokens
 
 
 def _weight_room(pool: MemoryPool, workspace: int) -> int:
@@ -493,6 +504,27 @@ def route_network_ms(route: list[StageAssignment], links: dict[tuple[str, str], 
     return _network_ms(forward, link_ms(links, names[-1], names[0]) if names else 0.0, ring)
 
 
+def ms_per_token(loop_ms: float, pace_ms: float, tokens_per_miss: float = 1.0, rewind_ms: float = 0.0) -> float:
+    """One reply's time per token, with passes overlapping on the route.
+
+    After a miss the next token has to come all the way around the loop and the draft
+    has to rewind. The others that hit follow at the pace of the slowest stage. So
+    tokens per second is L / (R + w + (L - 1) p), and with no draft L is 1 and only the
+    loop counts.
+    """
+    return (loop_ms + rewind_ms + (tokens_per_miss - 1) * pace_ms) / tokens_per_miss
+
+
+def route_times(route: list[StageAssignment], links: dict[tuple[str, str], float], ring: bool) -> tuple[float, float]:
+    """A planned route's time around the loop, and its slowest stage, in ms.
+
+    Bandwidth alone flatters small active sets, such as a MoE's: every layer still costs
+    its kernel launches, and every stage boundary costs a network hop.
+    """
+    stages = [max(stage.estimated_ms_per_token, (stage.end_layer - stage.start_layer) * LAYER_FLOOR_MS) for stage in route]
+    return sum(stages) + route_network_ms(route, links, ring), max(stages, default=0.0)
+
+
 class _Packer:
     """Packs stages for one set of capacities, for the searches to compare.
 
@@ -548,6 +580,15 @@ def _extended(
     return score[0] + open_layers + dead, score[1] + slow, max(score[2], read), total, walked
 
 
+def _paced(profile: ModelProfile) -> Callable[[_Score], float]:
+    """What a search minimizes: a route's total with the law's pace added in.
+
+    The pace is a maximum, so a walk can only weigh the slowest stage so far. A route
+    is judged in full by ``_route_cost``, once it is whole.
+    """
+    return lambda score: score[3] + (profile.tokens_per_miss - 1) * score[2]
+
+
 def _stage_scorer(profile: ModelProfile, packer: _Packer) -> Callable[[Candidate, int, int], _Score | None]:
     """Score stages by how much fast memory they leave open.
 
@@ -588,7 +629,8 @@ def _stage_scorer(profile: ModelProfile, packer: _Packer) -> Callable[[Candidate
                 room = sum(shares[group] for group in {pool.capacity_group for pool in fast.values()})
                 open_layers = max(room - fast_bytes(placements, fast), 0) // largest - room // largest
                 slow = sum(item.bytes for item in placements if item.pool_id not in fast)
-                cost = milliseconds + _download_ms(candidate, profile, start, end)
+                # A search compares L times the time per token, so a download counts L times.
+                cost = milliseconds + profile.tokens_per_miss * _download_ms(candidate, profile, start, end)
                 known[key] = (open_layers, slow, milliseconds, cost)
         return known[key]
 
@@ -786,7 +828,8 @@ def _fill_fast_memory(
     slow = _slow_bytes(fastest, candidates)
     if not slow or not any(pool.kind in FAST_MEMORY for pool in _all_pools(candidates)):
         return fastest
-    fullest = search(lambda score: (score[0], score[3])) or fastest
+    paced = _paced(profile)
+    fullest = search(lambda score: (score[0], paced(score))) or fastest
     if _slow_bytes(fullest, candidates) >= slow:
         fullest = fastest
     reads = [stage.estimated_ms_per_token for stage in fullest]
@@ -936,9 +979,19 @@ def _dead_links(route: list[StageAssignment], candidates: list[Candidate]) -> in
     return sum(hop >= UNREACHABLE_LINK_MS for hop in _round_trips(route, candidates)[0])
 
 
+def route_faults(route: list[StageAssignment], candidates: list[Candidate]) -> tuple[int, int]:
+    """What outranks speed: forward links that failed, then bytes outside fast memory."""
+    return _dead_links(route, candidates), _slow_bytes(route, candidates)
+
+
 def _route_cost(route: list[StageAssignment], candidates: list[Candidate], profile: ModelProfile) -> float:
-    reads = sum(stage.estimated_ms_per_token for stage in route)
-    return reads + _hops_ms(route, candidates, profile) + _moved_ms(route, candidates, profile)
+    """A route's time per token, with what it moves spread over the tokens to pay it back.
+
+    A draft's rewind is the same on every route, so it changes no comparison.
+    """
+    reads = [stage.estimated_ms_per_token for stage in route]
+    loop = sum(reads) + _hops_ms(route, candidates, profile)
+    return ms_per_token(loop, max(reads, default=0.0), profile.tokens_per_miss) + _moved_ms(route, candidates, profile)
 
 
 def _sampled(
@@ -956,7 +1009,7 @@ def _sampled(
         best: list[StageAssignment] | None = None
         best_cost = INFEASIBLE
         for order in orders:
-            walked = _walk_order(order, profile, stage, spread, required, lambda score: score[3], fewer_on_a_tie=True)
+            walked = _walk_order(order, profile, stage, spread, required, _paced(profile), fewer_on_a_tie=True)
             if walked is None:
                 continue
             route = _build_route(walked[1], profile, packer.capacities)
@@ -1004,7 +1057,8 @@ def _attempt(
             ranges = _search_order(orders, profile, stage, spread, required, rank, slowest)
         return None if ranges is None else _build_route(ranges, profile, packer.capacities)
 
-    fastest = search(lambda score: (score[3], score[0], score[1], score[2])) if every_order else sampled
+    paced = _paced(profile)
+    fastest = search(lambda score: (paced(score), score[0], score[1], score[2])) if every_order else sampled
     return None if fastest is None else _fill_fast_memory(fastest, search, candidates, profile)
 
 
@@ -1242,7 +1296,7 @@ def _plan_auto(
     held = [item for item in group if item.cached or item.worker_id in required]
 
     def worth(route: list[StageAssignment]) -> tuple[int, int, float]:
-        return _dead_links(route, group), _slow_bytes(route, group), _route_cost(route, group, profile)
+        return *route_faults(route, group), _route_cost(route, group, profile)
 
     best: list[StageAssignment] | None = None
     tried: set[frozenset[str]] = set()
@@ -1369,6 +1423,7 @@ def plan_placement(
     exit_worker: str | None = None,
     links: dict[tuple[str, str], float] | None = None,
     ring: bool | None = None,
+    tokens_per_miss: float | None = None,
 ) -> list[StageAssignment]:
     """Plan a route, adding standby workers only if the model needs them.
 
@@ -1377,10 +1432,13 @@ def plan_placement(
     machines hold the two ends. A worker holds one stage, so pinning one worker to
     both ends means it runs the whole model. ``links`` holds measured round trips in
     ms, from one worker to another, and a hop that has none costs ``HOP_MS``. ``ring``
-    costs a route as a closed loop, and otherwise it comes from the profile.
+    costs a route as a closed loop, and ``tokens_per_miss`` is what a route has measured.
+    Otherwise both come from the profile.
     """
     if ring is not None and ring != profile.ring:
         profile = replace(profile, ring=ring)
+    if tokens_per_miss is not None and tokens_per_miss != profile.tokens_per_miss:
+        profile = replace(profile, tokens_per_miss=tokens_per_miss)
     preferred, standby = with_links(preferred, links), with_links(standby, links)
     usable = [candidate for candidate in preferred if candidate.pools]
     reserve = [candidate for candidate in standby if candidate.pools]
@@ -1407,7 +1465,7 @@ def plan_placement(
             attempts.append(by_speed(everyone))
 
     def rank(route: list[StageAssignment]) -> tuple[int, int]:
-        return _dead_links(route, everyone), _slow_bytes(route, everyone)
+        return route_faults(route, everyone)
 
     # A standby worker with VRAM comes before RAM, like any other VRAM.
     standby_vram = any(pool.kind in FAST_MEMORY for pool in _all_pools(reserve))
