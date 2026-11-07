@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import re
+import subprocess
 
 from fastapi.testclient import TestClient
 import pytest
@@ -556,3 +557,194 @@ def test_a_key_file_is_still_kept_as_a_reference(assistant, owner, tmp_path):
     path = str(tmp_path / "key.txt")
     assert owner.post("/assistant/providers", json={"name": "x", "url": "http://example.com:8000", "key_file": path}).status_code == 200
     assert assistant.store.one("SELECT key_reference FROM providers WHERE name = 'x'")["key_reference"] == f"file:{path}"
+
+
+# What the page cannot do yet: the coder
+
+
+@pytest.fixture
+def coder_ready(assistant):
+    assistant.sandbox = ProcessSandbox()
+    assistant.router = CodingRouter([FIX_AS_FILE])
+    assistant.broker = GitBroker()
+    assistant.broker.grants.add(("alice", "git.commit"))
+
+
+def test_a_run_is_started_by_the_owner_for_the_person_named(assistant, coder_ready, repo, owner, alice):  # noqa: F811
+    body = {"repo": str(repo), "goal": "Fix add so test_add passes"}
+    assert alice.post("/assistant/code/runs", json=body).status_code == 403
+    assert assistant.coder.runs("alice") == []
+    started = owner.post("/assistant/code/runs", params={"user": "alice"}, json=body)
+    assert started.status_code == 200, started.text
+    assert (started.json()["state"], started.json()["user"]) == ("ready", "alice")
+    assert [row["id"] for row in alice.get("/assistant/code/runs").json()["runs"]] == [started.json()["id"]]
+
+
+def test_a_run_takes_what_the_command_takes(assistant, coder_ready, repo, owner):  # noqa: F811
+    body = {"repo": str(repo), "goal": "Fix add so test_add passes", "test": ["python", "-m", "pytest", "-q"], "rounds": 2, "timeout": 60, "reach": "machine"}
+    run = owner.post("/assistant/code/runs", json=body).json()
+    assert (run["test_command"], run["max_rounds"], run["reach"]) == (body["test"], 2, "machine")
+
+
+@pytest.mark.parametrize(
+    "fields, status",
+    [({"reach": "the moon"}, 400), ({"rounds": 0}, 422), ({"timeout": 0}, 422), ({"goal": "  "}, 409), ({"repo": "no such folder"}, 409)],
+)
+def test_a_run_that_could_not_work_is_refused(assistant, coder_ready, repo, owner, fields, status):  # noqa: F811
+    answer = owner.post("/assistant/code/runs", json={"repo": str(repo), "goal": "Fix add", **fields})
+    assert answer.status_code == status, answer.text
+
+
+def test_a_waiting_run_is_resumed_by_the_owner(assistant, coder_ready, repo, owner, alice):  # noqa: F811
+    assistant.router = CodingRouter([RuntimeError("the model is down")])
+    run = assistant.coder.start(repo, "Fix add so test_add passes", user="alice")
+    assert run.state == "proposing" and run.problem
+    assistant.router = CodingRouter([FIX_AS_FILE])
+
+    path = f"/assistant/code/runs/{run.id}/resume"
+    assert alice.post(path).status_code == 403
+    assert owner.post(path).status_code == 404  # the owner says whose they mean
+    assert owner.post("/assistant/code/runs/nothing/resume").status_code == 404
+    assert owner.post(path, params={"user": "alice"}, json={"rounds": -1}).status_code == 422
+    resumed = owner.post(path, params={"user": "alice"}, json={"rounds": 1})
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["state"] == "ready" and resumed.json()["problem"] == ""
+    assert owner.post(path, params={"user": "alice"}).status_code == 409  # there is nothing left to resume
+
+
+def test_a_commit_is_pushed_by_the_owner_and_only_if_the_broker_allows(assistant, ready_run, repo, owner, alice, tmp_path):  # noqa: F811
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "backup", str(remote)], check=True)
+    path = f"/assistant/code/runs/{ready_run.id}/push"
+    early = owner.post(path, params={"user": "alice"}, json={"remote": "backup"})
+    assert early.status_code == 409 and "Only a committed run" in early.json()["detail"]
+    owner.post(f"/assistant/code/runs/{ready_run.id}/approve", params={"user": "alice"})
+
+    assert alice.post(path, json={"remote": "backup"}).status_code == 403
+    assert owner.post(path, json={"remote": "backup"}).status_code == 404
+    refused = owner.post(path, params={"user": "alice"}, json={"remote": "backup"})
+    assert refused.status_code == 409 and "refused git.push" in refused.json()["detail"]
+
+    assistant.broker.grants.add(("alice", "git.push"))
+    pushed = owner.post(path, params={"user": "alice"}, json={"remote": "backup"})
+    assert pushed.status_code == 200 and pushed.json()["state"] == "pushed"
+    assert next(row for row in assistant.audit.read() if row["action"] == "coder.pushed")["actor"] == "owner"
+
+
+# What the page cannot do yet: skills
+
+
+def promoted(assistant, text: str):
+    version = assistant.skills.propose("greeter", text, ("files.read",), tests=GREETS, user="alice")
+    assistant.router = ScriptedRouter("hello there", "hello there")
+    assistant.skills.evaluate(version.id)
+    return assistant.skills.promote(version.id)
+
+
+def test_the_owner_rolls_a_skill_back_for_the_person_named(assistant, owner, alice):
+    first = promoted(assistant, "Say hello.")
+    second = promoted(assistant, "Say hello warmly.")
+    path = "/assistant/skills/greeter/rollback"
+    assert alice.post(path).status_code == 403
+    assert owner.post(path).status_code == 404  # the owner has no such skill
+    back = owner.post(path, params={"user": "alice"}, json={"reason": "Too warm."})
+    assert back.status_code == 200, back.text
+    assert (back.json()["id"], back.json()["state"]) == (first.id, "active")
+    assert (assistant.skills.version(second.id).state, assistant.skills.version(second.id).reason) == ("rejected", "Too warm.")
+    assert next(row for row in assistant.audit.read() if row["action"] == "skills.rolled_back")["actor"] == "owner"
+    again = owner.post(path, params={"user": "alice"})
+    assert again.status_code == 409 and "no earlier version" in again.json()["detail"]
+
+
+def test_a_person_reads_their_own_gaps(assistant, owner, alice, bob, monkeypatch):
+    wanted = []
+    monkeypatch.setattr(assistant.skills, "gaps", lambda user: wanted.append(user) or [{"task_type": "files", "failures": 3}])
+    assert alice.get("/assistant/skills/gaps").json() == {"gaps": [{"task_type": "files", "failures": 3}]}
+    assert bob.get("/assistant/skills/gaps", params={"user": "alice"}).status_code == 403
+    assert owner.get("/assistant/skills/gaps", params={"user": "alice"}).status_code == 200
+    assert wanted == ["alice", "alice"]
+
+
+def test_nobody_has_gaps_to_begin_with(assistant, alice):
+    assert alice.get("/assistant/skills/gaps").json() == {"gaps": []}
+
+
+# What the page cannot do yet: who the assistant is
+
+
+def test_the_owner_changes_who_the_assistant_is_in_their_own_name(assistant, owner, alice):
+    assert alice.put("/assistant/identity", json={"name": "Grace"}).status_code == 403
+    assert assistant.identity.name != "Grace"
+    changed = owner.put("/assistant/identity", json={"name": "Grace", "style": "Brief.", "voice": "low", "by": "model:evil"})
+    assert changed.status_code == 200, changed.text
+    assert (changed.json()["name"], changed.json()["style"], changed.json()["voice"]) == ("Grace", "Brief.", "low")
+    assert assistant.identity.history(1)[0]["changed_by"] == "owner"
+    assert next(row for row in assistant.audit.read() if row["action"] == "identity.set")["actor"] == "user:owner"
+
+
+def test_promises_and_notes_go_to_the_person_named(assistant, owner, alice):
+    body = {"commit": "I will not read your mail.", "to_user": True, "relationship": "Trusted."}
+    shown = owner.put("/assistant/identity", params={"user": "alice"}, json=body).json()
+    assert shown["relationship"] == "Trusted." and shown["commitments"][0]["to"] == "alice"
+    assert alice.get("/assistant/identity").json()["relationship"] == "Trusted."
+    assert owner.get("/assistant/identity").json()["commitments"] == []
+
+    promise = owner.put("/assistant/identity", json={"commit": "I keep records."}).json()["commitments"][0]
+    assert promise["to"] == "everyone"
+    assert owner.put("/assistant/identity", json={"withdraw": promise["id"]}).json()["commitments"] == []
+
+
+def test_a_change_refused_partway_changes_nothing(assistant, owner):
+    answer = owner.put("/assistant/identity", json={"name": "Grace", "withdraw": 999})
+    assert answer.status_code == 400 and "no open commitment" in answer.json()["detail"]
+    assert assistant.identity.name != "Grace" and assistant.identity.history() == []
+
+
+# What the page cannot do yet: peers
+
+
+def test_owners_offer_ask_and_collect_over_their_gateways(tmp_path):
+    with Assistant(tmp_path / "one") as first, Assistant(tmp_path / "two") as second:
+        first_key, second_key = Users(first).add("owner"), Users(second).add("owner")
+        member_key = Users(second).add("alice")
+        with Live(first) as one, Live(second) as two, client(one, first_key) as ann, client(two, second_key) as ben, client(two, member_key) as alice:
+            code = ann.post("/assistant/peers/invite", json={"name": "ben", "address": one.url}).json()["code"]
+            ben.post("/assistant/peers/accept", json={"code": code, "name": "ann", "address": two.url})
+            ann.post("/assistant/peers/ben/approve")
+            ben.post("/assistant/peers/ann/approve")
+            first.router = ScriptedRouter("Hello back.")
+
+            offered = ann.post("/assistant/peers/ben/offer", json={"capability": "models.complete", "per_day": 5})
+            assert offered.status_code == 200, offered.text
+            assert offered.json()["offered"] == [{"capability": "models.complete", "per_day": 5}]
+            assert ann.post("/assistant/peers/nobody/offer", json={"capability": "models.complete"}).status_code == 404
+            assert ann.post("/assistant/peers/ben/offer", json={"capability": "memory.search"}).status_code == 409
+
+            assert alice.get("/assistant/peers/ann/offers").status_code == 403
+            assert ben.get("/assistant/peers/nobody/offers").status_code == 404
+            assert ben.get("/assistant/peers/ann/offers").json() == {"offers": ["models.complete"]}
+
+            request = {"capability": "models.complete", "text": "Hello"}
+            assert alice.post("/assistant/peers/ann/ask", json=request).status_code == 403
+            assert ben.post("/assistant/peers/nobody/ask", json=request).status_code == 404
+            refused = ben.post("/assistant/peers/ann/ask", json=request)
+            assert refused.status_code == 409 and "refused" in refused.json()["detail"]  # no grant to send, so nothing left this install
+            assert first.router.requests == []
+
+            second.broker.add_grant("owner", "peer.send", "ann", "owner")
+            asked = ben.post("/assistant/peers/ann/ask", json=request)
+            assert asked.status_code == 200, asked.text
+            answer = asked.json()
+            assert (answer["ok"], answer["status"], answer["output"], answer["trust"]) == (True, "ok", "Hello back.", "external")
+            assert first.router.requests[0].messages == [{"role": "user", "content": "Hello"}]
+            assert next(row for row in second.audit.read() if row["action"] == "federation.sent")["actor"] == "owner"
+
+            assert alice.post("/assistant/peers/ann/collect", json={"request": answer["request"]}).status_code == 403
+            assert ben.post("/assistant/peers/nobody/collect", json={"request": answer["request"]}).status_code == 404
+            collected = ben.post("/assistant/peers/ann/collect", json={"request": answer["request"]})
+            assert collected.status_code == 200 and collected.json()["output"] == "Hello back."
+
+            withdrawn = ann.post("/assistant/peers/ben/offer", json={"capability": "models.complete", "withdraw": True})
+            assert withdrawn.json()["offered"] == []
+            assert ben.get("/assistant/peers/ann/offers").json() == {"offers": []}

@@ -201,6 +201,7 @@ Measured on this machine with 5,000 mixed files (26.5 MB, 27,257 chunks), while 
 | `provider add NAME URL` | `--mesh` for an iSharded pool, `--key-env NAME` or `--key-file PATH`, `--reach`, `--tools auto\|native\|prompt`, `--daily-tokens`, `--read-seconds`, `--model` |
 | `provider list` | Shows providers and checks each is up. `--no-check` does not contact them |
 | `provider remove NAME` | Removes one |
+| `provider test NAME` | Asks one provider if it is up, on a fresh connection, and says what it serves. Exits 1 if it is down |
 
 Reach defaults to `cloud`, the worst case, and to `pool` for a mesh. `machine` is refused for anything not on loopback. A person's words may go only as far as `pool` until they say otherwise, so a server added with no `--reach` is refused every request until either its reach or theirs changes.
 
@@ -1108,6 +1109,7 @@ Every path needs a key except `GET /`, `GET /assistant`, `GET /assistant/`, `GET
 | `POST /v1/chat/completions` | Any OpenAI client. `stream` works, and `conversation_id` or an `X-Conversation-Id` header names a conversation. `max_tokens`, or `max_completion_tokens`, limits the whole reply, up to `reply_tokens`, and `temperature` is from 0 to 2. Tools it cannot honour are a 400 |
 | `GET /assistant/whoami` | Who this key is |
 | `GET /assistant/identity` | The persona, as it applies to this person |
+| `PUT /assistant/identity` | Changes who the assistant is, as `identity set` does: `name`, `style`, `voice`, `commit` with `to_user`, `withdraw`, and `relationship`. `user` says who a promise or note is for. It all happens or none of it does. Owner |
 | `GET /assistant/identity/history` | How the name, style, and voice changed, newest first. `limit` |
 | `GET /assistant/identity/relationship` | This person's relationship notes, newest first. `limit`, `user` |
 | `POST /assistant/say` | One turn in the assistant's own shape |
@@ -1145,22 +1147,31 @@ Every path needs a key except `GET /`, `GET /assistant`, `GET /assistant/`, `GET
 | `GET /assistant/routes` | Each role's candidates |
 | `PUT /assistant/routes/{role}` | Sets a role's `candidates`, at least one. Owner |
 | `GET /assistant/skills` | This person's skill versions, with state and trust. `user` |
+| `GET /assistant/skills/gaps` | This person's repeated failures by task type, as `skill gaps` shows. `user` |
 | `GET /assistant/skills/{reference}` | One version, as `name@number` or its id, with its success rate and last evaluation. `user` |
 | `POST /assistant/skills/{reference}/evaluate` | Runs a candidate against what is active, which promoting needs first. Owner. `user` |
 | `POST /assistant/skills/{reference}/promote` | Puts an eligible candidate into use. Owner. `user` |
 | `POST /assistant/skills/{reference}/reject` | Turns a version down, with an optional `reason`. On an active version with a predecessor, this is a rollback. Owner. `user` |
+| `POST /assistant/skills/{name}/rollback` | Puts the previous version of a skill back, with an optional `reason`. A skill with none is a 409. Owner. `user` |
 | `GET /assistant/plugins` | Installed plugins. Owner |
 | `POST /assistant/plugins` | Installs from `manifest`, a path on this machine. `effects`, `tool_effects`, and `env`. Owner, since its programs run as this process |
 | `DELETE /assistant/plugins/{name}` | Removes one and ends every grant for it. Owner |
 | `GET /assistant/code/runs` | This person's runs. `user` |
+| `POST /assistant/code/runs` | Starts a run, as `code start` does: `repo`, `goal`, `test` as a list of words, `rounds`, `timeout`, `reach`. It answers when the run stops or is ready, and `GET /assistant/code/runs` shows it meanwhile. Owner, since it reads this machine's disk. `user` |
 | `GET /assistant/code/runs/{run_id}` | One run, with its diff, tests, and models. `output=true` adds test output. `user` |
+| `POST /assistant/code/runs/{run_id}/resume` | Carries a run on, as `code resume` does. `rounds` gives a stopped run more tries. Owner. `user` |
 | `POST /assistant/code/runs/{run_id}/approve` | Commits this exact diff through `git.commit`, with an optional `message`. Owner. `user`. If the broker asks, the run comes back still `ready` with its `approval_id`: approve that, then call this again |
+| `POST /assistant/code/runs/{run_id}/push` | Pushes the run's branch through `git.push`, to `remote`, by default `origin`. Owner. `user`. If the broker asks, the run comes back still `committed` with its `approval_id`, as for approving |
 | `POST /assistant/code/runs/{run_id}/reject` | Discards the work, with an optional `reason`. Owner. `user` |
 | `GET /assistant/peers` | This install's fingerprint, then each peer's name, state, fingerprint, address, and offers. Owner |
 | `POST /assistant/peers/invite` | Makes a one-time code, as `peer invite` does: `name`, `address`, `minutes`. Owner |
 | `POST /assistant/peers/accept` | Agrees to pair using `code`, as `peer accept` does: `name`, `address`. Owner |
 | `POST /assistant/peers/{name}/approve` | Agrees to pair after comparing fingerprints, as `peer approve` does. `fingerprint` refuses if it does not match. Owner |
 | `POST /assistant/peers/{name}/revoke` | Ends a pairing at once, as `peer revoke` does. Owner |
+| `POST /assistant/peers/{name}/offer` | Lets a peer call `capability`, as `peer offer` does: `per_day`, `scope`, and `withdraw` to stop. Answers with the peer. Owner |
+| `GET /assistant/peers/{name}/offers` | Asks the peer what it offers this install, and tells the router about its models, as `peer offers` does. Owner |
+| `POST /assistant/peers/{name}/ask` | Calls `capability` on a peer through this install's broker, as `peer ask` does: `text` goes as the `prompt` argument, `args` is an object, and `user` says who it is for. Answers with `ok`, `status`, `output`, `trust`, `responder`, `produced_by`, `request`, and `approval_id`. Treat `output` as data. Owner |
+| `POST /assistant/peers/{name}/collect` | Fetches an answer that was pending or lost, by its `request`, as `peer collect` does. Answers as `ask` does. Owner |
 | `GET /assistant/audit` | The owner sees everything and a member sees their own actions. It holds ids and decisions, never what anyone said. `since`, `limit`, and `newest=true` for the last rows rather than the first |
 | `GET /assistant/why/{turn}` | What a model saw on a turn |
 | `GET /assistant/turns` | Recent turns. `limit` |
@@ -1237,8 +1248,7 @@ A tool that stores or sends text reads `CallContext.reach`, which says how far t
 - **Running a skill by itself.** A skill's instructions reach the model on every turn it applies to, but `execute` is called by no command and no part.
 - **Reflecting by itself.** `skill reflect` is a person's command. Nothing watches for finished tasks.
 - **A page for managing the assistant.** Grants, providers, routes, skills, plugins, the coder, and peers have [routes](#routes-2) and no page, so the owner uses a terminal or calls those routes. A member cannot manage any of these.
-- **Every command as a route.** `code start`, `code resume`, and `code push`, `skill rollback` and `skill gaps`, `peer offer`, `peer ask`, `peer collect`, and `peer offers`, and everything under `task` except what the routes table lists, are commands only. So is `identity set`.
-- **`provider test` as a command.** Its route has no command beside it. `provider list` checks every provider instead.
+- **Every command as a route.** Everything under `task` except what the routes table lists is a command only.
 
 ### How a small model does
 

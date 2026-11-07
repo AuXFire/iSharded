@@ -978,6 +978,9 @@ def add_commands(commands: Any) -> None:
     remove = actions.add_parser("remove", help="remove a provider")
     remove.add_argument("name", help="its name")
     remove.set_defaults(run=plainly(run_remove))
+    test = actions.add_parser("test", help="ask one provider whether it is up, on a fresh connection")
+    test.add_argument("name", help="its name")
+    test.set_defaults(run=plainly(run_test))
 
 
 def run_add(assistant: Any, args: argparse.Namespace) -> int:
@@ -1015,3 +1018,13 @@ def run_remove(assistant: Any, args: argparse.Namespace) -> int:
     return 0
 
 
+def run_test(assistant: Any, args: argparse.Namespace) -> int:
+    provider = assistant.providers.get(args.name)
+    if provider is None:
+        raise ProviderRefused(f"There is no provider {args.name}. `provider list` shows them")
+    health = provider.health()
+    if not health["up"]:
+        emit(f"{args.name} is down: {health['error']}")
+        return 1
+    emit(f"{args.name} is up, in {health['seconds']:.2f} s. Models: {', '.join(health['models']) or 'none loaded'}.")
+    return 0

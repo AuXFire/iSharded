@@ -1718,7 +1718,7 @@ Until you grant something, it can only talk. A grant says who, what, and how far
 isharded assistant grant add files.read NOTES_FOLDER
 ```
 
-`isharded assistant serve` runs its own web page and OpenAI-shaped API at `http://127.0.0.1:8470`, with a key for each person. It stays on loopback unless told otherwise.
+`isharded assistant serve` runs its own web page and OpenAI-shaped API at `http://127.0.0.1:8470`, with a key for each person. It stays on loopback unless told otherwise. Nearly every command has a route too, under the same keys: [the assistant's guide](ASSISTANT.md) lists them, and `isharded assistant provider test NAME` checks one provider.
 
 Treat it as early. How far to trust it depends on the model. Qwen3-0.6B cannot be trusted with tools: each time it skipped reading a file, it said it had read it and made up what was inside. Qwen3.6-27B, split across two machines, read the file in 20 of 20 tries and invented nothing, and recalled a fact in a new session 5 of 5 times. Asked to read and then write, it reached the write 3 of 5 times, and each of those waited for a person, as a write after reading a file must. In one other try it said it had written the file when no write ran. So the `used` line at the end of a reply is the record of which tools really ran, on any model. Federation has run only between two installs on one machine. [The assistant's guide](ASSISTANT.md) is the full manual, and says what is not built or proven.
 

@@ -962,3 +962,25 @@ def test_a_stream_says_so_too():
         assert list(OpenAICompatible("p", server.url).stream(request(), "m"))[-1].finish_reason == "length"
 
 
+# provider test
+
+
+def test_provider_test_says_a_provider_is_up_and_what_it_serves(tmp_path, capsys):
+    with FakeModelServer() as server:
+        assert run_cli(tmp_path, "provider", "add", "pool", server.url, "--mesh") == 0
+        capsys.readouterr()
+        assert run_cli(tmp_path, "provider", "test", "pool") == 0
+    assert "pool is up" in capsys.readouterr().out
+
+
+def test_provider_test_exits_1_when_it_is_down_and_says_why(tmp_path, capsys):
+    url = closed_port_url()
+    assert run_cli(tmp_path, "provider", "add", "gone", url) == 0
+    capsys.readouterr()
+    assert run_cli(tmp_path, "provider", "test", "gone") == 1
+    assert "gone is down" in capsys.readouterr().out
+
+
+def test_provider_test_names_a_provider_that_does_not_exist(tmp_path, capsys):
+    assert run_cli(tmp_path, "provider", "test", "nobody") == 1
+    assert "no provider nobody" in capsys.readouterr().err

@@ -17,9 +17,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from .broker import is_person
-from .coder import CoderError, Run
+from .coder import CoderError, MAX_ROUNDS, Run, TEST_SECONDS
+from .contracts import CallContext, ToolResult
 from .federation import FederationError, grouped, INVITE_SECONDS, Peer
-from .mind import MACHINE_ACTORS
+from .mind import MACHINE_ACTORS, reach_named
 from .providers import ProviderRefused, READ_SECONDS
 from .router import AllFailed, Refused
 from .skills import SkillError, SkillVersion
@@ -107,6 +108,23 @@ class CommitRequest(BaseModel):
     message: str | None = None
 
 
+class CodeRequest(BaseModel):
+    repo: str
+    goal: str
+    test: list[str] | None = None  # one word to an item, so nothing here has to be split
+    rounds: int = Field(default=MAX_ROUNDS, ge=1)
+    timeout: float = Field(default=TEST_SECONDS, gt=0)
+    reach: str = "pool"
+
+
+class ResumeRequest(BaseModel):
+    rounds: int = Field(default=0, ge=0)
+
+
+class PushRequest(BaseModel):
+    remote: str = "origin"
+
+
 class InviteRequest(BaseModel):
     name: str | None = None
     address: str | None = None
@@ -121,6 +139,33 @@ class AcceptRequest(BaseModel):
 
 class PeerApproval(BaseModel):
     fingerprint: str | None = None
+
+
+class OfferRequest(BaseModel):
+    capability: str
+    per_day: int | None = None
+    scope: str | None = None
+    withdraw: bool = False
+
+
+class AskRequest(BaseModel):
+    capability: str
+    text: str | None = None
+    args: dict[str, Any] = {}
+
+
+class CollectRequest(BaseModel):
+    request: str
+
+
+class IdentityRequest(BaseModel):
+    name: str | None = None
+    style: str | None = None
+    voice: str | None = None
+    commit: str | None = None
+    to_user: bool = False
+    withdraw: int | None = None
+    relationship: str | None = None
 
 
 class PlanRequest(BaseModel):
@@ -203,6 +248,21 @@ def public_peer(peer: Peer, federation: Any) -> dict[str, Any]:
     }
 
 
+def public_answer(result: ToolResult) -> dict[str, Any]:
+    """What a peer sent is data, and ``trust`` says so."""
+    data = result.data
+    return {
+        "ok": result.ok,
+        "status": data.get("status"),
+        "output": result.output,
+        "trust": result.provenance.trust.value,
+        "responder": grouped(data["responder"]) if data.get("responder") else None,
+        "produced_by": data.get("produced_by"),
+        "request": data.get("request_hash"),
+        "approval_id": data.get("approval_id"),
+    }
+
+
 def routes(assistant: Any) -> APIRouter:
     api = APIRouter(prefix="/assistant")
 
@@ -213,6 +273,19 @@ def routes(assistant: Any) -> APIRouter:
         return installed
 
     # Who the assistant is
+
+    @api.put("/identity", dependencies=PERSON)
+    def identity_set(body: IdentityRequest, request: Request, user: str | None = None) -> dict[str, Any]:
+        by, who, identity = me(request), whose(request, user), assistant.identity
+        with assistant.store.transaction():  # a change refused halfway leaves everything as it was
+            identity.set(by, name=body.name, style=body.style, voice=body.voice)
+            if body.commit:
+                identity.commit(body.commit, by, who if body.to_user else None)
+            if body.withdraw is not None:
+                identity.withdraw(body.withdraw, by)
+            if body.relationship:
+                identity.set_relationship(who, body.relationship, by)
+        return identity.describe(who)
 
     @api.get("/identity/history")
     def identity_history(limit: int = 50) -> dict[str, Any]:
@@ -327,6 +400,10 @@ def routes(assistant: Any) -> APIRouter:
     def skills(request: Request, user: str | None = None) -> dict[str, Any]:
         return {"skills": [public_version(version) for version in part("skills").versions(whose(request, user))]}
 
+    @api.get("/skills/gaps")  # before the route below, which would take this for a version
+    def skill_gaps(request: Request, user: str | None = None) -> dict[str, Any]:
+        return {"gaps": part("skills").gaps(whose(request, user))}
+
     @api.get("/skills/{reference}")
     def skill_show(reference: str, request: Request, user: str | None = None) -> dict[str, Any]:
         version = own_version(request, reference, user)
@@ -344,6 +421,13 @@ def routes(assistant: Any) -> APIRouter:
     @api.post("/skills/{reference}/reject", dependencies=PERSON)
     def skill_reject(reference: str, request: Request, body: ReasonRequest = ReasonRequest(), user: str | None = None) -> dict[str, Any]:
         return public_version(assistant.skills.reject(own_version(request, reference, user).id, body.reason, by=me(request)))
+
+    @api.post("/skills/{name}/rollback", dependencies=PERSON)
+    def skill_rollback(name: str, request: Request, body: ReasonRequest = ReasonRequest(), user: str | None = None) -> dict[str, Any]:
+        who = whose(request, user)
+        if not any(version.name == name for version in part("skills").versions(who)):
+            raise HTTPException(404, f"There is no skill {name}")
+        return public_version(assistant.skills.rollback(name, body.reason, by=me(request), user=who))
 
     # Plugins
 
@@ -368,17 +452,37 @@ def routes(assistant: Any) -> APIRouter:
     def code_runs(request: Request, user: str | None = None) -> dict[str, Any]:
         return {"runs": [public_run(run) for run in part("coder").runs(whose(request, user))]}
 
+    @api.post("/code/runs", dependencies=PERSON)
+    def code_start(body: CodeRequest, request: Request, user: str | None = None) -> dict[str, Any]:
+        # This reads a folder on this machine, and runs what is in it in the sandbox.
+        run = part("coder").start(
+            body.repo, body.goal, test_command=body.test, max_rounds=body.rounds, test_seconds=body.timeout, reach=reach_named(body.reach), user=whose(request, user)
+        )
+        return public_run(run)
+
     @api.get("/code/runs/{run_id}")
     def code_show(run_id: str, request: Request, user: str | None = None, output: bool = False) -> dict[str, Any]:
         shown = found(part("coder").show, run_id, whose(request, user))
         tests = shown["tests"] if output else [{key: value for key, value in row.items() if key != "output"} for row in shown["tests"]]
         return {**public_run(shown["run"]), "diff": shown["diff"], "tests": tests, "models": shown["models"]}
 
+    @api.post("/code/runs/{run_id}/resume", dependencies=PERSON)
+    def code_resume(run_id: str, request: Request, body: ResumeRequest = ResumeRequest(), user: str | None = None) -> dict[str, Any]:
+        who = whose(request, user)
+        found(part("coder").run, run_id, who)
+        return public_run(assistant.coder.resume(run_id, body.rounds, who))
+
     @api.post("/code/runs/{run_id}/approve", dependencies=PERSON)
     def code_approve(run_id: str, request: Request, body: CommitRequest = CommitRequest(), user: str | None = None) -> dict[str, Any]:
         who = whose(request, user)
         found(part("coder").run, run_id, who)
         return public_run(assistant.coder.approve(run_id, body.message, by=me(request), user=who))
+
+    @api.post("/code/runs/{run_id}/push", dependencies=PERSON)
+    def code_push(run_id: str, request: Request, body: PushRequest = PushRequest(), user: str | None = None) -> dict[str, Any]:
+        who = whose(request, user)
+        found(part("coder").run, run_id, who)
+        return public_run(assistant.coder.push(run_id, body.remote, by=me(request), user=who))
 
     @api.post("/code/runs/{run_id}/reject", dependencies=PERSON)
     def code_reject(run_id: str, request: Request, body: ReasonRequest = ReasonRequest(), user: str | None = None) -> dict[str, Any]:
@@ -415,5 +519,36 @@ def routes(assistant: Any) -> APIRouter:
         federation = part("federation")
         found(federation.named, name)
         return public_peer(federation.revoke(name), federation)
+
+    @api.post("/peers/{name}/offer", dependencies=PERSON)
+    def peer_offer(name: str, body: OfferRequest) -> dict[str, Any]:
+        federation = part("federation")
+        found(federation.named, name)
+        if body.withdraw:
+            federation.withdraw(name, body.capability)
+        else:
+            federation.offer(name, body.capability, body.per_day, body.scope)
+        return public_peer(federation.named(name), federation)
+
+    @api.get("/peers/{name}/offers", dependencies=OWNER)
+    def peer_offers(name: str) -> dict[str, Any]:
+        federation = part("federation")
+        found(federation.named, name)
+        return {"offers": list(federation.discover(name))}
+
+    @api.post("/peers/{name}/ask", dependencies=PERSON)
+    def peer_ask(name: str, body: AskRequest, request: Request, user: str | None = None) -> dict[str, Any]:
+        federation = part("federation")
+        found(federation.named, name)
+        arguments = body.args if body.text is None else {**body.args, "prompt": body.text}
+        # Through the broker like any send. It answers for the person named, and the record says who asked.
+        context = CallContext(user=whose(request, user), actor=me(request))
+        return public_answer(federation.send(name, body.capability, arguments, context=context))
+
+    @api.post("/peers/{name}/collect", dependencies=PERSON)
+    def peer_collect(name: str, body: CollectRequest) -> dict[str, Any]:
+        federation = part("federation")
+        found(federation.named, name)
+        return public_answer(federation.collect(name, body.request))
 
     return api
