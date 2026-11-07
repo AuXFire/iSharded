@@ -916,3 +916,94 @@ def test_emit_writes_plain_text():
     stream = Stream()
     emit("hello", stream=stream)
     assert stream.text == "hello\n"
+
+
+# What a client asks of a reply
+
+
+def test_a_limit_and_a_temperature_reach_the_model(assistant):
+    router = scripted(assistant, "Fine.")
+    assistant.conversation.say("alice", "hello", learn="off", max_tokens=7, temperature=0.0)
+    assert (router.requests[0].max_tokens, router.requests[0].temperature) == (7, 0.0)
+
+
+def test_with_nothing_asked_a_turn_keeps_its_defaults(assistant):
+    router = scripted(assistant, "Fine.")
+    assistant.conversation.say("alice", "hello", learn="off")
+    assert (router.requests[0].max_tokens, router.requests[0].temperature) == (assistant.conversation.reply_tokens, 0.2)
+
+
+def test_a_stream_is_held_to_the_same_limit(assistant):
+    router = scripted(assistant, "Fine.")
+    list(assistant.conversation.stream("alice", "hello", learn="off", max_tokens=9, temperature=1.5))
+    assert (router.requests[0].max_tokens, router.requests[0].temperature) == (9, 1.5)
+
+
+def test_a_limit_covers_the_whole_turn_and_not_each_round(assistant):
+    """A client sees one reply, so what a tool round spent comes out of the same limit."""
+    assistant.broker = FakeBroker()
+    assistant.broker.add("notes.read", lambda arguments: "a note")
+    router = scripted(assistant, model_reply("", call()), "Done.")
+    assistant.conversation.say("alice", "read my notes", learn="off", max_tokens=10)
+    assert [request.max_tokens for request in router.requests] == [10, 7]  # a scripted reply costs 3
+
+
+def test_a_turn_that_waited_for_a_person_keeps_what_the_client_asked(assistant):
+    assistant.broker = FakeBroker()
+    assistant.broker.add("notes.read", lambda arguments: "a note", verdict=Verdict.ASK)
+    router = scripted(assistant, model_reply("", call()), "Done.")
+    result = assistant.conversation.say("alice", "read my notes", learn="off", max_tokens=10, temperature=0.0)
+    assert result.status == "awaiting_approval"
+    assistant.broker.verdicts = {}
+    assistant.conversation.resume("alice", result.turn_id, learn="off")
+    assert (router.requests[-1].max_tokens, router.requests[-1].temperature) == (7, 0.0)
+
+
+def test_a_turn_paused_before_this_was_kept_still_resumes(assistant):
+    assistant.broker = FakeBroker()
+    assistant.broker.add("notes.read", lambda arguments: "a note", verdict=Verdict.ASK)
+    router = scripted(assistant, model_reply("", call()), "Done.")
+    result = assistant.conversation.say("alice", "read my notes", learn="off")
+    row = assistant.store.one("SELECT state FROM paused_turns WHERE turn_id = ?", (result.turn_id,))
+    old = {key: value for key, value in json.loads(row["state"]).items() if key not in ("max_tokens", "temperature", "completion_tokens")}
+    assistant.store.execute("UPDATE paused_turns SET state = ? WHERE turn_id = ?", (json.dumps(old), result.turn_id))
+    assert assistant.conversation.resume("alice", result.turn_id, learn="off").status in ("done", "awaiting_approval")
+    assert router.requests[-1].max_tokens == assistant.conversation.reply_tokens
+
+
+# Handed-off work
+
+
+class StatusOnly:
+    def status(self, task_id, user=None):
+        if task_id != "t-kept" or user != "alice":
+            raise ValueError(f"There is no task {task_id}")
+        return {"title": "Check the backups", "status": "running"}
+
+
+def handed(assistant, task_id: str, user: str = "alice", conversation: str = "c1", at: float = 1.0) -> None:
+    assistant.store.execute(
+        "INSERT INTO handed_tasks (task_id, user, conversation_id, turn_id, created_at) VALUES (?, ?, ?, ?, ?)", (task_id, user, conversation, f"turn-{task_id}", at)
+    )
+
+
+def test_the_tasks_a_conversation_handed_off_can_be_read_back(assistant):
+    assistant.tasks = StatusOnly()
+    handed(assistant, "t-kept", at=2.0)
+    handed(assistant, "t-gone", at=1.0)
+    handed(assistant, "t-other", conversation="c2")
+    rows = assistant.conversation.handed_tasks("alice", "c1")
+    assert [(row["task_id"], row["title"], row["status"]) for row in rows] == [("t-gone", None, None), ("t-kept", "Check the backups", "running")]
+    assert rows[1]["turn_id"] == "turn-t-kept"
+
+
+def test_nobody_reads_back_another_persons_handed_tasks(assistant):
+    assistant.tasks = StatusOnly()
+    handed(assistant, "t-kept")
+    assert assistant.conversation.handed_tasks("bob", "c1") == []
+
+
+def test_handed_tasks_can_be_read_without_a_task_engine(assistant):
+    handed(assistant, "t-kept")
+    del assistant.tasks
+    assert assistant.conversation.handed_tasks("alice", "c1")[0]["status"] is None
