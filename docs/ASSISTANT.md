@@ -1101,7 +1101,7 @@ A new key goes to a private file and never to the screen, and only a hash is sto
 
 ### The page
 
-The page is a conversation with a rail beside it. The top bar names the assistant and who is signed in, and says how many things need that person. It has no link to a pool's chat or dashboard, because the assistant and a pool do not know each other's addresses.
+The page is a conversation with a rail beside it. The top bar names the assistant and who is signed in, and says how many things need that person, in a short form on a phone. It has no link to a pool's chat or dashboard, because the assistant and a pool do not know each other's addresses.
 
 | Panel | Shows | Does |
 |---|---|---|
@@ -1120,10 +1120,12 @@ Manage shows only for a key with the `owner` role. A part that is not installed 
 | Who answers | Each provider and whether it answers now, then the order each role tries them, with how each has done | Add, test, or remove a provider, and change the order |
 | Skills | Candidates first, then the active version, with earlier versions folded away | Test, promote, or reject |
 | Plugins | What is installed, and any that were turned off | Add or remove one |
-| Code runs | Each run's state, with its change and test results on request | Commit or reject a run that is ready |
+| Code runs | Each run's state, with its change and test results on request | Start a run, and commit or reject one that is ready |
 | Peers | This install's fingerprint and each peer's state | Invite, accept, approve after comparing fingerprints, revoke |
 
 Opening Manage tests every provider, which asks each for its models. Keys never reach the page: a provider's form takes where the key is kept. An invite's code is shown once, when it is made.
+
+Start a run takes a folder on this machine, the goal, and a test command if the run should not find its own. Starting answers only when the run is ready or stops, so the sheet closes once the run is under way, and the list is read every 2 seconds until then, showing the run's state as it goes. A refusal, such as a folder that is not a repository, stays in the sheet.
 
 When the gateway stops answering, the page says when it last heard from it and turns sending off, then picks up by itself when it is back. A reply that failed stays in its turn, with a button that puts the words back in the box. Nothing is sent again until the person sends it, since a tool may have run before the failure.
 

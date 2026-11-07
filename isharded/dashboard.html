@@ -99,7 +99,7 @@
       </section>
 
       <section class="section" aria-labelledby="factsTitle">
-        <div class="section-head"><h2 id="factsTitle">Facts</h2><button class="icon-btn" type="button" id="refreshButton" aria-label="Refresh now" data-tip="Refresh now"></button></div>
+        <div class="section-head"><h2 id="factsTitle">Facts</h2><div class="head-tools"><button class="btn small" type="button" id="keysButton" hidden>API keys</button><button class="icon-btn" type="button" id="refreshButton" aria-label="Refresh now" data-tip="Refresh now"></button></div></div>
         <dl class="facts" id="facts"></dl>
         <p class="facts-note" id="factsNote" hidden></p>
       </section>
@@ -128,6 +128,9 @@
           </select>
         </label>
       </div>
+      <label class="field" id="laneField" hidden>Lane, to run it beside the main model
+        <input class="input" id="laneName" placeholder="Leave empty to replace the main model" autocomplete="off" spellcheck="false">
+      </label>
       <div class="fields">
         <label class="field">Entry worker, which sees your prompt
           <select class="select" id="entryWorker"></select>
@@ -153,6 +156,34 @@
         <button class="btn primary" type="button" id="createInvite">Create invite</button>
       </div>
     </div>
+  </dialog>
+
+  <dialog class="sheet" id="keys" aria-labelledby="keysTitle">
+    <form class="sheet-body" id="keysForm">
+      <h2 id="keysTitle">API keys</h2>
+      <p>Each key lets a person or a program use this pool. A new key is shown once.</p>
+      <div id="keysList"></div>
+      <div class="fields">
+        <label class="field">Name, for who it is for
+          <input class="input" id="keyName" autocomplete="off" spellcheck="false" required>
+        </label>
+        <label class="field">Role
+          <select class="select" id="keyRole">
+            <option value="user">User: chat and read the pool</option>
+            <option value="admin">Admin: also load, cordon and manage keys</option>
+          </select>
+        </label>
+      </div>
+      <label class="field">Requests a minute, 0 for no limit
+        <input class="input" id="keyRate" type="number" min="0" step="1" value="0">
+      </label>
+      <div id="keyShown"></div>
+      <p class="error" id="keysError" role="alert" hidden></p>
+      <div class="sheet-actions">
+        <button class="btn" type="button" id="closeKeys">Close</button>
+        <button class="btn primary" type="submit" id="createKey">Create key</button>
+      </div>
+    </form>
   </dialog>
 
   <dialog class="sheet narrow" id="auth" aria-labelledby="authTitle">
@@ -185,7 +216,7 @@
 
   <script>
     /* isharded:ui.js */
-    const { routeModel, drawBoard, drawRouteList, drawRail, focusStage, keyStages, sparkline, glyphHtml, tierOf, median, num, bytes, ms, duration, relative, clock, count, whole, span, modelName, jobRunning, TIER_ORDER } = UI;
+    const { routeModel, drawBoard, drawRouteList, drawRail, focusStage, keyStages, sparkline, glyphHtml, tierOf, median, num, bytes, ms, duration, relative, clock, count, whole, span, modelName, jobRunning, relayout, needsTorch, runsTorch, TIER_ORDER } = UI;
     const $ = id => document.getElementById(id);
     const store = {
       get: key => { try { return localStorage.getItem(key); } catch { return null; } },
@@ -197,7 +228,7 @@
       samples: [], polling: false, timer: null, failures: 0, signedOut: false, problem: '', updatedAt: null, lastMembers: {},
       text: '', chip: 'all', group: store.get('isharded-group') || 'state', sortKey: 'state', sortDir: 1, groupsOpen: new Map(), limit: 50,
       allStages: false, allRoute: false, openStage: null, allNeeds: false, feed: 'all', openWorker: null, selected: '', previewTimer: null, previewId: 0, markKey: '', confirmRun: null,
-      joins: [], joinsHidden: false, joinsAt: 0, joinBusy: new Set(), joinErrors: new Map(),
+      joins: [], joinsHidden: false, joinsAt: 0, joinBusy: new Set(), joinErrors: new Map(), repairJob: null, keysChecked: false, keys: null,
     };
     const phone = matchMedia('(max-width: 760px)');
 
@@ -335,6 +366,13 @@
       if (data.status === 'ready' && route.length > 1 && entry?.ring && entry.ring_live === false) issues.push({ tone: 'info', title: 'Direct links are down', detail: 'Tokens are using the slower HTTP path.' });
       const battery = Object.entries(state.inventory).filter(([, item]) => item.battery && item.battery.on_mains === false).map(([node]) => node);
       if (battery.length) issues.push({ tone: 'info', title: `${count(battery.length, 'machine')} on battery`, detail: battery.slice(0, 4).join(', ') + (battery.length > 4 ? ` and ${battery.length - 4} more` : '') });
+      // Only information: nothing can apply a proposal, so this offers a closer look and no button.
+      const proposal = data.proposal;
+      if (proposal) issues.push({
+        tone: 'info', title: `Another order would save ${num(proposal.saved_ms_per_token)} ms a token`,
+        detail: `The same machines, ${num(proposal.current.loop_ms)} ms a loop now and ${num(proposal.proposed.loop_ms)} ms in the new order. It would fetch ${bytes(proposal.moved_bytes)}, paid back after ${whole(proposal.break_even_tokens)} tokens. Nothing applies it here. To look closer:`,
+        command: `isharded plan --url ${location.origin} --token YOUR_ADMIN_KEY`,
+      });
 
       issues.sort((a, b) => ['bad', 'warn', 'info'].indexOf(a.tone) - ['bad', 'warn', 'info'].indexOf(b.tone));
       const alerts = issues.filter(issue => issue.tone !== 'info');
@@ -349,7 +387,14 @@
         const where = `${count(route.length, 'stage')} on ${count(machineCount(route, data), 'machine')}`;
         return look('idle', '', 'Healthy', 'Serving, and nothing needs you', speed ? `${where}, ${rate(speed)} tokens/s.` : `${where}. No replies yet.`);
       }
-      if (running && route.length && job.model === data.model && model) {
+      // In a repair's last seconds the server clears the route while every stage takes its layers.
+      // The page remembers the repair, so that does not read as a first load.
+      if (relayout(data) && !route.length) {
+        const repair = state.repairJob === job.job_id;
+        return look('work', 'work', repair ? 'Repairing' : 'Loading', repair ? `Finishing the repair of ${name}` : `Moving ${name} to its new layout`, 'Every stage is taking its layers. New replies wait until the route is whole.');
+      }
+      if (relayout(data) && model) {
+        state.repairJob = job.job_id;
         const moving = model.stages.filter(stage => stage.moving);
         const wait = `New replies wait until the route is whole again${left != null ? `, about ${left} s at this rate` : ''}.`;
         if (moving.length === 1) return look('work', 'work', 'Repairing', `Moving stage ${moving[0].n} off ${moving[0].workerId}`, wait);
@@ -432,13 +477,19 @@
     }
 
     const sizeBytes = text => { const match = /([\d.]+)\s*(MB|GB|TB)/i.exec(text || ''); return match ? Number(match[1]) * { MB: 1e6, GB: 1e9, TB: 1e12 }[match[2].toUpperCase()] : 0; };
+    // A pool where no worker has PyTorch can run only GGUF models, so the rest say why they would fail.
+    const torchless = data => { const live = Object.values(data?.workers || {}).filter(worker => worker.live); return live.length > 0 && !live.some(runsTorch); };
     function modelRows(models, budget) {
-      return models.map(model => { const big = budget && sizeBytes(model.size) > budget; return `<li><button class="model-row${big ? ' too-big' : ''}" type="button" data-model="${esc(model.id)}" data-key="m:${esc(model.id)}" aria-pressed="${model.id === state.selected}"><span class="id">${esc(modelName(model.id))}</span><span class="meta">${esc(big ? 'Larger than this pool' : model.kind)}</span><span class="meta">${esc(model.size)}</span></button></li>`; }).join('');
+      const noTorch = torchless(state.data);
+      return models.map(model => {
+        const big = budget && sizeBytes(model.size) > budget, why = noTorch && needsTorch(model.id) ? 'Needs PyTorch, which no worker here has' : big ? 'Larger than this pool' : '';
+        return `<li><button class="model-row${why ? ' too-big' : ''}" type="button" data-model="${esc(model.id)}" data-key="m:${esc(model.id)}" aria-pressed="${model.id === state.selected}"><span class="id">${esc(modelName(model.id))}</span><span class="meta">${esc(why || model.kind)}</span><span class="meta">${esc(model.size)}</span></button></li>`;
+      }).join('');
     }
     const memoryMeter = (kind, used, budget) => `<div class="mem-row"><div><span>${esc(TIERS[kind]?.[0] || kind)}</span><span>${bytes(used)} of ${bytes(budget)}</span></div><div class="meter" role="img" aria-label="${budget ? Math.round(used / budget * 100) : 0} percent in use">${used ? `<i class="tier-${TIERS[kind] ? kind : 'disk'}" style="width:${(used / budget * 100).toFixed(1)}%"></i>` : ''}</div></div>`;
     function firstRun(data) {
       const { budget } = memoryOf(data);
-      const fit = (state.catalog || []).filter(model => !budget || sizeBytes(model.size) <= budget).sort((a, b) => sizeBytes(b.size) - sizeBytes(a.size)).slice(0, 6);
+      const fit = (state.catalog || []).filter(model => (!budget || sizeBytes(model.size) <= budget) && !(torchless(data) && needsTorch(model.id))).sort((a, b) => sizeBytes(b.size) - sizeBytes(a.size)).slice(0, 6);
       const list = state.catalogFailed ? '<p class="list-note">The model list could not be read. You can still load a model by name.</p>' : state.catalog ? (fit.length ? `<ul class="model-list">${modelRows(fit, budget)}</ul>` : '<p class="list-note">No listed model fits this memory. Add a machine, or load a smaller model by name.</p>') : '<p class="list-note">Reading the model list</p>';
       return `<div class="first-run"><div><p>Nothing is loaded. Pick a model to see where it would run before anything downloads.</p><p class="capacity-note">Each machine holds only its share, so a model can be larger than any one of them.</p></div><div><h2>Models that fit</h2><div class="scroll-list">${list}</div><p class="capacity-note"><button class="link" type="button" data-action="load" data-key="all-models">See every model</button></p></div></div>`;
     }
@@ -458,7 +509,8 @@
       if (issue.stage) buttons.push(`<button class="btn small" type="button" data-show-stage="${issue.stage}" data-key="i:s:${key}">Show on the route</button>`);
       if (issue.filter) buttons.push(`<button class="btn small" type="button" data-action="show-attention" data-key="i:f:${key}">Show them</button>`);
       if (issue.retry) buttons.push(`<button class="btn small" type="button" data-model="${esc(issue.retry)}" data-key="i:r:${key}">Try again</button>`);
-      return `<div class="issue">${glyphHtml(mark)}<div class="issue-body"><b>${esc(issue.title)}</b><p>${esc(issue.detail)}</p>${buttons.length ? `<div class="issue-actions">${buttons.slice(0, 2).join('')}</div>` : ''}</div></div>`;
+      const command = issue.command ? `<code class="issue-command">${esc(issue.command)}</code>` : '';
+      return `<div class="issue">${glyphHtml(mark)}<div class="issue-body"><b>${esc(issue.title)}</b><p>${esc(issue.detail)}</p>${command}${buttons.length ? `<div class="issue-actions">${buttons.slice(0, 2).join('')}</div>` : ''}</div></div>`;
     }
     function renderNeeds(view) {
       const slot = phone.matches ? $('needsTop') : $('needsBay'), other = phone.matches ? $('needsBay') : $('needsTop');
@@ -468,7 +520,7 @@
       const list = view.issues, alerts = list.filter(issue => issue.tone !== 'info');
       if (!list.length) { paint(slot, phone.matches ? '' : `<div class="needs calm">${head}<p>Nothing right now.</p></div>`); return; }
       const shown = state.allNeeds ? list : list.slice(0, 3), more = list.length - shown.length;
-      const worst = alerts.some(issue => issue.tone === 'bad') ? 'bad' : alerts.length ? 'warn' : '';
+      const worst = alerts.some(issue => issue.tone === 'bad') ? 'bad' : alerts.length ? 'warn' : 'calm';  // information alone asks for nothing
       const note = state.joins.length ? '<p class="quiet-text">Check that each fingerprint matches what the new machine shows before you approve it.</p>' : '';
       paint(slot, `<div class="needs ${worst}">${head}${note}${shown.map(issueLine).join('')}${more > 0 ? `<p class="issue-more"><button class="link" type="button" data-action="all-needs" data-key="i:more">and ${more} more</button></p>` : ''}</div>`);
     }
@@ -728,6 +780,8 @@
       const slots = data.active_plan?.slots;
       parts.push(fact('Epoch', data.epoch), fact('Machines', data.virtual_hardware?.hosts ?? 0), fact('Requests', whole(metrics.requests_total)), fact('Tokens', whole(metrics.tokens_generated)), fact('Recoveries', whole(metrics.recoveries_total)), fact('Up', duration(data.uptime_seconds)));
       if (slots != null) parts.push(fact('Reply slots', slots));
+      const live = Object.values(data.workers || {}).filter(worker => worker.live), torch = live.filter(runsTorch).length;
+      if (live.length) parts.push(fact('Run PyTorch models', torch ? `${torch} of ${count(live.length, 'worker')}` : 'No worker, so GGUF only'));
       if ((data.cordoned_nodes || []).length) parts.push(fact('Cordoned', data.cordoned_nodes.join(', ')));
       if (data.cache_url) parts.push(fact('KV cache', 'Protected in RAM'));
       parts.push(fact('Updated', clock(state.updatedAt)));
@@ -779,7 +833,7 @@
         <section class="detail"><h3>Live readings</h3>${readings(id)}</section>
         <section class="detail"><h3>Placement</h3>${row('Layer range', a ? span(a.start_layer, a.end_layer) : 'Not on the active route')}${row('Pipeline epoch', rt.epoch ?? '—')}${row('Address', w.advertised_url)}${flagged(w.country) ? row('Country', countryName(w.country)) : ''}</section>
         <section class="detail"><h3>Memory for weights</h3>${(rt.memory_pools || hw.memory_pools || []).map(pool => row(`${TIERS[pool.kind]?.[0] || pool.kind} (${pool.pool_id})`, `${bytes(pool.used_bytes || 0)} of ${bytes(pool.budget_bytes)}, ${pool.dtype}, ${pool.bandwidth_gbps} GB/s`)).join('') || row('Pools', 'None')}</section>
-        <section class="detail"><h3>Hardware</h3>${row('Machine', hw.host_id || '—')}${row('Backend', (hw.backend || '—').toUpperCase())}${row('Runtime', hw.runtime_version || '—')}${row('Accelerator', hw.accelerator_name || 'None')}${row('Accelerator memory', bytes(hw.accelerator_memory_bytes))}${row('System memory', bytes(hw.ram_total_bytes))}${row('CPU cores', hw.cpu_cores ?? '—')}</section>
+        <section class="detail"><h3>Hardware</h3>${row('Machine', hw.host_id || '—')}${row('Backend', (hw.backend || '—').toUpperCase())}${row('Runtime', hw.runtime_version || '—')}${row('Accelerator', hw.accelerator_name || 'None')}${row('PyTorch models', hw.pytorch === false ? 'No PyTorch here, so GGUF only' : hw.backend === 'vulkan' ? 'Not on a Vulkan GPU, so GGUF only' : 'Can run them')}${row('Accelerator memory', bytes(hw.accelerator_memory_bytes))}${row('System memory', bytes(hw.ram_total_bytes))}${row('CPU cores', hw.cpu_cores ?? '—')}</section>
         <section class="detail"><h3>Contribution</h3>${row('Roles', (contribution.roles || []).join(', ') || '—')}${row('CPU threads', contribution.cpu_threads ?? 0)}${row('RAM budget', bytes(contribution.ram_budget_bytes))}${row('Accelerator budget', bytes(contribution.accelerator_memory_budget_bytes))}${row('Standby', contribution.standby ? 'Yes' : 'No')}</section>
         <section class="detail"><h3>Telemetry</h3>${row('Round trip', `${num(w.control_latency_ms)} ms`)}${row('Local compute', `${num(tel.compute_ms_ema)} ms`)}${row('Downstream', `${num(tel.downstream_ms_ema)} ms`)}${row('Tokens processed', tel.tokens_processed ?? 0)}${row('Activations sent', bytes(tel.activation_bytes_sent))}${row('KV snapshots sent', tel.kv_snapshots_sent ?? 0)}${row('KV restores', tel.kv_restores ?? 0)}${row('RAM cache used', bytes(cache.used_bytes))}${row('RAM cache budget', bytes(cache.budget_bytes))}</section>
       </div>`);
@@ -848,19 +902,26 @@
       const options = { model_id: state.selected, context_tokens: Number($('contextTokens').value) || 4096, placement: $('placement').value };
       if ($('entryWorker').value) options.entry_worker = $('entryWorker').value;
       if ($('exitWorker').value) options.exit_worker = $('exitWorker').value;
+      if (!$('laneField').hidden && $('laneName').value.trim()) options.lane = $('laneName').value.trim();
       return options;
     }
+    // The server turns a second main load away while one runs, and lets a lane load beside it.
+    function loadBlocked(options) {
+      const job = state.data?.load_job;
+      if (!jobRunning(job) || options.lane) return '';
+      return ` ${modelName(job.model)} is still loading, so ${$('laneField').hidden ? 'cancel it first to load this one' : 'name a lane to load this beside it, or cancel that load first'}.`;
+    }
     async function runPreview() {
-      const ticket = ++state.previewId;
+      const ticket = ++state.previewId, options = loadOptions();
       try {
-        const plan = await api('/admin/plan', { method: 'POST', body: JSON.stringify(loadOptions()) });
+        const plan = await api('/admin/plan', { method: 'POST', body: JSON.stringify(options) });
         if (ticket !== state.previewId) return;
         const data = state.data || { workers: {} };
         const lines = plan.route.map((stage, index) => `<li><span>${esc(stage.worker_id)}${plan.route.length > 1 && (index === 0 || index === plan.route.length - 1) ? ` (${index === 0 ? 'entry' : 'exit'})` : ''}</span><span>${stageLayers(stage)} in ${esc(stageMemory(stage, data))}</span></li>`).join('');
         const speed = plan.estimated_tokens_per_second ? `, about ${esc(plan.estimated_tokens_per_second)} tokens/s` : '';
         const download = (plan.download_bytes ? `Needs ${bytes(plan.download_bytes)} of new shards.` : 'Every shard is already in place.') + (plan.draft_model ? ` A draft model (${modelName(plan.draft_model)}) will speed up replies.` : '');
-        const busy = jobRunning(state.data?.load_job) ? ` ${modelName(state.data.load_job.model)} is still loading, so cancel it first to load this one.` : '';
-        $('preview').innerHTML = `<b>Fits: ${bytes(plan.model_bytes)} across ${count(plan.route.length, 'worker')}${speed}</b><div id="previewRail"></div><ul>${lines}</ul>${esc(download + busy)}`;
+        const busy = loadBlocked(options), beside = options.lane ? ` Lane ${options.lane} uses only the memory the main model leaves, so it may land elsewhere.` : '';
+        $('preview').innerHTML = `<b>Fits: ${bytes(plan.model_bytes)} across ${count(plan.route.length, 'worker')}${speed}</b><div id="previewRail"></div><ul>${lines}</ul>${esc(download + beside + busy)}`;
         drawRail($('previewRail'), routeModel({ route: plan.route, workers: data.workers }).stages);
         $('loadModel').disabled = Boolean(busy);
       } catch (error) {
@@ -878,6 +939,7 @@
     }
     function openPicker(model) {
       fillWorkerChoices();
+      $('laneField').hidden = !state.data?.mesh;  // lanes run on a node's mesh, and nowhere else
       if (typeof model === 'string') { state.selected = model; $('customModel').value = ''; }
       $('catalogSearch').value = '';
       if (!$('picker').open) $('picker').showModal();
@@ -911,7 +973,7 @@
         const invite = await api('/admin/invites', { method: 'POST', body: JSON.stringify({ uses: 1, hours: 24 }) });
         $('inviteBody').innerHTML = `<div class="command"><p>Run this on the new machine. It works once, until ${esc(expiry(invite.expires_at))}.</p><pre id="inviteCommand" tabindex="0"></pre><div class="command-actions"><button class="btn" type="button" id="copyInvite">Copy command</button><span class="quiet-text" id="copyNote" role="status"></span></div></div>`;
         $('inviteCommand').textContent = invite.command ?? '';
-        $('copyInvite').onclick = () => copy($('inviteCommand'));
+        $('copyInvite').onclick = () => copy($('inviteCommand'), $('copyNote'));
         $('createInvite').textContent = 'Create another';
       } catch (error) {
         if (error.status === 401) return;
@@ -919,7 +981,7 @@
       } finally { $('createInvite').disabled = false; }
     }
     // Pages on a closed network are often plain HTTP, where the clipboard API is missing.
-    async function copy(element) {
+    async function copy(element, note) {
       const text = element.textContent;
       let done = false;
       try { await navigator.clipboard.writeText(text); done = true; } catch {
@@ -927,7 +989,60 @@
         const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range);
         try { done = document.execCommand('copy'); } catch {}
       }
-      $('copyNote').textContent = done ? 'Copied' : 'Selected. Press Ctrl+C to copy.';
+      note.textContent = done ? 'Copied' : 'Selected. Press Ctrl+C to copy.';
+    }
+
+    /* API keys. The entry shows only for a key that may list them. */
+
+    async function checkKeys() {
+      if (state.keysChecked || state.signedOut) return;
+      state.keysChecked = true;
+      try { state.keys = (await api('/admin/keys', { timeout: 10000, admin: true })).keys || []; $('keysButton').hidden = false; }
+      catch (error) { $('keysButton').hidden = true; if (![401, 403, 404].includes(error.status)) state.keysChecked = false; }  // a node that did not answer is asked again
+    }
+    // A page that reads the pool with no key is on an open pool, and its first key would close
+    // the pool to every worker and page that sends none.
+    const openPool = () => !state.token && !(state.keys || []).length;
+    function renderKeys() {
+      const keys = state.keys || [];
+      $('createKey').disabled = openPool();
+      if (openPool()) { paint($('keysList'), '<p class="list-note">This pool takes requests with no key. A first key would close it to every worker and page that sends none, so give the pool credentials with <code>isharded pool init</code> before adding keys.</p>'); return; }
+      paint($('keysList'), keys.length ? `<table class="grid keys"><thead><tr><th scope="col">Name</th><th scope="col">Role</th><th scope="col" class="right">Requests a minute</th><th scope="col"><span class="sr-only">Revoke</span></th></tr></thead><tbody>${keys.map(key => `<tr><td>${esc(key.name)}</td><td>${esc(key.role)}</td><td class="right">${key.requests_per_minute ? esc(key.requests_per_minute) : 'No limit'}</td><td class="right"><button class="btn small" type="button" data-revoke-key="${esc(key.name)}" data-key="key:${esc(key.name)}">Revoke</button></td></tr>`).join('')}</tbody></table>` : '<p class="list-note">No keys yet.</p>');
+    }
+    async function readKeys() {
+      try { state.keys = (await api('/admin/keys', { timeout: 10000, admin: true })).keys || []; renderKeys(); }
+      catch (error) { if (error.status !== 401) keysError(error); }
+    }
+    function keysError(error) {
+      $('keysError').textContent = error.offline ? 'This node did not answer, so nothing changed. Try again in a moment.' : error.detail || error.message;
+      $('keysError').hidden = false;
+    }
+    function openKeys() {
+      $('keysError').hidden = true; paint($('keyShown'), '');
+      renderKeys();
+      if (!$('keys').open) $('keys').showModal();
+      $('keyName').focus();  // not a Revoke button, which is first in the sheet
+      readKeys();
+    }
+    async function createKey() {
+      const name = $('keyName').value.trim();
+      if (!name || openPool()) return;
+      $('keysError').hidden = true; $('createKey').disabled = true;
+      try {
+        const made = await api('/admin/keys', { method: 'POST', admin: true, body: JSON.stringify({ name, role: $('keyRole').value, requests_per_minute: Number($('keyRate').value) || 0 }) });
+        paint($('keyShown'), `<div class="command"><p>The key for ${esc(made.name)}. It is shown only now, so copy it before you close this.</p><pre id="newKey" tabindex="0"></pre><div class="command-actions"><button class="btn" type="button" id="copyKey">Copy key</button><span class="quiet-text" id="copyKeyNote" role="status"></span></div></div>`);
+        $('newKey').textContent = made.key ?? '';
+        $('copyKey').onclick = () => copy($('newKey'), $('copyKeyNote'));
+        $('keyName').value = '';
+        await readKeys();
+      } catch (error) { if (error.status !== 401) keysError(error); }
+      finally { $('createKey').disabled = openPool(); }
+    }
+    function askRevokeKey(name) {
+      confirmSheet({ title: `Revoke ${name}`, text: 'Whatever uses this key stops working at once. It cannot be brought back, only replaced with a new key.', yes: 'Revoke key', run: async () => {
+        await api(`/admin/keys/${encodeURIComponent(name)}`, { method: 'DELETE', admin: true });
+        toast(`Revoked ${name}`); readKeys();
+      } });
     }
 
     /* Asking first */
@@ -1032,8 +1147,10 @@
       $('loadButton').hidden = view.empty === 'machines';
       $('loadButton').classList.toggle('primary', view.empty === 'model');
       $('addMachine').classList.toggle('primary', view.empty === 'machines');
+      // A lane loads beside a running job, so Load stays open where lanes can run.
       $('actionNote').hidden = !running;
-      $('rebalanceButton').disabled = running; $('loadButton').disabled = running;
+      $('actionNote').textContent = data.mesh ? 'A load is running. Only a lane can load beside it.' : 'A load is running.';
+      $('rebalanceButton').disabled = running; $('loadButton').disabled = running && !data.mesh;
       takeSample(data);
       renderBoard(data); renderStart(data, view); renderNeeds(view); renderMachinesBay(data, rows); renderMemory(data, rows); renderEvents(data); renderStages(data); renderReadings(data); renderMachines(data, rows); renderFacts(data);
       if (state.openWorker) renderWorker();
@@ -1059,6 +1176,7 @@
         render(data);
         readInventory();
         readJoins();
+        checkKeys();
       } catch (error) {
         if (error.status === 401) renderSignedOut();
         else if (error.offline) { state.failures += 1; renderOffline(); }
@@ -1075,7 +1193,8 @@
     function signOut() {
       store.drop('isharded-token');
       state.token = ''; state.data = null; state.model = null; state.tab = {}; state.inventory = {}; state.samples = []; state.joins = []; state.joinsHidden = false;
-      if ($('worker').open) $('worker').close();
+      state.keys = null; state.keysChecked = false; $('keysButton').hidden = true;
+      for (const sheet of [$('worker'), $('keys')]) if (sheet.open) sheet.close();
       refresh();
     }
 
@@ -1111,7 +1230,7 @@
       else if (action === 'cancel') api('/admin/load/cancel', { method: 'POST' }).then(() => { toast('Load cancelled'); refresh(); }).catch(error => toast(error.message));
     }
     document.addEventListener('click', event => {
-      const target = event.target.closest?.('[data-action],[data-join],[data-chip],[data-feed],[data-sort],[data-group],[data-model],[data-worker],[data-stagerow],[data-show-stage],[data-cordon],[data-uncordon],[data-lane-remove]');
+      const target = event.target.closest?.('[data-action],[data-join],[data-chip],[data-feed],[data-sort],[data-group],[data-model],[data-worker],[data-stagerow],[data-show-stage],[data-cordon],[data-uncordon],[data-lane-remove],[data-revoke-key]');
       if (!target) return;
       const set = target.dataset;
       if (set.action) onAction(set.action);
@@ -1132,6 +1251,7 @@
       else if (set.cordon) askCordon(set.cordon);
       else if (set.uncordon) uncordon(set.uncordon);
       else if (set.laneRemove) askRemoveLane(set.laneRemove);
+      else if (set.revokeKey) askRevokeKey(set.revokeKey);
       else if (set.worker) openWorker(set.worker);
     });
     // The mark field is one tab stop. Arrows walk it, and the name shows under it.
@@ -1148,11 +1268,11 @@
       button.tabIndex = -1; next.tabIndex = 0; next.focus();
       state.markKey = next.dataset.worker;
     });
-    for (const dialog of [$('worker'), $('picker'), $('invite'), $('confirm')]) dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
+    for (const dialog of [$('worker'), $('picker'), $('invite'), $('confirm'), $('keys')]) dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
     // A poll can draw the opener again while a sheet is up, and then focus has nowhere to return to.
     let opener = null;
     document.addEventListener('click', event => { if (!document.querySelector('dialog[open]')) opener = event.target.closest?.('[data-key],[id]')?.dataset.key || null; }, true);
-    for (const dialog of [$('worker'), $('picker'), $('invite'), $('confirm')]) dialog.addEventListener('close', () => setTimeout(() => {
+    for (const dialog of [$('worker'), $('picker'), $('invite'), $('confirm'), $('keys')]) dialog.addEventListener('close', () => setTimeout(() => {
       if (opener && document.activeElement === document.body && !document.querySelector('dialog[open]')) document.querySelector(`[data-key="${CSS.escape(opener)}"]`)?.focus();
     }));
     $('worker').addEventListener('close', () => { state.openWorker = null; });
@@ -1174,15 +1294,21 @@
     $('catalogSearch').addEventListener('input', renderCatalog);
     $('customModel').addEventListener('input', event => selectModel(event.target.value));
     for (const id of ['contextTokens', 'placement', 'entryWorker', 'exitWorker']) $(id).addEventListener('change', schedulePreview);
+    $('laneName').addEventListener('input', schedulePreview);
     $('closePicker').onclick = () => $('picker').close();
     $('loadButton').onclick = () => openPicker();
     $('loadModel').onclick = async () => {
       try {
-        await api('/admin/load', { method: 'POST', body: JSON.stringify({ ...loadOptions(), wait: false }) });
+        const options = loadOptions();
+        await api('/admin/load', { method: 'POST', body: JSON.stringify({ ...options, wait: false }) });
+        if (options.lane) toast(`Lane ${options.lane} is starting`);
         $('picker').close(); refresh();
       } catch (error) { $('preview').innerHTML = `<span class="error">${esc(error.message)}</span>`; }
     };
     $('addMachine').onclick = openInvite;
+    $('keysButton').onclick = openKeys;
+    $('closeKeys').onclick = () => $('keys').close();
+    $('keysForm').onsubmit = event => { event.preventDefault(); createKey(); };
     $('closeInvite').onclick = () => $('invite').close();
     $('createInvite').onclick = createInvite;
     $('rebalanceButton').onclick = askRebalance;
@@ -1201,12 +1327,12 @@
       event.preventDefault();
       const key = $('tokenInput').value.trim();
       if (!key) return;
-      state.token = key; store.set('isharded-token', key); state.signedOut = false; state.joinsHidden = false; state.joins = [];
+      state.token = key; store.set('isharded-token', key); state.signedOut = false; state.joinsHidden = false; state.joins = []; state.keysChecked = false;
       $('auth').close(); refresh(true);
     };
     $('signOut').onclick = signOut;
     $('themeButton').onclick = () => applyTheme(THEMES[(THEMES.indexOf($('themeButton').dataset.choice) + 1) % THEMES.length]);
-    addEventListener('hashchange', () => { if (takeKeyFromLink()) { state.signedOut = false; state.joinsHidden = false; state.joins = []; if ($('auth').open) $('auth').close(); refresh(); } });
+    addEventListener('hashchange', () => { if (takeKeyFromLink()) { state.signedOut = false; state.joinsHidden = false; state.joins = []; state.keysChecked = false; if ($('auth').open) $('auth').close(); refresh(); } });
     document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
     let resized = null;
     addEventListener('resize', () => { clearTimeout(resized); resized = setTimeout(() => { if (state.data) renderBoard(state.data); }, 120); });

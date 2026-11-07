@@ -7,6 +7,7 @@ evals in the page and the page's own policy refuses that, as it should.
 from __future__ import annotations
 
 from collections.abc import Iterator
+import json
 import time
 from typing import Any
 
@@ -244,6 +245,66 @@ def test_an_approval_shows_the_exact_action_and_the_top_bar_counts_it(page, inst
     until(page, "() => document.getElementById('panel-approvals').textContent.includes('Nothing is waiting')")
     assert tidied.exists()
     assert page.inner_text("#pill") == "Nothing waiting"
+
+
+def test_the_state_word_keeps_a_short_form_on_a_phone(page, install):  # noqa: F811
+    page.set_viewport_size({"width": 390, "height": 844})
+    sign_in(page, install.key)
+    page.route("**/assistant/approvals", lambda route: route.abort())
+    page.evaluate("() => poll()")
+    until(page, "() => document.getElementById('notices').textContent.includes('stopped answering')")
+    assert page.locator("#pill").is_visible() and page.locator("#pill-short").is_visible()
+    assert page.inner_text("#pill-short").endswith(" s ago")
+    assert page.text_content("#pill-text").startswith("Last heard")  # still there for a screen reader
+    page.unroute("**/assistant/approvals")
+    page.evaluate("() => poll()")
+    until(page, "() => document.getElementById('notices').textContent === ''")
+    page.evaluate("() => { state.waiting = 2; paintState(); }")  # as two approvals waiting would leave it
+    assert page.inner_text("#pill-short") == "2 waiting"
+    assert page.locator("#pill-short").is_visible()
+
+
+RUN = {"id": "sample-run", "goal": "Fix the rounding", "state": "inspecting", "round": 0, "max_rounds": 3, "branch": "assistant/sample-run", "note": "", "problem": None, "warnings": []}
+
+
+def start_a_run(page: Any) -> None:
+    open_manage(page)
+    page.click("#part-runs button:text('Start a run')")
+    page.locator("#ask-fields input").first.fill("sample-folder")
+    page.locator("#ask-fields textarea").fill(RUN["goal"])
+    page.click("#ask-yes")
+
+
+def test_a_run_that_is_starting_shows_its_state_until_it_answers(page, install):  # noqa: F811
+    held, listed = [], []
+
+    def runs(route):
+        if route.request.method == "POST":
+            held.append(route)  # answered only when the run is ready, as the real route does
+        else:
+            route.fulfill(body=json.dumps({"runs": listed}), content_type="application/json")
+
+    page.route("**/assistant/code/runs", runs)
+    sign_in(page, install.key)
+    start_a_run(page)
+    until(page, "() => !document.getElementById('ask').open")
+    listed.append(RUN)
+    until(page, "() => document.getElementById('part-runs').textContent.includes('Reading the code')")
+    assert "A run is starting" in page.inner_text("#part-runs")
+    listed[0] = {**RUN, "state": "ready"}
+    held[0].fulfill(body=json.dumps(listed[0]), content_type="application/json")
+    until(page, "() => document.getElementById('part-runs').textContent.includes('Ready for you')")
+    until(page, "() => !document.getElementById('part-runs').textContent.includes('A run is starting')")
+
+
+def test_a_run_refused_at_once_stays_in_the_sheet(page, install):  # noqa: F811
+    refused = json.dumps({"detail": "sample-folder is not a git repository"})
+    page.route("**/assistant/code/runs", lambda route: route.fulfill(status=400, body=refused, content_type="application/json") if route.request.method == "POST" else route.fallback())
+    sign_in(page, install.key)
+    start_a_run(page)
+    until(page, "() => !document.getElementById('ask-error').hidden")
+    assert "not a git repository" in page.inner_text("#ask-error")
+    assert page.locator("#ask").evaluate("sheet => sheet.open")
 
 
 def test_a_models_file_path_is_shown_as_its_name(page):

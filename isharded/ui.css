@@ -217,6 +217,7 @@ b { font-weight: 600; }
 .state-word.tone-warn { color: var(--warn); }
 .state-word.tone-bad { color: var(--bad); }
 .state-word.tone-work { color: var(--accent-text); }
+.state-word .short-word { display: none; }
 
 /* Buttons */
 
@@ -440,6 +441,7 @@ b { font-weight: 600; }
 .issue-body p.error { margin-top: var(--s-1); color: var(--bad); }
 .issue-actions { display: flex; flex-wrap: wrap; gap: var(--s-2); margin-top: var(--s-2); }
 .issue-more { margin-top: var(--s-2); }
+.issue-command { display: block; margin-top: var(--s-1); padding: var(--s-1) var(--s-2); border-radius: var(--r-control); background: var(--plate-2); font-size: var(--t-sm); overflow-wrap: anywhere; }
 .join-facts { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 1px var(--s-3); margin-top: 2px; font-size: var(--t-sm); }
 .join-facts dt { color: var(--ink-2); }
 .join-facts dd { min-width: 0; overflow-wrap: anywhere; }
@@ -881,11 +883,14 @@ textarea.input { padding: var(--s-1) var(--s-2); resize: vertical; }
   .drawer { width: 100vw; }
   .model-row { grid-template-columns: minmax(0, 1fr) 56px; }
   .model-row .meta:not(:last-child) { display: none; }
+  .model-row.too-big .meta:not(:last-child) { display: block; grid-row: 2; grid-column: 1 / -1; white-space: normal; }
 }
 
 @media (max-width: 480px) {
   .brand span { display: none; }
-  .assistant-page .top .state-word { display: none; }
+  /* The full words stay for screen readers, and the eye gets the short form. */
+  .assistant-page .top .state-word .long-word { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .assistant-page .top .state-word .short-word { display: inline; }
 }
 
 @media (pointer: coarse) {

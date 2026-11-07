@@ -289,8 +289,8 @@ def test_every_fixture_the_plan_names_exists():
     assert names >= {"calm-7", "repair-7", "spill-7", "lost-7", "load-lane-7", "two", "forty", "two-hundred", "fresh-no-times", "no-model", "no-machines"}
 
 
-def open_dashboard(playwright, fixture, status_change=None):
-    """The real page in real Chrome, with a fixture in place of the pool."""
+def open_dashboard(playwright, fixture, status_change=None, answers=None):
+    """The real page in real Chrome, with a fixture in place of the pool, and `answers` for other routes."""
     try:
         chrome = playwright.chromium.launch(channel="chrome")
     except Exception as error:  # no Chrome on this machine
@@ -302,6 +302,8 @@ def open_dashboard(playwright, fixture, status_change=None):
     page.route("**/*", lambda route: route.fulfill(status=404, body="{}", content_type="application/json"))
     page.route("**/dashboard", lambda route: route.fulfill(body=served("dashboard.html"), content_type="text/html"))
     page.route("**/admin/status", lambda route: route.fulfill(body=json.dumps(data), content_type="application/json"))
+    for pattern, answer in (answers or {}).items():
+        page.route(pattern, answer)
     page.goto("http://pool.invalid/dashboard")
     page.wait_for_selector("#consoleBody:not([hidden])")
     return chrome, page
@@ -352,3 +354,192 @@ def test_a_reply_that_ends_late_leaves_the_open_conversation_alone():
 def test_the_chat_word_counts_machines_asking_to_join():
     text = source("chat.html")
     assert "+ state.joins" in text and "/join/requests" in text
+
+
+def answer_json(body, status=200):
+    return lambda route: route.fulfill(status=status, body=json.dumps(body), content_type="application/json")
+
+
+def with_proposal(data):
+    order = list(data["workers"])[:3]
+    data["proposal"] = {
+        "groups": [order], "current": {"order": order, "loop_ms": 61.5, "pace_ms": 20.0, "ms_per_token": 30.2},
+        "proposed": {"order": order[::-1], "loop_ms": 48.0, "pace_ms": 20.0, "ms_per_token": 26.1, "stages": []},
+        "saved_ms_per_token": 4.1, "moved_bytes": 3 * 2**30, "move_seconds": 3.5, "stages_changed": 2, "break_even_tokens": 854,
+    }
+
+
+def test_a_proposal_is_information_under_needs_you_and_nothing_applies_it():
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    with playwright_api.sync_playwright() as playwright:
+        chrome, page = open_dashboard(playwright, "calm-7", with_proposal)
+        needs = page.inner_text("#needsBay")
+        assert "Another order would save 4.1 ms a token" in needs
+        assert "61.5 ms a loop now and 48 ms in the new order" in needs and "fetch 3 GiB" in needs and "after 854 tokens" in needs
+        assert page.locator("#needsBay .needs.calm").count() == 1  # information alone draws no alarm
+        assert "isharded plan --url http://pool.invalid --token YOUR_ADMIN_KEY" in needs
+        assert page.locator("#needsBay .issue button").count() == 0
+        assert page.inner_text("#pillText") == "Healthy"  # information, so it needs nobody
+        chrome.close()
+
+
+def test_load_stays_open_for_a_lane_while_a_job_runs():
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    with playwright_api.sync_playwright() as playwright:
+        plan = {"route": [], "model_bytes": 2**30}
+        chrome, page = open_dashboard(playwright, "load-lane-7", answers={"**/admin/plan": lambda route: answer_json(plan)(route)})
+        plan["route"] = page.evaluate("state.data.route.slice(0, 1)")
+        assert page.locator("#rebalanceButton").is_disabled()
+        assert page.locator("#loadButton").is_enabled()
+        assert "Only a lane can load beside it" in page.inner_text("#actionNote")
+        page.click("#loadButton")
+        page.fill("#customModel", "Qwen/Qwen3-0.6B")
+        page.wait_for_selector("#preview:has-text('still loading')")
+        assert "name a lane" in page.inner_text("#preview")
+        assert page.locator("#loadModel").is_disabled()
+        page.fill("#laneName", "side")
+        page.wait_for_selector("#preview:has-text('Lane side')")
+        assert "still loading" not in page.inner_text("#preview")
+        assert page.locator("#loadModel").is_enabled()
+        chrome.close()
+
+
+def test_load_waits_for_the_job_where_no_lane_can_run():
+    def without_mesh(data):
+        data["mesh"] = None
+
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    with playwright_api.sync_playwright() as playwright:
+        chrome, page = open_dashboard(playwright, "load-lane-7", without_mesh)
+        assert page.locator("#loadButton").is_disabled()
+        assert page.inner_text("#actionNote") == "A load is running."
+        chrome.close()
+
+
+CATALOG = {"models": [
+    {"id": "Qwen/Qwen3-0.6B", "family": "Qwen3", "kind": "dense", "size": "1.5 GB"},
+    {"id": "ggml-org/Sample-GGUF:Sample-Q4_K_M.gguf", "family": "Sample", "kind": "dense GGUF Q4", "size": "1 GB"},
+]}
+
+
+def test_a_pool_with_no_pytorch_says_so_and_marks_what_needs_it():
+    def light(data):
+        for worker in data["workers"].values():
+            worker["hardware"]["pytorch"] = False
+
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    with playwright_api.sync_playwright() as playwright:
+        chrome, page = open_dashboard(playwright, "calm-7", light, {"**/admin/catalog": answer_json(CATALOG)})
+        assert "No worker, so GGUF only" in page.inner_text("#facts")
+        page.click("#loadButton")
+        page.wait_for_selector("#catalog .model-row")
+        assert "Needs PyTorch, which no worker here has" in page.inner_text("[data-model='Qwen/Qwen3-0.6B']")
+        assert "PyTorch" not in page.inner_text("[data-model='ggml-org/Sample-GGUF:Sample-Q4_K_M.gguf']")
+        page.click("#closePicker")
+        page.click("#nodeTable .name-link >> nth=0")
+        assert "No PyTorch here, so GGUF only" in page.inner_text("#workerContent")
+        chrome.close()
+
+
+def test_a_pool_that_has_pytorch_counts_who_can_run_it():
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    with playwright_api.sync_playwright() as playwright:
+        chrome, page = open_dashboard(playwright, "calm-7", answers={"**/admin/catalog": answer_json(CATALOG)})
+        live = page.evaluate("Object.values(state.data.workers).filter(worker => worker.live).length")
+        assert f"Run PyTorch models\n{live} of {live} workers" in page.inner_text("#facts")
+        page.click("#loadButton")
+        page.wait_for_selector("#catalog .model-row")
+        assert "PyTorch" not in page.inner_text("#catalog")
+        chrome.close()
+
+
+def test_a_repairs_last_seconds_read_as_the_repair_finishing():
+    held = {}
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    with playwright_api.sync_playwright() as playwright:
+        chrome, page = open_dashboard(playwright, "repair-7", lambda data: held.setdefault("data", data))
+        assert page.inner_text("#pillText") == "Repairing"
+        data = held["data"]
+        data.update(status="loading", route=[], active_plan=None)
+        data["load_job"]["phase"] = "loading"
+        page.evaluate("refresh()")
+        assert page.inner_text("#pillText") == "Repairing"
+        assert page.inner_text("#headline").startswith("Finishing the repair of ")
+        chrome.close()
+
+
+def test_a_page_opened_late_in_a_move_does_not_call_it_a_first_load():
+    def cleared(data):
+        data.update(status="loading", route=[], active_plan=None)
+        data["load_job"]["phase"] = "loading"
+
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    with playwright_api.sync_playwright() as playwright:
+        chrome, page = open_dashboard(playwright, "repair-7", cleared)
+        assert page.inner_text("#headline").endswith("to its new layout")
+        assert page.evaluate("UI.relayout(state.data)") is True
+        chrome.close()
+    assert source("chat.html").count("relayout(status)") >= 3  # chat reads the same moment the same way
+
+
+def keys_answers(keys, asked):
+    def answer(route):
+        request = route.request
+        asked.append((request.method, request.url.rsplit("/admin/", 1)[1]))
+        if request.method == "POST":
+            body = json.loads(request.post_data)
+            keys.append({"name": body["name"], "role": body["role"], "requests_per_minute": body["requests_per_minute"]})
+            return answer_json({"name": body["name"], "key": "sample-key-shown-once"})(route)
+        if request.method == "DELETE":
+            keys[:] = [key for key in keys if not request.url.endswith("/" + key["name"])]
+            return answer_json({"status": "revoked"})(route)
+        return answer_json({"keys": keys, "revoked_nodes": [], "version": 1})(route)
+    return {"**/admin/keys": answer, "**/admin/keys/*": answer}
+
+
+def test_keys_are_listed_created_once_and_revoked_after_asking():
+    keys, asked = [{"name": "sample-reader", "role": "user", "requests_per_minute": 0}], []
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    with playwright_api.sync_playwright() as playwright:
+        chrome, page = open_dashboard(playwright, "calm-7", answers=keys_answers(keys, asked))
+        page.wait_for_selector("#keysButton:not([hidden])")
+        page.click("#keysButton")
+        page.wait_for_selector("#keysList:has-text('sample-reader')")
+        page.fill("#keyName", "sample-writer")
+        page.select_option("#keyRole", "admin")
+        page.click("#createKey")
+        page.wait_for_selector("#newKey:has-text('sample-key-shown-once')")
+        page.wait_for_selector("#keysList:has-text('sample-writer')")
+        assert keys[-1] == {"name": "sample-writer", "role": "admin", "requests_per_minute": 0}
+        page.click("[data-revoke-key='sample-reader']")
+        assert ("DELETE", "keys/sample-reader") not in asked  # asking first
+        page.click("#confirmYes")
+        page.wait_for_selector("#keysList:not(:has-text('sample-reader'))")
+        assert ("DELETE", "keys/sample-reader") in asked
+        chrome.close()
+
+
+def test_an_open_pool_is_not_closed_by_a_first_key_from_the_page():
+    asked = []
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    with playwright_api.sync_playwright() as playwright:
+        # The page holds no key and the pool lists none, which is an open pool.
+        chrome, page = open_dashboard(playwright, "calm-7", answers=keys_answers([], asked))
+        page.wait_for_selector("#keysButton:not([hidden])")
+        page.click("#keysButton")
+        page.wait_for_selector("#keysList:has-text('isharded pool init')")
+        assert page.locator("#createKey").is_disabled()
+        page.fill("#keyName", "sample-writer")
+        page.press("#keyName", "Enter")
+        page.wait_for_timeout(300)
+        assert not any(method == "POST" for method, _ in asked)
+        chrome.close()
+
+
+def test_a_key_that_cannot_list_keys_sees_no_entry():
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    with playwright_api.sync_playwright() as playwright:
+        chrome, page = open_dashboard(playwright, "calm-7", answers={"**/admin/keys": answer_json({"detail": "this needs the admin role"}, 403)})
+        page.wait_for_timeout(500)
+        assert page.locator("#keysButton").is_hidden()
+        chrome.close()

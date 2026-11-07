@@ -14,6 +14,12 @@ const UI = (() => {
   // GGUF ids carry a repository and a file, and a split file ends in its part number.
   const modelName = id => { const text = String(id || ''); if (/\.gguf$/i.test(text)) return text.split(/[:\\/]/).pop().replace(/\.gguf$/i, '').replace(/-\d{5}-of-\d{5}$/, ''); if (/^([A-Za-z]:[\\/]|[\\/.~])/.test(text)) return text.split(/[\\/]/).filter(Boolean).pop() || text; return text; };
   const jobRunning = job => Boolean(job) && !['ready', 'failed', 'cancelled'].includes(job.phase);
+  // A job for the model already running is a repair or a new layout, even after the server clears the route.
+  const relayout = data => jobRunning(data?.load_job) && Boolean(data.model) && data.load_job.model === data.model;
+  // As the planner decides: only a GGUF file runs on llama.cpp, and the rest need PyTorch,
+  // which a light install and a GPU reached through Vulkan do not have.
+  const needsTorch = id => !String(id || '').toLowerCase().includes('.gguf');
+  const runsTorch = worker => Boolean(worker?.live) && worker.hardware?.pytorch !== false && worker.hardware?.backend !== 'vulkan';
   const median = list => { const sorted = [...list].sort((a, b) => a - b), mid = sorted.length >> 1; return sorted.length ? sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2 : null; };
   const glyphHtml = kind => `<i class="glyph ${esc(kind)}" aria-hidden="true"></i>`;
   const TIER_ORDER = ['vram', 'unified', 'ram', 'disk'];
@@ -417,5 +423,5 @@ const UI = (() => {
     return `<svg class="spark" viewBox="0 0 96 20" aria-hidden="true"><polyline points="${values.map((value, index) => point(value, index).join(',')).join(' ')}"/><circle cx="${end[0]}" cy="${end[1]}" r="2"/></svg>`;
   }
 
-  return { routeModel, drawBoard, drawRouteList, drawRail, focusStage, keyStages, stageWords, sparkline, glyphHtml, tierOf, median, num, bytes, ms, duration, relative, clock, count, whole, span, modelName, jobRunning, TIER_ORDER, TIER_NAMES };
+  return { routeModel, drawBoard, drawRouteList, drawRail, focusStage, keyStages, stageWords, sparkline, glyphHtml, tierOf, median, num, bytes, ms, duration, relative, clock, count, whole, span, modelName, jobRunning, relayout, needsTorch, runsTorch, TIER_ORDER, TIER_NAMES };
 })();

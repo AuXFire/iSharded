@@ -554,7 +554,11 @@ Every node serves both, so any node's address works.
 | Page | What it shows |
 |---|---|
 | `/chat` | A chat window. Conversations are listed on the left, and the stages the model runs on, with each stage's memory and time, on the right. It asks for a key, and shows where a model would run and how fast before anything downloads. |
-| `/dashboard` | The state of the pool as a sentence, then the route board: the model's layers along the top, one pass in time along the bottom, and a band for each stage, so the slowest thing is the widest. Below it are what needs you, machines, memory, activity, the stage table, readings, and facts. Select a stage or machine for detail, and use the arrow keys to walk the stages. |
+| `/dashboard` | The state of the pool as a sentence, then the route board: the model's layers along the top, one pass in time along the bottom, and a band for each stage, so the slowest thing is the widest. Below it are what needs you, machines, memory, activity, the stage table, readings, and facts. Select a stage or machine for detail, and use the arrow keys to walk the stages. API keys, beside Facts, lists, creates and revokes [API keys](#isharded-key) for an admin key. |
+
+Load a model asks for a lane name on a node's mesh. Empty, the model replaces the main one, and that waits while another load runs, because the pool takes one at a time. With a name, it loads beside the main model as a [lane](#several-models-at-once), which the pool allows during a load, so Load stays open then. A model that needs PyTorch is marked in the list when no worker has it, and Facts and each worker's details say which can run PyTorch models. During a repair the route is gone for its last seconds, while every stage takes its layers, and the dashboard says the repair is finishing.
+
+API keys shows each key's name, role and rate limit, never the key. A new key is shown once, with a button to copy it. Revoking asks first. The button shows only for a key that may list keys, and a pool with an authority refuses changes here in its own words, as [isharded key](#isharded-key) explains. On a pool with no credentials it creates nothing, because a first key would close that pool to every worker that sends no token.
 
 Conversations are kept in your browser, the latest 50, because the pool stores none. Signing out forgets them, and a browser that runs out of room keeps the words and drops the images.
 
@@ -1226,7 +1230,7 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `POST` | `/api/pull`, `/api/push`, `/api/create`, `/api/copy`, `/api/blobs/{digest}` | User key | Refused with a 400 that says to load models through iSharded |
 | `DELETE` | `/api/delete` | User key | The same |
 | `POST` | `/mcp` | User key | [MCP](#mcp) over Streamable HTTP. `GET` and `DELETE` answer 405, since there is no stream or session |
-| `GET` | `/admin/status` | User key | Workers and their `country`, memory pools, route, measured [`links`](#what-a-route-costs), epoch, mesh, lanes, load progress, the last answer check, and how many [replies run at once](#several-conversations-at-once) and why. It asks every worker for its health and waits up to 3 s for each, so it answers within about that. A worker that still checks in but did not answer shows `state` `unreachable` |
+| `GET` | `/admin/status` | User key | Workers and their `country`, memory pools, route, measured [`links`](#what-a-route-costs), epoch, mesh, lanes, load progress, the last answer check, how many [replies run at once](#several-conversations-at-once) and why, and the running route's [shorter loop](#a-shorter-loop), if there is one. It asks every worker for its health and waits up to 3 s for each, so it answers within about that. A worker that still checks in but did not answer shows `state` `unreachable` |
 | `GET` | `/admin/catalog` | User key | Suggested models and supported architectures |
 | `POST` | `/admin/plan` | Admin key | Show where a model would run, and any [shorter loop](#a-shorter-loop) for the route already running, without moving anything |
 | `POST` | `/admin/load` | Admin key | Load a model |
@@ -1968,6 +1972,8 @@ To find one, nodes with a link of 15 ms or less are grouped as a site, and the r
 | `move_seconds` | How long that takes with nodes fetching side by side, at each node's measured rate. A node with no measured rate counts as 40 MB/s, and a copy from a peer as at least 100 MB/s |
 | `stages_changed` | Stages that would restart with other layers. Their reload is not in `move_seconds` |
 | `break_even_tokens` | Tokens until the saving has paid for the move |
+
+`/admin/status` has the same `proposal` for the route that is running, or `null`. The coordinator works it out once each load, repair or rebalance has measured its links, off the event loop, because proposing grows slow on a big pool. Status only reads what was kept, and a new route clears it. The dashboard shows it under Needs you as information: the time a token would save, the bytes that would move, the tokens until the move pays for itself, and the `isharded plan` command to look closer.
 
 Nothing applies a proposal yet. `POST /admin/rebalance` and `POST /admin/load` plan afresh and cannot be told an order, and pins only fix the two ends. So a proposal is there to read, and to decide on.
 
