@@ -1082,7 +1082,7 @@ class Orchestrator:
         ]
         if not candidates:
             return None
-        worker_id, record = max(
+        _, record = max(
             candidates,
             key=lambda item: (
                 item[0] not in route_workers,
@@ -1860,10 +1860,7 @@ class Orchestrator:
         self.add_event("failure", "A stage refused a request", f"HTTP {response.status_code}: {response.text[:160]}")
         return True
 
-    async def _mark_inference_failure(self, response: httpx.Response, entry_worker: str) -> None:
-        failed_worker = self._failed_worker(response, entry_worker)
-        if failed_worker in self.workers:
-            self._quarantine(failed_worker, f"inference request failed: HTTP {response.status_code}")
+
 
     async def next_token(
         self,
@@ -1937,8 +1934,8 @@ class Orchestrator:
                 session.needs_reset = True
                 attempt += 1
                 continue
-            if response is not None:
-                await self._mark_inference_failure(response, entry.worker_id)
+            if response is not None and (failed := self._failed_worker(response, entry.worker_id)) in self.workers:
+                self._quarantine(failed, f"inference request failed: HTTP {response.status_code}")
             if attempt == 0:
                 self.recoveries_total += 1
                 source_epoch = self.epoch
@@ -2036,7 +2033,7 @@ class Orchestrator:
             # Workers may hold more or less than the session does now.
             session.needs_reset = True
             self.stream_fallbacks += 1
-            if not await self._recover_stream(entry.worker_id, failure, epoch):
+            if not await self._recover_stream(failure, epoch):
                 break
         for _ in range(max_tokens - produced):
             yield await self.next_token(session, temperature, top_p, top_k, seed)
@@ -2076,7 +2073,7 @@ class Orchestrator:
         finally:
             reading.cancel()
 
-    async def _recover_stream(self, entry_worker: str, failure: Any, epoch: int) -> bool:
+    async def _recover_stream(self, failure: Any, epoch: int) -> bool:
         """Put things right after a stream stopped. True if a new stream can follow.
 
         Replaying through a new stream keeps the reply on a sequence of its own.
@@ -2139,7 +2136,7 @@ class Orchestrator:
                 if response.status_code in {400, 429}:
                     raise HTTPException(status_code=response.status_code, detail=reply_detail(response))
                 problem = "epoch" if response.status_code == 409 else reply_detail(response)
-            if not await self._recover_stream(entry.worker_id, problem, epoch):
+            if not await self._recover_stream(problem, epoch):
                 break
         raise HTTPException(status_code=502, detail=f"the entry worker could not answer: {problem}")
 
@@ -2378,27 +2375,6 @@ class Orchestrator:
             ),
         }
 
-    async def generate(
-        self,
-        prompt: str,
-        max_tokens: int,
-        temperature: float,
-        top_p: float,
-        top_k: int,
-        seed: int | None,
-        stop: str | list[str] | None,
-        history: str | None = None,
-        images: list[bytes] | None = None,
-    ) -> tuple[str, int, int, str]:
-        pieces: list[str] = []
-        summary: dict[str, Any] = {}
-        async for item in self.stream_tokens(prompt, max_tokens, temperature, top_p, top_k, seed, stop, history, images):
-            if "text" in item:
-                pieces.append(item["text"])
-            else:
-                summary = item
-        return "".join(pieces), summary["prompt_tokens"], summary["completion_tokens"], summary["finish_reason"]
-
     async def clear_session(self, session_id: str) -> None:
         async def clear(url: str) -> None:
             try:
@@ -2579,7 +2555,7 @@ class Orchestrator:
         }
 
     async def refresh_worker_metrics(self) -> None:
-        async def probe(worker_id: str, record: WorkerRecord) -> None:
+        async def probe(record: WorkerRecord) -> None:
             started = time.perf_counter()
             try:
                 response = await self.client.get(
@@ -2594,7 +2570,7 @@ class Orchestrator:
                 record.control_latency_ms = None
                 record.health = {"status": "unreachable", "error": str(exc)}
 
-        await asyncio.gather(*(probe(worker_id, record) for worker_id, record in self.workers.items()))
+        await asyncio.gather(*map(probe, self.workers.values()))
 
 
 runtime = Orchestrator()
@@ -3373,6 +3349,11 @@ def reply_detail(response: httpx.Response) -> Any:
         return f"HTTP {response.status_code}"
 
 
+def usage_of(summary: dict[str, Any]) -> dict[str, int]:
+    prompt, completion = summary["prompt_tokens"], summary["completion_tokens"]
+    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+
+
 def server_sent(payload: dict[str, Any] | str) -> str:
     return f"data: {payload if isinstance(payload, str) else json.dumps(payload)}\n\n"
 
@@ -3401,11 +3382,6 @@ async def event_stream(
                     yield delta_event(delta)
                 calls += 1
                 continue
-            usage = {
-                "prompt_tokens": item["prompt_tokens"],
-                "completion_tokens": item["completion_tokens"],
-                "total_tokens": item["prompt_tokens"] + item["completion_tokens"],
-            }
             timing = {
                 "time_to_first_token_ms": item["time_to_first_token_ms"],
                 "tokens_per_second": item["tokens_per_second"],
@@ -3416,7 +3392,7 @@ async def event_stream(
                 {
                     **envelope,
                     "choices": [to_choice("", item["finish_reason"])],
-                    "usage": usage,
+                    "usage": usage_of(item),
                     "isharded": timing,
                 }
             )
@@ -3485,18 +3461,14 @@ async def completions(
             ),
             media_type="text/event-stream",
         )
-    text, prompt_count, completion_count, finish_reason = await runtime.generate(prompt, *options)
+    message, summary = await whole_reply(runtime.stream_tokens(prompt, *options))
     return {
         "id": identifier,
         "object": "text_completion",
         "created": created,
         "model": runtime.model_id,
-        "choices": [{"index": 0, "text": text, "finish_reason": finish_reason}],
-        "usage": {
-            "prompt_tokens": prompt_count,
-            "completion_tokens": completion_count,
-            "total_tokens": prompt_count + completion_count,
-        },
+        "choices": [{"index": 0, "text": message["content"], "finish_reason": summary["finish_reason"]}],
+        "usage": usage_of(summary),
     }
 
 
@@ -3613,11 +3585,7 @@ async def chat_completions(
                 "finish_reason": summary["finish_reason"],
             }
         ],
-        "usage": {
-            "prompt_tokens": summary["prompt_tokens"],
-            "completion_tokens": summary["completion_tokens"],
-            "total_tokens": summary["prompt_tokens"] + summary["completion_tokens"],
-        },
+        "usage": usage_of(summary),
     }
 
 
