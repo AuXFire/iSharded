@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import ast
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 import ipaddress
 import json
 import os
@@ -157,27 +158,44 @@ def strip_thinking(text: str) -> str:
     return text[:start].rstrip() if start >= 0 else text
 
 
+@dataclass(slots=True)
+class OpenValue:
+    """A JSON value as far as it has been read, so more text carries on from there."""
+
+    size: int = 0  # characters read, which is its whole length once it closes
+    depth: int = 0
+    in_string: bool = False
+    escaped: bool = False
+
+    def read(self, text: str, start: int) -> bool:
+        """Read on through the value opening at ``start``. True if it closes, respecting strings."""
+        depth, in_string, escaped = self.depth, self.in_string, self.escaped
+        for index in range(start + self.size, len(text)):
+            character = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == '"':
+                    in_string = False
+            elif character == '"':
+                in_string = True
+            elif character in "{[":
+                depth += 1
+            elif character in "}]":
+                depth -= 1
+                if depth == 0:
+                    self.size = index + 1 - start
+                    return True
+        self.size, self.depth, self.in_string, self.escaped = max(len(text) - start, 0), depth, in_string, escaped
+        return False
+
+
 def balanced_span(text: str, start: int) -> int | None:
     """Where the JSON value opening at ``start`` closes, respecting strings."""
-    depth, in_string, escaped = 0, False, False
-    for index in range(start, len(text)):
-        character = text[index]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == '"':
-                in_string = False
-        elif character == '"':
-            in_string = True
-        elif character in "{[":
-            depth += 1
-        elif character in "}]":
-            depth -= 1
-            if depth == 0:
-                return index + 1
-    return None
+    value = OpenValue()
+    return start + value.size if value.read(text, start) else None
 
 
 def loose_json(text: str) -> Any:
@@ -307,33 +325,45 @@ class VisibleText:
     A call with no fence is held the same way, and only the whole reply can settle it,
     since a call has to end the reply. So what is still held at the end comes back from
     ``flush``, and the router drops it if the reply turned out to hold a call.
+
+    A reply can be held for a long time, so nothing is read twice. ``at`` is where the
+    unread text starts, which saves copying the rest each time a little is released.
+    ``looked`` is how far past ``at`` a fence or a run of calls is known to be settled.
     """
 
     def __init__(self, offered: Sequence[Capability] = ()) -> None:
         self.names = frozenset(capability.name for capability in offered)
         self.markers = ("<think>", "<tool_call>", "```", "{") if self.names else ("<think>",)
+        self.opening = re.compile("|".join(map(re.escape, self.markers)))
         self.held = ""
+        self.at = 0
+        self.looked = 0
+        self.value: OpenValue | None = None  # the bare call still arriving
         self.state = "text"  # or think, tool, fence, code, bare
         self.steps = {"text": self._text, "think": self._think, "tool": self._tool, "fence": self._fence, "code": self._code, "bare": self._bare}
 
     def feed(self, text: str) -> str:
         self.held += text
         released: list[str] = []
-        while self.held and self.steps[self.state](released):
+        while self.at < len(self.held) and self.steps[self.state](released):
             pass
+        self.held, self.at = self.held[self.at :], 0
         return "".join(released)
 
     def _release(self, released: list[str], size: int) -> None:
-        released.append(self.held[:size])
-        self.held = self.held[size:]
+        released.append(self.held[self.at : self.at + size])
+        self.at += size
+
+    def _settled(self) -> None:
+        self.state, self.looked, self.value = "text", 0, None
 
     def _skip_past(self, marker: str) -> bool:
-        end = self.held.find(marker)
+        end = self.held.find(marker, self.at)
         if end < 0:
-            self.held = self.held[-(len(marker) - 1) :]
+            self.at = max(self.at, len(self.held) - (len(marker) - 1))
             return False
-        self.held = self.held[end + len(marker) :].lstrip("\n")
-        self.state = "text"
+        self.held, self.at = self.held[end + len(marker) :].lstrip("\n"), 0
+        self._settled()
         return True
 
     def _think(self, released: list[str]) -> bool:
@@ -343,29 +373,31 @@ class VisibleText:
         return self._skip_past("</tool_call>")
 
     def _code(self, released: list[str]) -> bool:
-        end = self.held.find("```")
+        end = self.held.find("```", self.at)
         if end >= 0:
-            self._release(released, end + 3)
+            self._release(released, end + 3 - self.at)
             self.state = "text"
             return True
-        self._release(released, len(self.held) - self._partial("```"))
+        self._release(released, len(self.held) - self.at - self._partial("```"))
         return False
 
     def _fence(self, released: list[str]) -> bool:
-        first_line = self.held.find("\n")
+        first_line = self.held.find("\n", self.at)
         if first_line < 0:
             return False
-        if self.held[3:first_line].strip().lower() not in TOOL_FENCE_TAGS:
-            self._release(released, first_line)
+        if self.held[self.at + 3 : first_line].strip().lower() not in TOOL_FENCE_TAGS:
+            self._release(released, first_line - self.at)
             self.state = "code"
             return True
-        end = self.held.find("```", first_line)
+        end = self.held.find("```", max(first_line, self.at + self.looked))
         if end < 0:
+            self.looked = len(self.held) - self.at - 2  # a closing fence can still be cut in two
             return False
-        block = self.held[: end + 3]
-        self.held = self.held[end + 3 :]
-        self.state = "text"
-        if not as_calls(loose_json(block[first_line:end]), self.names):
+        block = self.held[self.at : end + 3]
+        call = self.held[first_line:end]
+        self.at = end + 3
+        self._settled()
+        if not as_calls(loose_json(call), self.names):
             released.append(block)
         return True
 
@@ -373,50 +405,54 @@ class VisibleText:
         if self._may_be_calls():
             return False
         self._release(released, 1)  # only the brace, as a call can still start after it
-        self.state = "text"
+        self._settled()
         return True
 
     def _may_be_calls(self) -> bool:
         """Whether what is held is nothing but tool calls so far, as ``bare_calls`` requires."""
-        position = 0
         while True:
-            rest = self.held[position:].lstrip()
-            if not rest:
-                return True
-            if rest[0] != "{":
-                return False
-            start = len(self.held) - len(rest)
-            end = balanced_span(self.held, start)
-            if end is None:
+            if self.value is None:
+                rest = self.held[self.at + self.looked :].lstrip()
+                if not rest:
+                    return True
+                if rest[0] != "{":
+                    return False
+                self.looked = len(self.held) - len(rest) - self.at
+                self.value = OpenValue()
+            start = self.at + self.looked
+            if not self.value.read(self.held, start):
                 return True  # still arriving
+            end = start + self.value.size
+            self.value = None
             if not as_calls(loose_json(self.held[start:end]), self.names):
                 return False
-            position = end
+            self.looked = end - self.at
 
     def _partial(self, marker: str) -> int:
         """How much of the end of the held text could be the start of a marker."""
         for size in range(len(marker) - 1, 0, -1):
-            if self.held.endswith(marker[:size]):
+            if self.held.endswith(marker[:size], self.at):
                 return size
         return 0
 
     def _text(self, released: list[str]) -> bool:
-        hits = [(start, marker) for marker in self.markers if (start := self.held.find(marker)) >= 0]
-        if not hits:
-            self._release(released, len(self.held) - max(self._partial(marker) for marker in self.markers))
+        hit = self.opening.search(self.held, self.at)
+        if hit is None:
+            self._release(released, len(self.held) - self.at - max(self._partial(marker) for marker in self.markers))
             return False
-        start, marker = min(hits)
-        self._release(released, start)
+        self._release(released, hit.start() - self.at)
+        marker = hit.group()
         if marker in ("```", "{"):
             self.state = "fence" if marker == "```" else "bare"
         else:
-            self.held = self.held[len(marker) :]
+            self.at += len(marker)
             self.state = "think" if marker == "<think>" else "tool"
         return True
 
     def flush(self) -> str:
         held, state = self.held, self.state
-        self.held, self.state = "", "text"
+        self.held = ""
+        self._settled()
         return "" if state in ("think", "tool") else held
 
 

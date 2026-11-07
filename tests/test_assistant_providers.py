@@ -6,6 +6,7 @@ from pathlib import Path
 import socket
 import time
 
+import httpx
 import pytest
 
 from isharded.assistant.app import Assistant
@@ -14,6 +15,7 @@ from isharded.assistant.contracts import Capability, Effect, ModelReply, ModelRe
 from isharded.assistant.providers import (
     MeshProvider,
     OpenAICompatible,
+    OpenValue,
     ProviderError,
     ProviderRefused,
     VisibleText,
@@ -224,6 +226,57 @@ def test_ordinary_code_is_not_held_until_the_end():
     visible = VisibleText(OFFERED)
     assert visible.feed("Here:\n```python\nprint(1)\n") == "Here:\n```python\nprint(1)\n"
     assert visible.feed("```\nThen more words.") == "```\nThen more words."
+
+
+@pytest.mark.parametrize("size", [1, 2, 3, 4, 7])
+@pytest.mark.parametrize(
+    ("text", "shown"),
+    [
+        # A fence held across feeds, closing where a feed can cut it.
+        ('```json\n{"a": "x` y``z"}\n```After', '```json\n{"a": "x` y``z"}\n```After'),
+        ('```tool\n{"tool": "files.read"}\n```\n```tool\n{"tool": "files.read"}\n```', "\n"),
+        # A string that holds what would close a value, and an escape cut from its quote.
+        ('{"name": "files.read", "arguments": {"path": "}{\\"]"}}', ""),
+        # A run of calls, then something that shows it never was one.
+        ('{"name": "files.read", "arguments": {}}  \n {"name": "files.read", "arguments": {}} ok', '{"name": "files.read", "arguments": {}}  \n {"name": "files.read", "arguments": {}} ok'),
+        ('{"a": {"name": "files.read", "arguments": {}}}', '{"a": {"name": "files.read", "arguments": {}}}'),
+        # What comes after a value that was let go of.
+        ("{1} <think>hidden</think>shown", "{1} shown"),
+        ('{"a": [{"b": 1}, {"c": 2}]} <tool_call>{"name": "files.read"}</tool_call>end', '{"a": [{"b": 1}, {"c": 2}]} end'),
+    ],
+)
+def test_held_text_is_settled_the_same_however_it_arrives(text, shown, size):
+    assert stream_through(text, size) == shown
+
+
+def test_a_long_value_is_read_once_however_many_pieces_it_comes_in(monkeypatch):
+    read: list[int] = []
+    original = OpenValue.read
+
+    def counted(self, text, start):
+        before = self.size
+        closed = original(self, text, start)
+        read.append(self.size - before)
+        return closed
+
+    monkeypatch.setattr(OpenValue, "read", counted)
+    rows = '{"id": 12, "name": "an entry"}, ' * 400
+    visible = VisibleText(OFFERED)
+    assert visible.feed('{"items": [') == ""
+    for start in range(0, len(rows), 3):
+        assert visible.feed(rows[start : start + 3]) == ""
+    assert sum(read) == len('{"items": [') + len(rows)
+    assert visible.flush() == '{"items": [' + rows
+
+
+def test_a_stream_is_ready_for_another_reply_after_a_flush():
+    visible = VisibleText(OFFERED)
+    assert visible.feed('{"name": "files.re') == ""
+    assert visible.flush() == '{"name": "files.re'
+    assert visible.feed("A set {1, 2}") == "A set {1, 2}"
+    assert visible.feed("```json\n{") == ""
+    assert visible.flush() == "```json\n{"
+    assert visible.feed('{"name": "files.read", "arguments": {}}') == ""
 
 
 def test_with_no_tools_only_reasoning_is_hidden():
