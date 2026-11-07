@@ -555,11 +555,17 @@ impl LlamaCompute {
         for (step, row) in rows.iter().enumerate() {
             alone.extend(self.probe_decode(&[(start + step as u32, 0, row)])?);
         }
-        self.cut(0, start, &history)?;
+        // Every size of verify pass up to the probed one, since a kernel picked for one size of
+        // batch can round differently from the next. Guesses past it go out under exact replies
+        // only that many at a time.
         let together: Vec<_> = rows.iter().enumerate().map(|(step, row)| (start + step as u32, 0, row.as_slice())).collect();
-        let checked = self.probe_decode(&together)?;
+        let mut matched = true;
+        for size in 2..=together.len() {
+            self.cut(0, start, &history)?;
+            matched &= self.probe_decode(&together[..size])? == alone[..size];
+        }
         self.empty(0);
-        Ok(alone == checked)
+        Ok(matched)
     }
 }
 
@@ -654,6 +660,9 @@ mod tests {
         /// Rows in a batch of more than this many come out a little different, as a GPU
         /// kernel picked for a bigger batch can round differently.
         rounds_above: Option<usize>,
+        /// Rows in a batch of exactly this many come out a little different, as a kernel picked
+        /// for one size can round differently from the sizes either side of it.
+        rounds_at: Option<usize>,
         /// Holds each slot to positions that follow on, as llama.cpp does.
         strict: bool,
     }
@@ -688,7 +697,7 @@ mod tests {
             state.0 = *batch.pos.add(row) + 1;
             state.1.push(*batch.pos.add(row));
         }
-        let shift = if fake.rounds_above.is_some_and(|most| count > most) { 0.5 } else { 0.0 };
+        let shift = if fake.rounds_above.is_some_and(|most| count > most) || fake.rounds_at == Some(count) { 0.5 } else { 0.0 };
         let doubled = hidden.iter().map(|value| value * 2.0 + shift);
         fake.capture.as_ref().unwrap().rows.lock().extend(doubled);
         fake.logits[0] = shift;
@@ -1171,6 +1180,14 @@ mod tests {
         let mut fake = Fake::default();
         let (found, _) = probed(&mut fake, true, 4);
         assert_eq!(found.map_err(|failure| failure.message), Ok(Exactness { exact_merge_limit: 3, verify_exact: true }));
+    }
+
+    #[test]
+    fn a_verify_pass_must_match_at_every_size_up_to_the_probed_one() {
+        // Four rows in one pass round as alone, three do not: a guess check of two guesses differs.
+        let mut fake = Fake { rounds_at: Some(3), ..Fake::default() };
+        let (found, _) = probed(&mut fake, false, 2);
+        assert_eq!(found.map_err(|failure| failure.message), Ok(Exactness { exact_merge_limit: 1, verify_exact: false }));
     }
 
     #[test]

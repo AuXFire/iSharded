@@ -197,6 +197,9 @@ def hardware_info(
 
 # Past this, a new reply is refused rather than left waiting indefinitely.
 MAX_WAITING_REPLIES = 32
+# Guesses one pass checks under exact replies: the probe compares verify passes of up to four
+# rows, the token and three guesses (PROBE_VERIFY_ROWS in engine/src/llama.rs), and no larger.
+EXACT_GUESSES = 3
 # A coordinator that asked for a drain and then died must not block replies forever.
 DRAIN_LIMIT_SECONDS = 180.0
 # A control plane this worker only heard about, and that stays silent, is forgotten.
@@ -2894,7 +2897,11 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
                 pipe = None
                 del runtime.pipes[request.slot]
             drafting = way == GUESSED
-            guesses = await draft_guesses(history[draft.seen(request.slot) :], min(ahead, room)) if drafting else []
+            if drafting:
+                most = min(ahead, room, EXACT_GUESSES) if runtime.exact else min(ahead, room)
+                guesses = await draft_guesses(history[draft.seen(request.slot) :], most)
+            else:
+                guesses = []
             result = await reply_step(
                 following.model_copy(update={"input_ids": [token, *guesses], "verify": drafting, "rollback_to": len(history) - 1})
             )
