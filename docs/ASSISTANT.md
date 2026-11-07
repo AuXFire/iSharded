@@ -615,6 +615,8 @@ A plugin is someone else's code. It runs as a separate process with a scrubbed e
 }
 ```
 
+`memory_mb` is the most memory the plugin may use. It can be from 16 to 262144, and leaving it out gives 2048.
+
 The command runs in the manifest's folder. Each call starts it, writes one line of JSON to its stdin, and reads one JSON object from its stdout:
 
 ```text

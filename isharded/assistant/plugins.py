@@ -42,6 +42,8 @@ MAX_FAILURES = 3
 DEFAULT_TIMEOUT = 30.0
 MAX_TIMEOUT = 3600.0
 DEFAULT_MEMORY_MB = 2048
+MIN_MEMORY_MB = 16
+MAX_MEMORY_MB = 256 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_STDERR_BYTES = 64 * 1024
 MAX_SUMMARY = 200
@@ -78,6 +80,16 @@ class ToolChanged(Exception):
 def require_person(by: str, action: str) -> None:
     if not is_person(by):
         raise ValueError(f"{by or 'Nobody'} is not a person, and only a person can {action} a plugin.")
+
+
+def memory_limit(manifest: dict[str, Any]) -> int:
+    try:
+        limit = int(manifest.get("memory_mb", DEFAULT_MEMORY_MB))
+    except (TypeError, ValueError, OverflowError):
+        limit = 0
+    if not MIN_MEMORY_MB <= limit <= MAX_MEMORY_MB:  # 0 would mean no limit at all to the sandbox
+        raise ValueError(f"memory_mb must be a whole number from {MIN_MEMORY_MB} to {MAX_MEMORY_MB}.")
+    return limit
 
 
 def parse_effects(words: Sequence[str]) -> list[str]:
@@ -191,13 +203,14 @@ class Plugins:
         timeout = manifest.get("timeout_seconds", DEFAULT_TIMEOUT)
         if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or not 0 < timeout <= MAX_TIMEOUT:
             raise ValueError(f"timeout_seconds must be above 0 and at most {MAX_TIMEOUT:g}.")
+        memory_mb = memory_limit(manifest)
         return {
             "name": name,
             "protocol": protocol,
             "command": command,
             "cwd": str(folder),
             "timeout": float(timeout),
-            "memory_mb": int(manifest.get("memory_mb", DEFAULT_MEMORY_MB)),
+            "memory_mb": memory_mb,
             "env": sorted(set(env)),  # names only: the value stays in the owner's environment
         }
 
