@@ -697,6 +697,7 @@ def test_a_draft_goes_on_from_the_whole_reply_after_a_resume(entry, monkeypatch)
 
 BUILD = os.environ.get("ISHARDED_TEST_LLAMA_DIR", "")
 MODEL = os.environ.get("ISHARDED_TEST_GGUF", "")
+PIPELINE_TRIALS = 8
 needs_real_route = pytest.mark.skipif(not (BUILD and MODEL and find_library()), reason="needs a real model and the built engine")
 
 
@@ -808,7 +809,12 @@ def test_a_reply_goes_back_to_the_pipeline_after_the_entry_stage_restarts(tmp_pa
         assert route.ask(prompt)  # the reply survives, on whatever way is open
         assert route.entry()["stage_restarts"] == 1
         route.wait_for(lambda: route.entry()["ring_live"], 90)
-        assert route.ask(prompt) == before
-        assert route.entry()["pipeline"]["tokens"] > made
+        # The entry keeps to whichever way has been faster, and plain decoding can win on a
+        # busy machine. It gives the pipeline a trial now and then, as long as the ring is up.
+        for _ in range(PIPELINE_TRIALS):
+            assert route.ask(prompt) == before
+            if route.entry()["pipeline"]["tokens"] > made:
+                break
+        assert route.entry()["pipeline"]["tokens"] > made, route.entry()["draft_ways"]
     finally:
         route.stop()
