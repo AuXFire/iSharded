@@ -1978,6 +1978,32 @@ def test_a_reply_does_not_wait_forever_for_a_repair(monkeypatch):
     done(orchestrator)
 
 
+def test_a_follower_no_worker_can_reach_does_not_hold_a_reply_back(monkeypatch):
+    """It has the route and no records, so the whole wait would pass before every reply."""
+    monkeypatch.setattr(orchestrator_module, "MOVE_WAIT_SECONDS", 30.0)
+    orchestrator = pool()
+    orchestrator.route = [stage("w1")]
+    orchestrator.mesh = SimpleNamespace(replica={"epoch": 3}, is_leader=False)
+    started = time.monotonic()
+    asyncio.run(orchestrator.wait_for_route())
+    assert time.monotonic() - started < 5
+    assert not orchestrator.serving()
+    orchestrator.mesh = None
+    done(orchestrator)
+
+
+def test_a_leader_back_from_a_restart_still_waits_for_its_workers(monkeypatch):
+    monkeypatch.setattr(orchestrator_module, "MOVE_WAIT_SECONDS", 0.2)
+    orchestrator = pool()
+    orchestrator.route = [stage("w1")]
+    orchestrator.mesh = SimpleNamespace(replica={"epoch": 3}, is_leader=True)
+    started = time.monotonic()
+    asyncio.run(orchestrator.wait_for_route())
+    assert time.monotonic() - started >= 0.2
+    orchestrator.mesh = None
+    done(orchestrator)
+
+
 def test_a_load_gets_longer_than_a_repair(monkeypatch):
     monkeypatch.setattr(orchestrator_module, "MOVE_WAIT_SECONDS", 0.0)
     monkeypatch.setattr(orchestrator_module, "LOAD_WAIT_SECONDS", 0.5)

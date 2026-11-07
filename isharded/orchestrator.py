@@ -1647,13 +1647,18 @@ class Orchestrator:
         """Whether a load, a repair, or a restart should bring a whole route."""
         return self.active is not None or self.saved_state is not None or self._loading() or bool(self.mesh and self.mesh.replica)
 
+    def _hears_no_stage(self) -> bool:
+        """A follower no worker can reach has a route and no records, and waiting tells it nothing."""
+        following = bool(self.mesh and self.mesh.replica and not self.mesh.is_leader)
+        return following and not self._loading() and bool(self.route) and not any(stage.worker_id in self.workers for stage in self.route)
+
     async def wait_for_route(self) -> None:
         """A reply arriving during a load or repair waits for it, rather than being turned away.
 
         The wait is bounded, and then the reply goes ahead and finds out for itself.
         """
         began = time.monotonic()
-        while not self._route_whole() and self._route_expected():
+        while not self._route_whole() and self._route_expected() and not self._hears_no_stage():
             if time.monotonic() - began >= (LOAD_WAIT_SECONDS if self._loading() else MOVE_WAIT_SECONDS):
                 return
             await asyncio.sleep(0.25)

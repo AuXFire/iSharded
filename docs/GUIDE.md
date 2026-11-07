@@ -2091,12 +2091,12 @@ Trust and status:
 
 - Seven machines is the most this has run on, for about two hours, so everything about larger meshes is design, not measurement. See [Scaling to many nodes](#scaling-to-many-nodes). The longest continuous soak ran under an hour. No human has audited it, and reviews by AI do not show it is free of flaws.
 - A node in the route can read prompts. It can return wrong answers too: [checking answers](#checking-answers) catches a route that disagrees with others, but not one that only misbehaves when it is not being tested, and it has been measured only with every route on one machine. Certificates limit who is in a pool. They do not make a hostile member safe.
-- The [native engine](#the-native-engine) is new. Macs with Intel chips, and Linux without glibc 2.28, get no wheel with it. Its direct links have known gaps: a frame over 64 KiB closes a TLS link, so multi-row passes on wide models fall back to HTTP; a closing link that goes silent can hold a reply for minutes before it replays; a stage that hangs without dying takes minutes to notice; and a route's stages share one key, so one stage can forge another's answers. Use it only among nodes you trust.
+- The [native engine](#the-native-engine) is new. Macs with Intel chips, and Linux without glibc 2.28, get no wheel with it. Its direct links have known gaps: a closing link that goes silent can hold a reply for minutes before it replays; a stage that hangs without dying takes minutes to notice; and a route's stages share one key, so one stage can forge another's answers. Use it only among nodes you trust.
 - An owned network has an owner.
 - A network nobody owns passed 27 of 27 checks on real processes, but as three nodes on one machine, not between strangers. Identities are free, so `--joining open` lets one person run many nodes, and a low name can be ground out to win coordination. A coordinator can stall a route. Traffic is not encrypted, so run it over a network that is, such as Tailscale. Use `--joining vouched` with a quorum unless you accept all of that.
 - Several models run in lanes with fixed memory shares, and each lane adds two processes to a node. The main model's planner does not see a lane's memory, so moving layers after a failure can run a node short. Workers started with `--no-control` do not join lanes.
-- GitHub Actions has not run yet, because the account's jobs do not start. The same steps pass locally on Linux and Windows.
-- Linux has run real nodes on CPU only, in WSL. A Linux GPU, and macOS, have not been run at all, although their builds are pinned and download by themselves.
+- GitHub Actions runs the tests on Linux and Windows for every push. Those jobs run on CPU, so real GPU runs are measured by hand.
+- Linux GPUs have run real nodes on rented A40 machines. macOS has not run a real model yet, although its builds are pinned and download by themselves.
 - Adding a machine with an invite needs the owner's machine running at that moment. The mesh keeps working without it.
 
 Behavior:

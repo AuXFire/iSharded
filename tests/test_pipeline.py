@@ -659,9 +659,17 @@ def test_a_draft_goes_on_from_the_whole_reply_after_a_resume(entry, monkeypatch)
 
         def prepare(self, prompt, plan, slot) -> None:
             self.prompt = list(prompt)
+            self.read = len(prompt)
 
-        def guess(self, text, count, slot) -> list[int]:
-            self.texts.append(list(text))
+        def seen(self, slot) -> int:
+            return self.read
+
+        def rewind(self, keep, slot) -> None:
+            self.read = keep
+
+        def guess(self, fresh, count, slot) -> list[int]:
+            self.texts.append(list(fresh))
+            self.read += len(fresh)
             return [5] * count
 
     draft = Draft()
@@ -673,5 +681,5 @@ def test_a_draft_goes_on_from_the_whole_reply_after_a_resume(entry, monkeypatch)
     tokens = asyncio.run(stream_of(body))
     assert tokens[0] == 303
     assert draft.prompt == [1, 2], "it reads the prompt, and the rest as text it has not seen"
-    assert draft.texts[0] == [1, 2, 7, 8, 303]
+    assert draft.texts[0] == [7, 8, 303]
     assert entry[3].rollback_to == 4, "the next pass goes after everything already written"

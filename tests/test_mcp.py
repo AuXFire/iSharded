@@ -481,6 +481,7 @@ def site(monkeypatch, tmp_path):
     node.model_id = "scripted"
     node.tokenizer = ScriptedChat()
     node.route = [StageAssignment(worker_id="w", url="http://worker", start_layer=0, end_layer=1)]
+    node._route_whole = lambda: True  # no worker stands behind this route, and these tests are about the door
 
     async def token_stream(session, *rest):
         yield 7
