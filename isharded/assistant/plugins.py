@@ -28,7 +28,7 @@ import re
 import threading
 from typing import Any
 
-from isharded.mcp_client import START_SECONDS, LineRpc, content_parts
+from isharded.mcp_client import LineRpc, content_parts, input_refusal
 
 from .broker import DEFAULT_USER, is_person
 from .contracts import CallContext, Capability, Effect, Provenance, ToolResult, Trust
@@ -451,6 +451,8 @@ class Plugins:
             with self.lock:
                 self._drop_session(name)  # a hung or broken server is not given a second call
             raise
+        if result.get("resultType") == "input_required":
+            return self._result(name, False, input_refusal(result))
         structured = result.get("structuredContent")
         return self._result(name, not result.get("isError", False), text_of(result.get("content")), structured if isinstance(structured, dict) else {})
 

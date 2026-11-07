@@ -428,6 +428,11 @@ SERVER = """
                 send({{"jsonrpc": "2.0", "id": ident, "result": {{"content": [{{"type": "text", "text": "it went wrong"}}], "isError": True}}}})
             elif name == "unknown":
                 send({{"jsonrpc": "2.0", "id": ident, "error": {{"code": -32602, "message": "no such tool"}}}})
+            elif name == "needs_input":
+                asks = {{"who": {{"method": "elicitation/create", "params": {{"message": "Which account?"}}}}}}
+                send({{"jsonrpc": "2.0", "id": ident, "result": {{"resultType": "input_required", "inputRequests": asks}}}})
+            elif name == "picture":
+                send({{"jsonrpc": "2.0", "id": ident, "result": {{"content": [{{"type": "image", "mimeType": "image/png", "data": "AAAA"}}]}}}})
             elif name == "ask_back":
                 send({{"jsonrpc": "2.0", "id": 900, "method": "sampling/createMessage", "params": {{}}}})
                 send({{"jsonrpc": "2.0", "method": "notifications/message", "params": {{"data": "a log line"}}}})
@@ -688,6 +693,13 @@ def test_a_legacy_server_never_sees_the_probe(assistant, mcp):
     grant(assistant, name)
     invoke(assistant, name, q="tea")
     assert "server/discover" not in [message.get("method") for message in mcp.seen()]
+
+
+def test_a_tool_that_needs_input_is_a_failed_call_that_says_so(assistant, mcp):
+    (name,) = assistant.plugins.add(mcp.manifest([tool_named("needs_input")]))
+    grant(assistant, name)
+    result = invoke(assistant, name)
+    assert not result.ok and "did not finish" in result.output and "Which account?" in result.output
 
 
 def test_a_server_that_will_not_start_is_refused_at_install(assistant, tmp_path):

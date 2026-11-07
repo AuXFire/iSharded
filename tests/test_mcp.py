@@ -1683,3 +1683,25 @@ def test_a_rename_is_said_in_a_way_a_tool_cannot_use_to_write_to_the_terminal(ca
     assert "\x1b" not in capsys.readouterr().err
 
 
+# --- a tool that asks for more
+
+
+def test_a_tool_that_needs_input_gets_an_honest_refusal():
+    asks = {"who": {"method": "elicitation/create", "params": {"message": "Which account?"}}, "more": {"method": "sampling/createMessage"}}
+    server = FakeServer("a", ["pay"], {"resultType": "input_required", "inputRequests": asks, "requestState": "opaque"})
+    said = Toolbox([server]).call("pay", {}, 5)
+    assert "did not finish" in said and "Which account?" in said and "sampling/createMessage" in said
+    assert "tell the person" in said
+
+
+@pytest.mark.parametrize("asks", [None, [], {"a": "junk"}, {"a": {"params": "junk", "method": "m"}}])
+def test_a_refusal_survives_whatever_a_server_says_it_wanted(asks):
+    result = {"resultType": "input_required", "inputRequests": asks}
+    assert "did not finish" in Toolbox([FakeServer("a", ["pay"], result)]).call("pay", {}, 5)
+
+
+def test_what_a_server_asks_cannot_flood_the_model():
+    asks = {"a": {"params": {"message": "x" * 100_000}}}
+    assert len(Toolbox([FakeServer("a", ["pay"], {"resultType": "input_required", "inputRequests": asks})]).call("pay", {}, 5)) < 1000
+
+

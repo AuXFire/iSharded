@@ -422,6 +422,17 @@ def content_parts(content: Iterable[Any]) -> list[str]:
     return parts
 
 
+def input_refusal(result: dict[str, Any]) -> str:
+    """What to tell a model when a tool stopped to ask for something we have no way to give."""
+    asks = result.get("inputRequests")
+    said = []
+    for ask in asks.values() if isinstance(asks, dict) else []:
+        if isinstance(ask, dict):
+            said.append(str(as_object(ask.get("params")).get("message") or ask.get("method")))
+    wanted = f" It asked: {'; '.join(said)[:MAX_ASKED_CHARACTERS]}." if said else ""
+    return f"The tool stopped to ask for more input, and this client has no way to give any, so it did not finish.{wanted} Call it again with what it needs in the arguments, or tell the person what it asked for."
+
+
 def result_text(result: dict[str, Any]) -> str:
     """What a tool sent back, as the text a model will read."""
     parts = content_parts(result.get("content") or [])
@@ -474,7 +485,7 @@ class Toolbox:
         except ServerError as exc:
             return f"The tool failed: {exc}"
         if result.get("resultType") == "input_required":
-            return "The tool asked for more input, which this client cannot give."
+            return input_refusal(result)
         text = result_text(result)
         return f"The tool reported an error: {text}" if result.get("isError") else text
 
