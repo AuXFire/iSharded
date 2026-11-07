@@ -69,6 +69,20 @@ LLAMA3 = """{% if tools %}Respond in the format {"name": function name, "paramet
 MISTRAL = """{% if tools %}[AVAILABLE_TOOLS]{{ tools | tojson }}[/AVAILABLE_TOOLS]{% endif %}{% for m in messages %}{% if m.tool_calls is defined and m.tool_calls is not none %}[TOOL_CALLS] [{% for call in m.tool_calls %}{% if call.id|length != 9 %}{{ raise_exception('Tool call IDs should be alphanumeric strings with length 9!') }}{% endif %}{{ call.function | tojson }}{% endfor %}]{% else %}[INST]{{ m.content }}[/INST]{% endif %}{% endfor %}"""
 HERMES_USE = """{% for tool in tools %}{{ tool | tojson }}{% endfor %}<tool_call>{% for m in messages %}{{ m.role }}:{{ m.content }}{% if m.role == 'tool' %}({{ m.name }}){% endif %}|{% endfor %}<assistant>"""
 PLAIN = "{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}<assistant>"
+GLM46 = """{% if tools %}For each function call, output the function name and arguments within the following XML format:
+<tool_call>{function-name}
+<arg_key>{arg-key-1}</arg_key>
+<arg_value>{arg-value-1}</arg_value>
+...
+</tool_call>{% endif %}{% for m in messages %}{% if m.role == 'tool' %}<|observation|>
+<tool_response>
+{{ m.content }}
+</tool_response>{% else %}<|{{ m.role }}|>{{ m.content }}{% if m.tool_calls %}{% for tc in m.tool_calls %}{% set tc = tc.function %}
+<tool_call>{{ tc.name }}
+{% set _args = tc.arguments %}{% for k, v in _args.items() %}<arg_key>{{ k }}</arg_key>
+<arg_value>{{ v | tojson(ensure_ascii=False) if v is not string else v }}</arg_value>
+{% endfor %}</tool_call>{% endfor %}{% endif %}{% endif %}{% endfor %}<|assistant|>"""
+GLM47 = GLM46.replace("{function-name}\n", "{function-name}").replace("{{ tc.name }}\n", "{{ tc.name }}")
 
 
 class Scripted(ChatTokenizer):
@@ -139,7 +153,7 @@ def stream_events(mesh, **body):
 
 
 def scan(kind: str, text: str, step: int | None = None, tools=(WEATHER,), choice=None, parallel=None, thinking=False, opening="", truncated=False, template=None):
-    templates = {"hermes": QWEN3, "xml": QWEN35, "llama3": LLAMA3, "mistral": MISTRAL, "mistral-new": MISTRAL + "[ARGS]"}
+    templates = {"hermes": QWEN3, "xml": QWEN35, "llama3": LLAMA3, "mistral": MISTRAL, "mistral-new": MISTRAL + "[ARGS]", "glm": GLM46}
     plan = plan_tools(list(tools), choice, parallel, template or templates[kind])
     scanner = ReplyScanner(plan, thinking, opening)
     items = []
@@ -162,10 +176,12 @@ def scan(kind: str, text: str, step: int | None = None, tools=(WEATHER,), choice
         (QWEN35, "xml"),
         (LLAMA3 + "tool_call", "llama3"),
         (MISTRAL, "mistral"),
+        (GLM46, "glm"),
+        (GLM47, "glm"),
         (HERMES_USE, "hermes"),
         (PLAIN, None),
         (None, None),
-        ("tools <tool_call>{{ name }}<arg_key>k</arg_key>", None),
+        ("tools <tool_call>{{ name }}<arg_key>k</arg_key>", "glm"),
         ("tools, in a format of its own", None),
     ],
 )
@@ -876,3 +892,70 @@ def test_a_forced_opening_ends_where_a_real_token_ends(choice):
     }[plan.format]
     opening = chat.encode(forced_opening(plan))
     assert chat.encode(whole)[: len(opening)] == opening
+
+
+# --- GLM, whose calls are neither JSON nor Qwen's XML
+
+
+GLM46_REPLY = "<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\n<arg_key>days</arg_key>\n<arg_value>3</arg_value>\n</tool_call>"
+GLM47_REPLY = "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call>"
+BOTH_GLM_FORMS = pytest.mark.parametrize("reply, template", [(GLM46_REPLY, GLM46), (GLM47_REPLY, GLM47)], ids=["4.5-4.6", "4.7"])
+
+
+@BOTH_GLM_FORMS
+@pytest.mark.parametrize("step", [None, 1, 2, 3, 7])
+def test_a_glm_call_reads_the_same_however_it_arrives(reply, template, step):
+    assert scan("glm", reply, step, template=template) == ("", [("get_weather", {"city": "Paris", "days": 3})])
+
+
+def test_glm_values_follow_the_schema_and_stay_text_without_one():
+    reply = '<tool_call>get_weather<arg_key>tags</arg_key><arg_value>["a"]</arg_value><arg_key>metric</arg_key><arg_value>true</arg_value><arg_key>city</arg_key><arg_value>12</arg_value><arg_key>other</arg_key><arg_value>7</arg_value></tool_call>'
+    assert scan("glm", reply)[1] == [("get_weather", {"tags": ["a"], "metric": True, "city": "12", "other": "7"})]
+
+
+def test_a_glm_value_keeps_its_lines():
+    reply = "<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>line one\nline two</arg_value>\n</tool_call>"
+    assert scan("glm", reply)[1] == [("get_weather", {"city": "line one\nline two"})]
+
+
+def test_a_glm_call_with_no_arguments():
+    assert scan("glm", "<tool_call>get_weather\n</tool_call>")[1] == [("get_weather", {})]
+
+
+def test_glm_parallel_calls_and_words_before_them():
+    words, calls = scan("glm", f"Checking.\n{GLM46_REPLY}\n{GLM46_REPLY}")
+    assert words == "Checking." and len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "<tool_call>not_offered\n<arg_key>a</arg_key>\n<arg_value>b</arg_value>\n</tool_call>",
+        "<tool_call>get_weather\nsome stray words\n</tool_call>",
+        '<tool_call>{"name": "get_weather"}</tool_call>',
+    ],
+)
+def test_what_is_not_a_glm_call_stays_as_it_was_written(reply):
+    words, calls = scan("glm", reply)
+    assert not calls and words.strip() == reply
+
+
+@BOTH_GLM_FORMS
+def test_a_forced_glm_call_leaves_the_rest_to_the_model(reply, template):
+    choice = {"type": "function", "function": {"name": "get_weather"}}
+    opening = forced_opening(plan_tools([WEATHER], choice, None, template))
+    assert opening == "<tool_call>get_weather"
+    assert scan("glm", reply.removeprefix(opening), template=template, opening=opening, choice=choice)[1] == [("get_weather", {"city": "Paris", "days": 3})]
+
+
+def test_a_whole_glm_conversation_goes_round_the_chat_route(mesh):
+    mesh.use(GLM46, GLM46_REPLY)
+    first = ask(mesh, tools=[WEATHER]).json()["choices"][0]
+    assert first["finish_reason"] == "tool_calls"
+    call = first["message"]["tool_calls"][0]
+    assert json.loads(call["function"]["arguments"]) == {"city": "Paris", "days": 3}
+    mesh.use(GLM46, "17C in Paris.")
+    turns = [{"role": "user", "content": "weather?"}, first["message"], {"role": "tool", "tool_call_id": call["id"], "content": "17C"}]
+    assert ask(mesh, messages=turns, tools=[WEATHER]).json()["choices"][0]["message"]["content"] == "17C in Paris."
+    assert "<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>" in mesh.prompt
+    assert "<arg_value>3</arg_value>" in mesh.prompt and "<tool_response>\n17C\n</tool_response>" in mesh.prompt
