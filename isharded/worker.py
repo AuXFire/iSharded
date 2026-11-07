@@ -347,6 +347,8 @@ class WorkerRuntime:
         self.term = 0
         self.advertised_url = os.getenv("ISHARDED_ADVERTISE_URL", "http://127.0.0.1:8100").rstrip("/")
         self.draft_choice = DraftChoice()
+        # The stage that would not restart, for as long as it is still this worker's stage.
+        self.stage_down: Any = None
         self.ring_live = False
         self.ring_epoch: int | None = None
         self.ring_door: dict[str, Any] | None = None
@@ -719,9 +721,11 @@ class WorkerRuntime:
                 await asyncio.to_thread(self.gguf.respawn)
             except (LlamaError, OSError, AssertionError) as exc:
                 self.last_error = f"stage would not restart: {exc}"
+                self.stage_down = self.gguf
                 # Not a 500, which reads as a request the stage refused: that ends the reply
                 # and blames nobody. This node has lost its stage, so it goes and the reply goes on.
                 return HTTPException(status_code=502, detail={"failed_worker": self.worker_id, "message": self.last_error})
+            self.stage_down = None
             self.stage_restarts += 1
         if self.draft_request is not None and not draft_apart():
             await self.replace_draft(lost, draft)  # it lived in that process
@@ -1854,6 +1858,9 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
     if not authorized(authorization):
         return {"status": "ok"}  # hardware and layout are nobody else's business
     if runtime.gguf is not None:
+        if runtime.stage_down is runtime.gguf:
+            # A report that this node lost its stage is checked here, and must not hear all is well.
+            raise HTTPException(status_code=503, detail=runtime.last_error)
         await asyncio.to_thread(runtime.gguf.refresh_states)
     assignment = runtime.assignment.model_dump() if runtime.assignment else None
     return {

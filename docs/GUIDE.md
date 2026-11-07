@@ -385,7 +385,7 @@ A stage that hangs without dying keeps its links open, so it is watched in three
 - **A stuck call.** Each call to a stage has a deadline of 30 s plus 1 s a row, and past it the process is stopped. Saved states and images get the time of 600 rows, and a load has no deadline.
 - **A stuck pass on the engine.** The engine holds its own passes to the same limit, counted only while a pass holds the model. Past it, the engine refuses what is in flight and ends the process.
 
-Whichever finds it, the worker sees a lost stage, as if it had been killed: it starts another, and the reply replays. A process that will not exit is killed, killed harder, and left behind, so no reply waits on it. It keeps its memory until the system lets it go. If the new stage then cannot load, the node's stage will not restart: the node is quarantined, and the reply goes on without it.
+Whichever finds it, the worker sees a lost stage, as if it had been killed: it starts another, and the reply replays. A process that will not exit is killed, killed harder, and left behind, so no reply waits on it. It keeps its memory until the system lets it go. If the new stage then cannot load, the node's stage will not restart: its `/health` answers 503, the node is quarantined, and the reply goes on without it.
 
 Qwen3-0.6B Q8_0 over two CPU stages on one machine, frozen 12 chunks into a reply. Each cell is the longest pause. All 64-token replies at temperature 0 matched an unbroken run:
 

@@ -2321,6 +2321,55 @@ def test_a_failed_restart_is_no_refused_request_and_the_reply_goes_on(monkeypatc
     assert quarantined == ["w2"] and repairs == [1]
 
 
+def test_a_stage_that_will_not_restart_fails_the_check_a_report_gets(monkeypatch):
+    """A follower reports the node to the coordinator, which only believes what /health says."""
+    from isharded import worker as worker_module
+    from isharded.llamacpp import LlamaError
+
+    worker, _ = failed_restart(LlamaError("no"))
+    assert worker.stage_down is worker.gguf
+
+    stage = SimpleNamespace(refresh_states=lambda: None, ring_stats=lambda: None, states={})
+    monkeypatch.setattr(worker_module, "authorized", lambda _: True)
+    monkeypatch.setattr(worker_module.runtime, "gguf", stage)
+    monkeypatch.setattr(worker_module.runtime, "stage_down", stage)
+    client = TestClient(worker_module.app)
+    assert client.get("/health").status_code == 503
+    monkeypatch.setattr(worker_module, "authorized", lambda _: False)
+    assert client.get("/health").json() == {"status": "ok"}, "a stranger hears nothing of it"
+
+    monkeypatch.setattr(worker_module, "authorized", lambda _: True)
+    monkeypatch.setattr(worker_module.runtime, "stage_down", object())  # the stage of an older route
+    assert client.get("/health").status_code == 200
+
+
+def test_a_coordinator_believes_a_report_of_a_stage_that_will_not_restart(monkeypatch):
+    orchestrator = gguf_pool(w1=record())
+    orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(503, json={})))
+    quarantined = []
+    monkeypatch.setattr(orchestrator, "_quarantine", lambda worker, reason: quarantined.append(worker))
+
+    async def rebalance(**_):
+        pass
+
+    monkeypatch.setattr(orchestrator, "rebalance", rebalance)
+    asyncio.run(orchestrator.handle_report("w1", "reply failed"))
+    assert quarantined == ["w1"]
+
+
+def test_a_stage_that_restarts_takes_back_its_good_name():
+    from isharded.llamacpp import StageLost
+    from isharded.worker import WorkerRuntime
+
+    async def scenario():
+        stage = RestartingStage()
+        worker = SimpleNamespace(replacing=asyncio.Lock(), gguf=stage, last_error=None, caches={}, stage_restarts=0, draft=None, draft_request=None, ring_live=True, stage_down=stage)
+        await WorkerRuntime.replace_stage(worker, StageLost("gone", stage.host))
+        return worker
+
+    assert asyncio.run(scenario()).stage_down is None
+
+
 def test_a_lost_stage_takes_its_ring_with_it(monkeypatch):
     from types import SimpleNamespace
 
