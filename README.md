@@ -12,10 +12,10 @@ Each token crosses every machine in the route. It is built to grow to many nodes
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/dashboard-dark.png">
-  <img alt="The dashboard on a real mesh: a 235B model's 94 layers in VRAM across seven machines, with each stage's country, memory, and compute time." src="docs/screenshots/dashboard-light.png">
+  <img alt="The dashboard on a small real pool: one drawing of a model's layers along the top and one pass in time along the bottom, with a band between for each stage, so the slowest stage is the widest." src="docs/screenshots/dashboard-light.png">
 </picture>
 
-*The dashboard on a real seven-machine mesh, serving a 235B model from VRAM alone. [More of the console](docs/GUIDE.md#chat-page-and-dashboard).*
+*The dashboard on a real pool of three local CPU workers serving Qwen3-0.6B, with sample names. [More of the console](docs/GUIDE.md#chat-page-and-dashboard).*
 
 ## Measured results
 

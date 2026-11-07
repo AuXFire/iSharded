@@ -4,10 +4,10 @@ How to install, run, configure, and understand iSharded. [The README](../README.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="screenshots/dashboard-dark.png">
-  <img alt="The dashboard on a real mesh: a 235B model's 94 layers in VRAM across seven machines, with each stage's country, memory, and compute time." src="screenshots/dashboard-light.png">
+  <img alt="The dashboard on a small real pool: one drawing of a model's layers along the top and one pass in time along the bottom, with a band between for each stage, so the slowest stage is the widest." src="screenshots/dashboard-light.png">
 </picture>
 
-*The dashboard on a real seven-machine mesh, serving a 235B model from VRAM alone. [More of the console](#chat-page-and-dashboard).*
+*The dashboard on a real pool of three local CPU workers serving Qwen3-0.6B, with sample names. [More of the console](#chat-page-and-dashboard).*
 
 ## Contents
 
@@ -470,24 +470,26 @@ An earlier mesh of seven machines on the Python path, in four countries and two 
 
 ### Chat page and dashboard
 
-Every node serves a chat page at `/chat` and a console at `/dashboard`. The chat page below and the dashboard at the top of this page are from the [seven-machine mesh](#measured-across-data-centers). Their speed estimates are the planner's, from before it used measured links, so go by the measured figures in that section.
+Every node serves a chat page at `/chat` and a console at `/dashboard`. The dashboard at the top of this page is from a real pool of three local CPU workers. The chat page below is from the [seven-machine mesh](#measured-across-data-centers), and its speed estimates are the planner's, from before it used measured links, so go by the measured figures in that section.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="screenshots/chat-dark.png">
   <img alt="The chat page: a reply with its speed, and the stages it ran on." src="screenshots/chat-light.png">
 </picture>
 
-The console is built to stay readable at 60 workers, grouping them by state so what needs you comes first. No mesh this size has run yet, so this view uses simulated data:
+The dashboard is built to stay readable at 200 workers. What needs you is grouped by cause, machines become a field of marks with trouble first, and only the stages that matter are named. No pool this size has run yet, so this view uses simulated data, and the page says so at the top:
 
-![The dashboard with 60 simulated workers, marked as simulated at the top of the page.](screenshots/dashboard-60-workers.png)
+![The dashboard with 200 simulated workers, marked as simulated at the top of the page.](screenshots/dashboard-200-workers.png)
 
+
+The board's pass time is an estimate, so it says "about". It adds each stage's compute to half of its measured direct link round trip, or to a small HTTP probe when no direct reading exists. It lays one pass end to end, which is not the time per token, because pipelining and the draft overlap work. It fills in after the first reply. Trends under Readings are kept by the browser tab since it opened, because the pool stores no history.
 
 Every node serves both, so any node's address works.
 
 | Page | What it shows |
 |---|---|
 | `/chat` | A chat window. It asks for a key, shows where a model would run and how fast before anything downloads, and colors each layer by the memory holding it. |
-| `/dashboard` | The active pipeline, each node's state and hardware, latency, throughput, memory, recoveries, and events. Click a stage or worker for detail. |
+| `/dashboard` | The state of the pool as a sentence, then the route board: the model's layers along the top, one pass in time along the bottom, and a band for each stage, so the slowest thing is the widest. Below it are what needs you, machines, memory, activity, the stage table, readings, and facts. Select a stage or machine for detail, and use the arrow keys to walk the stages. |
 
 If the node serving your chat dies mid-reply, the page asks before sending your key and conversation to another member, then restarts the reply there.
 
@@ -1748,7 +1750,7 @@ The ends of the pipeline are not equal: the exit reads the whole output head for
 
 An explicit `--gpu-memory-gb` is a hard allocator limit on CUDA and ROCm. RAM and disk budgets are enforced by placement. Disk is a capacity tier: expect it to be far slower than RAM once a model outgrows the OS page cache.
 
-The dashboard's "Memory for weights" counts weights only. Real use is higher, because KV cache, compute buffers, a draft model, and each worker's GPU context come on top.
+The dashboard's memory figures count weights only. Real use is higher, because KV cache, compute buffers, a draft model, and each worker's GPU context come on top.
 
 A pool that measures 0 bytes free counts as full. A pool that was never measured, which shows as no size at all, keeps its budget.
 
@@ -2082,7 +2084,7 @@ Adapter tests compare every family with the reference `transformers` implementat
 | `isharded/statestore.py`, `isharded/statecopy.py` | Saved prompt states, where prompts are cut, and the copy of each on another node |
 | `isharded/weights.py` | Readers, the unit cache, and hash checks |
 | `isharded/access.py`, `isharded/pool.py`, `isharded/tickets.py`, `isharded/tls.py`, `isharded/statements.py` | Keys, certificates, signed entries, tickets, TLS, and proving who asked when a request is passed on |
-| `isharded/chat.html`, `isharded/dashboard.html`, `isharded/ui.css` | The chat page and the dashboard |
+| `isharded/chat.html`, `isharded/dashboard.html`, `isharded/ui.css`, `isharded/ui.js` | The chat page and the dashboard, with their shared styles and drawing code |
 | `isharded/assistant/` | The assistant. [Its guide](ASSISTANT.md) says which part does what |
 
 ## Current limits
