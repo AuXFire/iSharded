@@ -993,7 +993,7 @@ Commands for a pool's credentials and members.
 | `--pass-env` | run | None | An environment variable servers may see, beyond the basics. Repeatable |
 | `--max-turns` | run | 8 | Most times the model may be asked before giving up |
 | `--max-tokens` | run | The API's default | Longest reply on each turn |
-| `--tool-timeout` | run | 60 | Seconds a tool may take |
+| `--tool-timeout` | run | 60 | Seconds a tool may take, from sending the request to the end of the reply, headers included |
 
 ### isharded assistant
 

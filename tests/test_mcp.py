@@ -1867,6 +1867,70 @@ def test_a_body_that_could_not_be_read_cannot_write_to_a_terminal():
         server.request("tools/list", {}, 5)
     assert "" not in str(caught.value) and "gone" in str(caught.value)
 
+# --- the deadline covers a whole exchange
+
+
+def drips_headers(connection):
+    connection.recv(65536)
+    try:
+        connection.sendall(b"HTTP/1.1 200 OK\r\n")
+        for number in range(2000):
+            connection.sendall(f"X-Drip-{number}: x\r\n".encode())
+            time.sleep(0.05)
+    except OSError:
+        pass
+
+
+def test_a_server_that_drips_its_headers_runs_out_of_time(bad_socket):
+    server = HttpServer(bad_socket(drips_headers))
+    began = time.monotonic()
+    with pytest.raises(ServerError, match="longer than 0.5"):
+        server.request("tools/list", {}, 0.5)
+    assert time.monotonic() - began < 5
+    server.close()
+    assert time.monotonic() - began < 5
+
+
+def test_a_tool_on_a_server_that_drips_its_headers_tells_the_model(bad_socket):
+    server = FakeServerAt(bad_socket(drips_headers))
+    began = time.monotonic()
+    assert "longer than 0.5" in Toolbox([server]).call("slow", {}, 0.5)
+    assert time.monotonic() - began < 5
+    server.close()
+
+
+class FakeServerAt(HttpServer):
+    """Offers one tool without being asked, so that only the call meets the server."""
+
+    def list_tools(self):
+        return [{"name": "slow"}]
+
+
+def test_a_notice_to_a_server_that_drips_cannot_hold_a_run_up(bad_socket, monkeypatch):
+    monkeypatch.setattr(mcp_client, "STOP_SECONDS", 0.3)
+    server = HttpServer(bad_socket(drips_headers))
+    began = time.monotonic()
+    server._notify("notifications/initialized")
+    assert time.monotonic() - began < 5
+
+
+def test_ending_a_session_with_a_server_that_drips_cannot_hold_a_run_up(bad_socket, monkeypatch):
+    monkeypatch.setattr(mcp_client, "STOP_SECONDS", 0.3)
+    server = HttpServer(bad_socket(drips_headers))
+    server.session = "a-session"
+    began = time.monotonic()
+    server.close()
+    assert time.monotonic() - began < 5
+
+
+def test_a_failure_inside_the_exchange_is_still_the_same_failure():
+    def refuses(request):
+        raise httpx.ConnectError("nobody home")
+
+    with pytest.raises(ServerError, match="could not reach"):
+        HttpServer("http://x/mcp", httpx.MockTransport(refuses)).request("tools/list", {}, 5)
+
+
 # --- a request over stdio is always answered
 
 

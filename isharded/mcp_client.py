@@ -12,6 +12,7 @@ a server says can widen what ``--allow`` allows.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import suppress
 from itertools import count
 import json
 import os
@@ -86,6 +87,25 @@ def split_command(command: str) -> list[str]:
 def server_environment(passed: Sequence[str]) -> dict[str, str]:
     names = {item.upper() for item in (*SAFE_ENVIRONMENT, *passed)}
     return {name: value for name, value in os.environ.items() if name.upper() in names}
+def within(seconds: float, work: Callable[[], Any]) -> Any:
+    """What ``work`` returns, or queue.Empty once the time is up.
+
+    A read timeout only sees silence, so a server that drips its headers never trips one,
+    and httpx has no limit on a whole exchange. A thread left waiting goes when its client closes.
+    """
+    box: queue.Queue[tuple[Any, Exception | None]] = queue.Queue(1)
+
+    def run() -> None:
+        try:
+            box.put((work(), None))
+        except Exception as exc:
+            box.put((None, exc))
+
+    threading.Thread(target=run, daemon=True).start()
+    result, failure = box.get(timeout=seconds)
+    if failure is not None:
+        raise failure
+    return result
 
 
 def offer_nothing(message: dict[str, Any]) -> dict[str, Any]:
@@ -336,10 +356,8 @@ class HttpServer(McpConnection):
 
     def _post(self, message: dict[str, Any], headers: dict[str, str]) -> None:
         """Send something that wants no reply. A server that will not take it has told us nothing we can use."""
-        try:
-            self.client.post(self.url, json=message, headers=headers, timeout=STOP_SECONDS)
-        except httpx.HTTPError:
-            pass
+        with suppress(httpx.HTTPError, queue.Empty):
+            within(STOP_SECONDS, lambda: self.client.post(self.url, json=message, headers=headers, timeout=STOP_SECONDS))
 
     def _notify(self, method: str) -> None:
         self._post({"jsonrpc": "2.0", "method": method}, self._headers(method, {}))
@@ -383,6 +401,9 @@ class HttpServer(McpConnection):
         raise ServerError(f"{self.name} closed the stream without answering")
 
     def _exchange(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
+        return within(timeout, lambda: self._answer(method, params, timeout))
+
+    def _answer(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
         self.next_id += 1
         number = self.next_id
         headers = self._headers(method, params)
@@ -410,10 +431,8 @@ class HttpServer(McpConnection):
 
     def close(self) -> None:
         if self.session:
-            try:
-                self.client.delete(self.url, headers=self._headers("", {}), timeout=STOP_SECONDS)
-            except httpx.HTTPError:
-                pass
+            with suppress(httpx.HTTPError, queue.Empty):
+                within(STOP_SECONDS, lambda: self.client.delete(self.url, headers=self._headers("", {}), timeout=STOP_SECONDS))
         self.client.close()
 
 
