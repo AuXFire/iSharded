@@ -235,6 +235,8 @@ class NextHop:
     client: httpx.AsyncClient
     lost: asyncio.Event = field(default_factory=asyncio.Event)
     watch: asyncio.Task[None] | None = None
+    retired: bool = False
+    passes: int = 0  # on their way now
 
     @property
     def options(self) -> dict[str, Any]:
@@ -1285,16 +1287,16 @@ class WorkerRuntime:
         via, url = next_stage.url.rstrip("/"), body.get("url")
         if self.hop is not None and self.hop.url == url and self.hop.via == via:
             return
+        hop = NextHop(next_stage.worker_id, via, str(url).rstrip("/"), direct_client(self.client.auth)) if url else None
+        # Any node may call this route, so its word alone must not move a stage's traffic.
+        proved = hop is not None and await self._proves(hop.client, hop.url, via, hop.worker_id)
         if self.hop is not None:
-            self._forget_hop(self.hop)
-        if url:
-            hop = NextHop(next_stage.worker_id, via, str(url).rstrip("/"), direct_client(self.client.auth))
-            # Any node may call this route, so its word alone must not move a stage's traffic.
-            if await self._proves(hop.client, hop.url, via, hop.worker_id):
-                self.hop = hop
-                hop.watch = asyncio.create_task(self._watch_hop(hop))
-            else:
-                await hop.client.aclose()
+            self._retire_hop(self.hop)
+        if proved:
+            self.hop = hop
+            hop.watch = asyncio.create_task(self._watch_hop(hop))
+        elif hop is not None:
+            await hop.client.aclose()
 
     async def _proves(self, client: httpx.AsyncClient, url: str, via: str, worker_id: str) -> bool:
         try:
@@ -1306,7 +1308,7 @@ class WorkerRuntime:
         """The shorter way to this stage. One learned for an earlier route is not it."""
         hop = self.hop
         if hop is not None and (hop.worker_id != next_stage.worker_id or hop.via != next_stage.url.rstrip("/")):
-            self._forget_hop(hop)
+            self._retire_hop(hop)
             return None
         return hop
 
@@ -1314,6 +1316,14 @@ class WorkerRuntime:
         hop.lost.set()
         if self.hop is hop:
             self.hop = None
+
+    def _retire_hop(self, hop: NextHop) -> None:
+        """Nothing failed, so passes on their way finish there and no reply has to replay."""
+        hop.retired = True
+        if self.hop is hop:
+            self.hop = None
+        if not hop.passes:
+            hop.lost.set()
 
     def _hop_failed(self, hop: NextHop) -> None:
         self.hop_fallbacks += self.hop is hop
@@ -1335,6 +1345,7 @@ class WorkerRuntime:
                     if time.monotonic() - heard >= HOP_SILENCE_SECONDS:
                         self._hop_failed(hop)
         finally:
+            self._forget_hop(hop)  # its client closes here, and no pass may be sent to that
             await hop.client.aclose()
 
     async def _over_hop(self, hop: NextHop, payload: bytes, headers: dict[str, str], timeout: httpx.Timeout) -> httpx.Response:
@@ -1345,6 +1356,7 @@ class WorkerRuntime:
         """
         sending = asyncio.ensure_future(hop.client.post(hop.url + "/internal/forward", content=payload, headers=headers, timeout=timeout, extensions=hop.options))
         lost = asyncio.ensure_future(hop.lost.wait())
+        hop.passes += 1
         try:
             await asyncio.wait({sending, lost}, return_when=asyncio.FIRST_COMPLETED)
             response = sending.result() if sending.done() else None
@@ -1353,8 +1365,11 @@ class WorkerRuntime:
         finally:
             sending.cancel()
             lost.cancel()
+            hop.passes -= 1
+            if hop.retired and not hop.passes:
+                hop.lost.set()
         # A refusal here may come from whoever has this address now, not from the next stage.
-        if response is None or (response.status_code >= 400 and response.status_code != 409 and failure_report(response) is None):
+        if response is None or (response.status_code >= 300 and response.status_code != 409 and failure_report(response) is None):
             self._hop_failed(hop)
             raise retry_error("the shorter way to the next stage failed")
         return response
@@ -2069,7 +2084,7 @@ async def diag_probe(body: dict[str, Any], authorization: str | None = Header(de
     async def old_way() -> dict[str, Any]:
         try:
             return await asyncio.wait_for(runtime.time_link(runtime.client, via, sizes, rounds), ADDRESS_PROBE_SECONDS)
-        except (asyncio.TimeoutError, httpx.HTTPError):
+        except (asyncio.TimeoutError, *LINK_FAILURES):
             return {}
 
     tried = [runtime.try_address(url, via, str(body["worker_id"]), sizes, rounds) for url in addresses]

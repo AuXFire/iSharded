@@ -75,7 +75,8 @@ def reach_urls(setting: str, advertised: str, bind_host: str, port: int, plain_a
         if item == "none":
             return [], 0
         hosts += local_hosts(bind_host) if item == "auto" else [item] if item else []
-    usable = [host for host in dict.fromkeys(hosts) if scheme == "https" or plain_allowed or _private_link(host)]
+    hosts = list(dict.fromkeys(hosts))
+    usable = [host for host in hosts if scheme == "https" or plain_allowed or _private_link(host)]
     urls = [f"{scheme}://{host_port(host, port)}" for host in usable]
     return [url for url in urls if url != advertised.rstrip("/")][:MOST_ADDRESSES], len(hosts) - len(usable)
 
@@ -130,7 +131,8 @@ class NodeProof:
         if self._named():
             checker = make_checker({text})
             return checker.name(proof) if checker and proof.startswith(PREFIX) else None
-        return "" if self.token and hmac.compare_digest(proof, self._mac(text)) else None
+        # As bytes: anyone can send this, and comparing text refuses what is not ASCII.
+        return "" if self.token and hmac.compare_digest(proof.encode(), self._mac(text).encode()) else None
 
 
 async def prove(client: httpx.AsyncClient, proof: NodeProof, url: str, via: str, worker_id: str, revoked: set[str]) -> bool:

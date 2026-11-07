@@ -696,3 +696,106 @@ def test_an_address_that_will_not_prove_itself_is_never_timed(monkeypatch, no_au
     answer = asyncio.run(item.try_address(REUSED, "http://b:1", "b", [100], 1))
     assert answer == {"proved": False}
     assert seen == [module.PROVE_PATH]
+
+
+def test_a_pass_on_its_way_finishes_when_the_stage_is_told_another_address(monkeypatch) -> None:
+    released = asyncio.Event()
+
+    async def on_hop(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/internal/forward"):
+            await released.wait()
+        return httpx.Response(200, json={"token_id": 7})
+
+    item = stage_at(lambda _: httpx.Response(500), on_hop)
+
+    async def work() -> None:
+        hop = item.hop
+        running = asyncio.ensure_future(send(item))
+        await asyncio.sleep(0)
+        await item.aim_hop({"worker_id": "b", "url": None})
+        assert item.hop is None and not hop.lost.is_set()  # new passes go the old way at once
+        released.set()
+        assert (await running).json() == {"token_id": 7}
+        assert hop.lost.is_set() and item.hop_fallbacks == 0  # its watch and its client end with it
+
+    run_on_hop(item, monkeypatch, work)
+
+
+def test_a_watch_that_dies_takes_its_hop_with_it(monkeypatch) -> None:
+    async def on_hop(_: httpx.Request) -> httpx.Response:
+        raise RuntimeError("something nobody planned for")
+
+    item = stage_at(lambda _: httpx.Response(200), on_hop)
+    monkeypatch.setattr(worker_module, "HOP_WATCH_SECONDS", 0.01)
+
+    async def run() -> None:
+        aim(item, monkeypatch)
+        await item.aim_hop({"worker_id": "b", "url": REUSED})
+        watch = item.hop.watch
+        await asyncio.gather(watch, return_exceptions=True)
+        assert item.hop is None  # or every pass would go to a closed client
+
+    asyncio.run(run())
+
+
+def test_two_aims_at_once_leave_one_hop_and_no_second_watch(monkeypatch) -> None:
+    item = stage_at(lambda _: httpx.Response(200), lambda _: httpx.Response(200))
+    monkeypatch.setattr(worker_module, "HOP_WATCH_SECONDS", 30.0)
+
+    async def run() -> None:
+        aim(item, monkeypatch)
+
+        async def proved_later(*_):
+            await asyncio.sleep(0)
+            return True
+
+        monkeypatch.setattr(worker_module, "prove", proved_later)
+        made = []
+        real = worker_module.NextHop
+
+        def counted(*args):
+            made.append(real(*args))
+            return made[-1]
+
+        monkeypatch.setattr(worker_module, "NextHop", counted)
+        await asyncio.gather(*(item.aim_hop({"worker_id": "b", "url": url}) for url in (REUSED, "http://10.0.0.6:1")))
+        assert [hop.lost.is_set() for hop in made].count(False) == 1
+        item._forget_hop(item.hop)
+
+    asyncio.run(run())
+
+
+def test_a_redirect_from_whoever_has_the_address_now_shows_no_address(monkeypatch) -> None:
+    item = stage_at(lambda _: httpx.Response(200), lambda _: httpx.Response(301, headers={"location": "http://elsewhere"}))
+
+    async def work() -> None:
+        with pytest.raises(HTTPException) as caught:
+            await send(item)
+        assert caught.value.detail["retry"] and REUSED not in str(caught.value.detail)
+        assert item.hop is None
+
+    run_on_hop(item, monkeypatch, work)
+
+
+def test_a_certificate_failure_on_the_old_way_leaves_only_its_reading_out(monkeypatch) -> None:
+    def refused(_: httpx.Request) -> httpx.Response:
+        raise ssl.SSLCertVerificationError("no such name")
+
+    answer = probing(monkeypatch, refused)
+    assert answer == {"addresses": {REUSED: {"proved": True}}}
+
+
+def test_an_answer_of_any_text_only_fails_to_prove(no_authority) -> None:
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"proof": "caf\u00e9"})))
+    assert not proved(client, NodeProof(TOKEN, None))
+
+
+def test_the_prove_route_turns_away_any_text_as_a_stranger(no_authority, monkeypatch) -> None:
+    monkeypatch.setattr(worker_module, "runtime", SimpleNamespace(proof=NodeProof(TOKEN, None), revoked_nodes=set()))
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(worker_module.diag_prove({"nonce": "n", "url": REUSED, "worker_id": "b"}, "Bearer caf\u00e9"))
+    assert caught.value.status_code == 401
+
+
+def test_the_same_host_twice_is_not_counted_as_left_out() -> None:
+    assert reach_urls("10.0.0.5,10.0.0.5", "https://relay:1", "0.0.0.0", 1, False) == (["https://10.0.0.5:1"], 0)
