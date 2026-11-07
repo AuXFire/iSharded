@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 import json
 import sys
 from typing import Any, BinaryIO
@@ -292,6 +292,40 @@ def as_object(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def is_request_id(value: Any) -> bool:
+    return isinstance(value, (str, int)) and not isinstance(value, bool)
+
+
+class InFlight:
+    """The requests still running, so that a cancel can find one."""
+
+    def __init__(self) -> None:
+        self.tasks: dict[tuple[str, Any], list[asyncio.Task[Any]]] = {}
+
+    def add(self, caller: str, identifier: Any, task: asyncio.Task[Any]) -> None:
+        key = (caller, identifier)
+        self.tasks.setdefault(key, []).append(task)
+        task.add_done_callback(lambda done: self._finished(key, done))
+
+    def _finished(self, key: tuple[str, Any], task: asyncio.Task[Any]) -> None:
+        self.tasks[key].remove(task)
+        if not self.tasks[key]:
+            del self.tasks[key]
+
+    def cancel(self, caller: str, identifier: Any) -> None:
+        """A cancel is a request, and the specification lets us ignore it.
+
+        Over HTTP there are no sessions, so two clients on one key can both be using
+        the same id. Stopping the wrong one would drop its reply, so neither stops.
+        """
+        running = self.tasks.get((caller, identifier), []) if is_request_id(identifier) else []
+        if len(running) == 1:
+            running[0].cancel()
+
+    def all(self) -> list[asyncio.Task[Any]]:
+        return [task for tasks in self.tasks.values() for task in tasks]
+
+
 LISTS: dict[str, tuple[str, list[dict[str, Any]]]] = {
     "tools/list": ("tools", TOOLS),
     "resources/list": ("resources", RESOURCES),
@@ -318,7 +352,7 @@ class McpHandler:
         if "method" not in message or "id" not in message:
             return None  # a notification, or the answer to a request we never send
         identifier = message["id"]
-        if isinstance(identifier, bool) or not isinstance(identifier, (str, int)):
+        if not is_request_id(identifier):
             return RpcError(INVALID_REQUEST, "A request id is a string or a number").body(None)
         try:
             return {"jsonrpc": "2.0", "id": identifier, "result": await self._answer(message)}
@@ -423,8 +457,7 @@ def check_modern_headers(headers: Mapping[str, str], message: dict[str, Any], ve
         raise RpcError(HEADER_MISMATCH, f"Header mismatch: Mcp-Name does not match the {named} {params.get(named)}")
 
 
-    if message.get("method") == "tools/call" and header_value(headers.get("mcp-name", "")) != params.get("name"):
-        raise RpcError(HEADER_MISMATCH, f"Header mismatch: Mcp-Name does not match the tool {params.get('name')}")
+HTTP_REQUESTS = InFlight()
 
 
 def accepts_both(accept: str) -> bool:
@@ -439,12 +472,57 @@ def http_status(reply: dict[str, Any], modern: bool) -> int:
     return 404 if modern and code == METHOD_NOT_FOUND else 200
 
 
+async def client_left(receive: Callable[[], Awaitable[dict[str, Any]]]) -> None:
+    while (await receive())["type"] != "http.disconnect":
+        pass
+
+
+async def answer_cancellably(
+    handler: McpHandler, message: dict[str, Any], caller: str, modern: bool, receive: Callable[[], Awaitable[dict[str, Any]]] | None
+) -> tuple[int, dict[str, Any] | None]:
+    """Answer a request while a cancel can still reach it.
+
+    Each era cancels its own way. The older one posts notifications/cancelled, and
+    says a dropped connection is not a cancel. The modern one closes the connection,
+    and that is its only signal.
+    """
+    identifier = message["id"]
+    work = asyncio.create_task(handler.handle(message))
+    if is_request_id(identifier):
+        HTTP_REQUESTS.add(caller, identifier, work)
+    watch = asyncio.create_task(client_left(receive)) if modern and receive else None
+    try:
+        await asyncio.wait({work, watch} if watch else {work}, return_when=asyncio.FIRST_COMPLETED)
+        if not work.done():
+            work.cancel()
+            await asyncio.wait({work})
+    except asyncio.CancelledError:  # the server is stopping, so this request stops with it
+        work.cancel()
+        raise
+    finally:
+        if watch:
+            watch.cancel()
+    if work.cancelled():
+        # The modern specification forbids a reply, and no client is left to read one.
+        return (202, None) if modern else (200, RpcError(REQUEST_CANCELLED, "Request cancelled").body(identifier))
+    reply = work.result()
+    return (202, None) if reply is None else (http_status(reply, modern), reply)
+
+
 async def answer_http(
-    handler: McpHandler, headers: Mapping[str, str], body: bytes, before: Callable[[str], None] = lambda method: None
+    handler: McpHandler,
+    headers: Mapping[str, str],
+    body: bytes,
+    before: Callable[[str], None] = lambda method: None,
+    caller: str = "",
+    receive: Callable[[], Awaitable[dict[str, Any]]] | None = None,
 ) -> tuple[int, dict[str, Any] | None]:
     """One POST to the MCP endpoint: an HTTP status, and the JSON to send, if any.
 
-    ``before`` sees each method first, and may refuse by raising.
+    ``before`` sees each method first, and may refuse by raising, except those the
+    API charges for itself. ``caller`` is who the key proved to be, since a cancel
+    reaches only that caller's own requests. ``receive`` is the ASGI channel, which
+    says when the client has gone.
     """
     if not accepts_both(headers.get("accept", "")):
         return 406, RpcError(INVALID_REQUEST, "Accept must list application/json and text/event-stream").body(None)
@@ -469,7 +547,14 @@ async def answer_http(
             check_modern_headers(headers, message, version)
         except RpcError as exc:
             return 400, exc.body(identifier)
-    before(str(message.get("method")))
+    method = str(message.get("method"))
+    if method not in PAID_AT_THE_API:
+        before(method)
+    if "id" not in message and method == "notifications/cancelled":
+        HTTP_REQUESTS.cancel(caller, as_object(message.get("params")).get("requestId"))
+        return 202, None
+    if "id" in message and "method" in message:
+        return await answer_cancellably(handler, message, caller, modern, receive)
     reply = await handler.handle(message)
     return (202, None) if reply is None else (http_status(reply, modern), reply)
 
@@ -490,7 +575,7 @@ async def serve_stdio(client: httpx.AsyncClient, source: BinaryIO, output: Binar
     """
     handler = McpHandler(MeshTools(client))
     loop = asyncio.get_running_loop()
-    running: dict[Any, asyncio.Task[None]] = {}
+    running = InFlight()
 
     async def answer(message: dict[str, Any]) -> None:
         reply = await handler.handle(message)
@@ -509,17 +594,14 @@ async def serve_stdio(client: httpx.AsyncClient, source: BinaryIO, output: Binar
             write_message(output, RpcError(PARSE_ERROR, "Parse error: a line is not JSON").body(None))
             continue
         if isinstance(message, dict) and message.get("method") == "notifications/cancelled":
-            task = running.get(as_object(message.get("params")).get("requestId"))
-            if task:
-                task.cancel()  # and it sends nothing more
+            running.cancel("", as_object(message.get("params")).get("requestId"))  # and it sends nothing more
             continue
         identifier = message.get("id") if isinstance(message, dict) else None
         task = asyncio.create_task(answer(message))
-        if identifier is not None:
-            running[identifier] = task
-            task.add_done_callback(lambda _, key=identifier: running.pop(key, None))
+        if is_request_id(identifier):
+            running.add("", identifier, task)
     # Closed input means stop soon, and a reply nearly done is still worth sending.
-    waiting = list(running.values())
+    waiting = running.all()
     if waiting:
         await asyncio.wait(waiting, timeout=STOP_GRACE_SECONDS)
     for task in waiting:

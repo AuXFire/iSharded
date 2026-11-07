@@ -14,6 +14,8 @@ import json
 import os
 from pathlib import Path
 import queue
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -23,6 +25,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from starlette.testclient import TestClient
+import uvicorn
 
 from isharded import cli, mcp_client, orchestrator
 from isharded.access import AccessControl, create_key
@@ -55,6 +58,7 @@ from isharded.mcp_server import (
     TOOLS,
     UNSUPPORTED_VERSION,
     VERSION_KEY,
+    InFlight,
     McpHandler,
     MeshTools,
     accepts_both,
@@ -1224,5 +1228,146 @@ def test_a_resource_read_mirrors_its_uri_in_the_name_header(site):
 def test_a_prompt_mirrors_its_name_in_the_name_header(site):
     assert modern_post(site, "prompts/get", {"name": "mesh_health"}).status_code == 200
     assert modern_post(site, "prompts/get", {"name": "mesh_health"}, **{"Mcp-Name": "other"}).status_code == 400
+
+
+# --- cancelling over HTTP, on a real socket, since a mock cannot drop a connection
+
+
+@pytest.fixture
+def live(site):
+    """The real app on a real socket, with a model that stays silent until told to stop."""
+    entered, closed = threading.Event(), threading.Event()
+
+    async def silent_stream(session, *rest):
+        entered.set()
+        try:
+            await asyncio.sleep(60)
+            yield 7
+        finally:
+            closed.set()
+
+    site.node.token_stream = silent_stream
+    server = uvicorn.Server(uvicorn.Config(orchestrator.app, host="127.0.0.1", port=0, log_level="warning", lifespan="off"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 15
+    while not server.started and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert server.started
+    port = server.servers[0].sockets[0].getsockname()[1]
+    yield SimpleNamespace(site=site, port=port, url=f"http://127.0.0.1:{port}/mcp", entered=entered, closed=closed)
+    server.should_exit = True
+    thread.join(15)
+
+
+CHAT_CALL = {"name": "chat", "arguments": {"prompt": "Ping?"}}
+
+
+def legacy_call(identifier=7) -> dict:
+    return {"jsonrpc": "2.0", "id": identifier, "method": "tools/call", "params": CHAT_CALL}
+
+
+def cancel(url: str, identifier=7, **headers) -> int:
+    message = {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": identifier}}
+    return httpx.post(url, json=message, headers={"Accept": WANTS, **headers}, timeout=15, trust_env=False).status_code
+
+
+def post_in_background(url: str, message: dict, **headers) -> tuple[threading.Thread, list]:
+    replies: list = []
+
+    def run() -> None:
+        replies.append(httpx.post(url, json=message, headers={"Accept": WANTS, **headers}, timeout=30, trust_env=False))
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, replies
+
+
+def open_and_leave(live, message: dict, headers: dict) -> socket.socket:
+    """Send a request by hand, which is the only way to walk away before the reply."""
+    body = json.dumps(message).encode()
+    lines = ["POST /mcp HTTP/1.1", "Host: 127.0.0.1", "Content-Type: application/json", f"Accept: {WANTS}", f"Content-Length: {len(body)}", *(f"{key}: {value}" for key, value in headers.items())]
+    connection = socket.create_connection(("127.0.0.1", live.port), timeout=15)
+    connection.sendall("\r\n".join(lines).encode() + b"\r\n\r\n" + body)
+    assert live.entered.wait(15), "the model should have been asked"
+    return connection
+
+
+def test_a_legacy_cancel_stops_the_model_and_answers_the_request(live):
+    thread, replies = post_in_background(live.url, legacy_call())
+    assert live.entered.wait(15)
+    assert cancel(live.url) == 202
+    assert live.closed.wait(5), "the model should stop"
+    thread.join(15)
+    assert replies[0].status_code == 200
+    assert replies[0].json() == {"jsonrpc": "2.0", "id": 7, "error": {"code": REQUEST_CANCELLED, "message": "Request cancelled"}}
+    deadline = time.monotonic() + 5
+    while live.site.node.replies_in_flight and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert live.site.node.replies_in_flight == 0
+
+
+def test_a_modern_client_cancels_by_closing_the_connection(live):
+    message = {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {**CHAT_CALL, "_meta": META}}
+    connection = open_and_leave(live, message, {"MCP-Protocol-Version": MODERN, "Mcp-Method": "tools/call", "Mcp-Name": "chat"})
+    connection.close()
+    assert live.closed.wait(5), "a dropped connection is how the modern era cancels"
+
+
+def test_a_dropped_connection_is_no_cancel_in_the_older_era(live):
+    connection = open_and_leave(live, legacy_call(), {})
+    connection.close()
+    assert not live.closed.wait(1), "the older era says a dropped connection is not a cancel"
+    assert cancel(live.url) == 202
+    assert live.closed.wait(5)
+
+
+def test_one_key_cannot_cancel_what_another_asked(live):
+    site = live.site
+    path = site.tmp / "keys.json"
+    mine, theirs = create_key(str(path), "me", "user", 0), create_key(str(path), "them", "user", 0)
+    site.node.access = AccessControl.load(None, str(path))
+    thread, replies = post_in_background(live.url, legacy_call(), Authorization=f"Bearer {mine}")
+    assert live.entered.wait(15)
+    assert cancel(live.url, Authorization=f"Bearer {theirs}") == 202
+    assert not live.closed.wait(0.5), "another caller's cancel must reach nothing"
+    assert cancel(live.url, Authorization="Bearer wrong") == 401
+    assert cancel(live.url, Authorization=f"Bearer {mine}") == 202
+    assert live.closed.wait(5)
+    thread.join(15)
+
+
+def test_a_cancel_for_nothing_is_accepted_quietly(site):
+    for identifier in (99, "nothing", [1], {"a": 1}, None):
+        assert site.client.post("/mcp", json={"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": identifier}}, headers={"Accept": WANTS}).status_code == 202
+
+
+def test_when_two_requests_share_an_id_a_cancel_stops_neither():
+    async def scene() -> None:
+        running = InFlight()
+        first, second = (asyncio.create_task(asyncio.sleep(30)) for _ in range(2))
+        running.add("me", 1, first)
+        running.add("me", 1, second)
+        running.cancel("me", 1)
+        await asyncio.sleep(0)
+        assert not first.cancelled() and not second.cancelled()
+        second.cancel()
+        await asyncio.wait({second})
+        await asyncio.sleep(0)
+        running.cancel("me", 1)
+        await asyncio.wait({first})
+        assert first.cancelled() and running.all() == []
+
+    asyncio.run(scene())
+
+
+def test_stdio_survives_an_id_it_cannot_use(stdio):
+    pipes, thread = stdio(httpx.MockTransport(fake_mesh))
+    pipes.send({"jsonrpc": "2.0", "id": [1], "method": "ping"})
+    pipes.send({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": {"a": 1}}})
+    pipes.send({"jsonrpc": "2.0", "id": 2, "method": "ping"})
+    assert pipes.wait_for(2)["result"] == {}
+    pipes.incoming.put(b"")
+    thread.join(5)
 
 

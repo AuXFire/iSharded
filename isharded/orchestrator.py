@@ -3482,7 +3482,7 @@ async def mcp_endpoint(request: Request, authorization: str | None = Header(defa
     if not origin_is_ours(request.headers.get("origin")):
         return JSONResponse(status_code=403, content=RpcError(INVALID_REQUEST, "This Origin may not use this endpoint").body(None))
     try:
-        require(authorization, ROLE_USER)
+        caller = require(authorization, ROLE_USER)
     except HTTPException as exc:
         if exc.status_code == 401:
             raise HTTPException(status_code=401, detail=exc.detail, headers={"WWW-Authenticate": "Bearer"}) from exc
@@ -3494,7 +3494,8 @@ async def mcp_endpoint(request: Request, authorization: str | None = Header(defa
             verify_user(authorization)
 
     async with own_api(request, authorization) as client:
-        status, reply = await answer_http(McpHandler(MeshTools(client), stateless=True), request.headers, await request.body(), charge)
+        handler = McpHandler(MeshTools(client), stateless=True)
+        status, reply = await answer_http(handler, request.headers, await request.body(), charge, caller.name, request.receive)
     return Response(status_code=status) if reply is None else JSONResponse(status_code=status, content=reply)
 
 
