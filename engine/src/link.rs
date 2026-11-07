@@ -11,7 +11,7 @@ use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use ring::digest;
@@ -224,11 +224,30 @@ impl Link {
                 connection.write_tls(sealed)?;
             }
             drop(connection);
-            (&self.socket).write_all(sealed)?;
+            self.write_piece(sealed)?;
             if left.is_empty() {
                 return Ok(());
             }
         }
+    }
+
+    /// Writes to the socket inside its write limit. The system applies that limit to one
+    /// call, and on Linux a call that moves a few bytes returns and starts it over, so a
+    /// stalled peer could otherwise hold a write for several limits.
+    fn write_piece(&self, mut bytes: &[u8]) -> io::Result<()> {
+        let began = Instant::now();
+        while !bytes.is_empty() {
+            match (&self.socket).write(bytes) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(count) => bytes = &bytes[count..],
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+            if !bytes.is_empty() && self.socket.write_timeout()?.is_some_and(|limit| began.elapsed() >= limit) {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+        }
+        Ok(())
     }
 
     pub fn reader(self: &Arc<Self>, limit: usize) -> Frames {
@@ -449,7 +468,6 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Instant;
 
     const KEY: &[u8] = b"route key";
 
@@ -540,7 +558,8 @@ mod tests {
             let _ = finished.recv();
         });
         let link = dial(&address, Some(&pin), KEY, Role::Hop, 1, Duration::from_secs(5)).unwrap();
-        link.limit_writes(Duration::from_secs(2)).unwrap();
+        let limit = Duration::from_secs(1);
+        link.limit_writes(limit).unwrap();
         let began = Instant::now();
         let writer = {
             let link = link.clone();
@@ -553,13 +572,13 @@ mod tests {
                 }
             })
         };
-        thread::sleep(Duration::from_millis(500));
+        thread::sleep(Duration::from_millis(300));
         // The lock is what the reader needs. Hearing the far end through a stalled socket
         // is not something every loopback allows, so this looks at the lock itself.
         assert!(link.tls.as_ref().unwrap().try_lock_for(Duration::from_millis(200)).is_some());
         assert!(!writer.is_finished(), "the write was meant to be stuck during that");
         assert!(matches!(writer.join().unwrap(), LinkError::Io(_)));
-        assert!(began.elapsed() < Duration::from_secs(WRITE_SECONDS / 2));
+        assert!(began.elapsed() < limit * 3);
         assert!(link.is_closed());
         assert!(matches!(link.send(b"more"), Err(LinkError::Closed)));
         drop(finish);

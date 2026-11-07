@@ -564,9 +564,9 @@ fn send_back(inner: &Inner, ring: &Ring, frame: &[u8]) {
 }
 
 fn start_peer(inner: &Arc<Inner>, ring: &Arc<Ring>, peer: &Arc<Peer>) {
-    // A ping leaves at most a third of the limit after the peer was last heard, so a write
-    // stuck on it still fails inside the limit, and the watcher is back on watch.
-    let limited = peer.link.limit_writes(ring.silence_timeout * 2 / 3);
+    // The watcher waits behind a stuck write, so that write must fail inside the silence
+    // limit. Half leaves room for a piece that only just finished before the one that stuck.
+    let limited = peer.link.limit_writes(ring.silence_timeout / 2);
     let reading = (inner.clone(), ring.clone(), peer.clone());
     let watching = (inner.clone(), ring.clone(), peer.clone());
     let started = limited
