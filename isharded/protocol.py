@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import fnmatch
-
 import base64
-import json
-import re
-import os
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
+import fnmatch
+import json
+import os
+import re
 from typing import Annotated, Any, Literal
 import uuid
 
@@ -468,13 +467,6 @@ def encode_activation(tensor: torch.Tensor, places: torch.Tensor | None = None) 
     if places is not None:
         tensors["places"] = places.contiguous()
     return save_safetensors(tensors)
-
-
-def decode_activation(payload: bytes) -> torch.Tensor:
-    tensors = load_safetensors(payload)
-    if set(tensors) != {"hidden"}:
-        raise ValueError("activation payload must contain exactly one 'hidden' tensor")
-    return tensors["hidden"]
 
 
 def decode_pass(payload: bytes) -> tuple[torch.Tensor, torch.Tensor | None]:
