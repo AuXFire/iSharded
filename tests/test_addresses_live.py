@@ -54,6 +54,7 @@ class Relay:
     def __init__(self, host: str, port: int, target: int, delay: float = 0.0) -> None:
         self.host, self.port, self.target, self.delay = host, port, target, delay
         self.silent = False
+        self.writers: list[asyncio.StreamWriter] = []
 
     async def _pipe(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         waiting: asyncio.Queue[tuple[float, bytes]] = asyncio.Queue()
@@ -85,6 +86,7 @@ class Relay:
         except OSError:
             writer.close()
             return
+        self.writers += [writer, far_writer]
         await asyncio.gather(self._pipe(reader, far_writer), self._pipe(far_reader, writer), return_exceptions=True)
 
     async def start(self) -> asyncio.AbstractServer:
@@ -112,8 +114,8 @@ class Pool:
 
     def _relay(self) -> None:
         asyncio.set_event_loop(self.loop)
-        slow = [Relay(ADVERTISED, port, port, DELAY_SECONDS) for port in self.ports + self.doors]
-        self.servers = [self.loop.run_until_complete(relay.start()) for relay in [*self.quick, *slow]]
+        self.relays = [*self.quick, *(Relay(ADVERTISED, port, port, DELAY_SECONDS) for port in self.ports + self.doors)]
+        self.servers = [self.loop.run_until_complete(relay.start()) for relay in self.relays]
         self.loop.run_forever()
         self.loop.close()
 
@@ -124,6 +126,10 @@ class Pool:
         for task in running:
             task.cancel()
         await asyncio.gather(*running, return_exceptions=True)
+        for relay in self.relays:
+            for writer in relay.writers:
+                writer.close()
+        await asyncio.sleep(0.2)  # a closed transport finishes on the next turns of this loop
 
     def _start(self, name: str, module: str, arguments: list[str], **env: str) -> None:
         log = (self.folder / f"{name}.log").open("w")
