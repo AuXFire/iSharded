@@ -10,10 +10,8 @@ import importlib.util
 import sys
 from typing import Any
 
-NO_TORCH = (
-    "this node has no PyTorch, and only GGUF models run without it. "
-    'To add it, run: pip install "isharded[torch]", or the installer again with --full'
-)
+ADD_TORCH = 'To add it, run: pip install "isharded[torch]", or the installer again with --full'
+NO_TORCH = f"this node has no PyTorch, and only GGUF models run without it. {ADD_TORCH}"
 
 
 class TorchMissing(RuntimeError):

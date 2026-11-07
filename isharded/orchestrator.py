@@ -39,7 +39,7 @@ from .lanes import LaneDoor
 from .mcp_server import INVALID_REQUEST, PAID_AT_THE_API, McpHandler, MeshTools, RpcError, answer_http
 from .mesh import GOSSIP_SECONDS, ControlMesh
 from .models import Adapter, GgufAdapter, SUPPORTED_TYPES, UnsupportedModel, create_adapter
-from .optional import NO_TORCH
+from .optional import ADD_TORCH
 from .planner import AMORTIZE_TOKENS, UNREACHABLE_LINK_MS, Candidate, ModelProfile, PlacementError, keep_layers, memory_report, plan_placement, route_network_ms, with_links
 from .protocol import (
     hosts_model,
@@ -1132,7 +1132,7 @@ class Orchestrator:
         """Who a PyTorch model cannot use, so that a refusal says what would change it."""
         model = self.planning_model or self.model_id
         names = sorted(name for name, record in self.workers.items() if record.live and not record.registration.hardware.pytorch)
-        return f" Left out {', '.join(names)}: {NO_TORCH}." if model and needs_pytorch(model) and names else ""
+        return f" {', '.join(names)} left out for having no PyTorch. {ADD_TORCH}." if model and needs_pytorch(model) and names else ""
 
     def candidates(self) -> list[Candidate]:
         preferred, standby = self.candidate_groups()
@@ -1421,7 +1421,8 @@ class Orchestrator:
         try:
             return self.plan(target, **options)
         except PlacementError as exc:
-            raise HTTPException(status_code=507, detail=f"{exc}{self._left_out()}") from exc
+            note = self._left_out()
+            raise HTTPException(status_code=507, detail=f"{str(exc).rstrip('.')}.{note}" if note else str(exc)) from exc
 
     def _keep_stages(
         self, target: ModelTarget, preferred: list[Candidate], standby: list[Candidate], available: set[str], pins: dict[str, str | None]

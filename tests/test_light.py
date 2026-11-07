@@ -231,7 +231,7 @@ def pool_with(*workers):
 def test_a_refused_pytorch_model_names_who_was_left_out_and_how_to_fix_it():
     pool = pool_with(("light", True, False), ("full", True, True), ("gone", False, False))
     note = Orchestrator._left_out(pool)
-    assert note.startswith(" Left out light:") and "isharded[torch]" in note
+    assert note.startswith(" light left out for having no PyTorch.") and "isharded[torch]" in note
 
 
 def test_a_refusal_says_nothing_of_pytorch_when_it_is_not_the_reason():
@@ -251,7 +251,8 @@ def test_the_refusal_reaches_whoever_asked():
     pool.plan = plan
     with pytest.raises(HTTPException) as refused:
         Orchestrator.plan_or_refuse(pool, None)
-    assert refused.value.status_code == 507 and "light" in refused.value.detail and "isharded[torch]" in refused.value.detail
+    assert refused.value.status_code == 507
+    assert refused.value.detail.startswith("no worker offers any memory for weights. light left out") and "isharded[torch]" in refused.value.detail
 
 
 def test_status_shows_which_nodes_have_no_pytorch():
