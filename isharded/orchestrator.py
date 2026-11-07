@@ -25,11 +25,11 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 
 from starlette.background import BackgroundTask
 
-from . import __version__
+from . import __version__, source_commit
 from .access import INVITE_FIELDS, load_authority, NeedsAuthority, node_of, ROLE_ADMIN, ROLE_MEMBER, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, Caller
 from .embedding import POOLED_TYPES, dimensions_problem, encoded, inputs_problem, length_problem, passes, shaped, smallest_dimensions
 from .engine import find_library
-from .gguf import GgufHeader, parse_source, split_parts
+from .gguf import GgufHeader, parse_source, quantization_name, split_parts
 from .llamacpp import KV_TYPES, PINNED_BUILD
 from .statestore import stage_namespace
 from . import audit
@@ -499,6 +499,9 @@ def describe_plan(target: ModelTarget, route: list[StageAssignment]) -> dict[str
         "experts": getattr(target.adapter, "num_experts", 0),
         "model_bytes": target.profile.total_bytes,
         "draft_model": target.draft.source if target.draft else None,
+        "slots": target.slots,
+        "quantization": quantization_name(target.adapter.header) if isinstance(target.adapter, GgufAdapter) else None,
+        "context_tokens": target.profile.context_tokens,
         "embedding": target.embedding,
         "mmproj": target.projector.source if target.projector else None,
         "download_bytes": download,
@@ -2583,6 +2586,7 @@ class Orchestrator:
         on_route = {stage.worker_id for stage in self.route}
         return {
             "status": self._state(),
+            "commit": source_commit(),
             "mesh": (
                 {"node": self.mesh.node_id, "leader": self.mesh.leader_id, "term": self.mesh.term, "members": self.mesh.alive()}
                 if self.mesh

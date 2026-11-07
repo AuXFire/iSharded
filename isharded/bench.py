@@ -3,6 +3,7 @@
 It asks a node the way any client does, through /v1/chat/completions and
 /admin/status, and changes nothing. People will post what it writes, so a report
 holds only the fields picked out here: no addresses, keys, or machine paths.
+Two saved reports can be set side by side with --compare.
 """
 
 from __future__ import annotations
@@ -17,14 +18,13 @@ import random
 import re
 import secrets
 import statistics
-import subprocess
 import sys
 import time
 from typing import Any, Callable
 
 import httpx
 
-from . import __version__
+from . import __version__, source_commit
 from .pool import bearer_headers, load_token
 from .tls import client_verify
 from .up import local_url, mesh_client, read_settings, sign_in_key, up_home
@@ -36,6 +36,7 @@ SIZING_TRIES = 5
 SIZING_FIRST_TOKENS_PER_UNIT = 64  # above any text here, so the first try cannot overrun a size that fits
 CACHED_REPLY_TOKENS = 8  # only the first token is being timed
 LONGEST_ERROR = 200
+REPORT_FORMAT = 2
 
 PROSE = (
     "The ferry left the harbour an hour late because the tide had turned early.",
@@ -220,21 +221,32 @@ def rounded(value: float | None) -> float | None:
     return None if value is None else round(value, 2)
 
 
+def stage_precision(hardware: dict[str, Any]) -> str | None:
+    """What a stage computes in, from its fastest pool's setting. A disk pool has none of its own."""
+    kinds = sorted({pool.get("dtype") for pool in hardware.get("memory_pools") or [] if pool.get("dtype") not in (None, "checkpoint")})
+    return ", ".join(kinds) or None
+
+
 def route_facts(status: dict[str, Any]) -> list[dict[str, Any]]:
     """One row per stage, numbered. A worker's id is often its machine's name."""
     rows = []
-    for index, stage in enumerate(status.get("route") or [], 1):
+    route = status.get("route") or []
+    probed = {(link.get("source"), link.get("target")): link for link in status.get("links") or []}
+    for index, stage in enumerate(route, 1):
         worker = (status.get("workers") or {}).get(stage["worker_id"]) or {}
         hardware = worker.get("hardware") or {}
         telemetry = telemetry_of(status, stage["worker_id"])
         round_trip = (telemetry.get("ring") or {}).get("link_rtt_us")
+        following = route[index % len(route)]["worker_id"]
         rows.append({
             "stage": index,
             "start_layer": stage.get("start_layer"),
             "end_layer": stage.get("end_layer"),
             "country": worker.get("country"),
             "gpu": hardware.get("accelerator_name") or hardware.get("device"),
+            "precision": stage_precision(hardware),
             "link_ms": round(round_trip / 1000, 2) if round_trip else None,
+            "probe_ms": rounded((probed.get((stage["worker_id"], following)) or {}).get("median_ms")),
             "next_stage_ms": rounded(telemetry.get("downstream_ms_ema")),
             "compute_ms": rounded(telemetry.get("compute_ms_ema")),
             "control_ms": worker.get("control_latency_ms"),
@@ -273,16 +285,11 @@ def native_engine(before: dict[str, Any], after: dict[str, Any]) -> bool:
     return bool(telemetry_of(after, ids[0]).get("ring_live")) and passes(after) > passes(before)
 
 
-def commit_here() -> str | None:
-    """The commit of this copy of the code. Nodes do not report theirs."""
-    root = Path(__file__).resolve().parents[1]
-    if not (root / ".git").exists():
-        return None
-    try:
-        answer = subprocess.run(["git", "-C", str(root), "rev-parse", "--short=12", "HEAD"], capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return answer.stdout.strip() or None
+def machine_count(status: dict[str, Any]) -> int:
+    """How many machines the route spans. Stages on one host count once, and no name leaves here."""
+    workers = status.get("workers") or {}
+    hosts = {((workers.get(worker_id) or {}).get("hardware") or {}).get("host_id") or worker_id for worker_id in route_ids(status)}
+    return len(hosts)
 
 
 class Bench:
@@ -451,6 +458,7 @@ def refusal(status_code: int, body: bytes, names: re.Pattern[str] | None = None)
 def build_report(options: argparse.Namespace, before: dict[str, Any], after: dict[str, Any], results: list[dict[str, Any]], repeat: dict[str, Any] | None) -> dict[str, Any]:
     plan = after.get("active_plan") or {}
     name = public_name(after.get("model"))
+    own_url = httpx.URL(options.url or LOCAL_NODE).host in LOOPBACK
     ids = route_ids(after)
     versions = sorted({(after.get("workers") or {}).get(worker_id, {}).get("code_version") or "unknown" for worker_id in ids})
     old_cache = (before.get("metrics") or {}).get("cache") or {}
@@ -476,18 +484,23 @@ def build_report(options: argparse.Namespace, before: dict[str, Any], after: dic
     if repeat and repeat.get("error"):
         notes.append(f"The repeat of a seeded reply could not be checked: {repeat['error']}")
     return {
-        "format": 1,
+        "format": REPORT_FORMAT,
         "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "version": ", ".join(versions) if ids else __version__,
         "bench_version": __version__,
-        "commit": commit_here(),
+        "commit": after.get("commit"),
+        "bench_commit": source_commit(),
         "model": {
             "name": name,
-            "quantization": quantization(name),
+            "quantization": plan.get("quantization") or quantization(name),
             "architecture": plan.get("architecture"),
             "layers": plan.get("layers"),
             "draft_model": public_name(plan.get("draft_model")),
+            "slots": plan.get("slots"),
+            "context_tokens": plan.get("context_tokens"),
         },
+        "machines": machine_count(after),
+        "asked_from": "on the node's own machine" if own_url else "over the network",
         "route": route_facts(after),
         "native_engine": native_engine(before, after),
         "decoding": decoding_facts(before, after),
@@ -532,14 +545,23 @@ def table(report: dict[str, Any]) -> tuple[list[str], list[list[str]]]:
     return headers, rows
 
 
+def stage_line(stage: dict[str, Any]) -> str:
+    where = stage["country"] or "country not shown"
+    link = f", link {stage['link_ms']} ms" if stage["link_ms"] else ""
+    probe = f", probe {stage['probe_ms']} ms" if stage.get("probe_ms") else ""
+    precision = f", {stage['precision']}" if stage.get("precision") else ""
+    return f"{stage['stage']}: layers {stage['start_layer']}-{stage['end_layer'] - 1}, {stage['gpu']}{precision}, {where}{link}{probe}"
+
+
+def code_line(report: dict[str, Any]) -> str:
+    commit, bench_commit = report.get("commit"), report.get("bench_commit")
+    return report["version"] + (f", node at commit {commit}" if commit else ", node reported no commit") + (f", bench at commit {bench_commit}" if bench_commit else "")
+
+
 def facts(report: dict[str, Any]) -> list[tuple[str, str]]:
     """What explains the numbers, in words."""
     model, decoding, repeat = report["model"], report["decoding"], report["repeat_check"]
-    stages = []
-    for stage in report["route"]:
-        where = stage["country"] or "country not shown"
-        link = f", link {stage['link_ms']} ms" if stage["link_ms"] else ""
-        stages.append(f"{stage['stage']}: layers {stage['start_layer']}-{stage['end_layer'] - 1}, {stage['gpu']}, {where}{link}")
+    stages = [stage_line(stage) for stage in report["route"]]
     way = f"pipeline {decoding['pipeline_tokens']} tokens, {decoding['pipeline_misses']} misses, depth {decoding['pipeline_depth']}"
     if decoding["draft_passes"]:
         way += f"; draft {decoding['draft_passes']} passes, {decoding['draft_tokens_per_pass']} tokens per pass since the stage started"
@@ -547,36 +569,166 @@ def facts(report: dict[str, Any]) -> list[tuple[str, str]]:
     same = "not checked" if repeat is None else "failed to run" if repeat["identical"] is None else "yes" if repeat["identical"] else "NO"
     rows = [
         ("Model", model["name"] or "unknown"),
-        ("Quantization", model["quantization"] or "not in the model's name"),
+        ("Quantization", model["quantization"] or "not known"),
+        ("Slots", str(model.get("slots") or "not reported")),
+        ("Machines", str(report.get("machines") or "not known")),
         ("Stages", "; ".join(stages) or "none"),
         ("Native engine", "on" if report["native_engine"] else "off"),
         ("Decoding", way),
         ("Reply length", f"{options['tokens']} tokens of {options['text']}, temperature {options['temperature']:g}, seed {options['seed']}"),
         ("Repeat of a seeded reply identical", same),
-        ("iSharded", report["version"] + (f", bench run from commit {report['commit']}" if report["commit"] else "")),
+        ("iSharded", code_line(report)),
     ]
     if model["draft_model"]:
         rows.insert(2, ("Draft model", model["draft_model"]))
     return rows
 
 
+def method(report: dict[str, Any]) -> list[str]:
+    """How the numbers were taken, so someone else can say whether theirs compare."""
+    options = report["options"]
+    rounds = f"{options['repeat']} rounds" if options["repeat"] != 1 else "1 round"
+    return [
+        f"Measured {report.get('asked_from', 'from an unknown place')} at {report['at']}, as any client would feel it: streamed replies from /v1/chat/completions, timed where they arrive.",
+        "First token is the time from sending a request to its first text. Tokens/s per reply leaves that out: tokens after the first, over the time from the first text to the last. Total tokens/s is every token of a round, over the whole of that round.",
+        f"Each case ran {rounds}, after {options['warmup']} replies thrown away for each prompt size. Every prompt starts differently, so none is read from the cache unless the table says cached.",
+        "A link is the direct link's own round trip to the next stage, where one was up. A probe is the same trip over HTTP, measured when the route was planned. Each number is the median, with the lowest and highest in brackets.",
+    ]
+
+
 def as_text(report: dict[str, Any]) -> str:
-    headers, rows = table(report)
-    widths = [max(len(row[column]) for row in [headers, *rows]) for column in range(len(headers))]
     lines = [f"{label}: {value}" for label, value in facts(report)] + [""]
-    lines += ["  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip() for row in [headers, *rows]]
-    lines += ["", "Each number is the median, with the lowest and highest in brackets."] if rows else []
+    headers, rows = table(report)
+    lines += columns(headers, rows)
+    lines += ["", *method(report)] if rows else []
     lines += report["notes"]
     return "\n".join(lines)
 
 
+def columns(headers: list[str], rows: list[list[str]]) -> list[str]:
+    widths = [max(len(row[column]) for row in [headers, *rows]) for column in range(len(headers))]
+    return ["  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip() for row in [headers, *rows]]
+
+
+def markdown_table(headers: list[str], rows: list[list[str]]) -> list[str]:
+    return ["| " + " | ".join(row) + " |" for row in [headers, ["---"] * len(headers), *rows]]
+
+
 def as_markdown(report: dict[str, Any]) -> str:
+    title = report["model"]["name"] or "unknown model"
     headers, rows = table(report)
-    lines = ["## iSharded bench", ""] + [f"- **{label}:** {value}" for label, value in facts(report)] + [""]
-    lines += ["| " + " | ".join(row) + " |" for row in [headers, ["---"] * len(headers), *rows]]
-    lines += ["", "Each number is the median, with the lowest and highest in brackets."]
-    lines += [""] + [f"- {note}" for note in report["notes"]] if report["notes"] else []
-    return "\n".join(lines) + "\n"
+    lines = [f"## iSharded bench: {title}", ""] + [f"- **{label}:** {value}" for label, value in facts(report)] + [""]
+    lines += markdown_table(headers, rows)
+    lines += ["", "### How this was measured", ""] + [f"{sentence}\n" for sentence in method(report)]
+    lines += [f"- {note}" for note in report["notes"]]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+# What must match for two runs' numbers to mean the same thing, as (label, how to read it from a report).
+SETUP: tuple[tuple[str, Callable[[dict[str, Any]], Any]], ...] = (
+    ("Model", lambda report: report["model"]["name"]),
+    ("Quantization", lambda report: report["model"]["quantization"]),
+    ("Draft model", lambda report: report["model"]["draft_model"]),
+    ("Slots", lambda report: report["model"].get("slots")),
+    ("Machines", lambda report: report.get("machines")),
+    ("Stages", lambda report: [(stage["start_layer"], stage["end_layer"], stage["gpu"], stage.get("precision")) for stage in report["route"]]),
+    ("Native engine", lambda report: report["native_engine"]),
+    ("Reply tokens", lambda report: report["options"]["tokens"]),
+    ("Temperature", lambda report: report["options"]["temperature"]),
+    ("Text", lambda report: report["options"]["text"]),
+    ("Asked from", lambda report: report.get("asked_from")),
+)
+# Label, the level's field, and whether more is better.
+MEASURES = (("First token ms", "first_token_ms", False), ("Tokens/s per reply", "reply_tokens_per_second", True), ("Total tokens/s", "total_tokens_per_second", True))
+
+
+def setup_text(value: Any) -> str:
+    if isinstance(value, list):
+        return "; ".join(f"layers {start}-{end - 1} on {gpu}" + (f" in {precision}" if precision else "") for start, end, gpu, precision in value) or "none"
+    return "not reported" if value is None else str(value)
+
+
+def change(old: dict[str, Any] | None, new: dict[str, Any] | None, higher_is_better: bool) -> dict[str, Any] | None:
+    """How one measure moved. Ranges that overlap are noise until a longer run says otherwise."""
+    if not old or not new:
+        return None
+    percent = round((new["median"] - old["median"]) / old["median"] * 100, 1) if old["median"] else None
+    overlap = old["min"] <= new["max"] and new["min"] <= old["max"]
+    better = new["median"] > old["median"] if higher_is_better else new["median"] < old["median"]
+    verdict = "within noise" if overlap or new["median"] == old["median"] else "better" if better else "worse"
+    return {"old": old["median"], "new": new["median"], "percent": percent, "verdict": verdict}
+
+
+def levels_of(report: dict[str, Any]) -> dict[tuple[int, int], dict[str, Any]]:
+    return {(result["wanted_prompt_tokens"], level["parallel"]): level for result in report["results"] for level in result.get("levels", [])}
+
+
+def compare_reports(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
+    """What differs between two saved runs: first what ran, then the numbers."""
+    setup = [{"what": label, "old": setup_text(read(old)), "new": setup_text(read(new))} for label, read in SETUP]
+    old_levels, new_levels = levels_of(old), levels_of(new)
+    rows = []
+    for key in sorted(old_levels.keys() & new_levels.keys()):
+        changes = {field: change(old_levels[key][field], new_levels[key][field], better) for _, field, better in MEASURES}
+        rows.append({"prompt_tokens": key[0], "parallel": key[1], **changes})
+    notes = [f"Prompts of {size} tokens, {parallel} at once, ran in only one of these." for size, parallel in sorted(old_levels.keys() ^ new_levels.keys())]
+    if any(item["old"] != item["new"] for item in setup):
+        notes.insert(0, "These runs differ in what ran, so a change below may come from that and not from the code.")
+    return {
+        "format": REPORT_FORMAT,
+        "old": {"at": old["at"], "commit": old.get("commit"), "version": old["version"]},
+        "new": {"at": new["at"], "commit": new.get("commit"), "version": new["version"]},
+        "setup": setup,
+        "results": rows,
+        "notes": notes,
+    }
+
+
+def run_name(run: dict[str, Any]) -> str:
+    return f"{run['version']}, {run['commit'] or 'no commit reported'}, {run['at']}"
+
+
+def moved(item: dict[str, Any] | None) -> str:
+    if not item:
+        return "-"
+    percent = "" if item["percent"] is None else f" ({item['percent']:+g}%)"
+    return f"{item['old']:g} -> {item['new']:g}{percent} {item['verdict']}"
+
+
+def compared_rows(comparison: dict[str, Any]) -> tuple[list[str], list[list[str]], list[list[str]]]:
+    headers = ["Prompt tokens", "Replies at once", *(label for label, _, _ in MEASURES)]
+    rows = [[str(row["prompt_tokens"]), str(row["parallel"]), *(moved(row[field]) for _, field, _ in MEASURES)] for row in comparison["results"]]
+    differs = [[item["what"], item["old"], item["new"]] for item in comparison["setup"] if item["old"] != item["new"]]
+    return headers, rows, differs
+
+
+COMPARE_RULE = "Each cell is the old median, then the new one. A change counts only if the two runs' lowest-to-highest ranges do not overlap."
+
+
+def comparison_text(comparison: dict[str, Any]) -> str:
+    headers, rows, differs = compared_rows(comparison)
+    lines = [f"Old: {run_name(comparison['old'])}", f"New: {run_name(comparison['new'])}", ""]
+    lines += ["What ran differently:", *columns(["", "Old", "New"], differs), ""] if differs else ["The same setup ran both times.", ""]
+    lines += [*columns(headers, rows), "", COMPARE_RULE] if rows else ["The two runs have no case in common."]
+    return "\n".join(lines + comparison["notes"])
+
+
+def comparison_markdown(comparison: dict[str, Any]) -> str:
+    headers, rows, differs = compared_rows(comparison)
+    lines = ["## iSharded bench comparison", "", f"- **Old:** {run_name(comparison['old'])}", f"- **New:** {run_name(comparison['new'])}", ""]
+    lines += ["What ran differently:", "", *markdown_table(["", "Old", "New"], differs), ""] if differs else ["The same setup ran both times.", ""]
+    lines += [*markdown_table(headers, rows), "", COMPARE_RULE, ""] if rows else ["The two runs have no case in common.", ""]
+    return "\n".join(lines + [f"- {note}" for note in comparison["notes"]]).rstrip() + "\n"
+
+
+def saved_report(name: str) -> dict[str, Any]:
+    try:
+        report = json.loads(Path(name).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise BenchError(f"cannot read {name}: {type(exc).__name__}") from exc
+    if not isinstance(report, dict) or not {"format", "results", "route", "options", "model"} <= report.keys():
+        raise BenchError(f"{name} is not a report from isharded bench --json")
+    return report
 
 
 def connect(args: argparse.Namespace) -> tuple[str, dict[str, str], httpx.Client]:
@@ -604,7 +756,19 @@ def went_wrong(report: dict[str, Any]) -> bool:
     return not levels or any(level["failed"] for level in levels) or bool(failed_sizes) or any(item.get("cached_failed") for item in results) or "error" in repeat
 
 
+def run_compare(args: argparse.Namespace) -> int:
+    try:
+        comparison = compare_reports(*map(saved_report, args.compare))
+    except (BenchError, KeyError, TypeError, AttributeError) as exc:
+        print(f"Cannot compare these: {exc}", file=sys.stderr)
+        return 1
+    print(comparison_text(comparison))
+    return write_files(args, comparison, comparison_markdown(comparison))
+
+
 def run_bench(args: argparse.Namespace) -> int:
+    if args.compare:
+        return run_compare(args)
     try:
         url, headers, client = connect(args)
         with client:
@@ -613,8 +777,12 @@ def run_bench(args: argparse.Namespace) -> int:
         print(f"Cannot run the bench: {exc}", file=sys.stderr)
         return 1
     print(as_text(result))
-    code = 1 if went_wrong(result) else 0
-    for name, text in ((args.json_file, json.dumps(result, indent=2) + "\n"), (args.markdown_file, as_markdown(result))):
+    return write_files(args, result, as_markdown(result)) or (1 if went_wrong(result) else 0)
+
+
+def write_files(args: argparse.Namespace, result: dict[str, Any], markdown: str) -> int:
+    code = 0
+    for name, text in ((args.json_file, json.dumps(result, indent=2) + "\n"), (args.markdown_file, markdown)):
         try:
             if name:
                 Path(name).write_text(text, encoding="utf-8")
@@ -639,4 +807,5 @@ def add_arguments(subparsers: Any) -> None:
     bench.add_argument("--markdown", dest="markdown_file", default=None, help="also write the results to this file as Markdown")
     bench.add_argument("--url", default=None, help="any node's address; default is this machine's node")
     bench.add_argument("--key", default=None, help="an API key; default is this machine's own, for its own node only")
+    bench.add_argument("--compare", nargs=2, metavar=("OLD", "NEW"), default=None, help="set two runs saved with --json side by side, and measure nothing")
     bench.set_defaults(handler=run_bench)

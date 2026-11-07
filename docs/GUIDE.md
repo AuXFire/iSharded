@@ -888,6 +888,7 @@ Measures a running mesh and gives numbers others can compare. It asks a node ove
 isharded bench
 isharded bench --url http://node-a:8209 --key YOUR_KEY --markdown result.md
 isharded bench --prompt-tokens 128 --parallel 1,2 --repeat 5 --text code --json result.json
+isharded bench --compare before.json after.json
 ```
 
 | Option | Default | What it does |
@@ -905,6 +906,7 @@ isharded bench --prompt-tokens 128 --parallel 1,2 --repeat 5 --text code --json 
 | `--markdown` | Off | Also write the results to this file as Markdown, ready to paste |
 | `--url` | This machine's node | Any node's address |
 | `--key` | This machine's own | An API key. A user key is enough. See below |
+| `--compare` | Off | Two files saved with `--json`, old then new. Sets them side by side and measures nothing. `--json` and `--markdown` save the comparison |
 
 With no `--url` it reads the `up` folder, so `isharded bench` on a node just works. The saved key, or the pool token, goes only to this machine's own node. For any other `--url`, give `--key`, so that benching someone else's mesh cannot hand them your key. In the same way this mesh's certificate authority is used only for this machine's own node. For a node elsewhere whose certificate comes from a mesh's own authority, name that authority's file in `ISHARDED_CA_FILE`.
 
@@ -920,7 +922,11 @@ What it reports:
 | Total tokens/s | All the tokens of a round, divided by the whole round, reading prompts included. This is what the mesh delivers |
 | Repeat of a seeded reply identical | The same seeded request, sent twice. `NO` deserves a look, as one route should repeat itself. It does not fail the run |
 
-Each number is the median of the measurements, with the lowest and highest in brackets. The report also says what explains them: the model and its quantization (read from the name), each stage's layers, GPU and country, link times where the status has them, the pipeline's tokens, misses and depth, any draft's passes in this run and its tokens per pass since the stage started, whether the native engine was on, the iSharded version nodes report, and the commit of the copy running the bench, if it is a git checkout. It leaves out addresses, keys, machine names and paths, so it is safe to post. Countries appear only where a node's operator shows one.
+Each number is the median of the measurements, with the lowest and highest in brackets. The report also says what explains them: the model, its quantization (what the GGUF says, or else what its name says) and its slots, how many machines the route spans, each stage's layers, GPU, precision and country, link times, the pipeline's tokens, misses and depth, any draft's passes in this run and its tokens per pass since the stage started, whether the native engine was on, the iSharded version nodes report, the commit of the node that was asked and of the copy running the bench, where each is a git checkout, and how the numbers were taken. A link is the direct link's own round trip to the next stage, and a probe is the same trip over HTTP, measured when the route was planned. It leaves out addresses, keys, machine names and paths, so it is safe to post. Countries appear only where a node's operator shows one.
+
+`--compare` shows what ran differently, then each case both runs have, as old and new median with the change in percent. A change counts as better or worse only if the two runs' lowest-to-highest ranges do not overlap, and otherwise it says within noise. If the two runs differ in what ran, it says so first, because the change may come from that. It exits with 1 if a file is not a report.
+
+`GET /admin/status` gives what this needs: `commit` beside `status`, and `slots`, `quantization` and `context_tokens` in `active_plan`.
 
 Notes under the table say when something bent the numbers: a route that moved, cache use nobody asked for, `--cached` with no cache behind it, replies that ended before `--tokens`, sizes skipped. A node keeps prompt states only with room for them, in `--state-ram-gb` or `--state-disk-gb`. It exits with 1 if any reply failed, or if nothing could be measured. A repeat that differs does not fail it, and neither does a size the model has no room for.
 
