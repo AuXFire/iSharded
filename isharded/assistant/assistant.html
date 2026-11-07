@@ -753,7 +753,7 @@
     // Who answers. The routes are tried in order, so they are drawn as the sequence they are.
 
     const candidate = text => { const at = String(text).indexOf('/'); return at < 0 ? { provider: text, model: '' } : { provider: text.slice(0, at), model: text.slice(at + 1) }; };
-    function chain(roles, candidates, stats) {
+    function chain(roles, candidates, stats, known) {
       const holder = make('div');
       holder.append(make('p', 'chain-role', upper(worded(roles))));
       const list = make('div', 'route-list');
@@ -764,7 +764,7 @@
         const speeds = seen.map(item => item.tokens_per_second).filter(Boolean);
         const stop = make('div', 'route-stop');
         stop.append(make('span', 'route-no', index + 1), make('span', 'route-who', model ? `${provider}, ${modelName(model)}` : provider), make('span', 'route-val', speeds.length ? `${num(Math.max(...speeds))} tokens/s, prompt and reply` : ''));
-        stop.append(make('span', 'route-sub', runs ? `${worked} of ${count(runs, 'run')} worked` : 'Not used yet'));
+        stop.append(make('span', 'route-sub', !known.has(provider) ? 'Removed, so it is skipped' : runs ? `${worked} of ${count(runs, 'run')} worked` : 'Not used yet'));
         list.append(stop);
       });
       if (!candidates.length) list.append(note('No model is set for this.'));
@@ -808,7 +808,7 @@
       body.replaceChildren(...rows);
       if (!rows.length) body.append(note('No provider yet, so nothing can answer. Add one: a pool, or any OpenAI-compatible server.'));
       body.append(make('h3', '', 'Tried in this order'));
-      for (const [key, roles] of groups) body.append(chain(roles, JSON.parse(key), stats));
+      for (const [key, roles] of groups) body.append(chain(roles, JSON.parse(key), stats, new Set(providers.map(item => item.name))));
     }
 
     function addProvider() {
