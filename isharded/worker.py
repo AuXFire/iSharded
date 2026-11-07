@@ -17,7 +17,7 @@ import threading
 import time
 from urllib.parse import urlsplit
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Collection, Iterator
 import contextlib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -32,7 +32,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette.requests import ClientDisconnect
 
-from .inventory import ram
+from .inventory import inventory, ram
 from .memory import (
     AUTO_RAM_SHARE,
     Accelerator,
@@ -97,7 +97,6 @@ from .slots import SlotGate
 from .statecopy import CopySender, fetch_file
 from .statestore import HISTORY, PARTIAL, PrefixIndex, StateStore, clear_other_stores, prompt_parts, stage_namespace
 from .access import load_authority
-from .inventory import inventory
 from .tickets import TicketIdentity, client_auth
 from .tls import client_verify, node_transport, PEER, stay_on_this_machine_async
 from .vision import PromptPart, PromptRows, lay_out
@@ -194,6 +193,23 @@ RING_DIAL_MS = 10_000
 # Off is for checking results against a prompt that went out whole.
 PROMPT_PARTS = os.getenv("ISHARDED_PROMPT_PARTS", "1") != "0"
 UNAVAILABLE_STATUSES = {502, 503, 504}
+# What every pass of a reply after its first has in common.
+GOING_ON = {"reset": False, "restore_length": None, "checkpoint_key": None}
+
+
+def retry_error(message: str) -> HTTPException:
+    """Asks for a replay, and says nothing against any worker."""
+    return HTTPException(status_code=503, detail={"retry": True, "message": message})
+
+
+def epoch_error(epoch: int) -> HTTPException:
+    return HTTPException(status_code=409, detail=f"pipeline epoch mismatch; worker has {epoch}")
+
+
+def free_memory() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 @dataclass(slots=True)
@@ -573,16 +589,14 @@ class WorkerRuntime:
 
     def pool_status(self) -> list[dict[str, Any]]:
         """Live view of each pool, for the planner and the dashboard."""
-        status: list[dict[str, Any]] = []
-        for pool in self.pools.values():
-            status.append(
-                {
-                    **pool.model_dump(),
-                    "free_bytes": live_free_bytes(pool, self.cache_dir),
-                    "used_bytes": self.pool_used.get(pool.pool_id, 0),
-                }
-            )
-        return status
+        return [
+            {
+                **pool.model_dump(),
+                "free_bytes": live_free_bytes(pool, self.cache_dir),
+                "used_bytes": self.pool_used.get(pool.pool_id, 0),
+            }
+            for pool in self.pools.values()
+        ]
 
     def start_prepare(self, request: PrepareRequest) -> FetchProgress:
         """Begin downloading in the background. Serving is not interrupted."""
@@ -693,7 +707,7 @@ class WorkerRuntime:
         for a replay and says nothing against the worker. A stage that will not
         restart is a real failure, and reads as one.
         """
-        retry = HTTPException(status_code=503, detail={"retry": True, "message": str(lost)})
+        retry = retry_error(str(lost))
         # Several replies can find the same stage dead. Starting a second copy would
         # kill the fresh one, and two loading at once can run a small GPU out of memory.
         async with self.replacing:
@@ -710,14 +724,15 @@ class WorkerRuntime:
             self.stage_restarts += 1
         return retry
 
-    async def replace_draft(self, reason: Exception) -> None:
-        """A draft is only an accelerator: lose it, try for another, keep serving."""
+    async def replace_draft(self, reason: Exception) -> RuntimeError:
+        """A draft is only an accelerator: lose it, try for another, and replay without it."""
         self.last_error = f"draft model lost: {reason}"
         draft, self.draft = self.draft, None
         if draft is not None:
             await asyncio.to_thread(draft.close)
         if self.draft_request is not None:
             await asyncio.to_thread(self._load_draft, *self.draft_request)
+        return RuntimeError("the draft model was lost; replaying without it")
 
     @staticmethod
     def _stage_signature(request: ConfigureRequest) -> tuple[Any, ...]:
@@ -901,9 +916,7 @@ class WorkerRuntime:
 
     def _materialize_gguf(self, request: ConfigureRequest, adapter: GgufAdapter) -> None:
         """Assemble this stage's file from cached units and load it into llama.cpp."""
-        for key in list(self.loaded):
-            self.loaded.pop(key).release()
-        self.unit_weights = {}
+        self._drop_units()
         placements = [item for item in request.assignment.placements if item.bytes]
         self.materialize_total = len(placements)
         self.materialize_done = 0
@@ -929,6 +942,22 @@ class WorkerRuntime:
         self.pool_used = used
         self.materialize_done = len(placements)
 
+    def _drop_units(self, keep: Collection[str] = ()) -> None:
+        for key in [key for key in self.loaded if key not in keep]:
+            self.loaded.pop(key).release()
+        self.unit_weights = {}
+
+    def _load_unit(self, request: ConfigureRequest, adapter: Adapter, item: Any) -> LoadedUnit:
+        pool = self.pools.get(item.pool_id)
+        if pool is None:
+            raise ValueError(f"this worker has no memory pool {item.pool_id!r}")
+        path = self.unit_cache.path(request.model_id, request.revision, item.unit)
+        if not path.is_file():
+            raise ValueError(f"unit {item.unit} was not fetched before configure")
+        if pool.kind == "disk":
+            return map_unit(path)
+        return load_unit(path, pool.device, choose_dtype(pool.dtype), adapter.keep_float32, compact=item.compact)
+
     def _materialize(self, request: ConfigureRequest, adapter: Adapter) -> None:
         """Move fetched units into their pools, keeping what is already there."""
         signature = self._stage_signature(request)
@@ -946,34 +975,15 @@ class WorkerRuntime:
         wanted = {
             f"{prefix}/{item.unit}/{item.pool_id}/{item.compact}": item for item in placements if item.bytes
         }
-        self.unit_weights = {}
-        for key in [key for key in self.loaded if key not in wanted]:
-            self.loaded.pop(key).release()
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self._drop_units(keep=wanted)
+        free_memory()
 
         self.materialize_total = len(wanted)
         self.materialize_done = 0
         used: dict[str, int] = {}
         for key, item in wanted.items():
             if key not in self.loaded:
-                pool = self.pools.get(item.pool_id)
-                if pool is None:
-                    raise ValueError(f"this worker has no memory pool {item.pool_id!r}")
-                path = self.unit_cache.path(request.model_id, request.revision, item.unit)
-                if not path.is_file():
-                    raise ValueError(f"unit {item.unit} was not fetched before configure")
-                if pool.kind == "disk":
-                    self.loaded[key] = map_unit(path)
-                else:
-                    self.loaded[key] = load_unit(
-                        path,
-                        pool.device,
-                        choose_dtype(pool.dtype),
-                        adapter.keep_float32,
-                        compact=item.compact,
-                    )
+                self.loaded[key] = self._load_unit(request, adapter, item)
             self.unit_weights[item.unit] = {
                 adapter.local_name(name): tensor for name, tensor in self.loaded[key].tensors.items()
             }
@@ -994,18 +1004,14 @@ class WorkerRuntime:
         self._close_gguf()
         self.gguf_signature = None
         self.prefix.clear()
-        for key in list(self.loaded):
-            self.loaded.pop(key).release()
-        self.unit_weights = {}
+        self._drop_units()
         self.pool_used = {}
         self.adapter = None
         self.model_id = None
         self.assignment = None
         self.route = []
         self.caches.clear()
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        free_memory()
 
     async def configure(self, request: ConfigureRequest) -> None:
         if "inference" not in self.roles:
