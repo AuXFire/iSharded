@@ -266,6 +266,8 @@ fn build_ring(count: u16, closing: bool, delay: Duration, (ack_timeout_ms, silen
     // the answer to a beat comes from that same thread.
     client.beat(&wire::beat(Kind::Ping, 1)).unwrap();
     assert_eq!(frames.next().unwrap().0, Kind::Pong);
+    // A frame that never comes fails the test instead of holding it for ever.
+    client.limit_reads(Duration::from_secs(30)).unwrap();
     Ring { nodes, seen, client, frames, relay, doors }
 }
 
@@ -715,7 +717,10 @@ fn a_redialled_hop_that_says_nothing_is_not_redialled_again() {
     let_links_prove_themselves(&ring, 1);
     relay.hold();
     wait_until("the redial", || relay.attempts() == 2);
-    thread::sleep(Duration::from_millis(100));
+    // The new link's first beat goes out a tenth of a second after it opens, and the answer
+    // to it would prove the link and earn a third dial. Hold it well before that. Holding it
+    // before its handshake ends is a dial that failed, which must not dial again either.
+    thread::sleep(Duration::from_millis(40));
     relay.hold();
     wait_for_loss(&mut ring, 1);
     assert_eq!(relay.attempts(), 2);

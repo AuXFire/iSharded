@@ -12,6 +12,8 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python: ["3.10", "3.13"]
     runs-on: ${{ matrix.os }}
+    # A full run takes about 20 minutes on Windows. A hang should fail, not hold a runner.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -29,6 +31,7 @@ jobs:
   # The light install, which is the default. Tests that need PyTorch skip themselves.
   no-torch:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -50,6 +53,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # About a minute normally.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Test
