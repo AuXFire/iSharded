@@ -1,0 +1,167 @@
+name: release
+
+# A tag v* publishes a release. By hand, give a tag that already exists to publish it,
+# or leave it empty to build everything and keep it as this run's artifacts.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "An existing tag to publish, such as v0.3.0. Empty builds without publishing"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  ZIGLANG_VERSION: "0.17.1"
+  CARGO_ZIGBUILD_VERSION: "0.24.1"
+
+jobs:
+  wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+          - { os: macos-14, target: aarch64-apple-darwin }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install tools
+        run: |
+          rustup target add ${{ matrix.target }}
+          python -m pip install wheel
+      - name: Install the Linux linker
+        if: runner.os == 'Linux'
+        run: python -m pip install "ziglang==$ZIGLANG_VERSION" "cargo-zigbuild==$CARGO_ZIGBUILD_VERSION"
+      - name: Build
+        run: python scripts/build_wheel.py --target ${{ matrix.target }} --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  pure-wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build
+        run: |
+          python -m pip install wheel
+          python scripts/build_wheel.py --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-pure
+          path: dist/*.whl
+          if-no-files-found: error
+
+  windows-installer:
+    needs: wheels
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-x86_64-pc-windows-msvc
+          path: dist
+      - name: Build
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $wheel = (Get-ChildItem dist/*.whl).FullName
+          $version = (Split-Path -Leaf $wheel).Split("-")[1]
+          $iscc = (Get-Item "${env:ProgramFiles(x86)}\Inno Setup *\iscc.exe" | Select-Object -Last 1).FullName
+          & $iscc "/DAppVersion=$version" "/DWheel=$wheel" packaging\windows\isharded.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc failed" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-windows
+          path: dist/iSharded-Setup.exe
+          if-no-files-found: error
+
+  macos-package:
+    needs: wheels
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-aarch64-apple-darwin
+          path: wheels
+      - name: Build
+        run: |
+          wheel=$(ls wheels/*.whl)
+          version=$(basename "$wheel" | cut -d- -f2)
+          sh packaging/macos/build_pkg.sh "$wheel" "$version" dist
+          digest=$(shasum -a 256 dist/iSharded.pkg | cut -d' ' -f1)
+          sed -e "s/__VERSION__/$version/" -e "s/__SHA256__/$digest/" packaging/homebrew/isharded.rb >dist/isharded.rb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-macos
+          path: dist/*
+          if-no-files-found: error
+
+  linux-packages:
+    needs: wheels
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, architecture: amd64 }
+          - { target: aarch64-unknown-linux-gnu, architecture: arm64 }
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-${{ matrix.target }}
+          path: wheels
+      - name: Build
+        run: |
+          wheel=$(ls wheels/*.whl)
+          sh packaging/linux/build_deb.sh "$wheel" ${{ matrix.architecture }} "$(basename "$wheel" | cut -d- -f2)" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-linux-${{ matrix.architecture }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' || inputs.tag != ''
+    needs: [pure-wheel, windows-installer, macos-package, linux-packages]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: Check the version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml)
+          test "v$version" = "$TAG" || { echo "$TAG does not match version $version in pyproject.toml"; exit 1; }
+      - name: Publish
+        working-directory: release
+        run: |
+          sha256sum -- * >SHA256SUMS
+          cat SHA256SUMS
+          gh release create "$TAG" --verify-tag --generate-notes -- *
