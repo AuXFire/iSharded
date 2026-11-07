@@ -413,7 +413,7 @@ def stage_runtime(stage):
     runtime.assignment = SimpleNamespace(start_layer=4)
     runtime.caches = {"s": worker_module.CacheEntry(epoch=1, slot=0, length=7)}
     runtime.inference_calls = runtime.tokens_processed = 0
-    runtime.compute_ms_ema = None
+    runtime.compute_ms_ema = runtime.row_ms_ema = None
     return runtime
 
 
