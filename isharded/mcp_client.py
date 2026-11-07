@@ -1,8 +1,8 @@
 """MCP tools for a model on the mesh: an agent loop over MCP stdio servers.
 
-``isharded.assistant.plugins`` has an MCP client of its own, built on the
-assistant's sandbox and speaking only the older revisions. This one stands alone
-so the core package does not depend on the assistant.
+``isharded.assistant.plugins`` has an MCP client of its own, built on ``LineRpc``
+here but held in the assistant's sandbox and speaking only the older revisions.
+The dependency runs that way so the core package does not need the assistant.
 
 A server's annotations are its own claim, and a tool's output is only text it
 chose to send. So anything not marked read-only waits for a person, and nothing
@@ -11,6 +11,7 @@ a server says can widen what ``--allow`` allows.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable, Sequence
 import json
 import os
 from pathlib import Path
@@ -20,12 +21,12 @@ import shutil
 import subprocess
 import sys
 import threading
-from typing import Any, Callable, Sequence
+from typing import Any
 
 import httpx
 
 from . import __version__
-from .mcp_server import LEGACY_VERSIONS, MODERN_VERSIONS, SERVER_KEY, UNSUPPORTED_VERSION, VERSION_KEY
+from .mcp_server import LEGACY_VERSIONS, MODERN_VERSIONS, SERVER_KEY, UNSUPPORTED_VERSION, VERSION_KEY, encode_line
 from .toolcalls import without_reasoning
 
 CLIENT_INFO = {"name": "isharded-mcp-run", "version": __version__}
@@ -64,33 +65,39 @@ def split_command(command: str) -> list[str]:
 
 
 def server_environment(passed: Sequence[str]) -> dict[str, str]:
-    names = {*SAFE_ENVIRONMENT, *passed}
-    return {name: value for name, value in os.environ.items() if name.upper() in {item.upper() for item in names}}
+    names = {item.upper() for item in (*SAFE_ENVIRONMENT, *passed)}
+    return {name: value for name, value in os.environ.items() if name.upper() in names}
 
 
-class StdioServer:
-    """An MCP server this process started: JSON-RPC, one message per line."""
+class LineRpc:
+    """JSON-RPC to a process over its pipes, one message per line.
 
-    def __init__(self, command: str, environment: dict[str, str]) -> None:
-        parts = split_command(command)
-        try:
-            self.process = subprocess.Popen(parts, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=environment, bufsize=0)
-        except OSError as exc:
-            raise ServerError(f"could not start {command!r}: {exc}") from None
+    Subclasses start the process and say how failures are named.
+    """
+
+    name = "it"
+    failure: type[Exception] = ServerError
+    refusal: type[Exception] = ToolRefused
+    ensure_ascii = False
+
+    def __init__(self, stdin: Any, stdout: Any) -> None:
+        self.stdin = stdin
         self.lock = threading.Lock()
         self.next_id = 0
         self.waiting: dict[int, queue.Queue[dict[str, Any] | None]] = {}
-        self.modern_version: str | None = None
-        self.name = Path(parts[0]).stem  # until it says what it is called
-        threading.Thread(target=self._read, daemon=True).start()
+        self.alive = True
+        threading.Thread(target=self._read, args=(stdout,), daemon=True).start()
 
-    def _read(self) -> None:
-        assert self.process.stdout is not None
-        with self.process.stdout as stream:
-            for line in iter(lambda: stream.readline(MAX_LINE_BYTES + 1), b""):
-                if len(line) > MAX_LINE_BYTES:
-                    break
-                self._receive(line)
+    def _read(self, stream: Any) -> None:
+        try:
+            with stream:
+                for line in iter(lambda: stream.readline(MAX_LINE_BYTES + 1), b""):
+                    if len(line) > MAX_LINE_BYTES:
+                        break
+                    self._receive(line)
+        except (OSError, ValueError):
+            pass  # the pipe closed under us
+        self.alive = False
         with self.lock:
             boxes = list(self.waiting.values())
         for box in boxes:
@@ -114,14 +121,13 @@ class StdioServer:
             box.put(message)
 
     def _send(self, message: dict[str, Any]) -> None:
-        data = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
-        assert self.process.stdin is not None
+        data = encode_line(message, self.ensure_ascii)
         try:
             with self.lock:
-                self.process.stdin.write(data)
-                self.process.stdin.flush()
+                self.stdin.write(data)
+                self.stdin.flush()
         except (OSError, ValueError):
-            raise ServerError(f"{self.name} stopped listening") from None
+            raise self.failure(f"{self.name} stopped listening") from None
 
     def _exchange(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
         """Send a request and wait for its reply. Raises queue.Empty if none comes in time."""
@@ -137,21 +143,60 @@ class StdioServer:
             with self.lock:
                 self.waiting.pop(number, None)
         if reply is None:
-            raise ServerError(f"{self.name} stopped while answering")
+            raise self.failure(f"{self.name} stopped while answering")
         return reply
+
+    def _too_slow(self, method: str, timeout: float) -> str:
+        return f"{self.name} took longer than {timeout:g} seconds over {method}"
+
+    def request(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
+        try:
+            reply = self._exchange(method, params, timeout)
+        except queue.Empty:
+            raise self.failure(self._too_slow(method, timeout)) from None
+        if "error" in reply:
+            error = reply["error"]
+            raise self.refusal(str(error.get("message", error)) if isinstance(error, dict) else str(error))
+        result = reply.get("result")
+        return result if isinstance(result, dict) else {}
+
+    @staticmethod
+    def _listable(tool: Any) -> bool:
+        return isinstance(tool, dict)
+
+    def list_tools(self) -> list[dict[str, Any]]:
+        tools: list[dict[str, Any]] = []
+        cursor = None
+        while len(tools) < MAX_TOOLS:
+            page = self.request("tools/list", {"cursor": cursor} if cursor else {}, START_SECONDS)
+            tools += [tool for tool in page.get("tools", []) if self._listable(tool)]
+            cursor = page.get("nextCursor")
+            if not cursor:
+                break
+        return tools[:MAX_TOOLS]
+
+
+class StdioServer(LineRpc):
+    """An MCP server this process started, of either era."""
+
+    def __init__(self, command: str, environment: dict[str, str]) -> None:
+        parts = split_command(command)
+        try:
+            self.process = subprocess.Popen(parts, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=environment, bufsize=0)
+        except OSError as exc:
+            raise ServerError(f"could not start {command!r}: {exc}") from None
+        self.modern_version: str | None = None
+        self.name = Path(parts[0]).stem  # until it says what it is called
+        super().__init__(self.process.stdin, self.process.stdout)
 
     def request(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
         if self.modern_version:
             params = {**params, "_meta": self._meta(self.modern_version)}
-        try:
-            reply = self._exchange(method, params, timeout)
-        except queue.Empty:
-            raise ServerError(f"{self.name} took longer than {timeout:g} seconds over {method}") from None
-        if "error" in reply:
-            error = reply["error"]
-            raise ToolRefused(str(error.get("message", error)) if isinstance(error, dict) else str(error))
-        result = reply.get("result")
-        return result if isinstance(result, dict) else {}
+        return super().request(method, params, timeout)
+
+    @staticmethod
+    def _listable(tool: Any) -> bool:
+        return isinstance(tool, dict) and isinstance(tool.get("name"), str)
 
     @staticmethod
     def _meta(version: str) -> dict[str, Any]:
@@ -183,17 +228,6 @@ class StdioServer:
         self.name = str((result.get("serverInfo") or {}).get("name") or self.name)
         self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
-    def list_tools(self) -> list[dict[str, Any]]:
-        tools: list[dict[str, Any]] = []
-        cursor = None
-        while len(tools) < MAX_TOOLS:
-            page = self.request("tools/list", {"cursor": cursor} if cursor else {}, START_SECONDS)
-            tools += [tool for tool in page.get("tools", []) if isinstance(tool, dict) and isinstance(tool.get("name"), str)]
-            cursor = page.get("nextCursor")
-            if not cursor:
-                break
-        return tools[:MAX_TOOLS]
-
     def close(self) -> None:
         """Close its input, which is the polite way, and then insist."""
         if self.process.stdin is not None:
@@ -211,14 +245,20 @@ class StdioServer:
                 self.process.kill()
 
 
-def result_text(result: dict[str, Any]) -> str:
-    """What a tool sent back, as the text a model will read, saying what was left out."""
+def content_parts(content: Iterable[Any]) -> list[str]:
+    """The text of an MCP result, saying what was left out."""
     parts = []
-    for item in result.get("content") or []:
+    for item in content:
         if isinstance(item, dict) and item.get("type") == "text":
             parts.append(str(item.get("text", "")))
         else:
             parts.append(f"[{item.get('type', 'unknown') if isinstance(item, dict) else 'unknown'} content omitted]")
+    return parts
+
+
+def result_text(result: dict[str, Any]) -> str:
+    """What a tool sent back, as the text a model will read."""
+    parts = content_parts(result.get("content") or [])
     if not parts and result.get("structuredContent") is not None:
         parts.append(json.dumps(result["structuredContent"], ensure_ascii=False))
     text = "\n".join(parts)
@@ -334,6 +374,7 @@ def agent_loop(
 def run_agent(args: Any) -> int:
     environment = server_environment(args.pass_env or [])
     headers = {"Authorization": f"Bearer {args.token}"} if args.token else {}
+    allowed = set(args.allow or [])
     servers: list[StdioServer] = []
     try:
         for command in args.server:
@@ -343,11 +384,11 @@ def run_agent(args: Any) -> int:
         toolbox = Toolbox(servers)
         if not toolbox.tools:
             raise ServerError("no server offered any tools")
-        unknown = sorted(set(args.allow or []) - set(toolbox.tools))
+        unknown = sorted(allowed - set(toolbox.tools))
         if unknown:
             raise ServerError(f"--allow names {', '.join(unknown)}, and the servers offer {', '.join(sorted(toolbox.tools))}")
         with httpx.Client(base_url=args.url.rstrip("/"), headers=headers, timeout=None, trust_env=False) as client:
-            answer = agent_loop(client, toolbox, args.model, args.prompt, set(args.allow or []), args.max_turns, args.max_tokens, args.tool_timeout)
+            answer = agent_loop(client, toolbox, args.model, args.prompt, allowed, args.max_turns, args.max_tokens, args.tool_timeout)
         print(answer)
         return 0
     except (ServerError, ToolRefused, httpx.HTTPError) as exc:
