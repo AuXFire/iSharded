@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 from isharded.assistant.gateway import Users
-from test_assistant_system import OWNER, Install, ScriptedModel, install, model  # noqa: F401
+from test_assistant_system import OWNER, Install, ScriptedModel, free_port, install, model, script_tidy  # noqa: F401
 
 playwright_api = pytest.importorskip("playwright.sync_api")
 
@@ -69,7 +69,7 @@ def asking_for_a_key(page: Any) -> bool:
 
 def shown_to_the_next_person(page: Any) -> str:
     """textContent, as innerText skips what is hidden, and hidden text is still on the page."""
-    return page.evaluate("() => ['turns', 'panel-approvals', 'panel-tasks', 'panel-history', 'panel-audit', 'memory-list', 'who'].map(id => document.getElementById(id).textContent).join(' ')")
+    return page.evaluate("() => ['turns', 'panel-approvals', 'panel-tasks', 'panel-history', 'panel-audit', 'panel-manage', 'memory-list', 'who'].map(id => document.getElementById(id).textContent).join(' ')")
 
 
 def test_escape_cannot_leave_a_person_with_no_way_to_sign_in(page):
@@ -137,3 +137,117 @@ def test_the_page_works_inside_its_own_policy(page, install, model):  # noqa: F8
     page.click("#theme-button")
     assert [problem for problem in page.problems if "401" not in problem] == []
     assert page.evaluate("() => getComputedStyle(document.body).backgroundColor") != "rgba(0, 0, 0, 0)"  # ui.css really arrived
+
+
+def open_manage(page: Any) -> None:
+    page.click("[data-panel=manage]")
+    until(page, "() => !document.querySelector('#part-answers .panel').textContent.includes('Checking') && document.querySelector('#part-peers .panel').childElementCount > 0")
+
+
+def test_manage_works_inside_the_policy_and_says_what_each_part_holds(page, install):  # noqa: F811
+    sign_in(page, install.key)
+    open_manage(page)
+    for title in ("What it may do", "Who answers", "Skills", "Plugins", "Code runs", "Peers"):
+        assert title in page.inner_text("#panel-manage")
+    assert "Answering" in page.inner_text("#part-answers")
+    assert page.locator("#part-answers .route-no").first.inner_text() == "1"  # tried in order, so numbered
+    assert [problem for problem in page.problems if "401" not in problem] == []
+
+
+def test_a_member_has_no_manage_panel(page, install):  # noqa: F811
+    sign_in(page, Users(install.assistant).add("member"))
+    assert page.locator("[data-panel=manage]").is_hidden()
+    assert page.inner_text("#panel-manage") == ""
+
+
+def test_signing_out_of_manage_leaves_it_closed_for_a_member(page, install):  # noqa: F811
+    sign_in(page, install.key)
+    open_manage(page)
+    page.click("#sign-out")
+    assert OWNER not in shown_to_the_next_person(page)
+    sign_in(page, Users(install.assistant).add("member"))
+    assert page.locator("[data-panel=manage]").is_hidden() and page.locator("#panel-manage").is_hidden()
+    assert page.locator("#panel-approvals").is_visible()
+
+
+def test_a_grant_is_added_and_revoked_from_the_page_and_a_refusal_stays_in_the_sheet(page, install):  # noqa: F811
+    sign_in(page, install.key)
+    open_manage(page)
+    page.click("#part-grants button:text('Add a grant')")
+    page.select_option("#ask-fields select", "files.read")
+    page.click("#ask-yes")  # a path capability with no scope
+    until(page, "() => !document.getElementById('ask-error').hidden")
+    assert page.locator("#ask").evaluate("sheet => sheet.open")
+
+    page.select_option("#ask-fields select", "system.info")
+    assert page.locator("#ask-fields input").first.is_hidden()  # it takes no scope, so nothing asks for one
+    page.click("#ask-yes")
+    until(page, "() => document.querySelector('#part-grants .panel').textContent.includes('system.info, for')")
+    assert len(install.assistant.broker.grants(OWNER)) == 1
+
+    page.click("#part-grants .card button:text('Revoke')")
+    page.click("#ask-yes")
+    until(page, "() => !document.querySelector('#part-grants .panel').textContent.includes('system.info, for')")
+    assert install.assistant.broker.grants(OWNER) == []
+
+
+def test_a_provider_that_stops_answering_is_said_in_words(page, install):  # noqa: F811
+    install.assistant.providers.add("gone", f"http://127.0.0.1:{free_port()}", reach="pool")
+    sign_in(page, install.key)
+    page.click("[data-panel=manage]")
+    until(page, "() => document.getElementById('part-answers').textContent.includes('Not answering')")
+    assert "gone" in page.inner_text("#manage-summary")
+    assert "Answering" in page.inner_text("#part-answers")  # the one that is up says so too
+
+
+def test_a_lost_gateway_is_said_and_sending_comes_back_by_itself(page, install):  # noqa: F811
+    sign_in(page, install.key)
+    page.route("**/assistant/approvals", lambda route: route.abort())
+    page.evaluate("() => poll()")
+    until(page, "() => document.getElementById('notices').textContent.includes('stopped answering')")
+    assert page.locator("#send").is_disabled()
+    assert "Last heard" in page.inner_text("#pill")
+    page.unroute("**/assistant/approvals")
+    page.evaluate("() => poll()")
+    until(page, "() => document.getElementById('notices').textContent === ''")
+    assert page.locator("#send").is_enabled()
+    assert page.evaluate("() => document.title") != ""
+
+
+def test_a_failed_reply_stays_in_the_turn_with_a_way_to_send_it_again(page, install):  # noqa: F811
+    install.assistant.providers.remove("scripted", by=OWNER)
+    install.assistant.providers.add("gone", f"http://127.0.0.1:{free_port()}", reach="pool")
+    sign_in(page, install.key)
+    page.fill("#input", "Are you there?")
+    page.press("#input", "Enter")
+    until(page, "() => document.querySelector('article.turn.assistant .failure') !== null", 60)
+    assert page.locator("article.turn.assistant .receipt").count() == 1
+    page.click("article.turn.assistant .failure button")
+    assert page.input_value("#input") == "Are you there?"
+
+
+def test_an_approval_shows_the_exact_action_and_the_top_bar_counts_it(page, install, model, tmp_path):  # noqa: F811
+    folder = tmp_path / "work"
+    folder.mkdir()
+    install.grant("files.read", str(folder))
+    install.grant("files.write", str(folder))
+    tidied = script_tidy(model, folder)
+    sign_in(page, install.key)
+    page.fill("#input", "Please tidy my notes")
+    page.press("#input", "Enter")
+    until(page, "() => document.querySelector('#panel-approvals .issue') !== null")
+    assert "Waiting for you" in page.inner_text("article.turn.assistant .receipt")
+    assert page.inner_text("#pill") == "1 needs you"
+    assert page.evaluate("() => document.title").startswith("1 needs you")
+    assert str(tidied.name) in page.inner_text("#panel-approvals .arguments")
+    page.click("#panel-approvals button:text('Approve this exact action')")
+    until(page, "() => document.getElementById('panel-approvals').textContent.includes('Nothing is waiting')")
+    assert tidied.exists()
+    assert page.inner_text("#pill") == "Nothing waiting"
+
+
+def test_a_models_file_path_is_shown_as_its_name(page):
+    named = "text => named(text)"
+    assert page.evaluate(named, "pool/C:\\models\\small\\Sample-8B.gguf failed") == "pool/Sample-8B failed"
+    assert page.evaluate(named, "/srv/models/Sample-8B.gguf") == "Sample-8B"
+    assert page.evaluate(named, "pool cannot be reached") == "pool cannot be reached"

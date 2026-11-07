@@ -5,42 +5,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <title>iSharded assistant</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%2308738a' d='M6 3h14l-2.4 5H3.6zM8 10h14l-2.4 5H5.6zM4 17h14l-2.4 5H1.6z'/%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%235d737b' d='M6 3h14l-2.4 5H3.6zM8 10h14l-2.4 5H5.6zM4 17h14l-2.4 5H1.6z'/%3E%3C/svg%3E">
   <script nonce="__CSP_NONCE__">try { const theme = localStorage.getItem('isharded-theme'); if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme; } catch {}</script>
-  <style nonce="__CSP_NONCE__">/* isharded:ui.css */
-
-    /* What only this page has. Everything else comes from the design system above. */
-    .who { color: var(--ink-2); font-size: var(--t-sm); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .panel-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: var(--s-3); }
-    .count { display: inline-grid; place-items: center; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--warn); color: var(--plate); font: 600 var(--t-xs)/1 var(--font-display); }
-    .panel { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s-2); }
-    .card { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s-2); padding: var(--s-3); border: 1px solid var(--edge); border-radius: var(--r-control); background: var(--plate); }
-    .card-text { overflow-wrap: anywhere; white-space: pre-wrap; }
-    .card-note { color: var(--ink-2); font-size: var(--t-xs); overflow-wrap: anywhere; }
-    .card-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--s-2); }
-    .tags { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-1); }
-    .tag.tone-ok { color: var(--good); }
-    .tag.tone-work { color: var(--accent-text); }
-    .tag.tone-warn { color: var(--warn); }
-    .tag.tone-bad { color: var(--bad); }
-    .arguments { margin: 0; color: var(--ink-2); font: 400 var(--t-xs)/1.5 var(--font-code); white-space: pre-wrap; overflow-wrap: anywhere; }
-    .audit-line { color: var(--ink-2); font: 400 var(--t-xs)/1.5 var(--font-code); overflow-wrap: anywhere; }
-    .inline-form { display: flex; gap: var(--s-2); }
-    .inline-form .input { flex: 1; min-width: 0; }
-    .receipt { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-1) var(--s-2); }
-    .send-row { justify-content: flex-end; }
-    .open-conversation { padding: 0; border: 0; background: none; color: var(--ink); font-weight: 600; text-align: left; overflow-wrap: anywhere; }
-    .open-conversation:hover { color: var(--accent-text); text-decoration: underline; text-underline-offset: 2px; }
-    .rail-toggle svg { margin-left: auto; }
-    @media (max-width: 760px) { .who { display: none; } }
-  </style>
+  <style nonce="__CSP_NONCE__">/* isharded:ui.css */</style>
 </head>
-<body class="chat-page">
+<body class="chat-page assistant-page">
   <a class="skip" href="#input">Skip to the message box</a>
   <header class="top">
     <span class="brand"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 3h14l-2.4 5H3.6zM8 10h14l-2.4 5H5.6zM4 17h14l-2.4 5H1.6z"/></svg><span id="name">Assistant</span></span>
     <span class="who" id="who"></span>
     <div class="top-gap"></div>
+    <div role="status"><button class="state-word quiet-state" id="pill" type="button" hidden><i class="glyph" id="pill-glyph" hidden></i><span id="pill-text"></span></button></div>
     <button class="btn quiet" id="new-chat" type="button">New conversation</button>
     <button class="icon-btn" id="theme-button" type="button">
       <svg data-theme-icon="system" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor" stroke="none"/></svg>
@@ -50,14 +25,15 @@
     <button class="btn quiet" id="sign-out" type="button">Sign out</button>
   </header>
 
-  <div class="workspace">
+  <div class="workspace" id="workspace">
     <button class="rail-toggle" id="rail-toggle" type="button" aria-expanded="false" aria-controls="rail"><span>Approvals, memory, tasks</span><span class="count" id="toggle-count" hidden></span><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m2.5 4.5 3.5 3.5 3.5-3.5"/></svg></button>
     <main class="conversation">
       <div class="log" id="log" role="log" tabindex="0" aria-label="Conversation">
         <div class="column" id="turns">
-          <div class="greeting" id="empty"><h1 id="greeting">Hello</h1><p>What is said here is remembered, with where it came from. Nothing runs without a grant, and anything with consequences that untrusted text could have steered waits for you first.</p></div>
+          <div class="greeting" id="empty"><h1 id="greeting">Hello</h1><p>What is said here is remembered, with where it came from. Nothing runs without a grant, and anything with consequences that untrusted text could have steered waits for you first.</p><p id="answers-line" hidden></p></div>
         </div>
       </div>
+      <div class="notices chat-notices" id="notices"></div>
       <form class="composer" id="composer">
         <div class="column box">
           <label class="sr-only" for="input">Message</label>
@@ -67,16 +43,17 @@
       </form>
     </main>
 
-    <aside class="rail" id="rail" aria-label="What the assistant is doing">
-      <div class="panel-tabs" id="panel-tabs">
-        <button class="chip" type="button" data-panel="approvals" aria-pressed="true">Approvals<span class="count" id="approval-count" hidden></span></button>
-        <button class="chip" type="button" data-panel="memory" aria-pressed="false">Memory</button>
-        <button class="chip" type="button" data-panel="tasks" aria-pressed="false">Tasks</button>
-        <button class="chip" type="button" data-panel="history" aria-pressed="false">History</button>
-        <button class="chip" type="button" data-panel="audit" aria-pressed="false">Audit</button>
+    <aside class="rail" id="rail" tabindex="0" aria-label="What the assistant is doing">
+      <div class="panel-tabs" id="panel-tabs" role="tablist" aria-label="What the assistant is doing">
+        <button class="panel-tab" type="button" role="tab" data-panel="approvals" aria-controls="panel-approvals" aria-selected="true">Approvals<span class="count" id="approval-count" hidden></span></button>
+        <button class="panel-tab" type="button" role="tab" data-panel="memory" aria-controls="panel-memory" aria-selected="false" tabindex="-1">Memory</button>
+        <button class="panel-tab" type="button" role="tab" data-panel="tasks" aria-controls="panel-tasks" aria-selected="false" tabindex="-1">Tasks</button>
+        <button class="panel-tab" type="button" role="tab" data-panel="history" aria-controls="panel-history" aria-selected="false" tabindex="-1">History</button>
+        <button class="panel-tab" type="button" role="tab" data-panel="audit" aria-controls="panel-audit" aria-selected="false" tabindex="-1">Audit</button>
+        <button class="panel-tab" type="button" role="tab" data-panel="manage" aria-controls="panel-manage" aria-selected="false" tabindex="-1" hidden>Manage</button>
       </div>
-      <section class="panel" id="panel-approvals" aria-label="Approvals"></section>
-      <section class="panel" id="panel-memory" aria-label="Memory" hidden>
+      <section class="panel" id="panel-approvals" role="tabpanel" aria-label="Approvals"></section>
+      <section class="panel" id="panel-memory" role="tabpanel" aria-label="Memory" hidden>
         <form class="inline-form" id="memory-search">
           <input class="input" id="memory-query" placeholder="Search memory" aria-label="Search memory">
           <button class="btn small" type="submit">Search</button>
@@ -88,9 +65,10 @@
         <p class="error" id="memory-error" role="alert" hidden></p>
         <div class="panel" id="memory-list"></div>
       </section>
-      <section class="panel" id="panel-tasks" aria-label="Tasks" hidden></section>
-      <section class="panel" id="panel-history" aria-label="Earlier conversations" hidden></section>
-      <section class="panel" id="panel-audit" aria-label="Audit" hidden></section>
+      <section class="panel" id="panel-tasks" role="tabpanel" aria-label="Tasks" hidden></section>
+      <section class="panel" id="panel-history" role="tabpanel" aria-label="Earlier conversations" hidden></section>
+      <section class="panel" id="panel-audit" role="tabpanel" aria-label="Audit" hidden></section>
+      <section id="panel-manage" role="tabpanel" aria-label="Manage" hidden></section>
     </aside>
   </div>
 
@@ -114,9 +92,22 @@
     </div>
   </dialog>
 
-  <script nonce="__CSP_NONCE__">
+  <dialog class="sheet" id="ask" aria-labelledby="ask-title">
+    <form class="sheet-body" id="ask-form">
+      <h2 id="ask-title"></h2>
+      <p id="ask-text" hidden></p>
+      <div class="panel" id="ask-fields"></div>
+      <p class="error" id="ask-error" role="alert" hidden></p>
+      <div class="sheet-actions"><button class="btn" id="ask-no" type="button">Cancel</button><button class="btn primary" id="ask-yes" type="submit"></button></div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status"></div>
+
+  <script nonce="__CSP_NONCE__">/* isharded:ui.js */
     // Everything shown here can come from a model, a file, or a tool, so text only
     // ever reaches the page as text.
+    const { count, modelName, num, relative, whole } = UI;
     const $ = id => document.getElementById(id);
     const session = {
       get: key => { try { return sessionStorage.getItem(key); } catch { return null; } },
@@ -127,9 +118,15 @@
       set: (key, value) => { try { localStorage.setItem(key, value); } catch {} },
       drop: key => { try { localStorage.removeItem(key); } catch {} },
     };
-    const state = { key: session.get('assistant-key') || '', conversation: session.get('assistant-conversation') || '', busy: false, panel: 'approvals', role: 'member', opening: 0 };
+    const state = { key: session.get('assistant-key') || '', conversation: session.get('assistant-conversation') || '', busy: false, panel: 'approvals', role: 'member', opening: 0, name: '', waiting: 0, heard: 0, lost: false, abilities: {}, titles: new Map(), needs: {}, down: new Set() };
     const ENDED = ['done', 'partial', 'failed', 'cancelled', 'missed'];
-    const TONE = { done: 'ok', partial: 'warn', failed: 'bad', cancelled: 'idle', missed: 'warn', blocked: 'warn', paused: 'warn', running: 'work', pending: 'idle' };
+    // Each state has a shape and a word. The shape is a .glyph class in ui.css.
+    const TASK_MARK = { done: 'active', partial: 'warn', failed: 'bad', cancelled: 'idle', missed: 'warn', blocked: 'warn', paused: 'warn', running: 'work', pending: 'idle' };
+    const RUN_STATE = {
+      created: ['work', 'Starting'], inspecting: ['work', 'Reading the code'], proposing: ['work', 'Writing a change'], applying: ['work', 'Applying the change'], testing: ['work', 'Testing'], reviewing: ['work', 'Being reviewed'],
+      ready: ['warn', 'Ready for you'], stopped: ['warn', 'Stopped'], committed: ['active', 'Committed'], pushed: ['active', 'Pushed'], rejected: ['idle', 'Rejected'],
+    };
+    const PEER_STATE = { awaiting_owner: ['warn', 'Asks to pair'], awaiting_peer: ['idle', 'Waiting for them'], paired: ['active', 'Paired'], revoked: ['idle', 'Revoked'] };
 
     function newConversation() {
       state.conversation = `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -148,21 +145,106 @@
       return element;
     }
     const when = seconds => seconds ? new Date(seconds * 1000).toLocaleString() : '';
-    const tag = (text, tone) => make('span', `tag ${tone ? `tone-${tone}` : ''}`, text);
-    const trustTone = trust => ({ verified: 'ok', owner: 'ok', model: 'work', external: 'warn' }[trust] || '');
-    const note = text => make('p', 'rail-note', text);
+    const upper = text => { const words = String(text ?? ''); return words.charAt(0).toUpperCase() + words.slice(1); };
+    // A model's id on a pool is often its file, and where that file sits is nobody's business here.
+    const named = text => String(text ?? '').replace(/(?:[A-Za-z]:[\\/]|(?<![\w.])[\\/])[^\s'"]*?([^\\/\s'"]+\.gguf)/g, '$1').replace(/\.gguf\b/g, '');
+    const glyph = kind => { const mark = make('i', `glyph ${kind}`); mark.setAttribute('aria-hidden', 'true'); return mark; };
+    function tag(text, tone, mark) {
+      const element = make('span', `tag ${tone || ''}`);
+      if (mark) element.append(glyph(mark));
+      element.append(text);
+      return element;
+    }
+    const trustTag = trust => trust === 'external' ? tag('External', 'warn', 'warn') : tag(upper(trust), trust === 'model' ? '' : 'plain');
+    // A sentence for an empty or quiet place. A command in it goes between backticks.
+    function note(text) {
+      const line = make('p', 'rail-note');
+      text.split('`').forEach((piece, index) => line.append(index % 2 ? make('code', '', piece) : piece));
+      return line;
+    }
+    function say(text) {
+      $('toast').textContent = text;
+      $('toast').classList.add('show');
+      clearTimeout(say.timer);
+      say.timer = setTimeout(() => $('toast').classList.remove('show'), 3200);
+    }
+    function copyButton(text) {
+      if (!navigator.clipboard) return make('span');
+      const copy = button('Copy', 'btn small', async () => {
+        try { await navigator.clipboard.writeText(text()); say('Copied'); }
+        catch { say('The browser refused to copy. Select the text instead.'); }
+      });
+      return copy;
+    }
 
     async function api(path, options = {}) {
       const key = state.key;
-      const response = await fetch(path, { ...options, headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` } });
+      let response;
+      try {
+        response = await fetch(path, { ...options, headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` } });
+      } catch {
+        lostTouch();
+        throw new Error('The assistant did not answer. Check that it is still running.');
+      }
       if (key !== state.key) throw new Error('Signed out');  // an answer for someone who has left must not be drawn
+      heard();
       if (response.status === 401) { askForKey('That key was not accepted.'); throw new Error('Sign in first'); }
       if (!response.ok) {
-        let message = `Request failed with HTTP ${response.status}`;
-        try { const body = await response.json(); if (typeof body.detail === 'string') message = body.detail; } catch {}
-        throw new Error(message);
+        const failure = new Error(await refusal(response));
+        failure.status = response.status;
+        throw failure;
       }
       return response.json();
+    }
+    async function refusal(response) {
+      try { const body = await response.json(); if (typeof body.detail === 'string') return body.detail; } catch {}
+      return `The assistant answered with an error, HTTP ${response.status}. Its log says why.`;
+    }
+
+    // The top bar says what needs this person, and stays quiet when nothing does.
+    function paintState() {
+      const silent = state.lost ? Math.round((Date.now() - state.heard) / 1000) : 0;
+      const pill = $('pill'), mark = $('pill-glyph'), name = state.name || 'iSharded assistant';
+      const signedIn = Boolean($('who').textContent);
+      pill.hidden = !signedIn;
+      pill.disabled = !state.waiting;
+      pill.classList.remove('tone-warn', 'tone-bad');
+      pill.classList.toggle('quiet-state', !state.lost && !state.waiting);
+      if (state.lost) {
+        mark.className = 'glyph bad';
+        pill.classList.add('tone-bad');
+        $('pill-text').textContent = state.heard ? `Last heard ${silent} s ago` : 'Not answering';
+        document.title = `Out of date: ${name}`;
+      } else if (state.waiting) {
+        mark.className = 'glyph warn';
+        pill.classList.add('tone-warn');
+        $('pill-text').textContent = `${state.waiting} ${state.waiting === 1 ? 'needs' : 'need'} you`;
+        document.title = `${state.waiting} ${state.waiting === 1 ? 'needs' : 'need'} you: ${name}`;
+      } else {
+        $('pill-text').textContent = 'Nothing waiting';
+        document.title = name;
+      }
+      mark.hidden = !state.lost && !state.waiting;
+      $('send').disabled = state.busy || state.lost;
+      const notices = $('notices');
+      notices.replaceChildren();
+      if (!state.lost) return;
+      const notice = make('div', 'notice bad');
+      const body = make('div', 'notice-body');
+      body.append(make('b', '', 'The assistant stopped answering'), note('Sending is off until it is back. Start it with `isharded assistant serve`, and this page picks up by itself. What is on this page stays here.'));
+      notice.append(glyph('bad'), body);
+      notices.append(notice);
+    }
+    function heard() {
+      state.heard = Date.now();
+      if (!state.lost) return;
+      state.lost = false;
+      paintState();
+      if (state.key && !$('who').textContent) start();  // it was down when this page opened
+    }
+    function lostTouch() {
+      state.lost = true;
+      paintState();
     }
 
     // Whoever signs in next must not see this person's words, even dimmed behind the sheet.
@@ -170,16 +252,30 @@
       state.opening += 1;
       state.conversation = '';
       state.approvalsShown = null;
+      state.tasksShown = null;
+      state.role = 'member';
+      state.name = '';
+      state.abilities = {};
+      state.titles.clear();
+      state.needs = {};
+      state.down.clear();
       session.drop('assistant-conversation');
       showConversation([]);
-      for (const id of ['panel-approvals', 'panel-tasks', 'panel-history', 'panel-audit', 'memory-list']) $(id).replaceChildren();
+      for (const id of ['panel-approvals', 'panel-tasks', 'panel-history', 'panel-audit', 'panel-manage', 'memory-list']) $(id).replaceChildren();
       $('memory-query').value = '';
       $('memory-text').value = '';
       $('who').textContent = '';
       $('name').textContent = 'Assistant';
       $('greeting').textContent = 'Hello';
-      document.title = 'iSharded assistant';
+      $('answers-line').hidden = true;
+      $('answers-line').replaceChildren();
+      document.querySelector('[data-panel=manage]').hidden = true;
+      if (state.panel === 'manage') choosePanel('approvals');
+      if ($('ask').open) $('ask').close();
+      if ($('why').open) $('why').close();
       showCount(0);
+      paintState();
+      document.title = 'iSharded assistant';
     }
 
     function askForKey(problem) {
@@ -196,9 +292,11 @@
       text.split(/(```[\s\S]*?(?:```|$))/g).forEach(part => {
         if (!part) return;
         if (part.startsWith('```')) {
-          const block = make('pre');
-          block.append(make('code', '', part.replace(/^```[^\n]*\n?/, '').replace(/```$/, '')));
-          container.append(block);
+          const code = part.replace(/^```[^\n]*\n?/, '').replace(/```$/, '');
+          const block = make('pre'), holder = make('div', 'code');
+          block.append(make('code', '', code));
+          holder.append(block, copyButton(() => code));
+          container.append(holder);
         } else {
           for (const paragraph of part.replace(/^\n+|\n+$/g, '').split(/\n{2,}/)) if (paragraph) container.append(make('p', '', paragraph));
         }
@@ -217,16 +315,27 @@
 
     function addReceipt(turn, details) {
       const receipt = make('div', 'receipt');
-      receipt.append(make('span', '', details.model ? `${details.model} via ${details.provider}` : 'no model answered'));
-      receipt.append(tag(`reach ${details.reach}`));
-      if (details.tainted) receipt.append(tag('read untrusted text', 'warn'));
-      if (details.tools?.length) receipt.append(tag(`used ${details.tools.join(', ')}`, 'work'));
-      if (details.status === 'task') receipt.append(tag(`task ${details.task}`, 'work'));
-      if (details.status === 'awaiting_approval') receipt.append(tag('waiting for you', 'warn'));
-      if (details.status === 'refused') receipt.append(tag('refused', 'bad'));
-      if (details.status === 'failed') receipt.append(tag('failed', 'bad'));
+      receipt.append(make('span', '', details.model ? `Answered by ${modelName(details.model)} via ${details.provider}.` : 'No model answered.'));
+      receipt.append(tag(`Reach ${details.reach}`));
+      if (details.tainted) receipt.append(tag('Read untrusted text', 'warn', 'warn'));
+      if (details.tools?.length) receipt.append(tag(`Used ${details.tools.join(', ')}`));
+      if (details.status === 'task') receipt.append(tag(`Task ${details.task}`, 'work'));
+      if (details.status === 'awaiting_approval') receipt.append(tag('Waiting for you', 'warn', 'warn'));
+      if (details.status === 'refused') receipt.append(tag('Refused', 'bad', 'bad'));
+      if (details.status === 'failed') receipt.append(tag('Failed', 'bad', 'bad'));
       if (details.turn) receipt.append(button('What did it see?', 'link', () => showWhy(details.turn)));
       turn.append(receipt);
+    }
+
+    function addFailure(turn, message, text) {
+      const failure = make('div', 'failure');
+      failure.append(glyph('bad'), make('span', '', message));
+      failure.append(button('Edit and send again', 'btn small', () => {
+        $('input').value = text;
+        $('input').dispatchEvent(new Event('input'));
+        $('input').focus();
+      }));
+      turn.append(failure);
     }
 
     async function send(text) {
@@ -235,7 +344,7 @@
       addTurn('user').body.textContent = text;
       const reply = addTurn('assistant');
       const waiting = make('span', 'waiting');
-      waiting.append(make('i', 'glyph work tone-work'), make('span', '', 'Working on it'));
+      waiting.append(glyph('work'), make('span', '', 'Working on it'));
       reply.body.append(waiting);
       scrollDown();
       let answer = '', details = null;
@@ -246,7 +355,7 @@
           body: JSON.stringify({ messages: [{ role: 'user', content: text }], stream: true, conversation_id: state.conversation }),
         });
         if (response.status === 401) { askForKey('That key was not accepted.'); throw new Error('Sign in first'); }
-        if (!response.ok) throw new Error(`Request failed with HTTP ${response.status}`);
+        if (!response.ok) throw new Error(await refusal(response));
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
@@ -266,17 +375,19 @@
           }
         }
         if (!answer) waiting.remove();
+        if (details && !details.model && ['failed', 'refused'].includes(details.status)) { reply.body.replaceChildren(); addFailure(reply.turn, named(answer) || 'No model answered.', text); }
         if (details) addReceipt(reply.turn, details);
         if (details?.pending_approval) { await refreshApprovals(); showPanel('approvals'); }
         if (details?.status === 'task') showPanel('tasks');
       } catch (error) {
         waiting.remove();
-        reply.turn.append(make('p', 'failure', error.message));
+        if (state.key) addFailure(reply.turn, error instanceof TypeError ? 'The connection to the assistant dropped. Whatever arrived is above. Check that it is still running, then send this again.' : named(error.message), text);
       } finally {
         state.busy = false;
-        $('send').disabled = false;
+        paintState();
         scrollDown();
         if (state.panel === 'memory') refreshMemory().catch(() => {});
+        if (state.panel === 'manage') readPart(partNamed('answers'));
       }
     }
 
@@ -286,20 +397,19 @@
       $('why').showModal();
       try {
         const record = await api(`/assistant/why/${encodeURIComponent(turn)}`);
-        const who = [...new Set(record.answered_by.map(row => `${row.model} via ${row.provider}`))].join(', ') || 'nobody';
+        const who = [...new Set(record.answered_by.map(row => `${modelName(row.model)} via ${row.provider}`))].join(', ') || 'nobody';
         const summary = make('div', 'tags');
-        summary.append(make('span', 'card-note', `Answered by ${who}`), tag(`reach ${record.reach}`), tag(`${record.tokens} of ${record.budget} tokens`));
-        if (record.tainted) summary.append(tag('read untrusted text', 'warn'));
+        summary.append(make('span', 'card-note', `Answered by ${who}.`), tag(`Reach ${record.reach}`), tag(`${whole(record.tokens)} of ${whole(record.budget)} tokens`));
+        if (record.tainted) summary.append(tag('Read untrusted text', 'warn', 'warn'));
         body.replaceChildren(summary);
         for (const [title, rows] of [['Seen', record.seen], ['Left out for space', record.left_out]]) {
           if (!rows.length) continue;
           body.append(make('h3', '', title));
           for (const row of rows) {
-            const card = make('div', 'card');
-            const line = make('div', 'tags');
-            line.append(tag(row.trust, trustTone(row.trust)), tag(row.reach), make('span', 'card-note', `${row.source}: ${row.source_id}`));
-            card.append(line, make('div', 'card-text', row.text === null ? '(no longer held)' : row.text.slice(0, 600)));
-            body.append(card);
+            const line = make('div', 'tags'), item = make('div', 'why-row');
+            line.append(trustTag(row.trust), tag(`Reach ${row.reach}`), make('span', 'card-note', `${row.source}: ${row.source_id}`));
+            item.append(line, make('div', 'card-text', row.text === null ? '(no longer held)' : row.text.slice(0, 600)));
+            body.append(item);
           }
         }
       } catch (error) {
@@ -308,10 +418,12 @@
     }
 
     function showCount(total) {
+      state.waiting = total;
       for (const id of ['approval-count', 'toggle-count']) {
         $(id).hidden = !total;
         $(id).textContent = total;
       }
+      paintState();
     }
 
     async function refreshApprovals() {
@@ -325,12 +437,17 @@
       const panel = $('panel-approvals');
       panel.replaceChildren();
       if (!approvals.length) { panel.append(note('Nothing is waiting for you. When an action needs your say, it stops here, and nothing runs until you decide.')); return; }
-      for (const item of approvals) {
-        const card = make('div', 'card');
-        card.append(make('strong', '', item.capability), make('div', 'card-note', item.reason));
-        card.append(make('pre', 'arguments', JSON.stringify(item.arguments, null, 2)));
-        if (item.user && item.user.startsWith('peer:')) card.append(tag('asked by another install', 'warn'));
-        const row = make('div', 'card-actions');
+      const needs = make('div', 'needs warn');
+      needs.append(make('h2', '', 'Waiting for you'));
+      approvals.forEach((item, index) => {
+        const issue = make('div', 'issue'), body = make('div', 'issue-body');
+        body.append(make('b', '', state.abilities[item.capability]?.summary || item.capability), make('p', '', item.reason));
+        const exact = make('details', 'more');
+        exact.open = true;
+        exact.append(make('summary', '', `The exact action: ${item.capability}`), make('pre', 'arguments', JSON.stringify(item.arguments, null, 2)));
+        body.append(exact);
+        if (item.user && item.user.startsWith('peer:')) body.append(tag('Asked by another install', 'warn', 'warn'));
+        const row = make('div', 'issue-actions');
         const decide = approve => async () => {
           row.querySelectorAll('button').forEach(other => { other.disabled = true; });
           try {
@@ -341,34 +458,43 @@
               addReceipt(reply.turn, outcome.turn);
               scrollDown();
             }
+            say(approve ? 'Approved' : 'Declined');
           } catch (error) {
-            card.append(make('p', 'error', error.message));
+            body.append(make('p', 'error', error.message));
             row.querySelectorAll('button').forEach(other => { other.disabled = false; });  // it is still waiting
           }
           await refreshApprovals();
+          keepFocus(document.querySelector('[data-panel=approvals]'));
         };
-        row.append(button('Decline', 'btn small', decide(false)), button('Approve this exact action', 'btn small primary', decide(true)));
-        card.append(row);
-        panel.append(card);
-      }
+        row.append(button('Approve this exact action', `btn small ${index ? '' : 'primary'}`, decide(true)), button('Decline', 'btn small', decide(false)));
+        body.append(row);
+        issue.append(glyph('warn'), body);
+        needs.append(issue);
+      });
+      panel.append(needs);
     }
+
+    // The control that held focus can go with what it acted on.
+    const keepFocus = element => { if (document.activeElement === document.body) element.focus(); };
 
     function memoryCard(row, onChange) {
       const card = make('div', 'card');
       card.append(make('div', 'card-text', row.text));
       const tags = make('div', 'tags');
-      tags.append(tag(row.trust, trustTone(row.trust)), tag(row.kind), tag(`reach ${row.reach}`));
-      card.append(tags, make('div', 'card-note', `From ${row.source} (${row.source_id}), by ${row.author}, ${when(row.captured_at)}`));
+      tags.append(trustTag(row.trust), tag(upper(row.kind)), tag(`Reach ${row.reach}`));
+      const from = make('div', 'card-note', `From ${row.source}, by ${modelName(row.author)}, ${relative(row.captured_at)}.`);
+      from.title = `${row.source_id}, ${when(row.captured_at)}`;
+      card.append(tags, from);
       const actions = make('div', 'card-actions');
       if (row.trust === 'model') {
-        actions.append(button('This is right', 'btn small', async () => {
-          try { await api(`/assistant/memory/${row.id}/confirm`, { method: 'POST' }); await onChange(); }
+        actions.append(button('Confirm', 'btn small', async () => {
+          try { await api(`/assistant/memory/${row.id}/confirm`, { method: 'POST' }); say('Confirmed'); await onChange(); }
           catch (error) { card.append(make('p', 'error', error.message)); }
         }));
       }
       const forget = button('Forget', 'btn small', async () => {
         if (forget.dataset.armed !== 'yes') { forget.dataset.armed = 'yes'; forget.textContent = 'Delete for good?'; return; }
-        try { await api(`/assistant/memory/${row.id}`, { method: 'DELETE' }); await onChange(); }
+        try { await api(`/assistant/memory/${row.id}`, { method: 'DELETE' }); say('Forgotten'); await onChange(); keepFocus($('memory-query')); }
         catch (error) { card.append(make('p', 'error', error.message)); }
       });
       actions.append(forget);
@@ -384,33 +510,37 @@
         list.replaceChildren(...results.map(item => {
           const card = make('div', 'card');
           const tags = make('div', 'tags');
-          tags.append(tag(item.trust, trustTone(item.trust)), tag(`reach ${item.reach}`));
-          card.append(make('div', 'card-text', item.text), tags, make('div', 'card-note', `${item.source_id}, by ${item.author}`));
+          tags.append(trustTag(item.trust), tag(`Reach ${item.reach}`));
+          card.append(make('div', 'card-text', item.text), tags, make('div', 'card-note', `${item.source_id}, by ${modelName(item.author)}`));
           return card;
         }));
-        if (!results.length) list.append(note('Nothing remembered matches that.'));
+        if (!results.length) list.append(note('Nothing remembered matches that. Clear the search to see everything.'));
         return;
       }
       const { memories } = await api('/assistant/memory');
       list.replaceChildren(...memories.map(row => memoryCard(row, refreshMemory)));
-      if (!memories.length) list.append(note('Nothing is remembered yet.'));
+      if (!memories.length) list.append(note('Nothing remembered yet. Say something worth keeping, or add it here.'));
+      if (memories.length >= 100) list.append(note('Showing the latest 100. Search to reach the rest.'));
     }
 
     async function refreshTasks() {
       const { available, tasks } = await api('/assistant/tasks');
+      const shown = JSON.stringify([available, tasks.map(task => [task.id, task.status])]);
+      if (shown === state.tasksShown) return;  // a timer runs this, so the buttons must stay put
+      state.tasksShown = shown;
       const panel = $('panel-tasks');
       panel.replaceChildren();
       if (!available) { panel.append(note('The task engine is not installed, so everything is answered directly.')); return; }
-      if (!tasks.length) { panel.append(note('No tasks yet. Larger pieces of work appear here.')); return; }
+      if (!tasks.length) { panel.append(note('No tasks yet. Ask for something that takes a while.')); return; }
       for (const task of tasks) {
-        const card = make('div', 'card');
-        const tags = make('div', 'tags');
-        tags.append(tag(task.status, TONE[task.status]), make('span', 'card-note', when(task.created_at)));
-        card.append(make('strong', '', task.title), tags, make('div', 'card-note', task.id));
+        const card = make('div', 'card'), head = make('div', 'card-head');
+        const mark = TASK_MARK[task.status] || 'idle';
+        head.append(make('span', 'card-title', task.title), tag(upper(task.status), { warn: 'warn', bad: 'bad', work: 'work' }[mark], mark));
+        card.append(head, make('div', 'card-note', `Started ${relative(task.created_at)}. Task ${task.id}`));
         if (!ENDED.includes(task.status)) {
           const row = make('div', 'card-actions');
           row.append(button('Cancel', 'btn small', async () => {
-            try { await api(`/assistant/tasks/${encodeURIComponent(task.id)}/cancel`, { method: 'POST' }); await refreshTasks(); }
+            try { await api(`/assistant/tasks/${encodeURIComponent(task.id)}/cancel`, { method: 'POST' }); say('Cancelled'); await refreshTasks(); }
             catch (error) { card.append(make('p', 'error', error.message)); }
           }));
           card.append(row);
@@ -425,7 +555,7 @@
       for (const row of rows) {
         if (row.role === 'user') addTurn('user').body.textContent = row.content;
         if (row.role === 'assistant') renderText(addTurn('assistant').body, row.content);
-        if (row.role === 'notice') addTurn('assistant').body.append(make('p', 'quiet-text', row.content));
+        if (row.role === 'notice') addTurn('assistant').body.append(make('p', 'quiet-text', named(row.content)));
       }
       scrollDown();
     }
@@ -437,41 +567,562 @@
       state.conversation = id;
       session.set('assistant-conversation', id);
       showConversation(messages);
+      if (state.panel === 'history') refreshHistory().catch(() => {});
+    }
+
+    // The list gives only dates, so a row's title is the first thing said. Twenty is plenty to find one.
+    async function titleOf(id) {
+      if (!state.titles.has(id)) {
+        const { messages } = await api(`/assistant/conversations/${encodeURIComponent(id)}`);
+        const first = messages.find(row => row.role === 'user');
+        if (first) state.titles.set(id, first.content.split('\n')[0].slice(0, 80));
+      }
+      return state.titles.get(id);
     }
 
     async function refreshHistory() {
       const { conversations } = await api('/assistant/conversations');
       const panel = $('panel-history');
       panel.replaceChildren();
-      if (!conversations.length) { panel.append(note('Nothing has been said yet.')); return; }
-      for (const row of conversations) {
+      if (!conversations.length) { panel.append(note('Earlier conversations appear here.')); return; }
+      conversations.forEach((row, index) => {
         const card = make('div', 'card');
-        card.append(button(when(row.last_at), 'open-conversation', () => openConversation(row.conversation_id).catch(error => card.append(make('p', 'error', error.message)))));
-        card.append(make('div', 'card-note', `${row.messages} messages${row.conversation_id === state.conversation ? ', open now' : ''}`));
+        const open = button(when(row.last_at), 'open-conversation', () => openConversation(row.conversation_id).catch(error => card.append(make('p', 'error', error.message))));
+        if (row.conversation_id === state.conversation) open.setAttribute('aria-current', 'true');
+        card.append(open, make('div', 'card-note', `${count(row.messages, 'message')}, ${relative(row.last_at)}${row.conversation_id === state.conversation ? ', open now' : ''}`));
         panel.append(card);
-      }
+        if (index < 20) titleOf(row.conversation_id).then(title => { if (title) open.textContent = title; }).catch(() => {});
+      });
     }
 
     async function refreshAudit() {
       const { entries, intact } = await api('/assistant/audit?limit=100&newest=true');
       const panel = $('panel-audit');
       panel.replaceChildren();
-      const status = make('div', 'tags');
-      status.append(tag(intact ? 'the record is intact' : 'the record was changed', intact ? 'ok' : 'bad'));
+      const status = make('p', `audit-state ${intact ? 'tone-ok' : 'tone-bad'}`);
+      if (!intact) status.append(glyph('bad'));
+      status.append(intact ? 'The audit trail is intact.' : 'The audit trail has been altered. Stop and check the entries below.');
       panel.append(status);
       if (state.role !== 'owner') panel.append(note('Showing your own actions. Only the owner sees the whole record.'));
       for (const row of entries.slice().reverse()) {
-        panel.append(make('div', 'audit-line', `${when(row.at)}  ${row.actor}  ${row.action}  ${row.subject}`));
+        const line = make('div', 'audit-line');
+        const time = make('time', '', relative(row.at));
+        time.title = when(row.at);
+        line.append(make('b', '', row.action), time, make('span', '', named([row.actor, row.subject].filter(Boolean).join(', '))));
+        panel.append(line);
       }
       if (!entries.length) panel.append(note('Nothing recorded yet.'));
     }
 
-    const panels = { approvals: refreshApprovals, memory: refreshMemory, tasks: refreshTasks, history: refreshHistory, audit: refreshAudit };
-    function showPanel(name) {
+    // Manage: one sheet asks for everything, so a new action is a list of fields.
+
+    function field(spec, values) {
+      const box = make('label', spec.kind === 'check' ? 'switch' : 'field');
+      let input;
+      if (spec.kind === 'check') {
+        input = make('input');
+        input.type = 'checkbox';
+        input.checked = Boolean(spec.value);
+        box.append(input, make('i'), spec.label);
+      } else {
+        input = make(spec.kind === 'area' ? 'textarea' : spec.kind === 'select' ? 'select' : 'input', spec.kind === 'select' ? 'select' : 'input');
+        if (spec.kind === 'area') input.rows = 4;
+        if (spec.kind === 'number') { input.type = 'number'; input.min = spec.min ?? 0; input.step = 'any'; }
+        for (const [value, text] of spec.options || []) { const option = make('option', '', text); option.value = value; input.append(option); }
+        if (spec.value !== undefined) input.value = spec.value;
+        input.required = Boolean(spec.required);
+        input.autocomplete = 'off';
+        if (spec.placeholder) input.placeholder = spec.placeholder;
+        box.append(spec.label, input);
+      }
+      if (spec.hint) box.append(make('span', 'field-hint', spec.hint));
+      if (spec.onChange) input.addEventListener('change', () => spec.onChange(input.value, values));
+      values[spec.key] = input;
+      return box;
+    }
+
+    function ask({ title, text, body = [], fields = [], yes, danger, done, run }) {
+      const inputs = {};
+      $('ask-title').textContent = title;
+      $('ask-text').hidden = !text;
+      $('ask-text').textContent = text || '';
+      $('ask-fields').replaceChildren(...body, ...fields.map(spec => field(spec, inputs)));
+      $('ask-error').hidden = true;
+      $('ask-yes').hidden = !yes;
+      $('ask-yes').textContent = yes || '';
+      $('ask-yes').className = `btn ${danger ? 'danger' : 'primary'}`;
+      $('ask-no').textContent = yes ? 'Cancel' : 'Close';
+      state.answer = async () => {
+        const values = Object.fromEntries(Object.entries(inputs).map(([key, input]) => [key, input.type === 'checkbox' ? input.checked : input.value.trim()]));
+        const shown = await run(values);
+        if (done) say(done);
+        if (!shown) { $('ask').close(); return; }
+        $('ask-text').hidden = true;  // something shown once stays until the person has taken it
+        $('ask-fields').replaceChildren(shown);
+        $('ask-yes').hidden = true;
+        $('ask-no').textContent = 'Close';
+      };
+      for (const spec of fields) if (spec.onChange) spec.onChange(inputs[spec.key].value, inputs);
+      $('ask').showModal();
+      Object.values(inputs)[0]?.focus();
+    }
+
+    const post = (path, body) => api(path, { method: 'POST', ...(body ? { body: JSON.stringify(body) } : {}) });
+    const quote = encodeURIComponent;
+    const worded = list => list.length > 1 ? `${list.slice(0, -1).join(', ')} and ${list.at(-1)}` : list[0];
+    const partNamed = name => PARTS.find(part => part.id === name);
+    const redraw = async name => { await readPart(partNamed(name)); if (document.activeElement === document.body || !document.activeElement) $(`title-${name}`).focus(); };
+
+    function row({ title, state: shown, notes = [], more, actions = [] }) {
+      const card = make('div', 'card'), head = make('div', 'card-head');
+      head.append(make('span', 'card-title', title));
+      if (shown) head.append(shown);
+      card.append(head, ...notes.filter(Boolean).map(line => typeof line === 'string' ? make('div', 'card-note', line) : line));
+      if (more) { const details = make('details', 'more'); details.append(make('summary', '', more[0]), ...more.slice(1)); card.append(details); }
+      if (actions.length) { const line = make('div', 'card-actions'); line.append(...actions); card.append(line); }
+      return card;
+    }
+    const stateTag = ([mark, word]) => tag(word, { warn: 'warn', bad: 'bad', work: 'work' }[mark], mark);
+    const small = (text, action) => button(text, 'btn small', action);
+    // An action on a row: the server's refusal stays on that row, in its own words.
+    const acting = (text, action, done, name) => {
+      const control = small(text, async () => {
+        control.disabled = true;
+        try { await action(); say(done); await redraw(name); }
+        catch (error) { control.disabled = false; control.closest('.card')?.append(make('p', 'error', error.message)); }
+      });
+      return control;
+    };
+
+    function waitingWords() {
+      const words = [];
+      if (state.needs.skills) words.push(count(state.needs.skills, 'skill'));
+      if (state.needs.runs) words.push(count(state.needs.runs, 'code run'));
+      if (state.needs.peers) words.push(count(state.needs.peers, 'peer'));
+      if (state.needs.plugins) words.push(count(state.needs.plugins, 'plugin'));
+      const line = $('manage-summary');
+      if (!line) return;
+      line.replaceChildren();
+      if (state.down.size) line.append(tag(`${worded([...state.down])} ${state.down.size === 1 ? 'is' : 'are'} not answering`, 'bad', 'bad'));
+      if (words.length) line.append(tag(`Waiting for you: ${worded(words)}`, 'warn', 'warn'));
+      if (!state.down.size && !words.length) line.append(tag('Nothing here needs you.'));
+    }
+
+    // What it may do
+
+    async function readGrants(body) {
+      const [{ capabilities }, { grants }] = await Promise.all([api('/assistant/capabilities'), api('/assistant/grants')]);
+      state.abilities = Object.fromEntries(capabilities.map(item => [item.name, item]));
+      const rows = grants.map(item => row({
+        title: state.abilities[item.capability]?.summary || item.capability,
+        state: small('Revoke', () => ask({
+          title: 'Revoke this grant?',
+          text: `${item.capability} stops working for ${item.user} at once.`,
+          yes: 'Revoke', danger: true, done: 'Revoked',
+          run: async () => { await post(`/assistant/grants/${quote(item.id)}/revoke`); await redraw('grants'); },
+        })),
+        notes: [[`${item.capability}${item.scope && item.scope !== '*' ? ` on ${item.scope}` : ''}, for ${item.user}`, item.uses_left === null ? '' : count(item.uses_left, 'use') + ' left', item.expires_at ? `ends ${when(item.expires_at)}` : ''].filter(Boolean).join(', ') + '.'],
+      }));
+      const list = make('details', 'more');
+      list.append(make('summary', '', `Everything it could ask for (${capabilities.length})`), ...capabilities.map(item => row({ title: item.name, notes: [item.summary, item.effects.length ? `Effects: ${item.effects.join(', ')}.` : ''] })));
+      body.replaceChildren(...rows);
+      if (!rows.length) body.append(note('No grants yet, so it can only talk. Add one to let it use a tool.'));
+      body.append(list);
+    }
+
+    function addGrant() {
+      const abilities = Object.values(state.abilities);
+      ask({
+        title: 'Add a grant',
+        text: 'A grant says who, what, and how far. Anything with consequences that untrusted text could have steered still waits for a person.',
+        fields: [
+          { key: 'capability', label: 'What it may do', kind: 'select', options: abilities.map(item => [item.name, `${item.name}: ${item.summary}`]), onChange: (name, inputs) => { inputs.scope.closest('label').hidden = !state.abilities[name]?.scope; } },
+          { key: 'scope', label: 'How far', placeholder: 'A folder or a host', hint: 'Write * for everything, if that is what you mean.' },
+          { key: 'for_user', label: 'For', placeholder: 'You, unless you name someone' },
+          { key: 'hours', label: 'Ends after, in hours', kind: 'number', hint: 'Leave empty to keep it until you revoke it.' },
+          { key: 'uses', label: 'Number of uses', kind: 'number', min: 1, hint: 'Leave empty for no limit.' },
+        ],
+        yes: 'Add grant', done: 'Grant added',
+        run: async values => {
+          await post('/assistant/grants', { capability: values.capability, scope: values.scope || null, for_user: values.for_user || null, expires_in: values.hours ? Number(values.hours) * 3600 : null, uses: values.uses ? Number(values.uses) : null });
+          await redraw('grants');
+        },
+      });
+    }
+
+    // Who answers. The routes are tried in order, so they are drawn as the sequence they are.
+
+    const candidate = text => { const at = String(text).indexOf('/'); return at < 0 ? { provider: text, model: '' } : { provider: text.slice(0, at), model: text.slice(at + 1) }; };
+    function chain(roles, candidates, stats, known) {
+      const holder = make('div');
+      holder.append(make('p', 'chain-role', upper(worded(roles))));
+      const list = make('div', 'route-list');
+      candidates.forEach((text, index) => {
+        const { provider, model } = candidate(text);
+        const seen = stats.filter(item => item.provider === provider && roles.includes(item.role) && (!model || item.model === model));
+        const runs = seen.reduce((sum, item) => sum + item.runs, 0), worked = seen.reduce((sum, item) => sum + item.successes, 0);
+        const speeds = seen.map(item => item.tokens_per_second).filter(Boolean);
+        const stop = make('div', 'route-stop');
+        stop.append(make('span', 'route-no', index + 1), make('span', 'route-who', model ? `${provider}, ${modelName(model)}` : provider), make('span', 'route-val', speeds.length ? `${num(Math.max(...speeds))} tokens/s, prompt and reply` : ''));
+        stop.append(make('span', 'route-sub', !known.has(provider) ? 'Removed, so it is skipped' : runs ? `${worked} of ${count(runs, 'run')} worked` : 'Not used yet'));
+        list.append(stop);
+      });
+      if (!candidates.length) list.append(note('No model is set for this.'));
+      holder.append(list);
+      return holder;
+    }
+
+    async function readAnswers(body) {
+      const [{ providers }, { stats, routes }] = await Promise.all([api('/assistant/providers'), api('/assistant/models')]);
+      state.routes = routes;
+      state.down.clear();
+      const rows = providers.map(item => {
+        const word = tag('Checking', '', 'work'), problem = make('p', 'error');
+        problem.hidden = true;
+        const check = async () => {
+          const health = await post(`/assistant/providers/${quote(item.name)}/test`).catch(error => ({ up: false, error: error.message }));
+          const fresh = health.up ? tag(health.seconds < 0.1 ? 'Answering' : `Answering in ${num(health.seconds, 1)} s`) : tag('Not answering', 'bad', 'bad');
+          word.replaceChildren(...fresh.childNodes);
+          word.className = fresh.className;
+          problem.hidden = health.up;
+          problem.textContent = health.up ? '' : 'It did not answer. Check that it is running and that this install can reach it.';
+          if (health.up) state.down.delete(item.name); else state.down.add(item.name);
+          waitingWords();
+        };
+        const facts = [`Reach ${item.reach}`, item.model ? modelName(item.model) : '', item.daily_tokens ? `${whole(item.daily_tokens)} tokens a day` : ''].filter(Boolean).join(', ');
+        const card = row({
+          title: item.name, state: word, notes: [`${facts}.`, problem], more: ['Where it is', make('code', 'fingerprint', item.url)],
+          actions: [small('Test', check), small('Remove', () => ask({
+            title: `Remove ${item.name}?`, text: 'Routes that name it stop using it. What it answered stays in the record.', yes: 'Remove', danger: true, done: 'Removed',
+            run: async () => { await api(`/assistant/providers/${quote(item.name)}`, { method: 'DELETE' }); await redraw('answers'); },
+          }))],
+        });
+        check();
+        return card;
+      });
+      const groups = new Map();
+      for (const [role, candidates] of Object.entries(routes)) {
+        const key = JSON.stringify(candidates);
+        groups.set(key, [...(groups.get(key) || []), role]);
+      }
+      body.replaceChildren(...rows);
+      if (!rows.length) body.append(note('No provider yet, so nothing can answer. Add one: a pool, or any OpenAI-compatible server.'));
+      body.append(make('h3', '', 'Tried in this order'));
+      for (const [key, roles] of groups) body.append(chain(roles, JSON.parse(key), stats, new Set(providers.map(item => item.name))));
+    }
+
+    function addProvider() {
+      ask({
+        title: 'Add a provider',
+        text: 'Give where the key is kept, never the key. Nothing here sends a key back to this page.',
+        fields: [
+          { key: 'name', label: 'Name', required: true, placeholder: 'pool' },
+          { key: 'url', label: 'Address', required: true, placeholder: 'http://127.0.0.1:8209' },
+          { key: 'mesh', label: 'This is an iSharded pool', kind: 'check' },
+          { key: 'key_env', label: 'Key in this environment variable' },
+          { key: 'key_file', label: 'Or key in this file' },
+          { key: 'reach', label: 'How far your words may go to reach it', kind: 'select', options: [['', 'Decide from the kind'], ['machine', 'This machine'], ['pool', 'My own pool'], ['peer', "Another owner's install"], ['cloud', 'A third party']] },
+          { key: 'model', label: 'Model', placeholder: 'Leave empty for its default' },
+        ],
+        yes: 'Add provider', done: 'Provider added',
+        run: async values => {
+          await post('/assistant/providers', { name: values.name, url: values.url, mesh: values.mesh, key_env: values.key_env || null, key_file: values.key_file || null, reach: values.reach || null, model: values.model || null });
+          await redraw('answers');
+        },
+      });
+    }
+
+    function changeRoute() {
+      const roles = Object.keys(state.routes || {});
+      ask({
+        title: 'Change who answers',
+        text: 'They are tried from the top. Write one per line, as PROVIDER or PROVIDER/MODEL.',
+        fields: [
+          { key: 'role', label: 'For', kind: 'select', options: roles.map(role => [role, upper(role)]), value: roles[0], onChange: (role, inputs) => { inputs.candidates.value = state.routes[role].join('\n'); } },
+          { key: 'candidates', label: 'Tried in this order', kind: 'area', required: true, value: (state.routes?.[roles[0]] || []).join('\n') },
+        ],
+        yes: 'Change route', done: 'Route changed',
+        run: async values => {
+          await api(`/assistant/routes/${quote(values.role)}`, { method: 'PUT', body: JSON.stringify({ candidates: values.candidates.split('\n').map(line => line.trim()).filter(Boolean) }) });
+          await redraw('answers');
+        },
+      });
+    }
+
+    // Skills. Rolling back has a command and no route here yet. When /assistant/skills/{name}/rollback
+    // lands, it is one more acting() on an active version, and the hint below goes.
+
+    function skillRow(item) {
+      const path = `/assistant/skills/${quote(item.id)}`;
+      const waiting = item.state === 'candidate';
+      const actions = [];
+      if (waiting) {
+        actions.push(small('Test it', async event => {
+          const control = event.currentTarget;
+          control.disabled = true;
+          control.textContent = 'Testing';
+          try {
+            const report = await post(`${path}/evaluate`);
+            say(report.eligible ? `Passed ${report.own_passed} of ${report.own_total}, and it can be promoted` : `Passed ${report.own_passed} of ${report.own_total}, so it cannot be promoted yet`);
+            await redraw('skills');
+          } catch (error) { control.disabled = false; control.textContent = 'Test it'; control.closest('.card')?.append(make('p', 'error', error.message)); }
+        }));
+        actions.push(acting('Promote', () => post(`${path}/promote`), 'Promoted', 'skills'));
+      }
+      if (waiting || item.state === 'active') {
+        actions.push(small('Reject', () => ask({
+          title: `Reject ${item.label}?`,
+          text: item.state === 'active' ? 'If it replaced an earlier version, that version comes back.' : 'This turns it down for good.',
+          fields: [{ key: 'reason', label: 'Why', placeholder: 'For the record' }], yes: 'Reject', danger: true, done: 'Rejected',
+          run: async values => { await post(`${path}/reject`, { reason: values.reason }); await redraw('skills'); },
+        })));
+      }
+      const mark = waiting ? ['warn', 'Candidate'] : item.state === 'active' ? ['active', 'Active'] : ['idle', upper(item.state)];
+      return row({
+        title: item.label, state: stateTag(mark),
+        notes: [`For ${item.task_type}, ${item.trust} trust, written by ${item.author}.`, item.source_tainted ? tag('Learned from untrusted text', 'warn', 'warn') : null, item.reason ? `Reason: ${item.reason}` : ''],
+        more: ['Instructions', make('div', 'card-text', item.instructions)], actions,
+      });
+    }
+
+    async function readSkills(body) {
+      const { skills } = await api('/assistant/skills');
+      const live = skills.filter(item => ['candidate', 'active'].includes(item.state)).sort((a, b) => (a.state === 'candidate' ? 0 : 1) - (b.state === 'candidate' ? 0 : 1));
+      const past = skills.filter(item => !live.includes(item));
+      state.needs.skills = skills.filter(item => item.state === 'candidate').length;
+      body.replaceChildren(...live.map(skillRow));
+      if (past.length) { const earlier = make('details', 'more'); earlier.append(make('summary', '', `Earlier versions (${past.length})`), ...past.map(skillRow)); body.append(earlier); }
+      if (!skills.length) body.append(note('No skills yet. After a task, `isharded assistant skill reflect TASK` drafts one from it.'));
+      else body.append(note('To go back to the previous version, run `isharded assistant skill rollback NAME`.'));
+    }
+
+    // Plugins
+
+    async function readPlugins(body) {
+      const { plugins } = await api('/assistant/plugins');
+      state.needs.plugins = plugins.filter(item => !item.enabled).length;
+      body.replaceChildren(...plugins.map(item => row({
+        title: item.name, state: item.enabled ? tag('On') : tag('Turned off', 'warn', 'warn'),
+        notes: [`${item.protocol === 'mcp' ? 'MCP server' : 'Plugin'}, added by ${item.installed_by}, ${relative(item.installed_at)}.`, item.disabled_reason || ''],
+        actions: [small('Remove', () => ask({
+          title: `Remove ${item.name}?`, text: 'Its tools stop at once, and grants for them no longer do anything.', yes: 'Remove', danger: true, done: 'Removed',
+          run: async () => { await api(`/assistant/plugins/${quote(item.name)}`, { method: 'DELETE' }); await redraw('plugins'); },
+        }))],
+      })));
+      if (!plugins.length) body.append(note('No plugins yet. A plugin or an MCP server gives it new tools.'));
+    }
+
+    function addPlugin() {
+      ask({
+        title: 'Add a plugin',
+        text: 'Its programs run on this machine as this user, so adding one is trusting its code.',
+        fields: [
+          { key: 'manifest', label: 'Manifest file on this machine', required: true },
+          { key: 'effects', label: 'What its tools can do', placeholder: 'read, write', hint: 'Comma separated. This overrides the manifest.' },
+          { key: 'env', label: 'Environment variables to pass', placeholder: 'SAMPLE_TOKEN', hint: 'By name, comma separated. Values are never stored.' },
+        ],
+        yes: 'Add plugin', done: 'Plugin added',
+        run: async values => {
+          const list = text => text.split(',').map(word => word.trim()).filter(Boolean);
+          await post('/assistant/plugins', { manifest: values.manifest, effects: list(values.effects).length ? list(values.effects) : null, env: list(values.env) });
+          await redraw('plugins');
+        },
+      });
+    }
+
+    // Code runs
+
+    async function showRun(item) {
+      const shown = await api(`/assistant/code/runs/${quote(item.id)}`);
+      const tests = shown.tests.map(test => `${test.round ? `Round ${test.round}` : 'Before any change'}: ${test.timed_out ? 'ran out of time' : `exit ${test.exit_code}`}`).join('. ');
+      ask({ title: item.goal, body: [make('p', 'card-note', tests ? `${tests}.` : 'No tests have run.'), make('pre', 'diff', shown.diff || 'No change has been made yet.')] });
+    }
+
+    async function readRuns(body) {
+      const { runs } = await api('/assistant/code/runs');
+      // A run that hit a problem part way keeps its working state, and stays there until someone resumes it.
+      const runState = item => item.problem && !['committed', 'pushed', 'rejected', 'stopped'].includes(item.state) ? ['warn', 'Waiting to resume'] : RUN_STATE[item.state] || ['idle', upper(item.state)];
+      state.needs.runs = runs.filter(item => runState(item)[0] === 'warn').length;
+      body.replaceChildren(...runs.map(item => {
+        const path = `/assistant/code/runs/${quote(item.id)}`;
+        const actions = [small('Show the change', () => showRun(item).catch(error => say(error.message)))];
+        if (item.state === 'ready') {
+          actions.push(small('Commit', () => ask({
+            title: 'Commit this change?', text: `It lands on ${item.branch}. Nothing is pushed.`,
+            fields: [{ key: 'message', label: 'Commit message', placeholder: 'Leave empty for the run\'s own' }], yes: 'Commit', done: 'Committed',
+            run: async values => { await post(`${path}/approve`, { message: values.message || null }); await redraw('runs'); },
+          })));
+          actions.push(small('Reject', () => ask({
+            title: 'Reject this change?', text: 'The run ends and its change is dropped.', fields: [{ key: 'reason', label: 'Why', placeholder: 'For the record' }], yes: 'Reject', danger: true, done: 'Rejected',
+            run: async values => { await post(`${path}/reject`, { reason: values.reason }); await redraw('runs'); },
+          })));
+        }
+        return row({
+          title: item.goal, state: stateTag(runState(item)),
+          notes: [`Round ${item.round} of ${item.max_rounds}, branch ${item.branch}.`, named(item.note), item.problem ? tag(named(item.problem), 'warn') : null, ...item.warnings.map(line => tag(line, 'warn', 'warn'))],
+          actions,
+        });
+      }));
+      if (!runs.length) body.append(note('No code runs yet. Start one with `isharded assistant code start`.'));
+    }
+
+    // Peers. A pairing is between two owners, and each compares fingerprints with the other.
+
+    function peerRow(item) {
+      const path = `/assistant/peers/${quote(item.name)}`;
+      const actions = [];
+      if (item.state === 'awaiting_owner') {
+        actions.push(small('Approve', () => ask({
+          title: `Pair with ${item.name}?`,
+          text: 'Compare this fingerprint with the other owner over something you trust, like a call. If it differs, do not pair.',
+          body: [make('code', 'shown-once', item.fingerprint)], yes: 'They match, so pair', done: 'Paired',
+          run: async () => { await post(`${path}/approve`, { fingerprint: item.fingerprint }); await redraw('peers'); },
+        })));
+      }
+      if (item.state === 'awaiting_peer') actions.push(acting('Check again', () => post(`${path}/approve`, {}), 'Checked', 'peers'));
+      if (item.state !== 'revoked') {
+        actions.push(small('Revoke', () => ask({
+          title: `Revoke ${item.name}?`, text: 'Nothing passes between you from now on. To work together again takes a new invite.', yes: 'Revoke', danger: true, done: 'Revoked',
+          run: async () => { await post(`${path}/revoke`); await redraw('peers'); },
+        })));
+      }
+      return row({
+        title: item.name, state: stateTag(PEER_STATE[item.state] || ['idle', upper(item.state)]),
+        notes: [make('code', 'fingerprint', item.fingerprint), item.offered?.length ? `You offer ${item.offered.join(', ')}.` : '', item.their_offers?.length ? `They offer ${item.their_offers.join(', ')}.` : ''],
+        actions,
+      });
+    }
+
+    async function readPeers(body) {
+      const { fingerprint, peers } = await api('/assistant/peers');
+      state.needs.peers = peers.filter(item => item.state === 'awaiting_owner').length;
+      const own = make('div', 'card-note', 'This install\'s fingerprint: ');
+      own.append(make('code', 'fingerprint', fingerprint));
+      body.replaceChildren(own, ...peers.map(peerRow));
+      if (!peers.length) body.append(note('No peers yet. Invite another owner, or accept their invite.'));
+    }
+
+    function invitePeer() {
+      ask({
+        title: 'Invite another owner',
+        text: 'This makes a one-time code. Give it to them yourself, and compare fingerprints when they answer.',
+        fields: [
+          { key: 'name', label: 'What to call them here' },
+          { key: 'address', label: 'Where they can reach this install', placeholder: 'http://host:port', hint: 'Needed the first time. It is remembered.' },
+          { key: 'minutes', label: 'Good for, in minutes', kind: 'number', value: 15, min: 1 },
+        ],
+        yes: 'Make the code', done: 'Invite made',
+        run: async values => {
+          const { code } = await post('/assistant/peers/invite', { name: values.name || null, address: values.address || null, ...(values.minutes ? { minutes: Number(values.minutes) } : {}) });
+          const shown = make('div', 'panel');
+          shown.append(make('p', 'card-note', 'This is shown once.'), make('code', 'shown-once', code), copyButton(() => code));
+          await readPart(partNamed('peers'));
+          return shown;
+        },
+      });
+    }
+
+    function acceptPeer() {
+      ask({
+        title: 'Accept an invite',
+        text: 'They still have to approve before anything works.',
+        fields: [
+          { key: 'code', label: 'Their code', kind: 'area', required: true },
+          { key: 'name', label: 'What to call them here' },
+          { key: 'address', label: 'Where they can reach this install', placeholder: 'http://host:port' },
+        ],
+        yes: 'Accept', done: 'Invite accepted',
+        run: async values => { await post('/assistant/peers/accept', { code: values.code, name: values.name || null, address: values.address || null }); await redraw('peers'); },
+      });
+    }
+
+    // A part reads from one route. A 404 means it is not installed, so it does not show. A new
+    // part, like the identity routes when they land, is one more row here with one read function.
+    const PARTS = [
+      { id: 'grants', title: 'What it may do', read: readGrants, tools: [['Add a grant', addGrant]] },
+      { id: 'answers', title: 'Who answers', read: readAnswers, tools: [['Add a provider', addProvider], ['Change who answers', changeRoute]] },
+      { id: 'skills', title: 'Skills', read: readSkills, tools: [] },
+      { id: 'plugins', title: 'Plugins', read: readPlugins, tools: [['Add a plugin', addPlugin]] },
+      { id: 'runs', title: 'Code runs', read: readRuns, tools: [] },
+      { id: 'peers', title: 'Peers', read: readPeers, tools: [['Invite', invitePeer], ['Accept an invite', acceptPeer]] },
+    ];
+
+    function buildManage() {
+      const head = make('div', 'manage-head'), jump = make('nav', 'jump');
+      const summary = make('div', 'tags');
+      summary.id = 'manage-summary';
+      jump.setAttribute('aria-label', 'Parts of Manage');
+      head.append(summary, jump);
+      $('panel-manage').replaceChildren(head);
+      for (const part of PARTS) {
+        const section = make('section', 'part'), top = make('div', 'section-head'), title = make('h2', '', part.title), tools = make('div', 'head-tools'), body = make('div', 'panel');
+        section.id = `part-${part.id}`;
+        title.id = `title-${part.id}`;
+        title.tabIndex = -1;
+        section.setAttribute('aria-labelledby', title.id);
+        tools.append(...part.tools.map(([label, action]) => small(label, action)));
+        top.append(title, tools);
+        section.append(top, body);
+        const link = button(part.title, 'link', () => { section.scrollIntoView(); title.focus(); });
+        link.id = `jump-${part.id}`;
+        jump.append(link);
+        $('panel-manage').append(section);
+      }
+    }
+
+    async function readPart(part) {
+      const section = $(`part-${part.id}`);
+      if (!section) return;
+      const body = section.querySelector('.panel');
+      try {
+        await part.read(body);
+        section.hidden = false;
+        $(`jump-${part.id}`).hidden = false;
+      } catch (error) {
+        if (!state.key) return;
+        section.hidden = error.status === 404;
+        $(`jump-${part.id}`).hidden = error.status === 404;
+        body.replaceChildren(make('p', 'error', error.message), small('Try again', () => readPart(part)));
+      }
+      waitingWords();
+    }
+    const refreshManage = async () => { await Promise.all(PARTS.map(readPart)); };
+
+    const panels = { approvals: refreshApprovals, memory: refreshMemory, tasks: refreshTasks, history: refreshHistory, audit: refreshAudit, manage: refreshManage };
+    function choosePanel(name) {
       state.panel = name;
-      for (const tab of document.querySelectorAll('[data-panel]')) tab.setAttribute('aria-pressed', String(tab.dataset.panel === name));
+      for (const tab of document.querySelectorAll('[data-panel]')) {
+        const chosen = tab.dataset.panel === name;
+        tab.setAttribute('aria-selected', String(chosen));
+        tab.tabIndex = chosen ? 0 : -1;
+      }
       for (const key of Object.keys(panels)) $(`panel-${key}`).hidden = key !== name;
-      panels[name]().catch(error => $(`panel-${name}`).append(make('p', 'error', error.message)));
+      $('workspace').classList.toggle('managing', name === 'manage');
+    }
+    function showPanel(name) {
+      choosePanel(name);
+      if (name === 'tasks') state.tasksShown = null;
+      panels[name]().catch(error => { if (state.key) $(`panel-${name}`).append(make('p', 'error', error.message)); });
+    }
+    function openRail(open) {
+      $('rail').classList.toggle('open', open);
+      $('rail-toggle').setAttribute('aria-expanded', String(open));
+    }
+
+    // Where a reply will come from, or what to do when nothing can answer.
+    async function showAnswers() {
+      const { routes } = await api('/assistant/routes');
+      const first = routes.conversation?.[0], line = $('answers-line');
+      line.replaceChildren();
+      line.hidden = false;
+      if (first) {
+        const { provider, model } = candidate(first);
+        line.textContent = `Replies come from ${model ? `${modelName(model)} via ${provider}` : provider}.`;
+      } else if (state.role === 'owner') {
+        line.append('Nothing can answer yet, because no model is set up. ', button('Add a provider', 'link', () => { openRail(true); showPanel('manage'); addProvider(); }));
+      } else {
+        line.textContent = 'Nothing can answer yet, because no model is set up. Ask the owner to add one.';
+      }
     }
 
     async function start() {
@@ -479,15 +1130,20 @@
       try {
         const me = await api('/assistant/whoami');
         state.role = me.role;
+        state.name = me.assistant;
         $('name').textContent = me.assistant;
         $('who').textContent = `with ${me.user}`;
         $('greeting').textContent = `${me.assistant} is here`;
         document.title = me.assistant;
+        document.querySelector('[data-panel=manage]').hidden = me.role !== 'owner';
+        if (me.role === 'owner') buildManage();
         session.set('assistant-key', state.key);
         if (state.conversation) await openConversation(state.conversation).catch(() => {});
         else newConversation();
+        await api('/assistant/capabilities').then(({ capabilities }) => { state.abilities = Object.fromEntries(capabilities.map(item => [item.name, item])); }).catch(() => {});
         showPanel(state.panel);
         refreshApprovals().catch(() => {});
+        showAnswers().catch(() => {});
       } catch {}
     }
 
@@ -512,7 +1168,7 @@
     $('composer').addEventListener('submit', event => {
       event.preventDefault();
       const text = $('input').value.trim();
-      if (!text || state.busy) return;
+      if (!text || state.busy || state.lost) return;
       $('input').value = '';
       $('input').style.height = '';
       send(text);
@@ -525,6 +1181,16 @@
       $('input').style.height = `${$('input').scrollHeight + 2}px`;
     });
     for (const tab of document.querySelectorAll('[data-panel]')) tab.addEventListener('click', () => showPanel(tab.dataset.panel));
+    $('panel-tabs').addEventListener('keydown', event => {
+      const tabs = [...document.querySelectorAll('[data-panel]')].filter(tab => !tab.hidden);
+      const at = tabs.indexOf(document.activeElement);
+      const to = { ArrowRight: at + 1, ArrowLeft: at - 1, Home: 0, End: tabs.length - 1 }[event.key];
+      if (to === undefined || at < 0) return;
+      event.preventDefault();
+      const tab = tabs[(to + tabs.length) % tabs.length];
+      tab.focus();
+      showPanel(tab.dataset.panel);
+    });
     $('memory-search').addEventListener('submit', event => { event.preventDefault(); refreshMemory().catch(() => {}); });
     $('memory-add').addEventListener('submit', async event => {
       event.preventDefault();
@@ -544,19 +1210,32 @@
       state.opening += 1;
       newConversation();
       showConversation([]);
+      if (state.panel === 'history') refreshHistory().catch(() => {});
     });
     $('sign-out').addEventListener('click', () => askForKey());
     $('why-close').addEventListener('click', () => $('why').close());
-    $('theme-button').addEventListener('click', () => applyTheme(THEMES[(THEMES.indexOf($('theme-button').dataset.choice) + 1) % THEMES.length]));
-    $('rail-toggle').addEventListener('click', () => {
-      const open = $('rail').classList.toggle('open');
-      $('rail-toggle').setAttribute('aria-expanded', String(open));
+    $('ask-no').addEventListener('click', () => $('ask').close());
+    // What opened the sheet can be gone, as Remove is when its row goes.
+    $('ask').addEventListener('close', () => setTimeout(() => keepFocus(document.querySelector('[data-panel=manage]'))));
+    $('ask-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      $('ask-yes').disabled = true;
+      $('ask-error').hidden = true;
+      try { await state.answer(); }
+      catch (error) { $('ask-error').hidden = false; $('ask-error').textContent = error.message; }
+      $('ask-yes').disabled = false;
     });
-    setInterval(() => {
+    $('pill').addEventListener('click', () => { if (state.waiting) { openRail(true); showPanel('approvals'); } });
+    $('theme-button').addEventListener('click', () => applyTheme(THEMES[(THEMES.indexOf($('theme-button').dataset.choice) + 1) % THEMES.length]));
+    $('rail-toggle').addEventListener('click', () => openRail(!$('rail').classList.contains('open')));
+    function poll() {
       if (!state.key || document.hidden) return;
       refreshApprovals().catch(() => {});
       if (state.panel === 'tasks') refreshTasks().catch(() => {});
-    }, 5000);
+      if (state.lost) paintState();
+    }
+    setInterval(poll, 5000);
+    document.addEventListener('visibilitychange', poll);
     applyTheme(document.documentElement.dataset.theme || 'system');
     start();
   </script>

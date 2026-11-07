@@ -5,32 +5,40 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <title>iSharded chat</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%2308738a' d='M6 3h14l-2.4 5H3.6zM8 10h14l-2.4 5H5.6zM4 17h14l-2.4 5H1.6z'/%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%235d737b' d='M6 3h14l-2.4 5H3.6zM8 10h14l-2.4 5H5.6zM4 17h14l-2.4 5H1.6z'/%3E%3C/svg%3E">
   <script>try { const theme = localStorage.getItem('isharded-theme'); if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme; } catch {}</script>
   <style>/* isharded:ui.css */</style>
 </head>
-<body class="chat-page">
+<body class="chat-page pool-chat">
   <a class="skip" href="#prompt">Skip to the message box</a>
   <header class="top">
     <a class="brand" href="/chat"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 3h14l-2.4 5H3.6zM8 10h14l-2.4 5H5.6zM4 17h14l-2.4 5H1.6z"/></svg><span>iSharded</span></a>
     <nav class="tabs" aria-label="Pages"><a href="/chat" aria-current="page">Chat</a><a href="/dashboard">Dashboard</a></nav>
     <div class="model-control">
-      <i class="glyph idle tone-idle" id="light"></i>
       <select class="select" id="modelChoice" aria-label="Which running model answers this chat" hidden></select>
       <button class="model-button" id="modelButton" type="button" aria-haspopup="dialog"><span id="modelLabel">Choose a model</span><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m2.5 4.5 3.5 3.5 3.5-3.5"/></svg></button>
     </div>
     <div class="top-gap"></div>
-    <div class="pill tone-idle" id="pill" role="status" hidden><i class="glyph idle" id="pillGlyph"></i><span id="pillText"></span></div>
+    <div role="status"><a class="state-word" id="pill" href="/dashboard"><i class="glyph work" id="pillGlyph"></i><span id="pillText">Connecting</span></a></div>
     <button class="btn quiet" id="newChat" type="button">New chat</button>
     <button class="icon-btn" id="themeButton" type="button"></button>
     <button class="btn quiet" id="signOut" type="button" hidden>Sign out</button>
   </header>
 
   <div class="workspace">
-    <button class="rail-toggle" id="railToggle" type="button" aria-expanded="false" aria-controls="rail"><span id="railToggleText">Nothing loaded</span><span id="railToggleStrip" style="flex:1;min-width:0"></span><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m2.5 4.5 3.5 3.5 3.5-3.5"/></svg></button>
+    <div class="side-toggles">
+      <button class="rail-toggle" id="chatsToggle" type="button" aria-expanded="false" aria-controls="chats"><span>Conversations</span><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m2.5 4.5 3.5 3.5 3.5-3.5"/></svg></button>
+      <button class="rail-toggle" id="railToggle" type="button" aria-expanded="false" aria-controls="rail"><i class="glyph" id="railGlyph" hidden></i><span>Where this model runs</span><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m2.5 4.5 3.5 3.5 3.5-3.5"/></svg></button>
+    </div>
+    <nav class="chats" id="chats" aria-labelledby="chatsTitle">
+      <h2 id="chatsTitle">Conversations</h2>
+      <label class="search wide" id="chatSearchBox" hidden><span class="sr-only">Find a conversation</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.8-3.8"/></svg><input class="input" id="chatSearch" type="search" placeholder="Find a conversation" autocomplete="off" spellcheck="false"></label>
+      <ul class="chat-list" id="chatList"></ul>
+      <p class="chats-note" id="chatsNote"></p>
+    </nav>
     <main class="conversation">
-      <div class="chat-notices notices" id="notices"></div>
       <div class="log" id="log" role="log" tabindex="0" aria-label="Conversation"><div class="column" id="turns"></div></div>
+      <div class="notices chat-notices" id="notices"></div>
       <form class="composer" id="composer">
         <div class="column box">
           <div class="attachments" id="attachments" hidden></div>
@@ -40,21 +48,30 @@
           <div class="controls">
             <button class="btn quiet small" id="attach" type="button" title="Attach an image for the model to look at" hidden>Add image</button>
             <input class="sr-only" id="imageFile" type="file" accept="image/png,image/jpeg,image/gif,image/bmp" multiple tabindex="-1" aria-hidden="true" hidden>
-            <label class="switch" title="Lets the model reason before it answers, on models that support it"><input type="checkbox" id="thinking"><i></i>Thinking</label>
-            <label>Temperature <input class="num-input" type="number" id="temperature" min="0" max="2" step="0.1" value="0.7"></label>
-            <label>Max tokens <input class="num-input" type="number" id="maxTokens" min="1" max="32768" step="1" value="1024"></label>
+            <button class="btn quiet small settings-toggle" id="settingsToggle" type="button" aria-expanded="false" aria-controls="settings">Reply settings</button>
+            <div class="settings" id="settings">
+              <label class="switch" title="Lets the model reason before it answers, on models that support it"><input type="checkbox" id="thinking"><i></i>Thinking</label>
+              <label>Temperature <input class="num-input" type="number" id="temperature" min="0" max="2" step="0.1" value="0.7"></label>
+              <label>Max tokens <input class="num-input" type="number" id="maxTokens" min="1" max="32768" step="1" value="1024"></label>
+              <button class="btn quiet small" id="toolsButton" type="button" aria-haspopup="dialog">Tools</button>
+            </div>
             <button class="btn primary send" id="send" type="submit">Send</button>
           </div>
         </div>
       </form>
     </main>
-    <aside class="rail" id="rail" tabindex="0" aria-label="Where the model is running"></aside>
+    <aside class="rail" id="rail" tabindex="0" aria-label="Where the model is running">
+      <div id="railHead"></div>
+      <div id="railLine"></div>
+      <div id="railRoute"></div>
+      <div id="railFoot"></div>
+    </aside>
   </div>
 
   <dialog class="sheet" id="picker" aria-labelledby="pickerTitle">
     <form class="sheet-body" id="pickerForm" method="dialog">
       <h2 id="pickerTitle">Load a model</h2>
-      <label class="search" style="max-width:none"><span class="sr-only">Search models</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.8-3.8"/></svg><input class="input" id="catalogSearch" type="search" placeholder="Search the model list" autocomplete="off" spellcheck="false"></label>
+      <label class="search wide"><span class="sr-only">Search models</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.8-3.8"/></svg><input class="input" id="catalogSearch" type="search" placeholder="Search the model list" autocomplete="off" spellcheck="false"></label>
       <div class="scroll-list" id="catalog"></div>
       <label class="field">Or any Hugging Face model, or a folder on this node
         <input class="input" id="customModel" placeholder="Qwen/Qwen3-4B" autocomplete="off" spellcheck="false">
@@ -72,10 +89,10 @@
         </label>
       </div>
       <div class="fields">
-        <label class="field">Entry node, which sees your prompt
+        <label class="field">Entry worker, which sees your prompt
           <select class="select" id="entryWorker"></select>
         </label>
-        <label class="field">Exit node, which sees the reply
+        <label class="field">Exit worker, which sees the reply
           <select class="select" id="exitWorker"></select>
         </label>
       </div>
@@ -87,10 +104,37 @@
     </form>
   </dialog>
 
+  <dialog class="sheet" id="toolsSheet" aria-labelledby="toolsTitle">
+    <form class="sheet-body" id="toolsForm">
+      <h2 id="toolsTitle">Tools the model may ask for</h2>
+      <p>Paste function definitions as JSON, in OpenAI's shape. Nothing runs on its own: when the model asks for a call, you type what it returned.</p>
+      <label class="field">Definitions
+        <textarea class="input code-input" id="toolsText" rows="9" spellcheck="false" placeholder='[{"type": "function", "function": {"name": "get_time", "description": "The time in a city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]'></textarea>
+      </label>
+      <p class="error" id="toolsError" role="alert" hidden></p>
+      <div class="sheet-actions">
+        <button class="btn" type="button" id="toolsCancel">Cancel</button>
+        <button class="btn" type="button" id="toolsClear">Remove tools</button>
+        <button class="btn primary" type="submit">Use these tools</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="sheet narrow" id="forget" aria-labelledby="forgetTitle">
+    <form class="sheet-body" method="dialog">
+      <h2 id="forgetTitle">Delete this conversation?</h2>
+      <p id="forgetText"></p>
+      <div class="sheet-actions">
+        <button class="btn" value="no">Keep it</button>
+        <button class="btn danger" value="yes">Delete</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog class="sheet narrow" id="auth" aria-labelledby="authTitle">
     <form class="sheet-body" id="authForm">
       <h2 id="authTitle">Sign in</h2>
-      <p>This mesh is protected. Your key stays in this browser.</p>
+      <p>Enter this pool's key to chat with it. Your key stays in this browser.</p>
       <label class="field">Key
         <input class="input" id="tokenInput" type="password" autocomplete="current-password">
       </label>
@@ -101,7 +145,7 @@
 
   <dialog class="sheet narrow" id="move" aria-labelledby="moveTitle">
     <form class="sheet-body" method="dialog">
-      <h2 id="moveTitle">Move this reply to another node?</h2>
+      <h2 id="moveTitle">Start this reply again on another node?</h2>
       <p id="moveText"></p>
       <div class="sheet-actions">
         <button class="btn" value="no">Stop the reply</button>
@@ -111,6 +155,8 @@
   </dialog>
 
   <script>
+    /* isharded:ui.js */
+    const { routeModel, drawRouteList, drawRail, glyphHtml, jobRunning: running, modelName, bytes: size, count, num } = UI;
     const $ = id => document.getElementById(id);
     const store = {
       get: key => { try { return localStorage.getItem(key); } catch { return null; } },
@@ -119,23 +165,20 @@
     };
     // What one request can carry. A conversation resends its images on every turn.
     const MOST_IMAGE_BYTES = 10 * 1024 * 1024;
-    const state = { attachments: [], approved: new Set(), token: store.get('isharded-token') || '', status: null, turns: [], streaming: false, abort: null, link: null, selected: '', previewTimer: null, previewId: 0, lastPulse: 0, failures: 0, signedOut: false, members: {}, catalog: null, catalogFailed: false };
-    const TIER = { vram: 'VRAM', unified: 'Unified', ram: 'RAM', disk: 'Disk' };
-    const TIER_ORDER = ['vram', 'unified', 'ram', 'disk'];
+    const MOST_CHATS = 50, CHATS_KEY = 'isharded-chats', TOOLS_KEY = 'isharded-chat-tools';
+    const QUIET_STREAM_MS = 15000, QUIET_NODE_MS = 30000, HELD_MS = 4000, SEAM_MS = 1500;
+    const state = { attachments: [], approved: new Set(), token: store.get('isharded-token') || '', status: null, chats: [], chat: null, turns: [], streaming: false, abort: null, link: null, selected: '', previewTimer: null, previewId: 0, lastPulse: 0, failures: 0, signedOut: false, members: {}, catalog: null, catalogFailed: false, heardAt: performance.now(), lastByte: 0, tools: [], routeAll: false, tab: {}, laneTab: {}, chatsFull: false, joins: 0, joinsAt: 0, joinsHidden: false };
     const PHASE = { resolving: 'Reading the model\'s tensor list', fetching: 'Downloading each worker\'s shards', loading: 'Moving weights into memory' };
     const ICONS = {
       system: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor" stroke="none"/></svg>',
       light: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6 7 7M17 17l1.4 1.4M5.6 18.4 7 17M17 7l1.4-1.4"/></svg>',
       dark: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M20 14.5A8.5 8.5 0 1 1 9.5 4a7 7 0 0 0 10.5 10.5z"/></svg>',
+      drop: '<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="m3 3 6 6M9 3 3 9"/></svg>',
     };
-    // GGUF ids carry a repository and a file; the file names the model and its quantization.
-    const modelName = id => { const text = String(id || ''); if (/\.gguf$/i.test(text)) return text.split(/[:\\/]/).pop().replace(/\.gguf$/i, ''); if (/^([A-Za-z]:[\\/]|[\\/.~])/.test(text)) return text.split(/[\\/]/).filter(Boolean).pop() || text; return text; };
     const esc = value => String(value ?? '').replace(/[&<>'"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[c]));
-    const size = value => { if (!value) return '0 B'; const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']; const i = Math.min(Math.floor(Math.log(value) / Math.log(1024)), 4); return `${(value / 1024 ** i).toFixed(i > 2 ? 2 : 1).replace(/\.0+$/, '')} ${units[i]}`; };
-    const count = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
     const headers = () => state.token ? { Authorization: `Bearer ${state.token}` } : {};
-    const stageLayers = stage => { const start = Number(stage.start_layer), end = Number(stage.end_layer); return end - 1 > start ? `layers ${start}–${end - 1}` : `layer ${start}`; };
     const byName = (a, b) => String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' });
+    const jobRunning = status => running(status?.load_job);
 
     // Repainting a region must not cost the reader their place in it.
     const painted = new WeakMap();
@@ -179,6 +222,78 @@
       return response.json();
     }
 
+    /* Conversations live in this browser, because the pool keeps none. Signing out forgets them. */
+
+    const newChat = () => ({ id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, title: '', at: 0, model: '', turns: [] });
+    function readChats() {
+      let saved = [];
+      try { saved = JSON.parse(store.get(CHATS_KEY) || '[]'); } catch {}
+      state.chats = (Array.isArray(saved) ? saved : []).filter(chat => chat?.id && Array.isArray(chat.turns));
+      for (const turn of state.chats.flatMap(chat => chat.turns)) if (turn.pending) { turn.pending = false; turn.receipt = 'The page closed before this reply finished.'; }
+    }
+    const withoutLive = (key, value) => key === 'live' ? undefined : value;
+    function keepChats() {
+      state.chats.sort((a, b) => b.at - a.at);
+      state.chats.length = Math.min(state.chats.length, MOST_CHATS);
+      const write = chats => { try { localStorage.setItem(CHATS_KEY, JSON.stringify(chats, withoutLive)); return true; } catch { return false; } };
+      // Images fill a browser's storage first, so a full one keeps the words.
+      const plain = () => state.chats.map(chat => ({ ...chat, turns: chat.turns.map(turn => turn.images?.length ? { ...turn, images: [], imagesLeft: turn.images.length } : turn) }));
+      state.chatsFull = !write(state.chats) && !write(plain());
+      renderChats();
+    }
+    function touchChat() {
+      const chat = state.chat, first = chat.turns.find(turn => turn.role === 'user');
+      chat.at = Date.now();
+      chat.model = modelName(currentModel()) || chat.model;
+      chat.title ||= (first?.text || 'An image').replace(/\s+/g, ' ').slice(0, 80);
+      if (!state.chats.includes(chat)) state.chats.push(chat);
+      keepChats();
+    }
+    function openChat(chat) {
+      if (state.abort) state.abort.abort();
+      state.chat = chat; state.turns = chat.turns; state.attachments = [];
+      renderAttachments(); renderTurns(); renderChats(); syncComposer(); renderHealth();
+      closeSides();
+      stickToBottom(true);
+    }
+    function renderChats() {
+      const words = $('chatSearch').value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      const shown = state.chats.filter(chat => { const text = `${chat.title} ${chat.model}`.toLowerCase(); return words.every(word => text.includes(word)); });
+      $('chatSearchBox').hidden = state.chats.length <= 8;
+      paint($('chatList'), shown.map(chat => {
+        const current = chat === state.chat;
+        return `<li class="chat-row"><button class="chat-open" type="button" data-chat="${esc(chat.id)}" data-key="c:${esc(chat.id)}"${current ? ' aria-current="true"' : ''}><span class="chat-title">${esc(chat.title)}</span><span class="chat-meta">${esc(chat.model ? `${chat.model}, ` : '')}${esc(UI.relative(chat.at / 1000))}</span></button><button class="icon-btn chat-drop" type="button" data-forget="${esc(chat.id)}" data-key="d:${esc(chat.id)}" aria-label="Delete ${esc(chat.title)}" title="Delete">${ICONS.drop}</button></li>`;
+      }).join(''));
+      $('chatsNote').textContent = state.chatsFull ? 'This browser has no room left, so new messages are not being kept.' : state.streaming && state.chats.length > 1 ? 'Opening another conversation stops this reply.' : !state.chats.length ? 'Nothing here yet. Conversations stay in this browser, and signing out forgets them.' : words.length && !shown.length ? 'No conversation matches.' : `Kept in this browser, the latest ${MOST_CHATS}.`;
+    }
+    function forgetChat(id) {
+      const chat = state.chats.find(item => item.id === id);
+      if (!chat) return;
+      $('forgetTitle').textContent = 'Delete this conversation?';
+      $('forgetText').textContent = `“${chat.title}” is kept only in this browser, so it cannot be brought back.`;
+      $('forget').returnValue = '';
+      $('forget').showModal();
+      $('forget').addEventListener('close', () => {
+        if ($('forget').returnValue !== 'yes') return;
+        state.chats.splice(state.chats.indexOf(chat), 1);
+        if (chat === state.chat) openChat(newChat());
+        keepChats();
+        closeSides();
+        $('prompt').focus();
+      }, { once: true });
+    }
+    function closeSides() {
+      for (const [panel, toggle] of [['rail', 'railToggle'], ['chats', 'chatsToggle']]) { $(panel).classList.remove('open'); $(toggle).setAttribute('aria-expanded', 'false'); }
+    }
+    function toggleSide(panel, toggle) {
+      const open = !$(panel).classList.contains('open');
+      closeSides();
+      $(panel).classList.toggle('open', open);
+      $(toggle).setAttribute('aria-expanded', String(open));
+    }
+
+    /* A reply */
+
     function inlineMarkdown(text) {
       return text.replace(/`([^`\n]+)`/g, '<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
     }
@@ -205,7 +320,7 @@
       return text.split(/(```[\s\S]*?(?:```|$))/g).map(part => {
         if (!part.startsWith('```')) return renderProse(part);
         const body = part.replace(/^```[^\n]*\n?/, '').replace(/```$/, '');
-        return `<pre><code>${esc(body)}</code></pre>`;
+        return `<div class="code"><button class="btn quiet small" type="button" data-copy>Copy</button><pre><code>${esc(body)}</code></pre></div>`;
       }).join('');
     }
     function splitReasoning(text) {
@@ -214,18 +329,43 @@
       if (text.trimStart().startsWith('<think>')) return { reasoning: text.replace('<think>', '').trim(), answer: '', thinking: true };
       return { reasoning: '', answer: text, thinking: false };
     }
+    // Where the route broke and healed, a reply shows the join, as a route shows its link back.
+    const seamHtml = text => `<p class="seam"><span>${esc(text)}</span></p>`;
+    function answerHtml(turn, answer) {
+      if (!turn.seam) return renderMarkdown(answer);
+      let at = Math.max(turn.seam.at - (turn.text.length - answer.length), 0);
+      if ((answer.slice(0, at).match(/```/g) || []).length % 2) { const close = answer.indexOf('```', at); at = close < 0 ? answer.length : close + 3; }
+      return renderMarkdown(answer.slice(0, at)) + seamHtml(`Paused here for ${num(turn.seam.seconds)} s while the pool repaired the route. The reply carried on from this word.`) + renderMarkdown(answer.slice(at).trimStart());
+    }
+    function callsHtml(turn) {
+      if (!turn.calls?.length) return '';
+      const waiting = turn.calls.some(call => !call.sent) && !turn.pending;
+      const rows = turn.calls.map((call, index) => {
+        let args = call.function.arguments;
+        try { args = JSON.stringify(JSON.parse(args), null, 2); } catch {}
+        return `<div class="tool-call"><b>${esc(call.function.name)}</b><pre><code>${esc(args)}</code></pre>${waiting && !call.sent ? `<label class="field">What it returned<textarea class="input code-input" rows="2" data-result="${index}" spellcheck="false">${esc(call.result || '')}</textarea></label>` : ''}</div>`;
+      }).join('');
+      return `<div class="tool-calls"><p>${turn.calls.length === 1 ? 'The model asked for a tool.' : `The model asked for ${turn.calls.length} tools.`}${waiting ? ' Nothing ran. Type what came back to continue.' : ''}</p>${rows}${waiting ? `<button class="btn small" type="button" data-action="send-results">${turn.calls.length === 1 ? 'Send result' : 'Send results'}</button>` : ''}</div>`;
+    }
     function renderAnswer(turn) {
       const { reasoning, answer, thinking } = splitReasoning(turn.text);
       let html = '';
+      if (turn.moved) html += seamHtml(`This node stopped answering, so the reply started again on ${turn.moved}.`);
+      if (turn.lost) html += `<details class="reasoning"><summary>Show what the first node wrote</summary><div>${esc(turn.lost)}</div></details>`;
       if (reasoning) html += `<details class="reasoning"${thinking ? ' open' : ''}><summary>${thinking ? 'Thinking' : 'Show reasoning'}</summary><div>${esc(reasoning)}</div></details>`;
-      html += answer ? `<div class="answer">${renderMarkdown(answer)}</div>` : (turn.pending && !reasoning ? `<div class="waiting"><i class="glyph work"></i>${esc(turn.waiting || 'Running the prompt through the route')}</div>` : '');
+      if (answer) html += `<div class="answer">${answerHtml(turn, answer)}</div>`;
+      else if (turn.pending && !reasoning && !turn.live?.held) html += `<div class="waiting"><i class="glyph work"></i>Running the prompt through the route</div>`;
+      if (turn.live?.held) html += `<div class="waiting"><i class="glyph work"></i>A stage stopped answering. This reply carries on when the route is repaired.</div>`;
+      html += callsHtml(turn);
+      if (turn.error) html += `<div class="failure" role="alert"><i class="glyph bad"></i><span>${esc(turn.error)}</span><button class="btn small" type="button" data-action="retry">Try again</button></div>`;
+      if (turn.imagesLeft) html += `<div class="receipt">${count(turn.imagesLeft, 'image')} left out, because this browser had no room.</div>`;
       if (turn.notice) html += `<div class="receipt">${esc(turn.notice)}</div>`;
-      if (turn.error) html += `<div class="failure" role="alert">${esc(turn.error)}</div>`;
       if (turn.receipt) html += `<div class="receipt">${esc(turn.receipt)}</div>`;
       return html;
     }
-    const jobRunning = status => { const job = status?.load_job; return Boolean(job) && !['ready', 'failed', 'cancelled'].includes(job.phase); };
-    const workerCount = route => count(route.length, 'worker');
+
+    /* Empty screens */
+
     const liveWorkers = status => Object.values(status?.workers || {}).filter(w => w.live && (w.hardware?.memory_pools || []).length).length;
     function memoryOf(status) {
       const byKind = status?.virtual_hardware?.memory_by_kind || {};
@@ -233,37 +373,34 @@
     }
     const sizeBytes = text => { const match = /([\d.]+)\s*(MB|GB|TB)/i.exec(text || ''); return match ? Number(match[1]) * { MB: 1e6, GB: 1e9, TB: 1e12 }[match[2].toUpperCase()] : 0; };
     function modelRows(models, budget) {
-      return models.map(model => { const big = budget && sizeBytes(model.size) > budget; return `<li><button class="model-row${big ? ' too-big' : ''}" type="button" data-model="${esc(model.id)}" data-key="m:${esc(model.id)}" aria-pressed="${model.id === state.selected}"><span class="id">${esc(modelName(model.id))}</span><span class="meta">${esc(big ? 'Larger than this mesh' : model.kind)}</span><span class="meta">${esc(model.size)}</span></button></li>`; }).join('');
+      return models.map(model => { const big = budget && sizeBytes(model.size) > budget; return `<li><button class="model-row${big ? ' too-big' : ''}" type="button" data-model="${esc(model.id)}" data-key="m:${esc(model.id)}" aria-pressed="${model.id === state.selected}"><span class="id">${esc(modelName(model.id))}</span><span class="meta">${esc(big ? 'Larger than this pool' : model.kind)}</span><span class="meta">${esc(model.size)}</span></button></li>`; }).join('');
     }
+    const greeting = (title, body = '', actions = '') => `<div class="greeting"><h1>${esc(title)}</h1>${body}${actions ? `<div class="greeting-actions">${actions}</div>` : ''}</div>`;
     function firstRun(status) {
       const { byKind, budget } = memoryOf(status), workers = liveWorkers(status);
-      const kinds = TIER_ORDER.filter(kind => byKind[kind]?.budget_bytes);
-      const capacity = kinds.length ? `<div class="ribbon" aria-hidden="true">${kinds.map(kind => `<div class="seg" style="--layers:${byKind[kind].budget_bytes}"><span class="cell"><i class="tier-${kind}"></i></span></div>`).join('')}</div><div class="legend">${kinds.map(kind => `<span class="tier-${kind}"><i></i>${TIER[kind]} <b>${size(byKind[kind].budget_bytes)}</b></span>`).join('')}</div>` : '';
+      const kinds = UI.TIER_ORDER.filter(kind => byKind[kind]?.budget_bytes);
+      const capacity = kinds.length ? `<div class="legend">${kinds.map(kind => `<span><i class="tier-${kind}"></i>${UI.TIER_NAMES[kind]} ${size(byKind[kind].budget_bytes)}</span>`).join('')}</div>` : '';
       const fit = (state.catalog || []).filter(model => !budget || sizeBytes(model.size) <= budget).sort((a, b) => sizeBytes(b.size) - sizeBytes(a.size)).slice(0, 5);
       const list = state.catalogFailed ? '<p class="list-note">The model list could not be read. You can still load a model by name.</p>' : state.catalog ? (fit.length ? `<ul class="model-list">${modelRows(fit, budget)}</ul>` : '<p class="list-note">No listed model fits this memory. You can load a smaller one by name.</p>') : '<p class="list-note">Reading the model list</p>';
-      return `<div class="greeting"><h1>Load a model to start</h1><p>${workers} worker${workers === 1 ? ' is' : 's are'} connected, with ${size(budget)} for weights. Each one downloads only the layers it will run.</p>${capacity}<div class="scroll-list">${list}</div><div class="greeting-actions"><button class="btn primary" type="button" id="emptyPick">See every model</button></div></div>`;
+      return greeting('Nothing is loaded yet', `<p>${count(workers, 'worker')} connected, with ${size(budget)} for weights. Pick a model to see where it would run before anything downloads.</p>${capacity}<div class="scroll-list">${list}</div>`, '<button class="btn primary" type="button" id="emptyPick">See every model</button>');
     }
     function renderEmpty() {
       const status = state.status;
-      if (state.signedOut) return '<div class="greeting"><h1>Signed out</h1><p>Sign in with a key to chat with this mesh.</p><div class="greeting-actions"><button class="btn primary" type="button" id="emptySignIn">Sign in</button></div></div>';
-      if (!status) return state.failures ? '<div class="greeting"><h1>This node is not answering</h1><p>The page keeps trying. Any other node in the mesh can serve this chat.</p></div>' : '<div class="greeting"><h1>Connecting to this node</h1></div>';
-      const ready = status.status === 'ready';
-      if (ready && jobRunning(status)) {
-        const job = status.load_job, serving = status.route || [];
-        const change = job.model === status.model ? `A new layout across ${workerCount(job.route || [])} is being prepared` : `${modelName(job.model)} is being prepared`;
-        return `<div class="greeting"><h1>${esc(modelName(status.model))} is running on ${workerCount(serving)}</h1><p>${esc(change)}. Chat stays on the current layout, which has all its weights, until every new shard is in place.</p></div>`;
-      }
-      if (ready) return `<div class="greeting"><h1>${esc(modelName(status.model))} is ready</h1><p>Send a message to run it across the mesh.</p></div>`;
+      if (state.signedOut) return greeting('Signed out', '<p>Sign in with this pool\'s key to chat with it.</p>', '<button class="btn primary" type="button" id="emptySignIn">Sign in</button>');
+      if (!status) return state.failures ? greeting('This node is not answering', '<p>The page keeps trying. Any other node in the pool can serve this chat.</p>') : greeting('Connecting to this node');
+      const name = modelName(status.model), ready = status.status === 'ready', job = status.load_job, stages = count((status.route || []).length, 'stage');
+      if (ready && jobRunning(status)) return greeting(`Ask ${name} something`, `<p>${esc(job.model === status.model ? 'A new layout is being prepared.' : `${modelName(job.model)} is being prepared beside it.`)} Replies stay on the current route until every shard is in place.</p>`);
+      if (ready) return greeting(`Ask ${name} something`, `<p>It runs on ${stages} across your pool.</p>`);
       if (jobRunning(status)) {
-        const job = status.load_job;
+        if ((status.route || []).length && job.model === status.model) return greeting(`Moving ${name}`);
         const percent = job.bytes_total ? Math.floor(job.bytes_done / job.bytes_total * 100) : 0;
         const bar = job.phase === 'fetching' && job.bytes_total ? `<div class="progress" role="progressbar" aria-label="Load progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><i style="width:${percent}%"></i></div>` : '';
-        return `<div class="greeting"><h1>Loading ${esc(modelName(job.model))}</h1>${bar}<p>${esc(PHASE[job.phase] || job.phase)}${job.phase === 'fetching' && job.bytes_total ? `, ${percent}%` : ''}. Chat opens when every shard is in place.</p></div>`;
+        return greeting(`Loading ${modelName(job.model)}`, `${bar}<p>${esc(PHASE[job.phase] || job.phase)}${job.phase === 'fetching' && job.bytes_total ? `, ${percent}%` : ''}. Chat opens when every shard is in place.</p>`);
       }
-      if (status.status === 'recovering') return `<div class="greeting"><h1>Recovering ${esc(modelName(status.model) || 'the last model')}</h1><p>Waiting for its workers to come back. Chat opens when the route is whole again.</p></div>`;
-      if (status.status === 'repairing') return `<div class="greeting"><h1>Repairing ${esc(modelName(status.model))}</h1><p>A stage lost its layers and is getting them back. Chat opens when the route is whole again.</p></div>`;
-      if (status.load_job?.phase === 'failed') return `<div class="greeting"><h1>${esc(modelName(status.load_job.model))} did not load</h1><p class="failure">${esc(status.load_job.error)}</p><div class="greeting-actions"><button class="btn primary" type="button" id="emptyPick">Choose a model</button></div></div>`;
-      if (!liveWorkers(status)) return '<div class="greeting"><h1>No workers connected</h1><p>Start a node with <code>python -m isharded node</code> and point it at this node, or create an invite on the dashboard. It will appear here.</p><div class="greeting-actions"><a class="btn" href="/dashboard">Open the dashboard</a></div></div>';
+      if (status.status === 'recovering') return greeting(`Recovering ${name || 'the last model'}`);
+      if (status.status === 'repairing') return greeting(`Repairing ${name}`);
+      if (job?.phase === 'failed') return greeting(`${modelName(job.model)} did not load`, `<p class="failure">${esc(job.error)}</p><p>Check the name and try again, or pick another model.</p>`, '<button class="btn primary" type="button" id="emptyPick">Choose a model</button>');
+      if (!liveWorkers(status)) return greeting('No machines yet', '<ol class="steps"><li>Open the dashboard and choose Add a machine</li><li>Run its command on the machine</li><li>Come back here and load a model</li></ol><p>Or start a node with <code>python -m isharded node</code> and point it at this one.</p>', '<a class="btn primary" href="/dashboard">Open the dashboard</a>');
       if (!state.catalog && !state.catalogFailed) readCatalog();
       return firstRun(status);
     }
@@ -276,11 +413,12 @@
         return;
       }
       painted.delete(root);
-      root.innerHTML = state.turns.map(turn => turn.role === 'user' ? `<div class="turn user"><div>${(turn.images || []).map(url => `<img class="turn-image" src="${esc(url)}" alt="An attached image">`).join('')}${esc(turn.text)}</div></div>` : `<div class="turn">${renderAnswer(turn)}</div>`).join('');
+      root.innerHTML = state.turns.map(turn => turn.role === 'user' ? `<div class="turn user"><div>${(turn.images || []).map(url => `<img class="turn-image" src="${esc(url)}" alt="An attached image">`).join('')}${esc(turn.text)}${turn.imagesLeft ? `<span class="receipt">${count(turn.imagesLeft, 'image')} not kept in this browser.</span>` : ''}</div></div>` : turn.role === 'tool' ? `<div class="turn tool"><div class="tool-call"><b>What ${esc(turn.name)} returned</b><pre><code>${esc(turn.text)}</code></pre></div></div>` : `<div class="turn">${renderAnswer(turn)}</div>`).join('');
     }
     // While a reply streams, only its own block changes, so earlier turns keep any selection.
     function renderLastTurn(turn) {
       const root = $('turns');
+      if (state.turns.at(-1) !== turn) return;
       if (root.children.length === state.turns.length && !painted.has(root)) root.lastElementChild.innerHTML = renderAnswer(turn);
       else renderTurns();
     }
@@ -289,33 +427,50 @@
       if (force || log.scrollHeight - log.scrollTop - log.clientHeight < 140) log.scrollTop = log.scrollHeight;
     }
 
+    // Real tokens drive this: the entry stage marks each one that arrives.
     function pulse() {
-      const now = performance.now();
-      if (now - state.lastPulse < 420) return;
+      const now = performance.now(), mark = document.querySelector('#railRoute .route-no');
+      if (now - state.lastPulse < 420 || !mark) return;
       state.lastPulse = now;
-      document.querySelectorAll('.pulse').forEach((element, index) => {
-        setTimeout(() => { element.classList.remove('run'); void element.offsetWidth; element.classList.add('run'); }, index * 90);
-      });
+      mark.classList.remove('run'); void mark.offsetWidth; mark.classList.add('run');
     }
 
-    function askToMove(url) {
-      $('moveText').textContent = `This node stopped answering. Send your key and this conversation to ${url} to finish the reply?`;
+    function askToMove(name, url) {
+      $('moveText').textContent = `This node stopped answering, and your conversation is safe in this page. Send your key and this conversation to ${name} (${url}) to start the reply again there?`;
       $('move').returnValue = '';
       $('move').showModal();
       return new Promise(resolve => { $('move').addEventListener('close', () => resolve($('move').returnValue === 'yes'), { once: true }); });
     }
 
     const messageContent = turn => turn.images?.length ? [...turn.images.map(url => ({ type: 'image_url', image_url: { url } })), ...(turn.text ? [{ type: 'text', text: turn.text }] : [])] : turn.text;
-    async function send(text) {
+    function toMessage(turn) {
+      if (turn.role === 'tool') return { role: 'tool', tool_call_id: turn.callId, content: turn.text };
+      if (turn.role !== 'assistant') return { role: turn.role, content: messageContent(turn) };
+      const content = splitReasoning(turn.text).answer;
+      if (!turn.calls?.length || !turn.calls.every(call => call.sent)) return { role: 'assistant', content };
+      return { role: 'assistant', content: content || null, tool_calls: turn.calls.map(({ id, type, function: call }) => ({ id, type, function: call })) };
+    }
+    const receiptOf = (data, turn) => {
+      const info = data.isharded || {}, parts = [`${count(data.usage.completion_tokens, 'token')}`];
+      if (info.tokens_per_second) parts[0] += ` at ${num(info.tokens_per_second)} tokens/s`;
+      if (info.time_to_first_token_ms != null) parts.push(`first token in ${num(info.time_to_first_token_ms / 1000)} s`);
+      if (info.stages) parts.push(count(info.stages, 'stage'));
+      if (data.choices?.[0]?.finish_reason === 'length') parts.push('stopped at the token limit');
+      turn.receipt = `${parts.join(', ')}.`;
+    };
+    function send(text) {
       const images = state.attachments.map(item => item.url);
       state.attachments = []; renderAttachments();
-      const history = state.turns.filter(turn => !turn.error).map(turn => ({ role: turn.role, content: turn.role === 'assistant' ? splitReasoning(turn.text).answer : messageContent(turn) }));
-      history.push({ role: 'user', content: messageContent({ text, images }) });
       state.turns.push({ role: 'user', text, images });
-      const turn = { role: 'assistant', text: '', pending: true };
+      return reply();
+    }
+    async function reply() {
+      const history = state.turns.filter(turn => !turn.error).map(toMessage);
+      const turn = { role: 'assistant', text: '', pending: true, live: { recoveries: state.status?.metrics?.recoveries_total ?? 0, gap: null, chunkAt: 0 } };
+      const chat = state.chat;
       state.turns.push(turn);
       state.streaming = true; state.abort = new AbortController();
-      syncComposer(); renderTurns(); stickToBottom(true);
+      touchChat(); syncComposer(); renderTurns(); stickToBottom(true);
       const started = performance.now();
       const attempt = async base => {
         // Polling this node notices a link that went silent, which a stream alone never reports.
@@ -327,12 +482,13 @@
           const response = await fetch(base + '/v1/chat/completions', {
             method: 'POST', signal: link.signal,
             headers: { 'Content-Type': 'application/json', ...headers() },
-            body: JSON.stringify({ model: $('modelChoice').hidden ? undefined : $('modelChoice').value, messages: history, stream: true, temperature: Number($('temperature').value), top_p: 0.9, top_k: 40, max_tokens: Number($('maxTokens').value), enable_thinking: $('thinking').checked }),
+            body: JSON.stringify({ model: $('modelChoice').hidden ? undefined : $('modelChoice').value, messages: history, stream: true, temperature: Number($('temperature').value), top_p: 0.9, top_k: 40, max_tokens: Number($('maxTokens').value), enable_thinking: $('thinking').checked, tools: state.tools.length ? state.tools : undefined }),
           });
           if (!response.ok) { let message = `The request failed with HTTP ${response.status}.`; try { message = (await response.json()).detail; } catch {} throw new Error(message); }
           const reader = response.body.getReader(), decoder = new TextDecoder();
           let buffer = '', scheduled = false;
           const paintReply = () => { scheduled = false; renderLastTurn(turn); stickToBottom(); };
+          const schedule = () => { if (!scheduled) { scheduled = true; requestAnimationFrame(paintReply); } };
           for (;;) {
             const { value, done } = await reader.read();
             if (done) break;
@@ -344,15 +500,20 @@
               const data = JSON.parse(event.slice(6));
               if (data.error) throw new Error(data.error.message);
               const delta = data.choices?.[0]?.delta?.content;
-              if (delta) { turn.text += delta; pulse(); if (!scheduled) { scheduled = true; requestAnimationFrame(paintReply); } }
-              if (data.usage) {
-                const info = data.isharded || {}, parts = [`${data.usage.completion_tokens} tokens`];
-                if (info.tokens_per_second) parts.push(`${info.tokens_per_second} tokens/s`);
-                parts.push(`first token in ${(info.time_to_first_token_ms / 1000).toFixed(2)} s`);
-                parts.push(`${info.stages} stage${info.stages === 1 ? '' : 's'}`);
-                if (data.choices?.[0]?.finish_reason === 'length') parts.push('stopped at the token limit');
-                turn.receipt = parts.join(', ');
+              if (delta) {
+                // The longest silence inside a reply is where a repair would have held it.
+                const now = performance.now(), gap = now - turn.live.chunkAt;
+                if (turn.text && gap > (turn.live.gap?.ms ?? 0)) turn.live.gap = { at: turn.text.length, ms: gap };
+                turn.live.chunkAt = now; turn.live.held = false;
+                turn.text += delta; pulse(); schedule();
               }
+              for (const part of data.choices?.[0]?.delta?.tool_calls || []) {
+                const call = (turn.calls ||= [])[part.index] ||= { id: part.id, type: 'function', function: { name: '', arguments: '' } };
+                call.function.name += part.function?.name || '';
+                call.function.arguments += part.function?.arguments || '';
+                schedule();
+              }
+              if (data.usage) receiptOf(data, turn);
             }
           }
         } catch (error) {
@@ -365,25 +526,37 @@
       };
       try {
         // Each node serves replies itself, so if this one is lost, another can.
-        const here = location.origin, nodes = ['', ...Object.values(state.members).filter(url => url !== here && url.startsWith(location.protocol))];
+        const here = location.origin, nodes = [['', ''], ...Object.entries(state.members).filter(([, url]) => url !== here && url.startsWith(location.protocol)).map(([name, url]) => [url, name])];
         for (let index = 0; ; index += 1) {
-          try { turn.text = ''; await attempt(nodes[index]); break; }
+          try { turn.text = ''; await attempt(nodes[index][0]); break; }
           catch (error) {
             if (!(error instanceof TypeError) || index === nodes.length - 1) throw error;
             // A member names its own address, so sending it a key and this conversation is your call.
-            const next = nodes[index + 1];
-            if (!state.approved.has(next) && !await askToMove(next)) throw error;
+            const [next, name] = nodes[index + 1];
+            if (!state.approved.has(next) && !await askToMove(name, next)) throw error;
             state.approved.add(next);
-            turn.text = ''; turn.notice = 'Lost the connection, so this reply restarted on another node.'; renderLastTurn(turn);
+            if (turn.text) turn.lost = turn.text;
+            turn.text = ''; turn.moved = name; turn.live.gap = null; renderLastTurn(turn);
           }
         }
       } catch (error) {
-        if (error.name === 'AbortError') turn.receipt = `Stopped after ${((performance.now() - started) / 1000).toFixed(1)} s`;
+        if (error.name === 'AbortError') turn.receipt = `Stopped after ${num((performance.now() - started) / 1000)} s.`;
         else turn.error = error instanceof TypeError ? 'This node stopped answering, and no other node could take over the reply.' : error.message;
       } finally {
-        turn.pending = false; state.streaming = false; state.abort = null;
+        if (!turn.moved) await settleRepair(turn);
+        turn.pending = false; state.streaming = false; state.abort = null; delete turn.live;
+        // Someone may have opened another conversation, or signed out, while this reply ended.
+        if (chat === state.chat) touchChat(); else if (state.chats.includes(chat)) keepChats();
         syncComposer(); renderTurns(); stickToBottom();
       }
+    }
+    // A repair is invisible in the stream, so the pool's own count says whether one happened.
+    async function settleRepair(turn) {
+      const gap = turn.live.gap?.ms >= SEAM_MS ? turn.live.gap : null;
+      const status = gap ? await api('/admin/status', { timeout: 15000 }).catch(() => state.status) : state.status;
+      if (!((status?.metrics?.recoveries_total ?? 0) > turn.live.recoveries)) return;
+      if (gap) turn.seam = { at: gap.at, seconds: gap.ms / 1000 };
+      else turn.notice = 'The pool repaired the route during this reply.';
     }
 
     function syncComposer() {
@@ -392,14 +565,16 @@
       button.textContent = state.streaming ? 'Stop' : 'Send';
       button.classList.toggle('primary', !state.streaming);
       button.disabled = !state.streaming && !ready;
-      $('prompt').placeholder = ready ? 'Message the model' : state.signedOut ? 'Sign in to start chatting' : 'Load a model to start chatting';
+      $('prompt').placeholder = ready ? 'Message the model' : state.signedOut ? 'Sign in to start chatting' : state.status?.model ? 'Replies wait for the route' : 'Load a model to start chatting';
       const sees = ready && chatSees();
       $('attach').hidden = !sees;
       if (!sees && state.attachments.length) { state.attachments = []; renderAttachments(); }
+      $('toolsButton').textContent = state.tools.length ? `Tools, ${state.tools.length} on` : 'Tools';
+      renderChats();
     }
+    const currentModel = () => { const pick = $('modelChoice'); return pick.hidden ? state.status?.model : pick.value; };
     function chatSees() {
-      const status = state.status, pick = $('modelChoice');
-      const name = pick.hidden ? status?.model : pick.value;
+      const status = state.status, name = currentModel();
       return Boolean(name === status?.model ? status?.vision : (status?.lanes || []).find(lane => lane.model === name)?.vision);
     }
     function renderAttachments(note = '') {
@@ -433,167 +608,190 @@
       renderAttachments(note);
     }
 
-    function tierOf(status, workerId, poolId) {
-      const pools = status.workers?.[workerId]?.hardware?.memory_pools || [];
-      return pools.find(pool => pool.pool_id === poolId)?.kind || 'disk';
-    }
-    function stageRole(index, count) {
-      if (count === 1) return 'Entry and exit';
-      return index === 0 ? 'Entry' : index === count - 1 ? 'Exit' : '';
-    }
-    function stageTotals(status, stage) {
-      const totals = {};
-      for (const item of stage.placements || []) { const kind = tierOf(status, stage.worker_id, item.pool_id); totals[kind] = (totals[kind] || 0) + item.bytes; }
-      return totals;
-    }
-    function renderStage(status, stage, index, count, progress) {
-      const placed = Object.fromEntries((stage.placements || []).map(item => [item.unit, item]));
-      const layerName = (layer, part) => `layer-${String(layer).padStart(5, '0')}.${part}`;
-      const totals = stageTotals(status, stage);
-      const fetched = progress ? (progress.bytes_total ? progress.bytes_done / progress.bytes_total : 1) : 1;
-      const layers = stage.end_layer - stage.start_layer;
-      const fallback = stage.placements?.length ? 'disk' : 'none';
-      let rows = '';
-      for (let offset = 0; offset < layers; offset++) {
-        const layer = stage.start_layer + offset;
-        const dense = placed[layerName(layer, 'dense')], experts = placed[layerName(layer, 'experts')];
-        const cell = item => `<i class="tier-${item ? esc(tierOf(status, stage.worker_id, item.pool_id)) : fallback}"></i>`;
-        const done = progress && (offset + 1) / layers <= fetched ? ' done' : '';
-        rows += `<div class="core-layer${experts ? ' moe' : ''}${done}" title="Layer ${Number(layer)}">${cell(dense)}${experts ? cell(experts) : ''}</div>`;
-      }
-      const memory = Object.entries(totals).map(([kind, bytes]) => `<li><span>${esc(TIER[kind] || kind)}</span><span>${size(bytes)}</span></li>`).join('');
-      let fetchLine = '';
-      if (progress) {
-        const speed = progress.bytes_per_second ? `, ${size(progress.bytes_per_second)}/s` : '';
-        fetchLine = `<div class="core-fetch">${progress.phase === 'ready' ? 'Shards ready' : `${size(progress.bytes_done)} of ${size(progress.bytes_total)}${speed}`}${progress.bytes_from_peers ? `, ${size(progress.bytes_from_peers)} from other nodes` : ''}${progress.bytes_reused ? `, ${size(progress.bytes_reused)} already here` : ''}</div>`;
-      }
-      const hop = index < count - 1 ? '<div class="hop">Activations hop to the next worker</div>' : '';
-      const role = stageRole(index, count);
-      return `<section class="core-stage"><div class="core${progress ? ' fetching' : ''}" style="--layers:${Number(layers)}">${rows}<div class="pulse"></div></div><div class="core-note"><b>${esc(stage.worker_id)}</b><div class="core-range">${role ? `${role}, ${stageLayers(stage)}` : stageLayers(stage).replace(/^l/, 'L')}</div><ul class="core-memory">${memory}</ul>${fetchLine}</div></section>${hop}`;
-    }
-    function strip(status, route) {
-      const total = route.map(stage => {
-        const totals = stageTotals(status, stage);
-        const main = Object.entries(totals).sort((a, b) => b[1] - a[1])[0]?.[0] || 'none';
-        return `<div class="seg" style="--layers:${Number(stage.end_layer) - Number(stage.start_layer)}"><span class="cell"><i class="tier-${esc(main)}"></i></span></div>`;
-      }).join('');
-      return `<div class="ribbon" aria-hidden="true">${total}</div>`;
-    }
+    /* Where the model runs */
+
+    const memoryWords = stage => stage.tiers.map(item => `${size(item.bytes)} ${UI.TIER_NAMES[item.kind]}`).join(', ');
     function renderRail(status) {
-      const job = status.load_job, active = jobRunning(status);
-      const picked = $('modelChoice').hidden ? null : $('modelChoice').value;
+      const job = status.load_job, active = jobRunning(status), picked = currentModel();
       const lane = picked && picked !== status.model ? (status.lanes || []).find(item => item.model === picked) : null;
-      const route = lane ? lane.route || [] : active && job.route?.length ? job.route : status.route || [];
-      const serving = status.route || [];
-      let html = '<div class="rail-head">', toggle = 'Nothing loaded';
+      const model = lane ? routeModel({ route: lane.route || [], workers: status.workers, model: lane.model }, state.laneTab) : routeModel(status, state.tab);
+      const percent = active && job.bytes_total ? Math.floor(job.bytes_done / job.bytes_total * 100) : null;
+      const bar = active && job.phase === 'fetching' && percent != null ? `<div class="progress" role="progressbar" aria-label="Load progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><i style="width:${percent}%"></i></div>` : '';
+      const cancel = active && job.phase !== 'loading' ? '<p class="rail-action"><button class="btn small" id="cancelLoad" data-key="cancel" type="button">Cancel load</button></p>' : '';
+      const fetched = job?.phase === 'fetching' && percent != null ? `, ${percent}%, ${size(job.bytes_done)} of ${size(job.bytes_total)}${job.bytes_from_peers ? `, ${size(job.bytes_from_peers)} from other nodes` : ''}${job.bytes_reused ? `, ${size(job.bytes_reused)} already here` : ''}` : '';
+      const phase = active ? `${esc(PHASE[job.phase] || job.phase)}${fetched}.` : '';
+      let head, foot = '';
       if (lane) {
-        html += `<h2>Where ${esc(modelName(lane.model))} runs</h2><p class="rail-note">Lane ${esc(lane.name)}, ${count(route.length, 'stage')}</p>`;
-        toggle = `${modelName(lane.model)} on ${workerCount(route)}`;
+        head = `<h2>Where ${esc(modelName(lane.model))} runs</h2><p class="rail-note">Lane ${esc(lane.name)}, ${count(model?.stages.length ?? 0, 'stage')}.</p>`;
+        foot = '<p class="rail-note">This lane does not report stage times here.</p>';
       } else if (active) {
-        const percent = job.bytes_total ? Math.floor(job.bytes_done / job.bytes_total * 100) : null;
-        html += `<h2>${serving.length ? 'Preparing a new layout' : esc(modelName(job.model))}</h2><p class="rail-note">${esc(PHASE[job.phase] || job.phase)}${job.phase === 'fetching' && percent != null ? `, ${percent}%` : ''}</p>`;
-        if (job.phase === 'fetching' && percent != null) html += `<div class="progress" role="progressbar" aria-label="Load progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><i style="width:${percent}%"></i></div>`;
-        if (serving.length) html += `<p class="rail-note">Chat is running on ${esc(serving.map(stage => stage.worker_id).join(', '))} until this finishes. Below is the layout it will switch to.</p>`;
-        if (job.phase !== 'loading') html += '<p class="rail-action"><button class="btn small" id="cancelLoad" data-key="cancel" type="button">Cancel load</button></p>';
-        toggle = job.phase === 'fetching' && percent != null ? `Loading, ${percent}%` : 'Loading';
-      } else if (route.length) {
-        const speed = status.active_plan?.estimated_tokens_per_second;
-        const layers = route.reduce((n, stage) => n + Number(stage.end_layer) - Number(stage.start_layer), 0);
-        html += `<h2>Where this model runs</h2><p class="rail-note">${count(route.length, 'stage')}, ${count(layers, 'layer')}${speed ? `, planned for about ${esc(speed)} tokens/s` : ''}</p>`;
-        toggle = `Running on ${workerCount(route)}`;
+        const serving = (status.route || []).length, title = !serving ? modelName(job.model) : job.model === status.model ? 'Preparing a new layout' : `Loading ${modelName(job.model)}`;
+        head = `<h2>${esc(title)}</h2><p class="rail-note">${phase}${serving ? ' Chat stays on this route until every shard is in place.' : ''}</p>${bar}${cancel}`;
+      } else if (model) {
+        head = `<h2>Where this model runs</h2><p class="rail-note">${count(model.layers, 'layer')} on ${count(model.stages.length, 'stage')}.</p>`;
       } else {
-        html += `<h2>Nothing loaded</h2><p class="rail-note">The model's layers appear here, colored by the memory each one sits in.</p>`;
+        head = `<h2>Nothing loaded</h2><p class="rail-note">${status.load_job?.phase === 'failed' ? esc(job.error) : 'Each stage of a model appears here, with the memory it sits in.'}</p>`;
       }
-      if (job?.phase === 'failed' && !route.length) html += `<p class="rail-note failure">${esc(job.error)}</p>`;
-      html += '</div>';
-      html += route.map((stage, index) => renderStage(status, stage, index, route.length, !lane && active && job.phase === 'fetching' ? job.workers?.[stage.worker_id] : null)).join('');
-      const kinds = new Set();
-      for (const stage of route) for (const item of stage.placements || []) kinds.add(tierOf(status, stage.worker_id, item.pool_id));
-      if (kinds.size) html += `<div class="legend">${TIER_ORDER.filter(kind => kinds.has(kind)).map(kind => `<span class="tier-${kind}"><i></i>${TIER[kind]}</span>`).join('')}</div>`;
-      $('rail').classList.toggle('dense', route.length > 8);
-      paint($('rail'), html);
-      const cancel = $('cancelLoad');
-      if (cancel) cancel.onclick = () => api('/admin/load/cancel', { method: 'POST' }).then(poll).catch(() => {});
-      $('railToggleText').textContent = toggle;
-      paint($('railToggleStrip'), route.length ? strip(status, route) : '');
+      if (!lane && model) {
+        const reading = model.passMs != null ? `One pass takes about ${num(model.passMs, 0)} ms.` : model.planned || model.stages.some(stage => stage.computeMs != null) ? '' : 'Stage times fill in after the first reply.';
+        foot = reading ? `<p class="rail-note">${reading}</p>` : '';
+      }
+      const totals = {};
+      for (const stage of model?.stages || []) for (const item of stage.tiers) totals[item.kind] = (totals[item.kind] || 0) + item.bytes;
+      const kinds = UI.TIER_ORDER.filter(kind => totals[kind]);
+      if (kinds.length) foot += `<div class="legend">${kinds.map(kind => `<span><i class="tier-${kind}"></i>${UI.TIER_NAMES[kind]} ${size(totals[kind])}</span>`).join('')}</div>`;
+      foot += '<p class="rail-action"><a href="/dashboard">Open the dashboard</a></p>';
+      paint($('railHead'), head); paint($('railFoot'), foot);
+      const line = $('railLine'), shape = JSON.stringify(model?.stages.map(stage => [stage.layerCount, stage.tiers]));
+      if (line.dataset.shape !== shape) { line.dataset.shape = shape; line.textContent = ''; if (model) drawRail(line, model.stages); }
+      if (model) drawRouteList($('railRoute'), model, { all: state.routeAll, plain: true, memory: memoryWords });
+      else { $('railRoute').textContent = ''; $('railRoute').routeHtml = null; }
+      const trouble = model?.stages.find(stage => stage.trouble === 'bad') || model?.stages.find(stage => stage.trouble);
+      $('railGlyph').className = `glyph ${trouble?.trouble || ''}`;
+      $('railGlyph').hidden = !trouble;
+      const cancelButton = $('cancelLoad');
+      if (cancelButton) cancelButton.onclick = () => api('/admin/load/cancel', { method: 'POST' }).then(poll).catch(() => {});
+      return model;
     }
     function renderBar(status) {
-      const busy = status.status === 'loading', moving = status.status === 'ready' && jobRunning(status), ready = status.status === 'ready';
-      $('light').className = `glyph ${moving || busy ? 'work tone-work' : ready ? 'ok tone-ok' : 'idle tone-idle'}`;
+      const busy = status.status === 'loading';
       renderChoice(status);
       // With a choice of running models, the select names the model and this only loads another.
       const choosing = !$('modelChoice').hidden;
       $('modelButton').classList.toggle('plain', choosing);
-      $('modelLabel').textContent = choosing ? 'Load a model' : busy ? `Loading ${modelName(status.load_job?.model)}` : status.model && ready ? modelName(status.model) : 'Choose a model';
+      $('modelLabel').textContent = choosing ? 'Load a model' : busy && !(status.route || []).length ? `Loading ${modelName(status.load_job?.model)}` : status.model ? modelName(status.model) : 'Choose a model';
     }
     function renderChoice(status) {
-      const running = [status.status === 'ready' && status.kind !== 'embedding' ? status.model : null, ...(status.lanes || []).filter(lane => lane.ready && lane.kind !== 'embedding').map(lane => lane.model)].filter(Boolean);
+      const models = [status.status === 'ready' && status.kind !== 'embedding' ? status.model : null, ...(status.lanes || []).filter(lane => lane.ready && lane.kind !== 'embedding').map(lane => lane.model)].filter(Boolean);
       const pick = $('modelChoice');
       // Embedding models cannot chat, so a lone chat model beside one has to be named.
-      pick.hidden = running.length < 2 && !(running.length === 1 && status.kind === 'embedding');
-      if (pick.dataset.running === running.join('|')) return;
+      pick.hidden = models.length < 2 && !(models.length === 1 && status.kind === 'embedding');
+      if (pick.dataset.running === models.join('|')) return;
       const chosen = pick.value;
-      pick.dataset.running = running.join('|');
-      pick.replaceChildren(...running.map(name => new Option(modelName(name), name)));
-      if (running.includes(chosen)) pick.value = chosen;
+      pick.dataset.running = models.join('|');
+      pick.replaceChildren(...models.map(name => new Option(modelName(name), name)));
+      if (models.includes(chosen)) pick.value = chosen;
     }
-    function setPill(tone, glyph, label) {
-      $('pill').hidden = !label;
-      $('pill').className = `pill tone-${tone}`;
+
+    /* The same word the dashboard shows. */
+    async function readJoins() {
+      if (state.joinsHidden || document.hidden || Date.now() - state.joinsAt < 8000) return;
+      state.joinsAt = Date.now();
+      try {
+        const answer = await fetch('/join/requests', { headers: headers() });
+        if (answer.ok) state.joins = ((await answer.json()).requests || []).length;
+        // A key that cannot read the list, or a node without one, has nothing to count here.
+        else if ([401, 403, 404].includes(answer.status)) { state.joins = 0; state.joinsHidden = true; }
+      } catch {}
+    }
+    function poolWord(status, model) {
+      const workers = Object.entries(status.workers || {}), route = status.route || [], job = status.load_job;
+      const lost = route.filter(stage => !status.workers?.[stage.worker_id]?.live), lostIds = new Set(lost.map(stage => stage.worker_id));
+      const alerts = workers.filter(([id, worker]) => worker.state === 'quarantined' || (worker.state === 'offline' && !lostIds.has(id))).length + lost.length + (job?.phase === 'failed' ? 1 : 0) + (status.lanes || []).filter(lane => lane.error).length + (status.last_audit && status.last_audit.verdict !== 'agree' ? 1 : 0) + (model?.stages || []).filter(stage => stage.spillSlow).length + (status.mesh && !status.mesh.leader ? 1 : 0) + state.joins;
+      const need = [alerts ? 'warn' : 'idle', alerts ? 'warn' : 'idle', `${alerts} need${alerts === 1 ? 's' : ''} you`];
+      if (status.status === 'ready') return lost.length ? ['bad', 'bad', 'Route lost'] : alerts ? need : jobRunning(status) ? ['work', 'work', 'Loading'] : ['idle', '', 'Healthy'];
+      if (jobRunning(status)) return ['work', 'work', route.length && job.model === status.model ? 'Repairing' : 'Loading'];
+      if (status.status === 'recovering') return ['work', 'work', 'Recovering'];
+      if (status.status === 'repairing') return ['work', 'work', 'Repairing'];
+      if (job?.phase === 'failed') return ['bad', 'bad', 'Load failed'];
+      if (!workers.some(([, worker]) => worker.live)) return ['idle', 'idle', 'No machines'];
+      return alerts ? need : ['idle', 'idle', 'No model'];
+    }
+    function setWord(tone, glyph, word, title = word) {
+      $('pill').className = `state-word tone-${tone}`;
       $('pillGlyph').className = `glyph ${glyph}`;
-      $('pillText').textContent = label;
+      $('pillGlyph').hidden = !glyph;
+      $('pillText').textContent = word;
+      document.title = title ? `${title}: iSharded chat` : 'iSharded chat';
     }
-    function renderHealth() {
+    // Why a reply cannot run now, for the line above the message box.
+    function holdUp(status) {
+      if (!status || status.status === 'ready') return '';
+      const job = status.load_job, route = (status.route || []).length;
+      if (jobRunning(status) && route && job.model === status.model) {
+        const left = job.bytes_per_second ? Math.ceil(Math.max((job.bytes_total || 0) - (job.bytes_done || 0), 0) / job.bytes_per_second) : null;
+        return `The route is moving. Replies start again ${left != null ? `in about ${left} s` : 'when it is whole'}.`;
+      }
+      if (jobRunning(status)) return state.turns.length ? `${modelName(job.model)} is loading. Replies start when every shard is in place.` : '';
+      if (status.status === 'repairing') return 'A stage lost its layers. Replies wait for the repair.';
+      if (status.status === 'recovering') return 'Waiting for this model\'s workers to come back.';
+      return state.turns.length ? 'Nothing is loaded, so replies cannot run. Choose a model to carry on.' : '';
+    }
+    const notice = (tone, glyph, title, body = '', links = '') => `<div class="notice ${tone}"><i class="glyph ${glyph}"></i><div class="notice-body"><b>${esc(title)}</b>${body ? `<p>${esc(body)}</p>` : ''}${links}</div></div>`;
+    function renderHealth(model) {
       const status = state.status;
-      if (state.signedOut) { setPill('idle', 'idle', 'Signed out'); paint($('notices'), ''); return; }
+      if (state.signedOut) { setWord('idle', 'idle', 'Signed out', ''); paint($('notices'), ''); return; }
       if (state.failures) {
         const others = Object.entries(state.members).filter(([, url]) => /^https?:/.test(url) && url.replace(/\/$/, '') !== location.origin);
         const links = state.failures >= 3 && others.length ? `<div class="notice-links">${others.slice(0, 5).map(([name, url]) => `<a href="${esc(url)}/chat" rel="noreferrer">Open ${esc(name)}</a>`).join('')}</div>` : '';
-        setPill('warn', 'work', 'Reconnecting');
-        paint($('notices'), `<div class="notice warn"><i class="glyph warn"></i><div class="notice-body"><b>Reconnecting to this node</b><p>Your conversation is safe in this page. Replies resume when it answers.</p>${links}</div></div>`);
+        const quiet = Math.round((performance.now() - state.heardAt) / 1000);
+        setWord('bad', 'bad', `Last heard ${quiet} s ago`, 'Out of date');
+        paint($('notices'), notice('bad', 'bad', `This node stopped answering ${quiet} s ago`, 'Your conversation is safe in this page. Replies resume when it answers.', links));
         return;
       }
-      const workers = Object.values(status?.workers || {}), trouble = workers.filter(worker => worker.state === 'quarantined' || worker.state === 'offline').length;
-      if (trouble) setPill('warn', 'warn', 'Degraded');
-      else setPill('idle', 'idle', '');
-      const failed = status?.load_job?.phase === 'failed' && (status.route || []).length ? `<div class="notice bad"><i class="glyph bad"></i><div class="notice-body"><b>${esc(modelName(status.load_job.model))} did not load</b><p>${esc(status.load_job.error)} Chat stays on the model that is running.</p></div></div>` : '';
-      const test = status?.model_profile === 'protocol-test' ? '<div class="notice"><i class="glyph idle"></i><div class="notice-body"><b>Test model</b><p>Its output means nothing. It checks sharding, not language quality.</p></div></div>' : '';
-      paint($('notices'), failed + test);
+      if (!status) return;
+      const [tone, glyph, word] = poolWord(status, model);
+      setWord(tone, glyph, word, tone === 'idle' ? '' : word);
+      const why = state.streaming ? '' : holdUp(status), work = why ? notice('work', 'work', why) : '';
+      const cut = status.status === 'ready' && tone === 'bad' ? notice('bad', 'bad', 'Part of the route stopped answering', 'Replies may stall until the pool repairs it.') : '';
+      const failed = status.load_job?.phase === 'failed' && (status.route || []).length ? notice('bad', 'bad', `${modelName(status.load_job.model)} did not load`, status.load_job.error + ' Chat stays on the model that is running.') : '';
+      const test = status.model_profile === 'protocol-test' ? notice('', 'idle', 'Test model', 'It checks sharding, not language quality, so its output means nothing.') : '';
+      const simulated = status.simulated ? notice('', 'idle', 'Simulated pool', 'Every name and figure on this page is a sample.') : '';
+      paint($('notices'), simulated + cut + work + failed + test);
     }
 
-    const QUIET_STREAM_MS = 15000;
     let pollTimer = null;
     async function poll() {
       clearTimeout(pollTimer);
       $('signOut').hidden = !state.token;
+      // A dead worker can hold the answer for seconds, and the last word may be an all-clear.
+      const slow = setTimeout(() => { if (state.status && !state.failures) setWord('work', 'work', 'Checking'); }, 5000);
+      const noticesWere = $('notices').offsetHeight;
       try {
-        const status = await api('/admin/status', { timeout: 8000 });
-        const changed = status.status !== state.status?.status || jobRunning(status) !== jobRunning(state.status);
-        state.status = status; state.failures = 0; state.signedOut = false;
+        const status = await api('/admin/status', { timeout: 15000 });
+        state.status = status; state.failures = 0; state.signedOut = false; state.heardAt = performance.now();
         if (status.mesh?.members) state.members = status.mesh.members;
         if ($('auth').open) $('auth').close();
-        renderBar(status); renderRail(status); syncComposer(); renderHealth();
-        if ((changed || !state.turns.length) && !state.streaming) renderTurns();
+        renderBar(status);
+        const model = renderRail(status);
+        syncComposer(); renderHealth(model);
+        if (!state.turns.length) renderTurns();
+        holdReply(status);
       } catch (error) {
         if (error.offline) {
           state.failures += 1;
-          if (state.failures >= 3 && performance.now() - state.lastByte > QUIET_STREAM_MS) state.link?.abort();
+          if (performance.now() - state.heardAt > QUIET_NODE_MS && performance.now() - state.lastByte > QUIET_STREAM_MS) state.link?.abort();
           renderHealth();
           if (!state.status && !state.turns.length) renderTurns();
         } else if (error.status === 401) { renderSignedOut(); }
       }
+      clearTimeout(slow);
+      // A notice takes room from the log, and the end of a reply must stay in view.
+      if ($('notices').offsetHeight !== noticesWere) stickToBottom();
       if (state.signedOut) return;
+      readJoins();
       const wait = document.hidden ? 10000 : state.status?.status === 'loading' ? 1000 : 2500;
       pollTimer = setTimeout(poll, state.failures ? Math.min(wait * state.failures, 10000) : wait);
+    }
+    // A reply that went quiet while the route is broken says so in place.
+    function holdReply(status) {
+      const turn = state.turns.at(-1);
+      if (!state.streaming || !turn?.live) return;
+      const broken = status.status !== 'ready' || (status.route || []).some(stage => !status.workers?.[stage.worker_id]?.live);
+      const held = broken && performance.now() - state.lastByte > HELD_MS;
+      if (held !== Boolean(turn.live.held)) { turn.live.held = held; renderLastTurn(turn); stickToBottom(); }
     }
     function renderSignedOut() {
       state.status = null;
       $('modelLabel').textContent = 'Choose a model';
-      $('light').className = 'glyph idle tone-idle';
-      paint($('rail'), '<div class="rail-head"><h2>Nothing to show</h2><p class="rail-note">Sign in to see where the model runs.</p></div>');
+      paint($('railHead'), '<h2>Nothing to show</h2><p class="rail-note">Sign in to see where the model runs.</p>');
+      paint($('railFoot'), '');
+      $('railLine').textContent = ''; $('railLine').dataset.shape = ''; $('railRoute').textContent = ''; $('railRoute').routeHtml = null;
       syncComposer(); renderHealth();
       if (!state.turns.length) renderTurns();
     }
+
+    /* Loading a model */
 
     async function readCatalog() {
       if (readCatalog.busy) return;
@@ -636,16 +834,13 @@
       try {
         const plan = await api('/admin/plan', { method: 'POST', body: JSON.stringify(loadOptions()) });
         if (ticket !== state.previewId) return;
-        const status = state.status || { workers: {} };
-        const lines = plan.route.map(stage => {
-          const memory = Object.entries(stageTotals(status, stage)).map(([kind, bytes]) => `${size(bytes)} ${TIER[kind] || kind}`).join(', ');
-          const role = stageRole(plan.route.indexOf(stage), plan.route.length);
-          return `<li><span>${esc(stage.worker_id)}${role ? ` (${role.toLowerCase()})` : ''}</span><span>${stageLayers(stage)} in ${esc(memory)}</span></li>`;
-        }).join('');
+        const stages = routeModel({ route: plan.route, workers: state.status?.workers || {} }).stages;
+        const lines = stages.map(stage => `<li><span>${esc(stage.workerId)}${stage.n === 1 ? ' (entry)' : stage.n === stages.length ? ' (exit)' : ''}</span><span>${stage.layerCount > 1 ? 'layers' : 'layer'} ${UI.span(stage.start, stage.end)} in ${esc(memoryWords(stage))}</span></li>`).join('');
         const speed = plan.estimated_tokens_per_second ? `, about ${esc(plan.estimated_tokens_per_second)} tokens/s` : '';
         const download = (plan.download_bytes ? `Needs ${size(plan.download_bytes)} of new shards.` : 'Every shard is already in place.') + (plan.draft_model ? ` A draft model (${modelName(plan.draft_model)}) will speed up replies.` : '');
         const busy = jobRunning(state.status) ? ` ${modelName(state.status.load_job.model)} is still loading, so cancel it first to load this one.` : '';
-        $('preview').innerHTML = `<b>Fits: ${size(plan.model_bytes)} across ${count(plan.route.length, 'worker')}${speed}</b>${strip(status, plan.route)}<ul>${lines}</ul>${esc(download + busy)}`;
+        $('preview').innerHTML = `<b>Fits: ${size(plan.model_bytes)} across ${count(plan.route.length, 'worker')}${speed}</b><div id="previewRail"></div><ul>${lines}</ul>${esc(download + busy)}`;
+        drawRail($('previewRail'), stages);
         $('loadModel').disabled = Boolean(busy);
       } catch (error) {
         if (ticket !== state.previewId) return;
@@ -676,6 +871,34 @@
       if (!$('auth').open) { $('tokenInput').value = ''; $('auth').showModal(); }
     }
 
+    /* Tools: the page asks, the model answers with a call, and the person supplies what came back. */
+
+    function readTools() { try { const saved = JSON.parse(store.get(TOOLS_KEY) || '[]'); state.tools = Array.isArray(saved) ? saved : []; } catch { state.tools = []; } }
+    function openTools() {
+      $('toolsText').value = state.tools.length ? JSON.stringify(state.tools, null, 2) : '';
+      $('toolsError').hidden = true;
+      $('toolsSheet').showModal();
+    }
+    function setTools(tools) {
+      state.tools = tools;
+      if (tools.length) store.set(TOOLS_KEY, JSON.stringify(tools)); else store.drop(TOOLS_KEY);
+      $('toolsSheet').close(); syncComposer();
+    }
+    function saveTools() {
+      let tools;
+      const refuse = text => { $('toolsError').textContent = text; $('toolsError').hidden = false; };
+      try { tools = JSON.parse($('toolsText').value.trim() || '[]'); } catch (error) { refuse('That is not valid JSON: ' + error.message); return; }
+      if (!Array.isArray(tools)) tools = [tools];
+      if (tools.some(tool => !tool?.function?.name)) { refuse('Each tool needs a function with a name. Check the shape and try again.'); return; }
+      setTools(tools.map(tool => ({ type: 'function', ...tool })));
+    }
+    function sendResults() {
+      const turn = state.turns.findLast(item => item.calls?.some(call => !call.sent));
+      if (!turn || state.streaming || state.status?.status !== 'ready') return;
+      for (const call of turn.calls) { state.turns.push({ role: 'tool', callId: call.id, name: call.function.name, text: call.result || '' }); call.sent = true; }
+      reply();
+    }
+
     const THEMES = ['system', 'light', 'dark'];
     function applyTheme(choice) {
       if (choice === 'system') { delete document.documentElement.dataset.theme; store.drop('isharded-theme'); }
@@ -686,15 +909,50 @@
       $('themeButton').title = `Theme: ${choice}`;
       $('themeButton').setAttribute('aria-label', `Theme: ${choice}. Switch to ${next}.`);
     }
+    async function copyText(text, button) {
+      try { await navigator.clipboard.writeText(text); }
+      catch {
+        // Over plain http a browser has no clipboard API, and a pool on a closed network is often there.
+        const box = document.createElement('textarea');
+        box.value = text; document.body.append(box); box.select(); document.execCommand('copy'); box.remove();
+      }
+      button.textContent = 'Copied';
+      setTimeout(() => { button.textContent = 'Copy'; }, 1500);
+    }
 
     document.addEventListener('click', event => {
       const row = event.target.closest?.('[data-model]');
       if (!row) return;
       if ($('picker').open) { $('customModel').value = ''; selectModel(row.dataset.model); } else openPicker(row.dataset.model);
     });
+    $('turns').addEventListener('click', event => {
+      const target = event.target.closest('[data-copy], [data-action]');
+      if (!target) return;
+      if ('copy' in target.dataset) copyText(target.closest('.code').querySelector('code').textContent, target);
+      else if (target.dataset.action === 'send-results') sendResults();
+      else if (target.dataset.action === 'retry') {
+        if (!state.streaming && state.status?.status === 'ready') { state.turns.pop(); reply(); return; }
+        target.textContent = state.streaming ? 'A reply is running' : 'The pool is not ready yet';
+        setTimeout(() => { target.textContent = 'Try again'; }, 2500);
+      }
+    });
+    $('turns').addEventListener('input', event => {
+      if (event.target.dataset.result == null) return;
+      const call = state.turns.findLast(item => item.calls)?.calls[Number(event.target.dataset.result)];
+      if (call) call.result = event.target.value;
+    });
+    $('chats').addEventListener('click', event => {
+      const open = event.target.closest('[data-chat]'), drop = event.target.closest('[data-forget]');
+      if (open) { const chat = state.chats.find(item => item.id === open.dataset.chat); if (chat && chat !== state.chat) openChat(chat); else closeSides(); }
+      if (drop) forgetChat(drop.dataset.forget);
+    });
+    $('chatSearch').oninput = renderChats;
+    $('railRoute').addEventListener('click', event => { if (event.target.closest('[data-action=route-all]')) { state.routeAll = !state.routeAll; if (state.status) renderRail(state.status); } });
     $('picker').addEventListener('click', event => { if (event.target === $('picker')) $('picker').close(); });
     $('auth').addEventListener('close', () => { if (state.signedOut) renderTurns(); });
-    $('railToggle').onclick = () => { const open = $('rail').classList.toggle('open'); $('railToggle').setAttribute('aria-expanded', String(open)); };
+    $('railToggle').onclick = () => toggleSide('rail', 'railToggle');
+    $('chatsToggle').onclick = () => toggleSide('chats', 'chatsToggle');
+    $('settingsToggle').onclick = () => { const open = $('settings').classList.toggle('open'); $('settingsToggle').setAttribute('aria-expanded', String(open)); };
     $('modelChoice').onchange = () => { if (state.status) { renderRail(state.status); syncComposer(); } };
     $('modelButton').onclick = () => openPicker();
     $('closePicker').onclick = () => $('picker').close();
@@ -710,7 +968,11 @@
         $('picker').close(); poll();
       } catch (error) { $('preview').innerHTML = `<span class="error">${esc(error.message)}</span>`; }
     };
-    $('newChat').onclick = () => { if (state.abort) state.abort.abort(); state.turns = []; state.attachments = []; renderAttachments(); renderTurns(); $('prompt').focus(); };
+    $('toolsButton').onclick = openTools;
+    $('toolsCancel').onclick = () => $('toolsSheet').close();
+    $('toolsClear').onclick = () => setTools([]);
+    $('toolsForm').onsubmit = event => { event.preventDefault(); saveTools(); };
+    $('newChat').onclick = () => { openChat(newChat()); $('prompt').focus(); };
     $('authForm').onsubmit = event => {
       event.preventDefault();
       const key = $('tokenInput').value.trim();
@@ -720,9 +982,9 @@
     };
     $('signOut').onclick = () => {
       if (state.abort) state.abort.abort();
-      store.drop('isharded-token');
-      state.token = ''; state.turns = []; state.status = null; state.approved.clear();
-      renderTurns(); poll();
+      store.drop('isharded-token'); store.drop(CHATS_KEY);
+      state.token = ''; state.chats = []; state.status = null; state.approved.clear();
+      openChat(newChat()); poll();
     };
     $('themeButton').onclick = () => applyTheme(THEMES[(THEMES.indexOf($('themeButton').dataset.choice) + 1) % THEMES.length]);
     $('composer').onsubmit = event => {
@@ -742,11 +1004,14 @@
     $('prompt').onkeydown = event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); $('composer').requestSubmit(); } };
     $('prompt').oninput = event => { const box = event.target; box.style.height = 'auto'; box.style.height = `${box.scrollHeight}px`; };
     addEventListener('hashchange', () => { if (takeKeyFromLink()) { state.signedOut = false; if ($('auth').open) $('auth').close(); poll(); } });
+    addEventListener('pagehide', () => { if (state.streaming) keepChats(); });
     document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
 
     takeKeyFromLink();
     applyTheme(document.documentElement.dataset.theme || 'system');
-    renderTurns(); syncComposer(); poll();
+    readChats(); readTools();
+    state.chat = newChat(); state.turns = state.chat.turns;
+    renderTurns(); renderChats(); syncComposer(); poll();
   </script>
 </body>
 </html>

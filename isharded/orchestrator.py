@@ -2239,7 +2239,7 @@ class Orchestrator:
                                 event = json.loads(line)
                                 if "token_id" not in event:
                                     failure = event.get("error")
-                                    self.add_event("failure", "Generation stream stopped", str(failure)[:200])
+                                    self.add_event("failure", "Generation stream stopped", (f"{failure.get('failed_worker')}: {failure.get('message')}" if isinstance(failure, dict) else str(failure))[:200])
                                     break
                                 now = time.perf_counter()
                                 if produced:
@@ -3012,6 +3012,7 @@ def page(name: str) -> HTMLResponse:
     folder = Path(__file__).parent
     styles = (folder / "ui.css").read_text(encoding="utf-8")
     content = (folder / name).read_text(encoding="utf-8").replace("/* isharded:ui.css */", styles)
+    content = content.replace("/* isharded:ui.js */", (folder / "ui.js").read_text(encoding="utf-8"))
     content = content.replace("<!-- isharded:flags.svg -->", (folder / "flags.svg").read_text(encoding="utf-8"))
     return HTMLResponse(content, headers={"Cache-Control": "no-store"})
 

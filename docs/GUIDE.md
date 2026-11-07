@@ -4,10 +4,10 @@ How to install, run, configure, and understand iSharded. [The README](../README.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="screenshots/dashboard-dark.png">
-  <img alt="The dashboard on a real mesh: a 235B model's 94 layers in VRAM across seven machines, with each stage's country, memory, and compute time." src="screenshots/dashboard-light.png">
+  <img alt="The dashboard on a small real pool: one drawing of a model's layers along the top and one pass in time along the bottom, with a band between for each stage, so the slowest stage is the widest." src="screenshots/dashboard-light.png">
 </picture>
 
-*The dashboard on a real seven-machine mesh, serving a 235B model from VRAM alone. [More of the console](#chat-page-and-dashboard).*
+*The dashboard on a real pool of three local CPU workers serving Qwen3-0.6B, with sample names. [More of the console](#chat-page-and-dashboard).*
 
 ## Contents
 
@@ -519,26 +519,32 @@ An earlier mesh of seven machines on the Python path, in four countries and two 
 
 ### Chat page and dashboard
 
-Every node serves a chat page at `/chat` and a console at `/dashboard`. The chat page below and the dashboard at the top of this page are from the [seven-machine mesh](#measured-across-data-centers). Their speed estimates are the planner's, from before it used measured links, so go by the measured figures in that section.
+Every node serves a chat page at `/chat` and a console at `/dashboard`. The dashboard at the top of this page is from a real pool of three local CPU workers. The chat page below is from the same kind of pool, with one worker's process killed during the reply, so the reply shows where it paused and the top bar shows that the pool needs you.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="screenshots/chat-dark.png">
-  <img alt="The chat page: a reply with its speed, and the stages it ran on." src="screenshots/chat-light.png">
+  <img alt="The chat page: conversations on the left, a reply with a dotted line where the pool repaired its route, and on the right the stages the model runs on." src="screenshots/chat-light.png">
 </picture>
 
-The console is built to stay readable at 60 workers, grouping them by state so what needs you comes first. No mesh this size has run yet, so this view uses simulated data:
+The dashboard is built to stay readable at 200 workers. What needs you is grouped by cause, machines become a field of marks with trouble first, and only the stages that matter are named. No pool this size has run yet, so this view uses simulated data, and the page says so at the top:
 
-![The dashboard with 60 simulated workers, marked as simulated at the top of the page.](screenshots/dashboard-60-workers.png)
+![The dashboard with 200 simulated workers, marked as simulated at the top of the page.](screenshots/dashboard-200-workers.png)
 
+
+The board's pass time is an estimate, so it says "about". It adds each stage's compute to half of its measured direct link round trip, or to a small HTTP probe when no direct reading exists. It lays one pass end to end, which is not the time per token, because pipelining and the draft overlap work. It fills in after the first reply. Trends under Readings are kept by the browser tab since it opened, because the pool stores no history.
 
 Every node serves both, so any node's address works.
 
 | Page | What it shows |
 |---|---|
-| `/chat` | A chat window. It asks for a key, shows where a model would run and how fast before anything downloads, and colors each layer by the memory holding it. |
-| `/dashboard` | The active pipeline, each node's state and hardware, latency, throughput, memory, recoveries, and events. Click a stage or worker for detail. |
+| `/chat` | A chat window. Conversations are listed on the left, and the stages the model runs on, with each stage's memory and time, on the right. It asks for a key, and shows where a model would run and how fast before anything downloads. |
+| `/dashboard` | The state of the pool as a sentence, then the route board: the model's layers along the top, one pass in time along the bottom, and a band for each stage, so the slowest thing is the widest. Below it are what needs you, machines, memory, activity, the stage table, readings, and facts. Select a stage or machine for detail, and use the arrow keys to walk the stages. |
 
-If the node serving your chat dies mid-reply, the page asks before sending your key and conversation to another member, then restarts the reply there.
+Conversations are kept in your browser, the latest 50, because the pool stores none. Signing out forgets them, and a browser that runs out of room keeps the words and drops the images.
+
+If a stage is lost during a reply and the pool repairs the route, the reply carries on, and a dotted line marks where it paused and for how long. The page learns this from the pool's count of repairs, so a repair for another reply at the same moment can show there too. If the node serving your chat dies mid-reply, the page asks before sending your key and conversation to another member, then starts the reply again there, marks that it did, and keeps what the first node wrote under a link. Any other failure stays in the turn with what had already arrived, and Try again sends it again.
+
+Reply settings has a Tools button. Paste function definitions as JSON and the model can ask for a call. Nothing runs on its own: the page shows the call, you type what it returned, and the model carries on from that.
 
 The dashboard shows a flag beside each worker whose country is known, with the name on hover and in the worker's details. The country comes from a table in the package, so no outside service sees a node's address. Only a public address can be looked up. A private, loopback, or Tailscale address shows nothing, and so does a host name, because resolving it would tell a DNS server. A node on Tailscale or a LAN therefore needs `--location` to show a flag.
 
@@ -1800,6 +1806,12 @@ isharded assistant grant add files.read NOTES_FOLDER
 
 `isharded assistant serve` runs its own web page and OpenAI-shaped API at `http://127.0.0.1:8470`, with a key for each person. It stays on loopback unless told otherwise. Nearly every command has a route too, under the same keys: [the assistant's guide](ASSISTANT.md) lists them, and `isharded assistant provider test NAME` checks one provider.
 
+The page is the chat page's shell with its own rail: Approvals, Memory, Tasks, History, and Audit for everyone, and Manage for the owner. What waits for a person is counted in the top bar, and stops in Approvals with the exact action. Manage holds grants, providers and the order they are tried in, skills, plugins, code runs, and peers. A reply says who answered and which tools ran, and "What did it see?" opens what the model was shown. It has no link to the pool's pages, because neither knows the other's address. [Its guide](ASSISTANT.md#the-page) says what each panel does.
+
+![A real reply, a failed one after the pool was stopped, and an action waiting for approval](screenshots/assistant-light.png)
+
+![Manage in the dark theme on the same real install, with the pool stopped](screenshots/assistant-dark.png)
+
 Treat it as early. How far to trust it depends on the model. Qwen3-0.6B cannot be trusted with tools: each time it skipped reading a file, it said it had read it and made up what was inside. Qwen3.6-27B, split across two machines, read the file in 20 of 20 tries and invented nothing, and recalled a fact in a new session 5 of 5 times. Asked to read and then write, it reached the write 3 of 5 times, and each of those waited for a person, as a write after reading a file must. In one other try it said it had written the file when no write ran. So the `used` line at the end of a reply is the record of which tools really ran, on any model. Federation has run only between two installs on one machine. [The assistant's guide](ASSISTANT.md) is the full manual, and says what is not built or proven.
 
 ## Memory and placement
@@ -1828,7 +1840,7 @@ The ends of the pipeline are not equal: the exit reads the whole output head for
 
 An explicit `--gpu-memory-gb` is a hard allocator limit on CUDA and ROCm. RAM and disk budgets are enforced by placement. Disk is a capacity tier: expect it to be far slower than RAM once a model outgrows the OS page cache.
 
-The dashboard's "Memory for weights" counts weights only. Real use is higher, because KV cache, compute buffers, a draft model, and each worker's GPU context come on top.
+The dashboard's memory figures count weights only. Real use is higher, because KV cache, compute buffers, a draft model, and each worker's GPU context come on top.
 
 A pool that measures 0 bytes free counts as full. A pool that was never measured, which shows as no size at all, keeps its budget.
 
@@ -2221,7 +2233,7 @@ Adapter tests compare every family with the reference `transformers` implementat
 | `isharded/statestore.py`, `isharded/statecopy.py` | Saved prompt states, where prompts are cut, and the copy of each on another node |
 | `isharded/weights.py` | Readers, the unit cache, and hash checks |
 | `isharded/access.py`, `isharded/pool.py`, `isharded/tickets.py`, `isharded/tls.py`, `isharded/statements.py` | Keys, certificates, signed entries, tickets, TLS, and proving who asked when a request is passed on |
-| `isharded/chat.html`, `isharded/dashboard.html`, `isharded/ui.css` | The chat page and the dashboard |
+| `isharded/chat.html`, `isharded/dashboard.html`, `isharded/ui.css`, `isharded/ui.js` | The chat page and the dashboard, with their shared styles and drawing code |
 | `isharded/assistant/` | The assistant. [Its guide](ASSISTANT.md) says which part does what |
 
 ## Current limits
