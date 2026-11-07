@@ -580,6 +580,7 @@ mod tests {
 
     fn rows_pass(slot: u32, position: u32, values: &[f32]) -> Pass {
         Pass {
+            generation: 1,
             id: u64::from(slot),
             epoch: 1,
             slot,

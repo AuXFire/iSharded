@@ -182,6 +182,7 @@ fn build_ring(count: u16, closing: bool, delay: Duration, (ack_timeout_ms, silen
 fn pass(id: u64, token: u32, position: u32) -> Pass {
     Pass {
         id,
+        generation: 1,
         epoch: 7,
         slot: 0,
         position,
@@ -236,7 +237,7 @@ fn a_pass_runs_every_stage_in_order_and_the_answer_reaches_the_entry() {
     ring.client.send(&pass(1, 5, 9).encode()).unwrap();
     let got = answer(&mut ring);
     // ((5 * 10 + 1) * 10 + 2) * 10 + 3
-    assert_eq!(got, Answer { id: 1, epoch: 7, tokens: vec![5123, 9] });
+    assert_eq!(got, Answer { id: 1, generation: 1, epoch: 7, slot: 0, tokens: vec![5123, 9] });
     assert!(ring.nodes[2].stats().closing_up);
 }
 
@@ -373,7 +374,7 @@ fn losing_the_closing_link_costs_nothing_but_speed() {
     wait_until("the closing link's loss", || !ring.nodes[2].stats().closing_up);
     ring.client.send(&pass(2, 5, 9).encode()).unwrap();
     let got = answer(&mut ring);
-    assert_eq!(got, Answer { id: 2, epoch: 7, tokens: vec![5123, 9] });
+    assert_eq!(got, Answer { id: 2, generation: 1, epoch: 7, slot: 0, tokens: vec![5123, 9] });
     assert_eq!(ring.nodes[2].stats().refusals, 0);
 }
 
@@ -449,6 +450,95 @@ fn a_rewind_leaves_other_replies_and_earlier_places_alone() {
     seen.sort_unstable();
     assert_eq!(seen, vec![1, 2, 3, 4]);
     assert_eq!(ring.nodes[0].stats().dropped, 0);
+}
+
+#[test]
+fn a_new_reply_clears_what_an_older_one_left_queued_on_its_slot() {
+    let mut ring = ring(2, true, Duration::from_millis(30), 2000);
+    for id in 1..=8 {
+        ring.client.send(&pass(id, 1, id as u32).encode()).unwrap();
+    }
+    let other = Pass { slot: 1, ..pass(9, 1, 3) };
+    ring.client.send(&other.encode()).unwrap();
+    ring.client.send(&Pass { generation: 2, ..pass(10, 1, 0) }.encode()).unwrap();
+    let mut seen = vec![];
+    while !seen.contains(&10) || !seen.contains(&9) {
+        seen.push(answer(&mut ring).id);
+    }
+    assert!(seen.len() < 5, "{seen:?}");
+    assert!(ring.nodes[0].stats().dropped >= 5);
+}
+
+#[test]
+fn a_pass_from_a_generation_that_has_ended_never_runs() {
+    let mut ring = ring(2, true, Duration::ZERO, 2000);
+    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+    answer(&mut ring);
+    ring.client.send(&Pass { generation: 2, ..pass(2, 5, 0) }.encode()).unwrap();
+    answer(&mut ring);
+    let ran = ring.seen[0].load(Ordering::SeqCst);
+    // It reaches the stage after the reply that replaced it, as a pass orphaned by a lost link can.
+    ring.client.send(&pass(3, 5, 10).encode()).unwrap();
+    ring.client.send(&Pass { generation: 2, ..pass(4, 5, 1) }.encode()).unwrap();
+    assert_eq!(answer(&mut ring).id, 4);
+    assert_eq!(ring.seen[0].load(Ordering::SeqCst), ran + 1);
+    assert_eq!(ring.nodes[0].stats().dropped, 1);
+}
+
+#[test]
+fn a_pass_that_arrives_twice_runs_once() {
+    let mut ring = ring(2, true, Duration::ZERO, 2000);
+    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+    ring.client.send(&pass(2, 5, 10).encode()).unwrap();
+    assert_eq!(answer(&mut ring).id, 1);
+    assert_eq!(answer(&mut ring).id, 2);
+    assert_eq!(ring.seen[1].load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn the_entry_drops_a_late_result_from_an_older_generation() {
+    let mut ring = ring(2, true, Duration::from_millis(100), 2000);
+    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+    ring.client.send(&Pass { generation: 2, ..pass(2, 5, 0) }.encode()).unwrap();
+    assert_eq!(answer(&mut ring).id, 2);
+    assert!(ring.nodes[0].stats().dropped >= 1);
+}
+
+/// Says what the last stage says, from outside it, as a stage that lost track could.
+fn closing_voice(ring: &Ring) -> Arc<Link> {
+    let door = &ring.doors[0];
+    link::dial(&format!("127.0.0.1:{}", door.port), Some(&door.fingerprint), KEY, Role::Closing, 7, Duration::from_secs(3)).unwrap()
+}
+
+#[test]
+fn the_entry_passes_on_an_answer_it_has_already_seen_only_once() {
+    let mut ring = ring(2, false, Duration::ZERO, 2000);
+    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+    let first = answer(&mut ring);
+    let voice = closing_voice(&ring);
+    voice.send(&first.encode()).unwrap();
+    voice.send(&Answer { id: 2, ..first.clone() }.encode()).unwrap();
+    voice.send(&Answer { id: 2, ..first.clone() }.encode()).unwrap();
+    voice.send(&Answer { id: 3, ..first }.encode()).unwrap();
+    assert_eq!(answer(&mut ring).id, 2);
+    assert_eq!(answer(&mut ring).id, 3);
+    wait_until("both repeats dropped", || ring.nodes[0].stats().dropped == 2);
+    voice.close();
+}
+
+#[test]
+fn an_answer_from_no_reply_this_entry_knows_is_dropped() {
+    let mut ring = ring(2, false, Duration::ZERO, 2000);
+    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+    let first = answer(&mut ring);
+    let voice = closing_voice(&ring);
+    voice.send(&Answer { id: 2, generation: 99, ..first.clone() }.encode()).unwrap();
+    voice.send(&Answer { id: 3, slot: 4, ..first.clone() }.encode()).unwrap();
+    voice.send(&Answer { id: 4, ..first }.encode()).unwrap();
+    assert_eq!(answer(&mut ring).id, 4);
+    assert_eq!(ring.nodes[0].stats().dropped, 2);
+    voice.close();
 }
 
 #[test]

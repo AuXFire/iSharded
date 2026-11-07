@@ -9,7 +9,7 @@
 //! the same errors the HTTP path raises, so every failure lands on recovery that is already
 //! proven: a reply replays, and a lost worker is replaced.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -22,7 +22,7 @@ use parking_lot::{Condvar, Mutex, RawMutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::link::{self, Frames, Identity, Link, LinkError};
-use crate::wire::{self, Ack, Answer, Hello, Kind, Nack, Pass, Refusal, Role, FLAG_BF16, FLAG_TOKENS};
+use crate::wire::{self, Ack, Answer, Hello, Kind, Nack, Pass, Refusal, Role, FLAG_BF16, FLAG_TOKENS, HEADER_BYTES};
 
 /// How many connections may be mid-handshake at once, so strangers cannot pile up threads.
 const MAX_STRANGERS: usize = 16;
@@ -33,6 +33,10 @@ const DIAL_ATTEMPT: Duration = Duration::from_secs(5);
 const DIAL_RETRY: Duration = Duration::from_millis(250);
 /// The most replies that share one trip through the model.
 const MAX_MERGED: usize = 64;
+/// How far back a slot remembers. Passes on a link keep their order, so what is left over
+/// from a reply is close behind it, and a repeated answer is close behind the first.
+const GENERATIONS_KEPT: usize = 16;
+const ANSWERS_KEPT: usize = 1024;
 
 /// What a stage does with a pass. `Rows` go on to the next stage, and `Tokens` are the answer.
 pub enum Output {
@@ -153,6 +157,46 @@ struct Job {
     arrived: Instant,
 }
 
+/// What a stage knows of the replies on one slot. Generations are random, so the only way to
+/// know one is old is to have seen the one that replaced it.
+#[derive(Default)]
+struct Line {
+    generation: u64,
+    newest_pass: u64,
+    ended: VecDeque<u64>,
+    answered: VecDeque<u64>,
+}
+
+impl Line {
+    /// Whether a pass is an old reply's, or one already seen. A client numbers its passes in
+    /// order, and a link keeps them in it.
+    fn refuses(&self, pass: &Pass) -> bool {
+        self.ended.contains(&pass.generation) || (pass.generation == self.generation && pass.id <= self.newest_pass)
+    }
+
+    fn begin(&mut self, generation: u64) {
+        self.ended.push_back(std::mem::replace(&mut self.generation, generation));
+        keep_newest(&mut self.ended, GENERATIONS_KEPT);
+        self.answered.clear();
+    }
+
+    /// Whether an answer belongs to this slot's reply and is the first with its id.
+    fn takes(&mut self, answer: &Answer) -> bool {
+        if answer.generation != self.generation || self.answered.contains(&answer.id) {
+            return false;
+        }
+        self.answered.push_back(answer.id);
+        keep_newest(&mut self.answered, ANSWERS_KEPT);
+        true
+    }
+}
+
+fn keep_newest(list: &mut VecDeque<u64>, keep: usize) {
+    if list.len() > keep {
+        list.drain(..list.len() - keep);
+    }
+}
+
 struct Peer {
     link: Arc<Link>,
     stage: u16,
@@ -212,6 +256,8 @@ struct Inner {
     local: Mutex<Option<Arc<Link>>>,
     local_key: [u8; 32],
     jobs: Mutex<VecDeque<Job>>,
+    /// Taken only inside `jobs`, or with no other lock held.
+    lines: Mutex<HashMap<u32, Line>>,
     ready: Condvar,
     stopping: AtomicBool,
     strangers: AtomicUsize,
@@ -235,6 +281,7 @@ impl Node {
             local: Mutex::new(None),
             local_key: link::random_bytes(),
             jobs: Mutex::new(VecDeque::new()),
+            lines: Mutex::default(),
             ready: Condvar::new(),
             stopping: AtomicBool::new(false),
             strangers: AtomicUsize::new(0),
@@ -520,13 +567,26 @@ fn serve_passes(inner: &Inner, link: &Link, mut frames: Frames, acknowledge: boo
 /// Queues a pass. A rewind says that whatever waits past it has already been thrown away,
 /// so it goes now and the rewind does not sit behind it. Nobody expects an answer to those:
 /// passes run in order, so once the newest pass of a reply is back, nothing of it is left.
+/// A new generation says the same of all its slot's queue. The entry gave up on that reply.
 fn enqueue(inner: &Inner, pass: Pass) {
     let mut jobs = inner.jobs.lock();
-    if let Some(keep) = pass.rollback_to {
-        let before = jobs.len();
-        jobs.retain(|job| job.pass.slot != pass.slot || job.pass.epoch != pass.epoch || job.pass.position < keep);
-        inner.counters.dropped.fetch_add((before - jobs.len()) as u64, Ordering::Relaxed);
+    let before = jobs.len();
+    let mut lines = inner.lines.lock();
+    let line = lines.entry(pass.slot).or_default();
+    if line.refuses(&pass) {
+        inner.counters.dropped.fetch_add(1, Ordering::Relaxed);
+        return;
     }
+    if pass.generation != line.generation {
+        line.begin(pass.generation);
+        jobs.retain(|job| job.pass.slot != pass.slot);
+    }
+    line.newest_pass = pass.id;
+    drop(lines);
+    if let Some(keep) = pass.rollback_to {
+        jobs.retain(|job| job.pass.slot != pass.slot || job.pass.epoch != pass.epoch || job.pass.position < keep);
+    }
+    inner.counters.dropped.fetch_add((before - jobs.len()) as u64, Ordering::Relaxed);
     jobs.push_back(Job { pass, arrived: Instant::now() });
     drop(jobs);
     inner.ready.notify_one();
@@ -536,13 +596,24 @@ fn enqueue(inner: &Inner, pass: Pass) {
 fn serve_answers(inner: &Inner, link: &Link, mut frames: Frames) {
     while let Ok((kind, body)) = frames.next() {
         match kind {
-            Kind::Result => {
-                inner.counters.answers.fetch_add(1, Ordering::Relaxed);
-                to_local(inner, frames.whole());
-            }
+            Kind::Result => receive_answer(inner, frames.whole()),
             Kind::Ping if answer_ping(link, body) => {}
             _ => return,
         }
+    }
+}
+
+/// At the entry: a result, by whichever way it came. Only the first of it, for the reply now
+/// on its slot, goes on to the worker.
+fn receive_answer(inner: &Inner, frame: &[u8]) {
+    let Ok(answer) = Answer::decode(&frame[HEADER_BYTES..]) else {
+        return;
+    };
+    let fresh = inner.lines.lock().get_mut(&answer.slot).is_some_and(|line| line.takes(&answer));
+    let counter = if fresh { &inner.counters.answers } else { &inner.counters.dropped };
+    counter.fetch_add(1, Ordering::Relaxed);
+    if fresh {
+        to_local(inner, frame);
     }
 }
 
@@ -618,6 +689,7 @@ fn read_peer(inner: &Inner, ring: &Ring, peer: &Peer) {
                     average(&inner.counters.link_rtt_us, now.saturating_sub(stamp));
                 }
             }
+            Kind::Result if ring.is_entry() => receive_answer(inner, frames.whole()),
             // Coming back along the route, towards the entry.
             Kind::Result | Kind::Nack => send_back(inner, ring, frames.whole()),
             _ => return,
@@ -662,7 +734,7 @@ fn peer_lost(inner: &Inner, ring: &Ring, peer: &Peer, why: &str) {
     }
     ring.next.lock().take();
     // Id zero means every pass this stage has sent on: nothing can say which ones were lost.
-    let nack = Nack { id: 0, epoch: ring.epoch, refusal: Refusal::FailedStage, stage: peer.stage, message: why.to_string() };
+    let nack = Nack { id: 0, generation: 0, epoch: ring.epoch, refusal: Refusal::FailedStage, stage: peer.stage, message: why.to_string() };
     inner.counters.refusals.fetch_add(1, Ordering::Relaxed);
     send_back(inner, ring, &nack.encode());
 }
@@ -704,7 +776,7 @@ fn take_batch(first: Job, jobs: &mut VecDeque<Job>) -> Vec<Job> {
 }
 
 fn refuse(inner: &Inner, ring: &Ring, pass: &Pass, refusal: Refusal, message: String) {
-    let nack = Nack { id: pass.id, epoch: pass.epoch, refusal, stage: ring.index, message };
+    let nack = Nack { id: pass.id, generation: pass.generation, epoch: pass.epoch, refusal, stage: ring.index, message };
     inner.counters.refusals.fetch_add(1, Ordering::Relaxed);
     send_back(inner, ring, &nack.encode());
 }
@@ -713,7 +785,8 @@ fn handle(inner: &Inner, jobs: Vec<Job>) {
     let Some(ring) = inner.ring.read().clone() else {
         // No route: the link that carried this has nothing to do any more. Say so at the entry.
         for job in &jobs {
-            let nack = Nack { id: job.pass.id, epoch: job.pass.epoch, refusal: Refusal::Epoch, stage: 0, message: "no route here".into() };
+            let pass = &job.pass;
+            let nack = Nack { id: pass.id, generation: pass.generation, epoch: pass.epoch, refusal: Refusal::Epoch, stage: 0, message: "no route here".into() };
             to_local(inner, &nack.encode());
         }
         return;
@@ -753,7 +826,7 @@ fn finish(inner: &Inner, ring: &Ring, pass: Pass, result: Result<Output, Failure
         Err(failure) => refuse(inner, ring, &pass, failure.refusal, failure.message),
         Ok(Output::Tokens(tokens)) => {
             inner.counters.answers.fetch_add(1, Ordering::Relaxed);
-            let frame = Answer { id: pass.id, epoch: pass.epoch, tokens }.encode();
+            let frame = Answer { id: pass.id, generation: pass.generation, epoch: pass.epoch, slot: pass.slot, tokens }.encode();
             answer(inner, ring, &frame);
         }
         Ok(Output::Rows { rows, width, bf16, data }) => {

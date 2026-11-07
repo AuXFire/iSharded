@@ -651,6 +651,20 @@ mod tests {
     }
 
     #[test]
+    fn a_node_on_another_wire_version_is_refused_at_its_greeting() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            accept(socket, None, |_, _| Some(KEY.to_vec())).map(|_| ())
+        });
+        let mut frame = Hello { role: Role::Hop, epoch: 1, nonce: [0; NONCE_BYTES] }.encode();
+        frame[2] = wire::VERSION - 1;
+        TcpStream::connect(address).unwrap().write_all(&frame).unwrap();
+        assert!(matches!(handle.join().unwrap(), Err(LinkError::Wire(wire::WireError::BadVersion(_)))));
+    }
+
+    #[test]
     fn a_stranger_cannot_send_a_large_frame_before_proving_anything() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -661,6 +675,7 @@ mod tests {
         let mut stranger = TcpStream::connect(address).unwrap();
         let frame = crate::wire::Pass {
             id: 1,
+            generation: 1,
             epoch: 1,
             slot: 0,
             position: 0,

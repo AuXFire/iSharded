@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes as C
+from dataclasses import dataclass
 import hashlib
 import hmac
 import json
@@ -27,10 +28,10 @@ import numpy as np
 
 ABI_VERSION = 2
 MAGIC = 0x5369
-WIRE_VERSION = 1
+WIRE_VERSION = 2
 HEADER = struct.Struct("<HBBI")
-RESULT_HEAD = struct.Struct("<QQI")
-NACK_HEAD = struct.Struct("<QQBHI")
+RESULT_HEAD = struct.Struct("<QQQII")
+NACK_HEAD = struct.Struct("<QQQBHI")
 KIND_HELLO, KIND_HELLO_OK, KIND_AUTH, KIND_PASS, KIND_ACK, KIND_RESULT, KIND_NACK, KIND_PING, KIND_PONG = range(1, 10)
 ROLE_LOCAL = 3
 FLAG_VERIFY, FLAG_TOKENS, FLAG_KEEP = 1, 2, 8
@@ -233,6 +234,7 @@ def _proof(key: bytes, label: bytes, role: int, epoch: int, client_nonce: bytes,
 
 def pass_frame(
     identity: int,
+    generation: int,
     epoch: int,
     slot: int,
     position: int,
@@ -249,13 +251,22 @@ def pass_frame(
     flags = FLAG_TOKENS | (FLAG_VERIFY if verify else 0) | (FLAG_KEEP if keep else 0)
     rollback = NO_ROLLBACK if rollback_to is None else rollback_to
     body = struct.pack(
-        f"<QQIIIBffIBQI{len(guesses)}II{len(tokens)}III",
-        identity, epoch, slot, position, rollback, flags, temperature, top_p, top_k, seed is not None, (seed or 0) & (2**64 - 1),
+        f"<QQQIIIBffIBQI{len(guesses)}II{len(tokens)}III",
+        identity, generation, epoch, slot, position, rollback, flags, temperature, top_p, top_k, seed is not None, (seed or 0) & (2**64 - 1),
         len(guesses), *guesses,
         len(tokens), *tokens,
         0, 0,
     )  # fmt: skip
     return _frame(KIND_PASS, body)
+
+
+@dataclass(slots=True)
+class Flight:
+    """A pass that is out on the ring."""
+
+    future: asyncio.Future[list[int]]
+    slot: int
+    generation: int
 
 
 class EngineClient:
@@ -264,9 +275,11 @@ class EngineClient:
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self.reader = reader
         self.writer = writer
-        self.waiting: dict[int, asyncio.Future[list[int]]] = {}
+        self.waiting: dict[int, Flight] = {}
         # The newest pass of each slot. Passes run in order, so when it is back all of them are.
         self.newest: dict[int, asyncio.Future[list[int]]] = {}
+        # The reply on each slot. A slot that has settled has none, so its next pass starts one.
+        self.generations: dict[int, int] = {}
         self.next_id = 1
         self.alive = True
         self.task: asyncio.Task[None] | None = None
@@ -305,19 +318,19 @@ class EngineClient:
             while True:
                 kind, body = await self._read_frame(self.reader)
                 if kind == KIND_RESULT:
-                    identity, _epoch, count = RESULT_HEAD.unpack_from(body)
+                    identity, generation, _epoch, _slot, count = RESULT_HEAD.unpack_from(body)
                     tokens = list(struct.unpack_from(f"<{count}I", body, RESULT_HEAD.size))
-                    future = self.waiting.pop(identity, None)
-                    if future is not None and not future.done():
-                        future.set_result(tokens)
+                    flight = self._landing(identity, generation)
+                    if flight is not None:
+                        flight.future.set_result(tokens)
                 elif kind == KIND_NACK:
-                    identity, _epoch, refusal, stage, length = NACK_HEAD.unpack_from(body)
+                    identity, generation, _epoch, refusal, stage, length = NACK_HEAD.unpack_from(body)
                     message = body[NACK_HEAD.size : NACK_HEAD.size + length].decode("utf-8", "replace")
                     refused = EngineRefusal(refusal, stage, message)
                     if identity:
-                        future = self.waiting.pop(identity, None)
-                        if future is not None and not future.done():
-                            future.set_exception(refused)
+                        flight = self._landing(identity, generation)
+                        if flight is not None:
+                            flight.future.set_exception(refused)
                     else:
                         # A link failed, and nothing can say which passes it took with it.
                         reason = refused
@@ -326,11 +339,19 @@ class EngineClient:
             reason = EngineRefusal(REFUSE_RETRY, 0, f"the link to the engine failed: {exc}")
         finally:
             self.alive = False
-            for future in self.waiting.values():
-                if not future.done():
-                    future.set_exception(reason)
+            for flight in self.waiting.values():
+                if not flight.future.done():
+                    flight.future.set_exception(reason)
             self.waiting.clear()
             self.writer.close()
+
+    def _landing(self, identity: int, generation: int) -> Flight | None:
+        """The pass this frame answers. Anything else is left over, or a repeat, and is dropped."""
+        flight = self.waiting.get(identity)
+        if flight is None or flight.generation != generation or flight.future.done():
+            return None
+        del self.waiting[identity]
+        return flight
 
     def send(self, **fields: Any) -> asyncio.Future[list[int]]:
         """Sends a pass and does not wait. Cancelling the future says the answer is not wanted."""
@@ -339,10 +360,12 @@ class EngineClient:
         identity = self.next_id
         self.next_id += 1
         future: asyncio.Future[list[int]] = asyncio.get_running_loop().create_future()
-        self.waiting[identity] = future
-        self.newest[fields["slot"]] = future
+        slot = fields["slot"]
+        generation = self.generations.setdefault(slot, secrets.randbits(64) | 1)  # zero means every pass
+        self.waiting[identity] = Flight(future, slot, generation)
+        self.newest[slot] = future
         future.add_done_callback(lambda done: self._landed(identity, done))
-        self.writer.write(pass_frame(identity, **fields))
+        self.writer.write(pass_frame(identity, generation, **fields))
         return future
 
     def _landed(self, identity: int, future: asyncio.Future[list[int]]) -> None:
@@ -355,12 +378,20 @@ class EngineClient:
         return await asyncio.wait_for(self.send(**fields), deadline)
 
     async def settled(self, slot: int, seconds: float) -> bool:
-        """Waits until nothing of this slot's is out, and says whether that happened."""
+        """Waits until nothing of this slot's is out, and says whether that happened.
+
+        Every reply ends here, so this also ends its generation. Whatever is still out can
+        now only be dropped, here and at every stage, so nothing waits for it.
+        """
         newest = self.newest.get(slot)
-        if newest is None:
-            return True
-        await asyncio.wait({newest}, timeout=seconds)
-        return newest.done()
+        if newest is not None:
+            await asyncio.wait({newest}, timeout=seconds)
+        landed = newest is None or newest.done()
+        self.generations.pop(slot, None)
+        for flight in list(self.waiting.values()):
+            if flight.slot == slot:
+                flight.future.cancel()
+        return landed
 
     def close(self) -> None:
         self.alive = False
