@@ -213,8 +213,10 @@ RING_DIAL_MS = 10_000
 # two ends the closing link. Each link has its own key.
 RING_KEYS = frozenset({"back", "next", "closing"})
 # A silent link answers nothing, so a shorter address is checked while it is in use. It
-# gets as long without an answer as a ring link gets without an acknowledgement.
-HOP_WATCH_SECONDS = 1.0
+# gets as long without an answer as a ring link gets without an acknowledgement. The same
+# check keeps the connection a prompt goes out on in use, so a prompt after a pause does
+# not find it idle, which on a long link costs it round trips to open the window again.
+HOP_WATCH_SECONDS = 0.1
 HOP_SILENCE_SECONDS = RING_ACK_MS / 1000
 # Longest one address may take to prove itself and be timed.
 ADDRESS_PROBE_SECONDS = 6.0
@@ -378,8 +380,11 @@ class MergedStep:
 
 
 class WorkerRuntime:
+    route: list[StageAssignment] = []  # replaced, never changed in place
     hop: NextHop | None = None
     hop_fallbacks = 0
+    # Keeps the way to the next stage in use while there is no shorter one.
+    warming: asyncio.Task[None] | None = None
 
     def __init__(self) -> None:
         self.worker_id = os.getenv("ISHARDED_WORKER_ID", socket.gethostname())
@@ -1423,8 +1428,21 @@ class WorkerRuntime:
         hop = self.hop
         if hop is not None and (hop.worker_id != next_stage.worker_id or hop.via != next_stage.url.rstrip("/")):
             self._retire_hop(hop)
-            return None
+            hop = None
+        if hop is None and next_stage in self.route and (self.warming is None or self.warming.done()):
+            self.warming = asyncio.create_task(self._keep_warm(next_stage.url.rstrip("/"), self.route))
         return hop
+
+    async def _keep_warm(self, url: str, route: list[StageAssignment]) -> None:
+        """Keeps the advertised way to the next stage in use, as the watch does a shorter one.
+
+        It goes on the client the passes use, so it keeps their connection. It ends with the
+        route, or when a shorter way takes over, whose watch then does the same.
+        """
+        while self.route is route and self.hop is None:
+            with suppress(*LINK_FAILURES):
+                await self.client.post(url + ECHO_PATH, headers=auth_headers(self.pool_token), timeout=HOP_SILENCE_SECONDS)
+            await asyncio.sleep(HOP_WATCH_SECONDS)
 
     def _forget_hop(self, hop: NextHop) -> None:
         hop.lost.set()
@@ -1452,7 +1470,7 @@ class WorkerRuntime:
                     await asyncio.wait_for(hop.lost.wait(), HOP_WATCH_SECONDS)
                     return
                 try:
-                    answer = await hop.client.post(hop.url + ECHO_PATH, headers=auth_headers(self.pool_token), extensions=hop.options, timeout=HOP_WATCH_SECONDS * 2)
+                    answer = await hop.client.post(hop.url + ECHO_PATH, headers=auth_headers(self.pool_token), extensions=hop.options, timeout=HOP_SILENCE_SECONDS)
                     answer.raise_for_status()
                     heard = time.monotonic()
                 except LINK_FAILURES:
