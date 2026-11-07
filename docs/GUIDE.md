@@ -48,6 +48,7 @@ More detail lives in [Operating iSharded](OPERATIONS.md), [iSharded security](SE
 - Speeds up replies with a small draft model, reuses earlier conversation state, and lets conversations share a pass through each stage.
 - Runs several models at once on the same mesh, and users choose between them.
 - Serves OpenAI-shaped `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, and `/v1/models`, with streaming, tool calling, and image input, plus a chat page and a live dashboard on every node.
+- Speaks [Claude Messages, OpenAI Responses, and Ollama](#claude-responses-and-ollama-clients) as well, so tools built for those work against a mesh.
 - Speaks MCP both ways: MCP clients can use a mesh, and models on a mesh can use the tools of MCP servers.
 - Checks answers, by asking separate routes the same questions and comparing what comes back.
 - Comes with an assistant that each person runs for themselves, with a mesh as its model.
@@ -978,6 +979,19 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `POST` | `/v1/completions` | User key | Text completion, one prompt per request |
 | `POST` | `/v1/embeddings` | User key | Vectors for text, from an embedding model. See [Embeddings](#embeddings) |
 | `GET` | `/v1/models` | User key | Every running model, and what each is for |
+| `POST` | `/v1/messages` | User key | [Claude Messages](#claude-messages), streaming with `stream: true`. Takes the key as `x-api-key` too |
+| `POST` | `/v1/messages/count_tokens` | User key | How many tokens a Messages request comes to. Takes the key as `x-api-key` too |
+| `POST` | `/v1/responses` | User key | [OpenAI Responses](#openai-responses), streaming with `stream: true` |
+| `POST` | `/api/chat` | User key | [Ollama](#ollama) chat. Streams unless `stream` is `false` |
+| `POST` | `/api/generate` | User key | Ollama text generation. Streams unless `stream` is `false` |
+| `POST` | `/api/embed` | User key | Ollama vectors for one text or a list |
+| `POST` | `/api/embeddings` | User key | Ollama's older vector route, for one `prompt` |
+| `GET` | `/api/tags` | User key | Every running model, in Ollama's shape |
+| `POST` | `/api/show` | User key | What Ollama clients ask about one running model |
+| `GET` | `/api/ps` | User key | Running models, in Ollama's shape |
+| `GET` | `/api/version` | User key | This node's iSharded version |
+| `POST` | `/api/pull`, `/api/push`, `/api/create`, `/api/copy` | User key | Refused with a 400 that says to load models through iSharded |
+| `DELETE` | `/api/delete` | User key | The same |
 | `POST` | `/mcp` | User key | [MCP](#mcp) over Streamable HTTP. `GET` and `DELETE` answer 405, since there is no stream or session |
 | `GET` | `/admin/status` | User key | Workers and their `country`, memory pools, route, epoch, mesh, lanes, load progress, and the last answer check |
 | `GET` | `/admin/catalog` | User key | Suggested models and supported architectures |
@@ -1163,6 +1177,97 @@ On two nodes on one machine, the same loop ran through the coordinator, a follow
 | 502 | A stage could not process this request |
 | 503 | No coordinator yet, or a stage restarting. Try again shortly |
 | 507 | The model does not fit in the pool |
+
+### Claude, Responses, and Ollama clients
+
+A mesh also speaks three other APIs, so tools built for them work with only an address and a key changed. Each one is a thin translation onto `/v1/chat/completions`, so every rule of that route holds here: the same keys and roles, the same rate limit, one charge per reply, the 16 MiB body limit, lanes, tool calling, and images. `model` picks a running model the same way, a name that is not running gets a 404, and leaving it out means the main model. Set the client's model to a name from `/v1/models`, not a name from the provider. POST requests appear in the audit log, and like `/v1/models`, the `GET` routes do not.
+
+What differs from `/v1/chat/completions`:
+
+- With no reply limit, or a limit above 32768, a reply runs until the model stops, the limit of 32768 is reached, or the context is full.
+- A `temperature` left out means 0, the same default as `/v1/chat/completions`, and not the default of the API being spoken.
+- Bodies must be sent as `Content-Type: application/json`. `curl -d` alone sends a form type and is refused, so add `-H "Content-Type: application/json"`. The check keeps web pages from posting here.
+- Reasoning stays in the text, as it does on `/v1/chat/completions`, between its tags if the model writes them. Clients get no separate thinking blocks.
+- Refusals made before a route runs, such as a body that is too large or no coordinator answering, use iSharded's `{"detail": ...}` shape.
+
+#### Claude Messages
+
+Point a Claude client at the node's address, with no `/v1`:
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(base_url="http://NODE:8209", api_key="KEY")
+reply = client.messages.create(model=MODEL, max_tokens=1024, messages=[{"role": "user", "content": "Say hello."}])
+```
+
+Other tools usually read `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`. The key may come as `x-api-key` or as `Authorization: Bearer`. If both are sent, `Authorization` is the one used. `x-api-key` works on these two routes only, and it is taken off the request before anything else sees it, so it stays on the node you gave it to.
+
+| Field | What happens to it |
+|---|---|
+| `max_tokens` | Required, as it is at Anthropic |
+| `system` | A string or a list of text blocks |
+| `messages` | `content` is a string or a list of `text`, `image`, `tool_use`, and `tool_result` blocks. `thinking` blocks sent back are dropped. An image comes as base64, and a URL is refused as in [Vision](#vision). A `tool_result` with `is_error` reaches the model starting with `Error:` |
+| `temperature`, `top_p`, `top_k` | As on the [chat route](#chat-and-completion-requests) |
+| `stop_sequences` | Ends the reply, as `stop` does |
+| `stream` | Sends `message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, and `message_stop`. Tool calls come as `tool_use` blocks with `input_json_delta`, each one whole in a single delta. The prompt's token count arrives in `message_delta`, since `message_start` goes out before it is known |
+| `tools` | Your own tools, with `input_schema`. Tools Anthropic runs for you, such as web search, are refused with a 400 |
+| `tool_choice` | `auto`, `any`, `none`, or `tool` with a `name`. `disable_parallel_tool_use` keeps only the first call |
+| `thinking` | `type: "disabled"` turns reasoning off on models with a switch, and any other type turns it on. `budget_tokens` is not used |
+
+A reply stopped by a stop sequence says `stop_reason: "end_turn"`, with `stop_sequence` null, because the chat path does not say which ending it met. Errors have Anthropic's shape, with `type: "error"`, an `error` holding `type` and `message`, and a `request_id`. A failure during a stream is an `error` event. `POST /v1/messages/count_tokens` takes the same fields without `max_tokens` and runs the model's template, and an image counts only as its marker.
+
+#### OpenAI Responses
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://NODE:8209/v1", api_key="KEY")
+print(client.responses.create(model=MODEL, input="Say hello.", max_output_tokens=1024).output_text)
+```
+
+| Field | What happens to it |
+|---|---|
+| `input` | A string, or a list of items: messages with a role of `user`, `assistant`, `system`, or `developer`, then `function_call` and `function_call_output`. `reasoning` items are dropped. Parts are `input_text`, `output_text`, and `input_image` with a data URL in `image_url` |
+| `instructions` | The system message |
+| `max_output_tokens` | The reply limit. A reply that reaches it ends with `status: "incomplete"` |
+| `temperature`, `top_p` | As on the [chat route](#chat-and-completion-requests) |
+| `stream` | Sends `response.created`, `response.in_progress`, `response.output_item.added`, `response.content_part.added`, `response.output_text.delta`, `response.output_text.done`, `response.content_part.done`, `response.output_item.done`, and `response.completed` or `response.incomplete`. A call comes with `response.function_call_arguments.delta` and `.done`, and a failure ends with `response.failed` |
+| `tools`, `tool_choice`, `parallel_tool_calls` | Function tools only. Calls come back as `function_call` items |
+
+Nothing is stored here, so `previous_response_id`, `conversation`, and `background` are refused with a 400. Send the whole conversation in `input` each time. `text.format` is refused too, because the chat path cannot hold a reply to a format. Errors have OpenAI's `{"error": {...}}` shape.
+
+#### Ollama
+
+Clients that speak Ollama take the node's address as their host. Many send no key at all, and on a mesh with keys those are refused with a 401, like anything else here. Set the header:
+
+```python
+from ollama import Client
+
+client = Client(host="http://NODE:8209", headers={"Authorization": "Bearer KEY"})
+print(client.chat(model=MODEL, messages=[{"role": "user", "content": "Say hello."}]).message.content)
+```
+
+```
+curl http://NODE:8209/api/tags -H "Authorization: Bearer KEY"
+```
+
+A tool with no way to set a header cannot reach a mesh with keys.
+
+`/api/chat` and `/api/generate` stream by default, as newline-delimited JSON ending in a line with `done: true`, `done_reason`, and `total_duration`, `load_duration`, `prompt_eval_count`, `prompt_eval_duration`, `eval_count`, and `eval_duration`. Durations are in nanoseconds, and `load_duration` is 0 because a model stays on its route. A failure during a stream is a last line holding `error`.
+
+| Field | What happens to it |
+|---|---|
+| `messages` | Roles and `content`, with `images` as base64, `tool_calls`, and `tool` results by `tool_name` |
+| `prompt`, `system`, `images` | On `/api/generate`, they go through the model's template. With `raw: true`, `prompt` goes in as it is, and `images` are refused |
+| `options` | `temperature`, `top_p`, `top_k`, `seed`, `num_predict`, and `stop`. Others, such as `num_ctx`, do nothing, since a route's context is set when it loads |
+| `tools` | As on the [chat route](#tool-calling) |
+| `think` | Switches reasoning on models that support it |
+| `format` | Refused with a 400. The chat path cannot hold a reply to JSON or a schema, and asking the model nicely would only look as if it worked |
+| `suffix`, `template` | Refused with a 400 |
+| `keep_alive` | Does nothing. A model stays until it is replaced |
+
+A request with no `prompt`, or an empty `messages` list, answers `done_reason: "load"` if the model is running, and runs nothing. `/api/embed` and `/api/embeddings` need an [embedding model](#embeddings). In `/api/tags`, `/api/show`, and `/api/ps`, sizes, family, and context length are known for the main model and left empty for a lane's, and `size_vram` is always 0, because a model here is spread over many machines. `/api/version` gives iSharded's version, not Ollama's. Pulling, pushing, creating, copying, and deleting are refused: load models with [isharded load](#isharded-load) or `POST /admin/load`.
 
 ## MCP
 

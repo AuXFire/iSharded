@@ -32,6 +32,7 @@ from .gguf import GgufHeader, parse_source, split_parts
 from .llamacpp import KV_TYPES, PINNED_BUILD
 from .statestore import stage_namespace
 from . import audit
+from .compat import Node as CompatNode, mount as mount_compat
 from .discovery import start_beacon
 from .lanes import LaneDoor
 from .mcp_server import INVALID_REQUEST, McpHandler, MeshTools, RpcError, answer_http
@@ -2608,7 +2609,7 @@ def verify_user(authorization: str | None) -> Caller:
     return caller
 
 
-FORWARDED_PATHS = ("/v1/", "/admin/")
+FORWARDED_PATHS = ("/v1/", "/api/", "/admin/")
 SAFE_NODE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 # Connection details belong to each hop, and httpx sets the length itself.
 REPEATABLE_METHODS = {"GET", "HEAD"}
@@ -2664,7 +2665,7 @@ async def forward_to_coordinator(request: Request, call_next: Any) -> Any:
     if any(part in {".", ".."} for part in path.replace("\\", "/").split("/")):
         # httpx would resolve these, turning a forwarded path into any other.
         return JSONResponse(status_code=400, content={"detail": "bad path"})
-    serves_locally = path.startswith("/v1/") and bool(runtime.route)
+    serves_locally = path.startswith(("/v1/", "/api/")) and bool(runtime.route)
     own_choice = path in {"/admin/invites", "/admin/network", "/admin/audit"} or path.startswith("/admin/join/") or (runtime.access.ownerless and (path.startswith("/admin/keys") or path.endswith("/revoke")))
     if mesh is None or mesh.is_leader or serves_locally or own_choice or not path.startswith(FORWARDED_PATHS):
         return await call_next(request)
@@ -3503,6 +3504,9 @@ async def mcp_endpoint(request: Request, authorization: str | None = Header(defa
 async def mcp_elsewhere() -> Response:
     """There is no stream to open and no session to end."""
     return Response(status_code=405, headers={"Allow": "POST"})
+
+
+mount_compat(app, CompatNode(chat_completions, completions, embeddings, models, lambda authorization: require(authorization, ROLE_USER), verify_user, check_request, lambda: runtime))
 
 
 def build_parser() -> argparse.ArgumentParser:
