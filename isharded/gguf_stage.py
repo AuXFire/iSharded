@@ -42,6 +42,7 @@ def load_on(host: Channel, operation: str, settings: dict[str, Any]) -> None:
     """Has a host do this load. One that failed it does not stay."""
     try:
         host.call(operation, **settings)
+        host.watch()
     except LlamaError:
         host.close()
         raise

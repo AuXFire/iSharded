@@ -1543,6 +1543,125 @@ def test_once_a_stage_is_given_up_on_nobody_waits_on_it_again(quick_deadlines):
         host.close()
 
 
+@pytest.fixture
+def quick_pulse(monkeypatch):
+    from isharded import llama_host
+
+    monkeypatch.setattr(llama_host, "PULSE_EVERY", 0.05)
+    monkeypatch.setattr(llama_host, "PULSE_SECONDS", 0.5)
+    return llama_host
+
+
+def test_a_frozen_stage_is_stopped_with_nobody_calling_it(quick_pulse):
+    """A pass on the engine goes past every call here, so this is all that can see it freeze."""
+    import psutil
+
+    from isharded.llamacpp import StageLost
+
+    host = quick_pulse.StageHost()
+    try:
+        host.watch()
+        psutil.Process(host.process.pid).suspend()
+        assert host.process.wait(5) != 0
+        with pytest.raises(StageLost):
+            host.call("state_stats")
+    finally:
+        host.close()
+
+
+def test_a_frozen_stage_does_not_cost_a_long_prompt_its_whole_deadline(quick_pulse):
+    import psutil
+
+    from isharded.llamacpp import StageLost
+
+    host = quick_pulse.StageHost()
+    try:
+        host.watch()
+        psutil.Process(host.process.pid).suspend()
+        began = time.monotonic()
+        with pytest.raises(StageLost):
+            # More than a pipe holds, so this sticks in the write before it ever reaches a wait.
+            host.call("forward", bytes(1 << 24), rows=4000)
+        assert time.monotonic() - began < 5
+    finally:
+        host.close()
+
+
+@pytest.mark.parametrize("payload", [b"", bytes(1 << 24)], ids=["waiting for an answer", "stuck in the pipe"])
+def test_a_call_in_flight_hears_when_the_pulse_stops_a_stage_that_takes_no_kill(quick_pulse, payload):
+    import psutil
+
+    from isharded.llamacpp import StageLost
+
+    host = quick_pulse.StageHost()
+    try:
+        host.watch()
+        host.process.kill = lambda: None
+        psutil.Process(host.process.pid).suspend()
+        began = time.monotonic()
+        with pytest.raises(StageLost, match="stopped"):
+            host.call("forward", payload, rows=4000)
+        assert time.monotonic() - began < 5
+    finally:
+        del host.process.kill
+        host.close()
+
+
+def test_a_stage_keeps_its_pulse_through_a_long_pass(quick_pulse, monkeypatch):
+    monkeypatch.setattr(quick_pulse, "PULSE_SECONDS", 0.2)
+    if not (BUILD and MODEL):
+        pytest.skip("needs a real model")
+    host = quick_pulse.StageHost()
+    try:
+        real_stage(host, gpu_layers=0)  # on a CPU, so the pass is sure to be long
+        host.watch()
+        rows = host.call("embed", tokens=(REAL_PROMPT * 40)[:200], rows=200)[1]
+        began = time.monotonic()
+        host.call("forward", rows, position=0, rows=200)
+        assert time.monotonic() - began > 0.2, "the pass must outlast the pulse's limit to prove anything"
+        assert host.process.poll() is None
+    finally:
+        host.close()
+
+
+def test_closing_a_watched_host_stops_watching_it(quick_pulse):
+    host = quick_pulse.StageHost()
+    host.watch()
+    time.sleep(0.2)
+    host.close()
+    assert host.quiet.is_set()
+    assert host.process.poll() == 0, "it left by itself, and nothing had to stop it"
+
+
+def test_loading_on_a_host_starts_watching_it():
+    from isharded.gguf_stage import load_on
+    from isharded.llamacpp import LlamaError
+
+    class Host:
+        watched = closed = 0
+
+        def __init__(self, failure=None):
+            self.failure = failure
+
+        def call(self, operation, **_):
+            if self.failure:
+                raise self.failure
+
+        def watch(self):
+            self.watched += 1
+
+        def close(self):
+            self.closed += 1
+
+    loaded = Host()
+    load_on(loaded, "load", {})
+    assert (loaded.watched, loaded.closed) == (1, 0)
+    refused = Host(LlamaError("no"))
+    with pytest.raises(LlamaError):
+        load_on(refused, "load", {})
+    assert (refused.watched, refused.closed) == (0, 1)
+
+
 def test_a_stage_that_dies_mid_call_is_still_lost_at_once(quick_deadlines):
     from isharded.llamacpp import StageLost
 

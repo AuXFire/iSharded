@@ -41,6 +41,11 @@ CONNECT_SECONDS = 60.0
 EXIT_SECONDS = 15.0
 # What a kill gets to take effect, each time. A healthy process is gone long before.
 KILL_SECONDS = 5.0
+# A frozen process cannot say so, and a long prompt's deadline, or a pass on the engine that no
+# call here waits on, would leave it frozen for as long as a real reply can wait. So a thread
+# in the process answers this all the time, whatever its passes are doing.
+PULSE_EVERY = 2.0
+PULSE_SECONDS = 10.0
 # How often a call that is waiting looks up to see whether its process has been stopped.
 ANSWER_LOOK_SECONDS = 0.25
 # Past this, a write can stick until the far end reads.
@@ -66,6 +71,8 @@ def seconds_for(operation: str, rows: int) -> float | None:
     """How long a stage may take over a call, or None if nothing can say."""
     if operation in LOADS:
         return None
+    if operation == "pulse":
+        return PULSE_SECONDS
     return pass_seconds(max(rows, SLOW_ROWS) if operation in SLOW else rows)
 
 
@@ -259,6 +266,9 @@ class _Host:
     def engine(self) -> Any:
         return None if self.stage is None else self.stage.engine
 
+    def pulse(self, _: dict[str, Any], __: bytes) -> Reply:
+        return {}, b""
+
     def ring_open(self, meta: dict[str, Any], _: bytes) -> Reply:
         if self.engine is None:
             return {"engine": False}, b""
@@ -426,6 +436,9 @@ class Channel:
         finally:
             self.lock.release()
 
+    def watch(self) -> None:
+        """A second connection needs no watching: the host of its process does that."""
+
     def _say_goodbye(self) -> None:
         """Asks the far end to finish, unless that would mean waiting on a stage that has hung."""
         if self.stopped.is_set() or not self.lock.acquire(timeout=EXIT_SECONDS):
@@ -447,6 +460,7 @@ class StageHost(Channel):
 
     def __init__(self) -> None:
         key = secrets.token_bytes(32)
+        self.quiet = threading.Event()
         self.listener = Listener(authkey=key)
         environment = {**os.environ, KEY_VARIABLE: key.hex()}
         package_root = str(Path(__file__).resolve().parents[1])
@@ -472,6 +486,20 @@ class StageHost(Channel):
         with self.lock:
             self._exchange("channel", b"", {}, seconds_for("channel", 1))
             return Channel(self.process, self._accept(), self.stopped)
+
+    def watch(self) -> None:
+        """Stops the process if it ever goes quiet. Only after a load: a load on a machine short
+        of memory can stall everything for a long time, and that is no reason to start again.
+        """
+        threading.Thread(target=self._listen, args=(self.channel(),), daemon=True).start()
+
+    def _listen(self, channel: Channel) -> None:
+        try:
+            while not self.quiet.wait(PULSE_EVERY):
+                channel.call("pulse")
+        except LlamaError:
+            pass  # gone, or stopped by that call. Whoever calls next hears it.
+        channel.connection.close()
 
     def _accept(self) -> Connection:
         accepted: list[Connection] = []
@@ -505,6 +533,7 @@ class StageHost(Channel):
             self._kill_harder()
 
     def close(self) -> None:
+        self.quiet.set()
         self._say_goodbye()
         try:
             self.process.wait(0 if self.stopped.is_set() else EXIT_SECONDS)
