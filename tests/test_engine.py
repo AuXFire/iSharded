@@ -17,6 +17,7 @@ import pytest
 
 from isharded import engine as native
 from isharded import llama_host
+from isharded import orchestrator as orchestrator_module
 from isharded import worker as worker_module
 from isharded.engine import EngineClient, EngineRefusal, find_library, library_name, pass_frame
 from isharded.gguf_stage import DRAFT_TRIAL_TOKENS, GUESSED, PIPELINED, PLAIN, DraftChoice
@@ -53,28 +54,28 @@ def test_the_library_is_optional_and_can_be_turned_off(tmp_path: Path, monkeypat
 
 
 def test_a_pass_frame_has_the_layout_the_engine_reads() -> None:
-    frame = pass_frame(9, 3, 1, 40, 38, [5, 6, 7], [6, 7], True, 0.5, 0.9, 40, 123)
+    frame = pass_frame(9, 2**64 - 3, 3, 1, 40, 38, [5, 6, 7], [6, 7], True, 0.5, 0.9, 40, 123)
     magic, version, kind, length = native.HEADER.unpack_from(frame)
     assert (magic, version, kind, length) == (native.MAGIC, native.WIRE_VERSION, native.KIND_PASS, len(frame) - 8)
-    fields = struct.unpack_from("<QQIIIBffIBQ", frame, 8)
-    assert fields[:6] == (9, 3, 1, 40, 38, native.FLAG_TOKENS | native.FLAG_VERIFY)
-    assert fields[8:] == (40, 1, 123)
-    at = 8 + struct.calcsize("<QQIIIBffIBQ")
+    fields = struct.unpack_from("<QQQIIIBffIBQ", frame, 8)
+    assert fields[:7] == (9, 2**64 - 3, 3, 1, 40, 38, native.FLAG_TOKENS | native.FLAG_VERIFY)
+    assert fields[9:] == (40, 1, 123)
+    at = 8 + struct.calcsize("<QQQIIIBffIBQ")
     assert struct.unpack_from("<I2I", frame, at) == (2, 6, 7)
     assert struct.unpack_from("<I3I", frame, at + 12) == (3, 5, 6, 7)
     assert frame[-8:] == bytes(8)
 
 
 def test_no_rollback_and_no_seed_have_their_own_encoding() -> None:
-    frame = pass_frame(1, 1, 0, 0, None, [1], [], False, 0.0, 1.0, 0, None)
-    fields = struct.unpack_from("<QQIIIBffIBQ", frame, 8)
-    assert fields[4] == native.NO_ROLLBACK
-    assert fields[9:] == (0, 0)
+    frame = pass_frame(1, 5, 1, 0, 0, None, [1], [], False, 0.0, 1.0, 0, None)
+    fields = struct.unpack_from("<QQQIIIBffIBQ", frame, 8)
+    assert fields[5] == native.NO_ROLLBACK
+    assert fields[10:] == (0, 0)
 
 
 def test_only_a_pass_that_asks_carries_the_keep_flag() -> None:
-    arguments = (1, 1, 0, 0, None, [1], [], False, 0.0, 1.0, 0, None)
-    flags = lambda frame: struct.unpack_from("<QQIIIB", frame, 8)[5]  # noqa: E731
+    arguments = (1, 5, 1, 0, 0, None, [1], [], False, 0.0, 1.0, 0, None)
+    flags = lambda frame: struct.unpack_from("<QQQIIIB", frame, 8)[6]  # noqa: E731
     assert flags(pass_frame(*arguments)) == native.FLAG_TOKENS
     assert flags(pass_frame(*arguments, keep=True)) == native.FLAG_TOKENS | native.FLAG_KEEP
     assert len(pass_frame(*arguments, keep=True)) == len(pass_frame(*arguments))
@@ -279,7 +280,9 @@ def test_a_ring_opens_every_stage_before_any_dials_and_the_last_dials_the_entry(
         return httpx.Response(200, json={})
 
     orchestrator = pool(handler)
+    orchestrator.ring_closing_down = 1.0  # an open ring starts its closing link's clock again
     run_ring(orchestrator)
+    assert orchestrator.ring_closing_down is None
     opens = [call for call in calls if call[1].endswith("/open")]
     connects = {call[0]: call[2] for call in calls if call[1].endswith("/connect")}
     assert [call[0] for call in calls[:3]] == ["a", "b", "c"]
@@ -372,6 +375,75 @@ def test_a_ring_that_lost_a_link_is_noticed(entry, middle, stays) -> None:
     assert (orchestrator.ring_epoch == 4) is stays
 
 
+HEARD: dict[int, int] = {}  # each pass id's generation, as the door last heard it
+
+
+def closing_pool(closing_up: bool | None) -> Orchestrator:
+    orchestrator = pool(lambda item: httpx.Response(200, json={}), ("a", "b"))
+    orchestrator.ring_epoch = 4
+    entry = {"ring_live": True, "ring": {"epoch": 4, "next_up": True, "closing_up": bool(closing_up)}}
+    last = {"ring": None if closing_up is None else {"epoch": 4, "next_up": False, "closing_up": closing_up}}
+    orchestrator.workers = {"a": healthy(entry), "b": healthy(last)}
+    return orchestrator
+
+
+def test_a_closing_link_that_stays_down_reopens_the_ring_and_a_short_dip_does_not(monkeypatch) -> None:
+    now = [100.0]
+    monkeypatch.setattr(orchestrator_module.time, "monotonic", lambda: now[0])
+    orchestrator = closing_pool(False)
+    orchestrator._check_ring()
+    now[0] += orchestrator_module.RING_CLOSING_SECONDS - 1
+    orchestrator._check_ring()
+    assert orchestrator.ring_epoch == 4
+    orchestrator.workers["b"] = closing_pool(True).workers["b"]
+    orchestrator._check_ring()
+    orchestrator.workers["b"] = closing_pool(False).workers["b"]
+    orchestrator._check_ring()
+    now[0] += orchestrator_module.RING_CLOSING_SECONDS - 1
+    orchestrator._check_ring()
+    assert orchestrator.ring_epoch == 4
+    now[0] += 2
+    orchestrator._check_ring()
+    assert orchestrator.ring_epoch is None
+    assert any("losing link" in str(event) for event in orchestrator.events)
+
+
+def test_a_closing_link_that_cannot_exist_does_not_reopen_the_ring_every_time(monkeypatch) -> None:
+    now = [100.0]
+    monkeypatch.setattr(orchestrator_module.time, "monotonic", lambda: now[0])
+    orchestrator = closing_pool(False)
+    reopened = []
+    for _ in range(600):
+        orchestrator._check_ring()
+        if orchestrator.ring_epoch is None:
+            reopened.append(now[0])
+            orchestrator.ring_epoch = 4
+        now[0] += 5
+    assert reopened[1] - reopened[0] > 1.9 * orchestrator_module.RING_CLOSING_SECONDS
+    assert len(reopened) < 8
+
+
+def test_a_stage_too_busy_to_say_is_not_a_closing_link_down(monkeypatch) -> None:
+    now = [100.0]
+    monkeypatch.setattr(orchestrator_module.time, "monotonic", lambda: now[0])
+    orchestrator = closing_pool(None)
+    for _ in range(3):
+        orchestrator._check_ring()
+        now[0] += orchestrator_module.RING_CLOSING_SECONDS
+    assert orchestrator.ring_epoch == 4
+
+
+def test_one_stage_has_no_closing_link(monkeypatch) -> None:
+    now = [100.0]
+    monkeypatch.setattr(orchestrator_module.time, "monotonic", lambda: now[0])
+    orchestrator = closing_pool(False)
+    orchestrator.route = orchestrator.route[1:]
+    for _ in range(3):
+        orchestrator._check_ring()
+        now[0] += orchestrator_module.RING_CLOSING_SECONDS
+    assert orchestrator.ring_epoch == 4
+
+
 class FakeDoor:
     """The engine's local door, spoken from the other end."""
 
@@ -395,7 +467,7 @@ class FakeDoor:
                 kind, body = await EngineClient._read_frame(reader)
             except asyncio.IncompleteReadError:
                 return
-            identity = struct.unpack_from("<Q", body)[0]
+            identity, HEARD[identity] = struct.unpack_from("<QQ", body)
             writer.write(self.answers(identity))
             await writer.drain()
 
@@ -428,13 +500,14 @@ FIELDS = {
 }
 
 
-def answer(identity: int, tokens: list[int]) -> bytes:
-    return native._frame(native.KIND_RESULT, struct.pack("<QQI", identity, 3, len(tokens)) + struct.pack(f"<{len(tokens)}I", *tokens))
+def answer(identity: int, tokens: list[int], generation: int | None = None) -> bytes:
+    generation = HEARD[identity] if generation is None else generation
+    return native._frame(native.KIND_RESULT, native.RESULT_HEAD.pack(identity, generation, 3, 0, len(tokens)) + struct.pack(f"<{len(tokens)}I", *tokens))
 
 
 def refusal(identity: int, kind: int, text: str = "no") -> bytes:
     data = text.encode()
-    return native._frame(native.KIND_NACK, struct.pack("<QQBHI", identity, 3, kind, 2, len(data)) + data)
+    return native._frame(native.KIND_NACK, native.NACK_HEAD.pack(identity, HEARD.get(identity, 0), 3, kind, 2, len(data)) + data)
 
 
 def test_answers_find_their_own_pass_when_several_are_out() -> None:
@@ -443,6 +516,108 @@ def test_answers_find_their_own_pass_when_several_are_out() -> None:
 
     got = asyncio.run(with_door(lambda identity: answer(identity, [identity * 10]), use))
     assert got == [[10], [20], [30], [40], [50]]
+
+
+def test_a_reply_keeps_one_generation_and_the_next_on_its_slot_gets_another() -> None:
+    async def use(client):
+        for _ in range(2):
+            await client.run(5, **FIELDS)
+        await client.run(5, **{**FIELDS, "slot": 1})
+        assert await client.settled(0, 5)
+        await client.run(5, **FIELDS)
+
+    asyncio.run(with_door(lambda identity: answer(identity, [1]), use))
+    got = [HEARD[identity] for identity in range(1, 5)]
+    assert got[0] == got[1]
+    assert len(set(got[1:])) == 3
+    assert all(0 < item < 2**64 for item in got)
+
+
+def test_a_result_from_another_generation_is_dropped_and_the_real_one_still_lands() -> None:
+    def answers(identity):
+        return answer(identity, [1], HEARD[identity] ^ 2) + answer(identity, [2])
+
+    async def use(client):
+        return await client.run(5, **FIELDS)
+
+    assert asyncio.run(with_door(answers, use)) == [2]
+
+
+def test_a_refusal_from_another_generation_is_dropped() -> None:
+    def answers(identity):
+        data = native.NACK_HEAD.pack(identity, HEARD[identity] ^ 2, 3, native.REFUSE_STAGE_ERROR, 2, 0)
+        return native._frame(native.KIND_NACK, data) + answer(identity, [2])
+
+    async def use(client):
+        return await client.run(5, **FIELDS)
+
+    assert asyncio.run(with_door(answers, use)) == [2]
+
+
+def test_a_repeated_result_changes_nothing() -> None:
+    async def use(client):
+        got = await client.run(5, **FIELDS)
+        return got, await client.run(5, **FIELDS), client.alive
+
+    assert asyncio.run(with_door(lambda identity: answer(identity, [identity]) * 2, use)) == ([1], [2], True)
+
+
+def test_a_slot_that_will_not_settle_drops_what_is_left_and_starts_again() -> None:
+    def answers(identity):
+        return b"" if identity == 1 else answer(identity, [identity]) + answer(1, [9])
+
+    async def use(client):
+        lost = client.send(**FIELDS)
+        settled = await client.settled(0, 0.01)
+        return settled, await client.run(5, **FIELDS), lost.cancelled(), client.waiting
+
+    assert asyncio.run(with_door(answers, use)) == (False, [2], True, {})
+    assert HEARD[1] != HEARD[2]
+
+
+def test_a_round_trip_is_measured_once_something_comes_back() -> None:
+    async def use(client):
+        before = client.round_trip
+        await client.run(5, **FIELDS)
+        return before, client.round_trip
+
+    before, after = asyncio.run(with_door(lambda identity: answer(identity, [1]), use))
+    assert before is None and 0 < after < 5
+
+
+@pytest.mark.parametrize(
+    ("round_trip", "seconds"),
+    [
+        (None, worker_module.pass_seconds(1, 2)),
+        (0.01, worker_module.RING_ANSWER_FLOOR_SECONDS),
+        (4.0, worker_module.RING_ACK_MS / 1000 + 8.0),
+    ],
+)
+def test_an_answer_is_waited_for_by_what_the_ring_measured(monkeypatch, round_trip, seconds) -> None:
+    waits = []
+
+    async def wait_for(answer, timeout):
+        waits.append(timeout)
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(worker_module.asyncio, "wait_for", wait_for)
+    item = runtime(ring_client=SimpleNamespace(alive=True, round_trip=round_trip))
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(item.ring_answer(None))
+    assert caught.value.detail["retry"] and not item.ring_live
+    assert waits == [pytest.approx(seconds)]
+
+
+def test_a_ring_that_has_left_still_waits_the_old_way(monkeypatch) -> None:
+    waits = []
+
+    async def wait_for(answer, timeout):
+        waits.append(timeout)
+        return [7]
+
+    monkeypatch.setattr(worker_module.asyncio, "wait_for", wait_for)
+    assert asyncio.run(runtime(ring_client=None).ring_answer(None)) == 7
+    assert waits == [worker_module.pass_seconds(1, 2)]
 
 
 def test_a_refused_pass_raises_and_the_link_stays_up() -> None:

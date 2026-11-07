@@ -3,13 +3,18 @@
 //! A pass moves forward from stage to stage, and nobody waits for it: each stage hands it on
 //! and is free again. The last stage sends its answer straight to the entry over a closing
 //! link. If that link cannot exist, the answer walks back along the route, which is slower
-//! and still right, so the closing link is only ever an optimization.
+//! and still right, so the closing link is only ever an optimization. The last stage keeps
+//! an answer until the entry acknowledges it, and keeps redialling a closing link it lost.
+//!
+//! A link can go silent with both its ends alive. So a stage keeps a pass until the next stage
+//! acknowledges it, and when that link goes silent, it dials again once and sends what it
+//! kept. The next stage drops what it has already seen, and the reply never knows.
 //!
 //! This code never decides what a failure means. It says what it saw, and the entry raises
 //! the same errors the HTTP path raises, so every failure lands on recovery that is already
 //! proven: a reply replays, and a lost worker is replaced.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -22,7 +27,7 @@ use parking_lot::{Condvar, Mutex, RawMutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::link::{self, Frames, Identity, Link, LinkError};
-use crate::wire::{self, Ack, Answer, Hello, Kind, Nack, Pass, Refusal, Role, FLAG_BF16, FLAG_TOKENS};
+use crate::wire::{self, Ack, Answer, Hello, Kind, Nack, Pass, Refusal, Role, FLAG_BF16, FLAG_TOKENS, HEADER_BYTES};
 
 /// How many connections may be mid-handshake at once, so strangers cannot pile up threads.
 const MAX_STRANGERS: usize = 16;
@@ -31,8 +36,19 @@ const WATCH_EVERY: Duration = Duration::from_millis(50);
 const ACCEPT_EVERY: Duration = Duration::from_millis(20);
 const DIAL_ATTEMPT: Duration = Duration::from_secs(5);
 const DIAL_RETRY: Duration = Duration::from_millis(250);
+/// Redials of a closing link start at `DIAL_RETRY` and double up to this.
+const REDIAL_MOST: Duration = Duration::from_secs(5);
+/// A closing link that lasted this long has earned a quick redial.
+const REDIAL_STEADY: Duration = Duration::from_secs(30);
+/// How long a stage tries to get the link to the next stage back. Replies are waiting, and
+/// the replay that takes over if this fails needs no link at all.
+const REDIAL_HOP: Duration = Duration::from_secs(2);
 /// The most replies that share one trip through the model.
 const MAX_MERGED: usize = 64;
+/// How far back a slot remembers. Passes on a link keep their order, so what is left over
+/// from a reply is close behind it, and a repeated answer is close behind the first.
+const GENERATIONS_KEPT: usize = 16;
+const ANSWERS_KEPT: usize = 1024;
 
 /// What a stage does with a pass. `Rows` go on to the next stage, and `Tokens` are the answer.
 pub enum Output {
@@ -115,6 +131,10 @@ pub struct Stats {
     pub answers: u64,
     pub refusals: u64,
     pub dropped: u64,
+    /// Passes and answers sent again, because their link died or nobody acknowledged them.
+    pub resent: u64,
+    /// Answers at the last stage still waiting for the entry's acknowledgement.
+    pub answers_held: u64,
     pub compute_us: u64,
     pub wait_us: u64,
     pub link_rtt_us: u64,
@@ -136,6 +156,7 @@ struct Counters {
     answers: AtomicU64,
     refusals: AtomicU64,
     dropped: AtomicU64,
+    resent: AtomicU64,
     compute_us: AtomicU64,
     wait_us: AtomicU64,
     link_rtt_us: AtomicU64,
@@ -153,21 +174,70 @@ struct Job {
     arrived: Instant,
 }
 
+/// What a stage knows of the replies on one slot. Generations are random, so the only way to
+/// know one is old is to have seen the one that replaced it.
+#[derive(Default)]
+struct Line {
+    generation: u64,
+    newest_pass: u64,
+    ended: VecDeque<u64>,
+    answered: VecDeque<u64>,
+}
+
+impl Line {
+    /// Whether a pass is an old reply's, or one already seen. A client numbers its passes in
+    /// order, and a link keeps them in it.
+    fn refuses(&self, pass: &Pass) -> bool {
+        self.ended.contains(&pass.generation) || (pass.generation == self.generation && pass.id <= self.newest_pass)
+    }
+
+    fn begin(&mut self, generation: u64) {
+        self.ended.push_back(std::mem::replace(&mut self.generation, generation));
+        keep_newest(&mut self.ended, GENERATIONS_KEPT);
+        self.answered.clear();
+    }
+
+    /// Whether an answer belongs to this slot's reply and is the first with its id.
+    fn takes(&mut self, answer: &Answer) -> bool {
+        if answer.generation != self.generation || self.answered.contains(&answer.id) {
+            return false;
+        }
+        self.answered.push_back(answer.id);
+        keep_newest(&mut self.answered, ANSWERS_KEPT);
+        true
+    }
+}
+
+fn keep_newest(list: &mut VecDeque<u64>, keep: usize) {
+    if list.len() > keep {
+        list.drain(..list.len() - keep);
+    }
+}
+
 struct Peer {
     link: Arc<Link>,
     stage: u16,
     closing: bool,
-    unacked: Mutex<VecDeque<(u64, Instant)>>,
     heard: Mutex<Instant>,
     lost: AtomicBool,
+    /// The far end has answered something on this link, so another try may be worth it.
+    proven: AtomicBool,
     /// The clock heartbeats are stamped against, so a round trip needs no shared time.
     born: Instant,
 }
 
 impl Peer {
     fn new(link: Arc<Link>, stage: u16, closing: bool) -> Arc<Peer> {
-        Arc::new(Peer { link, stage, closing, unacked: Mutex::new(VecDeque::new()), heard: Mutex::new(Instant::now()), lost: AtomicBool::new(false), born: Instant::now() })
+        let now = Instant::now();
+        Arc::new(Peer { link, stage, closing, heard: Mutex::new(now), lost: AtomicBool::new(false), proven: AtomicBool::new(false), born: now })
     }
+}
+
+/// A pass the next stage has not acknowledged, or an answer the entry has not.
+struct Held {
+    id: u64,
+    frame: Vec<u8>,
+    sent: Instant,
 }
 
 struct Ring {
@@ -181,6 +251,16 @@ struct Ring {
     closing: Mutex<Option<Arc<Peer>>>,
     back: Mutex<Option<Arc<Link>>>,
     entry_closing: Mutex<Option<Arc<Link>>>,
+    answers: Mutex<VecDeque<Held>>,
+    /// Passes on their way to the next stage. Only this order can go wrong, as the next stage
+    /// takes a pass numbered below one it has seen for a repeat.
+    sent: Mutex<VecDeque<Held>>,
+    /// Held while a pass joins `sent` and goes on the link, so a pass and a resend cannot
+    /// cross. Separate, as a send can wait and the reader and the watcher must not.
+    forwarding: Mutex<()>,
+    next_door: Mutex<Option<Address>>,
+    next_dialling: AtomicBool,
+    shut: AtomicBool,
 }
 
 impl Ring {
@@ -192,13 +272,30 @@ impl Ring {
         self.index + 1 == self.count
     }
 
+    fn is_shut(&self) -> bool {
+        self.shut.load(Ordering::Acquire)
+    }
+
     fn shut(&self) {
+        self.shut.store(true, Ordering::Release);
         for peer in [self.next.lock().take(), self.closing.lock().take()].into_iter().flatten() {
             peer.lost.store(true, Ordering::Release);
             peer.link.close();
         }
         for link in [self.back.lock().take(), self.entry_closing.lock().take()].into_iter().flatten() {
             link.close();
+        }
+    }
+
+    /// Whether the oldest in a list has waited too long for its acknowledgement.
+    fn is_stale(&self, list: &Mutex<VecDeque<Held>>) -> bool {
+        list.lock().front().is_some_and(|held| held.sent.elapsed() > self.ack_timeout)
+    }
+
+    fn answer_acknowledged(&self, id: u64) {
+        let mut answers = self.answers.lock();
+        if let Some(at) = answers.iter().position(|held| held.id == id) {
+            answers.remove(at);
         }
     }
 }
@@ -212,6 +309,8 @@ struct Inner {
     local: Mutex<Option<Arc<Link>>>,
     local_key: [u8; 32],
     jobs: Mutex<VecDeque<Job>>,
+    /// Taken only inside `jobs`, or with no other lock held.
+    lines: Mutex<HashMap<u32, Line>>,
     ready: Condvar,
     stopping: AtomicBool,
     strangers: AtomicUsize,
@@ -235,6 +334,7 @@ impl Node {
             local: Mutex::new(None),
             local_key: link::random_bytes(),
             jobs: Mutex::new(VecDeque::new()),
+            lines: Mutex::default(),
             ready: Condvar::new(),
             stopping: AtomicBool::new(false),
             strangers: AtomicUsize::new(0),
@@ -302,6 +402,12 @@ impl Node {
             closing: Mutex::new(None),
             back: Mutex::new(None),
             entry_closing: Mutex::new(None),
+            answers: Mutex::new(VecDeque::new()),
+            sent: Mutex::new(VecDeque::new()),
+            forwarding: Mutex::new(()),
+            next_door: Mutex::new(None),
+            next_dialling: AtomicBool::new(false),
+            shut: AtomicBool::new(false),
         });
         if let Some(old) = self.inner.ring.write().replace(ring) {
             old.shut();
@@ -346,11 +452,13 @@ impl Node {
             answers: counters.answers.load(Ordering::Relaxed),
             refusals: counters.refusals.load(Ordering::Relaxed),
             dropped: counters.dropped.load(Ordering::Relaxed),
+            resent: counters.resent.load(Ordering::Relaxed),
+            answers_held: ring.as_ref().map_or(0, |item| item.answers.lock().len() as u64),
             compute_us: counters.compute_us.load(Ordering::Relaxed),
             wait_us: counters.wait_us.load(Ordering::Relaxed),
             link_rtt_us: counters.link_rtt_us.load(Ordering::Relaxed),
             hop_us: counters.hop_us.load(Ordering::Relaxed),
-            next_up: ring.as_ref().is_some_and(|item| item.next.lock().is_some()),
+            next_up: ring.as_ref().is_some_and(|item| item.next.lock().is_some() || item.next_dialling.load(Ordering::Acquire)),
             closing_up: ring.as_ref().is_some_and(|item| item.closing.lock().is_some() || item.entry_closing.lock().is_some()),
             epoch: ring.as_ref().map(|item| item.epoch),
             connect: self.inner.connect.lock().clone(),
@@ -393,17 +501,58 @@ fn connect(inner: &Arc<Inner>, links: &Links) -> Result<bool, String> {
         if peer.lost.load(Ordering::Acquire) {
             return Err("the link to the next stage could not start".to_string());
         }
+        *ring.next_door.lock() = Some(next.clone());
     }
     let mut closing = false;
     if let Some(entry) = &links.entry {
         if let Ok(link) = dial_with_retry(entry, &ring, Role::Closing, Duration::from_millis(links.timeout_ms)) {
-            let peer = Peer::new(link, 0, true);
-            *ring.closing.lock() = Some(peer.clone());
-            start_peer(inner, &ring, &peer);
-            closing = !peer.lost.load(Ordering::Acquire);
+            closing = start_closing(inner, &ring, link);
         }
+        let (inner, ring, entry) = (inner.clone(), ring.clone(), entry.clone());
+        // With no thread for this, answers still walk back. Only speed is lost.
+        let _ = spawn("isharded-closing", move || keep_closing(&inner, &ring, &entry));
     }
     Ok(closing)
+}
+
+fn start_closing(inner: &Arc<Inner>, ring: &Arc<Ring>, link: Arc<Link>) -> bool {
+    let peer = Peer::new(link, 0, true);
+    *ring.closing.lock() = Some(peer.clone());
+    start_peer(inner, ring, &peer);
+    !peer.lost.load(Ordering::Acquire)
+}
+
+/// At the last stage, for as long as the ring lasts: brings a lost closing link back, and
+/// while it is down, tries again with any answer that has heard nothing.
+fn keep_closing(inner: &Arc<Inner>, ring: &Arc<Ring>, entry: &Address) {
+    let mut wait = DIAL_RETRY;
+    let mut next_dial = Instant::now() + wait;
+    let mut began = Instant::now();
+    while !ring.is_shut() {
+        thread::sleep(WATCH_EVERY);
+        if ring.closing.lock().is_some() {
+            if began.elapsed() > REDIAL_STEADY {
+                wait = DIAL_RETRY;
+            }
+            next_dial = Instant::now() + wait;
+            continue;
+        }
+        if ring.is_stale(&ring.answers) {
+            resend_answers(inner, ring);
+        }
+        if Instant::now() < next_dial {
+            continue;
+        }
+        if let Ok(link) = link::dial(&entry.address, Some(&entry.fingerprint), &ring.key, Role::Closing, ring.epoch, DIAL_ATTEMPT) {
+            began = Instant::now();
+            start_closing(inner, ring, link);
+            if ring.is_shut() {
+                ring.shut();
+            }
+        }
+        wait = (wait * 2).min(REDIAL_MOST);
+        next_dial = Instant::now() + wait;
+    }
 }
 
 fn dial_with_retry(target: &Address, ring: &Ring, role: Role, patience: Duration) -> Result<Arc<Link>, LinkError> {
@@ -458,6 +607,7 @@ fn serve(inner: &Arc<Inner>, socket: TcpStream, encrypted: bool) {
     let Ok((link, frames, hello)) = accepted else {
         return;
     };
+    // Whatever happens below, the link's writer ends with this.
     match hello.role {
         Role::Local => {
             if let Some(old) = inner.local.lock().replace(link.clone()) {
@@ -466,15 +616,19 @@ fn serve(inner: &Arc<Inner>, socket: TcpStream, encrypted: bool) {
             serve_passes(inner, &link, frames, false);
         }
         Role::Hop => {
-            let Some(ring) = attach(inner, &hello, |ring| ring.back.lock().replace(link.clone())) else {
-                return;
-            };
-            serve_passes(inner, &link, frames, true);
-            ring.back.lock().take();
+            if let Some(ring) = attach(inner, &hello, |ring| ring.back.lock().replace(link.clone())) {
+                if keep_to_limits(&link, &ring) {
+                    serve_passes(inner, &link, frames, true);
+                }
+                forget(&ring.back, &link);
+            }
         }
         Role::Closing => {
-            if attach(inner, &hello, |ring| ring.entry_closing.lock().replace(link.clone())).is_some() {
-                serve_answers(inner, &link, frames);
+            if let Some(ring) = attach(inner, &hello, |ring| ring.entry_closing.lock().replace(link.clone())) {
+                if keep_to_limits(&link, &ring) {
+                    serve_answers(inner, &link, frames);
+                }
+                forget(&ring.entry_closing, &link);
             }
         }
     }
@@ -489,9 +643,24 @@ fn attach(inner: &Inner, hello: &Hello, put: impl Fn(&Ring) -> Option<Arc<Link>>
     Some(ring)
 }
 
+/// Gives a link someone dialled the limits of a link with a watcher. The far end's heartbeats
+/// mean silence past the limit is a dead link, and only a read limit can see that here.
+fn keep_to_limits(link: &Link, ring: &Ring) -> bool {
+    link.limit_writes(ring.silence_timeout / 2).and_then(|()| link.limit_reads(ring.silence_timeout)).is_ok()
+}
+
+/// Lets go of a link, unless a newer one has already taken its place.
+fn forget(place: &Mutex<Option<Arc<Link>>>, link: &Arc<Link>) {
+    let mut place = place.lock();
+    if place.as_ref().is_some_and(|held| Arc::ptr_eq(held, link)) {
+        *place = None;
+    }
+}
+
 /// Answers a heartbeat. False means the link is finished.
 fn answer_ping(link: &Link, body: &[u8]) -> bool {
-    wire::read_beat(body).is_ok_and(|stamp| link.send(&wire::beat(Kind::Pong, stamp)).is_ok())
+    // A pong that finds no room is only a missed heartbeat.
+    wire::read_beat(body).is_ok_and(|stamp| !matches!(link.beat(&wire::beat(Kind::Pong, stamp)), Err(LinkError::Closed)))
 }
 
 /// Reads passes off a link. Taking one off is what the acknowledgement means, so a stage
@@ -503,10 +672,16 @@ fn serve_passes(inner: &Inner, link: &Link, mut frames: Frames, acknowledge: boo
                 let Ok(pass) = Pass::decode(body) else {
                     return;
                 };
-                if acknowledge && link.send(&Ack { id: pass.id }.encode()).is_err() {
+                if acknowledge && link.beat(&Ack { id: pass.id }.encode()).is_err() {
                     return;
                 }
                 enqueue(inner, pass);
+            }
+            Kind::Ack if acknowledge => {
+                let Ok(ack) = Ack::decode(body) else {
+                    return;
+                };
+                pass_on_acknowledgement(inner, ack);
             }
             Kind::Ping if answer_ping(link, body) => {}
             _ => return,
@@ -514,16 +689,42 @@ fn serve_passes(inner: &Inner, link: &Link, mut frames: Frames, acknowledge: boo
     }
 }
 
+/// An answer that walked back has its acknowledgement walk forward, the way passes go.
+fn pass_on_acknowledgement(inner: &Inner, ack: Ack) {
+    let Some(ring) = inner.ring.read().clone() else {
+        return;
+    };
+    if ring.is_last() {
+        ring.answer_acknowledged(ack.id);
+    } else if let Some(peer) = ring.next.lock().clone() {
+        // Lost, it costs one resend, and the entry drops the repeat.
+        let _ = peer.link.beat(&ack.encode());
+    }
+}
+
 /// Queues a pass. A rewind says that whatever waits past it has already been thrown away,
 /// so it goes now and the rewind does not sit behind it. Nobody expects an answer to those:
 /// passes run in order, so once the newest pass of a reply is back, nothing of it is left.
+/// A new generation says the same of all its slot's queue. The entry gave up on that reply.
 fn enqueue(inner: &Inner, pass: Pass) {
     let mut jobs = inner.jobs.lock();
-    if let Some(keep) = pass.rollback_to {
-        let before = jobs.len();
-        jobs.retain(|job| job.pass.slot != pass.slot || job.pass.epoch != pass.epoch || job.pass.position < keep);
-        inner.counters.dropped.fetch_add((before - jobs.len()) as u64, Ordering::Relaxed);
+    let before = jobs.len();
+    let mut lines = inner.lines.lock();
+    let line = lines.entry(pass.slot).or_default();
+    if line.refuses(&pass) {
+        inner.counters.dropped.fetch_add(1, Ordering::Relaxed);
+        return;
     }
+    if pass.generation != line.generation {
+        line.begin(pass.generation);
+        jobs.retain(|job| job.pass.slot != pass.slot);
+    }
+    line.newest_pass = pass.id;
+    drop(lines);
+    if let Some(keep) = pass.rollback_to {
+        jobs.retain(|job| job.pass.slot != pass.slot || job.pass.epoch != pass.epoch || job.pass.position < keep);
+    }
+    inner.counters.dropped.fetch_add((before - jobs.len()) as u64, Ordering::Relaxed);
     jobs.push_back(Job { pass, arrived: Instant::now() });
     drop(jobs);
     inner.ready.notify_one();
@@ -533,13 +734,26 @@ fn enqueue(inner: &Inner, pass: Pass) {
 fn serve_answers(inner: &Inner, link: &Link, mut frames: Frames) {
     while let Ok((kind, body)) = frames.next() {
         match kind {
-            Kind::Result => {
-                inner.counters.answers.fetch_add(1, Ordering::Relaxed);
-                to_local(inner, frames.whole());
-            }
+            Kind::Result => receive_answer(inner, link, frames.whole()),
             Kind::Ping if answer_ping(link, body) => {}
             _ => return,
         }
+    }
+}
+
+/// At the entry: a result, by whichever way it came. Only the first of it, for the reply now
+/// on its slot, goes on to the worker. Every copy is acknowledged, by the link it came on, as
+/// the last stage holds it until it hears, and the first acknowledgement may have been lost.
+fn receive_answer(inner: &Inner, link: &Link, frame: &[u8]) {
+    let Ok(answer) = Answer::decode(&frame[HEADER_BYTES..]) else {
+        return;
+    };
+    let _ = link.beat(&Ack { id: answer.id }.encode());
+    let fresh = inner.lines.lock().get_mut(&answer.slot).is_some_and(|line| line.takes(&answer));
+    let counter = if fresh { &inner.counters.answers } else { &inner.counters.dropped };
+    counter.fetch_add(1, Ordering::Relaxed);
+    if fresh {
+        to_local(inner, frame);
     }
 }
 
@@ -564,8 +778,8 @@ fn send_back(inner: &Inner, ring: &Ring, frame: &[u8]) {
 }
 
 fn start_peer(inner: &Arc<Inner>, ring: &Arc<Ring>, peer: &Arc<Peer>) {
-    // The watcher waits behind a stuck write, so that write must fail inside the silence
-    // limit. Half leaves room for a piece that only just finished before the one that stuck.
+    // A stuck write must fail inside the silence limit, or the writer holds the link past
+    // it. Half leaves room for a piece that only just finished before the one that stuck.
     let limited = peer.link.limit_writes(ring.silence_timeout / 2);
     let reading = (inner.clone(), ring.clone(), peer.clone());
     let watching = (inner.clone(), ring.clone(), peer.clone());
@@ -574,7 +788,10 @@ fn start_peer(inner: &Arc<Inner>, ring: &Arc<Ring>, peer: &Arc<Peer>) {
             spawn("isharded-peer", move || {
                 let (inner, ring, peer) = reading;
                 read_peer(&inner, &ring, &peer);
-                peer_lost(&inner, &ring, &peer, "the link closed");
+                // A link that had already gone quiet was ended by the far end's read limit,
+                // and a stage that died was still answering heartbeats.
+                let quiet = peer.heard.lock().elapsed() > ring.silence_timeout / 2;
+                peer_lost(&inner, &ring, &peer, "the link closed", quiet || peer.link.write_failed());
             })
         })
         .and_then(|_| {
@@ -585,7 +802,7 @@ fn start_peer(inner: &Arc<Inner>, ring: &Arc<Ring>, peer: &Arc<Peer>) {
         });
     // A peer nobody reads or watches would fail in silence.
     if let Err(error) = started {
-        peer_lost(inner, ring, peer, &error.to_string());
+        peer_lost(inner, ring, peer, &error.to_string(), false);
     }
 }
 
@@ -593,17 +810,24 @@ fn read_peer(inner: &Inner, ring: &Ring, peer: &Peer) {
     let mut frames = peer.link.reader(wire::MAX_BODY_BYTES);
     while let Ok((kind, body)) = frames.next() {
         *peer.heard.lock() = Instant::now();
+        if matches!(kind, Kind::Ack | Kind::Pong) {
+            peer.proven.store(true, Ordering::Release);
+        }
         match kind {
             Kind::Ack => {
                 let Ok(ack) = Ack::decode(body) else {
                     return;
                 };
-                let mut unacked = peer.unacked.lock();
-                let at = unacked.iter().position(|(id, _)| *id == ack.id);
+                if peer.closing {
+                    ring.answer_acknowledged(ack.id);
+                    continue;
+                }
+                let mut sent = ring.sent.lock();
+                let at = sent.iter().position(|held| held.id == ack.id);
                 // A round trip that carried a real row, so unlike a heartbeat it shows
                 // what the row's size costs. It adds no traffic.
-                if let Some((_, sent)) = at.and_then(|at| unacked.remove(at)) {
-                    average(&inner.counters.hop_us, sent.elapsed().as_micros() as u64);
+                if let Some(held) = at.and_then(|at| sent.remove(at)) {
+                    average(&inner.counters.hop_us, held.sent.elapsed().as_micros() as u64);
                 }
             }
             Kind::Pong => {
@@ -615,6 +839,7 @@ fn read_peer(inner: &Inner, ring: &Ring, peer: &Peer) {
                     average(&inner.counters.link_rtt_us, now.saturating_sub(stamp));
                 }
             }
+            Kind::Result if ring.is_entry() => receive_answer(inner, &peer.link, frames.whole()),
             // Coming back along the route, towards the entry.
             Kind::Result | Kind::Nack => send_back(inner, ring, frames.whole()),
             _ => return,
@@ -622,50 +847,103 @@ fn read_peer(inner: &Inner, ring: &Ring, peer: &Peer) {
     }
 }
 
-fn watch_peer(inner: &Inner, ring: &Ring, peer: &Peer) {
+/// Queues heartbeats and checks deadlines, and nothing here can wait on the socket.
+fn watch_peer(inner: &Arc<Inner>, ring: &Arc<Ring>, peer: &Arc<Peer>) {
     let mut pinged = Instant::now();
     // A link with nothing to carry must still be heard from, well inside its limit.
     let ping_every = PING_EVERY.min(ring.silence_timeout / 3);
     while !peer.lost.load(Ordering::Acquire) && !peer.link.is_closed() {
         thread::sleep(WATCH_EVERY);
-        let stale = peer.unacked.lock().front().is_some_and(|(_, sent)| sent.elapsed() > ring.ack_timeout);
-        if stale {
-            peer_lost(inner, ring, peer, "a pass was not acknowledged");
+        if ring.is_stale(if peer.closing { &ring.answers } else { &ring.sent }) {
+            peer_lost(inner, ring, peer, "a pass was not acknowledged", true);
             return;
         }
         if peer.heard.lock().elapsed() > ring.silence_timeout {
-            peer_lost(inner, ring, peer, "the link went silent");
+            peer_lost(inner, ring, peer, "the link went silent", true);
             return;
         }
         if pinged.elapsed() >= ping_every {
             pinged = Instant::now();
             let stamp = peer.born.elapsed().as_micros() as u64;
-            if peer.link.send(&wire::beat(Kind::Ping, stamp)).is_err() {
-                peer_lost(inner, ring, peer, "the link failed");
-                return;
-            }
+            // No room means the writer is stuck, and the deadlines here will say so.
+            let _ = peer.link.beat(&wire::beat(Kind::Ping, stamp));
         }
     }
 }
 
-fn peer_lost(inner: &Inner, ring: &Ring, peer: &Peer, why: &str) {
+/// `silent` says the far end may be alive. A link that closed is usually a stage that died,
+/// and replies should not wait for a dial to find that out.
+fn peer_lost(inner: &Arc<Inner>, ring: &Arc<Ring>, peer: &Arc<Peer>, why: &str, silent: bool) {
     if peer.lost.swap(true, Ordering::AcqRel) {
         return;
     }
     peer.link.close();
     if peer.closing {
-        // Answers walk back along the route instead. Nothing has failed.
+        // Answers walk back along the route until it returns. Nothing has failed, and
+        // whatever it was carrying may never have arrived.
         ring.closing.lock().take();
+        resend_answers(inner, ring);
         return;
     }
+    // A link that never answered anything shows the way is shut, so going round again is no use.
+    let door = ring.next_door.lock().clone().filter(|_| silent && peer.proven.load(Ordering::Acquire) && !ring.is_shut());
+    ring.next_dialling.store(door.is_some(), Ordering::Release);
     ring.next.lock().take();
+    let Some(door) = door else {
+        give_up_on_next(inner, ring, peer.stage, why);
+        return;
+    };
+    let (dialling, place, stage, reason) = (inner.clone(), ring.clone(), peer.stage, why.to_string());
+    if spawn("isharded-redial", move || redial_next(&dialling, &place, &door, stage, &reason)).is_err() {
+        give_up_on_next(inner, ring, stage, why);
+    }
+}
+
+fn redial_next(inner: &Arc<Inner>, ring: &Arc<Ring>, door: &Address, stage: u16, why: &str) {
+    match link::dial(&door.address, Some(&door.fingerprint), &ring.key, Role::Hop, ring.epoch, REDIAL_HOP) {
+        Ok(link) if !ring.is_shut() => resume_next(inner, ring, link, stage),
+        Ok(link) => link.close(),
+        Err(_) => give_up_on_next(inner, ring, stage, why),
+    }
+}
+
+/// Puts a new link in the old one's place. What the next stage has not acknowledged goes
+/// first and in order, and whatever it has seen already, it drops.
+fn resume_next(inner: &Arc<Inner>, ring: &Arc<Ring>, link: Arc<Link>, stage: u16) {
+    let peer = Peer::new(link, stage, false);
+    let _order = ring.forwarding.lock();
+    *ring.next.lock() = Some(peer.clone());
+    ring.next_dialling.store(false, Ordering::Release);
+    start_peer(inner, ring, &peer);
+    if ring.is_shut() {
+        ring.shut();
+    }
+    for frame in restamped(&ring.sent, inner) {
+        if peer.link.send(&frame).is_err() {
+            break; // its reader is finding out too
+        }
+    }
+}
+
+fn give_up_on_next(inner: &Inner, ring: &Ring, stage: u16, why: &str) {
+    ring.next_dialling.store(false, Ordering::Release);
+    ring.sent.lock().clear();
     // Id zero means every pass this stage has sent on: nothing can say which ones were lost.
-    let nack = Nack { id: 0, epoch: ring.epoch, refusal: Refusal::FailedStage, stage: peer.stage, message: why.to_string() };
+    let nack = Nack { id: 0, generation: 0, epoch: ring.epoch, refusal: Refusal::FailedStage, stage, message: why.to_string() };
     inner.counters.refusals.fetch_add(1, Ordering::Relaxed);
     send_back(inner, ring, &nack.encode());
 }
 
-fn compute_loop(inner: &Inner) {
+/// Copies of what a list holds, each with a fresh chance to be acknowledged.
+fn restamped(list: &Mutex<VecDeque<Held>>, inner: &Inner) -> Vec<Vec<u8>> {
+    let mut list = list.lock();
+    let now = Instant::now();
+    list.iter_mut().for_each(|held| held.sent = now);
+    inner.counters.resent.fetch_add(list.len() as u64, Ordering::Relaxed);
+    list.iter().map(|held| held.frame.clone()).collect()
+}
+
+fn compute_loop(inner: &Arc<Inner>) {
     while let Some(batch) = next_batch(inner) {
         handle(inner, batch);
     }
@@ -702,16 +980,17 @@ fn take_batch(first: Job, jobs: &mut VecDeque<Job>) -> Vec<Job> {
 }
 
 fn refuse(inner: &Inner, ring: &Ring, pass: &Pass, refusal: Refusal, message: String) {
-    let nack = Nack { id: pass.id, epoch: pass.epoch, refusal, stage: ring.index, message };
+    let nack = Nack { id: pass.id, generation: pass.generation, epoch: pass.epoch, refusal, stage: ring.index, message };
     inner.counters.refusals.fetch_add(1, Ordering::Relaxed);
     send_back(inner, ring, &nack.encode());
 }
 
-fn handle(inner: &Inner, jobs: Vec<Job>) {
+fn handle(inner: &Arc<Inner>, jobs: Vec<Job>) {
     let Some(ring) = inner.ring.read().clone() else {
         // No route: the link that carried this has nothing to do any more. Say so at the entry.
         for job in &jobs {
-            let nack = Nack { id: job.pass.id, epoch: job.pass.epoch, refusal: Refusal::Epoch, stage: 0, message: "no route here".into() };
+            let pass = &job.pass;
+            let nack = Nack { id: pass.id, generation: pass.generation, epoch: pass.epoch, refusal: Refusal::Epoch, stage: 0, message: "no route here".into() };
             to_local(inner, &nack.encode());
         }
         return;
@@ -746,13 +1025,13 @@ fn handle(inner: &Inner, jobs: Vec<Job>) {
     }
 }
 
-fn finish(inner: &Inner, ring: &Ring, pass: Pass, result: Result<Output, Failure>) {
+fn finish(inner: &Arc<Inner>, ring: &Arc<Ring>, pass: Pass, result: Result<Output, Failure>) {
     match result {
         Err(failure) => refuse(inner, ring, &pass, failure.refusal, failure.message),
         Ok(Output::Tokens(tokens)) => {
             inner.counters.answers.fetch_add(1, Ordering::Relaxed);
-            let frame = Answer { id: pass.id, epoch: pass.epoch, tokens }.encode();
-            answer(inner, ring, &frame);
+            let frame = Answer { id: pass.id, generation: pass.generation, epoch: pass.epoch, slot: pass.slot, tokens }.encode();
+            answer(inner, ring, pass.id, frame);
         }
         Ok(Output::Rows { rows, width, bf16, data }) => {
             let mut flags = pass.flags & !(FLAG_TOKENS | FLAG_BF16);
@@ -765,30 +1044,47 @@ fn finish(inner: &Inner, ring: &Ring, pass: Pass, result: Result<Output, Failure
     }
 }
 
-fn answer(inner: &Inner, ring: &Ring, frame: &[u8]) {
+/// An answer lives until the entry acknowledges it.
+fn answer(inner: &Arc<Inner>, ring: &Arc<Ring>, id: u64, frame: Vec<u8>) {
     if ring.is_entry() && ring.is_last() {
-        to_local(inner, frame);
+        to_local(inner, &frame);
         return;
     }
-    let closing = ring.closing.lock().clone();
-    if let Some(peer) = closing {
-        if peer.link.send(frame).is_ok() {
-            return;
-        }
-        peer_lost(inner, ring, &peer, "the closing link failed");
-    }
-    send_back(inner, ring, frame);
+    ring.answers.lock().push_back(Held { id, frame: frame.clone(), sent: Instant::now() });
+    carry_answer(inner, ring, &frame);
 }
 
-fn forward(inner: &Inner, ring: &Ring, pass: &Pass) {
+fn carry_answer(inner: &Arc<Inner>, ring: &Arc<Ring>, frame: &[u8]) {
+    let closing = ring.closing.lock().clone();
+    match closing {
+        // Losing the link sends this and everything else it may have held back.
+        Some(peer) if peer.link.send(frame).is_err() => peer_lost(inner, ring, &peer, "the closing link failed", true),
+        Some(_) => {}
+        None => send_back(inner, ring, frame),
+    }
+}
+
+fn resend_answers(inner: &Arc<Inner>, ring: &Arc<Ring>) {
+    for frame in restamped(&ring.answers, inner) {
+        carry_answer(inner, ring, &frame);
+    }
+}
+
+fn forward(inner: &Arc<Inner>, ring: &Arc<Ring>, pass: &Pass) {
+    let order = ring.forwarding.lock();
     let peer = ring.next.lock().clone();
-    let Some(peer) = peer else {
+    if peer.is_none() && !ring.next_dialling.load(Ordering::Acquire) {
+        drop(order);
         refuse(inner, ring, pass, Refusal::FailedStage, "no link to the next stage".into());
         return;
-    };
-    peer.unacked.lock().push_back((pass.id, Instant::now()));
-    if let Err(error) = peer.link.send(&pass.encode()) {
-        peer_lost(inner, ring, &peer, &error.to_string());
+    }
+    let frame = pass.encode();
+    ring.sent.lock().push_back(Held { id: pass.id, frame: frame.clone(), sent: Instant::now() });
+    // With no link, this waits with the rest for the one being dialled.
+    let failed = peer.and_then(|peer| peer.link.send(&frame).err().map(|error| (peer, error)));
+    drop(order);
+    if let Some((peer, error)) = failed {
+        peer_lost(inner, ring, &peer, &error.to_string(), matches!(error, LinkError::Io(_)));
     }
 }
 
@@ -870,5 +1166,26 @@ mod tests {
         let stats = last.stats();
         assert!(!stats.closing_up);
         assert_eq!(stats.refusals, 0);
+    }
+
+    #[test]
+    fn a_closing_link_that_could_not_open_is_tried_again() {
+        let (last, _) = stage(1);
+        let entry = Node::new().unwrap();
+        entry.listen("127.0.0.1", 0).unwrap();
+        let door = {
+            let listening = entry.inner.listening.lock();
+            let door = listening.as_ref().unwrap();
+            Address { address: format!("127.0.0.1:{}", door.port), fingerprint: door.fingerprint.clone() }
+        };
+        // No route is open at the entry yet, so it turns the dial away.
+        assert_eq!(last.connect(Links { next: None, entry: Some(door), timeout_ms: 100 }), Ok(false));
+        assert!(!last.stats().closing_up);
+        entry.open(Plan { epoch: 1, index: 0, count: 2, key: vec![7], ack_timeout_ms: 60_000, silence_timeout_ms: 60_000 });
+        let began = Instant::now();
+        while !last.stats().closing_up {
+            assert!(began.elapsed() < Duration::from_secs(5), "it never came up");
+            thread::sleep(WATCH_EVERY);
+        }
     }
 }

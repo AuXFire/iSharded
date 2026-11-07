@@ -7,7 +7,8 @@
 use std::fmt;
 
 pub const MAGIC: u16 = 0x5369;
-pub const VERSION: u8 = 1;
+/// Two added a generation to passes, answers and refusals. Nodes that differ refuse each other.
+pub const VERSION: u8 = 2;
 pub const HEADER_BYTES: usize = 8;
 /// The most a body may hold. Enough for a 512 row pass at a width of 32,768 in FP32.
 pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -191,6 +192,9 @@ impl Sampling {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pass {
     pub id: u64,
+    /// Random, and the same for every pass of one reply on a slot, so nothing left over from
+    /// an earlier reply on that slot can be taken for this one.
+    pub generation: u64,
     pub epoch: u64,
     pub slot: u32,
     pub position: u32,
@@ -234,8 +238,9 @@ impl Pass {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut frame = start_frame(Kind::Pass, 64 + self.data.len() + 4 * (self.guesses.len() + self.tokens.len()));
+        let mut frame = start_frame(Kind::Pass, 72 + self.data.len() + 4 * (self.guesses.len() + self.tokens.len()));
         frame.extend_from_slice(&self.id.to_le_bytes());
+        frame.extend_from_slice(&self.generation.to_le_bytes());
         frame.extend_from_slice(&self.epoch.to_le_bytes());
         frame.extend_from_slice(&self.slot.to_le_bytes());
         frame.extend_from_slice(&self.position.to_le_bytes());
@@ -257,6 +262,7 @@ impl Pass {
     pub fn decode(body: &[u8]) -> Result<Pass, WireError> {
         let mut cursor = Cursor { data: body };
         let id = cursor.long()?;
+        let generation = cursor.long()?;
         let epoch = cursor.long()?;
         let slot = cursor.int()?;
         let position = cursor.int()?;
@@ -290,7 +296,7 @@ impl Pass {
         }
         let sampling = Sampling { temperature, top_p, top_k, seed: (seeded != 0).then_some(seed) };
         let rollback_to = (rollback != u32::MAX).then_some(rollback);
-        Ok(Pass { id, epoch, slot, position, rollback_to, flags, sampling, guesses, tokens, rows, width, data: cursor.data.to_vec() })
+        Ok(Pass { id, generation, epoch, slot, position, rollback_to, flags, sampling, guesses, tokens, rows, width, data: cursor.data.to_vec() })
     }
 }
 
@@ -314,15 +320,19 @@ impl Ack {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Answer {
     pub id: u64,
+    pub generation: u64,
     pub epoch: u64,
+    pub slot: u32,
     pub tokens: Vec<u32>,
 }
 
 impl Answer {
     pub fn encode(&self) -> Vec<u8> {
-        let mut frame = start_frame(Kind::Result, 20 + 4 * self.tokens.len());
+        let mut frame = start_frame(Kind::Result, 32 + 4 * self.tokens.len());
         frame.extend_from_slice(&self.id.to_le_bytes());
+        frame.extend_from_slice(&self.generation.to_le_bytes());
         frame.extend_from_slice(&self.epoch.to_le_bytes());
+        frame.extend_from_slice(&self.slot.to_le_bytes());
         put_tokens(&mut frame, &self.tokens);
         finish_frame(frame)
     }
@@ -330,10 +340,12 @@ impl Answer {
     pub fn decode(body: &[u8]) -> Result<Answer, WireError> {
         let mut cursor = Cursor { data: body };
         let id = cursor.long()?;
+        let generation = cursor.long()?;
         let epoch = cursor.long()?;
+        let slot = cursor.int()?;
         let tokens = cursor.tokens()?;
         cursor.finished()?;
-        Ok(Answer { id, epoch, tokens })
+        Ok(Answer { id, generation, epoch, slot, tokens })
     }
 }
 
@@ -354,6 +366,8 @@ pub enum Refusal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nack {
     pub id: u64,
+    /// Zero with an id of zero: a link failed, and every pass on it is gone.
+    pub generation: u64,
     pub epoch: u64,
     pub refusal: Refusal,
     pub stage: u16,
@@ -364,8 +378,9 @@ impl Nack {
     pub fn encode(&self) -> Vec<u8> {
         let text = self.message.as_bytes();
         let cut = floor_char_boundary(&self.message, MAX_MESSAGE_BYTES.min(text.len()));
-        let mut frame = start_frame(Kind::Nack, 24 + cut);
+        let mut frame = start_frame(Kind::Nack, 32 + cut);
         frame.extend_from_slice(&self.id.to_le_bytes());
+        frame.extend_from_slice(&self.generation.to_le_bytes());
         frame.extend_from_slice(&self.epoch.to_le_bytes());
         frame.push(self.refusal as u8);
         frame.extend_from_slice(&self.stage.to_le_bytes());
@@ -377,6 +392,7 @@ impl Nack {
     pub fn decode(body: &[u8]) -> Result<Nack, WireError> {
         let mut cursor = Cursor { data: body };
         let id = cursor.long()?;
+        let generation = cursor.long()?;
         let epoch = cursor.long()?;
         let refusal = match cursor.byte()? {
             1 => Refusal::Retry,
@@ -392,7 +408,7 @@ impl Nack {
         }
         let message = String::from_utf8_lossy(cursor.take(length)?).into_owned();
         cursor.finished()?;
-        Ok(Nack { id, epoch, refusal, stage, message })
+        Ok(Nack { id, generation, epoch, refusal, stage, message })
     }
 }
 
@@ -494,6 +510,7 @@ mod tests {
     fn pass() -> Pass {
         Pass {
             id: 7,
+            generation: 11,
             epoch: 3,
             slot: 1,
             position: 42,
@@ -560,7 +577,7 @@ mod tests {
     fn a_huge_token_count_is_refused_before_it_is_read() {
         let mut frame = pass().encode();
         // The guess count sits after the fixed fields.
-        let at = HEADER_BYTES + 8 + 8 + 4 + 4 + 4 + 1 + 4 + 4 + 4 + 1 + 8;
+        let at = HEADER_BYTES + 8 + 8 + 8 + 4 + 4 + 4 + 1 + 4 + 4 + 4 + 1 + 8;
         frame[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(Pass::decode(body(&frame)), Err(WireError::Invalid("too many tokens")));
     }
@@ -594,9 +611,9 @@ mod tests {
 
     #[test]
     fn answers_refusals_and_beats_survive_the_wire() {
-        let answer = Answer { id: 4, epoch: 2, tokens: vec![1, 2, 3] };
+        let answer = Answer { id: 4, generation: 9, epoch: 2, slot: 5, tokens: vec![1, 2, 3] };
         assert_eq!(Answer::decode(body(&answer.encode())).unwrap(), answer);
-        let nack = Nack { id: 4, epoch: 2, refusal: Refusal::FailedStage, stage: 3, message: "gone".into() };
+        let nack = Nack { id: 4, generation: 9, epoch: 2, refusal: Refusal::FailedStage, stage: 3, message: "gone".into() };
         assert_eq!(Nack::decode(body(&nack.encode())).unwrap(), nack);
         assert_eq!(read_beat(body(&beat(Kind::Ping, 11))).unwrap(), 11);
         assert_eq!(Ack::decode(body(&Ack { id: 8 }.encode())).unwrap().id, 8);
@@ -606,7 +623,7 @@ mod tests {
 
     #[test]
     fn a_long_message_is_cut_at_a_character_boundary() {
-        let nack = Nack { id: 1, epoch: 1, refusal: Refusal::Retry, stage: 0, message: "é".repeat(MAX_MESSAGE_BYTES) };
+        let nack = Nack { id: 1, generation: 1, epoch: 1, refusal: Refusal::Retry, stage: 0, message: "é".repeat(MAX_MESSAGE_BYTES) };
         let decoded = Nack::decode(body(&nack.encode())).unwrap();
         assert!(decoded.message.len() <= MAX_MESSAGE_BYTES);
         assert!(decoded.message.chars().all(|item| item == 'é'));

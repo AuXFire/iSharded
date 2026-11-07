@@ -6,14 +6,16 @@
 //! even on a network where the control plane is not. Once TLS is up, both ends prove they
 //! hold the route's key, so a stranger who reaches the port gets nothing.
 
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use ring::digest;
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -28,6 +30,12 @@ use crate::wire::{self, Hello, Kind, Role, HEADER_BYTES, MAC_BYTES, NONCE_BYTES}
 const HANDSHAKE_SECONDS: u64 = 10;
 /// A frame's write must finish in this long, or the link is treated as dead.
 const WRITE_SECONDS: u64 = 15;
+/// How much may wait for a link's writer. A frame longer than the whole limit still goes,
+/// alone. Past these a sender waits, up to the write limit.
+const QUEUE_FRAMES: usize = 1024;
+const QUEUE_BYTES: usize = 64 << 20;
+/// Heartbeats and acknowledgements are tiny. This many waiting means the writer is stuck.
+const QUEUE_BEATS: usize = 4096;
 /// The most a peer may send before proving it holds the key.
 const STRANGER_BYTES: usize = 256;
 const SERVER_LABEL: &[u8] = b"isharded link accept";
@@ -164,20 +172,58 @@ fn client_config(fingerprint: &str) -> Result<Arc<ClientConfig>, LinkError> {
     Ok(Arc::new(config))
 }
 
-/// One open, authenticated connection. Any thread may send; one thread reads.
+/// What waits for a link's writer.
+#[derive(Default)]
+struct Outbox {
+    /// These go ahead of frames, between one frame and the next, so a heartbeat or an
+    /// acknowledgement never waits behind a queue of long frames.
+    beats: VecDeque<Vec<u8>>,
+    frames: VecDeque<Vec<u8>>,
+    bytes: usize,
+}
+
+impl Outbox {
+    fn has_room(&self, length: usize) -> bool {
+        self.frames.is_empty() || (self.frames.len() < QUEUE_FRAMES && self.bytes + length <= QUEUE_BYTES)
+    }
+
+    fn take(&mut self) -> Option<Vec<u8>> {
+        let beat = self.beats.pop_front();
+        if beat.is_some() {
+            return beat;
+        }
+        let frame = self.frames.pop_front()?;
+        self.bytes -= frame.len();
+        Some(frame)
+    }
+}
+
+/// One open, authenticated connection. Any thread may send; one thread reads; and one thread
+/// writes, so no sender ever waits on the socket. It runs until `close`, which everyone who
+/// holds a link must call in the end.
 pub struct Link {
     socket: TcpStream,
     /// Never held across a socket write, so a stalled peer cannot stop the reader.
     tls: Option<Mutex<Connection>>,
-    /// Held for a whole frame, which keeps frames whole and in order. Inside is the space
-    /// for encrypted bytes on their way to the socket.
-    sending: Mutex<Vec<u8>>,
+    outbox: Mutex<Outbox>,
+    work: Condvar,
+    room: Condvar,
     closed: AtomicBool,
+    /// Why the writer stopped, for the next sender to hear.
+    failure: Mutex<Option<io::ErrorKind>>,
 }
 
 impl Link {
     fn new(socket: TcpStream, tls: Option<Connection>) -> Arc<Link> {
-        Arc::new(Link { socket, tls: tls.map(Mutex::new), sending: Mutex::new(Vec::new()), closed: AtomicBool::new(false) })
+        Arc::new(Link {
+            socket,
+            tls: tls.map(Mutex::new),
+            outbox: Mutex::default(),
+            work: Condvar::new(),
+            room: Condvar::new(),
+            closed: AtomicBool::new(false),
+            failure: Mutex::new(None),
+        })
     }
 
     pub fn is_closed(&self) -> bool {
@@ -188,6 +234,29 @@ impl Link {
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
         let _ = self.socket.shutdown(Shutdown::Both);
+        // Taken so that nobody can be between looking and waiting.
+        let _outbox = self.outbox.lock();
+        self.work.notify_all();
+        self.room.notify_all();
+    }
+
+    /// Whether a write stalled or failed, as opposed to the far end closing the link.
+    pub fn write_failed(&self) -> bool {
+        self.failure.lock().is_some()
+    }
+
+    /// Closes the link, and keeps the reason if this is what closed it.
+    fn fail(&self, kind: io::ErrorKind) {
+        let mut failure = self.failure.lock();
+        if !self.is_closed() {
+            *failure = Some(kind);
+        }
+        drop(failure);
+        self.close();
+    }
+
+    fn closed_error(&self) -> LinkError {
+        self.failure.lock().take().map_or(LinkError::Closed, |kind| LinkError::Io(kind.into()))
     }
 
     /// Shortens how long a stalled write may hold on, for a link with a tighter limit.
@@ -195,25 +264,93 @@ impl Link {
         self.socket.set_write_timeout(Some(limit.min(Duration::from_secs(WRITE_SECONDS))))
     }
 
+    /// Ends the link if nothing at all arrives for this long, for the end that has no watcher.
+    pub fn limit_reads(&self, limit: Duration) -> io::Result<()> {
+        self.socket.set_read_timeout(Some(limit))
+    }
+
+    /// Queues a frame for the writer, in order. A full queue makes this wait, and one that
+    /// stays full past the write limit means the link is lost.
     pub fn send(&self, frame: &[u8]) -> Result<(), LinkError> {
+        let mut outbox = self.outbox.lock();
+        let mut give_up = None;
+        while !outbox.has_room(frame.len()) && !self.is_closed() {
+            let limit = self.socket.write_timeout()?.unwrap_or(Duration::from_secs(WRITE_SECONDS));
+            let deadline = *give_up.get_or_insert_with(|| Instant::now() + limit);
+            if self.room.wait_until(&mut outbox, deadline).timed_out() && !outbox.has_room(frame.len()) {
+                drop(outbox);
+                self.fail(io::ErrorKind::TimedOut);
+                return Err(self.closed_error());
+            }
+        }
         if self.is_closed() {
-            return Err(LinkError::Closed);
+            drop(outbox);
+            return Err(self.closed_error());
         }
-        let mut sealed = self.sending.lock();
-        let sent = match &self.tls {
-            None => (&self.socket).write_all(frame).map_err(LinkError::from),
-            Some(connection) => self.send_sealed(connection, frame, &mut sealed),
-        };
-        if sent.is_err() {
-            // Part of the frame may have gone, and nothing after it could be read.
-            self.close();
+        outbox.bytes += frame.len();
+        outbox.frames.push_back(frame.to_vec());
+        self.work.notify_one();
+        Ok(())
+    }
+
+    /// Queues a heartbeat or an acknowledgement, and never waits, so a reader or a watcher
+    /// is always free. A refusal means the writer is stuck or gone.
+    pub fn beat(&self, frame: &[u8]) -> Result<(), LinkError> {
+        let mut outbox = self.outbox.lock();
+        if self.is_closed() {
+            drop(outbox);
+            return Err(self.closed_error());
         }
-        sent
+        if outbox.beats.len() >= QUEUE_BEATS {
+            return Err(LinkError::Refused("too many beats are waiting"));
+        }
+        outbox.beats.push_back(frame.to_vec());
+        self.work.notify_one();
+        Ok(())
+    }
+
+    fn start_writer(self: &Arc<Self>) -> io::Result<()> {
+        let link = self.clone();
+        thread::Builder::new().name("isharded-write".into()).spawn(move || link.write_out()).map(|_| ())
+    }
+
+    fn write_out(&self) {
+        let mut sealed = Vec::new();
+        while let Some(frame) = self.next_frame() {
+            if let Err(error) = self.write_frame(&frame, &mut sealed) {
+                // Part of the frame may have gone, and nothing after it could be read.
+                self.fail(error.kind());
+            }
+        }
+    }
+
+    fn next_frame(&self) -> Option<Vec<u8>> {
+        let mut outbox = self.outbox.lock();
+        while !self.is_closed() {
+            if let Some(frame) = outbox.take() {
+                self.room.notify_all();
+                return Some(frame);
+            }
+            self.work.wait(&mut outbox);
+        }
+        None
+    }
+
+    /// Writes a frame now, before the writer starts. Only a handshake does this.
+    fn greet(&self, frame: &[u8]) -> Result<(), LinkError> {
+        Ok(self.write_frame(frame, &mut Vec::new())?)
+    }
+
+    fn write_frame(&self, frame: &[u8], sealed: &mut Vec<u8>) -> io::Result<()> {
+        match &self.tls {
+            None => self.write_piece(frame),
+            Some(connection) => self.write_sealed(connection, frame, sealed),
+        }
     }
 
     /// Encrypts under the lock and writes outside it. TLS buffers a limited amount, so a
     /// long frame goes in pieces.
-    fn send_sealed(&self, connection: &Mutex<Connection>, frame: &[u8], sealed: &mut Vec<u8>) -> Result<(), LinkError> {
+    fn write_sealed(&self, connection: &Mutex<Connection>, frame: &[u8], sealed: &mut Vec<u8>) -> io::Result<()> {
         let mut left = frame;
         loop {
             sealed.clear();
@@ -405,6 +542,7 @@ pub fn dial(address: &str, fingerprint: Option<&str>, key: &[u8], role: Role, ep
     let target = address.to_socket_addrs()?.next().ok_or(LinkError::Refused("the address resolved to nothing"))?;
     let mut socket = TcpStream::connect_timeout(&target, timeout)?;
     prepare(&socket)?;
+    socket.set_read_timeout(Some(timeout.min(Duration::from_secs(HANDSHAKE_SECONDS))))?;
     let tls = match fingerprint {
         None => None,
         Some(fingerprint) => {
@@ -414,7 +552,7 @@ pub fn dial(address: &str, fingerprint: Option<&str>, key: &[u8], role: Role, ep
     };
     let link = Link::new(socket, tls);
     let hello = Hello { role, epoch, nonce: random_bytes() };
-    link.send(&hello.encode())?;
+    link.greet(&hello.encode())?;
     let mut frames = link.reader(STRANGER_BYTES);
     let (kind, body) = frames.next()?;
     if kind != Kind::HelloOk {
@@ -425,8 +563,9 @@ pub fn dial(address: &str, fingerprint: Option<&str>, key: &[u8], role: Role, ep
     if !same(&mac, &proof(key, SERVER_LABEL, &hello, &nonce, pin)) {
         return Err(LinkError::Refused("the other node does not hold this route's key"));
     }
-    link.send(&wire::auth(&proof(key, CLIENT_LABEL, &hello, &nonce, pin)))?;
+    link.greet(&wire::auth(&proof(key, CLIENT_LABEL, &hello, &nonce, pin)))?;
     link.socket.set_read_timeout(None)?;
+    link.start_writer()?;
     Ok(link)
 }
 
@@ -451,12 +590,13 @@ pub fn accept(
     let key = key_for(hello.role, hello.epoch).ok_or(LinkError::Refused("no route here for that greeting"))?;
     let nonce: [u8; NONCE_BYTES] = random_bytes();
     let pin = identity.map_or("", |item| item.fingerprint.as_str());
-    link.send(&wire::hello_ok(&nonce, &proof(&key, SERVER_LABEL, &hello, &nonce, pin)))?;
+    link.greet(&wire::hello_ok(&nonce, &proof(&key, SERVER_LABEL, &hello, &nonce, pin)))?;
     let (kind, body) = frames.next()?;
     if kind != Kind::Auth || !same(body, &proof(&key, CLIENT_LABEL, &hello, &nonce, pin)) {
         return Err(LinkError::Refused("the other node does not hold this route's key"));
     }
     link.socket.set_read_timeout(None)?;
+    link.start_writer()?;
     frames.set_limit(wire::MAX_BODY_BYTES);
     Ok((link, frames, hello))
 }
@@ -467,7 +607,6 @@ mod tests {
     use crate::wire::Ack;
     use std::net::TcpListener;
     use std::sync::mpsc;
-    use std::thread;
 
     const KEY: &[u8] = b"route key";
 
@@ -518,6 +657,20 @@ mod tests {
     }
 
     #[test]
+    fn a_node_on_another_wire_version_is_refused_at_its_greeting() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            accept(socket, None, |_, _| Some(KEY.to_vec())).map(|_| ())
+        });
+        let mut frame = Hello { role: Role::Hop, epoch: 1, nonce: [0; NONCE_BYTES] }.encode();
+        frame[2] = wire::VERSION - 1;
+        TcpStream::connect(address).unwrap().write_all(&frame).unwrap();
+        assert!(matches!(handle.join().unwrap(), Err(LinkError::Wire(wire::WireError::BadVersion(_)))));
+    }
+
+    #[test]
     fn a_stranger_cannot_send_a_large_frame_before_proving_anything() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -528,6 +681,7 @@ mod tests {
         let mut stranger = TcpStream::connect(address).unwrap();
         let frame = crate::wire::Pass {
             id: 1,
+            generation: 1,
             epoch: 1,
             slot: 0,
             position: 0,
@@ -546,20 +700,8 @@ mod tests {
 
     #[test]
     fn a_stalled_write_leaves_the_reader_free_and_then_ends_the_link() {
-        let identity = Arc::new(Identity::generate().unwrap());
-        let pin = identity.fingerprint.clone();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap().to_string();
-        let (finish, finished) = mpsc::channel::<()>();
-        // Takes the link and never reads from it.
-        let far = thread::spawn(move || {
-            let (socket, _) = listener.accept().unwrap();
-            let _held = accept(socket, Some(&identity), |_, _| Some(KEY.to_vec())).unwrap();
-            let _ = finished.recv();
-        });
-        let link = dial(&address, Some(&pin), KEY, Role::Hop, 1, Duration::from_secs(5)).unwrap();
         let limit = Duration::from_secs(1);
-        link.limit_writes(limit).unwrap();
+        let (link, finish, far) = stalled_link(limit);
         let began = Instant::now();
         let writer = {
             let link = link.clone();
@@ -581,6 +723,83 @@ mod tests {
         assert!(began.elapsed() < limit * 3);
         assert!(link.is_closed());
         assert!(matches!(link.send(b"more"), Err(LinkError::Closed)));
+        drop(finish);
+        far.join().unwrap();
+    }
+
+    #[test]
+    fn beats_go_ahead_of_frames_and_frames_keep_their_order() {
+        let mut outbox = Outbox::default();
+        for frame in [vec![1; 10], vec![2; 10]] {
+            outbox.bytes += frame.len();
+            outbox.frames.push_back(frame);
+        }
+        outbox.beats.push_back(vec![3]);
+        assert_eq!(outbox.take(), Some(vec![3]));
+        assert_eq!(outbox.take(), Some(vec![1; 10]));
+        assert_eq!(outbox.take(), Some(vec![2; 10]));
+        assert_eq!((outbox.take(), outbox.bytes), (None, 0));
+    }
+
+    #[test]
+    fn a_queue_is_bounded_by_count_and_by_bytes_and_a_long_frame_can_still_go() {
+        let mut outbox = Outbox::default();
+        assert!(outbox.has_room(QUEUE_BYTES * 2));
+        outbox.bytes += QUEUE_BYTES;
+        outbox.frames.push_back(vec![]);
+        assert!(!outbox.has_room(1));
+        outbox.bytes = 0;
+        outbox.frames.resize(QUEUE_FRAMES, vec![]);
+        assert!(!outbox.has_room(1));
+    }
+
+    /// A link to a far end that took it and will never read, and a way to end that.
+    fn stalled_link(limit: Duration) -> (Arc<Link>, mpsc::Sender<()>, thread::JoinHandle<()>) {
+        let identity = Arc::new(Identity::generate().unwrap());
+        let pin = identity.fingerprint.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (finish, finished) = mpsc::channel::<()>();
+        let far = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let _held = accept(socket, Some(&identity), |_, _| Some(KEY.to_vec())).unwrap();
+            let _ = finished.recv();
+        });
+        let link = dial(&address, Some(&pin), KEY, Role::Hop, 1, Duration::from_secs(5)).unwrap();
+        link.limit_writes(limit).unwrap();
+        (link, finish, far)
+    }
+
+    #[test]
+    fn a_queue_that_stays_full_loses_the_link_and_a_beat_never_waits() {
+        let limit = Duration::from_secs(1);
+        let (link, finish, far) = stalled_link(limit);
+        let began = Instant::now();
+        let frame = vec![0; 8 << 20];
+        let error = loop {
+            if let Err(error) = link.send(&frame) {
+                break error;
+            }
+            let queued = Instant::now();
+            assert!(link.beat(&Ack { id: 1 }.encode()).is_ok() || link.is_closed());
+            assert!(queued.elapsed() < Duration::from_millis(100));
+        };
+        assert!(matches!(error, LinkError::Io(_)));
+        assert!(began.elapsed() < limit * 3);
+        assert!(link.is_closed());
+        assert!(matches!(link.beat(b"more"), Err(LinkError::Closed)));
+        drop(finish);
+        far.join().unwrap();
+    }
+
+    #[test]
+    fn a_read_limit_ends_a_silent_link() {
+        let (link, finish, far) = stalled_link(Duration::from_secs(5));
+        link.limit_reads(Duration::from_millis(100)).unwrap();
+        let began = Instant::now();
+        assert!(link.reader(1024).next().is_err());
+        assert!(began.elapsed() < Duration::from_secs(2));
+        link.close();
         drop(finish);
         far.join().unwrap();
     }

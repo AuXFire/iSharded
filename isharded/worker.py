@@ -198,6 +198,9 @@ CONTROL_LINK_FAILURES = 60
 CHECK_IN_SECONDS = 5.0
 # How long a link may go without an acknowledgement, and how long a stage keeps dialling.
 RING_ACK_MS = 5000
+# A stage that loses a link says so inside the limit above, and an answer the closing link
+# held comes back by walking soon after. This leaves room for that, however fast the ring.
+RING_ANSWER_FLOOR_SECONDS = 2 * RING_ACK_MS / 1000
 RING_DIAL_MS = 10_000
 # Off is for checking results against a prompt that went out whole.
 PROMPT_PARTS = os.getenv("ISHARDED_PROMPT_PARTS", "1") != "0"
@@ -1190,8 +1193,13 @@ class WorkerRuntime:
             raise self.ring_refused(refused) from refused
 
     async def ring_answer(self, answer: asyncio.Future[list[int]]) -> int:
+        round_trip = self.ring_client.round_trip if self.ring_client is not None else None
+        if round_trip is None:
+            seconds = pass_seconds(1, len(self.route))
+        else:
+            seconds = max(RING_ANSWER_FLOOR_SECONDS, RING_ACK_MS / 1000 + 2 * round_trip)
         try:
-            return (await asyncio.wait_for(answer, pass_seconds(1, len(self.route))))[0]
+            return (await asyncio.wait_for(answer, seconds))[0]
         except EngineRefusal as refused:
             raise self.ring_refused(refused) from refused
         except asyncio.TimeoutError as exc:
