@@ -1867,3 +1867,42 @@ def test_a_body_that_could_not_be_read_cannot_write_to_a_terminal():
         server.request("tools/list", {}, 5)
     assert "" not in str(caught.value) and "gone" in str(caught.value)
 
+# --- a request over stdio is always answered
+
+
+def test_stdio_answers_a_request_that_failed_in_a_way_nobody_planned(stdio):
+    pipes, thread = stdio(httpx.MockTransport(lambda request: httpx.Response(200, json={"choices": []})))
+    pipes.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": LEGACY_VERSIONS[0]}})
+    pipes.wait_for(1)
+    pipes.send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "chat", "arguments": {"prompt": "Hi"}}})
+    error = pipes.wait_for(2)["error"]
+    assert error["code"] == INTERNAL_ERROR and "IndexError" in error["message"]
+    pipes.send({"jsonrpc": "2.0", "id": 3, "method": "ping"})
+    assert pipes.wait_for(3)["result"] == {}  # and it carries on
+
+
+def test_stdio_answers_a_line_nested_too_deep_to_read(stdio):
+    pipes, thread = stdio(httpx.MockTransport(lambda request: httpx.Response(200, json={})))
+    pipes.incoming.put(b"[" * 500_000 + b"\n")
+    pipes.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": LEGACY_VERSIONS[0]}})
+    pipes.wait_for(1)
+    assert pipes.replies()[0]["error"]["code"] == PARSE_ERROR
+
+
+def test_a_cancelled_request_over_stdio_still_gets_no_error_of_ours(stdio):
+    async def waits(request):
+        await asyncio.sleep(30)
+        return httpx.Response(200, json={})
+
+    pipes, thread = stdio(httpx.MockTransport(waits))
+    pipes.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": LEGACY_VERSIONS[0]}})
+    pipes.wait_for(1)
+    pipes.send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_models", "arguments": {}}})
+    time.sleep(0.2)
+    pipes.send({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 2}})
+    pipes.send({"jsonrpc": "2.0", "id": 3, "method": "ping"})
+    pipes.wait_for(3)
+    time.sleep(0.2)
+    assert not [reply for reply in pipes.replies() if reply.get("id") == 2]
+
+

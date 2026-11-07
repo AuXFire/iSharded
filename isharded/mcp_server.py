@@ -590,7 +590,11 @@ async def serve_stdio(client: httpx.AsyncClient, source: BinaryIO, output: Binar
     running = InFlight()
 
     async def answer(message: dict[str, Any]) -> None:
-        reply = await handler.handle(message)
+        try:
+            reply = await handler.handle(message)
+        except Exception as exc:  # a client waits for its reply however this went
+            identifier = message.get("id") if isinstance(message, dict) else None
+            reply = RpcError(INTERNAL_ERROR, f"This request failed inside the server: {type(exc).__name__}").body(identifier)
         if reply is not None:
             write_message(output, reply)
 
@@ -602,7 +606,7 @@ async def serve_stdio(client: httpx.AsyncClient, source: BinaryIO, output: Binar
             continue
         try:
             message = json.loads(line)
-        except ValueError:
+        except (RecursionError, ValueError):
             write_message(output, RpcError(PARSE_ERROR, "Parse error: a line is not JSON").body(None))
             continue
         if isinstance(message, dict) and message.get("method") == "notifications/cancelled":
