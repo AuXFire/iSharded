@@ -10,7 +10,7 @@ A node in the route sees prompts and replies in plain text, as hidden states or 
 
 An ordinary pool is decentralized in how it runs, not in who owns it. No server is special, any node can coordinate, and losing any machine loses nothing but what it was running. But it has an owner: whoever holds the authority key, or the shared token in a pool without one. That person decides who joins, who is thrown out, and who may load models.
 
-This suits a pool whose members trust each other. It is not a public mesh. A public mesh, where anyone can join, would need answers iSharded does not have today: a way to detect wrong results that a careful node cannot dodge, a way to stop one person running thousands of nodes, and a clear warning that node operators can read prompts. [Checking answers](../README.md#checking-answers) catches a route that disagrees with others, and no more. [A network nobody owns](#a-network-nobody-owns) covers what is built for a public mesh, and what stays unanswered.
+This suits a pool whose members trust each other. It is not a public mesh. A public mesh, where anyone can join, would need answers iSharded does not have today: a way to detect wrong results that a careful node cannot dodge, a way to stop one person running thousands of nodes, and a clear warning that node operators can read prompts. [Checking answers](GUIDE.md#checking-answers) catches a route that disagrees with others, and no more. [A network nobody owns](#a-network-nobody-owns) covers what is built for a public mesh, and what stays unanswered.
 
 ## Invites
 
@@ -31,7 +31,7 @@ An answer proves nothing, and anyone can send one. A machine that finds a mesh o
 
 ## A network nobody owns
 
-In this kind of network there is no pool authority and no owner. [The README shows how to run one](../README.md#a-network-nobody-owns). What changes:
+In this kind of network there is no pool authority and no owner. [The guide shows how to run one](GUIDE.md#a-network-nobody-owns). What changes:
 
 - A node makes its own key, and its name is a hash of that key. A certificate is accepted only if it signed itself and carries the name its key gives, so nobody can claim another node's name.
 - Each node decides who it accepts: anyone, or nodes vouched for by nodes it already accepts, starting from itself and whoever it trusts. Nodes can disagree, and nothing makes them agree.

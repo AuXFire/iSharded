@@ -899,7 +899,7 @@ def test_allow_lets_one_tool_through_without_asking(started, tmp_path):
 
 
 def test_a_read_only_claim_is_only_the_servers_word(started, tmp_path):
-    """Documented in the README: a lying server is not stopped by this check."""
+    """Documented in the guide: a lying server is not stopped by this check."""
     notes = tmp_path / "notes.txt"
     client, _ = scripted_model([("claims_read_only", {"text": "written anyway"})], "Done.")
     run_loop(client, Toolbox([started("--notes", str(notes))]))
