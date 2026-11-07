@@ -54,6 +54,9 @@ TOOL_MODES = ("auto", "native", "prompt")
 TOOL_FENCE_TAGS = frozenset({"", "tool", "tools", "tool_call", "tool_calls", "toolcall", "json", "json5", "javascript", "js"})
 LOOPBACK_NAMES = frozenset({"localhost"})
 NO_TOOLS_STATUSES = (400, 404, 422, 501)
+# What one request can get wrong by itself. The rest of the 4xx range is about the key, the
+# address, or a rate limit, and those stay wrong for everyone until someone fixes them.
+REQUEST_FAULT_STATUSES = (400, 413, 422)
 
 SCHEMA = [
     """
@@ -76,6 +79,10 @@ SCHEMA = [
 
 class ProviderError(Exception):
     """A provider failed. The message is safe to show and never holds a key."""
+
+
+class RequestRefused(ProviderError):
+    """A provider turned down this one request. That says nothing about the provider, so nobody else pays for it."""
 
 
 class ProviderRefused(ValueError):
@@ -619,7 +626,8 @@ class OpenAICompatible:
         return ProviderError(f"{self.name} {what}: {type(error).__name__}")
 
     def _failed(self, response: httpx.Response) -> ProviderError:
-        return ProviderError(f"{self.name} answered HTTP {response.status_code}: {self._clean(response.text)}")
+        kind = RequestRefused if response.status_code in REQUEST_FAULT_STATUSES else ProviderError
+        return kind(f"{self.name} answered HTTP {response.status_code}: {self._clean(response.text)}")
 
     def _post(self, path: str, body: dict[str, Any], read: float, doing: str) -> httpx.Response:
         try:
@@ -711,15 +719,16 @@ class OpenAICompatible:
             raise self._failed(response)
         try:
             payload = response.json()
-            message = payload["choices"][0]["message"]
+            choice = payload["choices"][0]
+            message = choice["message"]
         except (ValueError, KeyError, IndexError, TypeError):
             raise ProviderError(f"{self.name} sent a reply that could not be read") from None
         raw = str(message.get("content") or "")
         answered_by = payload.get("model") or model
-        return self._reply(raw, message.get("tool_calls") or [], request, body, payload.get("usage") or {}, answered_by, started)
+        return self._reply(raw, message.get("tool_calls") or [], request, body, payload.get("usage") or {}, answered_by, started, choice.get("finish_reason"))
 
     def _reply(
-        self, raw: str, native_calls: list[Any], request: ModelRequest, body: dict[str, Any], usage: dict[str, Any], model: Any, started: float
+        self, raw: str, native_calls: list[Any], request: ModelRequest, body: dict[str, Any], usage: dict[str, Any], model: Any, started: float, ended: Any
     ) -> ModelReply:
         text, calls = parse_tool_calls(raw, request.tools)
         found = as_calls(native_calls, frozenset(tool.name for tool in request.tools))
@@ -731,11 +740,12 @@ class OpenAICompatible:
             prompt_tokens=int(usage.get("prompt_tokens") or sum(estimate_tokens(item["content"]) for item in body["messages"])),
             completion_tokens=int(usage.get("completion_tokens") or estimate_tokens(raw)),
             seconds=time.perf_counter() - started,
+            finish_reason="length" if ended == "length" else "stop",
         )
 
-    def stream(self, request: ModelRequest, model: str) -> Iterator[str | ModelReply]:
+    def stream(self, request: ModelRequest, model: str, native: bool | None = None) -> Iterator[str | ModelReply]:
         """Text as it comes, then the finished ModelReply last."""
-        native = self._native(request)
+        native = self._native(request) if native is None else native
         if native and not self.streams_tool_calls:
             # Native calls arrive in pieces. Only the finished reply can be parsed safely.
             reply = self.complete(request, model)
@@ -751,6 +761,7 @@ class OpenAICompatible:
         usage: dict[str, Any] = {}
         answered_by = model
         finished = False
+        ended = None
         try:
             opened = self._client().stream(
                 "POST", f"{self.base_url}/chat/completions", json=body, headers=self._headers(), timeout=seconds_to_wait(self.read_seconds)
@@ -774,18 +785,21 @@ class OpenAICompatible:
                             yield piece
                         for call in delta.get("tool_calls") or []:
                             gather_call(streamed, call)
-                        finished = finished or bool(choice.get("finish_reason"))
+                        ended = choice.get("finish_reason") or ended
+                        finished = finished or bool(ended)
         except httpx.TimeoutException:
             raise ProviderError(f"{self.name} went silent for {self.read_seconds:.0f} s") from None
         except httpx.HTTPError as error:
             raise self._unreachable(error, "dropped the connection") from None
         if refused:
-            self.tool_mode = "prompt"  # this model has no tool calling of its own
-            yield from self.stream(request, model)
+            for item in self.stream(request, model, False):
+                if isinstance(item, ModelReply):
+                    self.tool_mode = "prompt"  # it worked this way, so this model has no tool calling of its own
+                yield item
             return
         if not finished:
             raise ProviderError(f"{self.name} stopped before finishing its reply")
-        yield self._reply("".join(parts), [streamed[index] for index in sorted(streamed)], request, body, usage, answered_by, started)
+        yield self._reply("".join(parts), [streamed[index] for index in sorted(streamed)], request, body, usage, answered_by, started, ended)
 
     def _events(self, response: httpx.Response) -> Iterator[dict[str, Any] | None]:
         for line in response.iter_lines():
@@ -804,8 +818,10 @@ class OpenAICompatible:
             if event.get("error"):
                 # Headers are long gone by now, so failures travel in the stream.
                 error = event["error"]
-                detail = error.get("message") if isinstance(error, dict) else error
-                raise ProviderError(f"{self.name} failed partway: {self._clean(str(detail))}")
+                detail, code = (error.get("message"), error.get("code")) if isinstance(error, dict) else (error, None)
+                # A mesh counts a prompt after its headers went out, so this is where it says one is too long.
+                kind = RequestRefused if code in REQUEST_FAULT_STATUSES else ProviderError
+                raise kind(f"{self.name} failed partway: {self._clean(str(detail))}")
             yield event
 
     def embed(self, model: str, texts: Sequence[str]) -> list[list[float]]:
@@ -966,6 +982,9 @@ def add_commands(commands: Any) -> None:
     remove = actions.add_parser("remove", help="remove a provider")
     remove.add_argument("name", help="its name")
     remove.set_defaults(run=plainly(run_remove))
+    test = actions.add_parser("test", help="ask one provider whether it is up, on a fresh connection")
+    test.add_argument("name", help="its name")
+    test.set_defaults(run=plainly(run_test))
 
 
 def run_add(assistant: Any, args: argparse.Namespace) -> int:
@@ -1000,4 +1019,16 @@ def run_list(assistant: Any, args: argparse.Namespace) -> int:
 def run_remove(assistant: Any, args: argparse.Namespace) -> int:
     assistant.providers.remove(args.name)
     emit(f"Removed {args.name}.")
+    return 0
+
+
+def run_test(assistant: Any, args: argparse.Namespace) -> int:
+    provider = assistant.providers.get(args.name)
+    if provider is None:
+        raise ProviderRefused(f"There is no provider {args.name}. `provider list` shows them")
+    health = provider.health()
+    if not health["up"]:
+        emit(f"{args.name} is down: {health['error']}")
+        return 1
+    emit(f"{args.name} is up, in {health['seconds']:.2f} s. Models: {', '.join(health['models']) or 'none loaded'}.")
     return 0

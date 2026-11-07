@@ -16,7 +16,7 @@ from typing import Any
 
 from .contracts import ModelReply, ModelRequest, Reach
 from .mind import actor, emit, LOCAL_USER, plainly, SECONDS_PER_DAY, table
-from .providers import VisibleText, estimate_tokens
+from .providers import estimate_tokens, RequestRefused, VisibleText
 
 ROLES = ("conversation", "planning", "coding", "worker", "decision", "vision", "embedding", "verification")
 Z_95 = 1.96
@@ -122,6 +122,12 @@ def wilson_lower_bound(successes: int, runs: int, z: float = Z_95) -> float:
 
 def tokens_per_second(row: Any) -> float:
     return row["tokens"] / row["seconds"] if row["seconds"] else 0.0
+
+
+def nothing_said(candidate: Candidate, reply: ModelReply) -> Exception:
+    """An empty reply. One the token limit ended came from the limit a request set, and a model that had only begun."""
+    kind = RequestRefused if reply.finish_reason == "length" else ValueError
+    return kind(f"{candidate} replied with nothing")
 
 
 def parse_candidate(text: str) -> Candidate:
@@ -318,6 +324,10 @@ class ModelRouter:
         return failures
 
     def _failed(self, candidate: Candidate, role: str, error: BaseException, seconds: float) -> None:
+        if isinstance(error, RequestRefused):
+            # Models are shared, so one person's bad request must not take this one from anybody, or lower its record.
+            self.assistant.audit.record("router", "router.request_refused", str(candidate), {"role": role})
+            return
         self._record(candidate, role, False, 0, seconds)
         failures = self._back_off(candidate, error)
         self.assistant.audit.record("router", "router.failed", str(candidate), {"role": role, "failures": failures})
@@ -330,7 +340,7 @@ class ModelRouter:
             try:
                 reply = provider.complete(request, candidate.model)
                 if not reply.text.strip() and not reply.tool_calls:
-                    raise ValueError(f"{candidate} replied with nothing")
+                    raise nothing_said(candidate, reply)
             except Exception as error:  # a provider's bug must not stop the next one being tried
                 self._failed(candidate, request.role, error, time.perf_counter() - started)
                 failures.append(f"{candidate}: {error}")
@@ -351,7 +361,7 @@ class ModelRouter:
                 for item in provider.stream(request, candidate.model):
                     if isinstance(item, ModelReply):
                         if not item.text.strip() and not item.tool_calls:
-                            raise ValueError(f"{candidate} replied with nothing")
+                            raise nothing_said(candidate, item)
                         tail = visible.flush()
                         if tail and not item.tool_calls:
                             yield tail

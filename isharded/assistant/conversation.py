@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import dataclass, field, replace
 import json
 import re
@@ -125,6 +126,7 @@ class TurnResult:
     tools: tuple[str, ...] = ()
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    finish_reason: str = "stop"  # or length, when the token limit cut the last reply short
 
 
 def final_result(items: Iterable[str | TurnResult]) -> TurnResult:
@@ -157,12 +159,14 @@ class Turn:
     completion_tokens: int = 0
     max_tokens: int | None = None  # what a client asked for, across the whole turn
     temperature: float | None = None
+    finish_reason: str = "stop"  # the last reply's
+    ended: bool = False  # its last audit row is written
 
     def sampling(self, default_tokens: int) -> dict[str, Any]:
         """What the next request asks of a model. A limit covers every round, as a client sees one reply.
 
-        It can only lower what a turn gives. A provider that refuses a number backs off for
-        every user, so one client's number must not reach it.
+        It can only lower what a turn gives. What a provider accepts is for this assistant
+        to know, so one client's number must not reach it.
         """
         tokens = default_tokens if self.max_tokens is None else min(max(self.max_tokens - self.completion_tokens, 1), default_tokens)
         return {"max_tokens": tokens} | ({} if self.temperature is None else {"temperature": self.temperature})
@@ -216,10 +220,11 @@ class Conversation:
         self, user: str, text: str, conversation_id: str | None = None, learn: str = "now", max_tokens: int | None = None, temperature: float | None = None
     ) -> Iterator[str | TurnResult]:
         """The same turn, yielding text as it comes and the TurnResult last."""
-        for item in self._run(user, text, conversation_id, True, max_tokens, temperature):
-            yield item
-            if isinstance(item, TurnResult):
-                self._learn_after(item, text, learn)
+        with closing(self._run(user, text, conversation_id, True, max_tokens, temperature)) as items:
+            for item in items:
+                yield item
+                if isinstance(item, TurnResult):
+                    self._learn_after(item, text, learn)
 
     def _run(
         self, user: str, text: str, conversation_id: str | None, streaming: bool, max_tokens: int | None = None, temperature: float | None = None
@@ -241,6 +246,9 @@ class Conversation:
         except ContextTooSmall as error:
             yield self._finish(turn, "failed", str(error))
             return
+        except KeyboardInterrupt:
+            self._finish(turn, "cancelled", "")
+            raise
         yield from self._advance(turn, streaming)
 
     def _build(self, turn: Turn) -> None:
@@ -277,29 +285,37 @@ class Conversation:
 
     def _advance(self, turn: Turn, streaming: bool, pending: Sequence[ToolCall] = ()) -> Iterator[str | TurnResult]:
         calls = pending
-        while True:
-            paused = self._run_calls(turn, calls)
-            if paused is not None:
-                yield paused
-                return
-            final_round = turn.rounds >= self.max_rounds
-            if final_round:
-                turn.transcript.append({"kind": "note", "text": "That was the last tool you can use this turn. Answer now with what you have."})
-            turn.rounds += 1
-            request = ModelRequest(
-                role=ROLE, messages=turn.messages(self.budget_tokens), tools=() if final_round else turn.offered, reach=turn.reach, **turn.sampling(self.reply_tokens)
-            )
-            partial: list[str] = []
-            try:
-                reply = yield from self._ask(request, streaming, partial)
-            except Exception as error:
-                yield self._failed(turn, error, "".join(partial))
-                return
-            self._note_reply(turn, reply)
-            if not reply.tool_calls or final_round:
-                yield self._finish(turn, "done", "")
-                return
-            calls = reply.tool_calls
+        partial: list[str] = []
+        try:
+            while True:
+                paused = self._run_calls(turn, calls)
+                if paused is not None:
+                    yield paused
+                    return
+                final_round = turn.rounds >= self.max_rounds
+                if final_round:
+                    turn.transcript.append({"kind": "note", "text": "That was the last tool you can use this turn. Answer now with what you have."})
+                turn.rounds += 1
+                request = ModelRequest(
+                    role=ROLE, messages=turn.messages(self.budget_tokens), tools=() if final_round else turn.offered, reach=turn.reach, **turn.sampling(self.reply_tokens)
+                )
+                partial = []
+                try:
+                    reply = yield from self._ask(request, streaming, partial)
+                except Exception as error:
+                    yield self._failed(turn, error, "".join(partial))
+                    return
+                self._note_reply(turn, reply)
+                partial = []
+                if not reply.tool_calls or final_round:
+                    yield self._finish(turn, "done", "")
+                    return
+                calls = reply.tool_calls
+        except (GeneratorExit, KeyboardInterrupt):  # whoever was reading stopped, and that is not a failure
+            if not turn.ended:
+                self._keep_partial(turn, "".join(partial))
+                self._finish(turn, "cancelled", "")
+            raise
 
     def _ask(self, request: ModelRequest, streaming: bool, partial: list[str]) -> Iterator[str]:
         router = self.assistant.router
@@ -324,6 +340,7 @@ class Conversation:
         turn.model, turn.provider = reply.model, reply.provider
         turn.prompt_tokens += reply.prompt_tokens
         turn.completion_tokens += reply.completion_tokens
+        turn.finish_reason = reply.finish_reason
         if reply.text:
             turn.said.append(reply.text)
             turn.transcript.append({"kind": "assistant", "text": reply.text})
@@ -332,16 +349,20 @@ class Conversation:
                 prompt_tokens=reply.prompt_tokens, completion_tokens=reply.completion_tokens, tainted=turn.tainted, reach=turn.reach,
             )
 
-    def _failed(self, turn: Turn, error: Exception, partial: str) -> TurnResult:
+    def _keep_partial(self, turn: Turn, partial: str) -> None:
         if partial:
             # What did arrive is kept, and marked, because a person has already read it.
             self.assistant.memory.record_message(
                 turn.user, turn.conversation_id, "assistant", partial, turn_id=turn.turn_id, tainted=turn.tainted, reach=turn.reach
             )
             turn.said.append(partial)
+
+    def _failed(self, turn: Turn, error: Exception, partial: str) -> TurnResult:
+        self._keep_partial(turn, partial)
         return self._finish(turn, "refused" if getattr(error, "refusal", False) else "failed", str(error))
 
     def _finish(self, turn: Turn, status: str, notice: str, pending: dict[str, Any] | None = None) -> TurnResult:
+        turn.ended = True
         if notice:
             self.assistant.memory.record_message(turn.user, turn.conversation_id, "notice", notice, turn_id=turn.turn_id, reach=turn.reach)
         self.assistant.audit.record(
@@ -351,6 +372,7 @@ class Conversation:
         return TurnResult(
             status, "\n\n".join([*turn.said, *([notice] if notice else [])]), turn.user, turn.conversation_id, turn.turn_id, turn.model, turn.provider,
             turn.tainted, turn.reach, pending, None, tuple(turn.tools), turn.prompt_tokens, turn.completion_tokens,
+            turn.finish_reason if status == "done" else "stop",
         )
 
     # Tools
@@ -654,12 +676,13 @@ def speak(assistant: Any, user: str, text: str, conversation_id: str | None, lea
     """Print a turn as it arrives."""
     result = None
     printed = False
-    for item in assistant.conversation.stream(user, text, conversation_id, learn="off"):
-        if isinstance(item, TurnResult):
-            result = item
-        else:
-            printed = True
-            emit(item, end="")
+    with closing(assistant.conversation.stream(user, text, conversation_id, learn="off")) as items:  # Ctrl-C can land here, and not in the turn
+        for item in items:
+            if isinstance(item, TurnResult):
+                result = item
+            else:
+                printed = True
+                emit(item, end="")
     assert result is not None
     if not printed:
         emit(result.text)

@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 from typing import Any
 
 import pytest
@@ -1097,3 +1098,125 @@ def test_a_reviewers_opinion_is_not_a_check(assistant, repo):
     assistant.router = Told([FIX_AS_FILE], ['{"verdict": "changes", "notes": "Hm."}', '{"verdict": "accept", "notes": "Fine."}'])
     assistant.coder.start(repo, "Fix add")
     assert {row[1] for row in assistant.router.outcomes} == {"coding"}
+
+
+# One thing at a time
+
+
+def holding_a_commit(assistant, monkeypatch) -> tuple[threading.Event, threading.Event]:
+    """Stops a commit partway, where a reject would do the most harm, until the test lets it go."""
+    entered, release = threading.Event(), threading.Event()
+    invoke = assistant.broker.invoke
+
+    def slow(call, context):
+        entered.set()
+        assert release.wait(30)
+        return invoke(call, context)
+
+    monkeypatch.setattr(assistant.broker, "invoke", slow)
+    return entered, release
+
+
+def on_a_thread(assistant, work) -> threading.Thread:
+    def run():
+        try:
+            work()
+        finally:
+            assistant.store.close()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
+
+
+def test_a_reject_during_a_commit_waits_for_it_and_the_commit_stands(assistant, repo, monkeypatch):
+    run = assistant.coder.start(repo, "Fix add")
+    entered, release = holding_a_commit(assistant, monkeypatch)
+    approving = on_a_thread(assistant, lambda: assistant.coder.approve(run.id))
+    assert entered.wait(30)
+
+    rejecting = on_a_thread(assistant, lambda: assistant.coder.reject(run.id, "changed my mind"))
+    rejecting.join(0.5)
+    assert rejecting.is_alive() and run.tree.exists()  # the tree is still there for the commit to work on
+
+    release.set()
+    approving.join(30)
+    rejecting.join(30)
+    done = assistant.coder.run(run.id)
+    assert done.state == REJECTED and done.commit_id
+    assert git(repo, "rev-parse", run.branch) == done.commit_id  # a commit that happened stays, as `code reject` promises
+
+
+def test_an_approve_after_a_reject_finds_nothing_to_commit(assistant, repo):
+    run = assistant.coder.start(repo, "Fix add")
+    assistant.coder.reject(run.id)
+    with pytest.raises(CoderError, match="Only a ready run"):
+        assistant.coder.approve(run.id)
+
+
+def test_two_approvals_at_once_commit_once(assistant, repo, monkeypatch):
+    run = assistant.coder.start(repo, "Fix add")
+    entered, release = holding_a_commit(assistant, monkeypatch)
+    refusals: list[str] = []
+
+    def approve() -> None:
+        try:
+            assistant.coder.approve(run.id)
+        except CoderError as error:
+            refusals.append(str(error))
+
+    first = on_a_thread(assistant, approve)
+    assert entered.wait(30)
+    second = on_a_thread(assistant, approve)
+    second.join(0.3)
+    release.set()
+    first.join(30)
+    second.join(30)
+    assert [row["action"] for row in assistant.audit.read()].count("coder.committed") == 1
+    assert len(refusals) == 1 and "Only a ready run" in refusals[0]
+
+
+def test_a_run_that_stays_busy_is_refused_in_words(assistant, repo):
+    run = assistant.coder.start(repo, "Fix add")
+    with assistant.coder._held(run.id):
+        with pytest.raises(CoderError, match="Something else is working on this run"):
+            assistant.coder.resume(run.id)
+        with pytest.raises(CoderError, match="Something else is working on this run"):
+            with assistant.coder._held(run.id, seconds=0.1):
+                pass
+    assert assistant.coder.reject(run.id).state == REJECTED
+
+
+def test_the_lock_holds_against_another_process_and_goes_when_it_dies(assistant, repo):
+    run = assistant.coder.start(repo, "Fix add")
+    path = assistant.coder.home / "locks" / f"{run.id}.lock"
+    script = f"from isharded.assistant.coder import _try_lock\nfile = open({str(path)!r}, 'ab')\nprint(_try_lock(file), flush=True)\ninput()\n"
+    holder = subprocess.Popen([sys.executable, "-c", script], cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "True"
+        with pytest.raises(CoderError, match="Something else is working on this run"):
+            with assistant.coder._held(run.id, seconds=0.1):
+                pass
+    finally:
+        holder.kill()
+        holder.wait(30)
+    with assistant.coder._held(run.id, seconds=10) as held:
+        assert held.id == run.id
+
+
+def test_an_id_nobody_knows_makes_no_file(assistant):
+    with pytest.raises(CoderError, match="There is no run"):
+        assistant.coder.reject("../../outside")
+    assert not (assistant.coder.home / "locks").exists()
+
+
+def test_a_run_is_read_afresh_once_the_lock_is_held(assistant, repo):
+    run = assistant.coder.start(repo, "Fix add")
+    assistant.store.execute("UPDATE coder_runs SET note = 'changed' WHERE id = ?", (run.id,))
+    with assistant.coder._held(run.id) as held:
+        assert held.note == "changed"
+
+
+def test_a_goal_cannot_name_the_folder_the_locks_are_kept_in(assistant, repo):
+    run = assistant.coder.start(repo, "Locks")
+    assert run.state == READY and run.folder.name == "locks-2"  # rejecting a run removes its folder

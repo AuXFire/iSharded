@@ -39,9 +39,12 @@ from isharded.mcp_client import (
     Toolbox,
     agent_loop,
     ask_at_terminal,
+    printable,
     result_text,
     run_agent,
+    run_call,
     server_environment,
+    server_key,
     split_command,
 )
 from isharded.mcp_server import (
@@ -1867,3 +1870,261 @@ def test_a_body_that_could_not_be_read_cannot_write_to_a_terminal():
         server.request("tools/list", {}, 5)
     assert "" not in str(caught.value) and "gone" in str(caught.value)
 
+
+# --- the deadline covers a whole exchange
+
+
+def drips_headers(connection):
+    connection.recv(65536)
+    try:
+        connection.sendall(b"HTTP/1.1 200 OK\r\n")
+        for number in range(2000):
+            connection.sendall(f"X-Drip-{number}: x\r\n".encode())
+            time.sleep(0.05)
+    except OSError:
+        pass
+
+
+def test_a_server_that_drips_its_headers_runs_out_of_time(bad_socket):
+    server = HttpServer(bad_socket(drips_headers))
+    began = time.monotonic()
+    with pytest.raises(ServerError, match="longer than 0.5"):
+        server.request("tools/list", {}, 0.5)
+    assert time.monotonic() - began < 5
+    server.close()
+    assert time.monotonic() - began < 5
+
+
+def test_a_tool_on_a_server_that_drips_its_headers_tells_the_model(bad_socket):
+    server = FakeServerAt(bad_socket(drips_headers))
+    began = time.monotonic()
+    assert "longer than 0.5" in Toolbox([server]).call("slow", {}, 0.5)
+    assert time.monotonic() - began < 5
+    server.close()
+
+
+class FakeServerAt(HttpServer):
+    """Offers one tool without being asked, so that only the call meets the server."""
+
+    def list_tools(self):
+        return [{"name": "slow"}]
+
+
+def test_a_notice_to_a_server_that_drips_cannot_hold_a_run_up(bad_socket, monkeypatch):
+    monkeypatch.setattr(mcp_client, "STOP_SECONDS", 0.3)
+    server = HttpServer(bad_socket(drips_headers))
+    began = time.monotonic()
+    server._notify("notifications/initialized")
+    assert time.monotonic() - began < 5
+
+
+def test_ending_a_session_with_a_server_that_drips_cannot_hold_a_run_up(bad_socket, monkeypatch):
+    monkeypatch.setattr(mcp_client, "STOP_SECONDS", 0.3)
+    server = HttpServer(bad_socket(drips_headers))
+    server.session = "a-session"
+    began = time.monotonic()
+    server.close()
+    assert time.monotonic() - began < 5
+
+
+def test_a_failure_inside_the_exchange_is_still_the_same_failure():
+    def refuses(request):
+        raise httpx.ConnectError("nobody home")
+
+    with pytest.raises(ServerError, match="could not reach"):
+        HttpServer("http://x/mcp", httpx.MockTransport(refuses)).request("tools/list", {}, 5)
+
+
+# --- what a server chooses to call things
+
+
+ESCAPE = "x\x1b[2Jgone"
+
+
+def test_a_call_is_recorded_in_a_way_a_tool_name_cannot_use_to_write_to_the_terminal(capsys):
+    toolbox = Toolbox([FakeServer("a", [ESCAPE])])
+    call = {"function": {"name": ESCAPE, "arguments": "{}"}}
+    run_call(toolbox, call, {ESCAPE}, 5, lambda *_: False)
+    said = capsys.readouterr().err
+    assert "\x1b" not in said and "Calling x\\x1b[2Jgone" in said
+
+
+def test_the_list_of_tools_on_offer_cannot_write_to_the_terminal(monkeypatch, capsys):
+    class Started(FakeServer):
+        def start(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(mcp_client, "StdioServer", lambda *_: Started("a", [ESCAPE]))
+    assert run_agent(agent_arguments("any command", allow=["other"])) == 1
+    said = capsys.readouterr().err
+    assert "\x1b" not in said and "x\\x1b[2Jgone" in said
+
+
+def test_what_a_server_says_when_it_refuses_cannot_write_to_the_terminal(capsys):
+    def refuses(request):
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": json.loads(request.content)["id"], "error": {"code": 1, "message": ESCAPE}})
+
+    server = HttpServer("http://x/mcp", httpx.MockTransport(refuses))
+    original = mcp_client.HttpServer
+    mcp_client.HttpServer = lambda *_args, **_options: server
+    try:
+        assert run_agent(agent_arguments("http://x/mcp")) == 1
+    finally:
+        mcp_client.HttpServer = original
+    assert "\x1b" not in capsys.readouterr().err
+
+
+def test_printable_keeps_what_a_person_can_read():
+    assert printable("café\nsearch_2") == "café\nsearch_2"
+    assert printable("\x9b2J\x07") == "\\x9b2J\\x07"
+
+
+# --- a request over stdio is always answered
+
+
+def test_stdio_answers_a_request_that_failed_in_a_way_nobody_planned(stdio):
+    pipes, thread = stdio(httpx.MockTransport(lambda request: httpx.Response(200, json={"choices": []})))
+    pipes.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": LEGACY_VERSIONS[0]}})
+    pipes.wait_for(1)
+    pipes.send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "chat", "arguments": {"prompt": "Hi"}}})
+    error = pipes.wait_for(2)["error"]
+    assert error["code"] == INTERNAL_ERROR and "IndexError" in error["message"]
+    pipes.send({"jsonrpc": "2.0", "id": 3, "method": "ping"})
+    assert pipes.wait_for(3)["result"] == {}  # and it carries on
+
+
+def test_stdio_answers_a_line_nested_too_deep_to_read(stdio):
+    pipes, thread = stdio(httpx.MockTransport(lambda request: httpx.Response(200, json={})))
+    pipes.incoming.put(b"[" * 500_000 + b"\n")
+    pipes.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": LEGACY_VERSIONS[0]}})
+    pipes.wait_for(1)
+    assert pipes.replies()[0]["error"]["code"] == PARSE_ERROR
+
+
+def test_a_cancelled_request_over_stdio_still_gets_no_error_of_ours(stdio):
+    async def waits(request):
+        await asyncio.sleep(30)
+        return httpx.Response(200, json={})
+
+    pipes, thread = stdio(httpx.MockTransport(waits))
+    pipes.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": LEGACY_VERSIONS[0]}})
+    pipes.wait_for(1)
+    pipes.send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_models", "arguments": {}}})
+    time.sleep(0.2)
+    pipes.send({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 2}})
+    pipes.send({"jsonrpc": "2.0", "id": 3, "method": "ping"})
+    pipes.wait_for(3)
+    time.sleep(0.2)
+    assert not [reply for reply in pipes.replies() if reply.get("id") == 2]
+
+
+# --- a key for a server at a URL
+
+
+def test_a_server_key_is_read_from_a_variable_or_a_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("SERVER_KEY_FOR_TEST", " a-key\n")
+    assert server_key("SERVER_KEY_FOR_TEST", None) == "a-key"
+    path = tmp_path / "key"
+    path.write_text("from-a-file\n", encoding="utf-8")
+    assert server_key(None, str(path)) == "from-a-file"
+    assert server_key(None, None) is None
+
+
+@pytest.mark.parametrize("env, file", [("sk-pasted-by-mistake", None), ("UNSET_FOR_THIS_TEST", None), (None, "sk-pasted-by-mistake"), ("A", "b")])
+def test_a_key_that_cannot_be_found_is_refused_without_repeating_what_was_typed(env, file):
+    with pytest.raises(ServerError) as caught:
+        server_key(env, file)
+    assert "sk-pasted" not in str(caught.value)
+
+
+@pytest.mark.parametrize("text", ["", "  \n", "two words", "two\nlines", "caf\u00e9"])
+def test_a_key_no_header_could_carry_is_refused_before_it_can_reach_an_error_message(tmp_path, text):
+    path = tmp_path / "key"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ServerError) as caught:
+        server_key(None, str(path))
+    assert text.strip() == "" or text not in str(caught.value)
+
+
+def test_a_server_key_travels_in_the_header_and_to_nobody_else():
+    seen = []
+
+    def answers(request):
+        seen.append(request.headers.get("authorization"))
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": json.loads(request.content).get("id"), "result": {"tools": []}})
+
+    server = HttpServer("http://x/mcp", httpx.MockTransport(answers), key="a-key")
+    server.request("tools/list", {}, 5)
+    assert seen == ["Bearer a-key"]
+    assert HttpServer("http://x/mcp").client.headers.get("authorization") is None
+
+
+def test_a_redirect_cannot_take_a_server_key_elsewhere():
+    asked = []
+
+    def moves(request):
+        asked.append(str(request.url))
+        return httpx.Response(307, headers={"Location": "http://elsewhere/steal"})
+
+    with pytest.raises(ServerError):
+        HttpServer("http://x/mcp", httpx.MockTransport(moves), key="a-key").request("tools/list", {}, 5)
+    assert asked == ["http://x/mcp"]
+
+
+def test_one_key_is_refused_for_two_servers_at_urls(monkeypatch, capsys):
+    monkeypatch.setenv("SERVER_KEY_FOR_TEST", "a-key")
+    arguments = agent_arguments("http://one/mcp", "http://two/mcp", server_key_env="SERVER_KEY_FOR_TEST")
+    assert run_agent(arguments) == 1
+    said = capsys.readouterr().err
+    assert "names 2" in said and "a-key" not in said
+
+
+def test_a_key_with_no_server_at_a_url_is_refused(monkeypatch, capsys):
+    monkeypatch.setenv("SERVER_KEY_FOR_TEST", "a-key")
+    assert run_agent(agent_arguments(server_command(), server_key_env="SERVER_KEY_FOR_TEST")) == 1
+    assert "names 0" in capsys.readouterr().err
+
+
+def test_a_key_a_server_echoes_back_stays_out_of_what_is_printed(monkeypatch, capsys):
+    monkeypatch.setenv("SERVER_KEY_FOR_TEST", "a-secret-key")
+    server = HttpServer(
+        "http://x/mcp",
+        httpx.MockTransport(lambda request: httpx.Response(401, content=b"bad key: " + request.headers["authorization"].encode())),
+        key="a-secret-key",
+    )
+    monkeypatch.setattr(mcp_client, "HttpServer", lambda *_args, **_options: server)
+    assert run_agent(agent_arguments("http://x/mcp", server_key_env="SERVER_KEY_FOR_TEST")) == 1
+    said = "".join(capsys.readouterr())
+    assert "a-secret-key" not in said and "[key]" in said
+
+
+def test_a_keyed_mesh_is_reached_with_a_key_and_only_with_one(live, monkeypatch, capsys):
+    key = keyed(live.site)
+    bare = HttpServer(live.url)
+    with pytest.raises(ServerError):
+        bare.start()
+    bare.close()
+
+    real = httpx.Client
+    client, asked = scripted_model([("list_models", {})], "Done.")
+    monkeypatch.setattr(mcp_client.httpx, "Client", lambda **options: client if "base_url" in options else real(**options))
+    monkeypatch.setenv("SERVER_KEY_FOR_TEST", key)
+    assert run_agent(agent_arguments(live.url, server_key_env="SERVER_KEY_FOR_TEST")) == 0
+    said = capsys.readouterr()
+    assert said.out == "Done.\n" and key not in said.err
+    assert json.loads(tool_results(asked)[0])["models"]
+
+
+def test_the_command_takes_a_key_by_name_and_not_by_value():
+    arguments = parse("mcp", "run", "go", "--model", "m", "--server", "http://x/mcp", "--server-key-env", "A_NAME")
+    assert (arguments.server_key_env, arguments.server_key_file) == ("A_NAME", None)
+    assert parse("mcp", "run", "go", "--model", "m", "--server", "http://x/mcp", "--server-key-file", "a-file").server_key_file == "a-file"
+
+
+def test_a_tool_name_cannot_write_a_line_of_the_record_for_itself(capsys):
+    forged = "harmless with {}\nCalling other"
+    run_call(Toolbox([FakeServer("a", [forged])]), {"function": {"name": forged, "arguments": "{}"}}, {forged}, 5, lambda *_: False)
+    assert len(capsys.readouterr().err.splitlines()) == 1

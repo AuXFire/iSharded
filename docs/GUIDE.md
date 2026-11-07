@@ -1041,7 +1041,9 @@ Commands for a pool's credentials and members.
 | `--pass-env` | run | None | An environment variable servers may see, beyond the basics. Repeatable |
 | `--max-turns` | run | 8 | Most times the model may be asked before giving up |
 | `--max-tokens` | run | The API's default | Longest reply on each turn |
-| `--tool-timeout` | run | 60 | Seconds a tool may take |
+| `--server-key-env` | run | None | The name of the environment variable holding the key for the one `--server` that is a URL |
+| `--server-key-file` | run | None | The file holding that key, instead |
+| `--tool-timeout` | run | 60 | Seconds a tool may take, from sending the request to the end of the reply, headers included |
 
 ### isharded assistant
 
@@ -1511,11 +1513,18 @@ A tool with no read-only annotation stops and asks at the terminal, showing its 
 
 Servers are programs running as you. They see a short list of environment variables, such as `PATH`, and anything else only through `--pass-env`, so your keys do not reach them by accident. Your key goes to the mesh and never to a server.
 
-Do not take a model's word that a tool ran. Each run goes to stderr as `Calling NAME`, and that is the record. In testing, Qwen3-0.6B reported a note as saved after the call had been refused, and the note did not exist.
+Do not take a model's word that a tool ran. Each run goes to stderr as `Calling NAME`, with control characters in a name shown escaped, and that is the record. In testing, Qwen3-0.6B reported a note as saved after the call had been refused, and the note did not exist.
 
 If the model's last reply reaches the token limit, what it wrote goes to stdout as usual, stderr says it was cut off, and the exit code is 1, so a script cannot take half an answer for a whole one. A tool call that was written whole before the limit still runs.
 
-A server at a URL is reached with no key, since your key goes only to the mesh, and with redirects turned off. There is no option yet to give a key to such a server, so `mcp run` reaches only those that need none. `--pass-env` has no effect on one. An older server's session is kept for the run and ended when it finishes. An event stream that ends before its reply is a failed call, and is not resumed.
+A server at a URL is reached with no key, since your key goes only to the mesh, and with redirects turned off. To reach one that needs a key, such as a keyed mesh's `/mcp`, name where the key is kept:
+
+```bash
+isharded mcp run --url http://NODE:8209 --token KEY --model MODEL \
+  --server http://NODE:8209/mcp --server-key-env MESH_KEY "What is loaded?"
+```
+
+`--server-key-env NAME` reads the environment variable, and `--server-key-file PATH` reads a file, so the key is never in the command line, where every process can read it. It goes as `Authorization: Bearer` to the one `--server` that is a URL, and a run with two of those is refused, so that no server is sent another's key. It is never printed, and if a server echoes it back it shows as `[key]` on stderr. `--pass-env` has no effect on a server at a URL. An older server's session is kept for the run and ended when it finishes. An event stream that ends before its reply is a failed call, and is not resumed.
 
 `mcp run` offers servers no sampling and no roots. In the current revision a tool can stop to ask for more input, with `resultType: "input_required"`. This client has nothing to answer with, so the model is told what the tool asked for, and that the tool did not finish. It can try again with more in the arguments, or say what is needed.
 
@@ -1770,7 +1779,7 @@ Until you grant something, it can only talk. A grant says who, what, and how far
 isharded assistant grant add files.read NOTES_FOLDER
 ```
 
-`isharded assistant serve` runs its own web page and OpenAI-shaped API at `http://127.0.0.1:8470`, with a key for each person. It stays on loopback unless told otherwise.
+`isharded assistant serve` runs its own web page and OpenAI-shaped API at `http://127.0.0.1:8470`, with a key for each person. It stays on loopback unless told otherwise. Nearly every command has a route too, under the same keys: [the assistant's guide](ASSISTANT.md) lists them, and `isharded assistant provider test NAME` checks one provider.
 
 Treat it as early. How far to trust it depends on the model. Qwen3-0.6B cannot be trusted with tools: each time it skipped reading a file, it said it had read it and made up what was inside. Qwen3.6-27B, split across two machines, read the file in 20 of 20 tries and invented nothing, and recalled a fact in a new session 5 of 5 times. Asked to read and then write, it reached the write 3 of 5 times, and each of those waited for a person, as a write after reading a file must. In one other try it said it had written the file when no write ran. So the `used` line at the end of a reply is the record of which tools really ran, on any model. Federation has run only between two installs on one machine. [The assistant's guide](ASSISTANT.md) is the full manual, and says what is not built or proven.
 

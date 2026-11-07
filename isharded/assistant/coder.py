@@ -13,7 +13,8 @@ moving on, so a crash at any point can be resumed.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -24,6 +25,7 @@ import secrets
 import shlex
 import shutil
 import subprocess
+import time
 from typing import Any
 
 from .contracts import (
@@ -42,6 +44,7 @@ READY, COMMITTED, PUSHED, STOPPED, REJECTED = "ready", "committed", "pushed", "s
 MAX_ROUNDS = 3
 TEST_SECONDS = 600.0
 GIT_SECONDS = 120.0
+LOCK_CHECK_SECONDS = 0.05
 MAX_REPLY_BYTES = 2 << 20
 MAX_FILES_PER_REPLY = 200
 SOURCE_BUDGET = 60_000  # characters of the repository shown to a model
@@ -313,6 +316,22 @@ def _combined(result: SandboxResult) -> str:
     return f"{result.stdout}\n{result.stderr}".strip()
 
 
+def _try_lock(file: Any) -> bool:
+    """The system drops this lock when the file closes or the process dies, so a crash cannot leave a run stuck."""
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
 class Coder:
     """Runs one change at a time per run, and keeps a person in charge of the result."""
 
@@ -396,6 +415,7 @@ class Coder:
         root = self._repository(Path(repo))
         base = self._text(root, "rev-parse", "--verify", "HEAD^{commit}")
         run_id = f"cr_{secrets.token_hex(6)}"
+        (self.home / "locks").mkdir(parents=True, exist_ok=True)  # taken, so that no run is given this folder
         slug = self._free_slug(root, slug_of(goal))
         branch = f"assistant/{slug}"
         now = self.clock()
@@ -405,7 +425,8 @@ class Coder:
             (run_id, user or self.owner, str(root), goal, branch, str(self.home / slug), base, CREATED, max_rounds, json.dumps(list(test_command or ())), test_seconds, int(reach), now, now),
         )
         self.audit.record("coder", "coder.started", str(root), {"run": run_id, "branch": branch, "base": base})
-        return self.advance(run_id)
+        with self._held(run_id, seconds=0):
+            return self.advance(run_id)
 
     def _require_models_and_sandbox(self) -> None:
         if getattr(self.assistant, "router", None) is None:
@@ -431,6 +452,26 @@ class Coder:
             slug = f"{base}-{count}"
         return slug
 
+    # One thing at a time.
+
+    @contextmanager
+    def _held(self, run_id: str, user: str | None = None, seconds: float = GIT_SECONDS) -> Iterator[Run]:
+        """The run as it stands now, with its lock held.
+
+        Working on a run, approving it, pushing it, and rejecting it all change its tree
+        and its state. A file, because a command can act on a run the server is acting on.
+        """
+        self.run(run_id, user)  # so that only a real run's id names a file
+        path = self.home / "locks" / f"{run_id}.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + seconds
+        with path.open("ab") as file:
+            while not _try_lock(file):
+                if time.monotonic() >= deadline:
+                    raise CoderError("Something else is working on this run. Try again when it has finished.")
+                time.sleep(LOCK_CHECK_SECONDS)
+            yield self.run(run_id, user)
+
     # The state machine.
 
     def advance(self, run_id: str) -> Run:
@@ -448,16 +489,17 @@ class Coder:
                 return self.run(run_id)
 
     def resume(self, run_id: str, rounds: int = 0, user: str | None = None) -> Run:
-        run = self.run(run_id, user)
-        self._require_models_and_sandbox()
-        if run.state == STOPPED and not run.test_command:
-            raise CoderError("This run stopped because it has no test command. Start it again with --test.")
-        if run.state == STOPPED and rounds > 0:
-            self._save(run.id, state=PROPOSING, max_rounds=run.round + rounds)
-        elif run.state not in self.steps:
-            raise CoderError(f"This run is {run.state}. There is nothing to resume." if run.state != STOPPED else "This run stopped. Give it more rounds with --rounds.")
-        self._save(run.id, problem="")
-        return self.advance(run.id)
+        # Not waiting: a run being worked on needs no second worker, and tests can take many minutes.
+        with self._held(run_id, user, seconds=0) as run:
+            self._require_models_and_sandbox()
+            if run.state == STOPPED and not run.test_command:
+                raise CoderError("This run stopped because it has no test command. Start it again with --test.")
+            if run.state == STOPPED and rounds > 0:
+                self._save(run.id, state=PROPOSING, max_rounds=run.round + rounds)
+            elif run.state not in self.steps:
+                raise CoderError(f"This run is {run.state}. There is nothing to resume." if run.state != STOPPED else "This run stopped. Give it more rounds with --rounds.")
+            self._save(run.id, problem="")
+            return self.advance(run.id)
 
     def _save(self, run_id: str, **fields: Any) -> None:
         """One row, in one write, so a step's result and its next state cannot come apart."""
@@ -824,7 +866,10 @@ Nothing here changes stored data unless the diff says so, so read it for new mig
     def approve(self, run_id: str, message: str | None = None, by: str | None = None, user: str | None = None) -> Run:
         """The owner saw this diff. Commit exactly that, through the broker."""
         by = self._acting_person(by, "approve a change")
-        run = self.run(run_id, user)
+        with self._held(run_id, user) as run:
+            return self._commit(run, message, by)
+
+    def _commit(self, run: Run, message: str | None, by: str) -> Run:
         if run.state != READY:
             raise CoderError(f"This run is {run.state}. Only a ready run can be approved.")
         self._check_same_as_tested(run)
@@ -896,7 +941,10 @@ Nothing here changes stored data unless the diff says so, so read it for new mig
     def push(self, run_id: str, remote: str = "origin", by: str | None = None, user: str | None = None) -> Run:
         """Only ever this run's own branch, and only if the broker allows it."""
         by = self._acting_person(by, "push")
-        run = self.run(run_id, user)
+        with self._held(run_id, user) as run:
+            return self._push(run, remote, by)
+
+    def _push(self, run: Run, remote: str, by: str) -> Run:
         if run.state != COMMITTED:
             raise CoderError(f"This run is {run.state}. Only a committed run can be pushed.")
         call = ToolCall("git.push", self._arguments("git.push", {"repo": str(run.tree), "remote": remote, "branch": run.branch}))
@@ -909,7 +957,10 @@ Nothing here changes stored data unless the diff says so, so read it for new mig
     def reject(self, run_id: str, reason: str = "", by: str | None = None, user: str | None = None) -> Run:
         """Throw the work away. A branch already committed stays, as that was the owner's own decision."""
         by = self._acting_person(by, "reject a change")
-        run = self.run(run_id, user)
+        with self._held(run_id, user) as run:
+            return self._discard(run, reason, by)
+
+    def _discard(self, run: Run, reason: str, by: str) -> Run:
         if run.state == REJECTED:
             raise CoderError("This run was already rejected.")
         if run.tree.exists():

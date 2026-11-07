@@ -1419,3 +1419,24 @@ def test_a_bad_command_tells_the_owner_what_to_do(tmp_path):
 
 if __name__ == "__main__":
     node_main(sys.argv[sys.argv.index("--node") + 1])
+
+
+def test_a_peers_reply_says_when_the_limit_cut_it_short(tmp_path):
+    from isharded.assistant.contracts import ModelReply, ModelRequest, Reach
+
+    class Cut(EchoRouter):
+        def complete(self, request: Any) -> Any:
+            return ModelReply("Cut off in the mid", (), "m", "p", 1, 1, 0.1, "length")
+
+    near, far, server = in_process_pair(tmp_path)
+    try:
+        near.federation.discover("far")
+        provider = near.providers.providers[0]
+        ask = ModelRequest(role="worker", messages=[{"role": "user", "content": "hi"}], reach=Reach.PEER)
+        assert provider.complete(ask).finish_reason == "stop"
+        far.router = Cut()
+        assert provider.complete(ask).finish_reason == "length"
+    finally:
+        server.stop()
+        near.close()
+        far.close()

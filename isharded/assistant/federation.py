@@ -1244,7 +1244,10 @@ class Federation:
             temperature=self._bounded_temperature(arguments.get("temperature")),
         )
         reply = router.complete(request)
-        data = {"model": reply.model, "provider": reply.provider, "prompt_tokens": reply.prompt_tokens, "completion_tokens": reply.completion_tokens}
+        data = {
+            "model": reply.model, "provider": reply.provider, "prompt_tokens": reply.prompt_tokens, "completion_tokens": reply.completion_tokens,
+            "finish_reason": reply.finish_reason,
+        }
         return ToolResult(True, reply.text, provenance, data)
 
     @staticmethod
@@ -1409,6 +1412,7 @@ class PeerProvider:
             prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
             completion_tokens=int(usage.get("completion_tokens", 0) or 0),
             seconds=time.monotonic() - started,
+            finish_reason="length" if usage.get("finish_reason") == "length" else "stop",
         )
 
 

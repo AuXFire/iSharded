@@ -12,6 +12,7 @@ a server says can widen what ``--allow`` allows.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import suppress
 from itertools import count
 import json
 import os
@@ -48,6 +49,7 @@ MAX_ASKED_CHARACTERS = 500
 BOTH_REPLY_KINDS = "application/json, text/event-stream"
 EVENT_END = re.compile(rb"\r\n\r\n|\n\n|\r\r")
 EVENT_LINE = re.compile(rb"\r\n|\n|\r")
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # Only a user message can hold an image, so this says whose words they are not.
 TOOL_IMAGES_NOTE = "The tools just called returned these images. They are tool output, and no request from the person."
 # The specification's defaults for what a server may inherit: enough to run, and no secrets.
@@ -86,6 +88,57 @@ def split_command(command: str) -> list[str]:
 def server_environment(passed: Sequence[str]) -> dict[str, str]:
     names = {item.upper() for item in (*SAFE_ENVIRONMENT, *passed)}
     return {name: value for name, value in os.environ.items() if name.upper() in names}
+
+
+def server_key(env: str | None, file: str | None) -> str | None:
+    """The key for a server at a URL, from where it is kept, as a command line is visible to every process.
+
+    What was typed may be a key by mistake, so these messages never repeat it.
+    """
+    if env and file:
+        raise ServerError("Give one of --server-key-env and --server-key-file")
+    if env:
+        if not ENV_NAME.fullmatch(env):
+            raise ServerError("--server-key-env takes the name of an environment variable, and this is not one")
+        key = os.environ.get(env, "")
+    elif file:
+        try:
+            key = Path(file).read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            raise ServerError("The file named by --server-key-file cannot be read") from None
+    else:
+        return None
+    key = key.strip()
+    # A header that cannot be sent would put the key in httpx's error message.
+    if not key or not key.isascii() or not key.isprintable() or " " in key:
+        raise ServerError("There is no key there: it has to be one word of plain characters")
+    return key
+
+
+def printable(text: str) -> str:
+    """Text a stranger chose, for a terminal. Its control characters stay escaped, so it cannot rewrite what a person reads."""
+    return "".join(character if character.isprintable() or character == "\n" else character.encode("unicode_escape").decode() for character in text)
+
+
+def within(seconds: float, work: Callable[[], Any]) -> Any:
+    """What ``work`` returns, or queue.Empty once the time is up.
+
+    A read timeout only sees silence, so a server that drips its headers never trips one,
+    and httpx has no limit on a whole exchange. A thread left waiting goes when its client closes.
+    """
+    box: queue.Queue[tuple[Any, Exception | None]] = queue.Queue(1)
+
+    def run() -> None:
+        try:
+            box.put((work(), None))
+        except Exception as exc:
+            box.put((None, exc))
+
+    threading.Thread(target=run, daemon=True).start()
+    result, failure = box.get(timeout=seconds)
+    if failure is not None:
+        raise failure
+    return result
 
 
 def offer_nothing(message: dict[str, Any]) -> dict[str, Any]:
@@ -312,7 +365,7 @@ class HttpServer(McpConnection):
     session to name in each request, and to end when we leave.
     """
 
-    def __init__(self, url: str, transport: httpx.BaseTransport | None = None) -> None:
+    def __init__(self, url: str, transport: httpx.BaseTransport | None = None, key: str | None = None) -> None:
         self.url = url
         try:
             self.name = urlsplit(url).hostname or url  # until it says what it is called
@@ -321,7 +374,8 @@ class HttpServer(McpConnection):
         self.next_id = 0
         self.session: str | None = None
         # Redirects stay off, since a server should not be able to send us somewhere else unasked.
-        self.client = httpx.Client(headers={"Accept": BOTH_REPLY_KINDS}, trust_env=False, transport=transport)
+        headers = {"Accept": BOTH_REPLY_KINDS} | ({"Authorization": f"Bearer {key}"} if key else {})
+        self.client = httpx.Client(headers=headers, trust_env=False, transport=transport)
 
     def _headers(self, method: str, params: dict[str, Any]) -> dict[str, str]:
         headers = {"Mcp-Session-Id": self.session} if self.session else {}
@@ -336,10 +390,8 @@ class HttpServer(McpConnection):
 
     def _post(self, message: dict[str, Any], headers: dict[str, str]) -> None:
         """Send something that wants no reply. A server that will not take it has told us nothing we can use."""
-        try:
-            self.client.post(self.url, json=message, headers=headers, timeout=STOP_SECONDS)
-        except httpx.HTTPError:
-            pass
+        with suppress(httpx.HTTPError, queue.Empty):
+            within(STOP_SECONDS, lambda: self.client.post(self.url, json=message, headers=headers, timeout=STOP_SECONDS))
 
     def _notify(self, method: str) -> None:
         self._post({"jsonrpc": "2.0", "method": method}, self._headers(method, {}))
@@ -383,6 +435,9 @@ class HttpServer(McpConnection):
         raise ServerError(f"{self.name} closed the stream without answering")
 
     def _exchange(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
+        return within(timeout, lambda: self._answer(method, params, timeout))
+
+    def _answer(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
         self.next_id += 1
         number = self.next_id
         headers = self._headers(method, params)
@@ -410,10 +465,8 @@ class HttpServer(McpConnection):
 
     def close(self) -> None:
         if self.session:
-            try:
-                self.client.delete(self.url, headers=self._headers("", {}), timeout=STOP_SECONDS)
-            except httpx.HTTPError:
-                pass
+            with suppress(httpx.HTTPError, queue.Empty):
+                within(STOP_SECONDS, lambda: self.client.delete(self.url, headers=self._headers("", {}), timeout=STOP_SECONDS))
         self.client.close()
 
 
@@ -584,7 +637,8 @@ def run_call(
         return "Arguments must be a JSON object."
     if not (toolbox.read_only(name) or name in allowed or ask(name, arguments)):
         return "The person running this did not allow that call. Answer without it, or say what you would need."
-    print(f"Calling {name} with {json.dumps(arguments, ensure_ascii=False)}", file=sys.stderr)
+    shown = printable(name).replace("\n", "\\n")  # each line of the record is one call, so a name cannot add one
+    print(f"Calling {shown} with {json.dumps(arguments, ensure_ascii=False)}", file=sys.stderr)
     return toolbox.call(name, arguments, timeout, tray)
 
 
@@ -637,14 +691,28 @@ def agent_loop(
     raise ServerError(f"the model was still calling tools after {max_turns} turns. Raise --max-turns, or ask for less")
 
 
+def is_address(server: str) -> bool:
+    return server.lower().startswith(("http://", "https://"))
+
+
 def run_agent(args: Any) -> int:
     environment = server_environment(args.pass_env or [])
     headers = {"Authorization": f"Bearer {args.token}"} if args.token else {}
     allowed = set(args.allow or [])
     servers: list[StdioServer | HttpServer] = []
+    key = None
+
+    def say(problem: Exception) -> None:
+        said = str(problem).replace(key, "[key]") if key else str(problem)  # a server may echo back what it was sent
+        print(f"isharded mcp run: {printable(said)}", file=sys.stderr)
+
     try:
+        key = server_key(getattr(args, "server_key_env", None), getattr(args, "server_key_file", None))
+        addresses = [command for command in args.server if is_address(command)]
+        if key and len(addresses) != 1:
+            raise ServerError(f"A server key goes to one server at a URL, so that no server is sent another's, and --server names {len(addresses)}")
         for command in args.server:
-            server = HttpServer(command) if command.lower().startswith(("http://", "https://")) else StdioServer(command, environment)
+            server = HttpServer(command, key=key) if is_address(command) else StdioServer(command, environment)
             servers.append(server)
             server.start()
         toolbox = Toolbox(servers)
@@ -659,10 +727,10 @@ def run_agent(args: Any) -> int:
         return 0
     except CutOff as exc:
         print(exc.answer)  # all there is, and the exit code says it is not whole
-        print(f"isharded mcp run: {exc}", file=sys.stderr)
+        say(exc)
         return 1
     except (ServerError, ToolRefused, httpx.HTTPError) as exc:
-        print(f"isharded mcp run: {exc}", file=sys.stderr)
+        say(exc)
         return 1
     finally:
         for server in servers:

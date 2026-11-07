@@ -15,7 +15,8 @@ import pytest
 from isharded.assistant.app import Assistant
 from isharded.assistant.cli import add_arguments, run
 from isharded.assistant.contracts import CallContext, Decision, Effect, Provenance, Reach, ToolCall, Trust, Verdict
-from isharded.assistant.conversation import MAX_ROUNDS, classify, decide_approval
+from isharded.assistant import conversation
+from isharded.assistant.conversation import MAX_ROUNDS, classify, decide_approval, speak
 from isharded.assistant.mind import emit
 from test_assistant_fakes import FakeBroker, FakeModelServer, FakeProvider, Reply, ScriptedRouter, model_reply
 
@@ -1007,3 +1008,84 @@ def test_handed_tasks_can_be_read_without_a_task_engine(assistant):
     handed(assistant, "t-kept")
     del assistant.tasks
     assert assistant.conversation.handed_tasks("alice", "c1")[0]["status"] is None
+
+
+# A turn that was stopped
+
+
+def cancelled(assistant) -> list[dict]:
+    return [row for row in assistant.audit.read() if row["action"] == "conversation.cancelled"]
+
+
+def test_a_stream_closed_partway_leaves_an_audit_row_and_keeps_what_was_read(assistant):
+    with FakeModelServer([Reply(text="An answer in several pieces.")], mesh_shape=True) as server:
+        assistant.providers.add("pool", server.url, mesh=True, model="fake-model")
+        items = assistant.conversation.stream("alice", "Hello there", "chat-1", learn="off")
+        shown = next(items)
+        items.close()
+    started = next(row for row in assistant.audit.read() if row["action"] == "conversation.turn")
+    (row,) = cancelled(assistant)
+    assert (row["actor"], row["subject"]) == ("user:alice", started["subject"])
+    assert assistant.memory.recent("alice", "chat-1")[-1]["content"] == shown
+
+
+def test_ctrl_c_during_a_turn_leaves_an_audit_row(assistant):
+    scripted(assistant, KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        assistant.conversation.say("alice", "Hello there", learn="off")
+    assert len(cancelled(assistant)) == 1
+
+
+def test_ctrl_c_while_a_reply_is_being_printed_leaves_an_audit_row_at_once(assistant, monkeypatch):
+    def interrupted(*_args, **_options):
+        raise KeyboardInterrupt
+
+    with FakeModelServer([Reply(text="An answer in several pieces.")], mesh_shape=True) as server:
+        assistant.providers.add("pool", server.url, mesh=True, model="fake-model")
+        monkeypatch.setattr(conversation, "emit", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            speak(assistant, "alice", "Hello there", None, "off")
+        assert len(cancelled(assistant)) == 1
+
+
+def test_a_finished_turn_nobody_read_past_is_not_called_cancelled(assistant):
+    scripted(assistant, "All at once.")
+    items = assistant.conversation.stream("alice", "Hello there", learn="off")
+    while isinstance(next(items), str):
+        pass
+    items.close()
+    assert cancelled(assistant) == []
+    assert [row["action"] for row in assistant.audit.read()].count("conversation.done") == 1
+
+
+def test_a_failed_turn_is_a_failure_and_not_a_cancel(assistant):
+    scripted(assistant, RuntimeError("no model"))
+    assert assistant.conversation.say("alice", "Hello there", learn="off").status == "failed"
+    assert cancelled(assistant) == []
+
+
+class Streams(ScriptedRouter):
+    def stream(self, request):
+        reply = self.complete(request)
+        yield reply.text
+        yield reply
+
+
+def test_ctrl_c_during_a_tool_keeps_what_was_said_once(assistant):
+    assistant.broker = FakeBroker()
+    assistant.broker.add("notes.read", output=KeyboardInterrupt())
+    assistant.router = Streams(model_reply("Looking.", ToolCall("notes.read", {})))
+    with pytest.raises(KeyboardInterrupt):
+        list(assistant.conversation.stream("alice", "Read my notes", "chat-1", learn="off"))
+    assert [row["content"] for row in assistant.memory.recent("alice", "chat-1") if row["role"] == "assistant"] == ["Looking."]
+    assert len(cancelled(assistant)) == 1
+
+
+def test_ctrl_c_while_a_turn_is_being_prepared_leaves_an_audit_row(assistant, monkeypatch):
+    def interrupted(*_args, **_options):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(assistant.context, "build", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        assistant.conversation.say("alice", "Hello there", learn="off")
+    assert len(cancelled(assistant)) == 1
