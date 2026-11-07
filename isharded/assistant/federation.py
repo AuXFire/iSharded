@@ -44,6 +44,7 @@ from .contracts import (
     Verdict,
     is_tainted,
 )
+from .providers import HeldClient
 
 PROTOCOL = 1
 CODE_PREFIX = "smp1."
@@ -366,11 +367,6 @@ def _proof(key: bytes, label: bytes, value: Any) -> str:
     return _b64(hmac.new(key, label + b"\0" + _pack(value), hashlib.sha256).digest())
 
 
-def _tls_for(url: str) -> ssl.SSLContext | bool:
-    """The OS store, as antivirus re-signing breaks certifi alone."""
-    return ssl.create_default_context() if url.startswith("https:") else False
-
-
 def _check_address(address: str) -> str:
     address = address.strip().rstrip("/")
     if not address:
@@ -428,6 +424,12 @@ class Federation:
         self._lock = threading.Lock()
         self._declared_to: Any = None
         self._strangers = [0.0, 0, 0]  # window start, recorded, not recorded
+        # One for every peer, since it keeps connections apart by address. The OS store,
+        # as antivirus re-signing breaks certifi alone, and no proxy, as closed networks have none.
+        self._client = HeldClient(lambda: {"verify": ssl.create_default_context(), "trust_env": False})
+
+    def close(self) -> None:
+        self._client.close()
 
     @property
     def identity(self) -> Identity:
@@ -1305,8 +1307,7 @@ class Federation:
     def _post(self, url: str, payload: dict[str, Any], seconds: float) -> httpx.Response:
         timeout = httpx.Timeout(seconds, connect=min(seconds, CONNECT_SECONDS))
         deadline = time.monotonic() + seconds
-        # No proxy, as closed networks have none.
-        with httpx.Client(timeout=timeout, trust_env=False, verify=_tls_for(url)) as client, client.stream("POST", url, json=payload) as response:
+        with self._client().stream("POST", url, json=payload, timeout=timeout) as response:
             body = b""
             for chunk in response.iter_bytes():  # one deadline in all, so dripped bytes cannot hold anything up
                 body += chunk
@@ -1330,10 +1331,8 @@ class Federation:
             return f"{peer.name} is {peer.state}"
         if not peer.address:
             return f"{peer.name} has no address"
-        verify = _tls_for(peer.address)
         try:
-            with httpx.Client(timeout=CONNECT_SECONDS, trust_env=False, verify=verify) as client:
-                response = client.get(f"{peer.address}/federation/identity")
+            response = self._client().get(f"{peer.address}/federation/identity", timeout=CONNECT_SECONDS)
         except httpx.HTTPError as error:
             return f"{peer.name} cannot be reached: {type(error).__name__}"
         if self._json(response).get("fingerprint") != peer.fingerprint:
@@ -1449,6 +1448,10 @@ def attach(assistant: Any) -> None:
     assistant.federation = Federation(assistant)
     assistant.federation.broker()
     assistant.federation.sync_providers()
+
+
+def detach(assistant: Any) -> None:
+    assistant.federation.close()
 
 
 def _show(peer: Peer, federation: Federation) -> str:

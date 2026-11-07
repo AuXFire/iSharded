@@ -175,11 +175,15 @@ class IncrementalText:
 
     Decoding a whole reply on every token gets slower as the reply grows. Tokens
     can split a character, so a tail is only settled once it decodes cleanly.
+
+    Joining onto a long text copies it, so a reader that is done with the start of
+    the text says so with ``forget``. ``start`` is where the text it gets back begins.
     """
 
     def __init__(self, tokenizer: Any) -> None:
         self.tokenizer = tokenizer
         self.settled = ""
+        self.start = 0
         self.pending: list[int] = []
 
     def add(self, token: int) -> str:
@@ -190,6 +194,13 @@ class IncrementalText:
         self.settled += tail
         self.pending = []
         return self.settled
+
+    def forget(self, keep: int) -> None:
+        """Let go of settled text, all but the last ``keep`` characters."""
+        drop = len(self.settled) - keep
+        if drop > 0:
+            self.settled = self.settled[drop:]
+            self.start += drop
 
 
 def tokenizer_from_gguf(header: GgufHeader) -> ChatTokenizer:

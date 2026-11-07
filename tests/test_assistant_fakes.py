@@ -343,6 +343,56 @@ class FakeBroker:
         return [{"capability": name} for name in self.tools]
 
 
+class CountingServer:
+    """Answers anything with a model list, and counts the connections it took.
+
+    It sets a cookie on every reply, and a path with ``slow`` in it waits before answering.
+    With ``hang_up`` it closes each connection after a reply, without having said it would.
+    """
+
+    def __init__(self, slow_seconds: float = 1.0, hang_up: bool = False) -> None:
+        outer = self
+        self.connections = 0
+        self.cookies: list[str | None] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def setup(self) -> None:
+                outer.connections += 1
+                super().setup()
+
+            def log_message(self, *_: Any) -> None:
+                pass
+
+            def answer(self) -> None:
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                outer.cookies.append(self.headers.get("Cookie"))
+                if "slow" in self.path:
+                    time.sleep(slow_seconds)
+                body = b'{"data": [{"id": "fake-model"}]}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Set-Cookie", "session=from-the-server; Path=/")
+                self.end_headers()
+                self.wfile.write(body)
+                self.close_connection = hang_up
+
+            do_GET = do_POST = answer
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def __enter__(self) -> CountingServer:
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
 def wait_until(condition: Any, seconds: float = 5.0) -> bool:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:

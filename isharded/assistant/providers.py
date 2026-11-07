@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import argparse
 import ast
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 import ipaddress
 import json
 import os
 from pathlib import Path
 import re
+import threading
 import time
 from typing import Any
 from urllib.parse import urlsplit
@@ -33,6 +36,9 @@ CONNECT_SECONDS = 10.0
 READ_SECONDS = 120.0  # silence this long means the link is gone; covers a long prefill
 WHOLE_REPLY_SECONDS = 300.0  # a reply with no stream has nothing to read until it is done
 HEALTH_SECONDS = 5.0
+# Under the five seconds many servers hold an idle connection, so that this side always
+# closes first, and never sends on a connection the server is dropping that same moment.
+IDLE_CONNECTION_SECONDS = 2.0
 MODELS_FRESH_SECONDS = 30.0
 MAX_TOOL_JSON = 200_000
 CHARS_PER_TOKEN = 3
@@ -158,27 +164,44 @@ def strip_thinking(text: str) -> str:
     return text[:start].rstrip() if start >= 0 else text
 
 
+@dataclass(slots=True)
+class OpenValue:
+    """A JSON value as far as it has been read, so more text carries on from there."""
+
+    size: int = 0  # characters read, which is its whole length once it closes
+    depth: int = 0
+    in_string: bool = False
+    escaped: bool = False
+
+    def read(self, text: str, start: int) -> bool:
+        """Read on through the value opening at ``start``. True if it closes, respecting strings."""
+        depth, in_string, escaped = self.depth, self.in_string, self.escaped
+        for index in range(start + self.size, len(text)):
+            character = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == '"':
+                    in_string = False
+            elif character == '"':
+                in_string = True
+            elif character in "{[":
+                depth += 1
+            elif character in "}]":
+                depth -= 1
+                if depth == 0:
+                    self.size = index + 1 - start
+                    return True
+        self.size, self.depth, self.in_string, self.escaped = max(len(text) - start, 0), depth, in_string, escaped
+        return False
+
+
 def balanced_span(text: str, start: int) -> int | None:
     """Where the JSON value opening at ``start`` closes, respecting strings."""
-    depth, in_string, escaped = 0, False, False
-    for index in range(start, len(text)):
-        character = text[index]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == '"':
-                in_string = False
-        elif character == '"':
-            in_string = True
-        elif character in "{[":
-            depth += 1
-        elif character in "}]":
-            depth -= 1
-            if depth == 0:
-                return index + 1
-    return None
+    value = OpenValue()
+    return start + value.size if value.read(text, start) else None
 
 
 def loose_json(text: str) -> Any:
@@ -310,33 +333,45 @@ class VisibleText:
     A call with no fence is held the same way, and only the whole reply can settle it,
     since a call has to end the reply. So what is still held at the end comes back from
     ``flush``, and the router drops it if the reply turned out to hold a call.
+
+    A reply can be held for a long time, so nothing is read twice. ``at`` is where the
+    unread text starts, which saves copying the rest each time a little is released.
+    ``looked`` is how far past ``at`` a fence or a run of calls is known to be settled.
     """
 
     def __init__(self, offered: Sequence[Capability] = ()) -> None:
         self.names = frozenset(capability.name for capability in offered)
         self.markers = ("<think>", "<tool_call>", "```", "{") if self.names else ("<think>",)
+        self.opening = re.compile("|".join(map(re.escape, self.markers)))
         self.held = ""
+        self.at = 0
+        self.looked = 0
+        self.value: OpenValue | None = None  # the bare call still arriving
         self.state = "text"  # or think, tool, fence, code, bare
         self.steps = {"text": self._text, "think": self._think, "tool": self._tool, "fence": self._fence, "code": self._code, "bare": self._bare}
 
     def feed(self, text: str) -> str:
         self.held += text
         released: list[str] = []
-        while self.held and self.steps[self.state](released):
+        while self.at < len(self.held) and self.steps[self.state](released):
             pass
+        self.held, self.at = self.held[self.at :], 0
         return "".join(released)
 
     def _release(self, released: list[str], size: int) -> None:
-        released.append(self.held[:size])
-        self.held = self.held[size:]
+        released.append(self.held[self.at : self.at + size])
+        self.at += size
+
+    def _settled(self) -> None:
+        self.state, self.looked, self.value = "text", 0, None
 
     def _skip_past(self, marker: str) -> bool:
-        end = self.held.find(marker)
+        end = self.held.find(marker, self.at)
         if end < 0:
-            self.held = self.held[-(len(marker) - 1) :]
+            self.at = max(self.at, len(self.held) - (len(marker) - 1))
             return False
-        self.held = self.held[end + len(marker) :].lstrip("\n")
-        self.state = "text"
+        self.held, self.at = self.held[end + len(marker) :].lstrip("\n"), 0
+        self._settled()
         return True
 
     def _think(self, released: list[str]) -> bool:
@@ -346,29 +381,31 @@ class VisibleText:
         return self._skip_past("</tool_call>")
 
     def _code(self, released: list[str]) -> bool:
-        end = self.held.find("```")
+        end = self.held.find("```", self.at)
         if end >= 0:
-            self._release(released, end + 3)
+            self._release(released, end + 3 - self.at)
             self.state = "text"
             return True
-        self._release(released, len(self.held) - self._partial("```"))
+        self._release(released, len(self.held) - self.at - self._partial("```"))
         return False
 
     def _fence(self, released: list[str]) -> bool:
-        first_line = self.held.find("\n")
+        first_line = self.held.find("\n", self.at)
         if first_line < 0:
             return False
-        if self.held[3:first_line].strip().lower() not in TOOL_FENCE_TAGS:
-            self._release(released, first_line)
+        if self.held[self.at + 3 : first_line].strip().lower() not in TOOL_FENCE_TAGS:
+            self._release(released, first_line - self.at)
             self.state = "code"
             return True
-        end = self.held.find("```", first_line)
+        end = self.held.find("```", max(first_line, self.at + self.looked))
         if end < 0:
+            self.looked = len(self.held) - self.at - 2  # a closing fence can still be cut in two
             return False
-        block = self.held[: end + 3]
-        self.held = self.held[end + 3 :]
-        self.state = "text"
-        if not as_calls(loose_json(block[first_line:end]), self.names):
+        block = self.held[self.at : end + 3]
+        call = self.held[first_line:end]
+        self.at = end + 3
+        self._settled()
+        if not as_calls(loose_json(call), self.names):
             released.append(block)
         return True
 
@@ -376,50 +413,54 @@ class VisibleText:
         if self._may_be_calls():
             return False
         self._release(released, 1)  # only the brace, as a call can still start after it
-        self.state = "text"
+        self._settled()
         return True
 
     def _may_be_calls(self) -> bool:
         """Whether what is held is nothing but tool calls so far, as ``bare_calls`` requires."""
-        position = 0
         while True:
-            rest = self.held[position:].lstrip()
-            if not rest:
-                return True
-            if rest[0] != "{":
-                return False
-            start = len(self.held) - len(rest)
-            end = balanced_span(self.held, start)
-            if end is None:
+            if self.value is None:
+                rest = self.held[self.at + self.looked :].lstrip()
+                if not rest:
+                    return True
+                if rest[0] != "{":
+                    return False
+                self.looked = len(self.held) - len(rest) - self.at
+                self.value = OpenValue()
+            start = self.at + self.looked
+            if not self.value.read(self.held, start):
                 return True  # still arriving
+            end = start + self.value.size
+            self.value = None
             if not as_calls(loose_json(self.held[start:end]), self.names):
                 return False
-            position = end
+            self.looked = end - self.at
 
     def _partial(self, marker: str) -> int:
         """How much of the end of the held text could be the start of a marker."""
         for size in range(len(marker) - 1, 0, -1):
-            if self.held.endswith(marker[:size]):
+            if self.held.endswith(marker[:size], self.at):
                 return size
         return 0
 
     def _text(self, released: list[str]) -> bool:
-        hits = [(start, marker) for marker in self.markers if (start := self.held.find(marker)) >= 0]
-        if not hits:
-            self._release(released, len(self.held) - max(self._partial(marker) for marker in self.markers))
+        hit = self.opening.search(self.held, self.at)
+        if hit is None:
+            self._release(released, len(self.held) - self.at - max(self._partial(marker) for marker in self.markers))
             return False
-        start, marker = min(hits)
-        self._release(released, start)
+        self._release(released, hit.start() - self.at)
+        marker = hit.group()
         if marker in ("```", "{"):
             self.state = "fence" if marker == "```" else "bare"
         else:
-            self.held = self.held[len(marker) :]
+            self.at += len(marker)
             self.state = "think" if marker == "<think>" else "tool"
         return True
 
     def flush(self) -> str:
         held, state = self.held, self.state
-        self.held, self.state = "", "text"
+        self.held = ""
+        self._settled()
         return "" if state in ("think", "tool") else held
 
 
@@ -477,6 +518,10 @@ def plain_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, str]]:
     ]
 
 
+def seconds_to_wait(read: float) -> httpx.Timeout:
+    return httpx.Timeout(read, connect=CONNECT_SECONDS)
+
+
 def gather_call(streamed: dict[int, dict[str, str]], call: dict[str, Any]) -> None:
     """Add one streamed piece of a native tool call to the call it belongs to."""
     held = streamed.setdefault(int(call.get("index") or 0), {"id": "", "name": "", "arguments": ""})
@@ -484,6 +529,33 @@ def gather_call(streamed: dict[int, dict[str, str]], call: dict[str, Any]) -> No
     held["id"] = call.get("id") or held["id"]
     held["name"] = function.get("name") or held["name"]
     held["arguments"] += function.get("arguments") or ""
+
+
+class HeldClient:
+    """One HTTP client, made on first use and kept, so a call can find a connection already open.
+
+    It serves many threads at once, so a timeout belongs to each call, and no call
+    waits for another's connection. It keeps no cookies, because a server's cookie
+    must not follow later calls.
+    """
+
+    def __init__(self, options: Callable[[], dict[str, Any]]) -> None:
+        self.options = options
+        self.lock = threading.Lock()
+        self.client: httpx.Client | None = None
+
+    def __call__(self) -> httpx.Client:
+        with self.lock:
+            if self.client is None:
+                limits = httpx.Limits(max_connections=None, max_keepalive_connections=20, keepalive_expiry=IDLE_CONNECTION_SECONDS)
+                self.client = httpx.Client(limits=limits, cookies=CookieJar(DefaultCookiePolicy(allowed_domains=[])), **self.options())
+            return self.client
+
+    def close(self) -> None:
+        with self.lock:
+            client, self.client = self.client, None
+        if client is not None:
+            client.close()
 
 
 class OpenAICompatible:
@@ -513,14 +585,17 @@ class OpenAICompatible:
         self.read_seconds = read_seconds
         self.default_model = model
         self._models: tuple[float, list[str]] | None = None
+        self._client = HeldClient(self._client_options)
 
-    def _client(self, read: float) -> httpx.Client:
-        return httpx.Client(
-            timeout=httpx.Timeout(read, connect=CONNECT_SECONDS),
-            verify=client_verify(),  # a pool with its own authority is checked against it
+    def _client_options(self) -> dict[str, Any]:
+        return {
+            "verify": client_verify(),  # a pool with its own authority is checked against it
             # A proxy set for the internet has no business seeing loopback traffic.
-            trust_env=not is_loopback(self.base_url),
-        )
+            "trust_env": not is_loopback(self.base_url),
+        }
+
+    def close(self) -> None:
+        self._client.close()
 
     def _headers(self) -> dict[str, str]:
         key = read_key(self.key)
@@ -547,24 +622,22 @@ class OpenAICompatible:
         return ProviderError(f"{self.name} answered HTTP {response.status_code}: {self._clean(response.text)}")
 
     def _post(self, path: str, body: dict[str, Any], read: float, doing: str) -> httpx.Response:
-        with self._client(read) as client:
-            try:
-                return client.post(f"{self.base_url}/{path}", json=body, headers=self._headers())
-            except httpx.TimeoutException:
-                raise ProviderError(f"{self.name} went silent while {doing}") from None
-            except httpx.HTTPError as error:
-                raise self._unreachable(error) from None
+        try:
+            return self._client().post(f"{self.base_url}/{path}", json=body, headers=self._headers(), timeout=seconds_to_wait(read))
+        except httpx.TimeoutException:
+            raise ProviderError(f"{self.name} went silent while {doing}") from None
+        except httpx.HTTPError as error:
+            raise self._unreachable(error) from None
 
     def models(self) -> list[str]:
         cached = self._models
         now = time.monotonic()
         if cached and now - cached[0] < MODELS_FRESH_SECONDS:
             return cached[1]
-        with self._client(HEALTH_SECONDS) as client:
-            try:
-                response = client.get(f"{self.base_url}/models", headers=self._headers())
-            except httpx.HTTPError as error:
-                raise self._unreachable(error) from None
+        try:
+            response = self._client().get(f"{self.base_url}/models", headers=self._headers(), timeout=seconds_to_wait(HEALTH_SECONDS))
+        except httpx.HTTPError as error:
+            raise self._unreachable(error) from None
         if response.status_code != 200:
             raise self._failed(response)
         try:
@@ -676,32 +749,34 @@ class OpenAICompatible:
         usage: dict[str, Any] = {}
         answered_by = model
         finished = False
-        with self._client(self.read_seconds) as client:
-            try:
-                with client.stream("POST", f"{self.base_url}/chat/completions", json=body, headers=self._headers()) as response:
-                    refused = native and self.tool_mode == "auto" and response.status_code in NO_TOOLS_STATUSES
-                    if response.status_code != 200 and not refused:
-                        response.read()
-                        raise self._failed(response)
-                    for event in () if refused else self._events(response):
-                        if event is None:
-                            finished = True
-                            break
-                        answered_by = event.get("model") or answered_by
-                        usage = event.get("usage") or usage
-                        for choice in event.get("choices") or []:
-                            delta = choice.get("delta") or {}
-                            piece = delta.get("content")
-                            if piece:
-                                parts.append(piece)
-                                yield piece
-                            for call in delta.get("tool_calls") or []:
-                                gather_call(streamed, call)
-                            finished = finished or bool(choice.get("finish_reason"))
-            except httpx.TimeoutException:
-                raise ProviderError(f"{self.name} went silent for {self.read_seconds:.0f} s") from None
-            except httpx.HTTPError as error:
-                raise self._unreachable(error, "dropped the connection") from None
+        try:
+            opened = self._client().stream(
+                "POST", f"{self.base_url}/chat/completions", json=body, headers=self._headers(), timeout=seconds_to_wait(self.read_seconds)
+            )
+            with opened as response:
+                refused = native and self.tool_mode == "auto" and response.status_code in NO_TOOLS_STATUSES
+                if response.status_code != 200 and not refused:
+                    response.read()
+                    raise self._failed(response)
+                for event in () if refused else self._events(response):
+                    if event is None:
+                        finished = True
+                        break
+                    answered_by = event.get("model") or answered_by
+                    usage = event.get("usage") or usage
+                    for choice in event.get("choices") or []:
+                        delta = choice.get("delta") or {}
+                        piece = delta.get("content")
+                        if piece:
+                            parts.append(piece)
+                            yield piece
+                        for call in delta.get("tool_calls") or []:
+                            gather_call(streamed, call)
+                        finished = finished or bool(choice.get("finish_reason"))
+        except httpx.TimeoutException:
+            raise ProviderError(f"{self.name} went silent for {self.read_seconds:.0f} s") from None
+        except httpx.HTTPError as error:
+            raise self._unreachable(error, "dropped the connection") from None
         if refused:
             self.tool_mode = "prompt"  # this model has no tool calling of its own
             yield from self.stream(request, model)
@@ -777,6 +852,11 @@ class Providers:
         self.store.migrate("providers", SCHEMA)
         self.registered: dict[str, Any] = {}
         self.cache: dict[str, tuple[tuple[Any, ...], Any]] = {}
+        self.built: list[Any] = []  # removed ones too, as a reply on one may still be running
+
+    def close(self) -> None:
+        for provider in self.built:
+            provider.close()
 
     def add(
         self,
@@ -836,6 +916,7 @@ class Providers:
         options = {"daily_tokens": row["daily_tokens"], "read_seconds": row["read_seconds"], "model": row["model"], "tool_mode": row["tool_mode"]}
         provider = kind(row["name"], row["base_url"], row["key_reference"], Reach(row["reach"]), **options)
         self.cache[row["name"]] = (fingerprint, provider)
+        self.built.append(provider)
         return provider
 
     def get(self, name: str) -> Any | None:
@@ -851,6 +932,12 @@ class Providers:
 
 def attach(assistant: Any) -> None:
     assistant.providers = Providers(assistant)
+
+
+def detach(assistant: Any) -> None:
+    close = getattr(assistant.providers, "close", None)  # another registry may stand in for this one
+    if close is not None:
+        close()
 
 
 def add_commands(commands: Any) -> None:

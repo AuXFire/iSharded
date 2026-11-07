@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 from pathlib import Path
 import re
@@ -11,12 +12,14 @@ import sqlite3
 import struct
 import threading
 import time
+from types import SimpleNamespace
 
 from fastapi import APIRouter, Request
 import httpx
 import pytest
 import uvicorn
 
+from isharded import replies
 from isharded.assistant import federation, gateway
 from isharded.assistant.app import Assistant
 from isharded.assistant.cli import add_arguments, run
@@ -285,6 +288,70 @@ def test_a_client_that_disconnects_does_not_lose_the_reply(alice, assistant):
         assert wait_until(lambda: any(row["role"] == "assistant" for row in assistant.memory.recent("alice", "c")))
     stored = next(row for row in assistant.memory.recent("alice", "c") if row["role"] == "assistant")
     assert stored["content"].startswith("A reply that keeps going") and stored["model"] == "fake-model"
+
+
+def test_a_turn_carries_on_past_a_client_that_left_partway(alice, assistant, monkeypatch):
+    left, finished = threading.Event(), threading.Event()
+
+    def stream(*_args, **_options):
+        yield "first words"
+        assert left.wait(10)
+        yield "words nobody is reading"
+        finished.set()
+
+    monkeypatch.setattr(assistant.conversation, "stream", stream)
+    with alice.stream("POST", "/v1/chat/completions", json={"messages": [{"role": "user", "content": "Hi"}], "stream": True}) as response:
+        assert "first words" in next(response.iter_lines())
+    left.set()
+    assert finished.wait(10)
+
+
+def fake_turn(stream) -> tuple[SimpleNamespace, list[bool]]:
+    closed: list[bool] = []
+    return SimpleNamespace(conversation=SimpleNamespace(stream=stream), store=SimpleNamespace(close=lambda: closed.append(True))), closed
+
+
+def test_a_turn_finishes_and_closes_up_after_the_server_stopped():
+    stopped, finished = threading.Event(), threading.Event()
+
+    def stream(*_args, **_options):
+        yield "first words"
+        assert stopped.wait(10)
+        yield "words with no event loop to go to"
+        finished.set()
+
+    turn, closed = fake_turn(stream)
+
+    async def first_item() -> str:
+        return await gateway.turn_in_background(turn, "alice", "Hi", "c").get()
+
+    assert asyncio.run(first_item()) == "first words"  # and the loop is gone
+    stopped.set()
+    assert wait_until(lambda: closed)
+    assert finished.is_set()
+
+
+def test_a_turn_hands_over_its_words_then_its_failure_then_the_end():
+    def stream(*_args, **_options):
+        yield "one"
+        yield "two"
+        raise ValueError("went wrong")
+
+    turn, closed = fake_turn(stream)
+
+    async def everything() -> list:
+        items = gateway.turn_in_background(turn, "alice", "Hi", "c")
+        return [await items.get() for _ in range(4)]
+
+    one, two, failure, end = asyncio.run(everything())
+    assert (one, two, str(failure), end) == ("one", "two", "went wrong", None)
+    assert wait_until(lambda: closed)
+
+
+def test_a_stream_is_written_the_way_the_rest_of_the_pool_writes_one():
+    assert gateway.server_sent is replies.server_sent
+    assert gateway.server_sent({"a": "é"}) == 'data: {"a": "\\u00e9"}\n\n'
+    assert gateway.server_sent("[DONE]") == "data: [DONE]\n\n"
 
 
 def test_a_model_failure_reaches_a_stream_as_words(alice, assistant):
