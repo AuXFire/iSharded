@@ -442,6 +442,11 @@ That is 10 jobs. CI runs on CPU only, so real GPU runs are measured by hand. `re
 
 | Run | Result | Commit | Date |
 |---|---|---|---|
+| Full Python suite, laptop, Windows 11, round-five merge | 5,660 passed, 0 failed, 87 skipped | 5dcdd00 | 2026-11-07 |
+| Full Python suite, Linux on the laptop, round-five merge | 5,623 passed, 0 failed, 108 skipped | 5dcdd00 | 2026-11-07 |
+| Real-model quick set, round-five merge, Qwen3-0.6B | 1,439 passed, 1 failed, 11 skipped. The failure was a test helper missing the new merge setting, fixed in 5dcdd00; the engine tests then gave 91 passed, 1 skipped | 3752f45, 5dcdd00 | 2026-11-07 |
+| Engine tests on the hybrid Qwen3.5-0.8B, round-five merge | 92 passed | 5dcdd00 | 2026-11-07 |
+| Rust engine, round-five merge, whole and one test at a time | 82 unit tests and 47 ring tests passed whole; 47 of 47 ring tests passed alone | 3752f45 | 2026-11-07 |
 | Full Python suite, laptop, Windows 11 | 5,618 passed, 3 failed, 86 skipped; all 3 fixed before the push | 5ec874d | 2026-11-07 |
 | Full Python suite, Linux on the laptop | 5,598 passed, 0 failed, 96 skipped | ef7b69a | 2026-11-07 |
 | Real-model quick set, round-four merge | 1,429 passed, 0 failed, 11 skipped | 9cc97c5 | 2026-11-07 |
