@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -1356,6 +1357,56 @@ def test_the_commands_pair_two_real_installs(tmp_path):
         server.terminate()
         server.wait(timeout=10)
         server.stdout.close()
+
+
+def bare_federation() -> Any:
+    from isharded.assistant.federation import Federation
+
+    return Federation(SimpleNamespace(store=None, audit=None, clock=time.time))
+
+
+def test_messages_to_a_peer_share_a_connection_and_no_cookies():
+    from test_assistant_fakes import CountingServer
+
+    with CountingServer() as server:
+        federation = bare_federation()
+        for _ in range(4):
+            assert federation._post(f"{server.url}/federation/notice", {"a": 1}, 5.0).status_code == 200
+        federation.close()
+        assert server.connections == 1
+        assert server.cookies == [None] * 4
+
+
+def test_each_peer_gets_its_own_connection_from_the_one_client():
+    from test_assistant_fakes import CountingServer
+
+    with CountingServer() as first, CountingServer() as second:
+        federation = bare_federation()
+        for server in (first, second, first, second):
+            federation._post(f"{server.url}/federation/notice", {}, 5.0)
+        federation.close()
+        assert (first.connections, second.connections) == (1, 1)
+        assert first.cookies == second.cookies == [None, None]
+
+
+def test_each_message_keeps_its_own_time_limit():
+    from test_assistant_fakes import CountingServer
+
+    with CountingServer(slow_seconds=0.5) as server:
+        federation = bare_federation()
+        with pytest.raises(httpx.TimeoutException):
+            federation._post(f"{server.url}/slow", {}, 0.1)
+        assert federation._post(f"{server.url}/slow", {}, 5.0).status_code == 200
+        federation.close()
+
+
+def test_shutting_down_closes_the_client_to_peers(tmp_path):
+    from isharded.assistant.app import Assistant
+
+    with Assistant(tmp_path / "home") as assistant:
+        client = assistant.federation._client()
+        assert not client.is_closed
+    assert client.is_closed
 
 
 def test_a_bad_command_tells_the_owner_what_to_do(tmp_path):

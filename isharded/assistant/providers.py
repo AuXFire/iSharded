@@ -12,13 +12,15 @@ from __future__ import annotations
 
 import argparse
 import ast
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 import ipaddress
 import json
 import os
 from pathlib import Path
 import re
+import threading
 import time
 from typing import Any
 from urllib.parse import urlsplit
@@ -34,6 +36,9 @@ CONNECT_SECONDS = 10.0
 READ_SECONDS = 120.0  # silence this long means the link is gone; covers a long prefill
 WHOLE_REPLY_SECONDS = 300.0  # a reply with no stream has nothing to read until it is done
 HEALTH_SECONDS = 5.0
+# Under the five seconds many servers hold an idle connection, so that this side always
+# closes first, and never sends on a connection the server is dropping that same moment.
+IDLE_CONNECTION_SECONDS = 2.0
 MODELS_FRESH_SECONDS = 30.0
 MAX_TOOL_JSON = 200_000
 ERROR_CHARS = 300
@@ -510,6 +515,10 @@ def plain_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, str]]:
     ]
 
 
+def seconds_to_wait(read: float) -> httpx.Timeout:
+    return httpx.Timeout(read, connect=CONNECT_SECONDS)
+
+
 def gather_call(streamed: dict[int, dict[str, str]], call: dict[str, Any]) -> None:
     """Add one streamed piece of a native tool call to the call it belongs to."""
     held = streamed.setdefault(int(call.get("index") or 0), {"id": "", "name": "", "arguments": ""})
@@ -517,6 +526,33 @@ def gather_call(streamed: dict[int, dict[str, str]], call: dict[str, Any]) -> No
     held["id"] = call.get("id") or held["id"]
     held["name"] = function.get("name") or held["name"]
     held["arguments"] += function.get("arguments") or ""
+
+
+class HeldClient:
+    """One HTTP client, made on first use and kept, so a call can find a connection already open.
+
+    It serves many threads at once, so a timeout belongs to each call, and no call
+    waits for another's connection. It keeps no cookies, because a server's cookie
+    must not follow later calls.
+    """
+
+    def __init__(self, options: Callable[[], dict[str, Any]]) -> None:
+        self.options = options
+        self.lock = threading.Lock()
+        self.client: httpx.Client | None = None
+
+    def __call__(self) -> httpx.Client:
+        with self.lock:
+            if self.client is None:
+                limits = httpx.Limits(max_connections=None, max_keepalive_connections=20, keepalive_expiry=IDLE_CONNECTION_SECONDS)
+                self.client = httpx.Client(limits=limits, cookies=CookieJar(DefaultCookiePolicy(allowed_domains=[])), **self.options())
+            return self.client
+
+    def close(self) -> None:
+        with self.lock:
+            client, self.client = self.client, None
+        if client is not None:
+            client.close()
 
 
 class OpenAICompatible:
@@ -546,14 +582,17 @@ class OpenAICompatible:
         self.read_seconds = read_seconds
         self.default_model = model
         self._models: tuple[float, list[str]] | None = None
+        self._client = HeldClient(self._client_options)
 
-    def _client(self, read: float) -> httpx.Client:
-        return httpx.Client(
-            timeout=httpx.Timeout(read, connect=CONNECT_SECONDS),
-            verify=client_verify(),  # a pool with its own authority is checked against it
+    def _client_options(self) -> dict[str, Any]:
+        return {
+            "verify": client_verify(),  # a pool with its own authority is checked against it
             # A proxy set for the internet has no business seeing loopback traffic.
-            trust_env=not is_loopback(self.base_url),
-        )
+            "trust_env": not is_loopback(self.base_url),
+        }
+
+    def close(self) -> None:
+        self._client.close()
 
     def _headers(self) -> dict[str, str]:
         key = read_key(self.key)
@@ -580,24 +619,22 @@ class OpenAICompatible:
         return ProviderError(f"{self.name} answered HTTP {response.status_code}: {self._clean(response.text)}")
 
     def _post(self, path: str, body: dict[str, Any], read: float, doing: str) -> httpx.Response:
-        with self._client(read) as client:
-            try:
-                return client.post(f"{self.base_url}/{path}", json=body, headers=self._headers())
-            except httpx.TimeoutException:
-                raise ProviderError(f"{self.name} went silent while {doing}") from None
-            except httpx.HTTPError as error:
-                raise self._unreachable(error) from None
+        try:
+            return self._client().post(f"{self.base_url}/{path}", json=body, headers=self._headers(), timeout=seconds_to_wait(read))
+        except httpx.TimeoutException:
+            raise ProviderError(f"{self.name} went silent while {doing}") from None
+        except httpx.HTTPError as error:
+            raise self._unreachable(error) from None
 
     def models(self) -> list[str]:
         cached = self._models
         now = time.monotonic()
         if cached and now - cached[0] < MODELS_FRESH_SECONDS:
             return cached[1]
-        with self._client(HEALTH_SECONDS) as client:
-            try:
-                response = client.get(f"{self.base_url}/models", headers=self._headers())
-            except httpx.HTTPError as error:
-                raise self._unreachable(error) from None
+        try:
+            response = self._client().get(f"{self.base_url}/models", headers=self._headers(), timeout=seconds_to_wait(HEALTH_SECONDS))
+        except httpx.HTTPError as error:
+            raise self._unreachable(error) from None
         if response.status_code != 200:
             raise self._failed(response)
         try:
@@ -709,32 +746,34 @@ class OpenAICompatible:
         usage: dict[str, Any] = {}
         answered_by = model
         finished = False
-        with self._client(self.read_seconds) as client:
-            try:
-                with client.stream("POST", f"{self.base_url}/chat/completions", json=body, headers=self._headers()) as response:
-                    refused = native and self.tool_mode == "auto" and response.status_code in NO_TOOLS_STATUSES
-                    if response.status_code != 200 and not refused:
-                        response.read()
-                        raise self._failed(response)
-                    for event in () if refused else self._events(response):
-                        if event is None:
-                            finished = True
-                            break
-                        answered_by = event.get("model") or answered_by
-                        usage = event.get("usage") or usage
-                        for choice in event.get("choices") or []:
-                            delta = choice.get("delta") or {}
-                            piece = delta.get("content")
-                            if piece:
-                                parts.append(piece)
-                                yield piece
-                            for call in delta.get("tool_calls") or []:
-                                gather_call(streamed, call)
-                            finished = finished or bool(choice.get("finish_reason"))
-            except httpx.TimeoutException:
-                raise ProviderError(f"{self.name} went silent for {self.read_seconds:.0f} s") from None
-            except httpx.HTTPError as error:
-                raise self._unreachable(error, "dropped the connection") from None
+        try:
+            opened = self._client().stream(
+                "POST", f"{self.base_url}/chat/completions", json=body, headers=self._headers(), timeout=seconds_to_wait(self.read_seconds)
+            )
+            with opened as response:
+                refused = native and self.tool_mode == "auto" and response.status_code in NO_TOOLS_STATUSES
+                if response.status_code != 200 and not refused:
+                    response.read()
+                    raise self._failed(response)
+                for event in () if refused else self._events(response):
+                    if event is None:
+                        finished = True
+                        break
+                    answered_by = event.get("model") or answered_by
+                    usage = event.get("usage") or usage
+                    for choice in event.get("choices") or []:
+                        delta = choice.get("delta") or {}
+                        piece = delta.get("content")
+                        if piece:
+                            parts.append(piece)
+                            yield piece
+                        for call in delta.get("tool_calls") or []:
+                            gather_call(streamed, call)
+                        finished = finished or bool(choice.get("finish_reason"))
+        except httpx.TimeoutException:
+            raise ProviderError(f"{self.name} went silent for {self.read_seconds:.0f} s") from None
+        except httpx.HTTPError as error:
+            raise self._unreachable(error, "dropped the connection") from None
         if refused:
             self.tool_mode = "prompt"  # this model has no tool calling of its own
             yield from self.stream(request, model)
@@ -810,6 +849,11 @@ class Providers:
         self.store.migrate("providers", SCHEMA)
         self.registered: dict[str, Any] = {}
         self.cache: dict[str, tuple[tuple[Any, ...], Any]] = {}
+        self.built: list[Any] = []  # removed ones too, as a reply on one may still be running
+
+    def close(self) -> None:
+        for provider in self.built:
+            provider.close()
 
     def add(
         self,
@@ -869,6 +913,7 @@ class Providers:
         options = {"daily_tokens": row["daily_tokens"], "read_seconds": row["read_seconds"], "model": row["model"], "tool_mode": row["tool_mode"]}
         provider = kind(row["name"], row["base_url"], row["key_reference"], Reach(row["reach"]), **options)
         self.cache[row["name"]] = (fingerprint, provider)
+        self.built.append(provider)
         return provider
 
     def get(self, name: str) -> Any | None:
@@ -884,6 +929,12 @@ class Providers:
 
 def attach(assistant: Any) -> None:
     assistant.providers = Providers(assistant)
+
+
+def detach(assistant: Any) -> None:
+    close = getattr(assistant.providers, "close", None)  # another registry may stand in for this one
+    if close is not None:
+        close()
 
 
 def add_commands(commands: Any) -> None:

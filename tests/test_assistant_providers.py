@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import socket
 import time
@@ -26,7 +27,7 @@ from isharded.assistant.providers import (
     read_key,
     strip_thinking,
 )
-from test_assistant_fakes import FakeModelServer, Reply
+from test_assistant_fakes import CountingServer, FakeModelServer, Reply
 
 READ_FILE = Capability("files.read", "Read a file.", frozenset({Effect.READ}), input_schema={"type": "object", "properties": {"path": {"type": "string"}}})
 SEND_MAIL = Capability("mail.send", "Send mail.", frozenset({Effect.EXTERNAL}))
@@ -445,7 +446,88 @@ def test_a_pool_with_its_own_authority_is_verified_against_it(tmp_path, monkeypa
 
 
 def httpx_client_of(provider):
-    return provider._client(1.0)
+    return provider._client()
+
+
+def test_calls_to_a_provider_share_a_connection_and_no_cookies():
+    with CountingServer() as server:
+        provider = OpenAICompatible("other", server.url)
+        for _ in range(4):
+            assert provider._post("chat/completions", {}, 5.0, "answering").status_code == 200
+        assert provider.health()["up"]
+        provider.close()
+        assert server.connections == 1
+        assert server.cookies == [None] * 5
+
+
+def test_each_call_keeps_its_own_timeout_on_the_shared_client():
+    with CountingServer(slow_seconds=0.6) as server:
+        provider = OpenAICompatible("other", server.url)
+
+        def patient() -> int:
+            return provider._post("slow", {}, 10.0, "answering").status_code
+
+        with ThreadPoolExecutor(2) as pool:
+            waiting = pool.submit(patient)
+            with pytest.raises(ProviderError, match="went silent while answering"):
+                provider._post("slow", {}, 0.1, "answering")
+            assert waiting.result() == 200
+        assert provider._post("fast", {}, 0.5, "answering").status_code == 200
+        provider.close()
+
+
+def test_many_threads_can_use_a_provider_at_once():
+    with CountingServer() as server:
+        provider = OpenAICompatible("other", server.url)
+        with ThreadPoolExecutor(8) as pool:
+            statuses = list(pool.map(lambda _: provider._post("chat/completions", {}, 5.0, "answering").status_code, range(40)))
+        assert statuses == [200] * 40
+        assert 1 <= server.connections <= 8
+        provider.close()
+
+
+def test_a_connection_the_server_hung_up_is_not_held_against_the_next_call():
+    with CountingServer(hang_up=True) as server:
+        provider = OpenAICompatible("other", server.url)
+        for _ in range(3):
+            assert provider._post("chat/completions", {}, 5.0, "answering").status_code == 200
+            time.sleep(0.05)
+        provider.close()
+        assert server.connections == 3
+
+
+def test_a_client_lets_go_of_an_idle_connection_before_a_server_does():
+    # Uvicorn drops one after five seconds, and a call sent that moment would fail.
+    client = OpenAICompatible("other", "http://127.0.0.1:1")._client()
+    assert client._transport._pool._keepalive_expiry < 5
+    client.close()
+
+
+def test_no_call_waits_for_a_connection_another_call_holds():
+    client = OpenAICompatible("other", "http://127.0.0.1:1")._client()
+    assert client._transport._pool._max_connections > 10_000
+    client.close()
+
+
+def test_a_provider_works_again_after_being_closed():
+    with CountingServer() as server:
+        provider = OpenAICompatible("other", server.url)
+        provider._post("chat/completions", {}, 5.0, "answering")
+        provider.close()
+        provider.close()
+        assert provider._post("chat/completions", {}, 5.0, "answering").status_code == 200
+        provider.close()
+
+
+def test_shutting_down_closes_every_client_and_removing_one_leaves_it_running(tmp_path):
+    with CountingServer() as server, Assistant(tmp_path / "home") as assistant:
+        assistant.providers.add("kept", server.url)
+        assistant.providers.add("removed", server.url)
+        kept, removed = assistant.providers.get("kept")._client(), assistant.providers.get("removed")._client()
+        assistant.providers.remove("removed")
+        assert not removed.is_closed  # a reply may still be coming through it
+        assistant.close()
+        assert kept.is_closed and removed.is_closed
 
 
 def test_an_http_failure_says_what_the_server_said():
@@ -743,7 +825,7 @@ def test_a_mesh_reads_tool_calls_from_the_stream_and_falls_back_when_it_has_none
 
     refuse = {"now": False}
     mesh = providers.MeshProvider("mesh", "http://mesh/v1", None)
-    monkeypatch.setattr(mesh, "_client", lambda read: httpx.Client(transport=httpx.MockTransport(serve), timeout=5))
+    monkeypatch.setattr(mesh, "_client", lambda: httpx.Client(transport=httpx.MockTransport(serve), timeout=5))
     tool = type("Tool", (), {"name": "files.read", "summary": "Read a file", "input_schema": {"type": "object"}})()
     request = type("Request", (), {"tools": (tool,), "messages": [{"role": "user", "content": "go"}], "max_tokens": 8, "temperature": 0, "stop": (), "role": "conversation"})()
 
