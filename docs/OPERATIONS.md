@@ -71,7 +71,7 @@ A reply is lost when the node a client is connected to dies, because that node h
 
 ## Saved prompt states
 
-Stages save what they computed for a prompt, at the end of a chat's system prompt and at the end of its settled history. [Conversation reuse](../README.md#conversation-reuse) says what that does. This is how to run it.
+Stages save what they computed for a prompt, at the end of a chat's system prompt and at the end of its settled history. [Conversation reuse](GUIDE.md#conversation-reuse) says what that does. This is how to run it.
 
 **Reading the saving.** `metrics.cache` in `/admin/status` has `saved_percent`, and `/metrics` has `prompt_tokens_computed_total` and `prompt_tokens_reused_total`. `worker_tokens_reused_total` says where each token came from: `prefix` or `history`, then `ram`, `disk`, or `copy`. A `copy` means a stage took over from one that was lost.
 
@@ -138,7 +138,7 @@ Failures, repairs, and leadership changes also go to each node's output with tim
 
 ## Several models
 
-Each [lane](../README.md#several-models-at-once) is a full control plane and a worker on each node, so everything here applies to a lane as it does to the main route, with two differences. Its ports are 1000 per lane above the node's own, so a firewall between nodes must allow them. Cordons pass to every lane, but `load`, `plan`, and rebalancing act on one route at a time.
+Each [lane](GUIDE.md#several-models-at-once) is a full control plane and a worker on each node, so everything here applies to a lane as it does to the main route, with two differences. Its ports are 1000 per lane above the node's own, so a firewall between nodes must allow them. Cordons pass to every lane, but `load`, `plan`, and rebalancing act on one route at a time.
 
 A lane's memory share is fixed when it starts, from what each node had spare. To change it, remove the lane and load it again.
 
