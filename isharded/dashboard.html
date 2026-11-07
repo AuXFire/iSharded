@@ -313,6 +313,7 @@
       const quarantined = workers.filter(worker => worker.state === 'quarantined');
       const offline = workers.filter(worker => worker.state === 'offline' && !lostIds.has(worker.id));
       const stageOf = id => model?.stages.find(stage => stage.workerId === id);
+      const reason = worker => String(worker.quarantine_reason).replace(/[:\s]+$/, '');
       if (lost.length === 1) issues.push({ tone: 'bad', title: `${lost[0].worker_id} stopped answering`, detail: `It holds stage ${stageOf(lost[0].worker_id)?.n}. Check the machine and its network.`, worker: lost[0].worker_id, stage: stageOf(lost[0].worker_id)?.n });
       else if (lost.length) issues.push({ tone: 'bad', n: lost.length, title: `${count(lost.length, 'stage')} of the route stopped answering`, detail: lost.slice(0, 4).map(stage => stage.worker_id).join(', ') + (lost.length > 4 ? ` and ${lost.length - 4} more` : ''), filter: 'attention' });
       if (job?.phase === 'failed') issues.push({ tone: route.length ? 'warn' : 'bad', title: `${modelName(job.model)} did not load`, detail: job.error, retry: job.model });
@@ -324,7 +325,7 @@
         else for (const worker of list) issues.push({ tone, title: `${worker.id} is ${word}`, detail: reason(worker), worker: worker.id, stage: stageOf(worker.id)?.n, ...one(worker) });
       };
       group(quarantined, 'warn', 'quarantined', worker => {
-        const stage = stageOf(worker.id), why = worker.quarantine_reason ? 'It failed: ' + worker.quarantine_reason + '.' : 'It is being checked before it can rejoin.';
+        const stage = stageOf(worker.id), why = worker.quarantine_reason ? 'It failed: ' + reason(worker) + '.' : 'It is being checked before it can rejoin.';
         return stage?.moving ? `${why} Stage ${stage.n} is moving to ${stage.moving.to}, so the route needs nothing from you. Fix the machine and it rejoins after a run of healthy checks.` : `${why} Fix the machine and it rejoins after a run of healthy checks.`;
       }, worker => ({ cordon: nodeOf(worker.id) }));
       group(offline, 'bad', 'offline', () => 'It stopped checking in. Check the machine and its network.', () => ({}));
@@ -344,7 +345,7 @@
       const left = job?.bytes_per_second ? Math.ceil(Math.max((job.bytes_total || 0) - (job.bytes_done || 0), 0) / job.bytes_per_second) : null;
       if (data.status === 'ready') {
         if (lost.length) return look('bad', 'bad', 'Route lost', `${name} lost part of its route`, 'Replies may stall until the pool repairs the route.');
-        if (alerts.length) return look('warn', 'warn', `${needed} need${needed === 1 ? 's' : ''} you`, needed === 1 ? alerts[0].title : `${needed} machines need you`, `Replies are still being served. ${count(route.length, 'stage')} at ${rate(speed)} tokens/s.`);
+        if (alerts.length) return look('warn', 'warn', `${needed} need${needed === 1 ? 's' : ''} you`, needed === 1 ? alerts[0].title : `${needed} ${alerts.every(issue => issue.worker || issue.filter) ? 'machines' : 'things'} need you`, `Replies are still being served. ${count(route.length, 'stage')} at ${rate(speed)} tokens/s.`);
         if (running) return look('work', 'work', 'Loading', job.model === data.model ? 'Preparing a new layout' : `Loading ${modelName(job.model)} beside this route`, 'Replies stay on the current route until every shard is in place.');
         const where = `${count(route.length, 'stage')} on ${count(machineCount(route, data), 'machine')}`;
         return look('idle', '', 'Healthy', 'Serving, and nothing needs you', speed ? `${where}, ${rate(speed)} tokens/s.` : `${where}. No replies yet.`);
@@ -354,6 +355,7 @@
         const wait = `New replies wait until the route is whole again${left != null ? `, about ${left} s at this rate` : ''}.`;
         if (moving.length === 1) return look('work', 'work', 'Repairing', `Moving stage ${moving[0].n} off ${moving[0].workerId}`, wait);
         if (moving.length) return look('work', 'work', 'Repairing', `Moving ${moving.length} stages`, wait);
+        return look('work', 'work', 'Repairing', `Repairing ${name}`, wait);
       }
       if (running) return look('work', 'work', 'Loading', `Loading ${modelName(job.model)}`, 'Chat opens when every shard is in place.');
       if (data.status === 'recovering') return look('work', 'work', 'Recovering', `Recovering ${name || 'the last model'}`, 'Waiting for its workers to come back.');
@@ -593,22 +595,26 @@
       if (!all.length) { paint($('nodeTable'), '<div class="empty"><span>No machines yet. Add one, and it appears here.</span></div>'); return; }
       if (!rows.length) { paint($('nodeTable'), '<div class="empty"><b>No machines match</b><button class="link" type="button" data-action="clear" data-key="clear">Clear the search and filter</button></div>'); return; }
       const sorted = [...rows].sort((a, b) => SORTS[state.sortKey](a, b) * state.sortDir || byName(a.id, b.id));
-      const paged = sorted.slice(0, state.limit);
       const showGpu = all.some(row => row.gpu), room = all.some(row => flagged(row.worker.country)), largest = Math.max(...all.map(row => row.budget), 1);
-      const grouped = all.length >= 5, groups = new Map();
-      for (const row of paged) { const key = grouped ? groupKey(row) : ''; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(row); }
+      // A small pool reads better as one list, until the operator asks for groups.
+      const grouped = all.length >= 5 || Boolean(store.get('isharded-group')), groups = new Map();
+      for (const row of sorted) { const key = grouped ? groupKey(row) : ''; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(row); }
+      const filtered = rows.length < all.length;
+      const isOpen = key => state.groupsOpen.has(key) ? state.groupsOpen.get(key) : filtered || !(state.group === 'state' && key === 'Idle' && all.length > 24);
+      // Only rows someone can see use up the page, so Show more always shows more.
+      let left = state.limit, hidden = 0;
       const sortHead = (key, label, right) => `<th scope="col"${right ? ' class="right"' : ''}${state.sortKey === key ? ` aria-sort="${state.sortDir > 0 ? 'ascending' : 'descending'}"` : ''}><button type="button" data-sort="${key}" data-key="h:${key}">${label}</button></th>`;
       const head = `<thead><tr>${sortHead('name', 'Worker')}${sortHead('state', 'Doing')}${sortHead('memory', 'Memory')}${showGpu ? sortHead('gpu', 'GPU', true) : ''}${sortHead('compute', 'Compute', true)}${sortHead('rtt', 'Round trip', true)}</tr></thead>`;
       const columns = showGpu ? 6 : 5;
       const body = [...groups.keys()].sort(groupOrder).map(key => {
-        const members = groups.get(key), lines = members.map(row => workerLine(row, showGpu, room, largest)).join('');
+        const members = groups.get(key), open = !key || isOpen(key), shown = open ? members.slice(0, Math.max(left, 0)) : [];
+        if (open) { left -= shown.length; hidden += members.length - shown.length; }
+        const lines = shown.map(row => workerLine(row, showGpu, room, largest)).join('');
         if (!key) return `<tbody>${lines}</tbody>`;
-        const open = state.groupsOpen.has(key) ? state.groupsOpen.get(key) : !(state.group === 'state' && key === 'Idle' && all.length > 24);
         const label = state.group === 'machine' ? `${count(members.length, 'worker')} on this machine` : count(members.length, 'worker');
         return `<tbody><tr class="group-row"><th colspan="${columns}" scope="colgroup"><button type="button" data-group="${esc(key)}" data-key="g:${esc(key)}" aria-expanded="${open}">${ICONS.chevron}${esc(key)} <span class="group-count">${esc(label)}</span><span class="group-memory">${hostMemory(members.map(row => row.worker))}</span></button></th></tr>${open ? lines : ''}</tbody>`;
       }).join('');
-      const filtered = rows.length < all.length, more = sorted.length - paged.length;
-      const foot = filtered || more > 0 ? `<div class="table-foot"><span>Showing ${paged.length} of ${count(all.length, 'worker')}</span>${more > 0 ? `<button class="link" type="button" data-action="more-rows" data-key="more-rows">Show ${Math.min(more, 50)} more</button>` : ''}${filtered ? '<button class="link" type="button" data-action="clear" data-key="clear">Clear the search and filter</button>' : ''}</div>` : '';
+      const foot = filtered || hidden > 0 ? `<div class="table-foot"><span>Showing ${state.limit - Math.max(left, 0)} of ${count(all.length, 'worker')}</span>${hidden > 0 ? `<button class="link" type="button" data-action="more-rows" data-key="more-rows">Show ${Math.min(hidden, 50)} more</button>` : ''}${filtered ? '<button class="link" type="button" data-action="clear" data-key="clear">Clear the search and filter</button>' : ''}</div>` : '';
       paint($('nodeTable'), `<table class="grid nodes stack">${head}${body}</table>${foot}`);
     }
     function renderMachinesBay(data, rows) {
@@ -652,7 +658,7 @@
         if (last && last.key === key) last.items.push(event); else runs.push({ key, shape: shape(event), items: [event] });
       }
       paint($('eventList'), runs.map(run => {
-        const first = run.items[0], tone = first.kind === 'failure' ? ' failure' : '';
+        const first = run.items[0], tone = first.kind === 'failure' ? ' trouble' : '';
         if (run.items.length === 1) return `<div class="event${tone}"><div class="event-title">${linked(first.title, `e:t:${first.id}`)}</div><div class="event-time">${esc(relative(first.at))}</div><div class="event-detail">${linked(first.detail, `e:d:${first.id}`)}</div></div>`;
         const title = run.shape.includes('{}') ? run.shape.replace('{}', `${run.items.length} workers`) : `${run.shape}, ${run.items.length} times`;
         return `<details class="event-group"><summary class="event${tone}" data-key="e:${esc(run.key)}"><div class="event-title">${esc(title)}</div><div class="event-time">${esc(relative(first.at))}</div></summary><ul class="event-members">${run.items.map(item => `<li><span>${esc(plain(item.title))}${item.detail ? `: ${esc(plain(item.detail))}` : ''}</span><span>${esc(relative(item.at))}</span></li>`).join('')}</ul></details>`;
@@ -1002,7 +1008,8 @@
         $('subline').textContent = 'The page keeps trying.';
       } else {
         // What was last read may be wrong now, so it must not be offered as an all-clear.
-        $('subline').textContent = `This node stopped answering ${silent} s ago. These figures are from then.`;
+        $('headline').textContent = 'This node stopped answering';
+        $('subline').textContent = `Last heard ${silent} s ago. These figures are from then.`;
         renderNeeds(assess(state.data));
       }
       tabTitle('Out of date');
@@ -1043,8 +1050,10 @@
       if (state.polling) return;
       state.polling = true;
       $('signOut').hidden = !state.token;
+      // The coordinator probes every worker first, and a dead one can hold the answer for seconds.
+      // The last word may be an all-clear, and it must not stand through that.
+      const slow = setTimeout(() => { if (state.data && !state.failures) { setWord('work', 'work', 'Checking'); $('subline').textContent = 'The pool is slow to answer, so this may be out of date.'; } }, 5000);
       try {
-        // The coordinator probes every worker first, and a dead one can hold the answer for seconds.
         const data = await api('/admin/status', { timeout: 15000 });
         state.failures = 0; state.signedOut = false; state.problem = ''; state.updatedAt = Date.now();
         if ($('auth').open) $('auth').close();
@@ -1056,7 +1065,7 @@
         else if (error.offline) { state.failures += 1; renderOffline(); }
         else { state.problem = error.message; if (state.data) render(state.data); else { $('headline').textContent = 'This node refused the request'; $('subline').textContent = error.message; paint($('startPanel'), '<div class="empty"><button class="btn" type="button" data-action="refresh" data-key="retry">Try again</button></div>'); } }
         if (manual === true && error.status !== 401) toast(error.message);
-      } finally { state.polling = false; schedule(); }
+      } finally { clearTimeout(slow); state.polling = false; schedule(); }
     }
 
     function askForKey(rejected) {
@@ -1141,6 +1150,12 @@
       state.markKey = next.dataset.worker;
     });
     for (const dialog of [$('worker'), $('picker'), $('invite'), $('confirm')]) dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
+    // A poll can draw the opener again while a sheet is up, and then focus has nowhere to return to.
+    let opener = null;
+    document.addEventListener('click', event => { if (!document.querySelector('dialog[open]')) opener = event.target.closest?.('[data-key],[id]')?.dataset.key || null; }, true);
+    for (const dialog of [$('worker'), $('picker'), $('invite'), $('confirm')]) dialog.addEventListener('close', () => setTimeout(() => {
+      if (opener && document.activeElement === document.body && !document.querySelector('dialog[open]')) document.querySelector(`[data-key="${CSS.escape(opener)}"]`)?.focus();
+    }));
     $('worker').addEventListener('close', () => { state.openWorker = null; });
     $('auth').addEventListener('close', () => { if (state.signedOut) renderSignedOut(); });
 

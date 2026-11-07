@@ -481,7 +481,7 @@ b { font-weight: 600; }
 .feed { max-height: 260px; margin-top: var(--s-1); overflow-y: auto; }
 .event { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 var(--s-2); padding: 3px 0; }
 .event-title { font-weight: 600; overflow-wrap: anywhere; }
-.event.failure .event-title { color: var(--bad); }
+.event.trouble .event-title { color: var(--bad); }
 .event-time { color: var(--ink-2); font-size: var(--t-xs); white-space: nowrap; }
 .event-detail { grid-column: 1 / 3; color: var(--ink-2); font-size: var(--t-sm); line-height: 18px; overflow-wrap: anywhere; }
 .event .name-link { display: inline; font: inherit; color: inherit; text-decoration: underline; text-decoration-color: var(--edge-strong); text-underline-offset: 2px; white-space: normal; }
