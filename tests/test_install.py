@@ -211,6 +211,60 @@ def test_the_scripts_keep_what_they_promise(script: str) -> None:
     assert "download.pytorch.org/whl/" in script
 
 
+def fake_uv(tmp_path: Path) -> str:
+    """A uv that writes down what it was asked, and tools that name a machine's GPU."""
+    uv = tmp_path / "uv"
+    uv.write_text('#!/bin/sh\necho "$*" >> calls\n', encoding="utf-8", newline="\n")
+    uv.chmod(0o755)
+    return f'uv="{uv.as_posix()}"; python=python; uname() {{ echo Linux; }}; '
+
+
+@needs_shell
+def test_the_shell_leaves_pytorch_out_unless_asked(tmp_path: Path) -> None:
+    done = in_shell(tmp_path, fake_uv(tmp_path) + "full=no; install_torch")
+    assert done.returncode == 0 and not (tmp_path / "calls").exists()
+
+
+@needs_shell
+def test_the_full_install_takes_the_cpu_build_where_it_finds_no_gpu_tools(tmp_path: Path) -> None:
+    done = in_shell(tmp_path, fake_uv(tmp_path) + 'command() { return 1; }; full=yes; install_torch')
+    assert done.returncode == 0
+    assert "torch --default-index https://download.pytorch.org/whl/cpu" in (tmp_path / "calls").read_text(encoding="utf-8")
+
+
+@needs_shell
+def test_the_full_install_takes_the_default_build_beside_a_gpu(tmp_path: Path) -> None:
+    done = in_shell(tmp_path, fake_uv(tmp_path) + 'command() { return 0; }; full=yes; install_torch')
+    assert done.returncode == 0
+    assert (tmp_path / "calls").read_text(encoding="utf-8").strip() == "pip install --python python torch"
+
+
+@pytest.mark.parametrize("script", [INSTALL_SH, INSTALL_PS1], ids=["sh", "ps1"])
+def test_the_scripts_offer_the_full_install(script: str) -> None:
+    assert "--full" in script and "--no-start, --service, or --full" in script
+
+
+@needs_powershell
+def test_powershell_adds_pytorch_only_for_a_full_install() -> None:
+    assert re.search(r"if \(\$full\) \{\s+\$index = .*\s+Invoke-Native \$uv pip install --python \$python torch", INSTALL_PS1)
+    assert in_powershell("Install-ISharded @('--wrong')").returncode != 0
+
+
+def test_torch_is_an_extra_and_not_a_dependency() -> None:
+    project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    dependencies = re.search(r"^dependencies = \[(.*?)^\]", project, re.M | re.S).group(1)
+    assert "torch" not in dependencies and re.search(r'^torch = \["torch>=[\d.]+"\]', project, re.M)
+    assert "torch" not in (ROOT / "requirements.txt").read_text(encoding="utf-8")
+
+
+def test_ci_tests_the_light_install_with_nothing_bringing_pytorch_in() -> None:
+    tests = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+    job = tests.split("no-torch:")[1].split("engine:")[0]
+    assert '"[test]"' not in tests and '-e ".[test]"' in job and "torch" not in job.split("Nothing brought")[0].replace("no-torch", "")
+    assert "find_spec('torch')" in job and "pytest tests" in job
+    assert '-e ".[test,torch]"' in tests.split("no-torch:")[0]
+
+
 @needs_powershell
 def test_powershell_picks_this_machines_wheel_or_the_pure_one(tmp_path: Path) -> None:
     sums = tmp_path / "sums"
