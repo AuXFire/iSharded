@@ -1445,3 +1445,42 @@ def test_an_unseeded_gguf_pass_samples_as_it_always_did(monkeypatch):
     monkeypatch.setattr(runtime, "gguf_logits", torch.tensor([0.0, 50.0, 0.0]))
     request = InferRequest(session_id="s", epoch=1, input_ids=[1], temperature=0.8)
     assert runtime._sample(None, request) == 1
+
+
+def test_the_entry_reserves_a_drafts_cache_for_every_slot(local_model, tmp_path, monkeypatch):
+    """Measured by what ``load_draft`` asks for: one context per slot, and one more for guesses."""
+    from isharded import orchestrator
+    from isharded.models import GgufAdapter
+    from isharded.protocol import LoadModelRequest
+
+    monkeypatch.setattr(GgufAdapter, "recurrent_state_bytes", lambda self, layer: 1000)
+    draft = tmp_path / "draft.gguf"
+    draft.write_bytes(build_file())
+
+    def extra(parallel, tokens=2048):
+        request = LoadModelRequest(model_id=str(local_model), draft_model=str(draft), parallel=parallel, context_tokens=tokens)
+        return orchestrator.build_target(request).profile.entry_extra_bytes
+
+    adapter = create_adapter(build_manifest(str(draft)).config)
+    token = sum(adapter.kv_bytes_per_token(layer, 2) for layer in range(adapter.num_layers))
+    state = sum(adapter.recurrent_state_bytes(layer) for layer in range(adapter.num_layers))
+    assert token and state
+    assert extra(1) == draft.stat().st_size + orchestrator.DRAFT_WORKSPACE_BYTES + token * 2048 * 2 + state * 2
+    assert extra(4) - extra(1) == token * 2048 * 3 + state * 6
+
+
+def test_a_recurrent_model_counts_its_snapshots_while_guessing(local_model, tmp_path, monkeypatch):
+    from isharded import orchestrator
+    from isharded.models import GgufAdapter
+    from isharded.protocol import LoadModelRequest
+
+    monkeypatch.setattr(GgufAdapter, "recurrent_state_bytes", lambda self, layer: 1000 * (layer % 2))
+    draft = tmp_path / "draft.gguf"
+    draft.write_bytes(build_file())
+    request = LoadModelRequest(model_id=str(local_model), draft_model=str(draft), parallel=3, draft_tokens=5)
+    target = orchestrator.build_target(request)
+    held = [target.adapter.recurrent_state_bytes(layer) for layer in range(target.adapter.num_layers)]
+    assert any(held)
+    assert target.profile.snapshot_bytes == [state * (5 + 2) * 3 for state in held]
+    plain = orchestrator.build_target(LoadModelRequest(model_id=str(local_model), draft_model="none", parallel=3))
+    assert not any(plain.profile.snapshot_bytes)

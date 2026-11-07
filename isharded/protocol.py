@@ -218,6 +218,9 @@ class DraftModel(BaseModel):
     file_size: int
     revision: PlainName
     file_sources: list[str] = Field(default_factory=list)
+    # What its cache costs, for planning. Only a draft has these.
+    kv_bytes_per_token: int = 0
+    state_bytes: int = 0
 
 
 class ConfigureRequest(BaseModel):

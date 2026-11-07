@@ -340,6 +340,7 @@ def build_target(
         kv_bytes_per_token=[adapter.kv_bytes_per_token(i, 2) * slots * kv_share // KV_TYPES["f16"][1] for i in range(adapter.num_layers)],
         # Rewinding needs a snapshot of recurrent state for each guess.
         state_bytes=[adapter.recurrent_state_bytes(i) * (1 + speculate_tokens) * slots for i in range(adapter.num_layers)],
+        snapshot_bytes=[adapter.recurrent_state_bytes(i) * (speculate_tokens + 2) * slots if speculate_tokens else 0 for i in range(adapter.num_layers)],
         context_tokens=request.context_tokens,
         # Only a lone embedding table can be shared: GPT-2's unit also holds
         # position embeddings, which the head does not have.
@@ -347,7 +348,7 @@ def build_target(
         amortize_tokens=AMORTIZE_TOKENS if reuse_cached else 0,
         stage_workspace_bytes=GGUF_STAGE_WORKSPACE_BYTES if isinstance(adapter, GgufAdapter) else 0,
         ring=isinstance(adapter, GgufAdapter) and os.getenv("ISHARDED_RING", "1") != "0",
-        entry_extra_bytes=(draft.file_size + DRAFT_WORKSPACE_BYTES if draft else 0)
+        entry_extra_bytes=(draft.file_size + DRAFT_WORKSPACE_BYTES + draft_cache_bytes(draft, request.context_tokens, slots) if draft else 0)
         + (projector.file_size + PROJECTOR_WORKSPACE_BYTES if projector else 0),
         attention_interval=getattr(adapter, "interval", 0),
     )
@@ -437,6 +438,7 @@ def resolve_draft(
         draft = build_manifest(choice, "main", holders, token)
         if draft.config.get("gguf_vocabulary") != manifest.config.get("gguf_vocabulary"):
             raise UnsupportedModel(f"draft model {choice} has a different vocabulary from {request.model_id}")
+        guesser = create_adapter(draft.config)
     except (UnsupportedModel, WeightSourceError, OSError, httpx.HTTPError, KeyError, ValueError):
         if named:
             raise
@@ -448,6 +450,8 @@ def resolve_draft(
         file_size=draft.config["gguf_file_size"],
         revision=draft.revision,
         file_sources=holders,
+        kv_bytes_per_token=sum(guesser.kv_bytes_per_token(layer, 2) for layer in range(guesser.num_layers)),
+        state_bytes=sum(guesser.recurrent_state_bytes(layer) for layer in range(guesser.num_layers)),
     )
 
 

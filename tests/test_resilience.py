@@ -721,8 +721,8 @@ def test_draft_memory_is_planned_on_the_entry_stage():
         state_bytes=[0, 0],
         entry_extra_bytes=500,
     )
-    entry = {item.unit.name: item.extra_bytes for item in _stage_items(profile, 0, 1)}
-    later = {item.unit.name: item.extra_bytes for item in _stage_items(profile, 1, 2)}
+    entry = {item.unit.name: item.entry_bytes for item in _stage_items(profile, 0, 1)}
+    later = {item.unit.name: item.entry_bytes for item in _stage_items(profile, 1, 2)}
     assert entry["layer-00000.dense"] == 500
     assert later["layer-00001.dense"] == 0
 

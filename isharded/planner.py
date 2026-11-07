@@ -96,6 +96,7 @@ PACKING_RETRIES = (1.0, 0.95, 0.9, 0.8, 0.65)
 # Memory kinds in the order they are used. Weights below a worker's best are spill.
 MEMORY_TIERS = {"vram": 0, "unified": 0, "ram": 1, "disk": 2}
 FAST_MEMORY = {"vram", "unified"}
+RAM_MEMORY = ("ram", "unified")
 INFEASIBLE = float("inf")
 
 
@@ -134,8 +135,10 @@ class ModelProfile:
     layer_step: int = 1
     # Every this many layers is full attention, and each stage needs one of those and a recurrent one.
     attention_interval: int = 0
-    # What the entry stage must also hold, such as a draft model.
+    # What the entry stage must also hold, such as a draft model and its cache.
     entry_extra_bytes: int = 0
+    # Per layer, the RAM a stage keeps for rewinding a recurrent model. Empty if it keeps none.
+    snapshot_bytes: list[int] = field(default_factory=list)
     # Tokens a plan has to earn back its download over. Zero ignores downloads.
     amortize_tokens: int = 0
     # Whether stages pass tokens around a closed loop, instead of each waiting for
@@ -158,10 +161,6 @@ class ModelProfile:
 
     def context_bytes(self, layer: int) -> int:
         return self.kv_bytes_per_token[layer] * self.context_tokens + self.state_bytes[layer]
-
-    def beside_bytes(self, layer: int) -> int:
-        """What must sit alongside a layer's dense weights."""
-        return self.context_bytes(layer) + (self.entry_extra_bytes if layer == 0 else 0)
 
     def layer_sizes(self) -> list[tuple[int, int, int]]:
         """Each layer's dense bytes, expert bytes, and context bytes."""
@@ -213,6 +212,9 @@ class _Item:
     unit: WeightUnit
     active: float  # share of its bytes one token reads
     extra_bytes: int = 0  # KV cache or recurrent state that must sit alongside
+    # Held apart from the unit, so that a unit pushed to slower memory cannot take them with it.
+    entry_bytes: int = 0
+    snapshot_bytes: int = 0
 
 
 def _speed(pool: MemoryPool) -> float:
@@ -230,7 +232,14 @@ def _stage_items(profile: ModelProfile, start: int, end: int) -> list[_Item]:
     if end == profile.num_layers:
         items.append(_Item(profile.head, 1.0))
     items.extend(
-        _Item(profile.dense[layer], 1.0, profile.beside_bytes(layer)) for layer in range(start, end)
+        _Item(
+            profile.dense[layer],
+            1.0,
+            profile.context_bytes(layer),
+            profile.entry_extra_bytes if layer == 0 else 0,
+            profile.snapshot_bytes[layer] if profile.snapshot_bytes else 0,
+        )
+        for layer in range(start, end)
     )
     items.extend(
         _Item(profile.experts[layer], profile.expert_active_fraction)
@@ -263,11 +272,36 @@ def _state_bytes(item: _Item, pool: MemoryPool) -> int:
     return item.extra_bytes * (2 if pool.dtype == "float32" else 1)
 
 
+def _room_left(items: list[_Item], ordered: list[MemoryPool], capacity: _Shares) -> dict[str, int] | None:
+    """What a stage's units have to work with, or None if what it holds beside them does not fit.
+
+    This comes first because VRAM comes first: a draft runs on the GPU, so the entry's weights
+    spill before it does. Snapshots live in the stage's own process, which is to say in RAM. A
+    worker offering none has no budget to charge them to, and a disk pool holds neither.
+    """
+    remaining = dict(capacity)
+    entry = sum(item.entry_bytes for item in items)
+    if entry:
+        for group, size in capacity.set_aside.items():
+            remaining[group] += size
+    held = (
+        (entry, [pool for pool in ordered if pool.kind != "disk"]),
+        (sum(item.snapshot_bytes for item in items), [pool for pool in ordered if pool.kind in RAM_MEMORY]),
+    )
+    for size, pools in held:
+        if size and pools:
+            pool = next((pool for pool in pools if size <= remaining[pool.capacity_group]), None)
+            if pool is None:
+                return None
+            remaining[pool.capacity_group] -= size
+    return remaining
+
+
 def _pack(
     profile: ModelProfile,
     items: list[_Item],
     pools: list[MemoryPool],
-    capacity: dict[str, int],
+    capacity: _Shares,
     expandable: int,
     compact_first: bool,
 ) -> tuple[list[UnitPlacement], float] | None:
@@ -279,8 +313,10 @@ def _pack(
     ``compact_first`` gives compact units first claim on fast memory: expanding
     FP8 on a GPU beats reading BF16 from RAM, so that order can win overall.
     """
-    remaining = dict(capacity)
     ordered = sorted(pools, key=_use_order)
+    remaining = _room_left(items, ordered, capacity)
+    if remaining is None:
+        return None
     placements: list[UnitPlacement] = []
     milliseconds = 0.0
     queue: list[tuple[_Item, bool, bool]] = []
@@ -313,7 +349,7 @@ def _fill(
     profile: ModelProfile,
     items: list[_Item],
     pools: list[MemoryPool],
-    capacity: dict[str, int],
+    capacity: _Shares,
 ) -> tuple[list[UnitPlacement], float] | None:
     """Pack a stage, trading FP8 expansion against capacity for the best time.
 
@@ -345,7 +381,7 @@ def _spill_less(
     profile: ModelProfile,
     items: list[_Item],
     pools: list[MemoryPool],
-    capacity: dict[str, int],
+    capacity: _Shares,
     filled: tuple[list[UnitPlacement], float],
 ) -> tuple[list[UnitPlacement], float]:
     """Spill the fewest expert bytes that make a stage fit.
@@ -359,7 +395,9 @@ def _spill_less(
     # The embedding is cold and leaves first, so it never pushes an expert out.
     wanted = [item for item in items if item.unit.kind != "embed"]
     excess = sum(profile.size_in(item.unit, fastest) + _state_bytes(item, fastest) for item in wanted)
-    excess -= capacity[fastest.capacity_group]
+    left = _room_left(items, sorted(pools, key=_use_order), capacity)
+    assert left is not None  # this stage was packed, so it fits
+    excess -= left[fastest.capacity_group]
     waiting = sorted(
         (item for item in items if item.unit.kind == "experts"), key=lambda item: profile.size_in(item.unit, fastest)
     )
@@ -427,24 +465,45 @@ def _group_rooms(pools: Iterable[MemoryPool], workspace: int = 0) -> dict[str, i
     return rooms
 
 
-def _capacities(candidates: list[Candidate], shrink: float, workspace: int = 0) -> dict[str, dict[str, int]]:
+class _Shares(dict[str, int]):
+    """A worker's share of each memory, and what only an entry stage may add to that."""
+
+    def __init__(self, shares: dict[str, int], set_aside: dict[str, int]) -> None:
+        super().__init__(shares)
+        self.set_aside = set_aside
+
+
+def _capacities(candidates: list[Candidate], shrink: float, workspace: int = 0, entry_bytes: int = 0) -> dict[str, _Shares]:
     """Give each worker its share of every capacity group it can reach.
 
     Workers on one host share RAM and disk. Each is planned independently, so
     a shared group is split evenly, which can never oversubscribe it.
+
+    Only one stage holds ``entry_bytes``, so that comes off a shared group before the split
+    and the entry gets it back. Split evenly with the rest, a draft larger than one share
+    stopped a load on memory with room for all of it.
     """
     sharers: dict[str, set[str]] = {}
     for candidate in candidates:
         for pool in candidate.pools:
             sharers.setdefault(pool.capacity_group, set()).add(candidate.worker_id)
     limits = _group_rooms(_all_pools(candidates), workspace)
+    aside: dict[str, int] = {}
+    for candidate in candidates if entry_bytes else ():
+        holders = sorted((pool for pool in candidate.pools if pool.kind != "disk"), key=_use_order)
+        holder = next((pool.capacity_group for pool in holders if entry_bytes <= limits[pool.capacity_group]), None)
+        if holder is not None and len(sharers[holder]) > 1:
+            aside[holder] = entry_bytes
     return {
-        candidate.worker_id: {
-            pool.capacity_group: int(
-                limits[pool.capacity_group] * shrink / len(sharers[pool.capacity_group])
-            )
-            for pool in candidate.pools
-        }
+        candidate.worker_id: _Shares(
+            {
+                pool.capacity_group: int(
+                    (limits[pool.capacity_group] - aside.get(pool.capacity_group, 0)) * shrink / len(sharers[pool.capacity_group])
+                )
+                for pool in candidate.pools
+            },
+            {pool.capacity_group: aside[pool.capacity_group] for pool in candidate.pools if pool.capacity_group in aside},
+        )
         for candidate in candidates
     }
 
@@ -503,7 +562,7 @@ class _Packer:
     right for the first, so a route is built by packing each stage afresh.
     """
 
-    def __init__(self, profile: ModelProfile, capacities: dict[str, dict[str, int]]) -> None:
+    def __init__(self, profile: ModelProfile, capacities: dict[str, _Shares]) -> None:
         self.profile = profile
         self.capacities = capacities
         self.shared: dict[Any, tuple[list[UnitPlacement], float] | None] = {}
@@ -667,7 +726,8 @@ def _stage_scorer(profile: ModelProfile, packer: _Packer) -> Callable[[Candidate
                 used += item.bytes
                 unit = units[item.unit]
                 if unit.kind == "dense":
-                    used += _state_bytes(_Item(unit, 1.0, profile.beside_bytes(unit.layer)), pool)
+                    used += _state_bytes(_Item(unit, 1.0, profile.context_bytes(unit.layer)), pool)
+                    used += profile.entry_extra_bytes if unit.layer == 0 else 0
         return used
 
     def stage(candidate: Candidate, start: int, end: int) -> _Score | None:
@@ -1014,7 +1074,7 @@ def _sampled(
 ) -> tuple[list[StageAssignment] | None, _Packer]:
     """The fastest route through the orders worth trying, with the packer that found it."""
     for shrink in shrinks:
-        packer = _Packer(profile, _capacities(candidates, shrink, profile.stage_workspace_bytes))
+        packer = _Packer(profile, _capacities(candidates, shrink, profile.stage_workspace_bytes, profile.entry_extra_bytes))
         costs: dict[tuple[str, int, int], float] = {}
         best: list[StageAssignment] | None = None
         best_cost = INFEASIBLE
@@ -1383,7 +1443,7 @@ def keep_layers(
             candidate = everyone.get(stage.worker_id)
             if candidate is None:
                 items = _stage_items(profile, stage.start_layer, stage.end_layer)
-                room = _capacities(free, shrink, profile.stage_workspace_bytes)
+                room = _capacities(free, shrink, profile.stage_workspace_bytes, profile.entry_extra_bytes)
                 fitting = [spare for spare in free if _fill(profile, items, spare.pools, room[spare.worker_id])]
                 if not fitting:
                     return None
@@ -1391,7 +1451,7 @@ def keep_layers(
                 candidate = min(fitting, key=lambda spare: added(spare, index, chosen))
                 free.remove(candidate)
             ranges.append((candidate, stage.start_layer, stage.end_layer))
-        capacities = _capacities([candidate for candidate, _, _ in ranges], shrink, profile.stage_workspace_bytes)
+        capacities = _capacities([candidate for candidate, _, _ in ranges], shrink, profile.stage_workspace_bytes, profile.entry_extra_bytes)
         route = _build_route(ranges, profile, capacities)
         if route is not None:
             return route
@@ -1404,14 +1464,25 @@ def _no_fit(everyone: list[Candidate], profile: ModelProfile, pinned: list[str])
     # Report what the pools would really hold: FP32 pools double a BF16 checkpoint.
     pools = _all_pools(everyone)
     needed = min(sum(profile.size_in(unit, pool, profile.quantized(unit)) for unit in profile.units) for pool in pools)
-    offered = sum(_group_rooms(pools).values())
+    workspace = profile.stage_workspace_bytes
+    offered = sum(_group_rooms(pools, workspace).values())
     hint = "remove a pin, " if pinned else ""
     extra = f" and {profile.entry_extra_bytes / 1024**3:.1f} GiB for a draft model or projector" if profile.entry_extra_bytes else ""
+    snapshots = sum(profile.snapshot_bytes)
+    extra += f" and {snapshots / 1024**3:.2f} GiB of RAM for snapshots" if snapshots else ""
     blocks = ""
+    if needed + context + profile.entry_extra_bytes + snapshots <= offered:
+        # Added up across workers and kinds of memory, the numbers above look like it fits.
+        shares = _capacities(everyone, 1.0, workspace, profile.entry_extra_bytes)
+        largest = max(sum(share.values()) + sum(share.set_aside.values()) for share in shares.values())
+        blocks = (
+            f". That is all the memory together, but a stage has to fit in its own worker, where the most "
+            f"any one can use is {largest / 1024**3:.1f} GiB, and workers on one machine share what it has"
+        )
     if profile.layer_step > 1:
         # Without this the numbers above can look like the model fits.
         size = needed / -(-profile.num_layers // profile.layer_step)
-        blocks = (
+        blocks += (
             f". Stages of this model start on a multiple of {profile.layer_step} layers, so a worker takes whole "
             f"blocks of about {size / 1024**3:.1f} GiB, and room left on a card goes unused unless that worker "
             "also offers RAM for the part of a block that does not fit"
@@ -1509,6 +1580,7 @@ def memory_report(route: list[StageAssignment], candidates: list[Candidate], pro
     """
     rows: dict[str, dict[str, Any]] = {}
     room = _group_rooms(_all_pools(candidates), profile.stage_workspace_bytes)
+    shares = _Shares(room, {})
     for candidate in candidates:
         for pool in candidate.pools:
             row = rows.setdefault(
@@ -1530,7 +1602,11 @@ def memory_report(route: list[StageAssignment], candidates: list[Candidate], pro
         by_id = {pool.pool_id: pool for pool in candidate.pools}
         best = min(MEMORY_TIERS[pool.kind] for pool in candidate.pools)
         placed = {item.unit: item for item in stage.placements}
-        for item in _stage_items(profile, stage.start_layer, stage.end_layer):
+        items = _stage_items(profile, stage.start_layer, stage.end_layer)
+        for group, left in (_room_left(items, sorted(candidate.pools, key=_use_order), shares) or room).items():
+            if group in rows:
+                rows[group]["used_bytes"] += room[group] - left
+        for item in items:
             placement = placed.get(item.unit.name)
             pool = by_id.get(placement.pool_id) if placement else None
             if placement is None or pool is None:
