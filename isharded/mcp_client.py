@@ -637,7 +637,8 @@ def run_call(
         return "Arguments must be a JSON object."
     if not (toolbox.read_only(name) or name in allowed or ask(name, arguments)):
         return "The person running this did not allow that call. Answer without it, or say what you would need."
-    print(f"Calling {printable(name)} with {json.dumps(arguments, ensure_ascii=False)}", file=sys.stderr)
+    shown = printable(name).replace("\n", "\\n")  # each line of the record is one call, so a name cannot add one
+    print(f"Calling {shown} with {json.dumps(arguments, ensure_ascii=False)}", file=sys.stderr)
     return toolbox.call(name, arguments, timeout, tray)
 
 

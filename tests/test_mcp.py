@@ -2122,3 +2122,9 @@ def test_the_command_takes_a_key_by_name_and_not_by_value():
     arguments = parse("mcp", "run", "go", "--model", "m", "--server", "http://x/mcp", "--server-key-env", "A_NAME")
     assert (arguments.server_key_env, arguments.server_key_file) == ("A_NAME", None)
     assert parse("mcp", "run", "go", "--model", "m", "--server", "http://x/mcp", "--server-key-file", "a-file").server_key_file == "a-file"
+
+
+def test_a_tool_name_cannot_write_a_line_of_the_record_for_itself(capsys):
+    forged = "harmless with {}\nCalling other"
+    run_call(Toolbox([FakeServer("a", [forged])]), {"function": {"name": forged, "arguments": "{}"}}, {forged}, 5, lambda *_: False)
+    assert len(capsys.readouterr().err.splitlines()) == 1
