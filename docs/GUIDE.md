@@ -801,6 +801,59 @@ Asks every route serving a model the same questions, and compares the answers. S
 
 It exits with 1 if routes disagree, so it can sit in a script. With `--every` it keeps going through a disagreement, and stops only if a check is refused.
 
+### isharded bench
+
+Measures a running mesh and gives numbers others can compare. It asks a node over the normal API, the way any client does, and changes nothing.
+
+```bash
+isharded bench
+isharded bench --url http://node-a:8209 --key YOUR_KEY --markdown result.md
+isharded bench --prompt-tokens 128 --parallel 1,2 --repeat 5 --text code --json result.json
+```
+
+| Option | Default | What it does |
+|---|---|---|
+| `--prompt-tokens` | 128,3400 | Prompt sizes to try, as a comma list |
+| `--tokens` | 200 | How many tokens each reply runs to |
+| `--parallel` | 1,4,8 | Replies at once to try, as a comma list. One at a time always runs, as the numbers for a single reply come from it |
+| `--repeat` | 3 | How many times to measure each case |
+| `--warmup` | 1 | Replies to throw away before each prompt size |
+| `--seed` | 1 | Seed for the prompts and the replies |
+| `--temperature` | 0 | Sampling temperature |
+| `--text` | prose | What the prompts are made of: `prose`, `code` or `counting` |
+| `--cached` | Off | Also send each prompt a second time, and time its first token from the cache |
+| `--json` | Off | Also write the results to this file as JSON |
+| `--markdown` | Off | Also write the results to this file as Markdown, ready to paste |
+| `--url` | This machine's node | Any node's address |
+| `--key` | This machine's own | An API key. A user key is enough. See below |
+
+With no `--url` it reads the `up` folder, so `isharded bench` on a node just works. The saved key, or the pool token, goes only to this machine's own node. For any other `--url`, give `--key`, so that benching someone else's mesh cannot hand them your key.
+
+Each prompt size starts with a few one-token requests that find how much text comes to that size on the model's own tokenizer, because a node has no route for counting. Prompts are fixed text in the module behind a prefix that is new every time, so nothing comes from the prompt cache, not even from an earlier run with the same seed. The table shows the size the prompts came to, which lands within 16 tokens or 2% of the size asked for. A size the model was not loaded with room for is skipped and noted. The defaults need a load with `--context-tokens` of 4096 or more.
+
+What it reports:
+
+| Number | What it means |
+|---|---|
+| First token ms | From sending the request to the first text arriving, measured on the client. With several replies at once this includes waiting behind the others |
+| Cached first token ms | The same, for a prompt the node has just seen. Only with `--cached` |
+| Tokens/s per reply | Tokens after the first, divided by the time between the first and the last. Token counts come from the node's usage line |
+| Total tokens/s | All the tokens of a round, divided by the whole round, reading prompts included. This is what the mesh delivers |
+| Repeat of a seeded reply identical | The same seeded request, sent twice. `NO` deserves a look, as one route should repeat itself. It does not fail the run |
+
+Each number is the median of the measurements, with the lowest and highest in brackets. The report also says what explains them: the model and its quantization (read from the name), each stage's layers, GPU and country, link times where the status has them, the pipeline's tokens, misses and depth, any draft's tokens per pass, whether the native engine was on, the iSharded version nodes report, and the commit of the copy running the bench, if it is a git checkout. It leaves out addresses, keys, machine names and paths, so it is safe to post. Countries appear only where a node's operator shows one.
+
+Notes under the table say when something bent the numbers: a route that moved, cache use nobody asked for, `--cached` with no cache behind it, replies that ended before `--tokens`, sizes skipped. A node keeps prompt states only with room for them, in `--state-ram-gb` or `--state-disk-gb`. It exits with 1 if any reply failed, or if nothing could be measured. A repeat that differs does not fail it.
+
+Read the numbers fairly. Two results compare only with the same model, the same quantization, and the same prompt size and reply length. After that:
+
+- Compare `--text` with `--text`. `counting` is the easy case for a draft and a pipeline, and `code` is easier than `prose`. A result from `counting` says nothing about chat.
+- Say what the route was. Two stages in one room and seven over the internet are different things, and the report shows which you measured.
+- Tokens/s per reply and total tokens/s answer different questions. One person waiting feels the first. A shared mesh is judged by the second.
+- Above the `--parallel` a model was loaded with, replies wait in line, so first token times grow and total tokens/s stops growing. That is the load's choice and not the mesh's limit.
+- Other traffic on the mesh lands in the numbers. Look at the spread in the brackets: a wide one means the run was disturbed, or `--repeat` was too low to say.
+- A rate limit on the key fails replies. Use a key without one.
+
 ### isharded cordon and uncordon
 
 `cordon` moves a node's share elsewhere for maintenance, and `uncordon` puts the node back. Both take the node's name.

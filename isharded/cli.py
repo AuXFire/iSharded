@@ -16,6 +16,7 @@ import httpx
 
 from .access import create_key, digest, new_key
 from .assistant.cli import add_arguments as add_assistant_arguments, run as run_assistant
+from .bench import add_arguments as add_bench_arguments
 from .commons import make_identity, sign_vouch, write_policy
 from .node import add_node_arguments, run_node
 from .pool import add_node, approve_membership, bearer_headers, init_pool, load_token, read_membership_request, request_membership, sign_entry
@@ -558,6 +559,7 @@ def build_parser() -> argparse.ArgumentParser:
     hashes.add_argument("--out", required=True, help="the file to write")
     hashes.set_defaults(handler=run_model_hash)
     add_load_command(subparsers, token)
+    add_bench_arguments(subparsers)
     check = subparsers.add_parser("audit", help="ask routes serving a model the same questions, and compare their answers")
     check.add_argument("--model", default=None, help="the model to check; default is the main one")
     check.add_argument("--samples", type=int, default=8, help="questions to ask each route")
