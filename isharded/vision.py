@@ -247,14 +247,20 @@ def lay_out(tokens: list[int], images: list[EncodedImage]) -> PromptRows:
     places = np.zeros((SECTIONS, count), dtype=np.int32)
     source = np.full(count, -1, dtype=np.int64)
     ends = np.zeros(count, dtype=np.int64)
+    is_image = np.asarray(tokens, dtype=np.int64) < 0
     position = row = done = 0
+
+    def add_text(stop: int) -> None:
+        nonlocal position, row
+        steps = np.arange(position, position + stop - row, dtype=np.int32)
+        places[:3, row:stop] = steps
+        ends[row:stop] = steps + 1
+        position += stop - row
+        row = stop
+
     for image in images:
         rows = image.places.shape[1]
-        while row < count and tokens[row] >= 0:
-            places[:3, row] = position
-            position += 1
-            ends[row] = position
-            row += 1
+        add_text(row + int(np.argmax(np.append(is_image[row:], True))))
         if tokens[row : row + rows] != [image.identity] * rows:
             raise ValueError("a prompt's image rows do not match the images sent with it")
         places[:, row : row + rows] = image.places
@@ -264,11 +270,8 @@ def lay_out(tokens: list[int], images: list[EncodedImage]) -> PromptRows:
         ends[row : row + rows] = position
         row += rows
         done += rows
-    if any(token < 0 for token in tokens[row:]):
+    if is_image[row:].any():
         raise ValueError("a prompt holds image rows with no image sent for them")
-    tail = np.arange(position, position + count - row, dtype=np.int32)
-    places[:3, row:] = tail
-    ends[row:] = tail + 1
-    width = images[0].vectors.shape[1] if images else 0
-    vectors = np.concatenate([image.vectors for image in images]) if images else np.empty((0, width), dtype=np.float32)
+    add_text(count)
+    vectors = np.concatenate([image.vectors for image in images]) if images else np.empty((0, 0), dtype=np.float32)
     return PromptRows(places, source, vectors, ends)

@@ -20,7 +20,7 @@ from typing import Any
 
 import numpy as np
 
-from .llamacpp import GGML_LOG_ERROR, LOG_CALLBACK, PINNED_BUILD, LlamaError, LlamaLibrary, library_file, load_native
+from .llamacpp import GGML_LOG_ERROR, LOG_CALLBACK, PINNED_BUILD, LlamaError, LlamaLibrary, bind, library_file, load_native
 from .vision import SECTIONS
 
 CHUNK_IMAGE = 1  # MTMD_INPUT_CHUNK_TYPE_IMAGE
@@ -77,6 +77,33 @@ class DecoderPosition(C.Structure):
     _fields_ = [("t", C.c_uint32), ("x", C.c_uint32), ("y", C.c_uint32), ("z", C.c_uint32)]
 
 
+# Native functions by name, each with its return type and then its arguments.
+MTMD_FUNCTIONS = {
+    "mtmd_helper_log_set": (None, LOG_CALLBACK, C.c_void_p),
+    "mtmd_default_marker": (C.c_char_p,),
+    "mtmd_context_params_default": (ContextParams,),
+    "mtmd_init_from_file": (C.c_void_p, C.c_char_p, C.c_void_p, ContextParams),
+    "mtmd_free": (None, C.c_void_p),
+    "mtmd_support_vision": (C.c_bool, C.c_void_p),
+    "mtmd_decode_use_non_causal": (C.c_bool, C.c_void_p, C.c_void_p),
+    "mtmd_helper_init_opt_default": (InitOptions,),
+    "mtmd_helper_bitmap_init_from_buf": (BitmapWrapper, C.c_void_p, C.c_char_p, C.c_size_t, C.c_bool, InitOptions),
+    "mtmd_bitmap_free": (None, C.c_void_p),
+    "mtmd_input_chunks_init": (C.c_void_p,),
+    "mtmd_input_chunks_free": (None, C.c_void_p),
+    "mtmd_input_chunks_size": (C.c_size_t, C.c_void_p),
+    "mtmd_input_chunks_get": (C.c_void_p, C.c_void_p, C.c_size_t),
+    "mtmd_input_chunk_get_type": (C.c_int, C.c_void_p),
+    "mtmd_input_chunk_get_n_tokens": (C.c_size_t, C.c_void_p),
+    "mtmd_input_chunk_get_n_pos": (C.c_int32, C.c_void_p),
+    "mtmd_input_chunk_get_tokens_image": (C.c_void_p, C.c_void_p),
+    "mtmd_tokenize": (C.c_int32, C.c_void_p, C.c_void_p, C.POINTER(InputText), C.POINTER(C.c_void_p), C.c_size_t),
+    "mtmd_encode_chunk": (C.c_int32, C.c_void_p, C.c_void_p),
+    "mtmd_get_output_embd": (C.POINTER(C.c_float), C.c_void_p),
+    "mtmd_helper_image_get_decoder_pos": (None, C.c_void_p, C.c_int32, C.POINTER(DecoderPosition)),
+}
+
+
 @dataclass
 class ImageShape:
     """What an image takes up in a prompt, before anything has been encoded."""
@@ -96,7 +123,7 @@ class Projector:
         if not path.is_file():
             raise LlamaError(f"this llama.cpp build has no {path.name}, which vision needs")
         self.mtmd = load_native(path)
-        self._bind()
+        bind(self.mtmd, MTMD_FUNCTIONS)
         self._check_binding()
         self._log = LOG_CALLBACK(self._on_log)
         self.mtmd.mtmd_helper_log_set(self._log, None)
@@ -128,49 +155,6 @@ class Projector:
     def _on_log(level: int, text: bytes | None, _: Any) -> None:
         if level == GGML_LOG_ERROR and text:
             print("mtmd:", text.decode("utf-8", "replace").rstrip(), flush=True)
-
-    def _bind(self) -> None:
-        native = self.mtmd
-        native.mtmd_helper_log_set.argtypes = [LOG_CALLBACK, C.c_void_p]
-        native.mtmd_helper_log_set.restype = None
-        native.mtmd_default_marker.restype = C.c_char_p
-        native.mtmd_context_params_default.restype = ContextParams
-        native.mtmd_init_from_file.argtypes = [C.c_char_p, C.c_void_p, ContextParams]
-        native.mtmd_init_from_file.restype = C.c_void_p
-        native.mtmd_free.argtypes = [C.c_void_p]
-        native.mtmd_free.restype = None
-        native.mtmd_support_vision.argtypes = [C.c_void_p]
-        native.mtmd_support_vision.restype = C.c_bool
-        native.mtmd_decode_use_non_causal.argtypes = [C.c_void_p, C.c_void_p]
-        native.mtmd_decode_use_non_causal.restype = C.c_bool
-        native.mtmd_helper_init_opt_default.restype = InitOptions
-        native.mtmd_helper_bitmap_init_from_buf.argtypes = [C.c_void_p, C.c_char_p, C.c_size_t, C.c_bool, InitOptions]
-        native.mtmd_helper_bitmap_init_from_buf.restype = BitmapWrapper
-        native.mtmd_bitmap_free.argtypes = [C.c_void_p]
-        native.mtmd_bitmap_free.restype = None
-        native.mtmd_input_chunks_init.restype = C.c_void_p
-        native.mtmd_input_chunks_free.argtypes = [C.c_void_p]
-        native.mtmd_input_chunks_free.restype = None
-        native.mtmd_input_chunks_size.argtypes = [C.c_void_p]
-        native.mtmd_input_chunks_size.restype = C.c_size_t
-        native.mtmd_input_chunks_get.argtypes = [C.c_void_p, C.c_size_t]
-        native.mtmd_input_chunks_get.restype = C.c_void_p
-        native.mtmd_input_chunk_get_type.argtypes = [C.c_void_p]
-        native.mtmd_input_chunk_get_type.restype = C.c_int
-        native.mtmd_input_chunk_get_n_tokens.argtypes = [C.c_void_p]
-        native.mtmd_input_chunk_get_n_tokens.restype = C.c_size_t
-        native.mtmd_input_chunk_get_n_pos.argtypes = [C.c_void_p]
-        native.mtmd_input_chunk_get_n_pos.restype = C.c_int32
-        native.mtmd_input_chunk_get_tokens_image.argtypes = [C.c_void_p]
-        native.mtmd_input_chunk_get_tokens_image.restype = C.c_void_p
-        native.mtmd_tokenize.argtypes = [C.c_void_p, C.c_void_p, C.POINTER(InputText), C.POINTER(C.c_void_p), C.c_size_t]
-        native.mtmd_tokenize.restype = C.c_int32
-        native.mtmd_encode_chunk.argtypes = [C.c_void_p, C.c_void_p]
-        native.mtmd_encode_chunk.restype = C.c_int32
-        native.mtmd_get_output_embd.argtypes = [C.c_void_p]
-        native.mtmd_get_output_embd.restype = C.POINTER(C.c_float)
-        native.mtmd_helper_image_get_decoder_pos.argtypes = [C.c_void_p, C.c_int32, C.POINTER(DecoderPosition)]
-        native.mtmd_helper_image_get_decoder_pos.restype = None
 
     def _check_binding(self) -> None:
         """Refuse a build whose structures have moved, as LlamaLibrary does for llama.h."""
