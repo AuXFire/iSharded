@@ -548,7 +548,34 @@ def test_a_pass_that_fails_on_the_ring_ends_the_read_and_drops_the_rest(monkeypa
     with pytest.raises(HTTPException):
         asyncio.run(run())
     assert len(ring.sent) < 10
-    assert all(flight.done() for flight in seen), "nothing is left waiting on a reply that gave up"
+    assert not any(flight.cancelled() for flight in seen), "finish_reply waits on what is still out"
+
+
+def test_a_reply_that_goes_away_leaves_its_passes_out_for_the_slot_to_wait_on(monkeypatch) -> None:
+    """ring_settle waits on the newest pass. Cancelled, it would free the slot with passes still on the ring."""
+    held: list[asyncio.Future[list[int]]] = []
+
+    def send(*arguments) -> asyncio.Future[list[int]]:
+        held.append(asyncio.get_running_loop().create_future())
+        return held[-1]
+
+    async def answer(flight: asyncio.Future[list[int]]) -> int:
+        return (await flight)[0]
+
+    monkeypatch.setattr(worker_module.runtime, "ring_ready", lambda request: True)
+    monkeypatch.setattr(worker_module.runtime, "ring_send", send)
+    monkeypatch.setattr(worker_module.runtime, "ring_answer", answer)
+    monkeypatch.setattr(worker_module, "RESUME_WINDOW", 3)
+
+    async def run() -> None:
+        reading = asyncio.ensure_future(worker_module.read_written(following(), list(range(10)), 0))
+        await asyncio.sleep(0)
+        reading.cancel()
+        await asyncio.gather(reading, return_exceptions=True)
+
+    asyncio.run(run())
+    assert len(held) == 3
+    assert not held[-1].cancelled()
 
 
 async def stream_of(body) -> list[int]:

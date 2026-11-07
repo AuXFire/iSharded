@@ -1877,10 +1877,14 @@ class Orchestrator:
         # Real failures are limited to two. A route moving on is not a failure,
         # and several changes in a row must not use those attempts up.
         while attempt < 2 and moves < MAX_ROUTE_MOVES:
-            await self.wait_for_route()
+            must_replay = session.needs_reset or session.epoch != self.epoch
+            if must_replay or not self.route:
+                # A route that just gave this reply a token is working, whatever the
+                # records say, and a wait for each token would never end.
+                await self.wait_for_route()
+                must_replay = session.needs_reset or session.epoch != self.epoch
             if not self.route:
                 raise HTTPException(status_code=409, detail="no active model pipeline")
-            must_replay = session.needs_reset or session.epoch != self.epoch
             input_ids = session.tokens if must_replay else [session.tokens[-1]]
             request = InferRequest(
                 session_id=session.session_id,
@@ -3348,7 +3352,9 @@ async def models(authorization: str | None = Header(default=None)) -> dict[str, 
 async def check_request(model: str | None, embedding: bool = False) -> None:
     if model and runtime.model_id and model != runtime.model_id:
         raise HTTPException(status_code=404, detail=f"model {model!r} is not loaded")
-    await runtime.wait_for_route()
+    if not runtime.tokenizer or not runtime.route:
+        # With both here, the reply does its own waiting for a route that is not whole.
+        await runtime.wait_for_route()
     if not runtime.tokenizer or not runtime.route:
         raise HTTPException(status_code=409, detail="no model is ready; load one first")
     runs_embeddings = bool(runtime.active and runtime.active.embedding)

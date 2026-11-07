@@ -2258,23 +2258,22 @@ async def read_written(request: InferRequest, written: list[int], position: int)
     Each token gets its own one-row pass at its own position, because that is what plain
     decoding ran, and a batched pass rounds differently. Whatever the model answers along
     the way, the written tokens stand, so on the ring no pass has to wait for the one before.
+
+    A reply that stops here leaves its passes out, uncancelled: ``finish_reply`` waits for
+    the newest of them, so none reaches a stage after the slot has gone to someone else.
     """
     if not runtime.ring_ready(request):
         for token in written:
             answer = (await reply_step(request.model_copy(update={"input_ids": [token]})))["token_id"]
         return answer
     flights: deque[asyncio.Future[list[int]]] = deque()
-    try:
-        for place, token in enumerate(written, position):
-            if len(flights) == RESUME_WINDOW:
-                await runtime.ring_answer(flights.popleft())
-            flights.append(runtime.ring_send(request, token, place, None))
-        while len(flights) > 1:
+    for place, token in enumerate(written, position):
+        if len(flights) == RESUME_WINDOW:
             await runtime.ring_answer(flights.popleft())
-        return await runtime.ring_answer(flights.popleft())
-    finally:
-        for flight in flights:
-            flight.cancel()
+        flights.append(runtime.ring_send(request, token, place, None))
+    while len(flights) > 1:
+        await runtime.ring_answer(flights.popleft())
+    return await runtime.ring_answer(flights.popleft())
 
 
 async def state_in_reach(key: str) -> bool:

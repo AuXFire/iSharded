@@ -1898,3 +1898,77 @@ def test_an_entry_worker_that_died_is_repaired_and_the_reply_resumes():
     orchestrator.rebalance = rebalance
     assert reply_through(orchestrator, handler) == [99]
     assert repairs and len(requests) == 2
+
+
+# A route that stays broken costs a reply one wait, and not one for each step.
+
+
+def test_a_request_on_a_broken_route_leaves_the_waiting_to_the_reply(monkeypatch):
+    """token_stream waits too, and waiting in both would double what the guide promises."""
+    monkeypatch.setattr(orchestrator_module, "MOVE_WAIT_SECONDS", 30.0)
+    orchestrator = serving_pool()
+    restart_empty(orchestrator)
+    orchestrator.active = SimpleNamespace(embedding=False)
+    monkeypatch.setattr(orchestrator_module, "runtime", orchestrator)
+    asyncio.run(asyncio.wait_for(orchestrator_module.check_request(None), 2))
+    done(orchestrator)
+
+
+def test_a_request_with_no_route_yet_still_waits_for_one(monkeypatch):
+    monkeypatch.setattr(orchestrator_module, "runtime", orchestrator := pool(w1=record("w1")))
+    orchestrator.tokenizer = object()
+    orchestrator.job = orchestrator_module.LoadJob(job_id="j", model_id="m")
+
+    async def scenario():
+        async def back():
+            await asyncio.sleep(0.05)
+            orchestrator.route = [stage("w1")]
+
+        returned = asyncio.ensure_future(back())
+        await orchestrator_module.check_request(None)
+        assert returned.done()
+
+    asyncio.run(scenario())
+    done(orchestrator)
+
+
+def test_the_slow_way_does_not_wait_again_for_every_token(monkeypatch):
+    """A token that went through says the route works, whatever the records say."""
+    monkeypatch.setattr(orchestrator_module, "MOVE_WAIT_SECONDS", 30.0)
+    orchestrator = serving_pool()
+    restart_empty(orchestrator)
+    orchestrator.active = object()
+
+    async def scenario():
+        orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"token_id": 7})))
+        session = SessionState(tokens=[1, 2], epoch=3, needs_reset=False)
+        got = await asyncio.wait_for(orchestrator.next_token(session, 0.0, 1.0, 0, None), 2)
+        await orchestrator.close()
+        return got
+
+    assert asyncio.run(scenario()) == 7
+
+
+def test_a_replay_on_the_slow_way_still_waits_for_the_repair():
+    orchestrator = serving_pool()
+    restart_empty(orchestrator)
+    orchestrator.active = object()
+    asked = []
+
+    def handler(request):
+        asked.append(orchestrator.workers["w1"].health["epoch"])
+        return httpx.Response(200, json={"token_id": 7})
+
+    async def repair():
+        await asyncio.sleep(0.05)
+        orchestrator.workers["w1"].health = {"status": "ok", "epoch": 3}
+
+    async def scenario():
+        orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        repaired = asyncio.ensure_future(repair())
+        await orchestrator.next_token(SessionState(tokens=[1, 2], epoch=3, needs_reset=True), 0.0, 1.0, 0, None)
+        await repaired
+        await orchestrator.close()
+
+    asyncio.run(scenario())
+    assert asked == [3]
