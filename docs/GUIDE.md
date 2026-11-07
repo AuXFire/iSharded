@@ -2005,7 +2005,7 @@ Nothing applies a proposal unless the operator asks. `POST /admin/rebalance` and
 - If a stage fails to start on the new layout, the route is planned afresh, as after a failed load.
 - After one shorter loop, the next waits at least 10 minutes, so a route cannot flap.
 
-A reply on the new route matches a fresh load of that layout. It can differ from one on the old layout at near-ties, because moving a layer boundary changes where prompt rows round to BF16 (see [Precision](#precision)). Weights move only on an apply that passes its break-even, and `break_even_tokens` counts fetching only: a stage that restarts with other layers also reloads them, which it leaves out.
+Where an apply keeps the layer split and only swaps a node, replies match the old route: 6 of 6 on the emulator, every node the same CPU build. Where it moves a boundary, a reply can differ at near-ties, because moving a layer boundary changes where prompt rows round to BF16 (see [Precision](#precision)). Weights move only on an apply that passes its break-even, and `break_even_tokens` counts fetching only: a stage that restarts with other layers also reloads them, which it leaves out.
 
 ### Mixed hardware
 
