@@ -365,12 +365,16 @@ class GenerateRequest(InferRequest):
     history ends, and ``cut_token`` is the token that opens a turn, which says where
     to cut it. The entry worker works out what it can reuse by itself, so it does not
     matter which node's control plane is asking.
+
+    ``written`` is what this reply had already said when it failed. Those tokens stand,
+    and ``max_tokens`` counts only what comes after them.
     """
 
     max_tokens: int = Field(default=32, ge=1)
     stop_token_ids: list[int] = Field(default_factory=list)
     checkpoint_at: int | None = None
     cut_token: int | None = None
+    written: list[int] = Field(default_factory=list)
 
 
 class CompletionRequest(BaseModel):
