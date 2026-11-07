@@ -1510,33 +1510,44 @@ class WorkerRuntime:
             self.merge_task = asyncio.ensure_future(self._run_merge_queue())
         return await step.outcome
 
+    def _take_merge_queue(self) -> list[MergedStep]:
+        """The steps that can still run. A step from another route hears so now."""
+        waiting, self.merge_queue = self.merge_queue, []
+        steps: list[MergedStep] = []
+        for step in waiting:
+            if step.outcome.done():
+                continue
+            if step.request.epoch != self.epoch or self.gguf is None:
+                step.outcome.set_exception(epoch_error(self.epoch))
+            else:
+                steps.append(step)
+        return steps
+
+    async def _merged_results(self, steps: list[MergedStep]) -> list[Any]:
+        """Each step's answer, or the exception for it, so every waiting reply hears."""
+        try:
+            if len(steps) == 1:
+                return [await self._step_alone(steps[0].hidden, steps[0].request)]
+            if not steps:
+                return []
+            started = time.perf_counter()
+            results = await asyncio.to_thread(self._run_merged, steps)
+            self._record("compute", started)
+            for step, result in zip(steps, results):
+                if isinstance(result, dict):
+                    self.schedule_checkpoint(step.request)
+            return results
+        except StageLost as exc:
+            # One of them restarts the stage. The rest just need a replay.
+            return [exc] + [retry_error(str(exc))] * (len(steps) - 1)
+        except Exception as exc:
+            return [exc] * len(steps)
+
     async def _run_merge_queue(self) -> None:
         while self.merge_queue:
             async with self.lock:
-                steps = [step for step in self.merge_queue if not step.outcome.done()]
-                self.merge_queue = []
-                stale = [step for step in steps if step.request.epoch != self.epoch or self.gguf is None]
-                steps = [step for step in steps if step not in stale]
-                for step in stale:
-                    step.outcome.set_exception(HTTPException(status_code=409, detail=f"pipeline epoch mismatch; worker has {self.epoch}"))
-                try:
-                    if len(steps) == 1:
-                        results: list[Any] = [await self._step_alone(steps[0].hidden, steps[0].request)]
-                    elif steps:
-                        started = time.perf_counter()
-                        results = await asyncio.to_thread(self._run_merged, steps)
-                        self._record("compute", started)
-                        for step, result in zip(steps, results):
-                            if isinstance(result, dict):
-                                self.schedule_checkpoint(step.request)
-                    else:
-                        results = []
-                except StageLost as exc:
-                    # One of them restarts the stage. The rest just need a replay.
-                    results = [exc] + [HTTPException(status_code=503, detail={"retry": True, "message": str(exc)})] * (len(steps) - 1)
-                except Exception as exc:  # noqa: BLE001 - each waiting reply must hear about it
-                    results = [exc] * len(steps)
-                for step, result in zip(steps, results):
+                steps = self._take_merge_queue()
+                for step, result in zip(steps, await self._merged_results(steps)):
                     if step.outcome.done():
                         continue
                     if isinstance(result, BaseException):
@@ -1544,23 +1555,16 @@ class WorkerRuntime:
                     else:
                         step.outcome.set_result(result)
 
-    def _run_merged(self, steps: list["MergedStep"]) -> list[Any]:
+    def _run_merged(self, steps: list[MergedStep]) -> list[Any]:
         assert self.gguf is not None
         started = time.perf_counter()
         results: dict[int, Any] = {}
         ready: list[tuple[int, MergedStep, CacheEntry]] = []
         for index, step in enumerate(steps):
-            request = step.request
             try:
-                entry = self.caches.get(request.session_id) if self.assignment.start_layer == 0 else None
-                entry = entry or self._session(request)
+                ready.append((index, step, self._pass_entry(step.request)))
             except HTTPException as exc:
                 results[index] = exc
-                continue
-            if request.rollback_to is not None and entry.length > request.rollback_to:
-                self.gguf.truncate(request.rollback_to, request.slot)
-                entry.length = request.rollback_to
-            ready.append((index, step, entry))
         ready.sort(key=lambda item: item[1].request.slot)
         if ready:
             rows = np.concatenate([step.hidden[0].float().numpy() for _, step, _ in ready])
