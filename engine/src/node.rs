@@ -458,6 +458,7 @@ fn serve(inner: &Arc<Inner>, socket: TcpStream, encrypted: bool) {
     let Ok((link, frames, hello)) = accepted else {
         return;
     };
+    // Whatever happens below, the link's writer ends with this.
     match hello.role {
         Role::Local => {
             if let Some(old) = inner.local.lock().replace(link.clone()) {
@@ -466,11 +467,12 @@ fn serve(inner: &Arc<Inner>, socket: TcpStream, encrypted: bool) {
             serve_passes(inner, &link, frames, false);
         }
         Role::Hop => {
-            let Some(ring) = attach(inner, &hello, |ring| ring.back.lock().replace(link.clone())) else {
-                return;
-            };
-            serve_passes(inner, &link, frames, true);
-            ring.back.lock().take();
+            if let Some(ring) = attach(inner, &hello, |ring| ring.back.lock().replace(link.clone())) {
+                if link.limit_writes(ring.silence_timeout / 2).is_ok() {
+                    serve_passes(inner, &link, frames, true);
+                }
+                ring.back.lock().take();
+            }
         }
         Role::Closing => {
             if attach(inner, &hello, |ring| ring.entry_closing.lock().replace(link.clone())).is_some() {
@@ -491,7 +493,8 @@ fn attach(inner: &Inner, hello: &Hello, put: impl Fn(&Ring) -> Option<Arc<Link>>
 
 /// Answers a heartbeat. False means the link is finished.
 fn answer_ping(link: &Link, body: &[u8]) -> bool {
-    wire::read_beat(body).is_ok_and(|stamp| link.send(&wire::beat(Kind::Pong, stamp)).is_ok())
+    // A pong that finds no room is only a missed heartbeat.
+    wire::read_beat(body).is_ok_and(|stamp| !matches!(link.beat(&wire::beat(Kind::Pong, stamp)), Err(LinkError::Closed)))
 }
 
 /// Reads passes off a link. Taking one off is what the acknowledgement means, so a stage
@@ -503,7 +506,7 @@ fn serve_passes(inner: &Inner, link: &Link, mut frames: Frames, acknowledge: boo
                 let Ok(pass) = Pass::decode(body) else {
                     return;
                 };
-                if acknowledge && link.send(&Ack { id: pass.id }.encode()).is_err() {
+                if acknowledge && link.beat(&Ack { id: pass.id }.encode()).is_err() {
                     return;
                 }
                 enqueue(inner, pass);
@@ -564,8 +567,8 @@ fn send_back(inner: &Inner, ring: &Ring, frame: &[u8]) {
 }
 
 fn start_peer(inner: &Arc<Inner>, ring: &Arc<Ring>, peer: &Arc<Peer>) {
-    // The watcher waits behind a stuck write, so that write must fail inside the silence
-    // limit. Half leaves room for a piece that only just finished before the one that stuck.
+    // A stuck write must fail inside the silence limit, or the writer holds the link past
+    // it. Half leaves room for a piece that only just finished before the one that stuck.
     let limited = peer.link.limit_writes(ring.silence_timeout / 2);
     let reading = (inner.clone(), ring.clone(), peer.clone());
     let watching = (inner.clone(), ring.clone(), peer.clone());
@@ -622,6 +625,7 @@ fn read_peer(inner: &Inner, ring: &Ring, peer: &Peer) {
     }
 }
 
+/// Queues heartbeats and checks deadlines, and nothing here can wait on the socket.
 fn watch_peer(inner: &Inner, ring: &Ring, peer: &Peer) {
     let mut pinged = Instant::now();
     // A link with nothing to carry must still be heard from, well inside its limit.
@@ -640,10 +644,8 @@ fn watch_peer(inner: &Inner, ring: &Ring, peer: &Peer) {
         if pinged.elapsed() >= ping_every {
             pinged = Instant::now();
             let stamp = peer.born.elapsed().as_micros() as u64;
-            if peer.link.send(&wire::beat(Kind::Ping, stamp)).is_err() {
-                peer_lost(inner, ring, peer, "the link failed");
-                return;
-            }
+            // No room means the writer is stuck, and the deadlines here will say so.
+            let _ = peer.link.beat(&wire::beat(Kind::Ping, stamp));
         }
     }
 }

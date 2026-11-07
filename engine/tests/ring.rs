@@ -133,18 +133,23 @@ struct Ring {
 }
 
 fn ring(count: u16, closing: bool, delay: Duration, ack_timeout_ms: u64) -> Ring {
-    build_ring(count, closing, delay, ack_timeout_ms, None)
+    build_ring(count, closing, delay, (ack_timeout_ms, ack_timeout_ms), None)
 }
 
 /// A ring whose dial to one stage goes through a relay. Only the closing link dials stage
 /// zero, so naming stage zero puts the relay on that link.
 fn ring_through(door: usize, count: u16, closing: bool, delay: Duration, ack_timeout_ms: u64) -> (Ring, Relay) {
-    let mut ring = build_ring(count, closing, delay, ack_timeout_ms, Some(door));
+    ring_with_limits(door, count, closing, delay, (ack_timeout_ms, ack_timeout_ms))
+}
+
+/// The same, with the acknowledgement and silence limits apart.
+fn ring_with_limits(door: usize, count: u16, closing: bool, delay: Duration, limits: (u64, u64)) -> (Ring, Relay) {
+    let mut ring = build_ring(count, closing, delay, limits, Some(door));
     let relay = ring.relay.take().unwrap();
     (ring, relay)
 }
 
-fn build_ring(count: u16, closing: bool, delay: Duration, ack_timeout_ms: u64, relayed: Option<usize>) -> Ring {
+fn build_ring(count: u16, closing: bool, delay: Duration, (ack_timeout_ms, silence_timeout_ms): (u64, u64), relayed: Option<usize>) -> Ring {
     let mut nodes = vec![];
     let mut seen = vec![];
     let mut doors = vec![];
@@ -157,7 +162,7 @@ fn build_ring(count: u16, closing: bool, delay: Duration, ack_timeout_ms: u64, r
         seen.push(counter);
     }
     for (index, node) in nodes.iter().enumerate() {
-        node.open(Plan { epoch: 7, index: index as u16, count, key: KEY.to_vec(), ack_timeout_ms, silence_timeout_ms: ack_timeout_ms });
+        node.open(Plan { epoch: 7, index: index as u16, count, key: KEY.to_vec(), ack_timeout_ms, silence_timeout_ms });
     }
     let relay = relayed.map(|door| Relay::to(doors[door].port));
     let address = |at: usize| {
@@ -202,6 +207,20 @@ fn wait_until(what: &str, done: impl Fn() -> bool) {
     while !done() {
         assert!(began.elapsed() < Duration::from_secs(5), "{what} never happened");
         thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Reads refusals until the one that says a link was lost, and checks which stage it names.
+fn wait_for_loss(ring: &mut Ring, stage: u16) {
+    loop {
+        let (kind, body) = ring.frames.next().unwrap();
+        assert_eq!(kind, Kind::Nack);
+        let nack = Nack::decode(&body).unwrap();
+        assert_eq!(nack.refusal, Refusal::FailedStage);
+        if nack.id == 0 {
+            assert_eq!(nack.stage, stage);
+            return;
+        }
     }
 }
 
@@ -311,20 +330,30 @@ fn a_peer_that_stops_reading_is_lost_within_the_silence_limit() {
     for id in 2..514 {
         ring.client.send(&rows(id, 2048).encode()).unwrap();
     }
-    loop {
-        let (kind, body) = ring.frames.next().unwrap();
-        assert_eq!(kind, Kind::Nack);
-        let nack = Nack::decode(&body).unwrap();
-        assert_eq!(nack.refusal, Refusal::FailedStage);
-        if nack.id == 0 {
-            assert_eq!(nack.stage, 1);
-            break;
-        }
-    }
+    wait_for_loss(&mut ring, 1);
     // The margin is for a busy machine: one turn of the watcher and some scheduling.
     let took = began.elapsed();
     assert!(took < silence + Duration::from_millis(500), "took {took:?}");
     assert!(!ring.nodes[0].stats().next_up);
+}
+
+#[test]
+fn a_write_stuck_on_a_long_frame_does_not_hold_up_the_acknowledgement_check() {
+    // Only the acknowledgement limit can say the link is lost in time. It is longer than the
+    // gap between heartbeats, so a watcher that waits on the socket gets stuck on a heartbeat
+    // first, and sees nothing until the write limit of half the silence limit.
+    let ack = Duration::from_millis(1500);
+    let (mut ring, relay) = ring_with_limits(1, 2, false, Duration::ZERO, (ack.as_millis() as u64, 8000));
+    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+    answer(&mut ring);
+    relay.hold();
+    let began = Instant::now();
+    for id in 2..514 {
+        ring.client.send(&rows(id, 2048).encode()).unwrap();
+    }
+    wait_for_loss(&mut ring, 1);
+    let took = began.elapsed();
+    assert!(took < ack + Duration::from_millis(800), "took {took:?}");
 }
 
 #[test]
