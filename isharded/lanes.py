@@ -330,7 +330,9 @@ class LaneDoor:
                 if response.status_code != 503:
                     response.raise_for_status()
                     return str(response.json()["choices"][0]["message"]["content"])
-            except HTTPException:
+            except httpx.ReadTimeout:
+                raise  # silent for the whole wait is no change of coordinator, and ten more would take an hour
+            except (HTTPException, httpx.TransportError):
                 pass  # no coordinator this moment
             await asyncio.sleep(3.0)
             await self._look(name)

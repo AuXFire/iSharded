@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
+from fastapi import HTTPException
+import httpx
+import pytest
+
 from isharded import node as node_module
 from isharded.lanes import (
+    LANE_ASK_ATTEMPTS,
     LANE_GPU_OVERHEAD_GB,
     LANE_PORT_STEP,
+    LaneDoor,
     clean_lanes,
     lane_budgets,
     lane_url,
@@ -93,6 +100,54 @@ def test_lanes_share_what_is_spare_and_never_exceed_it() -> None:
     assert lane_budgets(spare, existing)["alpha"] == {"gpu_gb": 0.5, "ram_gb": 4.0}
     assert lane_budgets(spare, {}, gpu_gb=1.0, ram_gb=2.0)["alpha"] == {"gpu_gb": 1.0, "ram_gb": 2.0}
     assert lane_budgets({"alpha": {"gpu_gb": 0.2, "ram_gb": 0.0}}, {})["alpha"] == {"gpu_gb": 0.0, "ram_gb": 0.0}
+
+
+def door_to_a_lane(monkeypatch, *failures: Exception) -> tuple[LaneDoor, list[str]]:
+    """A door to a lane whose coordinator fails these ways before it answers."""
+    left, asked = list(failures), []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        asked.append(request.url.host)
+        if left:
+            raise left.pop(0)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "hello"}}]})
+
+    async def no_wait(_: float) -> None:
+        pass
+
+    monkeypatch.setattr("isharded.lanes.asyncio.sleep", no_wait)
+    door = LaneDoor(
+        SimpleNamespace(
+            client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            mesh=SimpleNamespace(node_id="n", lanes={}, url="http://n:1"),
+            access=SimpleNamespace(authority=None),
+            pool_token=None,
+        )
+    )
+    door.seen["a"] = {"leader_url": "http://leader", "leader": "n"}
+    return door, asked
+
+
+@pytest.mark.parametrize("failure", [httpx.ConnectError("down"), httpx.ReadError("reset"), httpx.RemoteProtocolError("cut off")], ids=["connect", "read", "protocol"])
+def test_asking_a_lane_waits_out_a_lost_coordinator(monkeypatch, failure: Exception) -> None:
+    door, asked = door_to_a_lane(monkeypatch, failure)
+    assert asyncio.run(door.ask("a", {}, None)) == "hello"
+    assert len(asked) == 2
+
+
+def test_asking_a_lane_gives_up_the_same_way_as_with_no_coordinator(monkeypatch) -> None:
+    door, asked = door_to_a_lane(monkeypatch, *[httpx.ConnectError("down") for _ in range(LANE_ASK_ATTEMPTS)])
+    with pytest.raises(HTTPException) as refused:
+        asyncio.run(door.ask("a", {}, None))
+    assert refused.value.status_code == 503
+    assert len(asked) == LANE_ASK_ATTEMPTS
+
+
+def test_a_lane_silent_for_the_whole_wait_is_not_asked_again(monkeypatch) -> None:
+    door, asked = door_to_a_lane(monkeypatch, httpx.ReadTimeout("silent"))
+    with pytest.raises(httpx.ReadTimeout):
+        asyncio.run(door.ask("a", {}, None))
+    assert len(asked) == 1
 
 
 def test_followers_learn_lanes_from_the_leader_only() -> None:
