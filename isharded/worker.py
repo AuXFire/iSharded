@@ -206,6 +206,9 @@ HOP_WATCH_SECONDS = 1.0
 HOP_SILENCE_SECONDS = RING_ACK_MS / 1000
 # Longest one address may take to prove itself and be timed.
 ADDRESS_PROBE_SECONDS = 6.0
+# What a shorter address can do wrong. A certificate failure arrives as a plain OSError,
+# and whoever has the address may answer with anything.
+LINK_FAILURES = (httpx.HTTPError, OSError, ValueError)
 # Off is for checking results against a prompt that went out whole.
 PROMPT_PARTS = os.getenv("ISHARDED_PROMPT_PARTS", "1") != "0"
 UNAVAILABLE_STATUSES = {502, 503, 504}
@@ -1285,8 +1288,19 @@ class WorkerRuntime:
         if self.hop is not None:
             self._forget_hop(self.hop)
         if url:
-            self.hop = NextHop(next_stage.worker_id, via, str(url).rstrip("/"), direct_client(self.client.auth))
-            self.hop.watch = asyncio.create_task(self._watch_hop(self.hop))
+            hop = NextHop(next_stage.worker_id, via, str(url).rstrip("/"), direct_client(self.client.auth))
+            # Any node may call this route, so its word alone must not move a stage's traffic.
+            if await self._proves(hop.client, hop.url, via, hop.worker_id):
+                self.hop = hop
+                hop.watch = asyncio.create_task(self._watch_hop(hop))
+            else:
+                await hop.client.aclose()
+
+    async def _proves(self, client: httpx.AsyncClient, url: str, via: str, worker_id: str) -> bool:
+        try:
+            return await prove(client, self.proof, url, via, worker_id, self.revoked_nodes)
+        except LINK_FAILURES:
+            return False
 
     def _hop_to(self, next_stage: StageAssignment) -> NextHop | None:
         """The shorter way to this stage. One learned for an earlier route is not it."""
@@ -1317,7 +1331,7 @@ class WorkerRuntime:
                     answer = await hop.client.post(hop.url + ECHO_PATH, headers=auth_headers(self.pool_token), extensions=hop.options, timeout=HOP_WATCH_SECONDS * 2)
                     answer.raise_for_status()
                     heard = time.monotonic()
-                except httpx.HTTPError:
+                except LINK_FAILURES:
                     if time.monotonic() - heard >= HOP_SILENCE_SECONDS:
                         self._hop_failed(hop)
         finally:
@@ -1334,7 +1348,7 @@ class WorkerRuntime:
         try:
             await asyncio.wait({sending, lost}, return_when=asyncio.FIRST_COMPLETED)
             response = sending.result() if sending.done() else None
-        except httpx.HTTPError:
+        except LINK_FAILURES:
             response = None
         finally:
             sending.cancel()
@@ -1365,13 +1379,13 @@ class WorkerRuntime:
 
         async def attempt() -> dict[str, Any]:
             async with direct_client(self.client.auth) as client:
-                if not await prove(client, self.proof, url, via, worker_id, self.revoked_nodes):
+                if not await self._proves(client, url, via, worker_id):
                     return {"proved": False}
                 return {"proved": True, **await self.time_link(client, url, sizes, rounds, extensions=reach_options(via))}
 
         try:
             return await asyncio.wait_for(attempt(), ADDRESS_PROBE_SECONDS)
-        except (asyncio.TimeoutError, httpx.HTTPError, ValueError, AttributeError):
+        except (asyncio.TimeoutError, *LINK_FAILURES):
             return {"proved": False}
 
     def _session(self, request: InferRequest) -> CacheEntry:

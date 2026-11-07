@@ -6,14 +6,18 @@ import asyncio
 import json
 from pathlib import Path
 import socket
+import ssl
+import threading
 import time
 from types import SimpleNamespace
 
 from fastapi import HTTPException
 import httpx
 import pytest
+import uvicorn
 
 from isharded import addresses as module
+from isharded import up
 from isharded import worker as worker_module
 from isharded.addresses import NodeProof, claim, host_port, prove, reach_options, reach_urls
 from isharded.node import _worker_command
@@ -153,6 +157,40 @@ def test_a_stranger_at_an_address_is_never_shown_a_credential(no_authority) -> N
     seen: list[httpx.Request] = []
     assert proved(far_end(NodeProof(TOKEN, None), "alpha-gpu", seen), NodeProof(TOKEN, None))
     assert TOKEN not in str(seen[0].headers) and TOKEN not in seen[0].content.decode()
+
+
+def serve_tls(certificate: Path, key: Path, port: int) -> uvicorn.Server:
+    server = uvicorn.Server(uvicorn.Config(worker_module.app, host="127.0.0.1", port=port, lifespan="off", log_level="error", ssl_certfile=str(certificate), ssl_keyfile=str(key)))
+    threading.Thread(target=server.run, daemon=True).start()
+    while not server.started:
+        time.sleep(0.02)
+    return server
+
+
+def test_tls_checks_the_advertised_name_and_not_the_address_dialled(tmp_path, monkeypatch) -> None:
+    folder = init_pool(str(tmp_path / "pool"))
+    monkeypatch.setenv("ISHARDED_CA_FILE", str(folder / "ca.pem"))
+    monkeypatch.delenv("ISHARDED_OWNERLESS", raising=False)
+    certificate, key = add_node(str(folder), "alpha", ["relay.example"])  # names no address the test can dial
+    caller = NodeProof(None, TicketMaker(*map(str, add_node(str(folder), "beta", ["other.example"]))))
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    url = f"https://127.0.0.1:{port}"
+    item = worker_at(monkeypatch, NodeProof(None, TicketMaker(str(certificate), str(key))))
+    item.reach_urls = [url]
+    server = serve_tls(certificate, key, port)
+
+    async def try_as(via: str) -> bool:
+        async with module.direct_client(None) as client:
+            return await prove(client, caller, url, via, "alpha-gpu", set())
+
+    try:
+        assert asyncio.run(try_as("https://relay.example:8100"))
+        with pytest.raises((httpx.ConnectError, ssl.SSLError)):  # a certificate from the pool, for another node
+            asyncio.run(try_as("https://elsewhere.example:8100"))
+    finally:
+        server.should_exit = True
 
 
 def test_a_ticket_sent_to_a_shorter_address_names_the_advertised_one(members) -> None:
@@ -418,6 +456,7 @@ def stage_at(handler, hop_handler) -> worker_module.WorkerRuntime:
     item = worker_module.WorkerRuntime.__new__(worker_module.WorkerRuntime)
     item.worker_id = "a"
     item.pool_token = TOKEN
+    item.proof, item.revoked_nodes = NodeProof(TOKEN, None), set()
     item.assignment = stage("a")
     item.route = [stage("a"), stage("b")]
     item.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -427,6 +466,11 @@ def stage_at(handler, hop_handler) -> worker_module.WorkerRuntime:
 
 def aim(item: worker_module.WorkerRuntime, monkeypatch) -> None:
     monkeypatch.setattr(worker_module, "direct_client", lambda _: httpx.AsyncClient(transport=httpx.MockTransport(item.hop_handler)))
+
+    async def proved_it(*_):
+        return True
+
+    monkeypatch.setattr(worker_module, "prove", proved_it)
 
 
 async def send(item: worker_module.WorkerRuntime) -> httpx.Response:
@@ -560,6 +604,23 @@ def test_an_address_for_an_earlier_route_is_dropped(monkeypatch) -> None:
         assert item.hop is None and item.hop_fallbacks == 0
 
     run_on_hop(item, monkeypatch, work)
+
+
+def test_a_stage_checks_for_itself_what_it_is_told(monkeypatch, no_authority) -> None:
+    item = stage_at(lambda _: httpx.Response(200), lambda _: httpx.Response(200, json={"proof": "made up"}))
+
+    async def run() -> None:
+        monkeypatch.setattr(worker_module, "direct_client", lambda _: httpx.AsyncClient(transport=httpx.MockTransport(item.hop_handler)))
+        await item.aim_hop({"worker_id": "b", "url": REUSED})
+        assert item.hop is None
+
+    asyncio.run(run())
+
+
+def test_up_keeps_the_hosts_it_was_given(tmp_path) -> None:
+    settings = {"name": "alpha", "port": 8109, "address": "10.0.0.1", "cpu_threads": 2, "reach_hosts": "10.0.0.2"}
+    assert up.node_arguments(settings, tmp_path).reach_hosts == "10.0.0.2"
+    assert up.node_arguments({**settings, "reach_hosts": None}, tmp_path).reach_hosts is None
 
 
 def test_being_told_the_old_address_ends_the_shorter_way(monkeypatch) -> None:

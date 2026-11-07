@@ -147,5 +147,8 @@ async def prove(client: httpx.AsyncClient, proof: NodeProof, url: str, via: str,
     )
     if response.status_code != 200:
         return False
-    signer = proof.signer(str(response.json().get("proof")), claim("answer", nonce, url, worker_id))
+    answer = response.json()
+    if not isinstance(answer, dict):
+        return False
+    signer = proof.signer(str(answer.get("proof")), claim("answer", nonce, url, worker_id))
     return signer == "" or (signer == node_of(worker_id) and signer not in revoked)
