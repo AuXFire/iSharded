@@ -7,7 +7,6 @@ import hashlib
 import json
 from pathlib import Path
 import threading
-import time
 from typing import Any, Iterable, Sequence
 
 import numpy as np
@@ -31,6 +30,21 @@ PIPELINE_STRETCH = 24
 DRAFT_TRIAL_TOKENS = 96
 DRAFT_MEMORY = 0.9
 FEWEST_GUESSES = 2
+
+
+def start_host(operation: str, settings: dict[str, Any]) -> StageHost:
+    """A stage process that has done this load. One that failed it does not stay."""
+    host = StageHost()
+    try:
+        host.call(operation, **settings)
+    except LlamaError:
+        host.close()
+        raise
+    return host
+
+
+def as_payload(hidden: np.ndarray) -> bytes:
+    return np.ascontiguousarray(hidden, dtype=np.float32).tobytes()
 
 
 def cpu_tensor_patterns(placements: list[UnitPlacement], pools: dict[str, MemoryPool], start: int) -> list[str]:
@@ -86,17 +100,14 @@ def build_stage_file(
         return target
 
     # A stage file is a second copy of its units, and a disk that held the units may not hold both.
-    paths = {cache.path(request.model_id, request.revision, unit) for unit in units}
-    cache.make_room(sum(path.stat().st_size for path in paths), paths)
+    paths = {unit: cache.path(request.model_id, request.revision, unit) for unit in units}
+    cache.make_room(sum(path.stat().st_size for path in paths.values()), set(paths.values()))
     owners: dict[str, Path] = {}
-    for unit in units:
-        path = cache.path(request.model_id, request.revision, unit)
+    for unit, path in paths.items():
         expected = request.unit_hashes.get(unit)
         if request.unit_hashes and (expected is None or file_sha256(path) != expected):
             raise ValueError(f"{unit} does not match its hash, so this stage cannot be built from it")
-        for name in _read_unit_header(path):
-            if name != "__metadata__":
-                owners[name] = path
+        owners.update(dict.fromkeys(_read_unit_header(path), path))
 
     def read_tensor(tensor: TensorInfo) -> Iterable[bytes]:
         return iter_unit_tensor(owners[tensor.name], tensor.name)
@@ -139,14 +150,10 @@ class GgufStage:
         self.embedding = request.embedding
         placements = assignment.placements
         units = [item.unit for item in placements if item.bytes]
-        started = time.perf_counter()
-        path = build_stage_file(
+        self.path = build_stage_file(
             cache, request, adapter.header, units, assignment.start_layer, assignment.end_layer, self.last
         )
-        self.assemble_seconds = time.perf_counter() - started
-        uses_gpu = any(pools[item.pool_id].kind in FAST_POOLS for item in placements if item.pool_id in pools)
-        self.path = path
-        self.uses_gpu = uses_gpu
+        self.uses_gpu = any(pools[item.pool_id].kind in FAST_POOLS for item in placements if item.pool_id in pools)
         table = None
         if self.first:
             holder = "embed" if "embed" in units else "head"
@@ -161,10 +168,10 @@ class GgufStage:
         self._settings = {
             "folder": folder,
             "extra_paths": list(extra_paths),
-            "path": str(path),
+            "path": str(self.path),
             "last": self.last,
             "context_tokens": request.context_tokens,
-            "gpu_layers": -1 if uses_gpu else 0,
+            "gpu_layers": -1 if self.uses_gpu else 0,
             "threads": threads,
             "cpu_tensors": cpu_tensor_patterns(placements, pools, assignment.start_layer),
             "table": table,
@@ -180,21 +187,12 @@ class GgufStage:
         }
         # The store's last report. Asking would wait behind whatever the stage is running.
         self.states: dict[str, int] = {}
-        self.host = self._start()
-
-    def _start(self) -> StageHost:
-        host = StageHost()
-        try:
-            host.call("load", **self._settings)
-        except LlamaError:
-            host.close()
-            raise
-        return host
+        self.host = start_host("load", self._settings)
 
     def respawn(self) -> None:
         """Replace a dead stage process. Its sequence and checkpoint are gone."""
         self.host.close()
-        self.host = self._start()
+        self.host = start_host("load", self._settings)
 
     def embed(self, tokens: list[int]) -> np.ndarray:
         _, data = self.host.call("embed", tokens=tokens)
@@ -215,26 +213,23 @@ class GgufStage:
         saves: list[SavePoint] | None = None,
     ) -> np.ndarray:
         """Hidden states [tokens, width] in; hidden states out, or logits at the last stage."""
-        payload = np.ascontiguousarray(hidden, dtype=np.float32).tobytes()
         where: dict[str, Any] = {} if places is None else {"places": places.tolist()}
         if cuts:
             where["cuts"] = cuts
         if saves:
             where["saves"] = [save.model_dump() for save in saves]
-        answer, data = self.host.call("forward", payload, position=position, slot=slot, **where)
+        answer, data = self.host.call("forward", as_payload(hidden), position=position, slot=slot, **where)
         self.states = answer.get("states", self.states)
         output = np.frombuffer(data, dtype=np.float32)
         return output if self.last else output.reshape(-1, self.width)
 
     def forward_many(self, hidden: np.ndarray, positions: list[int], slots: list[int]) -> np.ndarray:
         """One row per conversation, in slot order. Rows out, or logits at the last stage."""
-        payload = np.ascontiguousarray(hidden, dtype=np.float32).tobytes()
-        _, data = self.host.call("forward_many", payload, positions=positions, slots=slots)
+        _, data = self.host.call("forward_many", as_payload(hidden), positions=positions, slots=slots)
         return np.frombuffer(data, dtype=np.float32).reshape(len(slots), -1)
 
     def verify(self, hidden: np.ndarray, position: int, **sampling: Any) -> list[int]:
-        payload = np.ascontiguousarray(hidden, dtype=np.float32).tobytes()
-        return self.host.call("verify", payload, position=position, **sampling)[0]["tokens"]
+        return self.host.call("verify", as_payload(hidden), position=position, **sampling)[0]["tokens"]
 
     def truncate(self, keep: int, slot: int = 0) -> None:
         self.host.call("truncate", keep=keep, slot=slot)
@@ -296,13 +291,7 @@ class ImageEncoder:
         self.host = self._start()
 
     def _start(self) -> StageHost:
-        host = StageHost()
-        try:
-            host.call("load_projector", **self._settings)
-        except LlamaError:
-            host.close()
-            raise
-        return host
+        return start_host("load_projector", self._settings)
 
     def _restart(self) -> None:
         self.host.close()
@@ -446,29 +435,26 @@ class DraftModel:
     def __init__(
         self, folder: str, extra_paths: tuple[str, ...], path: Path, context_tokens: int, threads: int, slots: int = 1
     ) -> None:
-        self.host = StageHost()
         self.committed: dict[int, int] = {}
-        try:
-            self.host.call(
-                "load_draft",
-                folder=folder,
-                extra_paths=list(extra_paths),
-                path=str(path),
-                context_tokens=context_tokens,
-                gpu_layers=-1,
-                threads=threads,
-                slots=slots,
-            )
-        except LlamaError:
-            self.host.close()
-            raise
+        self.host = start_host(
+            "load_draft",
+            {
+                "folder": folder,
+                "extra_paths": list(extra_paths),
+                "path": str(path),
+                "context_tokens": context_tokens,
+                "gpu_layers": -1,
+                "threads": threads,
+                "slots": slots,
+            },
+        )
 
     def _commit(self, tokens: list[int], slot: int) -> None:
         if tokens:
             self.host.call("commit", tokens=tokens, position=self.committed[slot], slot=slot)
             self.committed[slot] += len(tokens)
 
-    def prepare(self, prompt: list[int], plan: "PromptPlan", slot: int = 0) -> None:
+    def prepare(self, prompt: list[int], plan: PromptPlan, slot: int = 0) -> None:
         """Catch up with a prompt, reusing and saving checkpoints like the stages do."""
         self.committed[slot] = 0
         try:

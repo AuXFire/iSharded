@@ -27,6 +27,9 @@ import numpy as np
 from .llamacpp import LlamaError, LlamaLibrary, LlamaStage, StageLost, TokenEmbedding
 from .statestore import HISTORY, PARTIAL, StateStore
 
+# What every operation answers with: fields for the reply, and any raw bytes.
+Reply = tuple[dict[str, Any], bytes]
+
 KEY_VARIABLE = "ISHARDED_STAGE_KEY"
 CONNECT_SECONDS = 60.0
 EXIT_SECONDS = 15.0
@@ -50,7 +53,7 @@ class _Host:
         self.projector: Any = None
         self.encoded: OrderedDict[str, tuple[dict[str, Any], bytes]] = OrderedDict()
 
-    def load(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+    def load(self, meta: dict[str, Any], _: bytes) -> Reply:
         self.library = LlamaLibrary.load(meta["folder"], tuple(meta["extra_paths"]))
         self.stage = LlamaStage(
             self.library,
@@ -84,22 +87,21 @@ class _Host:
                 found.row_bytes if found else 0,
                 C.cast(found.to_float, C.c_void_p).value if found and found.to_float else None,
             )
-        answer = {"hidden_size": self.stage.hidden_size, "vocab_size": self.stage.vocab_size}
-        return {**answer, "engine": self.stage.engine is not None}, b""
+        return {"hidden_size": self.stage.hidden_size, "vocab_size": self.stage.vocab_size, "engine": self.stage.engine is not None}, b""
 
-    def embed(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+    def embed(self, meta: dict[str, Any], _: bytes) -> Reply:
         if self.embedding is None:
             raise LlamaError("this stage has no embedding table")
         return {}, self.embedding.rows(meta["tokens"]).tobytes()
 
-    def pool(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+    def pool(self, meta: dict[str, Any], _: bytes) -> Reply:
         assert self.stage is not None and self.embedding is not None
         inputs = meta["inputs"]
         rows = self.embedding.rows([token for item in inputs for token in item])
         pooled = self.stage.pool(rows, [len(item) for item in inputs])
         return {"width": self.stage.output_width}, pooled.tobytes()
 
-    def forward(self, meta: dict[str, Any], payload: bytes) -> tuple[dict[str, Any], bytes]:
+    def forward(self, meta: dict[str, Any], payload: bytes) -> Reply:
         assert self.stage is not None
         hidden = np.frombuffer(payload, dtype=np.float32).reshape(-1, self.stage.hidden_size)
         places = meta.get("places")
@@ -120,21 +122,21 @@ class _Host:
         if kept and save.get("replaces"):
             self.states.drop(save["replaces"])
 
-    def forward_many(self, meta: dict[str, Any], payload: bytes) -> tuple[dict[str, Any], bytes]:
+    def forward_many(self, meta: dict[str, Any], payload: bytes) -> Reply:
         assert self.stage is not None
         hidden = np.frombuffer(payload, dtype=np.float32).reshape(-1, self.stage.hidden_size)
         return {}, self.stage.forward_many(hidden, meta["positions"], meta["slots"]).tobytes()
 
-    def clear(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+    def clear(self, meta: dict[str, Any], _: bytes) -> Reply:
         assert self.stage is not None
         self.stage.clear(meta.get("slot"))
         return {}, b""
 
-    def save(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+    def save(self, meta: dict[str, Any], _: bytes) -> Reply:
         self._keep(meta, meta.get("slot", 0))
         return {"states": self.states.stats()}, b""
 
-    def restore(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+    def restore(self, meta: dict[str, Any], _: bytes) -> Reply:
         assert self.stage is not None
         held = self.states.get(meta["key"])
         if held is None:
@@ -142,40 +144,40 @@ class _Host:
         self.stage.restore_state(held[0], meta.get("slot", 0))
         return {"tier": held[1], "states": self.states.stats()}, b""
 
-    def state_stats(self, _: dict[str, Any], __: bytes) -> tuple[dict[str, Any], bytes]:
+    def state_stats(self, _: dict[str, Any], __: bytes) -> Reply:
         return {"states": self.states.stats()}, b""
 
-    def state_list(self, _: dict[str, Any], __: bytes) -> tuple[dict[str, Any], bytes]:
+    def state_list(self, _: dict[str, Any], __: bytes) -> Reply:
         return {"states": self.states.listing()}, b""
 
-    def state_has(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+    def state_has(self, meta: dict[str, Any], _: bytes) -> Reply:
         return {"held": self.states.has(meta["key"])}, b""
 
-    def state_adopt(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+    def state_adopt(self, meta: dict[str, Any], _: bytes) -> Reply:
         """Take a state the worker fetched into this store's folder from another node."""
         folder = self.states.folder
         if folder is None:
             return {"adopted": False}, b""
         return {"adopted": self.states.adopt(meta["key"], folder / (meta["key"] + PARTIAL))}, b""
 
-    def commit(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+    def commit(self, meta: dict[str, Any], _: bytes) -> Reply:
         assert self.stage is not None
         self.stage.decode_tokens(meta["tokens"], meta["position"], sequence_id=meta.get("slot", 0))
         return {}, b""
 
-    def truncate(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+    def truncate(self, meta: dict[str, Any], _: bytes) -> Reply:
         assert self.stage is not None
         self.stage.truncate(meta["keep"], meta.get("slot", 0))
         return {}, b""
 
-    def verify(self, meta: dict[str, Any], payload: bytes) -> tuple[dict[str, Any], bytes]:
+    def verify(self, meta: dict[str, Any], payload: bytes) -> Reply:
         assert self.stage is not None
         hidden = np.frombuffer(payload, dtype=np.float32).reshape(-1, self.stage.hidden_size)
         sampling = {key: meta[key] for key in ("guesses", "temperature", "top_p", "top_k", "seed")}
         sampling["slot"] = meta.get("slot", 0)
         return {"tokens": self.stage.verify(hidden, meta["position"], **sampling)}, b""
 
-    def load_draft(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+    def load_draft(self, meta: dict[str, Any], _: bytes) -> Reply:
         self.library = LlamaLibrary.load(meta["folder"], tuple(meta["extra_paths"]))
         self.stage = LlamaStage(
             self.library,
@@ -192,18 +194,18 @@ class _Host:
         self.states = StateStore(None, DRAFT_STATE_BYTES, 0)
         return {}, b""
 
-    def load_projector(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+    def load_projector(self, meta: dict[str, Any], _: bytes) -> Reply:
         from .mtmd import Projector
 
         self.library = LlamaLibrary.load(meta["folder"], tuple(meta["extra_paths"]))
         self.projector = Projector(self.library, meta["projector"], meta["stage"], meta["width"], meta["threads"], meta["use_gpu"])
         return {}, b""
 
-    def measure_image(self, _: dict[str, Any], payload: bytes) -> tuple[dict[str, Any], bytes]:
+    def measure_image(self, _: dict[str, Any], payload: bytes) -> Reply:
         shape = self.projector.measure(payload)
         return {"rows": shape.rows, "span": shape.span}, b""
 
-    def encode_image(self, meta: dict[str, Any], payload: bytes) -> tuple[dict[str, Any], bytes]:
+    def encode_image(self, meta: dict[str, Any], payload: bytes) -> Reply:
         digest = meta["digest"]
         if digest not in self.encoded:
             shape, rows = self.projector.encode(payload)
@@ -213,7 +215,7 @@ class _Host:
             self.encoded.popitem(last=False)
         return self.encoded[digest]
 
-    def guess(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+    def guess(self, meta: dict[str, Any], _: bytes) -> Reply:
         assert self.stage is not None
         tokens = self.stage.guess(meta["commit"], meta["position"], meta["count"], meta.get("slot", 0), self.scratch)
         return {"tokens": tokens}, b""
@@ -222,24 +224,24 @@ class _Host:
     def engine(self) -> Any:
         return None if self.stage is None else self.stage.engine
 
-    def ring_open(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+    def ring_open(self, meta: dict[str, Any], _: bytes) -> Reply:
         if self.engine is None:
             return {"engine": False}, b""
         door = self.engine.listen(meta["host"], meta["port"])
         self.engine.open(meta["epoch"], meta["index"], meta["count"], bytes.fromhex(meta["key"]), meta["ack_timeout_ms"], meta["silence_timeout_ms"])
         return {"engine": True, **door}, b""
 
-    def ring_connect(self, meta: dict[str, Any], _: bytes) -> tuple[dict[str, Any], bytes]:
+    def ring_connect(self, meta: dict[str, Any], _: bytes) -> Reply:
         assert self.engine is not None
         self.engine.connect(meta["links"])
         return {}, b""
 
-    def ring_close(self, _: dict[str, Any], __: bytes) -> tuple[dict[str, Any], bytes]:
+    def ring_close(self, _: dict[str, Any], __: bytes) -> Reply:
         if self.engine is not None:
             self.engine.close_ring()
         return {}, b""
 
-    def ring_stats(self, _: dict[str, Any], __: bytes) -> tuple[dict[str, Any], bytes]:
+    def ring_stats(self, _: dict[str, Any], __: bytes) -> Reply:
         return ({} if self.engine is None else self.engine.stats()), b""
 
 
@@ -302,7 +304,7 @@ class StageHost:
             raise LlamaError(f"the stage process did not start (exit code {self.process.poll()})")
         return accepted[0]
 
-    def _exchange(self, operation: str, payload: bytes, meta: dict[str, Any]) -> tuple[dict[str, Any], bytes]:
+    def _exchange(self, operation: str, payload: bytes, meta: dict[str, Any]) -> Reply:
         try:
             self.connection.send_bytes(json.dumps({"op": operation, **meta}).encode())
             self.connection.send_bytes(payload)
@@ -314,7 +316,7 @@ class StageHost:
             raise LlamaError(answer.get("error", "stage call failed"))
         return answer, data
 
-    def call(self, operation: str, payload: bytes = b"", **meta: Any) -> tuple[dict[str, Any], bytes]:
+    def call(self, operation: str, payload: bytes = b"", **meta: Any) -> Reply:
         with self.lock:
             return self._exchange(operation, payload, meta)
 
