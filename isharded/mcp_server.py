@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 import json
 import sys
 from typing import Any, BinaryIO
@@ -42,8 +42,17 @@ PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
+INTERNAL_ERROR = -32603
+RESOURCE_NOT_FOUND = -32002
 HEADER_MISMATCH = -32020
 UNSUPPORTED_VERSION = -32022
+# The older HTTP era ends a request's stream only with a reply, so even a cancelled one gets this.
+REQUEST_CANCELLED = -32800
+
+# Which parameter a request's Mcp-Name header mirrors.
+NAME_PARAMETERS = {"tools/call": "name", "prompts/get": "name", "resources/read": "uri"}
+# Each of these reaches the node's own API, which charges for it there.
+PAID_AT_THE_API = frozenset(NAME_PARAMETERS)
 
 
 class RpcError(Exception):
@@ -124,6 +133,64 @@ TOOLS: list[dict[str, Any]] = [
 JSON_KINDS: dict[str, tuple[type, ...]] = {"string": (str,), "integer": (int,), "number": (int, float), "boolean": (bool,)}
 
 
+def status_view(status: dict[str, Any]) -> dict[str, Any]:
+    mesh = status.get("mesh") or {}
+    return {
+        "status": status.get("status"),
+        "model": status.get("model"),
+        "epoch": status.get("epoch"),
+        "coordinator": mesh.get("leader"),
+        "nodes": mesh.get("members"),
+        "route": [stage.get("worker_id") for stage in status.get("route", [])],
+        "workers": {name: worker.get("state") for name, worker in status.get("workers", {}).items()},
+        "lanes": [{key: lane.get(key) for key in ("name", "model", "ready", "workers")} for lane in status.get("lanes", [])],
+        "tokens_per_second": (status.get("metrics") or {}).get("tokens_per_second_ema"),
+    }
+
+
+def shared_status_view(status: dict[str, Any]) -> dict[str, Any]:
+    # A member is an id and an address, and this text is made to be handed to a model.
+    return status_view(status) | {"nodes": sorted((status.get("mesh") or {}).get("members") or [])}
+
+
+def route_view(status: dict[str, Any]) -> dict[str, Any]:
+    # A stage also holds its worker's address, which a reader of the route has no need of.
+    stages = [{key: stage.get(key) for key in ("worker_id", "start_layer", "end_layer")} for stage in status.get("route", [])]
+    return {"model": status.get("model"), "epoch": status.get("epoch"), "stages": stages}
+
+
+def model_view(status: dict[str, Any]) -> dict[str, Any]:
+    # The plan also says where the files came from, which can be a path on someone's disk.
+    plan = status.get("active_plan") or {}
+    details = {key: plan.get(key) for key in ("architecture", "layers", "experts", "model_bytes")}
+    return {key: status.get(key) for key in ("model", "kind", "vision", "dimensions")} | details
+
+
+def resource(name: str, title: str, description: str) -> dict[str, Any]:
+    return {"uri": f"isharded://mesh/{name}", "name": name, "title": title, "description": description, "mimeType": "application/json"}
+
+
+RESOURCES = [
+    resource("status", "Mesh status", "Whether the mesh can answer, what it runs, and which nodes hold which stages."),
+    resource("route", "Route", "Which worker holds which layers of the model on the main route."),
+    resource("model", "Loaded model", "What the loaded model is: its kind, whether it can see, and its size."),
+]
+RESOURCE_VIEWS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
+    "isharded://mesh/status": shared_status_view,
+    "isharded://mesh/route": route_view,
+    "isharded://mesh/model": model_view,
+}
+HEALTH_PROMPT = "mesh_health"
+PROMPTS = [
+    {
+        "name": HEALTH_PROMPT,
+        "title": "Check the mesh",
+        "description": "The mesh's status as it is now, with a request to say in plain words whether it is healthy.",
+    }
+]
+HEALTH_REQUEST = "Here is the status of an iSharded mesh. Say in plain words whether it can answer, and name anything that looks wrong.\n\n"
+
+
 def check_arguments(schema: dict[str, Any], arguments: dict[str, Any]) -> None:
     properties = schema.get("properties", {})
     for name in schema.get("required", []):
@@ -184,20 +251,27 @@ class MeshTools:
         return as_result({"models": [item["id"] for item in reply.get("data", [])]})
 
     async def mesh_status(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        status = await self._ask("GET", "/admin/status")
-        mesh = status.get("mesh") or {}
-        summary = {
-            "status": status.get("status"),
-            "model": status.get("model"),
-            "epoch": status.get("epoch"),
-            "coordinator": mesh.get("leader"),
-            "nodes": mesh.get("members"),
-            "route": [stage.get("worker_id") for stage in status.get("route", [])],
-            "workers": {name: worker.get("state") for name, worker in status.get("workers", {}).items()},
-            "lanes": [{key: lane.get(key) for key in ("name", "model", "ready", "workers")} for lane in status.get("lanes", [])],
-            "tokens_per_second": (status.get("metrics") or {}).get("tokens_per_second_ema"),
-        }
-        return as_result(summary)
+        return as_result(status_view(await self._ask("GET", "/admin/status")))
+
+    async def _status(self) -> dict[str, Any]:
+        """The status for a resource or a prompt, which have no tool error to fail with."""
+        try:
+            return await self._ask("GET", "/admin/status")
+        except ToolFailed as exc:
+            raise RpcError(INTERNAL_ERROR, str(exc)) from exc
+
+    async def read(self, uri: str) -> dict[str, Any]:
+        view = RESOURCE_VIEWS.get(uri)
+        if view is None:
+            raise RpcError(RESOURCE_NOT_FOUND, "Resource not found", {"uri": uri})
+        text = json.dumps(view(await self._status()), ensure_ascii=False)
+        return {"contents": [{"uri": uri, "mimeType": "application/json", "text": text}]}
+
+    async def prompt(self, name: str) -> dict[str, Any]:
+        if name != HEALTH_PROMPT:
+            raise RpcError(INVALID_PARAMS, f"Unknown prompt: {name}")
+        text = HEALTH_REQUEST + json.dumps(shared_status_view(await self._status()), ensure_ascii=False)
+        return {"description": PROMPTS[0]["description"], "messages": [{"role": "user", "content": {"type": "text", "text": text}}]}
 
     async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         tool = next((tool for tool in TOOLS if tool["name"] == name), None)
@@ -223,6 +297,48 @@ def as_object(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def is_request_id(value: Any) -> bool:
+    return isinstance(value, (str, int)) and not isinstance(value, bool)
+
+
+class InFlight:
+    """The requests still running, so that a cancel can find one."""
+
+    def __init__(self) -> None:
+        self.tasks: dict[tuple[str, Any], list[asyncio.Task[Any]]] = {}
+
+    def add(self, caller: str, identifier: Any, task: asyncio.Task[Any]) -> None:
+        key = (caller, identifier)
+        self.tasks.setdefault(key, []).append(task)
+        task.add_done_callback(lambda done: self._finished(key, done))
+
+    def _finished(self, key: tuple[str, Any], task: asyncio.Task[Any]) -> None:
+        self.tasks[key].remove(task)
+        if not self.tasks[key]:
+            del self.tasks[key]
+
+    def cancel(self, caller: str, identifier: Any) -> None:
+        """A cancel is a request, and the specification lets us ignore it.
+
+        Over HTTP there are no sessions, so two clients on one key can both be using
+        the same id. Stopping the wrong one would drop its reply, so neither stops.
+        """
+        running = self.tasks.get((caller, identifier), []) if is_request_id(identifier) else []
+        if len(running) == 1:
+            running[0].cancel()
+
+    def all(self) -> list[asyncio.Task[Any]]:
+        return [task for tasks in self.tasks.values() for task in tasks]
+
+
+LISTS: dict[str, tuple[str, list[dict[str, Any]]]] = {
+    "tools/list": ("tools", TOOLS),
+    "resources/list": ("resources", RESOURCES),
+    "resources/templates/list": ("resourceTemplates", []),
+    "prompts/list": ("prompts", PROMPTS),
+}
+
+
 class McpHandler:
     """Answers JSON-RPC messages, whichever transport brought them.
 
@@ -241,7 +357,7 @@ class McpHandler:
         if "method" not in message or "id" not in message:
             return None  # a notification, or the answer to a request we never send
         identifier = message["id"]
-        if isinstance(identifier, bool) or not isinstance(identifier, (str, int)):
+        if not is_request_id(identifier):
             return RpcError(INVALID_REQUEST, "A request id is a string or a number").body(None)
         try:
             return {"jsonrpc": "2.0", "id": identifier, "result": await self._answer(message)}
@@ -264,7 +380,7 @@ class McpHandler:
             return modern_result(
                 {
                     "supportedVersions": list(SUPPORTED_VERSIONS),
-                    "capabilities": {"tools": {}},
+                    "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
                     "instructions": INSTRUCTIONS,
                     "ttlMs": TOOL_LIST_TTL_MS,
                     "cacheScope": "public",
@@ -274,20 +390,32 @@ class McpHandler:
             return {}  # removed from the modern protocol
         if not modern and not self.ready:
             raise RpcError(INVALID_REQUEST, "Send initialize first, or name a protocol version in _meta")
-        if method == "tools/list":
-            result = self._list_tools(params, modern)
+        if method in LISTS:
+            result = self._list(LISTS[method], params, modern)
         elif method == "tools/call":
             result = await self._call_tool(params)
+        elif method == "resources/read":
+            result = await self.tools.read(self._named(params, "uri", method))
+        elif method == "prompts/get":
+            result = await self.tools.prompt(self._named(params, "name", method))
         else:
             raise RpcError(METHOD_NOT_FOUND, f"Method not found: {method}")
         return modern_result(result) if modern else result
 
     @staticmethod
-    def _list_tools(params: dict[str, Any], modern: bool) -> dict[str, Any]:
+    def _named(params: dict[str, Any], key: str, method: str) -> str:
+        value = params.get(key)
+        if not isinstance(value, str):
+            raise RpcError(INVALID_PARAMS, f"{method} needs a {key}")
+        return value
+
+    @staticmethod
+    def _list(kind: tuple[str, list[dict[str, Any]]], params: dict[str, Any], modern: bool) -> dict[str, Any]:
+        key, items = kind
         if params.get("cursor") is not None:
-            raise RpcError(INVALID_PARAMS, "Invalid cursor: there is only one page of tools")
+            raise RpcError(INVALID_PARAMS, f"Invalid cursor: there is only one page of {key}")
         # The caller's key decides who sees this, so nothing shared may keep it.
-        return {"tools": TOOLS, "ttlMs": TOOL_LIST_TTL_MS, "cacheScope": "private"} if modern else {"tools": TOOLS}
+        return {key: items, "ttlMs": TOOL_LIST_TTL_MS, "cacheScope": "private"} if modern else {key: items}
 
     async def _call_tool(self, params: dict[str, Any]) -> dict[str, Any]:
         name, arguments = params.get("name"), params.get("arguments", {})
@@ -305,7 +433,7 @@ class McpHandler:
         return {
             # Anything unknown gets our own choice, and the client decides whether it can use that.
             "protocolVersion": requested if requested in LEGACY_VERSIONS else LEGACY_VERSIONS[0],
-            "capabilities": {"tools": {"listChanged": False}},
+            "capabilities": {"tools": {"listChanged": False}, "resources": {"listChanged": False}, "prompts": {"listChanged": False}},
             "serverInfo": SERVER_INFO,
             "instructions": INSTRUCTIONS,
         }
@@ -321,6 +449,13 @@ def header_value(value: str) -> str:
     return value
 
 
+def as_header(value: str) -> str:
+    """What ``header_value`` reads back."""
+    if value.isascii() and value.isprintable() and value == value.strip():
+        return value
+    return "=?base64?" + base64.b64encode(value.encode("utf-8")).decode("ascii") + "?="
+
+
 def check_modern_headers(headers: Mapping[str, str], message: dict[str, Any], version: str) -> None:
     """Modern headers mirror the body, so whatever routes on one cannot be told another story."""
     params = as_object(message.get("params"))
@@ -329,8 +464,12 @@ def check_modern_headers(headers: Mapping[str, str], message: dict[str, Any], ve
         raise RpcError(HEADER_MISMATCH, f"Header mismatch: MCP-Protocol-Version is {version}, and _meta says {claimed}")
     if headers.get("mcp-method") != message.get("method"):
         raise RpcError(HEADER_MISMATCH, f"Header mismatch: Mcp-Method does not match the method {message.get('method')}")
-    if message.get("method") == "tools/call" and header_value(headers.get("mcp-name", "")) != params.get("name"):
-        raise RpcError(HEADER_MISMATCH, f"Header mismatch: Mcp-Name does not match the tool {params.get('name')}")
+    named = NAME_PARAMETERS.get(str(message.get("method")))
+    if named and header_value(headers.get("mcp-name", "")) != params.get(named):
+        raise RpcError(HEADER_MISMATCH, f"Header mismatch: Mcp-Name does not match the {named} {params.get(named)}")
+
+
+HTTP_REQUESTS = InFlight()
 
 
 def accepts_both(accept: str) -> bool:
@@ -345,12 +484,57 @@ def http_status(reply: dict[str, Any], modern: bool) -> int:
     return 404 if modern and code == METHOD_NOT_FOUND else 200
 
 
+async def client_left(receive: Callable[[], Awaitable[dict[str, Any]]]) -> None:
+    while (await receive())["type"] != "http.disconnect":
+        pass
+
+
+async def answer_cancellably(
+    handler: McpHandler, message: dict[str, Any], caller: str, modern: bool, receive: Callable[[], Awaitable[dict[str, Any]]] | None
+) -> tuple[int, dict[str, Any] | None]:
+    """Answer a request while a cancel can still reach it.
+
+    Each era cancels its own way. The older one posts notifications/cancelled, and
+    says a dropped connection is not a cancel. The modern one closes the connection,
+    and that is its only signal.
+    """
+    identifier = message["id"]
+    work = asyncio.create_task(handler.handle(message))
+    if is_request_id(identifier):
+        HTTP_REQUESTS.add(caller, identifier, work)
+    watch = asyncio.create_task(client_left(receive)) if modern and receive else None
+    try:
+        await asyncio.wait({work, watch} if watch else {work}, return_when=asyncio.FIRST_COMPLETED)
+        if not work.done():
+            work.cancel()
+            await asyncio.wait({work})
+    except asyncio.CancelledError:  # the server is stopping, so this request stops with it
+        work.cancel()
+        raise
+    finally:
+        if watch:
+            watch.cancel()
+    if work.cancelled():
+        # The modern specification forbids a reply, and no client is left to read one.
+        return (202, None) if modern else (200, RpcError(REQUEST_CANCELLED, "Request cancelled").body(identifier))
+    reply = work.result()
+    return (202, None) if reply is None else (http_status(reply, modern), reply)
+
+
 async def answer_http(
-    handler: McpHandler, headers: Mapping[str, str], body: bytes, before: Callable[[str], None] = lambda method: None
+    handler: McpHandler,
+    headers: Mapping[str, str],
+    body: bytes,
+    before: Callable[[str], None] = lambda method: None,
+    caller: str = "",
+    receive: Callable[[], Awaitable[dict[str, Any]]] | None = None,
 ) -> tuple[int, dict[str, Any] | None]:
     """One POST to the MCP endpoint: an HTTP status, and the JSON to send, if any.
 
-    ``before`` sees each method first, and may refuse by raising.
+    ``before`` sees each method first, and may refuse by raising, except those the
+    API charges for itself. ``caller`` is who the key proved to be, since a cancel
+    reaches only that caller's own requests. ``receive`` is the ASGI channel, which
+    says when the client has gone.
     """
     if not accepts_both(headers.get("accept", "")):
         return 406, RpcError(INVALID_REQUEST, "Accept must list application/json and text/event-stream").body(None)
@@ -375,7 +559,14 @@ async def answer_http(
             check_modern_headers(headers, message, version)
         except RpcError as exc:
             return 400, exc.body(identifier)
-    before(str(message.get("method")))
+    method = str(message.get("method"))
+    if method not in PAID_AT_THE_API:
+        before(method)
+    if "id" not in message and method == "notifications/cancelled":
+        HTTP_REQUESTS.cancel(caller, as_object(message.get("params")).get("requestId"))
+        return 202, None
+    if "id" in message and "method" in message:
+        return await answer_cancellably(handler, message, caller, modern, receive)
     reply = await handler.handle(message)
     return (202, None) if reply is None else (http_status(reply, modern), reply)
 
@@ -396,7 +587,7 @@ async def serve_stdio(client: httpx.AsyncClient, source: BinaryIO, output: Binar
     """
     handler = McpHandler(MeshTools(client))
     loop = asyncio.get_running_loop()
-    running: dict[Any, asyncio.Task[None]] = {}
+    running = InFlight()
 
     async def answer(message: dict[str, Any]) -> None:
         reply = await handler.handle(message)
@@ -415,17 +606,14 @@ async def serve_stdio(client: httpx.AsyncClient, source: BinaryIO, output: Binar
             write_message(output, RpcError(PARSE_ERROR, "Parse error: a line is not JSON").body(None))
             continue
         if isinstance(message, dict) and message.get("method") == "notifications/cancelled":
-            task = running.get(as_object(message.get("params")).get("requestId"))
-            if task:
-                task.cancel()  # and it sends nothing more
+            running.cancel("", as_object(message.get("params")).get("requestId"))  # and it sends nothing more
             continue
         identifier = message.get("id") if isinstance(message, dict) else None
         task = asyncio.create_task(answer(message))
-        if identifier is not None:
-            running[identifier] = task
-            task.add_done_callback(lambda _, key=identifier: running.pop(key, None))
+        if is_request_id(identifier):
+            running.add("", identifier, task)
     # Closed input means stop soon, and a reply nearly done is still worth sending.
-    waiting = list(running.values())
+    waiting = running.all()
     if waiting:
         await asyncio.wait(waiting, timeout=STOP_GRACE_SECONDS)
     for task in waiting:

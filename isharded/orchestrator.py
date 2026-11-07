@@ -36,7 +36,7 @@ from . import audit
 from .compat import Node as CompatNode, mount as mount_compat
 from .discovery import start_beacon
 from .lanes import LaneDoor
-from .mcp_server import INVALID_REQUEST, McpHandler, MeshTools, RpcError, answer_http
+from .mcp_server import INVALID_REQUEST, PAID_AT_THE_API, McpHandler, MeshTools, RpcError, answer_http
 from .mesh import GOSSIP_SECONDS, ControlMesh
 from .models import Adapter, GgufAdapter, SUPPORTED_TYPES, UnsupportedModel, create_adapter
 from .planner import AMORTIZE_TOKENS, UNREACHABLE_LINK_MS, Candidate, ModelProfile, PlacementError, keep_layers, memory_report, plan_placement, route_network_ms, with_links
@@ -3594,19 +3594,20 @@ async def mcp_endpoint(request: Request, authorization: str | None = Header(defa
     if not origin_is_ours(request.headers.get("origin")):
         return JSONResponse(status_code=403, content=RpcError(INVALID_REQUEST, "This Origin may not use this endpoint").body(None))
     try:
-        require(authorization, ROLE_USER)
+        caller = require(authorization, ROLE_USER)
     except HTTPException as exc:
         if exc.status_code == 401:
             raise HTTPException(status_code=401, detail=exc.detail, headers={"WWW-Authenticate": "Bearer"}) from exc
         raise
 
     def charge(method: str) -> None:
-        # tools/call pays when it reaches /v1, which is enough.
-        if method != "tools/call":
+        # Whatever reaches the API pays there, which is enough.
+        if method not in PAID_AT_THE_API:
             verify_user(authorization)
 
     async with own_api(request, authorization) as client:
-        status, reply = await answer_http(McpHandler(MeshTools(client), stateless=True), request.headers, await request.body(), charge)
+        handler = McpHandler(MeshTools(client), stateless=True)
+        status, reply = await answer_http(handler, request.headers, await request.body(), charge, caller.name, request.receive)
     return Response(status_code=status) if reply is None else JSONResponse(status_code=status, content=reply)
 
 

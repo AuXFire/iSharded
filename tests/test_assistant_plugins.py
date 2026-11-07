@@ -15,7 +15,7 @@ import pytest
 from isharded.assistant import cli
 from isharded.assistant.app import Assistant
 from isharded.assistant.contracts import CallContext, Effect, ToolCall, Trust, Verdict
-from isharded.assistant.plugins import MAX_FAILURES, MAX_MEMORY_MB, MIN_MEMORY_MB, fingerprint, parse_effects, text_of
+from isharded.assistant.plugins import MAX_FAILURES, MAX_MEMORY_MB, MIN_MEMORY_MB, fingerprint, parse_effects, run_plugin_list, text_of
 
 PYTHON = sys.executable
 
@@ -416,7 +416,13 @@ SERVER = """
         if "strict" in FLAGS and method == "tools/call" and not ready:
             send({{"jsonrpc": "2.0", "id": ident, "error": {{"code": -32002, "message": "called before the handshake"}}}})
             continue
-        if method == "initialize":
+        if method == "server/discover" and "modern_only" in FLAGS:
+            send({{"jsonrpc": "2.0", "id": ident, "result": {{"supportedVersions": ["2026-07-28"], "capabilities": {{"tools": {{}}}}, "resultType": "complete"}}}})
+        elif method == "initialize" and "modern_only" in FLAGS:
+            send({{"jsonrpc": "2.0", "id": ident, "error": {{"code": -32601, "message": "there is no initialize here"}}}})
+        elif method == "initialize" and "newest_only" in FLAGS and message["params"]["protocolVersion"] != "2025-11-25":
+            send({{"jsonrpc": "2.0", "id": ident, "error": {{"code": -32602, "message": "unsupported protocol version"}}}})
+        elif method == "initialize":
             if "strict" in FLAGS:
                 import time
                 time.sleep(0.4)  # long enough for an impatient caller to get in first
@@ -440,6 +446,11 @@ SERVER = """
                 send({{"jsonrpc": "2.0", "id": ident, "result": {{"content": [{{"type": "text", "text": "it went wrong"}}], "isError": True}}}})
             elif name == "unknown":
                 send({{"jsonrpc": "2.0", "id": ident, "error": {{"code": -32602, "message": "no such tool"}}}})
+            elif name == "needs_input":
+                asks = {{"who": {{"method": "elicitation/create", "params": {{"message": "Which account?"}}}}}}
+                send({{"jsonrpc": "2.0", "id": ident, "result": {{"resultType": "input_required", "inputRequests": asks}}}})
+            elif name == "picture":
+                send({{"jsonrpc": "2.0", "id": ident, "result": {{"content": [{{"type": "image", "mimeType": "image/png", "data": "AAAA"}}]}}}})
             elif name == "ask_back":
                 send({{"jsonrpc": "2.0", "id": 900, "method": "sampling/createMessage", "params": {{}}}})
                 send({{"jsonrpc": "2.0", "method": "notifications/message", "params": {{"data": "a log line"}}}})
@@ -677,6 +688,158 @@ def test_a_new_tool_after_install_is_not_offered(assistant, mcp):
     mcp.manifest([SEARCH, tool_named("exfiltrate")])
     assert invoke(assistant, name, q="x").ok
     assert assistant.broker.capability("mcp.srv.exfiltrate") is None
+
+
+def test_a_tool_that_vanished_is_reported_and_called_no_more(assistant, mcp, capsys, home):
+    names = assistant.plugins.add(mcp.manifest([SEARCH, tool_named("other")]))
+    for name in names:
+        grant(assistant, name)
+    mcp.manifest([SEARCH])
+    assert invoke(assistant, "mcp.srv.search", q="x").ok, "the tools still there keep working"
+    assert assistant.plugins.list()[0]["drift"] == {"vanished": ["other"], "added": []}
+    assert assistant.plugins.list()[0]["enabled"] == 1
+    result = invoke(assistant, "mcp.srv.other")
+    assert not result.ok and "no longer offered" in result.output
+    assert not [message for message in mcp.seen() if message.get("method") == "tools/call" and message["params"]["name"] == "other"]
+
+
+def test_a_tool_added_since_install_is_reported_and_stays_unavailable(assistant, mcp):
+    (name,) = assistant.plugins.add(mcp.manifest())
+    grant(assistant, name)
+    mcp.manifest([SEARCH, tool_named("exfiltrate")])
+    assert invoke(assistant, name, q="x").ok
+    assert assistant.plugins.list()[0]["drift"] == {"vanished": [], "added": ["exfiltrate"]}
+    assert assistant.broker.capability("mcp.srv.exfiltrate") is None
+
+
+def test_drift_goes_in_the_audit_log_once(assistant, mcp):
+    (name,) = assistant.plugins.add(mcp.manifest())
+    grant(assistant, name)
+    mcp.manifest([SEARCH, tool_named("new")])
+    for _ in range(2):
+        invoke(assistant, name, q="x")
+        assistant.plugins._drop_session("srv")
+    rows = [row for row in assistant.audit.read(limit=500) if row["action"] == "plugin.drift"]
+    assert len(rows) == 1 and rows[0]["subject"] == "srv" and "new" in str(rows[0]["detail"])
+    assert assistant.audit.verify() is None
+
+
+def test_a_name_refused_at_install_is_not_news_later(assistant, mcp):
+    (name,) = assistant.plugins.add(mcp.manifest([SEARCH, tool_named("not a valid name")]))
+    grant(assistant, name)
+    assert invoke(assistant, name, q="x").ok
+    assert assistant.plugins.list()[0]["drift"] == {}
+
+
+def test_drift_reaches_plugin_list_in_another_process(assistant, mcp, home, capsys):
+    """Each `plugin list` is a process of its own, so memory is no way to hear of this."""
+    names = assistant.plugins.add(mcp.manifest([SEARCH, tool_named("other")]))
+    for name in names:
+        grant(assistant, name)
+    mcp.manifest([SEARCH, tool_named("new")])
+    assert invoke(assistant, "mcp.srv.search", q="x").ok
+    with Assistant(home) as later:
+        assert run_plugin_list(later, argparse.Namespace()) == 0
+    out = capsys.readouterr().out
+    assert "no longer offered: other" in out and "not offered until you install it again: new" in out
+
+
+def test_a_vanished_tool_is_said_once_across_restarts(assistant, mcp, home):
+    (name,) = assistant.plugins.add(mcp.manifest())
+    grant(assistant, name)
+    mcp.manifest([SEARCH, tool_named("new")])
+    invoke(assistant, name, q="x")
+    with Assistant(home) as later:
+        grant(later, name)
+        assert invoke(later, name, q="x").ok
+        later.plugins.close()
+    rows = [row for row in assistant.audit.read(limit=500) if row["action"] == "plugin.drift"]
+    assert len(rows) == 1
+
+
+def test_a_server_with_an_odd_identity_still_installs(assistant, tmp_path):
+    """The handshake now reads what a plugin says of itself, which it once ignored."""
+    body = """
+        import json, sys
+        for line in sys.stdin:
+            message = json.loads(line)
+            if "id" not in message:
+                continue
+            method = message["method"]
+            result = {"tools": [{"name": "search", "inputSchema": {"type": "object"}}]} if method == "tools/list" else {"protocolVersion": 7, "serverInfo": "just a name"}
+            print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+    """
+    script = tmp_path / "odd.py"
+    script.write_text(textwrap.dedent(body), encoding="utf-8")
+    manifest = tmp_path / "odd.json"
+    manifest.write_text(json.dumps({"name": "odd", "protocol": "mcp", "command": [sys.executable, str(script)]}), encoding="utf-8")
+    assert assistant.plugins.add(manifest) == ["mcp.odd.search"]
+
+
+def test_installing_again_clears_what_was_reported(assistant, mcp):
+    (name,) = assistant.plugins.add(mcp.manifest())
+    grant(assistant, name)
+    mcp.manifest([SEARCH, tool_named("new")])
+    invoke(assistant, name, q="x")
+    assistant.plugins.add(mcp.manifest([SEARCH, tool_named("new")]))
+    assert assistant.plugins.list()[0]["drift"] == {}
+    assert assistant.broker.capability("mcp.srv.new") is not None
+
+
+def test_a_changed_tool_still_turns_a_plugin_off_when_others_vanished(assistant, mcp):
+    names = assistant.plugins.add(mcp.manifest([SEARCH, tool_named("other")]))
+    for name in names:
+        grant(assistant, name)
+    mcp.manifest([{**SEARCH, "description": "Something else."}])
+    assert "changed what it claims" in invoke(assistant, "mcp.srv.search", q="x").output
+    assert assistant.plugins.list()[0]["enabled"] == 0
+
+
+def test_plugin_list_shows_what_changed_since_install(home, mcp, capsys):
+    with Assistant(home) as made:
+        (name,) = made.plugins.add(mcp.manifest([SEARCH, tool_named("gone")]))[:1]
+        made.broker.add_grant("ann", name, None, "ann")
+        mcp.manifest([SEARCH, tool_named("fresh")])
+        made.broker.invoke(ToolCall(name, {"q": "x"}), context())
+        run_plugin_list(made, None)
+    shown = capsys.readouterr().out
+    assert "no longer offered: gone" in shown and "new since install" in shown and "fresh" in shown
+
+
+def test_a_server_that_only_speaks_the_newest_era_can_be_installed(assistant, mcp):
+    (name,) = assistant.plugins.add(mcp.manifest(flags=["modern_only"]))
+    grant(assistant, name)
+    assert invoke(assistant, name, q="tea").ok
+    call = next(message for message in mcp.seen() if message.get("method") == "tools/call")
+    assert call["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
+    assert call["params"]["_meta"]["io.modelcontextprotocol/clientInfo"]["name"] == "isharded-assistant"
+
+
+def test_a_server_that_only_speaks_a_newer_older_version_can_be_installed(assistant, mcp):
+    (name,) = assistant.plugins.add(mcp.manifest(flags=["newest_only"]))
+    grant(assistant, name)
+    assert invoke(assistant, name, q="tea").ok
+
+
+def test_a_legacy_server_never_sees_the_probe(assistant, mcp):
+    """A silent one would cost the whole wait at every start."""
+    (name,) = assistant.plugins.add(mcp.manifest())
+    grant(assistant, name)
+    invoke(assistant, name, q="tea")
+    assert "server/discover" not in [message.get("method") for message in mcp.seen()]
+
+
+def test_a_tool_that_needs_input_is_a_failed_call_that_says_so(assistant, mcp):
+    (name,) = assistant.plugins.add(mcp.manifest([tool_named("needs_input")]))
+    grant(assistant, name)
+    result = invoke(assistant, name)
+    assert not result.ok and "did not finish" in result.output and "Which account?" in result.output
+
+
+def test_an_image_a_plugin_cannot_carry_is_described(assistant, mcp):
+    (name,) = assistant.plugins.add(mcp.manifest([tool_named("picture")]))
+    grant(assistant, name)
+    assert invoke(assistant, name).output == "[image content omitted: image/png, 3 bytes]"
 
 
 def test_a_server_that_will_not_start_is_refused_at_install(assistant, tmp_path):

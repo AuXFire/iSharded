@@ -14,6 +14,8 @@ import json
 import os
 from pathlib import Path
 import queue
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -23,11 +25,15 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from starlette.testclient import TestClient
+import uvicorn
 
 from isharded import cli, mcp_client, orchestrator
 from isharded.access import AccessControl, create_key
 from isharded.mcp_client import (
     SAFE_ENVIRONMENT,
+    CutOff,
+    HttpServer,
+    McpConnection,
     ServerError,
     StdioServer,
     Toolbox,
@@ -41,24 +47,31 @@ from isharded.mcp_client import (
 from isharded.mcp_server import (
     HEADER_MISMATCH,
     INVALID_PARAMS,
+    INTERNAL_ERROR,
     INVALID_REQUEST,
     LEGACY_VERSIONS,
     METHOD_NOT_FOUND,
     MODERN_VERSIONS,
+    NAME_PARAMETERS,
     PARSE_ERROR,
+    REQUEST_CANCELLED,
+    RESOURCE_NOT_FOUND,
     SERVER_KEY,
     SUPPORTED_VERSIONS,
     TOOLS,
     UNSUPPORTED_VERSION,
     VERSION_KEY,
+    InFlight,
     McpHandler,
     MeshTools,
     accepts_both,
+    as_header,
     header_value,
     serve_stdio,
 )
 from isharded.protocol import StageAssignment
 from isharded.tokenizer import ChatTokenizer
+from isharded.vision import MOST_IMAGES, chat_images
 
 ROOT = Path(__file__).resolve().parents[1]
 TEST_SERVER = Path(__file__).with_name("mcp_test_server.py")
@@ -145,7 +158,7 @@ def test_a_legacy_session_lists_and_calls_tools():
 def test_discover_says_what_is_supported_without_any_handshake():
     result = modern(handler(), "server/discover")["result"]
     assert result["supportedVersions"] == list(SUPPORTED_VERSIONS)
-    assert result["capabilities"] == {"tools": {}}
+    assert result["capabilities"] == {"tools": {}, "resources": {}, "prompts": {}}
     assert result["resultType"] == "complete"
     assert result["_meta"][SERVER_KEY]["name"] == "isharded"
     assert result["ttlMs"] > 0 and result["cacheScope"] in {"public", "private"}
@@ -191,7 +204,7 @@ def test_malformed_messages_are_named(message, code):
 
 
 def test_an_unknown_method_is_method_not_found():
-    assert rpc(ready(), "resources/list")["error"]["code"] == METHOD_NOT_FOUND == -32601
+    assert rpc(ready(), "resources/subscribe")["error"]["code"] == METHOD_NOT_FOUND == -32601
 
 
 def test_notifications_and_stray_answers_get_no_reply():
@@ -486,8 +499,8 @@ def legacy_post(site, method, params=None, identifier=1, **headers):
 def modern_post(site, method, params=None, version=MODERN, **headers):
     message = {"jsonrpc": "2.0", "id": 1, "method": method, "params": {**(params or {}), "_meta": {**META, VERSION_KEY: version}}}
     sent = {"Accept": WANTS, "MCP-Protocol-Version": version, "Mcp-Method": method}
-    if method == "tools/call":
-        sent["Mcp-Name"] = (params or {}).get("name", "")
+    if method in NAME_PARAMETERS:
+        sent["Mcp-Name"] = (params or {}).get(NAME_PARAMETERS[method], "")
     return site.client.post("/mcp", json=message, headers={**sent, **headers})
 
 
@@ -562,12 +575,12 @@ def test_an_unsupported_version_header_is_a_400_naming_what_works(site):
 
 
 def test_an_unknown_modern_method_is_a_404_with_a_json_rpc_body(site):
-    answer = modern_post(site, "resources/list")
+    answer = modern_post(site, "resources/subscribe")
     assert answer.status_code == 404 and answer.json()["error"]["code"] == METHOD_NOT_FOUND
 
 
 def test_a_legacy_unknown_method_stays_a_json_rpc_error(site):
-    answer = legacy_post(site, "resources/list", **{"MCP-Protocol-Version": "2025-11-25"})
+    answer = legacy_post(site, "resources/subscribe", **{"MCP-Protocol-Version": "2025-11-25"})
     assert answer.status_code == 200 and answer.json()["error"]["code"] == METHOD_NOT_FOUND
 
 
@@ -1047,6 +1060,10 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 async def exercise(client):
     tools = await client.list_tools()
+    resources = await client.list_resources()
+    route = await client.read_resource("isharded://mesh/route")
+    prompts = await client.list_prompts()
+    prompt = await client.get_prompt("mesh_health")
     models = await client.call_tool("list_models", {})
     bad = await client.call_tool("chat", {})
     try:
@@ -1054,7 +1071,7 @@ async def exercise(client):
         unknown = None
     except Exception as exc:
         unknown = str(exc)
-    return {"protocol": client.protocol_version, "tools": [tool.name for tool in tools.tools], "models_error": models.is_error, "bad_error": bad.is_error, "bad_text": bad.content[0].text, "unknown": unknown}
+    return {"protocol": client.protocol_version, "tools": [tool.name for tool in tools.tools], "models_error": models.is_error, "bad_error": bad.is_error, "bad_text": bad.content[0].text, "unknown": unknown, "resources": sorted(str(item.uri) for item in resources.resources), "route": route.contents[0].text, "prompts": [item.name for item in prompts.prompts], "prompt_text": prompt.messages[0].content.text}
 
 async def main():
     python, cwd, url, token_file = sys.argv[1:5]
@@ -1095,10 +1112,13 @@ def test_the_official_client_works_in_both_eras_over_both_transports(real_socket
     assert len(results) == 4
     for name, result in results.items():
         assert result["protocol"] == (MODERN if name.endswith("auto") else LEGACY_VERSIONS[0]), name
-        assert result["tools"] == ["chat", "list_models", "mesh_status"], name
+        assert result["tools"] == ["chat", "embed", "list_models", "mesh_status"], name
         assert result["models_error"] is False, name
         assert result["bad_error"] is True and "prompt is required" in result["bad_text"], name
         assert "Unknown tool" in result["unknown"], name
+        assert result["resources"] == ["isharded://mesh/model", "isharded://mesh/route", "isharded://mesh/status"], name
+        assert json.loads(result["route"])["stages"] == [], name
+        assert result["prompts"] == ["mesh_health"] and "plain words" in result["prompt_text"], name
 
 
 @needs_official
@@ -1115,3 +1135,734 @@ def test_our_client_works_with_an_official_server(tmp_path):
         assert "error" in toolbox.call("multiply", {"a": "six", "b": 7}, 30).lower()
     finally:
         server.close()
+
+
+# --- resources and prompts
+
+
+def status_with_secrets(request: httpx.Request) -> httpx.Response:
+    """What /admin/status really holds, which is more than a resource should pass on."""
+    if request.url.path != "/admin/status":
+        return fake_mesh(request)
+    stage = {"worker_id": "a-cpu", "url": "http://10.0.0.9:8301", "start_layer": 0, "end_layer": 28, "placements": [{"unit": "x"}]}
+    plan = {"architecture": "qwen3", "layers": 28, "experts": 0, "model_bytes": 1234, "mmproj": "/home/someone/projector.gguf", "draft_model": "/home/someone/draft.gguf"}
+    status = {"status": "ready", "model": "small", "kind": "chat", "vision": False, "epoch": 3, "route": [stage], "active_plan": plan, "cache_url": "http://10.0.0.9:9000"}
+    return httpx.Response(200, json=status)
+
+
+def read_resource(target: McpHandler, uri: str) -> dict:
+    return json.loads(modern(target, "resources/read", {"uri": uri})["result"]["contents"][0]["text"])
+
+
+def test_the_mesh_lists_its_resources_and_prompts_in_both_eras():
+    uris = {item["uri"] for item in modern(handler(), "resources/list")["result"]["resources"]}
+    assert uris == {"isharded://mesh/status", "isharded://mesh/route", "isharded://mesh/model"}
+    assert rpc(ready(), "resources/list")["result"]["resources"][0]["mimeType"] == "application/json"
+    assert [item["name"] for item in rpc(ready(), "prompts/list")["result"]["prompts"]] == ["mesh_health"]
+    assert rpc(ready(), "resources/templates/list")["result"] == {"resourceTemplates": []}
+    assert modern(handler(), "prompts/list")["result"]["cacheScope"] == "private"
+
+
+def test_initialize_says_resources_and_prompts_are_there():
+    capabilities = rpc(handler(), "initialize", {"protocolVersion": LEGACY_VERSIONS[0]})["result"]["capabilities"]
+    assert capabilities["resources"] == {"listChanged": False} and capabilities["prompts"] == {"listChanged": False}
+
+
+def test_a_legacy_session_cannot_read_before_it_says_hello():
+    assert rpc(handler(), "resources/read", {"uri": "isharded://mesh/status"})["error"]["code"] == INVALID_REQUEST
+
+
+def test_the_status_resource_says_what_the_tool_says_with_names_for_addresses():
+    tool = rpc(ready(), "tools/call", {"name": "mesh_status", "arguments": {}})["result"]["structuredContent"]
+    assert tool["nodes"] == {"a": "http://a"}
+    assert read_resource(handler(), "isharded://mesh/status") == {**tool, "nodes": ["a"]}
+
+
+def test_the_health_prompt_holds_no_addresses():
+    text = modern(handler(), "prompts/get", {"name": "mesh_health"})["result"]["messages"][0]["content"]["text"]
+    assert "http://a" not in text and '"nodes": ["a"]' in text
+
+
+def test_the_route_resource_names_workers_and_layers_and_no_addresses():
+    route = read_resource(handler(status_with_secrets), "isharded://mesh/route")
+    assert route == {"model": "small", "epoch": 3, "stages": [{"worker_id": "a-cpu", "start_layer": 0, "end_layer": 28}]}
+
+
+def test_the_model_resource_describes_the_model_and_no_paths():
+    model = read_resource(handler(status_with_secrets), "isharded://mesh/model")
+    assert model == {"model": "small", "kind": "chat", "vision": False, "dimensions": None, "architecture": "qwen3", "layers": 28, "experts": 0, "model_bytes": 1234}
+
+
+@pytest.mark.parametrize("uri", ["isharded://mesh/status", "isharded://mesh/route", "isharded://mesh/model"])
+def test_no_resource_passes_on_an_address_or_a_path(uri):
+    contents = modern(handler(status_with_secrets), "resources/read", {"uri": uri})["result"]["contents"][0]
+    assert contents["uri"] == uri and contents["mimeType"] == "application/json"
+    assert "10.0.0.9" not in contents["text"] and "/home/someone" not in contents["text"]
+
+
+def test_an_unknown_or_missing_resource_is_a_protocol_error():
+    assert modern(handler(), "resources/read", {"uri": "isharded://mesh/keys"})["error"]["code"] == RESOURCE_NOT_FOUND
+    assert modern(handler(), "resources/read")["error"]["code"] == INVALID_PARAMS
+
+
+def test_a_resource_says_when_the_mesh_will_not_answer():
+    def down(request):
+        raise httpx.ConnectError("refused")
+
+    error = modern(handler(down), "resources/read", {"uri": "isharded://mesh/status"})["error"]
+    assert error["code"] == INTERNAL_ERROR and "did not answer" in error["message"]
+
+
+def test_the_prompt_holds_the_status_as_it_is_now():
+    result = modern(handler(), "prompts/get", {"name": "mesh_health"})["result"]
+    (message,) = result["messages"]
+    assert message["role"] == "user" and '"coordinator": "a"' in message["content"]["text"]
+    assert modern(handler(), "prompts/get", {"name": "nothing"})["error"]["code"] == INVALID_PARAMS
+
+
+def test_resources_are_behind_the_same_keys_and_pay_once(site):
+    key = keyed(site, requests_per_minute=1)
+    assert legacy_post(site, "resources/read", {"uri": "isharded://mesh/status"}).status_code == 401
+    bearer = {"Authorization": f"Bearer {key}"}
+    assert json.loads(legacy_post(site, "resources/read", {"uri": "isharded://mesh/status"}, **bearer).json()["result"]["contents"][0]["text"])["status"] == "ready"
+    limited = legacy_post(site, "resources/read", {"uri": "isharded://mesh/status"}, **bearer).json()["error"]
+    assert limited["code"] == INTERNAL_ERROR and "429" in limited["message"]
+
+
+def test_a_resource_read_mirrors_its_uri_in_the_name_header(site):
+    uri = {"uri": "isharded://mesh/route"}
+    assert modern_post(site, "resources/read", uri).status_code == 200
+    answer = modern_post(site, "resources/read", uri, **{"Mcp-Name": "isharded://mesh/status"})
+    assert answer.status_code == 400 and answer.json()["error"]["code"] == HEADER_MISMATCH
+
+
+def test_a_prompt_mirrors_its_name_in_the_name_header(site):
+    assert modern_post(site, "prompts/get", {"name": "mesh_health"}).status_code == 200
+    assert modern_post(site, "prompts/get", {"name": "mesh_health"}, **{"Mcp-Name": "other"}).status_code == 400
+
+
+# --- cancelling over HTTP, on a real socket, since a mock cannot drop a connection
+
+
+@pytest.fixture
+def live(site):
+    """The real app on a real socket, with a model that stays silent until told to stop."""
+    entered, closed = threading.Event(), threading.Event()
+
+    async def silent_stream(session, *rest):
+        entered.set()
+        try:
+            await asyncio.sleep(60)
+            yield 7
+        finally:
+            closed.set()
+
+    site.node.token_stream = silent_stream
+    server = uvicorn.Server(uvicorn.Config(orchestrator.app, host="127.0.0.1", port=0, log_level="warning", lifespan="off"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 15
+    while not server.started and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert server.started
+    port = server.servers[0].sockets[0].getsockname()[1]
+    yield SimpleNamespace(site=site, port=port, url=f"http://127.0.0.1:{port}/mcp", entered=entered, closed=closed)
+    server.should_exit = True
+    thread.join(15)
+
+
+CHAT_CALL = {"name": "chat", "arguments": {"prompt": "Ping?"}}
+
+
+def legacy_call(identifier=7) -> dict:
+    return {"jsonrpc": "2.0", "id": identifier, "method": "tools/call", "params": CHAT_CALL}
+
+
+def cancel(url: str, identifier=7, **headers) -> int:
+    message = {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": identifier}}
+    return httpx.post(url, json=message, headers={"Accept": WANTS, **headers}, timeout=15, trust_env=False).status_code
+
+
+def post_in_background(url: str, message: dict, **headers) -> tuple[threading.Thread, list]:
+    replies: list = []
+
+    def run() -> None:
+        replies.append(httpx.post(url, json=message, headers={"Accept": WANTS, **headers}, timeout=30, trust_env=False))
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, replies
+
+
+def open_and_leave(live, message: dict, headers: dict) -> socket.socket:
+    """Send a request by hand, which is the only way to walk away before the reply."""
+    body = json.dumps(message).encode()
+    lines = ["POST /mcp HTTP/1.1", "Host: 127.0.0.1", "Content-Type: application/json", f"Accept: {WANTS}", f"Content-Length: {len(body)}", *(f"{key}: {value}" for key, value in headers.items())]
+    connection = socket.create_connection(("127.0.0.1", live.port), timeout=15)
+    connection.sendall("\r\n".join(lines).encode() + b"\r\n\r\n" + body)
+    assert live.entered.wait(15), "the model should have been asked"
+    return connection
+
+
+def test_a_legacy_cancel_stops_the_model_and_answers_the_request(live):
+    thread, replies = post_in_background(live.url, legacy_call())
+    assert live.entered.wait(15)
+    assert cancel(live.url) == 202
+    assert live.closed.wait(5), "the model should stop"
+    thread.join(15)
+    assert replies[0].status_code == 200
+    assert replies[0].json() == {"jsonrpc": "2.0", "id": 7, "error": {"code": REQUEST_CANCELLED, "message": "Request cancelled"}}
+    deadline = time.monotonic() + 5
+    while live.site.node.replies_in_flight and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert live.site.node.replies_in_flight == 0
+
+
+def test_a_modern_client_cancels_by_closing_the_connection(live):
+    message = {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {**CHAT_CALL, "_meta": META}}
+    connection = open_and_leave(live, message, {"MCP-Protocol-Version": MODERN, "Mcp-Method": "tools/call", "Mcp-Name": "chat"})
+    connection.close()
+    assert live.closed.wait(5), "a dropped connection is how the modern era cancels"
+
+
+def test_a_dropped_connection_is_no_cancel_in_the_older_era(live):
+    connection = open_and_leave(live, legacy_call(), {})
+    connection.close()
+    assert not live.closed.wait(1), "the older era says a dropped connection is not a cancel"
+    assert cancel(live.url) == 202
+    assert live.closed.wait(5)
+
+
+def test_one_key_cannot_cancel_what_another_asked(live):
+    site = live.site
+    path = site.tmp / "keys.json"
+    mine, theirs = create_key(str(path), "me", "user", 0), create_key(str(path), "them", "user", 0)
+    site.node.access = AccessControl.load(None, str(path))
+    thread, replies = post_in_background(live.url, legacy_call(), Authorization=f"Bearer {mine}")
+    assert live.entered.wait(15)
+    assert cancel(live.url, Authorization=f"Bearer {theirs}") == 202
+    assert not live.closed.wait(0.5), "another caller's cancel must reach nothing"
+    assert cancel(live.url, Authorization="Bearer wrong") == 401
+    assert cancel(live.url, Authorization=f"Bearer {mine}") == 202
+    assert live.closed.wait(5)
+    thread.join(15)
+
+
+def test_a_cancel_for_nothing_is_accepted_quietly(site):
+    for identifier in (99, "nothing", [1], {"a": 1}, None):
+        assert site.client.post("/mcp", json={"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": identifier}}, headers={"Accept": WANTS}).status_code == 202
+
+
+def test_when_two_requests_share_an_id_a_cancel_stops_neither():
+    async def scene() -> None:
+        running = InFlight()
+        first, second = (asyncio.create_task(asyncio.sleep(30)) for _ in range(2))
+        running.add("me", 1, first)
+        running.add("me", 1, second)
+        running.cancel("me", 1)
+        await asyncio.sleep(0)
+        assert not first.cancelled() and not second.cancelled()
+        second.cancel()
+        await asyncio.wait({second})
+        await asyncio.sleep(0)
+        running.cancel("me", 1)
+        await asyncio.wait({first})
+        assert first.cancelled() and running.all() == []
+
+    asyncio.run(scene())
+
+
+def test_stdio_survives_an_id_it_cannot_use(stdio):
+    pipes, thread = stdio(httpx.MockTransport(fake_mesh))
+    pipes.send({"jsonrpc": "2.0", "id": [1], "method": "ping"})
+    pipes.send({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": {"a": 1}}})
+    pipes.send({"jsonrpc": "2.0", "id": 2, "method": "ping"})
+    assert pipes.wait_for(2)["result"] == {}
+    pipes.incoming.put(b"")
+    thread.join(5)
+
+
+# --- mcp run over HTTP
+
+
+class FarServer:
+    """A Streamable HTTP server, written out by hand, that keeps what it was sent."""
+
+    def __init__(self, era: str = "legacy") -> None:
+        self.era = era
+        self.seen: list[tuple[str, httpx.Headers, dict | None]] = []
+
+    def reply(self, identifier, result: dict, **headers) -> httpx.Response:
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": identifier, "result": result}, headers=headers)
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        message = json.loads(request.content) if request.content else None
+        self.seen.append((request.method, request.headers, message))
+        if request.method == "DELETE" or message is None or "id" not in message or "method" not in message:
+            return httpx.Response(202)
+        identifier, method = message["id"], message["method"]
+        if method == "server/discover":
+            if self.era == "legacy":
+                return httpx.Response(400, text="Bad Request: no session")
+            return self.reply(identifier, {"supportedVersions": [MODERN], "capabilities": {"tools": {}}, "_meta": {SERVER_KEY: {"name": "far"}}, "resultType": "complete"})
+        if method == "initialize":
+            return self.reply(identifier, {"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {"name": "far"}}, **{"Mcp-Session-Id": "session-1"})
+        if method == "tools/list":
+            return self.reply(identifier, {"tools": [{"name": "search", "annotations": {"readOnlyHint": True}}, {"name": "hello wörld"}]})
+        events = [
+            {"jsonrpc": "2.0", "method": "notifications/progress", "params": {}},
+            {"jsonrpc": "2.0", "id": 99, "method": "sampling/createMessage", "params": {}},
+            {"jsonrpc": "2.0", "id": identifier, "result": {"content": [{"type": "text", "text": "found"}]}},
+        ]
+        body = "".join(f"event: message\ndata: {json.dumps(event)}\n\n" for event in events).encode()
+        return httpx.Response(200, content=b": a comment\r\n\r\nnot json\n\ndata: [1]\n\n" + body, headers={"Content-Type": "text/event-stream"})
+
+    def calls(self, method: str) -> list:
+        return [(headers, message) for _, headers, message in self.seen if message and message.get("method") == method]
+
+
+def far_server(era: str = "legacy") -> tuple[FarServer, HttpServer]:
+    far = FarServer(era)
+    server = HttpServer("http://far.example/mcp", transport=httpx.MockTransport(far))
+    server.start()
+    return far, server
+
+
+def test_an_http_server_of_the_older_era_gets_a_handshake_and_a_session():
+    far, server = far_server("legacy")
+    assert server.modern_version is None and server.name == "far"
+    assert "mcp-protocol-version" not in far.calls("initialize")[0][0]
+    notified = far.calls("notifications/initialized")[0][0]
+    assert notified["mcp-session-id"] == "session-1" and notified["mcp-protocol-version"] == "2025-06-18"
+    toolbox = Toolbox([server])
+    assert toolbox.call("search", {}, 5) == "found"
+    headers, message = far.calls("tools/call")[0]
+    assert headers["mcp-session-id"] == "session-1" and headers["accept"] == "application/json, text/event-stream"
+    assert "_meta" not in message["params"]
+    server.close()
+    assert far.seen[-1][0] == "DELETE" and far.seen[-1][1]["mcp-session-id"] == "session-1"
+
+
+def test_an_http_server_of_the_current_era_gets_every_mirrored_header():
+    far, server = far_server("modern")
+    assert server.modern_version == MODERN and server.name == "far"
+    assert not far.calls("initialize")
+    Toolbox([server]).call("hello wörld", {}, 5)
+    headers, message = far.calls("tools/call")[0]
+    assert headers["mcp-protocol-version"] == MODERN and headers["mcp-method"] == "tools/call"
+    assert header_value(headers["mcp-name"]) == "hello wörld"
+    assert message["params"]["_meta"][VERSION_KEY] == MODERN
+    server.close()
+    assert far.seen[-1][0] != "DELETE", "a modern server has no session to end"
+
+
+def test_a_question_on_a_stream_is_answered_with_a_no():
+    far, server = far_server()
+    server.request("tools/call", {"name": "search", "arguments": {}}, 5)
+    answer = next(message for _, _, message in far.seen if message and message.get("id") == 99 and "error" in message)
+    assert answer["error"]["code"] == -32601
+
+
+def test_a_name_a_header_cannot_carry_goes_as_base64_and_a_plain_one_does_not():
+    assert as_header("chat") == "chat"
+    for awkward in ("héllo", " spaced", "line\nbreak"):
+        assert as_header(awkward).startswith("=?base64?") and header_value(as_header(awkward)) == awkward
+
+
+def test_an_http_server_that_refuses_a_tool_says_why():
+    def refuses(request):
+        message = json.loads(request.content)
+        return httpx.Response(400, json={"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32602, "message": "no such tool"}})
+
+    server = HttpServer("http://far.example/mcp", transport=httpx.MockTransport(refuses))
+    with pytest.raises(mcp_client.ToolRefused, match="no such tool"):
+        server.request("tools/call", {"name": "x"}, 5)
+
+
+@pytest.mark.parametrize("answer, words", [(httpx.Response(401, text="who are you"), "401"), (httpx.Response(202), "202"), (httpx.Response(307, headers={"Location": "http://elsewhere"}), "307")])
+def test_an_http_server_that_gives_no_reply_is_named(answer, words):
+    server = HttpServer("http://far.example/mcp", transport=httpx.MockTransport(lambda request: answer))
+    with pytest.raises(ServerError, match=words):
+        server.start()
+
+
+def test_a_stream_that_ends_without_a_reply_is_a_failure():
+    empty = httpx.Response(200, content=b"data: {}\n\n", headers={"Content-Type": "text/event-stream"})
+    server = HttpServer("http://far.example/mcp", transport=httpx.MockTransport(lambda request: empty))
+    with pytest.raises(ServerError, match="without answering"):
+        server.request("tools/list", {}, 5)
+
+
+def test_one_enormous_event_is_refused(monkeypatch):
+    monkeypatch.setattr(mcp_client, "MAX_LINE_BYTES", 100)
+    big = httpx.Response(200, content=b"data: " + b"x" * 500, headers={"Content-Type": "text/event-stream"})
+    server = HttpServer("http://far.example/mcp", transport=httpx.MockTransport(lambda request: big))
+    with pytest.raises(ServerError, match="larger than"):
+        server.request("tools/list", {}, 5)
+
+
+@pytest.mark.parametrize("url, words", [("http://[nonsense", "is not a URL"), ("http://host:port/mcp", "could not reach")])
+def test_a_url_that_makes_no_sense_is_said_plainly(url, words, capsys):
+    assert run_agent(agent_arguments(url)) == 1
+    assert words in capsys.readouterr().err
+
+
+def test_a_server_that_cannot_be_reached_is_named():
+    def down(request):
+        raise httpx.ConnectError("refused")
+
+    server = HttpServer("http://far.example/mcp", transport=httpx.MockTransport(down))
+    with pytest.raises(ServerError, match="could not reach"):
+        server.start()
+
+
+@pytest.fixture
+def bad_socket():
+    """A real listener that takes requests and behaves badly, as ``behave(connection)`` says."""
+    listener = socket.create_server(("127.0.0.1", 0))
+    listener.settimeout(0.1)
+    stop = threading.Event()
+
+    def serve(behave) -> None:
+        while not stop.is_set():
+            try:
+                connection, _ = listener.accept()
+            except OSError:
+                continue
+            threading.Thread(target=behave, args=(connection,), daemon=True).start()
+
+    def start(behave) -> str:
+        threading.Thread(target=serve, args=(behave,), daemon=True).start()
+        return f"http://127.0.0.1:{listener.getsockname()[1]}/mcp"
+
+    yield start
+    stop.set()
+    listener.close()
+
+
+def test_a_silent_server_on_a_real_socket_runs_out_of_time(bad_socket):
+    def silent(connection):
+        connection.recv(65536)
+        time.sleep(10)
+
+    server = HttpServer(bad_socket(silent))
+    began = time.monotonic()
+    with pytest.raises(ServerError, match="longer than 0.5"):
+        server.request("tools/list", {}, 0.5)
+    assert time.monotonic() - began < 5
+
+
+def test_a_server_that_only_drips_bytes_runs_out_of_time_too(bad_socket):
+    def drip(connection):
+        connection.recv(65536)
+        connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+        try:
+            for _ in range(200):
+                connection.sendall(b"3\r\n: x\r\n")
+                time.sleep(0.05)
+        except OSError:
+            pass
+
+    server = HttpServer(bad_socket(drip))
+    began = time.monotonic()
+    with pytest.raises(ServerError, match="longer than 0.5"):
+        server.request("tools/list", {}, 0.5)
+    assert time.monotonic() - began < 5
+
+
+class LegacyHttp(HttpServer):
+    def _probe(self):
+        return None
+
+
+@pytest.mark.parametrize("kind, version", [(HttpServer, MODERN), (LegacyHttp, None)])
+def test_our_http_client_reaches_a_real_mesh_in_both_eras(real_socket, kind, version):
+    server = kind(real_socket + "/mcp")
+    try:
+        server.start()
+        assert server.modern_version == version and server.name == "isharded"
+        toolbox = Toolbox([server])
+        assert set(toolbox.tools) == {tool["name"] for tool in TOOLS}
+        assert json.loads(toolbox.call("list_models", {}, 20)) == {"models": []}
+    finally:
+        server.close()
+
+
+def test_the_command_takes_a_url_as_a_server(real_socket, monkeypatch, capsys):
+    real = httpx.Client
+    client, asked = scripted_model([("list_models", {})], "None are loaded.")
+    monkeypatch.setattr(mcp_client.httpx, "Client", lambda **options: client if "base_url" in options else real(**options))
+    assert run_agent(agent_arguments(real_socket + "/mcp")) == 0
+    assert capsys.readouterr().out == "None are loaded.\n"
+    assert tool_results(asked) == ['{"models": []}']
+
+
+def test_a_mesh_server_and_a_stdio_server_can_work_side_by_side(real_socket, monkeypatch, capsys):
+    real = httpx.Client
+    client, asked = scripted_model([("add", {"a": 1, "b": 2}), ("list_models", {})], "Done.")
+    monkeypatch.setattr(mcp_client.httpx, "Client", lambda **options: client if "base_url" in options else real(**options))
+    assert run_agent(agent_arguments(server_command(), real_socket + "/mcp")) == 0
+    assert tool_results(asked) == ["3", '{"models": []}']
+
+
+def test_a_stdio_server_still_negotiates_down_to_a_strict_older_version(started):
+    server = started("--only-version", "2025-06-18")
+    assert server.modern_version is None and server.legacy_version == "2025-06-18"
+    assert Toolbox([server]).call("add", {"a": 1, "b": 1}, 5) == "2"
+
+
+def test_a_server_that_refuses_every_version_is_refused(started, tmp_path):
+    with pytest.raises(mcp_client.ToolRefused, match="unsupported"):
+        started("--only-version", "1999-01-01")
+
+
+# --- a reply cut off at the token limit
+
+
+def cut_model(text: str):
+    def answer(request):
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "length"}]})
+
+    return httpx.Client(transport=httpx.MockTransport(answer), base_url="http://mesh")
+
+
+def test_a_reply_cut_off_at_the_limit_is_not_passed_off_as_finished(started):
+    with pytest.raises(CutOff, match="token limit") as caught:
+        run_loop(cut_model("<think>x</think>\n\nThe answer is"), Toolbox([started()]))
+    assert caught.value.answer == "The answer is"
+
+
+def test_the_command_prints_what_it_has_and_says_it_is_not_finished(monkeypatch, capsys):
+    client = cut_model("The answer is")
+    monkeypatch.setattr(mcp_client.httpx, "Client", lambda **options: client)
+    assert run_agent(agent_arguments(server_command())) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "The answer is\n", "stdout stays for the answer alone"
+    assert "cut off" in captured.err and "--max-tokens" in captured.err
+
+
+def test_a_call_written_whole_before_the_limit_still_runs(started):
+    calls = [{"id": "call_0", "type": "function", "function": {"name": "add", "arguments": json.dumps({"a": 1, "b": 2})}}]
+    replies = [{"message": {"role": "assistant", "content": None, "tool_calls": calls}, "finish_reason": "length"}, {"message": {"role": "assistant", "content": "3"}, "finish_reason": "stop"}]
+
+    def answer(request):
+        return httpx.Response(200, json={"choices": [replies.pop(0)]})
+
+    assert run_loop(httpx.Client(transport=httpx.MockTransport(answer), base_url="http://mesh"), Toolbox([started()])) == "3"
+
+
+# --- tool names that collide
+
+
+class FakeServer(McpConnection):
+    """A server's answers, written down, for what does not need a process."""
+
+    def __init__(self, name: str, tools=(), result=None) -> None:
+        self.name = name
+        self.names = list(tools)
+        self.result = result or {}
+
+    def list_tools(self):
+        return [{"name": name} for name in self.names]
+
+    def request(self, method, params, timeout):
+        return self.result
+
+
+def test_a_renamed_tool_never_replaces_the_tool_already_there(capsys):
+    first, second = FakeServer("a", ["search", "b_search"]), FakeServer("b", ["search"])
+    toolbox = Toolbox([first, second])
+    assert set(toolbox.tools) == {"search", "b_search", "b_search_2"}
+    assert toolbox.tools["b_search"][0] is first and toolbox.tools["b_search_2"][0] is second
+    assert toolbox.tools["b_search_2"][1]["name"] == "search", "the server still hears its own name"
+    assert '"b" offers that tool as "b_search_2"' in capsys.readouterr().err
+
+
+def test_three_servers_with_one_name_all_stay(capsys):
+    servers = [FakeServer("same", ["search"]) for _ in range(3)]
+    toolbox = Toolbox(servers)
+    assert set(toolbox.tools) == {"search", "same_search", "same_search_2"}
+    assert [toolbox.tools[name][0] for name in ("search", "same_search", "same_search_2")] == servers
+
+
+def test_a_rename_is_said_in_a_way_a_tool_cannot_use_to_write_to_the_terminal(capsys):
+    Toolbox([FakeServer("a", ["x\x1b[2J"]), FakeServer("b\x1b[2J", ["x\x1b[2J"])])
+    assert "\x1b" not in capsys.readouterr().err
+
+
+# --- a tool that asks for more
+
+
+def test_a_tool_that_needs_input_gets_an_honest_refusal():
+    asks = {"who": {"method": "elicitation/create", "params": {"message": "Which account?"}}, "more": {"method": "sampling/createMessage"}}
+    server = FakeServer("a", ["pay"], {"resultType": "input_required", "inputRequests": asks, "requestState": "opaque"})
+    said = Toolbox([server]).call("pay", {}, 5)
+    assert "did not finish" in said and "Which account?" in said and "sampling/createMessage" in said
+    assert "tell the person" in said
+
+
+@pytest.mark.parametrize("asks", [None, [], {"a": "junk"}, {"a": {"params": "junk", "method": "m"}}])
+def test_a_refusal_survives_whatever_a_server_says_it_wanted(asks):
+    result = {"resultType": "input_required", "inputRequests": asks}
+    assert "did not finish" in Toolbox([FakeServer("a", ["pay"], result)]).call("pay", {}, 5)
+
+
+def test_what_a_server_asks_cannot_flood_the_model():
+    asks = {"a": {"params": {"message": "x" * 100_000}}}
+    assert len(Toolbox([FakeServer("a", ["pay"], {"resultType": "input_required", "inputRequests": asks})]).call("pay", {}, 5)) < 1000
+
+
+# --- images in tool results
+
+
+PICTURE = base64.b64encode(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR" + struct.pack(">II", 2, 2) + b"rest").decode()
+IMAGE = {"type": "image", "mimeType": "image/png", "data": PICTURE}
+
+
+def seeing_model(*replies, vision=True):
+    """A scripted mesh that also answers /v1/models."""
+    asked = []
+    remaining = list(replies)
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "small", "kind": "chat", "vision": vision}]})
+        asked.append(json.loads(request.content))
+        reply = remaining.pop(0)
+        if reply != "look":
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": reply}, "finish_reason": "stop"}]})
+        calls = [{"id": "call_0", "type": "function", "function": {"name": reply, "arguments": "{}"}}]
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": calls}, "finish_reason": "tool_calls"}]})
+
+    return httpx.Client(transport=httpx.MockTransport(answer), base_url="http://mesh"), asked
+
+
+def tool_with(*content) -> Toolbox:
+    toolbox = Toolbox([FakeServer("a", ["look"], {"content": list(content)})])
+    server, tool = toolbox.tools["look"]
+    toolbox.tools["look"] = (server, {**tool, "annotations": {"readOnlyHint": True}})
+    return toolbox
+
+
+def test_a_model_that_can_see_is_shown_a_tools_image():
+    client, asked = seeing_model("look", "It is a cat.")
+    assert run_loop(client, tool_with({"type": "text", "text": "here"}, IMAGE)) == "It is a cat."
+    messages = asked[1]["messages"]
+    assert "here" in tool_results(asked)[0] and "in the next message" in tool_results(asked)[0]
+    assert messages[-1]["role"] == "user" and "no request from the person" in messages[-1]["content"][0]["text"]
+    assert messages[-1]["content"][1] == {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{PICTURE}"}}
+    plain, images = chat_images(messages)
+    assert len(images) == 1 and len(plain) == len(messages), "the mesh itself must take this as it is"
+
+
+def test_an_image_is_shown_once_and_stays_in_the_conversation():
+    client, asked = seeing_model("look", "look", "Done.")
+    run_loop(client, tool_with(IMAGE))
+    assert sum(message["role"] == "user" and isinstance(message["content"], list) for message in asked[2]["messages"]) == 2
+
+
+def test_a_model_that_cannot_see_is_told_what_it_missed():
+    client, asked = seeing_model("look", "I cannot tell.", vision=False)
+    run_loop(client, tool_with(IMAGE))
+    said = tool_results(asked)[0]
+    assert said.startswith("[image content omitted: image/png, ") and "bytes. This model cannot see images]" in said
+    assert not any(isinstance(message["content"], list) for message in asked[1]["messages"])
+
+
+def test_a_model_the_mesh_will_not_describe_is_treated_as_blind():
+    def answer(request):
+        if request.url.path == "/v1/models":
+            return httpx.Response(500, text="no")
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "Done."}, "finish_reason": "stop"}]})
+
+    assert mcp_client.model_sees(httpx.Client(transport=httpx.MockTransport(answer), base_url="http://mesh"), "small") is False
+
+
+def test_the_mesh_is_only_asked_about_sight_if_a_tool_sends_an_image(started):
+    client, asked = scripted_model([("add", {"a": 2, "b": 3})], "It is 5.")
+    assert run_loop(client, Toolbox([started()])) == "It is 5."
+
+
+@pytest.mark.parametrize(
+    "image, words",
+    [
+        ({"type": "image", "mimeType": "image/png", "data": "!!!not base64"}, "not valid base64"),
+        ({"type": "image", "mimeType": "image/png", "data": base64.b64encode(b"just some bytes").decode()}, "not an image"),
+        ({"type": "image", "data": PICTURE}, "named no type"),
+    ],
+)
+def test_one_bad_image_does_not_end_the_run(image, words):
+    client, asked = seeing_model("look", "Done.")
+    assert run_loop(client, tool_with(image)) == "Done."
+    assert words in tool_results(asked)[0]
+    assert len(asked[1]["messages"]) == 3, "nothing for the mesh to refuse"
+
+
+def test_images_past_the_mesh_limit_are_named_and_the_rest_still_go():
+    client, asked = seeing_model("look", "Done.")
+    run_loop(client, tool_with(*[IMAGE] * (MOST_IMAGES + 1)))
+    assert tool_results(asked)[0].count("would not fit") == 1
+    plain, images = chat_images(asked[1]["messages"])
+    assert len(images) == MOST_IMAGES
+
+
+def test_without_anywhere_to_put_an_image_the_text_says_what_it_was():
+    assert result_text({"content": [IMAGE]}).startswith("[image content omitted: image/png, ")
+    assert result_text({"content": [{"type": "audio", "mimeType": "audio/wav", "data": "AAAA"}]}) == "[audio content omitted: audio/wav, 3 bytes]"
+
+
+# --- what a server says of itself, which may be anything
+
+
+class Scripted(McpConnection):
+    def __init__(self, reply) -> None:
+        self.reply = reply
+
+    def _exchange(self, method, params, timeout):
+        return self.reply(method)
+
+    def _notify(self, method):
+        pass
+
+
+@pytest.mark.parametrize(
+    "discover",
+    [
+        {"error": {"code": UNSUPPORTED_VERSION, "data": "nope"}},
+        {"result": {"supportedVersions": 5}},
+        {"result": {"_meta": "odd", "supportedVersions": "odd"}},
+    ],
+)
+def test_an_odd_handshake_means_a_legacy_server_and_no_crash(discover):
+    server = Scripted(lambda method: discover if method == "server/discover" else {"result": {"serverInfo": "just a name", "protocolVersion": 7}})
+    server.start()
+    assert server.modern_version is None and server.legacy_version == LEGACY_VERSIONS[0]
+
+
+def odd_http_server(session: str = "", version: str = "2025-11-25") -> httpx.MockTransport:
+    def answer(request: httpx.Request) -> httpx.Response:
+        message = json.loads(request.content) if request.content else {}
+        if message.get("method") == "server/discover":
+            return httpx.Response(404)
+        if "id" not in message:
+            return httpx.Response(202)
+        result = {"protocolVersion": version} if message["method"] == "initialize" else {"tools": [], "headers": dict(request.headers)}
+        return httpx.Response(200, headers=[(b"mcp-session-id", session.encode("latin-1"))] if session else [], json={"jsonrpc": "2.0", "id": message["id"], "result": result})
+
+    return httpx.MockTransport(answer)
+
+
+@pytest.mark.parametrize("options", [{"session": "café"}, {"session": "a	b"}, {"version": "café"}])
+def test_what_no_header_can_carry_is_not_sent_back(options):
+    server = HttpServer("http://x/mcp", odd_http_server(**options))
+    server.start()
+    assert server.request("tools/list", {}, 5)["tools"] == []
+    server.close()
+
+
+def test_a_body_that_could_not_be_read_cannot_write_to_a_terminal():
+    server = HttpServer("http://x/mcp", httpx.MockTransport(lambda request: httpx.Response(500, content=b"[2Jgone")))
+    with pytest.raises(ServerError) as caught:
+        server.request("tools/list", {}, 5)
+    assert "" not in str(caught.value) and "gone" in str(caught.value)
+

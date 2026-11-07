@@ -28,7 +28,7 @@ import re
 import threading
 from typing import Any
 
-from isharded.mcp_client import START_SECONDS, LineRpc, content_parts
+from isharded.mcp_client import LineRpc, content_parts, input_refusal
 
 from .contracts import CallContext, Capability, Effect, Provenance, ToolResult, Trust
 from .mind import is_person, LOCAL_USER
@@ -47,7 +47,6 @@ MAX_MEMORY_MB = 256 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_STDERR_BYTES = 64 * 1024
 MAX_SUMMARY = 200
-MCP_PROTOCOL = "2025-06-18"
 
 SCHEMA = [
     """
@@ -62,6 +61,7 @@ SCHEMA = [
         installed_at REAL NOT NULL
     );
     """,
+    "ALTER TABLE plugins ADD COLUMN drift TEXT;",
 ]
 
 
@@ -121,6 +121,7 @@ class McpSession(LineRpc):
     failure = PluginFailure
     refusal = ToolError
     ensure_ascii = True
+    client_info = {"name": "isharded-assistant", "version": "1"}
 
     def __init__(self, command: Sequence[str], cwd: str | None, env: dict[str, str], memory_mb: int) -> None:
         try:
@@ -134,10 +135,17 @@ class McpSession(LineRpc):
         return f"{method} took longer than {timeout:g} seconds"
 
     def start(self) -> None:
-        identity = {"name": "isharded-assistant", "version": "1"}
-        # We offer no sampling and no roots: a server cannot call back into a model.
-        self.request("initialize", {"protocolVersion": MCP_PROTOCOL, "capabilities": {}, "clientInfo": identity}, START_SECONDS)
-        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        """The older handshake goes first here, and the probe only after a refusal.
+
+        A server that stays silent about the probe would cost its whole wait at
+        every start, and most servers a person has installed are of that era.
+        """
+        try:
+            self._initialize()
+        except ToolError:
+            self.modern_version = self._probe()
+            if not self.modern_version:
+                raise
 
     def close(self) -> None:
         self.tree.close()
@@ -297,7 +305,7 @@ class Plugins:
             self.store.execute(
                 "INSERT INTO plugins (name, protocol, spec, enabled, failures, installed_by, installed_at) VALUES (?, ?, ?, 1, 0, ?, ?) "
                 "ON CONFLICT(name) DO UPDATE SET protocol = excluded.protocol, spec = excluded.spec, enabled = 1, failures = 0, "
-                "disabled_reason = NULL, installed_by = excluded.installed_by, installed_at = excluded.installed_at",
+                "disabled_reason = NULL, installed_by = excluded.installed_by, installed_at = excluded.installed_at, drift = NULL",  # a person has looked again
                 (name, spec["protocol"], json.dumps(spec), by, self.clock()),
             )
             self.audit.record(by, "plugin.add", name, {"protocol": spec["protocol"], "capabilities": [entry["name"] for entry in spec["capabilities"]]})
@@ -344,7 +352,7 @@ class Plugins:
 
     def list(self) -> list[dict[str, Any]]:
         rows = self.store.query("SELECT * FROM plugins ORDER BY name")
-        return [{**dict(row), "spec": json.loads(row["spec"])} for row in rows]
+        return [{**dict(row), "spec": json.loads(row["spec"]), "drift": json.loads(row["drift"] or "{}")} for row in rows]
 
     # Calling.
 
@@ -445,10 +453,30 @@ class Plugins:
             if offered.get(entry["tool"]) not in (None, entry["fingerprint"]):
                 self._disable(name, f"tool {entry['tool']} changed what it claims since it was installed, so it needs a person to look again.")
                 raise ToolChanged(entry["tool"])
+        self._note_drift(name, spec, set(offered))
+
+    def _drift(self, name: str) -> dict[str, list[str]]:
+        """What a server offers that differs from its install. It is kept in the store because `plugin list` is another process."""
+        row = self.store.one("SELECT drift FROM plugins WHERE name = ?", (name,))
+        return json.loads(row["drift"]) if row is not None and row["drift"] else {"vanished": [], "added": []}
+
+    def _note_drift(self, name: str, spec: dict[str, Any], offered: set[str]) -> None:
+        """Neither of these breaks a promise, so neither turns a plugin off. A person still ought to know."""
+        installed = {entry["tool"] for entry in spec["capabilities"]}
+        # A name we could not take at install is no news now.
+        added = sorted(tool for tool in offered - installed if TOOL_NAME.match(tool))
+        drift = {"vanished": sorted(installed - offered), "added": added}
+        if drift != self._drift(name):
+            with self.store.transaction():
+                self.store.execute("UPDATE plugins SET drift = ? WHERE name = ?", (json.dumps(drift), name))
+                self.audit.record("plugins", "plugin.drift", name, drift)
 
     def _call_mcp(self, name: str, spec: dict[str, Any], entry: dict[str, Any], arguments: dict[str, Any]) -> ToolResult:
         try:
-            result = self._session(name, spec).request("tools/call", {"name": entry["tool"], "arguments": arguments}, spec["timeout"])
+            session = self._session(name, spec)
+            if entry["tool"] in self._drift(name)["vanished"]:
+                return self._result(name, False, f"Tool {entry['tool']} is no longer offered by this server. It was there when plugin {name} was installed.")
+            result = session.request("tools/call", {"name": entry["tool"], "arguments": arguments}, spec["timeout"])
         except ToolChanged as changed:
             return self._result(name, False, f"Tool {changed} changed what it claims since it was installed, so plugin {name} is turned off.")
         except ToolError as error:
@@ -457,6 +485,8 @@ class Plugins:
             with self.lock:
                 self._drop_session(name)  # a hung or broken server is not given a second call
             raise
+        if result.get("resultType") == "input_required":
+            return self._result(name, False, input_refusal(result))
         structured = result.get("structuredContent")
         return self._result(name, not result.get("isError", False), text_of(result.get("content")), structured if isinstance(structured, dict) else {})
 
@@ -524,6 +554,10 @@ def run_plugin_list(assistant: Any, args: Any) -> int:
     for row in rows:
         state = "on" if row["enabled"] else f"off: {row['disabled_reason']}"
         print(f"{row['name']:<20} {row['protocol']:<5} {len(row['spec']['capabilities'])} capabilities  {state}")
+        if row["drift"].get("vanished"):
+            print(f"  no longer offered: {', '.join(row['drift']['vanished'])}")
+        if row["drift"].get("added"):
+            print(f"  new since install, and not offered until you install it again: {', '.join(row['drift']['added'])}")
     if not rows:
         print("No plugins.")
     return 0

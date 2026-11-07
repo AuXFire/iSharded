@@ -1,6 +1,6 @@
 """A real MCP stdio server for the tests, runnable as its own process.
 
-python mcp_test_server.py [--era legacy|modern] [--notes FILE] [--no-reply-to-discover] [--banner]
+python mcp_test_server.py [--era legacy|modern] [--notes FILE] [--no-reply-to-discover] [--banner] [--only-version VERSION]
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ def main() -> None:
     parser.add_argument("--notes", default=None)
     parser.add_argument("--silent-probe", action="store_true")
     parser.add_argument("--banner", action="store_true")
+    parser.add_argument("--only-version", default=None)
     args = parser.parse_args()
     if args.banner:
         print("Starting up, not a JSON message", flush=True)
@@ -79,8 +80,10 @@ def main() -> None:
                 send({"jsonrpc": "2.0", "id": identifier, "result": {"supportedVersions": [MODERN], "capabilities": {"tools": {}}, **extra}})
             else:
                 send({"jsonrpc": "2.0", "id": identifier, "error": {"code": -32601, "message": "Method not found"}})
+        elif method == "initialize" and args.only_version and params.get("protocolVersion") != args.only_version:
+            send({"jsonrpc": "2.0", "id": identifier, "error": {"code": -32602, "message": "unsupported protocol version"}})
         elif method == "initialize":
-            send({"jsonrpc": "2.0", "id": identifier, "result": {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "test-tools", "version": "1"}}})
+            send({"jsonrpc": "2.0", "id": identifier, "result": {"protocolVersion": args.only_version or "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "test-tools", "version": "1"}}})
         elif method == "tools/list":
             send({"jsonrpc": "2.0", "id": identifier, "result": {"tools": TOOLS, **extra}})
         elif method == "tools/call":
