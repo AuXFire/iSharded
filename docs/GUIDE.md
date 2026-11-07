@@ -379,6 +379,27 @@ The rule is that a failure must not drop a reply, and weights move only when the
 
 Times are measured on the test pool, except the stage crash, measured on a small model. In the last soak test, 405 replies finished and none were lost while processes were killed on both machines for 21 minutes. [Operating iSharded](OPERATIONS.md) has the details.
 
+A stage that hangs without dying keeps its links open, so it is watched in three ways:
+
+- **A frozen process.** The worker asks a thread in the stage process for a pulse every 2 s, and 10 quiet seconds stop the process. This starts once the model has loaded.
+- **A stuck call.** Each call to a stage has a deadline of 30 s plus 1 s a row, and past it the process is stopped. Saved states and images get the time of 600 rows, and a load has no deadline.
+- **A stuck pass on the engine.** The engine holds its own passes to the same limit, counted only while a pass holds the model. Past it, the engine refuses what is in flight and ends the process.
+
+Whichever finds it, the worker sees a lost stage, as if it had been killed: it starts another, and the reply replays. A process that will not exit is killed, killed harder, and left behind, so no reply waits on it. It keeps its memory until the system lets it go. If the new stage then cannot load, the node's stage will not restart: the node is quarantined, and the reply goes on without it.
+
+Qwen3-0.6B Q8_0 over two CPU stages on one machine, frozen 12 chunks into a reply. Each cell is the longest pause. All 64-token replies at temperature 0 matched an unbroken run:
+
+| What stopped | Which stage | One reply | Four at once |
+|---|---|---:|---:|
+| The whole process | Entry | 14.8 s | 15.1 s |
+| The whole process | Exit | 14.0 s | 20.5 s |
+| One llama.cpp thread, so a pass hangs | Entry | 35.4 s | |
+| One llama.cpp thread, so a pass hangs | Exit | 37.4 s | |
+| The whole process, and no kill works | Exit | 26.1 s | 29.1 s |
+| The whole process, and no kill works | Entry | 75.6 s | |
+
+The last row waits out the entry's 62 s limit on a pass, because a process that takes no kill leaves its local link open.
+
 ### Joining an owned network
 
 A node makes its own key and asks to join through any member. The owner approves it from their own machine.
@@ -2078,7 +2099,7 @@ Adapter tests compare every family with the reference `transformers` implementat
 | `isharded/tokenizer.py` | Tokenizing and chat templates |
 | `isharded/serving.py` | The HTTP server's limits and diagnostics |
 | `isharded/models/` | Each model family's forward pass, for safetensors models, and the GGUF model description |
-| `isharded/gguf.py`, `isharded/gguf_stage.py`, `isharded/llamacpp.py`, `isharded/llama_host.py` | GGUF parsing, stage files, the llama.cpp binding, and the stage process |
+| `isharded/gguf.py`, `isharded/gguf_stage.py`, `isharded/llamacpp.py`, `isharded/llama_host.py`, `isharded/deadlines.py` | GGUF parsing, stage files, the llama.cpp binding, the stage process, and how long a pass may take |
 | `isharded/statestore.py`, `isharded/statecopy.py` | Saved prompt states, where prompts are cut, and the copy of each on another node |
 | `isharded/weights.py` | Readers, the unit cache, and hash checks |
 | `isharded/access.py`, `isharded/pool.py`, `isharded/tickets.py`, `isharded/tls.py`, `isharded/statements.py` | Keys, certificates, signed entries, tickets, TLS, and proving who asked when a request is passed on |
@@ -2091,7 +2112,7 @@ Trust and status:
 
 - Seven machines is the most this has run on, for about two hours, so everything about larger meshes is design, not measurement. See [Scaling to many nodes](#scaling-to-many-nodes). The longest continuous soak ran under an hour. No human has audited it, and reviews by AI do not show it is free of flaws.
 - A node in the route can read prompts. It can return wrong answers too: [checking answers](#checking-answers) catches a route that disagrees with others, but not one that only misbehaves when it is not being tested, and it has been measured only with every route on one machine. Certificates limit who is in a pool. They do not make a hostile member safe.
-- The [native engine](#the-native-engine) is new. Macs with Intel chips, and Linux without glibc 2.28, get no wheel with it. Its direct links have known gaps: a closing link that goes silent can hold a reply for minutes before it replays; a stage that hangs without dying takes minutes to notice; and a route's stages share one key, so one stage can forge another's answers. Use it only among nodes you trust.
+- The [native engine](#the-native-engine) is new. Macs with Intel chips, and Linux without glibc 2.28, get no wheel with it. Its direct links have known gaps: a closing link that goes silent can hold a reply for minutes before it replays; and a route's stages share one key, so one stage can forge another's answers. Use it only among nodes you trust.
 - An owned network has an owner.
 - A network nobody owns passed 27 of 27 checks on real processes, but as three nodes on one machine, not between strangers. Identities are free, so `--joining open` lets one person run many nodes, and a low name can be ground out to win coordination. A coordinator can stall a route. Traffic is not encrypted, so run it over a network that is, such as Tailscale. Use `--joining vouched` with a quorum unless you accept all of that.
 - Several models run in lanes with fixed memory shares, and each lane adds two processes to a node. The main model's planner does not see a lane's memory, so moving layers after a failure can run a node short. Workers started with `--no-control` do not join lanes.
