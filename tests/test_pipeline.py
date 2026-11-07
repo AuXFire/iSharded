@@ -684,9 +684,20 @@ def test_a_prompt_divides_where_a_whole_prompt_would_stop() -> None:
     assert prompt_parts([], 100) == [(0, 100)]
     assert prompt_parts([], 1500) == [(0, 512), (512, 1024), (1024, 1500)]
     # A cut starts a pass of its own, so the passes after it count from the cut.
-    assert prompt_parts([700], 2000) == [(0, 512), (512, 700 + 512), (1212, 1724), (1724, 2000)]
+    assert prompt_parts([700], 2000) == [(0, 512), (512, 700), (700, 1212), (1212, 1724), (1724, 2000)]
     every = [end for _, end in prompt_parts([700], 2000)]
-    assert set(every[:-1]) <= set(pass_ends([700], 2000))
+    assert every[:-1] == pass_ends([700], 2000)
+
+
+def test_every_pass_of_a_prompt_is_a_part_of_its_own() -> None:
+    # A system prompt of 300 rows, then a long turn: the short pass before the cut goes
+    # alone, so the longest part, which every later stage waits for once, stays one pass.
+    parts = prompt_parts([300, 3700], 3704)
+    assert parts[0] == (0, 300) and parts[-1] == (3700, 3704)
+    assert max(end - first for first, end in parts) == 512
+    assert [first for first, _ in parts[1:]] == [end for _, end in parts[:-1]]
+    assert prompt_parts([300], 520) == [(0, 300), (300, 520)]
+    assert prompt_parts([], 0) == [(0, 0)]
 
 
 class Parts:

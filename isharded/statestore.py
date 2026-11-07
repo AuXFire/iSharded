@@ -110,18 +110,16 @@ def pass_ends(cuts: list[int], total: int) -> list[int]:
 
 
 def prompt_parts(cuts: list[int], total: int) -> list[tuple[int, int]]:
-    """Rows of a prompt in parts of about one pass, each ending where a pass ends anyway.
+    """Rows of a prompt in parts of one pass each, ending where a whole prompt's passes end.
 
     A part stops only where a whole prompt would have stopped, so a stage runs the same
     passes on the same rows, and the result does not depend on how the prompt went out.
+    Parts run in order along the route, so a prompt takes all its passes on one stage plus
+    the longest part once for every other stage. A short pass before a cut keeps the
+    longest part short, so it goes alone rather than with the pass after it.
     """
-    parts: list[tuple[int, int]] = []
-    first = 0
-    for end in [*pass_ends(cuts, total), total]:
-        if end - first >= PASS_ROWS or end == total:
-            parts.append((first, end))
-            first = end
-    return parts
+    edges = [0, *pass_ends(cuts, total), total]
+    return list(zip(edges, edges[1:]))
 
 
 def stage_namespace(build: str, model_id: str, revision: str, start: int, end: int, rollback_tokens: int, kv_type: str) -> str:
