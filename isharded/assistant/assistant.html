@@ -15,7 +15,7 @@
     <span class="brand"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 3h14l-2.4 5H3.6zM8 10h14l-2.4 5H5.6zM4 17h14l-2.4 5H1.6z"/></svg><span id="name">Assistant</span></span>
     <span class="who" id="who"></span>
     <div class="top-gap"></div>
-    <div role="status"><button class="state-word quiet-state" id="pill" type="button" hidden><i class="glyph" id="pill-glyph" hidden></i><span id="pill-text"></span></button></div>
+    <div role="status"><button class="state-word quiet-state" id="pill" type="button" hidden><i class="glyph" id="pill-glyph" hidden></i><span class="long-word" id="pill-text"></span><span class="short-word" id="pill-short" aria-hidden="true"></span></button></div>
     <button class="btn quiet" id="new-chat" type="button">New conversation</button>
     <button class="icon-btn" id="theme-button" type="button">
       <svg data-theme-icon="system" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor" stroke="none"/></svg>
@@ -118,7 +118,7 @@
       set: (key, value) => { try { localStorage.setItem(key, value); } catch {} },
       drop: key => { try { localStorage.removeItem(key); } catch {} },
     };
-    const state = { key: session.get('assistant-key') || '', conversation: session.get('assistant-conversation') || '', busy: false, panel: 'approvals', role: 'member', opening: 0, name: '', waiting: 0, heard: 0, lost: false, abilities: {}, titles: new Map(), needs: {}, down: new Set() };
+    const state = { key: session.get('assistant-key') || '', conversation: session.get('assistant-conversation') || '', busy: false, panel: 'approvals', role: 'member', opening: 0, name: '', waiting: 0, heard: 0, lost: false, abilities: {}, titles: new Map(), needs: {}, down: new Set(), starting: 0 };
     const ENDED = ['done', 'partial', 'failed', 'cancelled', 'missed'];
     // Each state has a shape and a word. The shape is a .glyph class in ui.css.
     const TASK_MARK = { done: 'active', partial: 'warn', failed: 'bad', cancelled: 'idle', missed: 'warn', blocked: 'warn', paused: 'warn', running: 'work', pending: 'idle' };
@@ -214,14 +214,17 @@
         mark.className = 'glyph bad';
         pill.classList.add('tone-bad');
         $('pill-text').textContent = state.heard ? `Last heard ${silent} s ago` : 'Not answering';
+        $('pill-short').textContent = state.heard ? `${silent} s ago` : 'No answer';
         document.title = `Out of date: ${name}`;
       } else if (state.waiting) {
         mark.className = 'glyph warn';
         pill.classList.add('tone-warn');
         $('pill-text').textContent = `${state.waiting} ${state.waiting === 1 ? 'needs' : 'need'} you`;
+        $('pill-short').textContent = `${state.waiting} waiting`;
         document.title = `${state.waiting} ${state.waiting === 1 ? 'needs' : 'need'} you: ${name}`;
       } else {
         $('pill-text').textContent = 'Nothing waiting';
+        $('pill-short').textContent = '';
         document.title = name;
       }
       mark.hidden = !state.lost && !state.waiting;
@@ -938,6 +941,37 @@
       ask({ title: item.goal, body: [make('p', 'card-note', tests ? `${tests}.` : 'No tests have run.'), make('pre', 'diff', shown.diff || 'No change has been made yet.')] });
     }
 
+    // POST /assistant/code/runs answers only when the run stops or is ready, which can take many
+    // minutes. A refusal comes back at once and stays in the sheet. After that the sheet closes, and
+    // the list is read again every few seconds until the start answers, so the run's state shows.
+    const RUN_WATCH_MS = 2000, RUN_REFUSAL_MS = 1500;
+    function startRun() {
+      ask({
+        title: 'Start a code run',
+        text: 'It reads that folder on this machine and runs its tests in the sandbox. Nothing is committed until you say so.',
+        fields: [
+          { key: 'repo', label: 'Folder on this machine', required: true },
+          { key: 'goal', label: 'What to change', kind: 'area', required: true },
+          { key: 'test', label: 'Test command', placeholder: 'Leave empty to find it', hint: 'Words with spaces go in quotes.' },
+        ],
+        yes: 'Start run',
+        run: async values => {
+          const test = values.test ? (values.test.match(/"[^"]*"|'[^']*'|\S+/g) || []).map(word => word.replace(/^(["'])(.*)\1$/, '$2')) : null;
+          const started = post('/assistant/code/runs', { repo: values.repo, goal: values.goal, test });
+          const early = await Promise.race([started.then(() => null, error => error), new Promise(done => setTimeout(() => done('later'), RUN_REFUSAL_MS))]);
+          if (early instanceof Error) throw early;
+          watchRun(started);
+        },
+      });
+    }
+    function watchRun(started) {
+      const runs = partNamed('runs'), timer = setInterval(() => { if (!document.hidden) readPart(runs); }, RUN_WATCH_MS);
+      state.starting += 1;
+      readPart(runs);
+      started.then(run => say(run.state === 'ready' ? 'A code run is ready for you' : 'A code run stopped'), error => say(error.message))
+        .finally(() => { clearInterval(timer); state.starting -= 1; readPart(runs); });
+    }
+
     async function readRuns(body) {
       const { runs } = await api('/assistant/code/runs');
       // A run that hit a problem part way keeps its working state, and stays there until someone resumes it.
@@ -963,7 +997,8 @@
           actions,
         });
       }));
-      if (!runs.length) body.append(note('No code runs yet. Start one with `isharded assistant code start`.'));
+      if (state.starting) body.prepend(note('A run is starting. This list is read again every few seconds until it is ready or stops.'));
+      if (!runs.length && !state.starting) body.append(note('No code runs yet. Start one here, or with `isharded assistant code start`.'));
     }
 
     // Peers. A pairing is between two owners, and each compares fingerprints with the other.
@@ -1043,7 +1078,7 @@
       { id: 'answers', title: 'Who answers', read: readAnswers, tools: [['Add a provider', addProvider], ['Change who answers', changeRoute]] },
       { id: 'skills', title: 'Skills', read: readSkills, tools: [] },
       { id: 'plugins', title: 'Plugins', read: readPlugins, tools: [['Add a plugin', addPlugin]] },
-      { id: 'runs', title: 'Code runs', read: readRuns, tools: [] },
+      { id: 'runs', title: 'Code runs', read: readRuns, tools: [['Start a run', startRun]] },
       { id: 'peers', title: 'Peers', read: readPeers, tools: [['Invite', invitePeer], ['Accept an invite', acceptPeer]] },
     ];
 

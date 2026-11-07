@@ -217,6 +217,7 @@ b { font-weight: 600; }
 .state-word.tone-warn { color: var(--warn); }
 .state-word.tone-bad { color: var(--bad); }
 .state-word.tone-work { color: var(--accent-text); }
+.state-word .short-word { display: none; }
 
 /* Buttons */
 
@@ -887,7 +888,9 @@ textarea.input { padding: var(--s-1) var(--s-2); resize: vertical; }
 
 @media (max-width: 480px) {
   .brand span { display: none; }
-  .assistant-page .top .state-word { display: none; }
+  /* The full words stay for screen readers, and the eye gets the short form. */
+  .assistant-page .top .state-word .long-word { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .assistant-page .top .state-word .short-word { display: inline; }
 }
 
 @media (pointer: coarse) {
