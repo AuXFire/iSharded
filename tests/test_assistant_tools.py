@@ -779,6 +779,16 @@ def grant_git(assistant, repo):
         grant(assistant, name, str(repo))
 
 
+def test_git_missing_is_refused_plainly(assistant, repo, monkeypatch):
+    def no_git(*args, **kwargs):
+        raise FileNotFoundError("git")
+
+    grant_git(assistant, repo)
+    monkeypatch.setattr(tools_part, "run_tree", no_git)
+    result = ask(assistant, "git.status", repo=str(repo))
+    assert not result.ok and "git is not installed." in result.output
+
+
 def test_git_status_diff_and_log(assistant, repo):
     grant_git(assistant, repo)
     (repo / "a.txt").write_text("two\n", encoding="utf-8")
