@@ -43,6 +43,7 @@ from .engine import ABI_VERSION, find_library
 from .geo import country_code
 from .inventory import ram
 from .node import add_node_arguments, detect_address, run_node
+from .optional import has_torch
 from .tls import OWN_ADDRESS, stay_on_this_machine
 from .pool import _private_link, _write_private, add_node, approve_membership, bearer_headers, home as pool_home, init_pool, request_membership, sign_entry
 from .statements import VERIFIER_LENGTH, key_verifier
@@ -550,7 +551,7 @@ def native_engine() -> tuple[bool, str]:
 def describe_gpus(settings: dict[str, Any]) -> str:
     if settings.get("no_gpu"):
         return "not used"
-    from .memory import discover_accelerators  # brings in PyTorch, which only this line needs
+    from .memory import discover_accelerators  # brings in PyTorch where it is installed
 
     try:
         found = discover_accelerators("auto")
@@ -796,6 +797,7 @@ def checks() -> list[tuple[bool, str, str]]:
         check(True, "cryptography is installed", "")
     except ImportError:
         check(False, "cryptography is missing", "pip install cryptography")
+    found.append((True, "PyTorch is installed" if has_torch() else "No PyTorch, so this node runs GGUF models only", "" if has_torch() else 'To run safetensors models too: pip install "isharded[torch]"'))
     address = detect_address()
     private = _private_link(address)
     check(True, f"This machine would advertise {address}" + (" (encrypted by Tailscale)" if private else ""), "")

@@ -29,9 +29,10 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-import torch
+import numpy as np
 
 from .inventory import ram
+from .optional import has_torch, torch
 from .protocol import MemoryPool
 
 # Share of currently free memory an automatic budget may claim.
@@ -42,6 +43,10 @@ AUTO_RAM_SHARE = 0.6
 DISK_BANDWIDTH_GBPS = 1.5
 VULKAN_PROBE_SECONDS = 30
 ASSUMED_VULKAN_GBPS = 300.0
+NVIDIA_PROBE_SECONDS = 10
+NVIDIA_QUERY = ["nvidia-smi", "--query-gpu=index,name,memory.total,memory.free,driver_version", "--format=csv,noheader,nounits"]
+# Status asks for free memory every few seconds, and starting nvidia-smi is not free.
+NVIDIA_FREE_SECONDS = 30.0
 
 
 @dataclass(slots=True)
@@ -150,7 +155,35 @@ def vulkan_accelerators() -> tuple[Accelerator, ...]:
         return ()  # no way to fetch the build, as on a closed network
 
 
+def read_nvidia_devices(run: Any = subprocess.run) -> list[Accelerator]:
+    """What the driver's own tool sees, for a node with no PyTorch to ask."""
+    try:
+        done = run(NVIDIA_QUERY, capture_output=True, text=True, timeout=NVIDIA_PROBE_SECONDS)
+        lines = done.stdout.splitlines() if done.returncode == 0 else []
+        rows = [[part.strip() for part in line.split(",")] for line in lines if line.strip()]
+        return [
+            Accelerator(f"cuda:{int(index)}", "vram", "cuda", name, int(total) * 1024**2, int(free) * 1024**2, driver)
+            for index, name, total, free, driver in rows
+        ]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []  # no driver, or a card that reports [N/A]
+
+
+@functools.lru_cache(maxsize=1)
+def nvidia_accelerators() -> tuple[Accelerator, ...]:
+    return tuple(read_nvidia_devices())
+
+
+def _accelerators_without_torch() -> list[Accelerator]:
+    """The GPUs llama.cpp can use. The Arm Mac builds carry Metal, and every Arm Mac has it."""
+    if sys.platform == "darwin" and platform.machine() == "arm64":
+        return [_mps_accelerator()]
+    return list(nvidia_accelerators() or vulkan_accelerators())
+
+
 def _all_accelerators() -> list[Accelerator]:
+    if not has_torch():
+        return _accelerators_without_torch()
     found: list[Accelerator] = []
     if torch.cuda.is_available():
         found.extend(_cuda_accelerator(index) for index in range(torch.cuda.device_count()))
@@ -205,6 +238,8 @@ def measure_bandwidth(device: str, size_mib: int = 256, rounds: int = 16) -> flo
     """
     if device.startswith("vulkan"):
         return ASSUMED_VULKAN_GBPS  # PyTorch cannot reach this GPU to time it
+    if not has_torch():
+        return _measure_ram_bandwidth(size_mib, rounds) if device == "cpu" else ASSUMED_VULKAN_GBPS
     target = torch.device(device)
     try:
         source = torch.empty(size_mib * 1024 * 1024 // 4, dtype=torch.float32, device=target)
@@ -223,12 +258,35 @@ def measure_bandwidth(device: str, size_mib: int = 256, rounds: int = 16) -> flo
         return 300.0 if target.type != "cpu" else 20.0
 
 
+def _measure_ram_bandwidth(size_mib: int, rounds: int) -> float:
+    """The same copy as measure_bandwidth, for a node with no PyTorch."""
+    try:
+        source = np.ones(size_mib * 1024 * 1024 // 4, dtype=np.float32)
+        destination = np.empty_like(source)
+        np.copyto(destination, source)
+        started = time.perf_counter()
+        for _ in range(rounds):
+            np.copyto(destination, source)
+        elapsed = max(time.perf_counter() - started, 1e-6)
+        return round(2 * source.nbytes * rounds / elapsed / 1e9, 1)
+    except MemoryError:
+        return 20.0
+
+
+@functools.lru_cache(maxsize=8)
+def _nvidia_free_bytes(device: str, _: int) -> int | None:
+    return next((item.free_bytes for item in read_nvidia_devices() if item.device == device), None)
+
+
 def live_free_bytes(pool: MemoryPool, cache_dir: Path) -> int:
     """Current free bytes for a pool, read from the OS or driver."""
     if pool.kind == "disk":
         return shutil.disk_usage(cache_dir).free
     if pool.kind == "ram" or pool.device == "mps":
         return ram().available
+    if pool.device.startswith("cuda:") and not has_torch():
+        free = _nvidia_free_bytes(pool.device, int(time.monotonic() / NVIDIA_FREE_SECONDS))
+        return pool.free_bytes if free is None else free
     if pool.device.startswith("cuda:"):
         return torch.cuda.mem_get_info(int(pool.device.split(":", 1)[1]))[0]
     return pool.free_bytes
@@ -316,7 +374,7 @@ def apply_accelerator_limits(pools: list[MemoryPool], explicit_budget: bool) -> 
     if not explicit_budget:
         return
     for pool in pools:
-        if pool.device.startswith("cuda:") and pool.total_bytes:
+        if pool.device.startswith("cuda:") and pool.total_bytes and has_torch():
             index = int(pool.device.split(":", 1)[1])
             fraction = min(1.0, pool.budget_bytes / pool.total_bytes)
             torch.cuda.set_per_process_memory_fraction(fraction, index)
