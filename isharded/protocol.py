@@ -19,7 +19,7 @@ from safetensors.torch import save as save_safetensors
 META_HEADER = "x-isharded-meta"
 # Raised whenever workers and the orchestrator stop being able to talk safely.
 # A node on another version is refused at the door, not found out mid-request.
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 6
 
 
 class ResourceContribution(BaseModel):
