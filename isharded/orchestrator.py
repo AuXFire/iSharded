@@ -2655,6 +2655,7 @@ runtime = Orchestrator()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    await asyncio.to_thread(source_commit)  # read now: status runs on the loop, and a later pull is not what is running
     runtime.start_maintenance()
     try:
         yield
