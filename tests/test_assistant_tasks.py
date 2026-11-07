@@ -1959,10 +1959,10 @@ def test_status_gives_the_goal_and_the_type_a_plan_states(engine):
 
 
 def test_with_no_stated_type_the_tools_a_plan_uses_most_decide(assistant, engine):
-    for name in ("files.read", "files.list", "shell.run"):
+    for name in ("notes.read", "notes.list", "mail.send"):
         tool(assistant, name)
-    steps = [tool_step("a", "shell.run"), tool_step("b", "files.read"), tool_step("c", "files.list")]
-    assert engine.status(engine.submit("ann", {"title": "Mixed", "steps": steps}))["task_type"] == "files"
+    steps = [tool_step("a", "mail.send"), tool_step("b", "notes.read"), tool_step("c", "notes.list")]
+    assert engine.status(engine.submit("ann", {"title": "Mixed", "steps": steps}))["task_type"] == "notes"
 
 
 def test_a_plan_with_no_tools_is_general_and_its_title_is_its_goal(engine):

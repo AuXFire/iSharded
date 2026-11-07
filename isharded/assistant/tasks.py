@@ -572,7 +572,7 @@ def _top_errors(plan: Mapping[str, Any]) -> list[str]:
         found.append("priority must be a whole number.")
     if not isinstance(plan.get("inputs", {}), Mapping):
         found.append("inputs must be an object.")
-    if "task_type" in plan and not TASK_TYPE.fullmatch(str(plan["task_type"])):
+    if "task_type" in plan and not (isinstance(plan["task_type"], str) and TASK_TYPE.fullmatch(plan["task_type"])):
         found.append("task_type must be a short lowercase word: letters, digits, dashes, or underscores.")
     reach = plan.get("reach", Reach.POOL.name.lower())
     if str(reach).upper() not in Reach.__members__:
