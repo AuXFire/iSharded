@@ -1726,7 +1726,7 @@ class Orchestrator:
             if len(samples) < RING_LINK_MIN_SAMPLES:
                 continue
             price, held = round(statistics.median(samples), 2), self.ring_links.get(key)
-            reading = {"median_ms": round(rtt / 1000, 2), "hop_ms": round(hop / 1000, 2), "at": now}
+            reading = {"median_ms": round(rtt / 1000, 2), "hop_ms": round(hop / 1000, 2), "at": now, "checked_at": int(time.time())}
             if held is None or abs(price - held["cost_ms"]) > max(RING_LINK_MOVE_SHARE * held["cost_ms"], RING_LINK_MOVE_MS):
                 self.ring_links[key] = {**reading, "cost_ms": price}
                 moved = True
@@ -1735,7 +1735,7 @@ class Orchestrator:
         for key, held in self.ring_links.items():
             # An address probe over HTTP may have priced the link since, and the ring's price is the better one.
             self.links[key], self.links_checked[key] = held["cost_ms"], now
-            self.link_readings[key] = {"median_ms": held["median_ms"], "max_ms": held["median_ms"], "cost_ms": held["cost_ms"], "hop_ms": held["hop_ms"], "timed_by": "ring", "checked_at": int(time.time())}
+            self.link_readings[key] = {"median_ms": held["median_ms"], "max_ms": held["median_ms"], "cost_ms": held["cost_ms"], "hop_ms": held["hop_ms"], "timed_by": "ring", "checked_at": held["checked_at"]}
         return moved
 
     async def measure_links(self, row: int = 0) -> None:
@@ -1898,10 +1898,13 @@ class Orchestrator:
             return False
         # A node that joined since the load has no measured links, and only measured links count.
         # Only links never measured, or ten minutes old, are probed.
-        before = dict(self.links)
-        await self.measure_links(self.link_row_bytes)
-        if self.links != before:
-            await self.keep_proposal()
+        # Under the lock, as at a load: a load that began meanwhile would clear the tables for its
+        # own row size, and these probes, at the old one, would then land in them.
+        async with self.control_lock:
+            before = dict(self.links)
+            await self.measure_links(self.link_row_bytes)
+            if self.links != before:
+                await self.keep_proposal()
         kept = self.latest_proposal()
         if kept is None or self.replies_in_flight or self.control_lock.locked():
             return False
