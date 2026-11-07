@@ -145,6 +145,7 @@ class Plugins:
         self.audit = assistant.audit
         self.clock = assistant.clock
         self.sessions: dict[str, McpSession] = {}
+        self.drift: dict[str, dict[str, list[str]]] = {}  # what each server offers now that differs from its install
         self.lock = threading.Lock()
         self.starting: dict[str, threading.Lock] = {}
         self.store.migrate("plugins", SCHEMA)
@@ -285,6 +286,7 @@ class Plugins:
         same = existing == spec
         with self.lock:
             self._drop_session(name)
+        self.drift.pop(name, None)  # a person has looked again
         if existing is not None and not same:
             self._forget(existing, by)  # what was granted was for the old claims
         with self.store.transaction():
@@ -330,6 +332,7 @@ class Plugins:
             return False
         with self.lock:
             self._drop_session(name)
+        self.drift.pop(name, None)
         self._forget(json.loads(row["spec"]), by)
         with self.store.transaction():
             self.store.execute("DELETE FROM plugins WHERE name = ?", (name,))
@@ -338,7 +341,7 @@ class Plugins:
 
     def list(self) -> list[dict[str, Any]]:
         rows = self.store.query("SELECT * FROM plugins ORDER BY name")
-        return [{**dict(row), "spec": json.loads(row["spec"])} for row in rows]
+        return [{**dict(row), "spec": json.loads(row["spec"]), "drift": self.drift.get(row["name"], {})} for row in rows]
 
     # Calling.
 
@@ -439,10 +442,24 @@ class Plugins:
             if offered.get(entry["tool"]) not in (None, entry["fingerprint"]):
                 self._disable(name, f"tool {entry['tool']} changed what it claims since it was installed, so it needs a person to look again.")
                 raise ToolChanged(entry["tool"])
+        self._note_drift(name, spec, set(offered))
+
+    def _note_drift(self, name: str, spec: dict[str, Any], offered: set[str]) -> None:
+        """Neither of these breaks a promise, so neither turns a plugin off. A person still ought to know."""
+        installed = {entry["tool"] for entry in spec["capabilities"]}
+        # A name we could not take at install is no news now.
+        added = sorted(tool for tool in offered - installed if TOOL_NAME.match(tool))
+        drift = {"vanished": sorted(installed - offered), "added": added}
+        if drift != self.drift.get(name, {"vanished": [], "added": []}):
+            self.audit.record("plugins", "plugin.drift", name, drift)
+        self.drift[name] = drift
 
     def _call_mcp(self, name: str, spec: dict[str, Any], entry: dict[str, Any], arguments: dict[str, Any]) -> ToolResult:
         try:
-            result = self._session(name, spec).request("tools/call", {"name": entry["tool"], "arguments": arguments}, spec["timeout"])
+            session = self._session(name, spec)
+            if entry["tool"] in self.drift.get(name, {}).get("vanished", []):
+                return self._result(name, False, f"Tool {entry['tool']} is no longer offered by this server. It was there when plugin {name} was installed.")
+            result = session.request("tools/call", {"name": entry["tool"], "arguments": arguments}, spec["timeout"])
         except ToolChanged as changed:
             return self._result(name, False, f"Tool {changed} changed what it claims since it was installed, so plugin {name} is turned off.")
         except ToolError as error:
@@ -520,6 +537,10 @@ def run_plugin_list(assistant: Any, args: Any) -> int:
     for row in rows:
         state = "on" if row["enabled"] else f"off: {row['disabled_reason']}"
         print(f"{row['name']:<20} {row['protocol']:<5} {len(row['spec']['capabilities'])} capabilities  {state}")
+        if row["drift"].get("vanished"):
+            print(f"  no longer offered: {', '.join(row['drift']['vanished'])}")
+        if row["drift"].get("added"):
+            print(f"  new since install, and not offered until you install it again: {', '.join(row['drift']['added'])}")
     if not rows:
         print("No plugins.")
     return 0

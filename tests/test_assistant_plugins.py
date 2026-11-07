@@ -15,7 +15,7 @@ import pytest
 from isharded.assistant import cli
 from isharded.assistant.app import Assistant
 from isharded.assistant.contracts import CallContext, Effect, ToolCall, Trust, Verdict
-from isharded.assistant.plugins import MAX_FAILURES, fingerprint, parse_effects, text_of
+from isharded.assistant.plugins import MAX_FAILURES, fingerprint, parse_effects, run_plugin_list, text_of
 
 PYTHON = sys.executable
 
@@ -670,6 +670,77 @@ def test_a_new_tool_after_install_is_not_offered(assistant, mcp):
     mcp.manifest([SEARCH, tool_named("exfiltrate")])
     assert invoke(assistant, name, q="x").ok
     assert assistant.broker.capability("mcp.srv.exfiltrate") is None
+
+
+def test_a_tool_that_vanished_is_reported_and_called_no_more(assistant, mcp, capsys, home):
+    names = assistant.plugins.add(mcp.manifest([SEARCH, tool_named("other")]))
+    for name in names:
+        grant(assistant, name)
+    mcp.manifest([SEARCH])
+    assert invoke(assistant, "mcp.srv.search", q="x").ok, "the tools still there keep working"
+    assert assistant.plugins.list()[0]["drift"] == {"vanished": ["other"], "added": []}
+    assert assistant.plugins.list()[0]["enabled"] == 1
+    result = invoke(assistant, "mcp.srv.other")
+    assert not result.ok and "no longer offered" in result.output
+    assert not [message for message in mcp.seen() if message.get("method") == "tools/call" and message["params"]["name"] == "other"]
+
+
+def test_a_tool_added_since_install_is_reported_and_stays_unavailable(assistant, mcp):
+    (name,) = assistant.plugins.add(mcp.manifest())
+    grant(assistant, name)
+    mcp.manifest([SEARCH, tool_named("exfiltrate")])
+    assert invoke(assistant, name, q="x").ok
+    assert assistant.plugins.list()[0]["drift"] == {"vanished": [], "added": ["exfiltrate"]}
+    assert assistant.broker.capability("mcp.srv.exfiltrate") is None
+
+
+def test_drift_goes_in_the_audit_log_once(assistant, mcp):
+    (name,) = assistant.plugins.add(mcp.manifest())
+    grant(assistant, name)
+    mcp.manifest([SEARCH, tool_named("new")])
+    for _ in range(2):
+        invoke(assistant, name, q="x")
+        assistant.plugins._drop_session("srv")
+    rows = [row for row in assistant.audit.read(limit=500) if row["action"] == "plugin.drift"]
+    assert len(rows) == 1 and rows[0]["subject"] == "srv" and "new" in str(rows[0]["detail"])
+    assert assistant.audit.verify() is None
+
+
+def test_a_name_refused_at_install_is_not_news_later(assistant, mcp):
+    (name,) = assistant.plugins.add(mcp.manifest([SEARCH, tool_named("not a valid name")]))
+    grant(assistant, name)
+    assert invoke(assistant, name, q="x").ok
+    assert assistant.plugins.list()[0]["drift"] == {"vanished": [], "added": []}
+
+
+def test_installing_again_clears_what_was_reported(assistant, mcp):
+    (name,) = assistant.plugins.add(mcp.manifest())
+    grant(assistant, name)
+    mcp.manifest([SEARCH, tool_named("new")])
+    invoke(assistant, name, q="x")
+    assistant.plugins.add(mcp.manifest([SEARCH, tool_named("new")]))
+    assert assistant.plugins.list()[0]["drift"] == {}
+    assert assistant.broker.capability("mcp.srv.new") is not None
+
+
+def test_a_changed_tool_still_turns_a_plugin_off_when_others_vanished(assistant, mcp):
+    names = assistant.plugins.add(mcp.manifest([SEARCH, tool_named("other")]))
+    for name in names:
+        grant(assistant, name)
+    mcp.manifest([{**SEARCH, "description": "Something else."}])
+    assert "changed what it claims" in invoke(assistant, "mcp.srv.search", q="x").output
+    assert assistant.plugins.list()[0]["enabled"] == 0
+
+
+def test_plugin_list_shows_what_changed_since_install(home, mcp, capsys):
+    with Assistant(home) as made:
+        (name,) = made.plugins.add(mcp.manifest([SEARCH, tool_named("gone")]))[:1]
+        made.broker.add_grant("ann", name, None, "ann")
+        mcp.manifest([SEARCH, tool_named("fresh")])
+        made.broker.invoke(ToolCall(name, {"q": "x"}), context())
+        run_plugin_list(made, None)
+    shown = capsys.readouterr().out
+    assert "no longer offered: gone" in shown and "new since install" in shown and "fresh" in shown
 
 
 def test_a_server_that_only_speaks_the_newest_era_can_be_installed(assistant, mcp):
