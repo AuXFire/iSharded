@@ -16,6 +16,8 @@ pub mod wire;
 use std::ffi::{c_char, c_void, CStr};
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use llama::{Capture, LlamaCompute, Snapshots, StageApi, TensorApi};
 use node::{Links, Node, Plan};
 use serde::de::DeserializeOwned;
@@ -23,7 +25,8 @@ use watchdog::{Limits, Watchdog};
 
 /// Bumped when the functions below change, so a stale library is refused and not misused.
 /// Three: a plan carries a key for each link, and answers carry a seal.
-pub const ABI_VERSION: u32 = 3;
+/// Four: a stage can probe at load whether merged passes round as rows run alone.
+pub const ABI_VERSION: u32 = 4;
 
 /// One stage's engine, as Python holds it.
 pub struct Engine {
@@ -31,6 +34,8 @@ pub struct Engine {
     snapshots: Arc<Snapshots>,
     watchdog: Arc<Watchdog>,
     node: Node,
+    /// What `attach` was given, which the probe runs a compute of its own on.
+    api: Mutex<Option<StageApi>>,
 }
 
 fn write_text(text: &[u8], out: *mut c_char, capacity: usize) -> i32 {
@@ -79,7 +84,7 @@ pub unsafe extern "C" fn isharded_engine_new(target: *const c_char, tensors: *co
     };
     let capture = Arc::new(Capture::new(CStr::from_ptr(target).to_owned(), *tensors));
     let watchdog = Arc::new(Watchdog::new(node.refuser(), || std::process::abort()));
-    Box::into_raw(Box::new(Engine { capture, snapshots: Arc::default(), watchdog, node }))
+    Box::into_raw(Box::new(Engine { capture, snapshots: Arc::default(), watchdog, node, api: Mutex::new(None) }))
 }
 
 /// The eval callback, with the engine as its user data.
@@ -114,7 +119,39 @@ pub unsafe extern "C" fn isharded_engine_capture_read(engine: *mut Engine, out: 
 #[no_mangle]
 pub unsafe extern "C" fn isharded_engine_attach(engine: *mut Engine, api: *const StageApi) {
     let engine = &*engine;
+    *engine.api.lock() = Some(*api);
     engine.node.set_compute(Box::new(LlamaCompute::new(*api, engine.capture.clone(), engine.snapshots.clone(), engine.watchdog.clone())));
+}
+
+/// Finds out how far merged passes round as rows run alone, over `slots` slots, and writes
+/// it as JSON. Every slot it touched is empty again afterwards. Negative on failure, with
+/// the reason written instead.
+///
+/// # Safety
+/// `engine` must come from `isharded_engine_new`, after `attach`, and `out` must have room
+/// for `capacity` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn isharded_engine_probe(engine: *mut Engine, slots: u32, out: *mut c_char, capacity: usize) -> i32 {
+    let engine = &*engine;
+    let Some(api) = *engine.api.lock() else {
+        write_text(b"this stage has nothing loaded", out, capacity);
+        return -1;
+    };
+    let mut compute = LlamaCompute::new(api, engine.capture.clone(), engine.snapshots.clone(), engine.watchdog.clone());
+    engine.node.lock();
+    let found = compute.probe(slots, node::MAX_MERGED - 1);
+    engine.node.unlock();
+    match found.map(|found| serde_json::to_vec(&found)) {
+        Ok(Ok(text)) => write_text(&text, out, capacity),
+        Ok(Err(error)) => {
+            write_text(error.to_string().as_bytes(), out, capacity);
+            -1
+        }
+        Err(failure) => {
+            write_text(failure.message.as_bytes(), out, capacity);
+            -1
+        }
+    }
 }
 
 /// Forgets what a rewind could go back to, because Python changed what a slot holds. A

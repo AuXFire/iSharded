@@ -247,7 +247,7 @@ fn build_ring(count: u16, closing: bool, delay: Duration, (ack_timeout_ms, silen
         seen.push(counter);
     }
     for (index, node) in nodes.iter().enumerate() {
-        node.open(Plan { epoch: 7, index: index as u16, count, keys: keys_for(index as u16, count), ack_timeout_ms, silence_timeout_ms, merge_passes: true }).unwrap();
+        node.open(Plan { epoch: 7, index: index as u16, count, keys: keys_for(index as u16, count), ack_timeout_ms, silence_timeout_ms, merge_passes: true, merge_most: None }).unwrap();
     }
     let relay = relayed.map(|door| Relay::to(doors[door].port));
     let address = |at: usize| {
@@ -939,7 +939,7 @@ fn an_answer_a_middle_stage_makes_up_is_dropped_and_its_link_stays_up() {
     let entry = Node::new().unwrap();
     entry.set_compute(Box::new(Adder { stage: 1, last: false, delay: Duration::ZERO, seen: Arc::default() }));
     let door = listening(&entry);
-    entry.open(Plan { epoch: 7, index: 0, count: 3, keys: keys_for(0, 3), ack_timeout_ms: 5000, silence_timeout_ms: 5000, merge_passes: true }).unwrap();
+    entry.open(Plan { epoch: 7, index: 0, count: 3, keys: keys_for(0, 3), ack_timeout_ms: 5000, silence_timeout_ms: 5000, merge_passes: true, merge_most: None }).unwrap();
     let identity = Identity::generate().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = Address { address: listener.local_addr().unwrap().to_string(), fingerprint: identity.fingerprint.clone() };
@@ -1023,7 +1023,7 @@ fn the_local_role_is_refused_on_the_public_door() {
 fn a_route_cannot_be_joined_with_the_wrong_key_or_epoch() {
     let node = Node::new().unwrap();
     let door = listening(&node);
-    node.open(Plan { epoch: 7, index: 1, count: 2, keys: keys_for(1, 2), ack_timeout_ms: 1000, silence_timeout_ms: 1000, merge_passes: true }).unwrap();
+    node.open(Plan { epoch: 7, index: 1, count: 2, keys: keys_for(1, 2), ack_timeout_ms: 1000, silence_timeout_ms: 1000, merge_passes: true, merge_most: None }).unwrap();
     let address = format!("127.0.0.1:{}", door.port);
     let key = hop_key(0);
     assert!(link::dial(&address, Some(&door.fingerprint), b"wrong", Role::Hop, 7, Duration::from_secs(3)).is_err());
@@ -1071,7 +1071,7 @@ fn a_ring_pads_the_link_it_dials_before_any_pass_and_beats_ten_times_a_second() 
     let node = Node::new().unwrap();
     let door = listening(&node);
     node.set_compute(Box::new(Adder { stage: 1, last: false, delay: Duration::ZERO, seen: Arc::default() }));
-    node.open(Plan { epoch: 7, index: 0, count: 2, keys: keys_for(0, 2), ack_timeout_ms: 5000, silence_timeout_ms: 5000, merge_passes: true }).unwrap();
+    node.open(Plan { epoch: 7, index: 0, count: 2, keys: keys_for(0, 2), ack_timeout_ms: 5000, silence_timeout_ms: 5000, merge_passes: true, merge_most: None }).unwrap();
     let (next, reading) = listen_as_next_stage();
     node.connect(Links { next: Some(next), entry: None, timeout_ms: 3000 }).unwrap();
     let client = link::dial(&format!("127.0.0.1:{}", door.local_port), None, &door.local_key, Role::Local, 0, Duration::from_secs(3)).unwrap();
