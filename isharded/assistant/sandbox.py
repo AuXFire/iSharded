@@ -50,27 +50,12 @@ WORK_MOUNT = "/work"
 KEPT_EVERYWHERE = ("PATH", "LANG", "LC_ALL", "TZ")
 # Where Windows keeps things, which ordinary programs fail without. None of it is secret.
 KEPT_ON_WINDOWS = (
-    "SYSTEMROOT",
-    "WINDIR",
-    "SYSTEMDRIVE",
-    "COMSPEC",
-    "PATHEXT",
-    "NUMBER_OF_PROCESSORS",
-    "PROCESSOR_ARCHITECTURE",
-    "PROCESSOR_IDENTIFIER",
-    "PROCESSOR_LEVEL",
-    "PROCESSOR_REVISION",
-    "OS",
-    "PROGRAMFILES",
-    "PROGRAMFILES(X86)",
-    "PROGRAMW6432",
-    "PROGRAMDATA",
-    "COMMONPROGRAMFILES",
-    "COMMONPROGRAMFILES(X86)",
-    "COMMONPROGRAMW6432",
-    "ALLUSERSPROFILE",
-    "PUBLIC",
-)
+    "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "COMSPEC", "PATHEXT", "OS", "ALLUSERSPROFILE", "PUBLIC",
+    "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER", "PROCESSOR_LEVEL", "PROCESSOR_REVISION",
+    "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432", "PROGRAMDATA",
+    "COMMONPROGRAMFILES", "COMMONPROGRAMFILES(X86)", "COMMONPROGRAMW6432",
+)  # fmt: skip
+KEPT = (*KEPT_EVERYWHERE, *(KEPT_ON_WINDOWS if WINDOWS else ()))
 # What the docker or podman client itself needs. Its child sees only what -e names.
 KEPT_FOR_CLIENT = ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "XDG_RUNTIME_DIR", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "CONTAINER_HOST")
 
@@ -96,8 +81,7 @@ class Walls:
 
 def scrubbed_env(home: str | Path, extra: dict[str, str] | None = None) -> dict[str, str]:
     """A short allow-list, so a secret added to the environment tomorrow stays out too."""
-    names = (*KEPT_EVERYWHERE, *(KEPT_ON_WINDOWS if WINDOWS else ()))
-    environment = {name: os.environ[name] for name in names if name in os.environ}
+    environment = {name: os.environ[name] for name in KEPT if name in os.environ}
     environment.update({name: str(home) for name in ("HOME", "USERPROFILE", "TEMP", "TMP", "TMPDIR")})
     environment.update(extra or {})
     return environment
