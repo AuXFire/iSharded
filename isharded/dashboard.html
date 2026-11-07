@@ -99,7 +99,7 @@
       </section>
 
       <section class="section" aria-labelledby="factsTitle">
-        <div class="section-head"><h2 id="factsTitle">Facts</h2><button class="icon-btn" type="button" id="refreshButton" aria-label="Refresh now" data-tip="Refresh now"></button></div>
+        <div class="section-head"><h2 id="factsTitle">Facts</h2><div class="head-tools"><button class="btn small" type="button" id="keysButton" hidden>API keys</button><button class="icon-btn" type="button" id="refreshButton" aria-label="Refresh now" data-tip="Refresh now"></button></div></div>
         <dl class="facts" id="facts"></dl>
         <p class="facts-note" id="factsNote" hidden></p>
       </section>
@@ -128,6 +128,9 @@
           </select>
         </label>
       </div>
+      <label class="field" id="laneField" hidden>Lane, to run it beside the main model
+        <input class="input" id="laneName" placeholder="Leave empty to replace the main model" autocomplete="off" spellcheck="false">
+      </label>
       <div class="fields">
         <label class="field">Entry worker, which sees your prompt
           <select class="select" id="entryWorker"></select>
@@ -153,6 +156,34 @@
         <button class="btn primary" type="button" id="createInvite">Create invite</button>
       </div>
     </div>
+  </dialog>
+
+  <dialog class="sheet" id="keys" aria-labelledby="keysTitle">
+    <form class="sheet-body" id="keysForm">
+      <h2 id="keysTitle">API keys</h2>
+      <p>Each key lets a person or a program use this pool. A new key is shown once.</p>
+      <div id="keysList"></div>
+      <div class="fields">
+        <label class="field">Name, for who it is for
+          <input class="input" id="keyName" autocomplete="off" spellcheck="false" required>
+        </label>
+        <label class="field">Role
+          <select class="select" id="keyRole">
+            <option value="user">User: chat and read the pool</option>
+            <option value="admin">Admin: also load, cordon and manage keys</option>
+          </select>
+        </label>
+      </div>
+      <label class="field">Requests a minute, 0 for no limit
+        <input class="input" id="keyRate" type="number" min="0" step="1" value="0">
+      </label>
+      <div id="keyShown"></div>
+      <p class="error" id="keysError" role="alert" hidden></p>
+      <div class="sheet-actions">
+        <button class="btn" type="button" id="closeKeys">Close</button>
+        <button class="btn primary" type="submit" id="createKey">Create key</button>
+      </div>
+    </form>
   </dialog>
 
   <dialog class="sheet narrow" id="auth" aria-labelledby="authTitle">
@@ -871,19 +902,26 @@
       const options = { model_id: state.selected, context_tokens: Number($('contextTokens').value) || 4096, placement: $('placement').value };
       if ($('entryWorker').value) options.entry_worker = $('entryWorker').value;
       if ($('exitWorker').value) options.exit_worker = $('exitWorker').value;
+      if (!$('laneField').hidden && $('laneName').value.trim()) options.lane = $('laneName').value.trim();
       return options;
     }
+    // The server turns a second main load away while one runs, and lets a lane load beside it.
+    function loadBlocked(options) {
+      const job = state.data?.load_job;
+      if (!jobRunning(job) || options.lane) return '';
+      return ` ${modelName(job.model)} is still loading, so ${$('laneField').hidden ? 'cancel it first to load this one' : 'name a lane to load this beside it, or cancel that load first'}.`;
+    }
     async function runPreview() {
-      const ticket = ++state.previewId;
+      const ticket = ++state.previewId, options = loadOptions();
       try {
-        const plan = await api('/admin/plan', { method: 'POST', body: JSON.stringify(loadOptions()) });
+        const plan = await api('/admin/plan', { method: 'POST', body: JSON.stringify(options) });
         if (ticket !== state.previewId) return;
         const data = state.data || { workers: {} };
         const lines = plan.route.map((stage, index) => `<li><span>${esc(stage.worker_id)}${plan.route.length > 1 && (index === 0 || index === plan.route.length - 1) ? ` (${index === 0 ? 'entry' : 'exit'})` : ''}</span><span>${stageLayers(stage)} in ${esc(stageMemory(stage, data))}</span></li>`).join('');
         const speed = plan.estimated_tokens_per_second ? `, about ${esc(plan.estimated_tokens_per_second)} tokens/s` : '';
         const download = (plan.download_bytes ? `Needs ${bytes(plan.download_bytes)} of new shards.` : 'Every shard is already in place.') + (plan.draft_model ? ` A draft model (${modelName(plan.draft_model)}) will speed up replies.` : '');
-        const busy = jobRunning(state.data?.load_job) ? ` ${modelName(state.data.load_job.model)} is still loading, so cancel it first to load this one.` : '';
-        $('preview').innerHTML = `<b>Fits: ${bytes(plan.model_bytes)} across ${count(plan.route.length, 'worker')}${speed}</b><div id="previewRail"></div><ul>${lines}</ul>${esc(download + busy)}`;
+        const busy = loadBlocked(options), beside = options.lane ? ` Lane ${options.lane} uses only the memory the main model leaves, so it may land elsewhere.` : '';
+        $('preview').innerHTML = `<b>Fits: ${bytes(plan.model_bytes)} across ${count(plan.route.length, 'worker')}${speed}</b><div id="previewRail"></div><ul>${lines}</ul>${esc(download + beside + busy)}`;
         drawRail($('previewRail'), routeModel({ route: plan.route, workers: data.workers }).stages);
         $('loadModel').disabled = Boolean(busy);
       } catch (error) {
@@ -901,6 +939,7 @@
     }
     function openPicker(model) {
       fillWorkerChoices();
+      $('laneField').hidden = !state.data?.mesh;  // lanes run on a node's mesh, and nowhere else
       if (typeof model === 'string') { state.selected = model; $('customModel').value = ''; }
       $('catalogSearch').value = '';
       if (!$('picker').open) $('picker').showModal();
@@ -934,7 +973,7 @@
         const invite = await api('/admin/invites', { method: 'POST', body: JSON.stringify({ uses: 1, hours: 24 }) });
         $('inviteBody').innerHTML = `<div class="command"><p>Run this on the new machine. It works once, until ${esc(expiry(invite.expires_at))}.</p><pre id="inviteCommand" tabindex="0"></pre><div class="command-actions"><button class="btn" type="button" id="copyInvite">Copy command</button><span class="quiet-text" id="copyNote" role="status"></span></div></div>`;
         $('inviteCommand').textContent = invite.command ?? '';
-        $('copyInvite').onclick = () => copy($('inviteCommand'));
+        $('copyInvite').onclick = () => copy($('inviteCommand'), $('copyNote'));
         $('createInvite').textContent = 'Create another';
       } catch (error) {
         if (error.status === 401) return;
@@ -942,7 +981,7 @@
       } finally { $('createInvite').disabled = false; }
     }
     // Pages on a closed network are often plain HTTP, where the clipboard API is missing.
-    async function copy(element) {
+    async function copy(element, note) {
       const text = element.textContent;
       let done = false;
       try { await navigator.clipboard.writeText(text); done = true; } catch {
@@ -950,7 +989,54 @@
         const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range);
         try { done = document.execCommand('copy'); } catch {}
       }
-      $('copyNote').textContent = done ? 'Copied' : 'Selected. Press Ctrl+C to copy.';
+      note.textContent = done ? 'Copied' : 'Selected. Press Ctrl+C to copy.';
+    }
+
+    /* API keys. The entry shows only for a key that may list them. */
+
+    async function checkKeys() {
+      if (state.keysChecked || state.signedOut) return;
+      state.keysChecked = true;
+      try { state.keys = (await api('/admin/keys', { timeout: 10000, admin: true })).keys || []; $('keysButton').hidden = false; }
+      catch (error) { $('keysButton').hidden = true; if (![401, 403, 404].includes(error.status)) state.keysChecked = false; }  // a node that did not answer is asked again
+    }
+    function renderKeys() {
+      const keys = state.keys || [];
+      paint($('keysList'), keys.length ? `<table class="grid keys"><thead><tr><th scope="col">Name</th><th scope="col">Role</th><th scope="col" class="right">Requests a minute</th><th scope="col"><span class="sr-only">Revoke</span></th></tr></thead><tbody>${keys.map(key => `<tr><td>${esc(key.name)}</td><td>${esc(key.role)}</td><td class="right">${key.requests_per_minute ? esc(key.requests_per_minute) : 'No limit'}</td><td class="right"><button class="btn small" type="button" data-revoke-key="${esc(key.name)}" data-key="key:${esc(key.name)}">Revoke</button></td></tr>`).join('')}</tbody></table>` : '<p class="list-note">No keys yet.</p>');
+    }
+    async function readKeys() {
+      try { state.keys = (await api('/admin/keys', { timeout: 10000, admin: true })).keys || []; renderKeys(); }
+      catch (error) { if (error.status !== 401) keysError(error); }
+    }
+    function keysError(error) {
+      $('keysError').textContent = error.offline ? 'This node did not answer, so nothing changed. Try again in a moment.' : error.detail || error.message;
+      $('keysError').hidden = false;
+    }
+    function openKeys() {
+      $('keysError').hidden = true; paint($('keyShown'), '');
+      renderKeys();
+      if (!$('keys').open) $('keys').showModal();
+      readKeys();
+    }
+    async function createKey() {
+      const name = $('keyName').value.trim();
+      if (!name) return;
+      $('keysError').hidden = true; $('createKey').disabled = true;
+      try {
+        const made = await api('/admin/keys', { method: 'POST', admin: true, body: JSON.stringify({ name, role: $('keyRole').value, requests_per_minute: Number($('keyRate').value) || 0 }) });
+        paint($('keyShown'), `<div class="command"><p>The key for ${esc(made.name)}. It is shown only now, so copy it before you close this.</p><pre id="newKey" tabindex="0"></pre><div class="command-actions"><button class="btn" type="button" id="copyKey">Copy key</button><span class="quiet-text" id="copyKeyNote" role="status"></span></div></div>`);
+        $('newKey').textContent = made.key ?? '';
+        $('copyKey').onclick = () => copy($('newKey'), $('copyKeyNote'));
+        $('keyName').value = '';
+        await readKeys();
+      } catch (error) { if (error.status !== 401) keysError(error); }
+      finally { $('createKey').disabled = false; }
+    }
+    function askRevokeKey(name) {
+      confirmSheet({ title: `Revoke ${name}`, text: 'Whatever uses this key stops working at once. It cannot be brought back, only replaced with a new key.', yes: 'Revoke key', run: async () => {
+        await api(`/admin/keys/${encodeURIComponent(name)}`, { method: 'DELETE', admin: true });
+        toast(`Revoked ${name}`); readKeys();
+      } });
     }
 
     /* Asking first */
@@ -1055,8 +1141,10 @@
       $('loadButton').hidden = view.empty === 'machines';
       $('loadButton').classList.toggle('primary', view.empty === 'model');
       $('addMachine').classList.toggle('primary', view.empty === 'machines');
+      // A lane loads beside a running job, so Load stays open where lanes can run.
       $('actionNote').hidden = !running;
-      $('rebalanceButton').disabled = running; $('loadButton').disabled = running;
+      $('actionNote').textContent = data.mesh ? 'A load is running. Only a lane can load beside it.' : 'A load is running.';
+      $('rebalanceButton').disabled = running; $('loadButton').disabled = running && !data.mesh;
       takeSample(data);
       renderBoard(data); renderStart(data, view); renderNeeds(view); renderMachinesBay(data, rows); renderMemory(data, rows); renderEvents(data); renderStages(data); renderReadings(data); renderMachines(data, rows); renderFacts(data);
       if (state.openWorker) renderWorker();
@@ -1082,6 +1170,7 @@
         render(data);
         readInventory();
         readJoins();
+        checkKeys();
       } catch (error) {
         if (error.status === 401) renderSignedOut();
         else if (error.offline) { state.failures += 1; renderOffline(); }
@@ -1098,7 +1187,8 @@
     function signOut() {
       store.drop('isharded-token');
       state.token = ''; state.data = null; state.model = null; state.tab = {}; state.inventory = {}; state.samples = []; state.joins = []; state.joinsHidden = false;
-      if ($('worker').open) $('worker').close();
+      state.keys = null; state.keysChecked = false; $('keysButton').hidden = true;
+      for (const sheet of [$('worker'), $('keys')]) if (sheet.open) sheet.close();
       refresh();
     }
 
@@ -1134,7 +1224,7 @@
       else if (action === 'cancel') api('/admin/load/cancel', { method: 'POST' }).then(() => { toast('Load cancelled'); refresh(); }).catch(error => toast(error.message));
     }
     document.addEventListener('click', event => {
-      const target = event.target.closest?.('[data-action],[data-join],[data-chip],[data-feed],[data-sort],[data-group],[data-model],[data-worker],[data-stagerow],[data-show-stage],[data-cordon],[data-uncordon],[data-lane-remove]');
+      const target = event.target.closest?.('[data-action],[data-join],[data-chip],[data-feed],[data-sort],[data-group],[data-model],[data-worker],[data-stagerow],[data-show-stage],[data-cordon],[data-uncordon],[data-lane-remove],[data-revoke-key]');
       if (!target) return;
       const set = target.dataset;
       if (set.action) onAction(set.action);
@@ -1155,6 +1245,7 @@
       else if (set.cordon) askCordon(set.cordon);
       else if (set.uncordon) uncordon(set.uncordon);
       else if (set.laneRemove) askRemoveLane(set.laneRemove);
+      else if (set.revokeKey) askRevokeKey(set.revokeKey);
       else if (set.worker) openWorker(set.worker);
     });
     // The mark field is one tab stop. Arrows walk it, and the name shows under it.
@@ -1171,11 +1262,11 @@
       button.tabIndex = -1; next.tabIndex = 0; next.focus();
       state.markKey = next.dataset.worker;
     });
-    for (const dialog of [$('worker'), $('picker'), $('invite'), $('confirm')]) dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
+    for (const dialog of [$('worker'), $('picker'), $('invite'), $('confirm'), $('keys')]) dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
     // A poll can draw the opener again while a sheet is up, and then focus has nowhere to return to.
     let opener = null;
     document.addEventListener('click', event => { if (!document.querySelector('dialog[open]')) opener = event.target.closest?.('[data-key],[id]')?.dataset.key || null; }, true);
-    for (const dialog of [$('worker'), $('picker'), $('invite'), $('confirm')]) dialog.addEventListener('close', () => setTimeout(() => {
+    for (const dialog of [$('worker'), $('picker'), $('invite'), $('confirm'), $('keys')]) dialog.addEventListener('close', () => setTimeout(() => {
       if (opener && document.activeElement === document.body && !document.querySelector('dialog[open]')) document.querySelector(`[data-key="${CSS.escape(opener)}"]`)?.focus();
     }));
     $('worker').addEventListener('close', () => { state.openWorker = null; });
@@ -1197,15 +1288,21 @@
     $('catalogSearch').addEventListener('input', renderCatalog);
     $('customModel').addEventListener('input', event => selectModel(event.target.value));
     for (const id of ['contextTokens', 'placement', 'entryWorker', 'exitWorker']) $(id).addEventListener('change', schedulePreview);
+    $('laneName').addEventListener('input', schedulePreview);
     $('closePicker').onclick = () => $('picker').close();
     $('loadButton').onclick = () => openPicker();
     $('loadModel').onclick = async () => {
       try {
-        await api('/admin/load', { method: 'POST', body: JSON.stringify({ ...loadOptions(), wait: false }) });
+        const options = loadOptions();
+        await api('/admin/load', { method: 'POST', body: JSON.stringify({ ...options, wait: false }) });
+        if (options.lane) toast(`Lane ${options.lane} is starting`);
         $('picker').close(); refresh();
       } catch (error) { $('preview').innerHTML = `<span class="error">${esc(error.message)}</span>`; }
     };
     $('addMachine').onclick = openInvite;
+    $('keysButton').onclick = openKeys;
+    $('closeKeys').onclick = () => $('keys').close();
+    $('keysForm').onsubmit = event => { event.preventDefault(); createKey(); };
     $('closeInvite').onclick = () => $('invite').close();
     $('createInvite').onclick = createInvite;
     $('rebalanceButton').onclick = askRebalance;
@@ -1224,12 +1321,12 @@
       event.preventDefault();
       const key = $('tokenInput').value.trim();
       if (!key) return;
-      state.token = key; store.set('isharded-token', key); state.signedOut = false; state.joinsHidden = false; state.joins = [];
+      state.token = key; store.set('isharded-token', key); state.signedOut = false; state.joinsHidden = false; state.joins = []; state.keysChecked = false;
       $('auth').close(); refresh(true);
     };
     $('signOut').onclick = signOut;
     $('themeButton').onclick = () => applyTheme(THEMES[(THEMES.indexOf($('themeButton').dataset.choice) + 1) % THEMES.length]);
-    addEventListener('hashchange', () => { if (takeKeyFromLink()) { state.signedOut = false; state.joinsHidden = false; state.joins = []; if ($('auth').open) $('auth').close(); refresh(); } });
+    addEventListener('hashchange', () => { if (takeKeyFromLink()) { state.signedOut = false; state.joinsHidden = false; state.joins = []; state.keysChecked = false; if ($('auth').open) $('auth').close(); refresh(); } });
     document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
     let resized = null;
     addEventListener('resize', () => { clearTimeout(resized); resized = setTimeout(() => { if (state.data) renderBoard(state.data); }, 120); });

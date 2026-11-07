@@ -536,7 +536,11 @@ Every node serves both, so any node's address works.
 | Page | What it shows |
 |---|---|
 | `/chat` | A chat window. Conversations are listed on the left, and the stages the model runs on, with each stage's memory and time, on the right. It asks for a key, and shows where a model would run and how fast before anything downloads. |
-| `/dashboard` | The state of the pool as a sentence, then the route board: the model's layers along the top, one pass in time along the bottom, and a band for each stage, so the slowest thing is the widest. Below it are what needs you, machines, memory, activity, the stage table, readings, and facts. Select a stage or machine for detail, and use the arrow keys to walk the stages. |
+| `/dashboard` | The state of the pool as a sentence, then the route board: the model's layers along the top, one pass in time along the bottom, and a band for each stage, so the slowest thing is the widest. Below it are what needs you, machines, memory, activity, the stage table, readings, and facts. Select a stage or machine for detail, and use the arrow keys to walk the stages. API keys, beside Facts, lists, creates and revokes [API keys](#isharded-key) for an admin key. |
+
+Load a model asks for a lane name on a node's mesh. Empty, the model replaces the main one, and that waits while another load runs, because the pool takes one at a time. With a name, it loads beside the main model as a [lane](#several-models-at-once), which the pool allows during a load, so Load stays open then. A model that needs PyTorch is marked in the list when no worker has it, and Facts and each worker's details say which can run PyTorch models. During a repair the route is gone for its last seconds, while every stage takes its layers, and the dashboard says the repair is finishing.
+
+API keys shows each key's name, role and rate limit, never the key. A new key is shown once, with a button to copy it. Revoking asks first. The button shows only for a key that may list keys, and a pool with an authority refuses changes here in its own words, as [isharded key](#isharded-key) explains.
 
 Conversations are kept in your browser, the latest 50, because the pool stores none. Signing out forgets them, and a browser that runs out of room keeps the words and drops the images.
 
