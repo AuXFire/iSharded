@@ -14,9 +14,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+from collections.abc import Callable, Mapping
 import json
 import sys
-from typing import Any, BinaryIO, Callable, Mapping
+from typing import Any, BinaryIO
 
 import httpx
 
@@ -68,6 +69,7 @@ def unsupported(requested: Any) -> RpcError:
 
 
 READ_ONLY = {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}
+NO_ARGUMENTS = {"type": "object", "properties": {}, "additionalProperties": False}
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "chat",
@@ -108,14 +110,14 @@ TOOLS: list[dict[str, Any]] = [
         "name": "list_models",
         "title": "List models",
         "description": "List the models this mesh is running now.",
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "inputSchema": NO_ARGUMENTS,
         "annotations": READ_ONLY,
     },
     {
         "name": "mesh_status",
         "title": "Mesh status",
         "description": "Whether the mesh can answer, what it runs, and which nodes hold which stages.",
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "inputSchema": NO_ARGUMENTS,
         "annotations": READ_ONLY,
     },
 ]
@@ -134,7 +136,7 @@ def check_arguments(schema: dict[str, Any], arguments: dict[str, Any]) -> None:
         # JSON has no bool-is-an-int rule, though Python does.
         if not isinstance(value, JSON_KINDS[rule["type"]]) or (isinstance(value, bool) and rule["type"] != "boolean"):
             raise ToolFailed(f"{name} must be a {rule['type']}")
-        if "minimum" in rule and value < rule["minimum"] or "maximum" in rule and value > rule["maximum"]:
+        if ("minimum" in rule and value < rule["minimum"]) or ("maximum" in rule and value > rule["maximum"]):
             raise ToolFailed(f"{name} must be from {rule['minimum']} to {rule['maximum']}")
 
 
@@ -183,15 +185,15 @@ class MeshTools:
 
     async def mesh_status(self, arguments: dict[str, Any]) -> dict[str, Any]:
         status = await self._ask("GET", "/admin/status")
-        workers = status.get("workers", {})
+        mesh = status.get("mesh") or {}
         summary = {
             "status": status.get("status"),
             "model": status.get("model"),
             "epoch": status.get("epoch"),
-            "coordinator": (status.get("mesh") or {}).get("leader"),
-            "nodes": (status.get("mesh") or {}).get("members"),
+            "coordinator": mesh.get("leader"),
+            "nodes": mesh.get("members"),
             "route": [stage.get("worker_id") for stage in status.get("route", [])],
-            "workers": {name: worker.get("state") for name, worker in workers.items()},
+            "workers": {name: worker.get("state") for name, worker in status.get("workers", {}).items()},
             "lanes": [{key: lane.get(key) for key in ("name", "model", "ready", "workers")} for lane in status.get("lanes", [])],
             "tokens_per_second": (status.get("metrics") or {}).get("tokens_per_second_ema"),
         }
@@ -210,6 +212,15 @@ class MeshTools:
 
 def as_result(value: dict[str, Any]) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}], "structuredContent": value}
+
+
+def modern_result(result: dict[str, Any]) -> dict[str, Any]:
+    return {**result, "resultType": "complete", "_meta": {SERVER_KEY: SERVER_INFO}}
+
+
+def as_object(value: Any) -> dict[str, Any]:
+    """What a stranger sent, where only an object means anything."""
+    return value if isinstance(value, dict) else {}
 
 
 class McpHandler:
@@ -243,43 +254,48 @@ class McpHandler:
             raise RpcError(INVALID_REQUEST, "A method is a string")
         if not isinstance(params, dict):
             raise RpcError(INVALID_PARAMS, "params must be an object")
-        meta = params.get("_meta")
-        version = meta.get(VERSION_KEY) if isinstance(meta, dict) else None
+        version = as_object(params.get("_meta")).get(VERSION_KEY)
         if version is not None and version not in SUPPORTED_VERSIONS:
             raise unsupported(version)
         modern = version in MODERN_VERSIONS
         if method == "initialize" and not modern:
             return self._initialize(params)
         if method == "server/discover":
-            result: dict[str, Any] = {
-                "supportedVersions": list(SUPPORTED_VERSIONS),
-                "capabilities": {"tools": {}},
-                "instructions": INSTRUCTIONS,
-                "ttlMs": TOOL_LIST_TTL_MS,
-                "cacheScope": "public",
-            }
-            return {**result, "resultType": "complete", "_meta": {SERVER_KEY: SERVER_INFO}}
+            return modern_result(
+                {
+                    "supportedVersions": list(SUPPORTED_VERSIONS),
+                    "capabilities": {"tools": {}},
+                    "instructions": INSTRUCTIONS,
+                    "ttlMs": TOOL_LIST_TTL_MS,
+                    "cacheScope": "public",
+                }
+            )
         if method == "ping" and not modern:
             return {}  # removed from the modern protocol
         if not modern and not self.ready:
             raise RpcError(INVALID_REQUEST, "Send initialize first, or name a protocol version in _meta")
         if method == "tools/list":
-            if params.get("cursor") is not None:
-                raise RpcError(INVALID_PARAMS, "Invalid cursor: there is only one page of tools")
-            result = {"tools": TOOLS}
-            if modern:
-                # The caller's key decides who sees this, so nothing shared may keep it.
-                result |= {"ttlMs": TOOL_LIST_TTL_MS, "cacheScope": "private"}
+            result = self._list_tools(params, modern)
         elif method == "tools/call":
-            name, arguments = params.get("name"), params.get("arguments", {})
-            if not isinstance(name, str):
-                raise RpcError(INVALID_PARAMS, "tools/call needs a tool name")
-            if not isinstance(arguments, dict):
-                raise RpcError(INVALID_PARAMS, "arguments must be an object")
-            result = await self.tools.call(name, arguments)
+            result = await self._call_tool(params)
         else:
             raise RpcError(METHOD_NOT_FOUND, f"Method not found: {method}")
-        return {**result, "resultType": "complete", "_meta": {SERVER_KEY: SERVER_INFO}} if modern else result
+        return modern_result(result) if modern else result
+
+    @staticmethod
+    def _list_tools(params: dict[str, Any], modern: bool) -> dict[str, Any]:
+        if params.get("cursor") is not None:
+            raise RpcError(INVALID_PARAMS, "Invalid cursor: there is only one page of tools")
+        # The caller's key decides who sees this, so nothing shared may keep it.
+        return {"tools": TOOLS, "ttlMs": TOOL_LIST_TTL_MS, "cacheScope": "private"} if modern else {"tools": TOOLS}
+
+    async def _call_tool(self, params: dict[str, Any]) -> dict[str, Any]:
+        name, arguments = params.get("name"), params.get("arguments", {})
+        if not isinstance(name, str):
+            raise RpcError(INVALID_PARAMS, "tools/call needs a tool name")
+        if not isinstance(arguments, dict):
+            raise RpcError(INVALID_PARAMS, "arguments must be an object")
+        return await self.tools.call(name, arguments)
 
     def _initialize(self, params: dict[str, Any]) -> dict[str, Any]:
         requested = params.get("protocolVersion")
@@ -307,10 +323,10 @@ def header_value(value: str) -> str:
 
 def check_modern_headers(headers: Mapping[str, str], message: dict[str, Any], version: str) -> None:
     """Modern headers mirror the body, so whatever routes on one cannot be told another story."""
-    params = message.get("params") if isinstance(message.get("params"), dict) else {}
-    meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
-    if meta.get(VERSION_KEY) != version:
-        raise RpcError(HEADER_MISMATCH, f"Header mismatch: MCP-Protocol-Version is {version}, and _meta says {meta.get(VERSION_KEY)}")
+    params = as_object(message.get("params"))
+    claimed = as_object(params.get("_meta")).get(VERSION_KEY)
+    if claimed != version:
+        raise RpcError(HEADER_MISMATCH, f"Header mismatch: MCP-Protocol-Version is {version}, and _meta says {claimed}")
     if headers.get("mcp-method") != message.get("method"):
         raise RpcError(HEADER_MISMATCH, f"Header mismatch: Mcp-Method does not match the method {message.get('method')}")
     if message.get("method") == "tools/call" and header_value(headers.get("mcp-name", "")) != params.get("name"):
@@ -348,9 +364,7 @@ async def answer_http(
         return 400, RpcError(INVALID_REQUEST, "Send one JSON-RPC object per POST, not a batch").body(None)
     identifier = message.get("id")
     version = headers.get("mcp-protocol-version")
-    params = message.get("params") if isinstance(message.get("params"), dict) else {}
-    meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
-    if version is None and meta.get(VERSION_KEY) in MODERN_VERSIONS:
+    if version is None and as_object(as_object(message.get("params")).get("_meta")).get(VERSION_KEY) in MODERN_VERSIONS:
         return 400, RpcError(HEADER_MISMATCH, "Header mismatch: MCP-Protocol-Version is missing").body(identifier)
     version = version or HEADERLESS_VERSION
     if version not in SUPPORTED_VERSIONS:
@@ -366,8 +380,12 @@ async def answer_http(
     return (202, None) if reply is None else (http_status(reply, modern), reply)
 
 
+def encode_line(message: dict[str, Any], ensure_ascii: bool = False) -> bytes:
+    return json.dumps(message, ensure_ascii=ensure_ascii, separators=(",", ":")).encode("utf-8") + b"\n"
+
+
 def write_message(output: BinaryIO, message: dict[str, Any]) -> None:
-    output.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n")
+    output.write(encode_line(message))
     output.flush()
 
 
@@ -397,8 +415,7 @@ async def serve_stdio(client: httpx.AsyncClient, source: BinaryIO, output: Binar
             write_message(output, RpcError(PARSE_ERROR, "Parse error: a line is not JSON").body(None))
             continue
         if isinstance(message, dict) and message.get("method") == "notifications/cancelled":
-            params = message.get("params") if isinstance(message.get("params"), dict) else {}
-            task = running.get(params.get("requestId"))
+            task = running.get(as_object(message.get("params")).get("requestId"))
             if task:
                 task.cancel()  # and it sends nothing more
             continue
