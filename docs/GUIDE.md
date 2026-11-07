@@ -856,7 +856,7 @@ Commands for a pool's credentials and members.
 | `--url` | both | `http://127.0.0.1:8000` | Any node's control address |
 | `--token` | both | This machine's pool token | A user key |
 | `--model` | run | Required | The model to use. It must support [tool calling](#tool-calling) |
-| `--server` | run | Required | The command that starts an MCP stdio server. Repeatable |
+| `--server` | run | Required | The command that starts an MCP stdio server, or the `http://` or `https://` URL of a Streamable HTTP one. Repeatable |
 | `--allow` | run | None | A tool that may run without asking. Repeatable |
 | `--pass-env` | run | None | An environment variable servers may see, beyond the basics. Repeatable |
 | `--max-turns` | run | 8 | Most times the model may be asked before giving up |
@@ -1184,27 +1184,37 @@ Over HTTP, point it at `http://NODE:8209/mcp` with `Authorization: Bearer KEY`. 
 | `list_models` | The models running now |
 | `mesh_status` | Whether the mesh can answer, what it runs, and which nodes hold which stages |
 
-Each tool is a call to the node's own API with your key, so a reply reached this way takes the normal path, through lanes, followers, and failover. Rate limits and the audit log apply to it, and a key can do nothing here that it could not do there.
+| Resource | What it holds |
+|---|---|
+| `isharded://mesh/status` | What `mesh_status` returns |
+| `isharded://mesh/route` | Which worker holds which layers on the main route, with no addresses |
+| `isharded://mesh/model` | The loaded model: its kind, whether it can see, its architecture, layers, experts, and size, with no file paths |
 
-- Requests each stand alone, on any node. There are no sessions and no event streams, so replies arrive whole, with no progress updates. Over stdio, `notifications/cancelled` stops a reply.
+The `mesh_health` prompt takes no arguments. It gives a client the status as it is now, with a request to say in plain words whether the mesh is healthy.
+
+Each tool, resource, and prompt is a call to the node's own API with your key, so a reply reached this way takes the normal path, through lanes, followers, and failover. Rate limits and the audit log apply to it, and a key can do nothing here that it could not do there. All three resources come from `GET /admin/status`, which any user key may read, and they pass on less than it does. Each read pays once. An error reading one is a protocol error, since a resource has no tool error to fail with.
+
+- Requests each stand alone, on any node. There are no sessions and no event streams, so replies arrive whole, with no progress updates.
+- A reply can be cancelled. Over stdio, and over HTTP in the older revisions, `notifications/cancelled` stops it. Over HTTP in the older revisions the cancelled request still gets an answer, error `-32800`, because the specification ends a stream only with a reply. In the current revision over HTTP, closing the connection is the cancel, and nothing is sent. In the older revisions a dropped connection is not a cancel, as the specification says, and the reply runs on.
+- A cancel over HTTP must reach the node that took the request, since a request stands alone and no other node knows of it. It reaches only your own requests: another key's cancel does nothing. If two clients on one key both have a request running with the same id, a cancel stops neither, because it cannot tell which was meant.
 - A web page may only reach `/mcp` from this machine or from a member of the mesh, because a page from elsewhere could otherwise use DNS rebinding to reach a node on your own network.
 - Bad arguments come back as a tool error a model can read, with `isError: true`. An unknown tool is a protocol error.
 - `/mcp` replies are chunked, with no `Content-Length`. AVG's network filter corrupts any reply that has one to a request that looks like MCP, even on loopback, so that no client can read it.
-- Resources, prompts, and subscriptions are not offered.
+- Resource subscriptions, resource templates, and prompt arguments are not offered.
 
-The official `mcp` Python package, version 2.3.0, has used this as a client in both eras, over both stdio and HTTP. In the current era that included a reply from a real model. `chat` with an image and `embed` have each answered from a real model over HTTP, sent by a plain client in the older era.
+The official `mcp` Python package, version 2.3.0, has used this as a client in both eras, over both stdio and HTTP, resources and prompts included. In the current era that included a reply from a real model. `chat` with an image and `embed` have each answered from a real model over HTTP, sent by a plain client in the older era.
 
 ### MCP tools for models on the mesh
 
-`isharded mcp run` is an agent loop. It starts MCP stdio servers, gives the model their tools, runs the calls it asks for, and prints its answer to stdout. Everything else goes to stderr.
+`isharded mcp run` is an agent loop. It starts MCP stdio servers, or connects to Streamable HTTP ones, gives the model their tools, runs the calls it asks for, and prints its answer to stdout. Everything else goes to stderr.
 
 ```bash
 isharded mcp run --url http://NODE:8209 --token KEY --model MODEL \
-  --server "python my_server.py" --server "other-server --flag" --allow search \
+  --server "python my_server.py" --server http://127.0.0.1:9000/mcp --allow search \
   "What changed in the release notes?"
 ```
 
-A tool with no read-only annotation stops and asks at the terminal, showing its arguments, unless `--allow NAME` names it. With no terminal to ask at, the answer is no, and the model is told so. If two servers offer the same name, the later one is prefixed with its server's name.
+A tool with no read-only annotation stops and asks at the terminal, showing its arguments, unless `--allow NAME` names it. With no terminal to ask at, the answer is no, and the model is told so. If two servers offer the same name, the later one is prefixed with its server's name, and if that name is taken too, a number follows it, as in `other_search_2`. No tool ever replaces another, and each rename is said on stderr, so check it before naming a tool in `--allow`.
 
 **A server's annotations are its own claim.** `readOnlyHint` is what a server says about itself, and nothing checks it. A tool that says it is read-only runs without asking, even if it deletes your files, so only run servers you trust. The same goes for what a tool returns: it is text a stranger chose, and it reaches the model. It can talk the model into asking for another tool, and that call still has to pass the same check.
 
@@ -1212,9 +1222,17 @@ Servers are programs running as you. They see a short list of environment variab
 
 Do not take a model's word that a tool ran. Each run goes to stderr as `Calling NAME`, and that is the record. In testing, Qwen3-0.6B reported a note as saved after the call had been refused, and the note did not exist.
 
-Stdio servers only: `mcp run` does not connect to HTTP MCP servers. It offers servers no sampling and no roots. The whole command has run with both models [measured above](#tool-calling), against a test server of each era, through a read-only tool, a refused tool, and `--allow`. Its client has also listed and called tools on a server built with the official `mcp` package, without a model. How well a run does depends on the model.
+If the model's last reply reaches the token limit, what it wrote goes to stdout as usual, stderr says it was cut off, and the exit code is 1, so a script cannot take half an answer for a whole one. A tool call that was written whole before the limit still runs.
 
-The assistant has its own MCP client, in `isharded/assistant/plugins.py`, which adds its broker and sandbox. See [the assistant's guide](ASSISTANT.md).
+A server at a URL is reached with no key, since your key goes only to the mesh, and with redirects turned off. There is no option yet to give a key to such a server, so `mcp run` reaches only those that need none. `--pass-env` has no effect on one. An older server's session is kept for the run and ended when it finishes. An event stream that ends before its reply is a failed call, and is not resumed.
+
+`mcp run` offers servers no sampling and no roots. In the current revision a tool can stop to ask for more input, with `resultType: "input_required"`. This client has nothing to answer with, so the model is told what the tool asked for, and that the tool did not finish. It can try again with more in the arguments, or say what is needed.
+
+An image in a tool's result goes to a model that can see, as `GET /v1/models` reports, in a user message after the tool's reply, because the API lets only user messages hold images. That message says the images are tool output, but a model cannot tell who really made an image, so text in one reaches it as a tool's text does. An image the mesh would refuse stays out, and so does one past its limits of 10 MiB or 16 images for a run. The tool's text then says what was left out and why, and the same goes for audio and every other kind of content, and for every image a model that cannot see would have been sent. This path has run only against a scripted mesh, and through the mesh's own check of a request's images, and not yet with a real vision model.
+
+The whole command has run with both models [measured above](#tool-calling), against a test server of each era, through a read-only tool, a refused tool, and `--allow`. Its client has also listed and called tools on a server built with the official `mcp` package, without a model. How well a run does depends on the model.
+
+The assistant has its own MCP client, in `isharded/assistant/plugins.py`, which adds its broker and sandbox and negotiates through the same code. See [the assistant's guide](ASSISTANT.md).
 
 ## Models
 
@@ -1672,6 +1690,7 @@ A node started with `isharded up` keeps its route state, keys, and audit log in 
 | A tool call comes back as text | The model wrote something that is not a call to an offered tool | Read `content` to see what it wrote. Small models do this often, so retry or use a larger one |
 | A model answers without calling a tool | `auto` leaves that to the model | Send `tool_choice: "required"` |
 | `isharded mcp run` says `Refused`, with no question | There is no terminal to ask at | Name the tool with `--allow` |
+| `isharded mcp run` says the reply was cut off | The model reached the token limit on its last turn | Raise `--max-tokens`, or ask for less |
 | An MCP server cannot find a key or setting | Servers see only a short list of environment variables | Pass it with `--pass-env` |
 | `isharded up --model` says `Could not load`, and `this needs the member role` | An invited machine holds a user key, and loading needs an admin key | Load it from the owner's machine |
 | `checking needs two routes` | `isharded audit` found one route for that model | Load another with `--lane NAME --lane-apart` |
@@ -1763,7 +1782,7 @@ Adapter tests compare every family with the reference `transformers` implementat
 | `isharded/node.py` | The launcher that supervises a node's services |
 | `isharded/lanes.py` | Several models at once: the front door and each node's lanes |
 | `isharded/toolcalls.py` | Tool calling: what a template offers, and finding calls in replies |
-| `isharded/mcp_server.py`, `isharded/mcp_client.py` | The mesh as an MCP server, and the agent loop for `isharded mcp run` |
+| `isharded/mcp_server.py`, `isharded/mcp_client.py` | The mesh as an MCP server, and the agent loop and MCP client for `isharded mcp run` |
 | `isharded/embedding.py` | Packing text into embedding passes, and turning pooled output into vectors |
 | `isharded/vision.py`, `isharded/mtmd.py` | Images in chat, and the binding to llama.cpp's `mtmd` library |
 | `isharded/commons.py` | A network nobody owns: self-made identities, vouches, and each node's view |

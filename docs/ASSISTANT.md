@@ -622,7 +622,7 @@ The command runs in the manifest's folder. Each call starts it, writes one line 
 {"ok": true, "output": "Rain.", "data": {"mm": 4}}
 ```
 
-**MCP servers** use `"protocol": "mcp"`, and the tools come from the server over stdio: `initialize`, then `tools/list`, then `tools/call`. A server's own hints are untrusted and ignored, so what you state at install is what counts, and the default is execute plus external. You can state effects with `--effects` and `--tool-effects`, or in the manifest under `tools`, which is your note and not the server's:
+**MCP servers** use `"protocol": "mcp"`, and the tools come from the server over stdio: `initialize`, then `tools/list`, then `tools/call`. A server that refuses `initialize` is asked what it speaks, so one of the current revision, which has no `initialize`, can be installed too. A server's own hints are untrusted and ignored, so what you state at install is what counts, and the default is execute plus external. You can state effects with `--effects` and `--tool-effects`, or in the manifest under `tools`, which is your note and not the server's:
 
 ```json
 {
@@ -633,7 +633,7 @@ The command runs in the manifest's folder. Each call starts it, writes one line 
 }
 ```
 
-Each tool's name, description, and input schema are fingerprinted at install. If a server later changes one, the plugin is turned off until a person installs it again. A new tool is not offered until then. A description is shown as the server's own unverified words, cut to 200 characters. The server gets nothing back: no sampling, no roots.
+Each tool's name, description, and input schema are fingerprinted at install. If a server later changes one, the plugin is turned off until a person installs it again. A new tool is not offered until then, and a tool that has gone fails when called and says so. Neither turns the plugin off. Both are checked each time the server starts, written to the audit log as `plugin.drift`, and shown by `plugin list` until the plugin is installed again. A description is shown as the server's own unverified words, cut to 200 characters. The server gets nothing back: no sampling, no roots, and no answer to a tool that stops to ask for more input, so that call fails and says what it asked. An image in a result is not passed on: the output says what it was.
 
 **Failures.** A crash, a hang, or a reply that is not valid counts as a failure, and three in a row turn the plugin off. A proper reply saying `ok: false`, or an MCP error, is not a failure. The rest of the assistant carries on. Installing it again turns it back on and keeps its grants. If what it declares changed, its old grants end. Removing a plugin ends its grants.
 
