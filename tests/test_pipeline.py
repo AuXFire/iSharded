@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+import json
 import random
+from types import SimpleNamespace
 
 from fastapi import HTTPException
 import pytest
 
 from isharded import worker as worker_module
 from isharded.pipeline import Pipeline
-from isharded.protocol import InferRequest, SavePoint
+from isharded.protocol import GenerateRequest, InferRequest, SavePoint
 from isharded.statestore import pass_ends, prompt_parts
 
 STOP = 999
@@ -475,3 +477,201 @@ def test_a_part_whose_prompt_was_replaced_never_runs() -> None:
     with pytest.raises(HTTPException) as caught:
         asyncio.run(run())
     assert caught.value.status_code == 503
+
+
+# A reply that failed part way carries on from what it wrote.
+
+
+def following(**fields) -> InferRequest:
+    return InferRequest(session_id="s", epoch=1, input_ids=[], **fields)
+
+
+def test_written_tokens_each_get_their_own_pass_over_http(monkeypatch) -> None:
+    passes = []
+
+    async def reply_step(request):
+        passes.append(request.input_ids)
+        return {"token_id": 400 + len(passes)}
+
+    monkeypatch.setattr(worker_module, "reply_step", reply_step)
+    monkeypatch.setattr(worker_module.runtime, "ring_ready", lambda request: False)
+    answer = asyncio.run(worker_module.read_written(following(), [7, 8, 9], 5))
+    assert passes == [[7], [8], [9]]
+    assert answer == 403, "only the last answer is the next token"
+
+
+class Ring:
+    """Answers after a few turns of the loop, whatever was sent, and in order."""
+
+    def __init__(self, fail_at: int | None = None) -> None:
+        self.sent: list[tuple[int, int, int | None]] = []
+        self.out: deque[asyncio.Future[list[int]]] = deque()
+        self.most_out = 0
+        self.fail_at = fail_at
+        self.work: asyncio.Task[None] | None = None
+
+    def send(self, request: InferRequest, token: int, position: int, rollback_to: int | None) -> asyncio.Future[list[int]]:
+        answer = asyncio.get_running_loop().create_future()
+        self.sent.append((token, position, rollback_to))
+        self.out.append(answer)
+        self.most_out = max(self.most_out, len(self.out))
+        if self.work is None:
+            self.work = asyncio.create_task(self.run())
+        return answer
+
+    async def run(self) -> None:
+        answered = 0
+        while True:
+            await asyncio.sleep(0)
+            if self.out:
+                answered += 1
+                answer = self.out.popleft()
+                if answered == self.fail_at:
+                    answer.set_exception(HTTPException(status_code=503, detail={"retry": True}))
+                elif not answer.done():
+                    answer.set_result([1000 + answered])
+
+    async def answer(self, flight: asyncio.Future[list[int]]) -> int:
+        return (await flight)[0]
+
+
+def on_ring(monkeypatch, ring: Ring) -> None:
+    monkeypatch.setattr(worker_module.runtime, "ring_ready", lambda request: True)
+    monkeypatch.setattr(worker_module.runtime, "ring_send", ring.send)
+    monkeypatch.setattr(worker_module.runtime, "ring_answer", ring.answer)
+
+
+def test_written_tokens_go_back_to_back_on_the_ring_and_within_a_window(monkeypatch) -> None:
+    ring = Ring()
+    on_ring(monkeypatch, ring)
+    monkeypatch.setattr(worker_module, "RESUME_WINDOW", 4)
+    written = list(range(50, 70))
+
+    async def run() -> int:
+        answer = await worker_module.read_written(following(), written, 100)
+        ring.work.cancel()
+        return answer
+
+    assert asyncio.run(run()) == 1000 + len(written), "the last pass answers for the reply"
+    assert ring.sent == [(token, 100 + index, None) for index, token in enumerate(written)]
+    assert 1 < ring.most_out <= 4
+
+
+def test_a_pass_that_fails_on_the_ring_ends_the_read_and_drops_the_rest(monkeypatch) -> None:
+    ring = Ring(fail_at=2)
+    on_ring(monkeypatch, ring)
+    monkeypatch.setattr(worker_module, "RESUME_WINDOW", 3)
+    seen: list[asyncio.Future[list[int]]] = []
+    sending = ring.send
+
+    def send(*arguments) -> asyncio.Future[list[int]]:
+        seen.append(sending(*arguments))
+        return seen[-1]
+
+    monkeypatch.setattr(worker_module.runtime, "ring_send", send)
+
+    async def run() -> None:
+        try:
+            await worker_module.read_written(following(), list(range(10)), 0)
+        finally:
+            ring.work.cancel()
+
+    with pytest.raises(HTTPException):
+        asyncio.run(run())
+    assert len(ring.sent) < 10
+    assert not any(flight.cancelled() for flight in seen), "finish_reply waits on what is still out"
+
+
+def test_a_reply_that_goes_away_leaves_its_passes_out_for_the_slot_to_wait_on(monkeypatch) -> None:
+    """ring_settle waits on the newest pass. Cancelled, it would free the slot with passes still on the ring."""
+    held: list[asyncio.Future[list[int]]] = []
+
+    def send(*arguments) -> asyncio.Future[list[int]]:
+        held.append(asyncio.get_running_loop().create_future())
+        return held[-1]
+
+    async def answer(flight: asyncio.Future[list[int]]) -> int:
+        return (await flight)[0]
+
+    monkeypatch.setattr(worker_module.runtime, "ring_ready", lambda request: True)
+    monkeypatch.setattr(worker_module.runtime, "ring_send", send)
+    monkeypatch.setattr(worker_module.runtime, "ring_answer", answer)
+    monkeypatch.setattr(worker_module, "RESUME_WINDOW", 3)
+
+    async def run() -> None:
+        reading = asyncio.ensure_future(worker_module.read_written(following(), list(range(10)), 0))
+        await asyncio.sleep(0)
+        reading.cancel()
+        await asyncio.gather(reading, return_exceptions=True)
+
+    asyncio.run(run())
+    assert len(held) == 3
+    assert not held[-1].cancelled()
+
+
+async def stream_of(body) -> list[int]:
+    response = await worker_module.generate(body, None)
+    lines = [line async for line in response.body_iterator]
+    return [json.loads(line)["token_id"] for line in lines]
+
+
+@pytest.fixture
+def entry(monkeypatch):
+    """The entry worker of a one-stage route, with passes answered from ``model``."""
+    runtime = worker_module.runtime
+    monkeypatch.setattr(worker_module, "verify_token", lambda authorization: None)
+    monkeypatch.setattr(runtime, "assignment", SimpleNamespace(start_layer=0))
+    monkeypatch.setattr(runtime, "epoch", 1)
+    monkeypatch.setattr(runtime, "gguf", None)
+    monkeypatch.setattr(runtime, "draft", None)
+    monkeypatch.setattr(runtime, "route", [])
+    monkeypatch.setattr(runtime, "ring_ready", lambda request: False)
+    passes: list[InferRequest] = []
+
+    async def reply_step(request, part=None):
+        passes.append(request)
+        if request.verify:
+            return {"token_ids": [300 + len(passes)]}
+        return {"token_id": 300 + len(passes)}
+
+    monkeypatch.setattr(worker_module, "reply_step", reply_step)
+    return passes
+
+
+def test_a_resumed_reply_reads_the_prompt_as_usual_and_streams_only_new_tokens(entry) -> None:
+    body = GenerateRequest(session_id="s", epoch=1, input_ids=[1, 2, 3], written=[7, 8], max_tokens=2, reset=True)
+    assert asyncio.run(stream_of(body)) == [303, 304]
+    prompt, *rest = entry
+    assert prompt.input_ids == [1, 2, 3] and prompt.prompt_rows and prompt.reset
+    assert [item.input_ids for item in rest] == [[7], [8], [303]]
+    assert not any(item.prompt_rows or item.reset for item in rest), "plain decoding ran them, so these are plain passes"
+
+
+def test_a_reply_with_nothing_written_runs_as_it_always_did(entry) -> None:
+    body = GenerateRequest(session_id="s", epoch=1, input_ids=[1, 2], max_tokens=2, reset=True)
+    assert asyncio.run(stream_of(body)) == [301, 302]
+    assert [item.input_ids for item in entry] == [[1, 2], [301]]
+
+
+def test_a_draft_goes_on_from_the_whole_reply_after_a_resume(entry, monkeypatch) -> None:
+    class Draft:
+        texts: list[list[int]] = []
+
+        def prepare(self, prompt, plan, slot) -> None:
+            self.prompt = list(prompt)
+
+        def guess(self, text, count, slot) -> list[int]:
+            self.texts.append(list(text))
+            return [5] * count
+
+    draft = Draft()
+    runtime = worker_module.runtime
+    monkeypatch.setattr(runtime, "draft", draft)
+    monkeypatch.setattr(runtime, "speculate_tokens", 2)
+    monkeypatch.setattr(runtime, "draft_choice", worker_module.DraftChoice())
+    body = GenerateRequest(session_id="s", epoch=1, input_ids=[1, 2], written=[7, 8], max_tokens=2, reset=True)
+    tokens = asyncio.run(stream_of(body))
+    assert tokens[0] == 303
+    assert draft.prompt == [1, 2], "it reads the prompt, and the rest as text it has not seen"
+    assert draft.texts[0] == [1, 2, 7, 8, 303]
+    assert entry[3].rollback_to == 4, "the next pass goes after everything already written"

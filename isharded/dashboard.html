@@ -374,6 +374,7 @@
       }
       if (running) return { tone: 'work', glyph: 'work', label: 'Loading', title: `Loading ${modelName(job.model)}`, detail: 'Chat opens when every shard is in place.', issues };
       if (data.status === 'recovering') return { tone: 'work', glyph: 'work', label: 'Recovering', title: `Recovering ${name || 'the last model'}`, detail: 'Waiting for its workers to come back.', issues };
+      if (data.status === 'repairing') return { tone: 'work', glyph: 'work', label: 'Repairing', title: `Repairing ${name}`, detail: 'A stage lost its layers. Replies wait for the repair.', issues };
       if (job?.phase === 'failed') return { tone: 'bad', glyph: 'bad', label: 'Failed', title: `${modelName(job.model)} did not load`, detail: job.error, issues, empty: workers.some(worker => worker.live) ? 'model' : 'machines' };
       if (!workers.some(worker => worker.live)) return { tone: 'idle', glyph: 'idle', label: 'No machines', title: 'No machines connected', detail: 'This node is running, but no worker has joined it yet.', issues, empty: 'machines' };
       return { tone: alerts.length ? 'warn' : 'idle', glyph: alerts.length ? 'warn' : 'idle', label: alerts.length ? 'Degraded' : 'No model', title: 'No model loaded', detail: `${count(machines, 'machine')} ready. Choose a model to start.`, issues, empty: 'model' };

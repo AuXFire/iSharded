@@ -461,7 +461,7 @@ Replies came out identical to a load with no draft: 12 of 12 across greedy and s
 Three limits showed here:
 
 - The draft costs about 11 ms a guess on the entry's GPU, and that now sets the pace. A wrong guess costs a full trip along the route, and about 4 guesses in 10 were wrong on open-ended prose.
-- A kill during a reply replays what was already written as one batched pass, which rounds slightly differently. So after a failure the last words of a reply can differ from an unbroken run, where two tokens are nearly tied. Nothing is lost and nothing already sent changes.
+- A kill during a reply replayed what was already written as one batched pass, which rounded slightly differently. So after a failure the last words of a reply could differ from an unbroken run, where two tokens were nearly tied. Nothing was lost and nothing already sent changed. A reply now resumes one row at a time, which settles this on small local stages. See [Current limits](#current-limits). It has not been run again on this mesh.
 - Moving a layer boundary changes where prompt rows round to BF16, so two different layouts can give different replies at near-ties. The same layout repeats exactly.
 
 An earlier mesh of seven machines on the Python path, in four countries and two homes behind relays, ran the Q6_K build at 1.26 tokens/s. Its hops cost a full round trip plus about 10 ms, because each stage waited on the next. Stages no longer wait, but a relay still adds its own latency, so the planner keeps slow links out of the route when the model fits without them.
@@ -520,7 +520,7 @@ for part in stream:
     print(part.choices[0].delta.content or "", end="", flush=True)
 ```
 
-If the connection to a node drops, retry against another node. Replies survive almost every other failure, but nothing can save a connection to a node that died. `/ready` answers 200 when a node can serve, which suits load balancers.
+If the connection to a node drops, retry against another node. Replies survive almost every other failure, but nothing can save a connection to a node that died. `/ready` answers 200 when every stage of the route is held by a live worker, which suits load balancers. A node can know a route before its workers hold their layers, as a new coordinator does after a restart. Until they do, `/ready` answers 503 and `/admin/status` says `repairing`, or `loading` during a load. The same goes while a cordoned node's share moves. A reply that arrives then waits for the repair and goes ahead, for up to 90 seconds, or 10 minutes during a load. A worker that died a moment ago still counts until 15 seconds after its last heartbeat.
 
 ### Loading a model
 
@@ -1897,7 +1897,7 @@ A node started with `isharded up` keeps its route state, keys, and audit log in 
 | `workers_live`, `worker_live` | Workers heard from recently, overall and per worker |
 | `mesh_members` | Control planes reachable from here. Alert below the node count |
 | `mesh_term`, `coordinator`, `epoch` | Leadership term, whether this node coordinates, and the pipeline epoch |
-| `stream_fallbacks_total` | Replies that fell back to replay. Should stay near zero, because fallbacks hide trouble |
+| `stream_fallbacks_total` | Replies whose stream failed, and that resumed or fell back to replay. Should stay near zero, because fallbacks hide trouble |
 | `stage_errors_total` | Requests a stage refused. Nobody is quarantined for these, so a real fault shows here |
 | `stage_restarts_total`, `worker_stage_restarts_total` | Replays after a stage restart, and stage processes restarted |
 | `recoveries_total` | Pipeline repairs during a reply |
@@ -1922,7 +1922,7 @@ A node started with `isharded up` keeps its route state, keys, and audit log in 
 | `reachable by other machines and this pool has no credentials` | No token or authority on a node listening on the network | Run `isharded pool init`, or pass `--open` on a network you trust completely |
 | `would carry the pool's credentials unencrypted` | The node would send credentials across a plain network | Use Tailscale or TLS, or pass `--trusted-network` |
 | The chat page keeps asking for a token | A wrong key, or a pool token in a pool with certificates | Use an API key. With certificates, the pool token does nothing |
-| `no model is ready; load one first` | Nothing is loaded, or a load is still running | Load a model, or check progress on the dashboard |
+| `no model is ready; load one first` | Nothing is loaded, or a load outlasted the 10 minutes a reply waits for it | Load a model, or check progress on the dashboard |
 | `isharded load` cannot connect | It assumes the demo's port | Pass `--url http://NODE:8209` |
 | A node shows as standby | Its share moved away after a failure, and the model still fits without it | `POST /admin/rebalance` when you want the layout back. It returns by itself when idle |
 | `failed to load, and replanning would move` | A live node could not load its stage, and moving its share would be large | Read the error after the colon. The old model keeps serving meanwhile |
@@ -2098,7 +2098,9 @@ Behavior:
 - Cutting prompts into the same passes every time has a cost. A long chat of short messages, read with nothing saved, runs as many small passes: 1,770 tokens in 49 messages took 17.6 s where it took 13.5 s before, on CPU. Prompts with few turns cost the same as before. Turns under 64 tokens can also reread up to 64 tokens more than the last turn did.
 - A saved state is only good for the layers it came from. If a node is lost with no spare, the survivors split the layers differently and the prompt is read in full, with or without copies.
 - A different split of the layers can change a near-tie at temperature 0, because rows round to BF16 at each stage boundary. So a reply is the same with the cache on or off for a given split, and not across splits.
-- A reply that recovers from a failure reads the tokens it already generated as prompt rows, which round differently from the first time. So the rest of a recovered reply can differ at a near-tie, with or without the cache.
+- A GGUF reply that recovers from a failure reads its prompt as usual, then runs each token it already wrote as its own one-row pass, as plain decoding did. So it carries on exactly while its layers stay where they were. With a stage process killed mid-reply on three local stages of Qwen3-0.6B, 26 of 26 replies matched an unbroken run, greedy and seeded, with direct links and without. Reading back as prompt rows had changed 10 of 11. This has not run on a real mesh, with a draft model, or with other replies running beside it.
+- A recovered reply can still differ from an unbroken run at a near-tie in these cases. A prompt with images, or a PyTorch model, still reads the reply back as prompt rows. A reply that moved to other layers meets the limit above. A reply a draft checked several rows at a time had those tokens rounded differently the first time, and so did one that shared merged passes with other conversations. A seeded reply using `top_k` without `top_p` changes course if it leaves direct links, because the native engine and the Python path keep those candidates in different orders: 3 of 3 did.
+- Recovery costs one pass for each token already written. A failed stage takes the direct links down, so those passes usually run over HTTP, one at a time. On the same local stages that took 21 ms a token, and 4.7 ms on direct links, where they go 16 at a time. On a slow route a long reply takes much longer to resume than the one batched pass did.
 - Copies of saved states are sent whole on every turn, so a long conversation on a slow link falls behind. Recovery then uses an older state, or none.
 - Saved states are not deleted when a conversation ends, and are stored unencrypted. See [the security notes](SECURITY.md#saved-conversations).
 - With two nodes, a split network leaves two coordinators until it heals. Nothing can be corrupted, but neither side can know it is the minority.

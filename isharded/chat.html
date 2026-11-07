@@ -261,6 +261,7 @@
         return `<div class="greeting"><h1>Loading ${esc(modelName(job.model))}</h1>${bar}<p>${esc(PHASE[job.phase] || job.phase)}${job.phase === 'fetching' && job.bytes_total ? `, ${percent}%` : ''}. Chat opens when every shard is in place.</p></div>`;
       }
       if (status.status === 'recovering') return `<div class="greeting"><h1>Recovering ${esc(modelName(status.model) || 'the last model')}</h1><p>Waiting for its workers to come back. Chat opens when the route is whole again.</p></div>`;
+      if (status.status === 'repairing') return `<div class="greeting"><h1>Repairing ${esc(modelName(status.model))}</h1><p>A stage lost its layers and is getting them back. Chat opens when the route is whole again.</p></div>`;
       if (status.load_job?.phase === 'failed') return `<div class="greeting"><h1>${esc(modelName(status.load_job.model))} did not load</h1><p class="failure">${esc(status.load_job.error)}</p><div class="greeting-actions"><button class="btn primary" type="button" id="emptyPick">Choose a model</button></div></div>`;
       if (!liveWorkers(status)) return '<div class="greeting"><h1>No workers connected</h1><p>Start a node with <code>python -m isharded node</code> and point it at this node, or create an invite on the dashboard. It will appear here.</p><div class="greeting-actions"><a class="btn" href="/dashboard">Open the dashboard</a></div></div>';
       if (!state.catalog && !state.catalogFailed) readCatalog();

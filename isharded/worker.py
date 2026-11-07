@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 from urllib.parse import urlsplit
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Callable, Collection, Iterator
 import contextlib
 from contextlib import asynccontextmanager
@@ -91,7 +91,7 @@ from .gguf_stage import (
 )
 from .pipeline import Pipeline
 from . import __version__
-from .llamacpp import PINNED_BUILD, LlamaError, StageLost, ensure_build, pick_build, rocm_library_paths, step_random
+from .llamacpp import PINNED_BUILD, LlamaError, StageLost, ensure_build, pick_build, rocm_library_paths, speculative_choice, step_draws, step_random
 from .pool import check_exposure, load_token
 from .serving import MAX_STAGE_BYTES, MAX_STATE_BYTES, BodyLimit, serve, where_everything_is
 from .slots import SlotGate
@@ -110,6 +110,9 @@ SUPPORTED_DTYPES = ["bfloat16", "float32", "float16"]
 MAX_PENDING_CHECKPOINTS = 32
 # Times a reply plans again after a stage turns out not to hold a state.
 PLAN_ATTEMPTS = 3
+# Written tokens a resuming reply keeps on the ring at once. A pass is one row, so this
+# fills any route without crowding out other replies for long.
+RESUME_WINDOW = 16
 # Where a node keeps copies of other stages' states, beside its own store.
 HELD_FOLDER = "held"
 # After a route change, how long a reply waits to hear what the stages can restore.
@@ -1360,6 +1363,11 @@ class WorkerRuntime:
                 logits = self.adapter.logits(self.unit_weights["head"], hidden[:, -1:, :])[0, -1].float()
             if request.temperature == 0:
                 return int(torch.argmax(logits).item())
+            if self.gguf is not None and request.seed is not None:
+                # A reply leaves the ring for this path when a stage fails, so a seed has
+                # to draw here what it draws there.
+                draws = step_draws(request.seed, self.caches[request.session_id].length - 1)
+                return speculative_choice(lambda _: logits.numpy(), [], request.temperature, request.top_p, request.top_k, draws)[0]
             if request.top_k:
                 cutoff = torch.topk(logits, min(request.top_k, logits.numel())).values[-1]
                 logits = logits.masked_fill(logits < cutoff, float("-inf"))
@@ -2271,6 +2279,30 @@ async def reply_step(request: InferRequest, part: PromptPart | None = None) -> d
     return await entry_pass(request, part, arrived)
 
 
+async def read_written(request: InferRequest, written: list[int], position: int) -> int:
+    """Runs what a reply had already written, and returns the token that comes next.
+
+    Each token gets its own one-row pass at its own position, because that is what plain
+    decoding ran, and a batched pass rounds differently. Whatever the model answers along
+    the way, the written tokens stand, so on the ring no pass has to wait for the one before.
+
+    A reply that stops here leaves its passes out, uncancelled: ``finish_reply`` waits for
+    the newest of them, so none reaches a stage after the slot has gone to someone else.
+    """
+    if not runtime.ring_ready(request):
+        for token in written:
+            answer = (await reply_step(request.model_copy(update={"input_ids": [token]})))["token_id"]
+        return answer
+    flights: deque[asyncio.Future[list[int]]] = deque()
+    for place, token in enumerate(written, position):
+        if len(flights) == RESUME_WINDOW:
+            await runtime.ring_answer(flights.popleft())
+        flights.append(runtime.ring_send(request, token, place, None))
+    while len(flights) > 1:
+        await runtime.ring_answer(flights.popleft())
+    return await runtime.ring_answer(flights.popleft())
+
+
 async def state_in_reach(key: str) -> bool:
     """Gets a state held elsewhere onto every stage, or forgets about it."""
     try:
@@ -2302,8 +2334,8 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
     """Run the token loop here and stream ids out, one JSON object per line.
 
     Each token still crosses the stages, but no longer makes a round trip to the
-    orchestrator. A failure ends the stream, and the orchestrator recovers by
-    replaying through ``/v1/infer``.
+    orchestrator. A failure ends the stream, and the orchestrator recovers by opening
+    a new one with ``written`` set, or by replaying through ``/v1/infer``.
     """
     verify_token(authorization)
     require_entry(body.input_ids)
@@ -2341,8 +2373,14 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             runtime.prefix.add(save.key, save.length, save.kind)
         return result["token_id"]
 
-    async def plain(request: InferRequest, plan: PromptPlan, rows: PromptRows | None = None) -> AsyncIterator[int]:
+    async def next_new_token(request: InferRequest, plan: PromptPlan, rows: PromptRows | None = None) -> int:
         token = await first_token(request, plan, rows)
+        if body.written:
+            token = await read_written(request.model_copy(update=GOING_ON), body.written, len(body.input_ids))
+        return token
+
+    async def plain(request: InferRequest, plan: PromptPlan, rows: PromptRows | None = None) -> AsyncIterator[int]:
+        token = await next_new_token(request, plan, rows)
         yield token
         following = request.model_copy(update=GOING_ON)
         for _ in range(body.max_tokens - 1):
@@ -2363,7 +2401,7 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
         # The draft reads the prompt while the real model does.
         prepared = asyncio.create_task(asyncio.to_thread(draft.prepare, body.input_ids, plan, request.slot))
         try:
-            token = await first_token(request, plan)
+            token = await next_new_token(request, plan)
         except Exception:
             # A reply may plan again now, and two of these on one sequence would tangle it.
             await asyncio.gather(prepared, return_exceptions=True)
@@ -2373,7 +2411,7 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             await prepared
         except LlamaError as exc:
             raise await runtime.draft_failed(exc, draft) from exc
-        history = [*body.input_ids, token]
+        history = [*body.input_ids, *body.written, token]
         produced = 1
         ahead = min(INITIAL_GUESSES, runtime.speculate_tokens)
         following = request.model_copy(update=GOING_ON)
@@ -2451,7 +2489,7 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
                 draft.rewind(len(history) - 1, request.slot)  # the newest token is the model's own
 
     async def tokens() -> AsyncIterator[bytes]:
-        request = InferRequest(**body.model_dump(exclude={"max_tokens", "stop_token_ids", "checkpoint_at", "cut_token", "images"}))
+        request = InferRequest(**body.model_dump(exclude={"max_tokens", "stop_token_ids", "checkpoint_at", "cut_token", "written", "images"}))
         slot = await admitted(runtime.choose_slot)
         request = request.model_copy(update={"slot": slot})
         try:

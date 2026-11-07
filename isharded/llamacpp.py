@@ -208,6 +208,9 @@ LLAMA_FUNCTIONS = {
 # Nucleus sampling keeps the head of the distribution, so a full sort of a
 # quarter-million logits per row would be wasted work.
 NUCLEUS_CANDIDATES = 4096
+# The arithmetic of the engine's generator.
+GOLDEN = 0x9E3779B97F4A7C15
+WORD = 2**64 - 1
 
 
 class LlamaError(RuntimeError):
@@ -254,6 +257,38 @@ def step_random(seed: int | None, position: int) -> np.random.Generator:
     return np.random.default_rng(None if seed is None else [seed, position])
 
 
+def mix(value: int) -> int:
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & WORD
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & WORD
+    return value ^ (value >> 31)
+
+
+class Draws:
+    """The native engine's generator, the same number for number as ``Draws`` in sample.rs.
+
+    A reply leaves the ring for this path when a stage fails. With a generator of its
+    own here, a seeded reply would go another way from that point on.
+    """
+
+    def __init__(self, seed: int, position: int) -> None:
+        self.state = mix(mix(seed & WORD) ^ (position * GOLDEN & WORD))
+
+    def random(self) -> float:
+        self.state = (self.state + GOLDEN) & WORD
+        return (mix(self.state) >> 11) / 2**53
+
+
+def step_draws(seed: int | None, position: int) -> Draws | np.random.Generator:
+    """The random numbers for one pass of a GGUF stage. See ``step_random`` for why they follow the position."""
+    return np.random.default_rng() if seed is None else Draws(seed, position)
+
+
+def draw(ids: np.ndarray, probabilities: np.ndarray, generator: Draws | np.random.Generator) -> int:
+    """One token, walking the distribution in its own order, as the engine does."""
+    index = int(np.searchsorted(np.cumsum(probabilities), generator.random(), side="right"))
+    return int(ids[min(index, ids.size - 1)])
+
+
 def filtered_distribution(logits: np.ndarray, temperature: float, top_p: float, top_k: int) -> tuple[np.ndarray, np.ndarray]:
     """Token ids and probabilities after top-k, temperature, and top-p, in that order."""
     limit = top_k or (NUCLEUS_CANDIDATES if top_p < 1.0 else 0)
@@ -277,7 +312,7 @@ def speculative_choice(
     temperature: float,
     top_p: float,
     top_k: int,
-    generator: np.random.Generator,
+    generator: Draws | np.random.Generator,
 ) -> list[int]:
     """Decide what a speculative pass produced. ``logits_for(i)`` gives row ``i``.
 
@@ -312,7 +347,7 @@ def speculative_choice(
                 accepted.append(int(np.argmax(logits)))
                 return accepted
             probabilities = probabilities / probabilities.sum()
-        accepted.append(int(generator.choice(ids, p=probabilities)))
+        accepted.append(draw(ids, probabilities, generator))
         return accepted
     return accepted
 
@@ -723,7 +758,7 @@ class LlamaStage:
         """Check guesses against this model and return the tokens that came out of it."""
         hidden = np.ascontiguousarray(hidden, dtype=np.float32)
         self._decode(hidden.shape[0], position, True, hidden=hidden, sequence_id=slot)
-        return speculative_choice(self.logits_at, guesses, temperature, top_p, top_k, step_random(seed, position))
+        return speculative_choice(self.logits_at, guesses, temperature, top_p, top_k, step_draws(seed, position))
 
     def guess(
         self,
