@@ -1541,12 +1541,14 @@ This was measured on two CPU stages of Qwen3-0.6B on one laptop, with a copy of 
 
 | Route | No guesses | Draft | Lookup | Both |
 |---|---|---|---|---|
-| Local, repeating text | 31.5 | 33.2 | 42.2 | 32.5 |
-| Local, fresh text | 32.6 | 32.3 | 32.9 | 31.8 |
+| Local, repeating text | 31.5 | 33.2 | 32.8 | 32.5 |
+| Local, fresh text | 32.6 | 32.3 | 32.3 | 31.8 |
 | 50 ms added to each link, repeating text | 7.6 | 30.0 | 21.0 | 28.0 |
 | 50 ms added to each link, fresh text | 7.7 | 19.4 | 7.9 | 19.3 |
 
-Lookup alone tripled repeating text on the far route and cost nothing on fresh text. With a draft this good it added nothing, and over several runs on a busy machine both was sometimes ahead of the draft alone and sometimes behind. A real draft is smaller than its model and wrong more often, which this could not measure. On Qwen3.5-0.8B, with recurrent layers, lookup took repeating text from 6.5 to 17.0 tokens per second on the far route, and fresh text from 6.1 to 6.4.
+Every load above split the layers 1 and 27, except no guesses with 50 ms added, which split them 19 and 9. Locally the first stage then has almost nothing to overlap, and lookup on that very load with its guesses turned off made 31.6 and 32.3. One local lookup load that split the layers 19 and 9 made 42.2 on repeating text, so locally the split matters more than lookup does.
+
+Lookup alone nearly tripled repeating text on the far route and cost nothing on fresh text. With a draft this good it added nothing, and over several runs on a busy machine both was sometimes ahead of the draft alone and sometimes behind. A real draft is smaller than its model and wrong more often, which this could not measure. On Qwen3.5-0.8B, with recurrent layers, lookup took repeating text from 6.5 to 17.0 tokens per second on the far route, and fresh text from 6.1 to 6.4.
 
 Replies with guesses matched replies with none on every run, 12 of 12, as long as the load split the layers the same way. A load with free memory to spare can split them differently, and those replies differ with no guess involved, as above. On the recurrent model, plain decoding and lookup on the very same load matched in 24 of 24.
 
