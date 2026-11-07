@@ -987,6 +987,8 @@ A pass means the command exited 0. A test run that finds no tests, or times out,
 
 `code push` uses `git.push`, which is denied unless granted, and only ever pushes the run's own branch. `code reject` removes the worktree and the branch. If the run was already committed, the branch stays, as that was the owner's decision. Approving, pushing, and rejecting are for a person: a skill, peer, task, model, plugin, or conversation is refused.
 
+A run does one thing at a time, whether the server or a command beside it is acting, because each of these changes the tree and the state. A reject during a commit waits for the commit, for at most 120 s, and then finds a committed run. Past that wait it is refused, and nothing changed. `code resume` does not wait, since a run already at work needs nobody else on it. The lock is a file under `coder/locks` in the assistant's home, and the system releases it if the process dies.
+
 There is deliberately no capability for approving or pushing, so no model, task, or peer can reach them. Calls name their arguments from what `git.commit` and `git.push` declare in `input_schema`, and send only what the tool takes. The worktree is the repository named, so a scoped grant must cover the assistant's `coder` folder: `grant add git.commit HOME/coder`, where `HOME` is the assistant's folder. That folder is listed in `assistant.open_folders`, so file and git tools may reach it, and nothing else of the assistant's own.
 
 ### Working on iSharded itself
