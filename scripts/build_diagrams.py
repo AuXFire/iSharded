@@ -1,11 +1,11 @@
-"""Draws the How it works diagrams, as images for the README and as a single page.
+"""Draws the How it works diagrams, as images for the guide and as a single page.
 
     python scripts/build_diagrams.py
     python scripts/build_diagrams.py --page how-it-works.html
 
 Images go to docs/diagrams, in a light and a dark version. They need Chrome and the
-playwright package, and network access for the fonts. GitHub strips a README's styles
-and most of its SVG, so the README shows images rather than the drawings themselves.
+playwright package, and network access for the fonts. GitHub strips a page's styles
+and most of its SVG, so the guide shows images rather than the drawings themselves.
 """
 import argparse
 from html import escape

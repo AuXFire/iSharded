@@ -34,7 +34,6 @@ test = ["pytest>=8", "pytest-asyncio>=0.23", "transformers>=4.42", "cryptography
 isharded = "isharded.cli:main"
 isharded-orchestrator = "isharded.orchestrator:main"
 isharded-worker = "isharded.worker:main"
-isharded-node = "isharded.node:main"
 
 [tool.setuptools.packages.find]
 include = ["isharded*"]

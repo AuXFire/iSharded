@@ -1754,7 +1754,11 @@ Adapter tests compare every family with the reference `transformers` implementat
 |---|---|
 | `isharded/cli.py` | The `isharded` command |
 | `isharded/orchestrator.py` | The control plane: API, planning, repair, gossip handling |
+| `isharded/replies.py` | The OpenAI reply shapes: streaming events, usage, rendered prompts |
 | `isharded/worker.py` | A worker: stages, the token loop, merged passes, fetching |
+| `isharded/pipeline.py` | Keeps every stage busy on one reply: overlapping passes and wrong guesses |
+| `isharded/engine.py` | Loads the native engine, and speaks to it from the worker |
+| `engine/` | The native engine in Rust: stage links, token passes, sampling |
 | `isharded/up.py`, `isharded/discovery.py` | One-command setup: settings, invites, finding a mesh, `doctor`, and `service` |
 | `isharded/node.py` | The launcher that supervises a node's services |
 | `isharded/lanes.py` | Several models at once: the front door and each node's lanes |

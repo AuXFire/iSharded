@@ -181,7 +181,7 @@ def plan_tools(
     if kind is None:
         raise ToolRequestError(
             "this model's chat template has no tool format iSharded can read, so it cannot call tools here. "
-            'Leave tools out, send tool_choice "none", or load a model the Tool calling section of the README lists'
+            'Leave tools out, send tool_choice "none", or load a model the Tool calling section of docs/GUIDE.md lists'
         )
     return ToolPlan(
         format=kind,
