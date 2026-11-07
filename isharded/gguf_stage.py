@@ -13,7 +13,7 @@ from typing import Any, Iterable, Sequence
 import numpy as np
 
 from .gguf import GgufHeader, TensorInfo, plan_stage, write_stage
-from .llama_host import Channel, StageHost
+from .llama_host import SLOW_ROWS, Channel, StageHost
 from .llamacpp import LlamaError, StageLost
 from .models.gguf import GgufAdapter
 from .protocol import ConfigureRequest, MemoryPool, SavePoint, UnitPlacement
@@ -206,12 +206,12 @@ class GgufStage:
         self.host = start_host("load", self._settings)
 
     def embed(self, tokens: list[int]) -> np.ndarray:
-        _, data = self.host.call("embed", tokens=tokens)
+        _, data = self.host.call("embed", rows=len(tokens), tokens=tokens)
         return np.frombuffer(data, dtype=np.float32).reshape(-1, self.width)
 
     def pool(self, inputs: list[list[int]]) -> np.ndarray:
         """One pooled vector per input, in one pass, as the model made them."""
-        answer, data = self.host.call("pool", inputs=inputs)
+        answer, data = self.host.call("pool", rows=sum(map(len, inputs)), inputs=inputs)
         return np.frombuffer(data, dtype=np.float32).reshape(len(inputs), answer["width"])
 
     def forward(
@@ -229,18 +229,19 @@ class GgufStage:
             where["cuts"] = cuts
         if saves:
             where["saves"] = [save.model_dump() for save in saves]
-        answer, data = self.host.call("forward", as_payload(hidden), position=position, slot=slot, **where)
+        rows = len(hidden) + SLOW_ROWS * len(saves or ())
+        answer, data = self.host.call("forward", as_payload(hidden), rows=rows, position=position, slot=slot, **where)
         self.states = answer.get("states", self.states)
         output = np.frombuffer(data, dtype=np.float32)
         return output if self.last else output.reshape(-1, self.width)
 
     def forward_many(self, hidden: np.ndarray, positions: list[int], slots: list[int]) -> np.ndarray:
         """One row per conversation, in slot order. Rows out, or logits at the last stage."""
-        _, data = self.host.call("forward_many", as_payload(hidden), positions=positions, slots=slots)
+        _, data = self.host.call("forward_many", as_payload(hidden), rows=len(slots), positions=positions, slots=slots)
         return np.frombuffer(data, dtype=np.float32).reshape(len(slots), -1)
 
     def verify(self, hidden: np.ndarray, position: int, **sampling: Any) -> list[int]:
-        return self.host.call("verify", as_payload(hidden), position=position, **sampling)[0]["tokens"]
+        return self.host.call("verify", as_payload(hidden), rows=len(hidden), position=position, **sampling)[0]["tokens"]
 
     def truncate(self, keep: int, slot: int = 0) -> None:
         self.host.call("truncate", keep=keep, slot=slot)
@@ -488,7 +489,7 @@ class DraftModel:
     def _commit(self, tokens: list[int], slot: int) -> None:
         if tokens:
             text = self.text[slot]
-            self.host.call("commit", tokens=tokens, position=text.committed, slot=slot)
+            self.host.call("commit", rows=len(tokens), tokens=tokens, position=text.committed, slot=slot)
             text.committed += len(tokens)
 
     def prepare(self, prompt: list[int], plan: PromptPlan, slot: int = 0) -> None:
@@ -534,12 +535,14 @@ class DraftModel:
         text = self.text[slot]
         if text.stale:
             commit, fresh = text.chain + fresh[:1], fresh[1:]
-            answer, _ = self.host.call("guess", commit=commit, position=text.committed, count=count, slot=slot, fresh=fresh)
+            rows = len(commit) + len(fresh) + count
+            answer, _ = self.host.call("guess", rows=rows, commit=commit, position=text.committed, count=count, slot=slot, fresh=fresh)
             text.committed += len(commit)
             text.chain = []
             text.stale = False
         else:
-            answer, _ = self.host.call("guess", commit=[], position=self.seen(slot), count=count, slot=slot, fresh=fresh, restart=False)
+            rows = len(fresh) + count
+            answer, _ = self.host.call("guess", rows=rows, commit=[], position=self.seen(slot), count=count, slot=slot, fresh=fresh, restart=False)
         # The newest guess has not run yet. If it lands, it comes back as fresh text.
         text.chain += fresh + answer["tokens"][:-1]
         return answer["tokens"]

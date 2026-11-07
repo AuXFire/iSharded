@@ -23,10 +23,13 @@ import secrets
 import subprocess
 import sys
 import threading
+import time
 from typing import Any
 
 import numpy as np
+import psutil
 
+from .deadlines import pass_seconds
 from .llamacpp import LlamaError, LlamaLibrary, LlamaStage, StageLost, TokenEmbedding
 from .statestore import HISTORY, PARTIAL, StateStore
 
@@ -36,6 +39,12 @@ Reply = tuple[dict[str, Any], bytes]
 KEY_VARIABLE = "ISHARDED_STAGE_KEY"
 CONNECT_SECONDS = 60.0
 EXIT_SECONDS = 15.0
+# What a kill gets to take effect, each time. A healthy process is gone long before.
+KILL_SECONDS = 5.0
+# How often a call that is waiting looks up to see whether its process has been stopped.
+ANSWER_LOOK_SECONDS = 0.25
+# Past this, a write can stick until the far end reads.
+PIPE_BYTES = 64 * 1024
 # Encoded images kept for the next turn. A conversation resends its images every time.
 ENCODED_IMAGE_BYTES = 128 * 1024 * 1024
 # States a draft model keeps. It is small, and a draft that loses one just reads more.
@@ -44,6 +53,19 @@ DRAFT_STATE_BYTES = 256 * 1024 * 1024
 UNGATED = {"load", "ring_open", "ring_connect", "ring_close", "ring_stats"}
 # These put a sequence on another history, which the engine's snapshots cannot follow.
 NEW_HISTORY = {"clear", "restore", "truncate"}
+# A load takes as long as the disk takes, so nothing here can say it has hung.
+LOADS = {"load", "load_draft", "load_projector"}
+# These have no rows to go by and can be slow when healthy: a state can be gigabytes on a
+# slow disk, and an image a long encode on a CPU. They get the time of a long prompt.
+SLOW = {"save", "restore", "state_adopt", "state_list", "measure_image", "encode_image"}
+SLOW_ROWS = 600
+
+
+def seconds_for(operation: str, rows: int) -> float | None:
+    """How long a stage may take over a call, or None if nothing can say."""
+    if operation in LOADS:
+        return None
+    return pass_seconds(max(rows, SLOW_ROWS) if operation in SLOW else rows)
 
 
 class _Host:
@@ -323,15 +345,62 @@ def serve(connection: Connection, host: _Host, address: Any, key: bytes) -> None
 class Channel:
     """One connection to a stage process, which runs one exchange at a time."""
 
-    def __init__(self, process: subprocess.Popen[bytes], connection: Connection) -> None:
+    def __init__(self, process: subprocess.Popen[bytes], connection: Connection, stopped: threading.Event) -> None:
         self.process = process
         self.connection = connection
         self.lock = threading.Lock()
+        # Shared by every connection to this process. A kill can take a while to land, and
+        # until it does the pipe stays open and each call would sit out a deadline of its own.
+        self.stopped = stopped
 
-    def _exchange(self, operation: str, payload: bytes, meta: dict[str, Any]) -> Reply:
+    def _send(self, payload: bytes) -> None:
+        """Sends a call's rows. Many rows can stick in the pipe with no way to time them out, so
+        they go from a thread of their own, which a stop can leave behind.
+        """
+        if len(payload) <= PIPE_BYTES:
+            self.connection.send_bytes(payload)
+            return
+        failed: list[OSError] = []
+
+        def send() -> None:
+            try:
+                self.connection.send_bytes(payload)
+            except OSError as exc:
+                failed.append(exc)
+
+        sender = threading.Thread(target=send, daemon=True)
+        sender.start()
+        while sender.is_alive():
+            sender.join(ANSWER_LOOK_SECONDS)
+            if self.stopped.is_set():
+                raise StageLost("the stage process was stopped", self)
+        if failed:
+            raise failed[0]
+
+    def _answered(self, seconds: float | None) -> bool:
+        """Waits for an answer, and says whether it came in time.
+
+        It looks up now and then. A process that takes no kill leaves this pipe open, so a
+        stop made through another connection would otherwise reach nobody waiting here.
+        """
+        ends = None if seconds is None else time.monotonic() + seconds
+        while not self.connection.poll(ANSWER_LOOK_SECONDS):
+            if self.stopped.is_set():
+                raise StageLost("the stage process was stopped", self)
+            if ends is not None and time.monotonic() > ends:
+                return False
+        return True
+
+    def _exchange(self, operation: str, payload: bytes, meta: dict[str, Any], seconds: float | None) -> Reply:
+        if self.stopped.is_set():
+            raise StageLost("the stage process was stopped", self)
         try:
             self.connection.send_bytes(json.dumps({"op": operation, **meta}).encode())
-            self.connection.send_bytes(payload)
+            self._send(payload)
+            if not self._answered(seconds):
+                self.stopped.set()
+                self.process.kill()
+                raise StageLost(f"the stage process did not answer {operation} in {seconds:.0f} s, so it was stopped", self)
             answer = json.loads(self.connection.recv_bytes())
             data = self.connection.recv_bytes()
         except (EOFError, OSError) as exc:
@@ -340,24 +409,33 @@ class Channel:
             raise LlamaError(answer.get("error", "stage call failed"))
         return answer, data
 
-    def call(self, operation: str, payload: bytes = b"", **meta: Any) -> Reply:
+    def call(self, operation: str, payload: bytes = b"", rows: int = 1, **meta: Any) -> Reply:
+        """Runs an operation on the stage. ``rows`` says how long it may take; see ``seconds_for``."""
         with self.lock:
-            return self._exchange(operation, payload, meta)
+            return self._exchange(operation, payload, meta, seconds_for(operation, rows))
 
     def ask_if_idle(self, operation: str, **meta: Any) -> dict[str, Any] | None:
         """A quick question, or None if the stage is busy. For what must never wait on a pass."""
         if not self.lock.acquire(blocking=False):
             return None
         try:
-            return self._exchange(operation, b"", meta)[0]
+            return self._exchange(operation, b"", meta, seconds_for(operation, 1))[0]
+        finally:
+            self.lock.release()
+
+    def _say_goodbye(self) -> None:
+        """Asks the far end to finish, unless that would mean waiting on a stage that has hung."""
+        if self.stopped.is_set() or not self.lock.acquire(timeout=EXIT_SECONDS):
+            return
+        try:
+            self._exchange("close", b"", {}, EXIT_SECONDS)
+        except LlamaError:
+            pass
         finally:
             self.lock.release()
 
     def close(self) -> None:
-        try:
-            self.call("close")
-        except LlamaError:
-            pass
+        self._say_goodbye()
         self.connection.close()
 
 
@@ -376,7 +454,7 @@ class StageHost(Channel):
             stdin=subprocess.DEVNULL,
         )
         try:
-            super().__init__(self.process, self._accept())
+            super().__init__(self.process, self._accept(), threading.Event())
         except LlamaError:
             self.process.kill()
             raise
@@ -389,8 +467,8 @@ class StageHost(Channel):
         they are separate models and contexts. A crash in either still takes both.
         """
         with self.lock:
-            self._exchange("channel", b"", {})
-            return Channel(self.process, self._accept())
+            self._exchange("channel", b"", {}, seconds_for("channel", 1))
+            return Channel(self.process, self._accept(), self.stopped)
 
     def _accept(self) -> Connection:
         accepted: list[Connection] = []
@@ -401,15 +479,34 @@ class StageHost(Channel):
             raise LlamaError(f"the stage process did not start (exit code {self.process.poll()})")
         return accepted[0]
 
-    def close(self) -> None:
+    def _kill_harder(self) -> None:
+        """For a process a kill did not end. What it may have started goes first."""
         try:
-            self.call("close")
-            self.process.wait(EXIT_SECONDS)
-        except (LlamaError, subprocess.TimeoutExpired):
+            found = psutil.Process(self.process.pid)
+            for item in [*found.children(recursive=True), found]:
+                item.kill()
+            self.process.wait(KILL_SECONDS)
+        except (psutil.Error, OSError, subprocess.TimeoutExpired):
             pass
-        if self.process.poll() is None:
+
+    def _end_process(self) -> None:
+        """A process stuck in a driver can outlast any kill, and a reply must not wait for it.
+
+        It holds its memory until the system lets it go. If that leaves no room, the new stage
+        fails to load, and a stage that will not restart is how this node leaves the route.
+        """
+        try:
             self.process.kill()
-            self.process.wait(EXIT_SECONDS)
+            self.process.wait(KILL_SECONDS)
+        except (OSError, subprocess.TimeoutExpired):
+            self._kill_harder()
+
+    def close(self) -> None:
+        self._say_goodbye()
+        try:
+            self.process.wait(0 if self.stopped.is_set() else EXIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            self._end_process()
         self.connection.close()
         self.listener.close()
 

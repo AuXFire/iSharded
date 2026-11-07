@@ -3,6 +3,9 @@ import os
 from pathlib import Path
 import re
 import struct
+import subprocess
+import threading
+import time
 
 import httpx
 import numpy as np
@@ -27,7 +30,7 @@ from isharded.gguf import GgufHeader, split_parts
 from isharded.gguf_stage import cpu_tensor_patterns
 from isharded.models import create_adapter
 from isharded.planner import Candidate, ModelProfile, plan_placement, stored_bytes
-from isharded.protocol import MemoryPool, TensorRef, UnitPlacement, WeightUnit
+from isharded.protocol import MemoryPool, SavePoint, TensorRef, UnitPlacement, WeightUnit
 from isharded.weights import build_manifest, iter_unit_tensor, unit_tensor_span, UnitCache, FetchProgress
 
 WIDTH = 8
@@ -830,14 +833,14 @@ def test_a_draft_joins_the_entry_stage_unless_it_cannot(monkeypatch, tmp_path, a
     assert seen == [host if shared else None]
 
 
-def real_stage(host):
+def real_stage(host, gpu_layers=-1):
     """Loads the whole model as one stage."""
     from isharded.gguf import read_file_header
 
     header = read_file_header(MODEL)
     table = header.tensors["token_embd.weight"]
     embed = {"path": MODEL, "offset": header.data_start + table.offset, "length": table.nbytes, "ggml_type": table.ggml_type}
-    host.call("load", path=MODEL, last=True, table=embed, folder=BUILD, extra_paths=[], context_tokens=256, gpu_layers=-1, threads=2, cpu_tensors=[])
+    host.call("load", path=MODEL, last=True, table=embed, folder=BUILD, extra_paths=[], context_tokens=256, gpu_layers=gpu_layers, threads=2, cpu_tensors=[])
 
 
 def real_draft(slots=1, beside=None):
@@ -1445,3 +1448,193 @@ def test_an_unseeded_gguf_pass_samples_as_it_always_did(monkeypatch):
     monkeypatch.setattr(runtime, "gguf_logits", torch.tensor([0.0, 50.0, 0.0]))
     request = InferRequest(session_id="s", epoch=1, input_ids=[1], temperature=0.8)
     assert runtime._sample(None, request) == 1
+
+
+@pytest.fixture
+def quick_deadlines(monkeypatch):
+    """Every call may take half a second, plus a little for each row."""
+    from isharded import llama_host
+
+    monkeypatch.setattr(llama_host, "pass_seconds", lambda rows, hops=1: 0.5 + rows / 100)
+    return llama_host
+
+
+def test_a_call_gets_the_time_its_rows_need_and_a_load_gets_all_it_wants():
+    from isharded.deadlines import pass_seconds
+    from isharded.llama_host import SLOW_ROWS, seconds_for
+
+    assert seconds_for("forward", 1) == pass_seconds(1)
+    assert seconds_for("forward", 4000) == pass_seconds(4000), "a long prompt is no false alarm"
+    assert seconds_for("restore", 1) == pass_seconds(SLOW_ROWS), "a state can be gigabytes on a slow disk"
+    assert seconds_for("encode_image", 1) == pass_seconds(SLOW_ROWS)
+    for operation in ("load", "load_draft", "load_projector"):
+        assert seconds_for(operation, 1) is None
+
+
+def test_a_stage_call_says_how_many_rows_it_carries():
+    from isharded.gguf_stage import DraftModel, DraftText, GgufStage, PromptPlan
+
+    class Host:
+        def __init__(self):
+            self.rows = {}
+
+        def call(self, operation, payload=b"", rows=1, **_):
+            self.rows.setdefault(operation, []).append(rows)
+            return {"tokens": [1, 2], "width": 4}, np.zeros(4 * 7, dtype=np.float32).tobytes()
+
+    stage = GgufStage.__new__(GgufStage)
+    stage.host, stage.states, stage.last, stage.width = Host(), {}, True, 4
+    hidden = np.zeros((7, 4), dtype=np.float32)
+    stage.embed([1, 2, 3])
+    stage.forward(hidden, 0)
+    stage.forward_many(hidden, list(range(7)), list(range(7)))
+    stage.verify(hidden, 0, guesses=[])
+    stage.pool([[1, 2]] * 7)
+    assert stage.host.rows == {"embed": [3], "forward": [7], "forward_many": [7], "verify": [7], "pool": [14]}
+    stage.forward(hidden, 0, saves=[SavePoint(at=3, length=3, key="k", kind="history")])
+    assert stage.host.rows["forward"][-1] > 7 + 100, "saving a state on the way takes as long as saving one"
+
+    draft = DraftModel.__new__(DraftModel)
+    draft.host, draft.slots, draft.text = Host(), 1, {0: DraftText()}
+    draft.prepare([1, 2, 3, 4], PromptPlan())
+    draft.guess([5, 6], 4)
+    assert draft.host.rows["commit"] == [4]
+    assert draft.host.rows["guess"] == [6]
+
+
+def test_a_stage_that_hangs_is_stopped_and_reads_as_lost(quick_deadlines):
+    import psutil
+
+    from isharded.llamacpp import StageLost
+
+    host = quick_deadlines.StageHost()
+    try:
+        assert host.call("state_stats")[0]["states"] is not None
+        psutil.Process(host.process.pid).suspend()
+        began = time.monotonic()
+        with pytest.raises(StageLost, match="did not answer"):
+            host.call("state_stats")
+        assert time.monotonic() - began < 5
+        assert host.process.wait(10) != 0
+    finally:
+        host.close()
+
+
+def test_once_a_stage_is_given_up_on_nobody_waits_on_it_again(quick_deadlines):
+    """A kill the system has not finished leaves the pipe open, and each call would sit out its deadline."""
+    import psutil
+
+    from isharded.llamacpp import StageLost
+
+    host = quick_deadlines.StageHost()
+    beside = host.channel()
+    try:
+        psutil.Process(host.process.pid).suspend()
+        host.process.kill = lambda: None  # as a process stuck in a driver takes a kill
+        with pytest.raises(StageLost):
+            host.call("state_stats")
+        began = time.monotonic()
+        for channel in (host, beside):
+            with pytest.raises(StageLost):
+                channel.call("state_stats")
+        assert time.monotonic() - began < 0.4
+    finally:
+        del host.process.kill
+        host.close()
+
+
+def test_a_stage_that_dies_mid_call_is_still_lost_at_once(quick_deadlines):
+    from isharded.llamacpp import StageLost
+
+    host = quick_deadlines.StageHost()
+    try:
+        host.process.kill()
+        with pytest.raises(StageLost, match="died"):
+            host.call("state_stats")
+    finally:
+        host.close()
+
+
+class StubbornProcess:
+    """Takes every kill and never goes."""
+
+    pid = 2**31 - 1  # nobody
+
+    def __init__(self):
+        self.kills = 0
+
+    def poll(self):
+        return None
+
+    def kill(self):
+        self.kills += 1
+
+    def wait(self, seconds=None):
+        raise subprocess.TimeoutExpired("stage", seconds)
+
+
+def stubborn_host():
+    from types import SimpleNamespace
+
+    from isharded.llama_host import StageHost
+    from isharded.llamacpp import LlamaError
+
+    def refuses(*_):
+        raise LlamaError("no")
+
+    host = StageHost.__new__(StageHost)
+    host.process, host.lock, host.stopped, host.quiet = StubbornProcess(), threading.Lock(), threading.Event(), threading.Event()
+    host.connection = SimpleNamespace(close=lambda: None)
+    host.listener = SimpleNamespace(close=lambda: None)
+    host._exchange = refuses
+    return host
+
+
+def test_a_host_that_will_not_exit_is_killed_harder_and_left_behind(monkeypatch):
+    from isharded import llama_host
+
+    harder = []
+
+    class Found:
+        def __init__(self, pid=None):
+            self.pid = pid
+
+        def children(self, recursive):
+            return [Found("child")]
+
+        def kill(self):
+            harder.append(self.pid)
+
+    monkeypatch.setattr(llama_host.psutil, "Process", Found)
+    host = stubborn_host()
+    host.close()
+    assert host.process.kills == 1 and harder == ["child", host.process.pid]
+
+
+def test_a_host_gone_past_finding_does_not_stop_a_close_either():
+    host = stubborn_host()
+    host.close()  # no such process for the harder kill to find, and that is no reason to fail
+
+
+def test_a_suspended_host_cannot_hold_up_a_close(monkeypatch, quick_deadlines):
+    import psutil
+
+    monkeypatch.setattr(quick_deadlines, "EXIT_SECONDS", 0.5)
+    host = quick_deadlines.StageHost()
+    psutil.Process(host.process.pid).suspend()
+    began = time.monotonic()
+    host.close()
+    assert time.monotonic() - began < 5
+    assert host.process.poll() is not None
+
+
+def test_a_close_does_not_wait_behind_a_call_that_is_stuck(monkeypatch):
+    from isharded import llama_host
+
+    monkeypatch.setattr(llama_host, "EXIT_SECONDS", 0.1)
+    monkeypatch.setattr(llama_host, "KILL_SECONDS", 0.1)
+    host = stubborn_host()
+    with host.lock:  # as a pass with a long deadline ahead of it holds it
+        began = time.monotonic()
+        host.close()
+    assert time.monotonic() - began < 2
