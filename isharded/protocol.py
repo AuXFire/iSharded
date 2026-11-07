@@ -22,7 +22,7 @@ from .deadlines import PASS_SECONDS, PASS_SECONDS_PER_TOKEN, pass_seconds  # noq
 META_HEADER = "x-isharded-meta"
 # Raised whenever workers and the orchestrator stop being able to talk safely.
 # A node on another version is refused at the door, not found out mid-request.
-PROTOCOL_VERSION = 7
+PROTOCOL_VERSION = 8
 # A NaN in BF16. PyTorch writes this one on x86 and 0x7FC0 on Apple chips. Either is a NaN,
 # and a row that holds one is broken whichever it is.
 BFLOAT16_NAN = np.uint16(0xFFFF)

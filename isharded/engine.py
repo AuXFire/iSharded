@@ -27,9 +27,9 @@ from typing import Any
 
 import numpy as np
 
-ABI_VERSION = 2
+ABI_VERSION = 3
 MAGIC = 0x5369
-WIRE_VERSION = 2
+WIRE_VERSION = 3
 HEADER = struct.Struct("<HBBI")
 RESULT_HEAD = struct.Struct("<QQQII")
 NACK_HEAD = struct.Struct("<QQQBHI")
@@ -194,12 +194,15 @@ class Engine:
             raise OSError(out.value.decode("utf-8", "replace") or "the engine could not listen")
         return json.loads(out.value)
 
-    def open(self, epoch: int, index: int, count: int, key: bytes, ack_timeout_ms: int, silence_timeout_ms: int, pass_ms: int = 0, row_ms: int = 0) -> None:
+    def open(
+        self, epoch: int, index: int, count: int, keys: dict[str, bytes], ack_timeout_ms: int, silence_timeout_ms: int, pass_ms: int = 0, row_ms: int = 0
+    ) -> None:
+        """Takes a place in a route, with the keys of this stage's own links: back, next, closing."""
         plan = {
             "epoch": epoch,
             "index": index,
             "count": count,
-            "key": list(key),
+            "keys": {name: list(key) for name, key in keys.items()},
             "ack_timeout_ms": ack_timeout_ms,
             "silence_timeout_ms": silence_timeout_ms,
             "pass_ms": pass_ms,
@@ -331,6 +334,7 @@ class EngineClient:
             while True:
                 kind, body = await self._read_frame(self.reader)
                 if kind == KIND_RESULT:
+                    # The seal after the tokens was for the entry, which has checked it.
                     identity, generation, _epoch, _slot, count = RESULT_HEAD.unpack_from(body)
                     tokens = list(struct.unpack_from(f"<{count}I", body, RESULT_HEAD.size))
                     flight = self._landing(identity, generation)
