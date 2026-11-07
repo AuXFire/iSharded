@@ -495,7 +495,7 @@ def mixed_cards() -> tuple[list[Candidate], ModelProfile]:
 def layouts_of(workers: list[Candidate], model: ModelProfile) -> list[tuple[int, int, float, float]]:
     """Every way through these workers, scored as the planner scores a route."""
     packer = planner._Packer(model, planner._capacities(workers, 1.0, model.stage_workspace_bytes))
-    stage = planner._stage_scorer(workers, model, packer)
+    stage = planner._stage_scorer(model, packer)
     scored = []
     for order in permutations(workers):
         for inner in combinations(range(4, model.num_layers, 4), len(workers) - 1):

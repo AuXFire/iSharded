@@ -28,15 +28,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .inventory import ram
-
 import httpx
-import psutil
 import torch
 
+from .inventory import ram
 from .protocol import MemoryPool
 
-GIB = 1024**3
 # Share of currently free memory an automatic budget may claim.
 AUTO_ACCELERATOR_SHARE = 0.9
 AUTO_RAM_SHARE = 0.6
