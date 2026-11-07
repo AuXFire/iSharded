@@ -576,3 +576,55 @@ def test_commands_route_and_models(tmp_path, capsys):
 def test_models_with_no_runs_says_so(tmp_path, capsys):
     assert run_cli(tmp_path, "models") == 0
     assert "No runs recorded yet" in capsys.readouterr().out
+
+
+class NoEmbeddings(FakeProvider):
+    """What a peer is: a full provider for chat, with no call for embeddings."""
+
+    kind = "peer"
+
+
+def test_a_provider_with_no_embeddings_is_passed_over_and_says_why(assistant):
+    peer, local = NoEmbeddings("peer:ann"), Embedder("local", Reach.MACHINE)
+    provide(assistant, peer, local, role="embedding")
+    assert assistant.router.embed(["a"], Reach.MACHINE)[0] == [[1.0, 0.0]]
+    _, reasons = assistant.router.plan(ask("embedding", Reach.CLOUD))
+    assert reasons == ["peer:ann cannot make embeddings: a peer provider has no call for them"]
+
+
+def test_a_peer_alone_cannot_embed_and_is_not_marked_down_for_it(assistant):
+    peer = NoEmbeddings("peer:ann", Reach.PEER)
+    provide(assistant, peer, role="embedding")
+    assert assistant.router.can_embed() is False
+    with pytest.raises(Refused, match="cannot make embeddings"):
+        assistant.router.embed(["a"], Reach.CLOUD)
+    assert assistant.store.query("SELECT * FROM model_health") == []
+    assert assistant.router.stats() == []  # no failure counted against what it does well
+    provide(assistant, peer)
+    assert assistant.router.complete(ask()).provider == "peer:ann"
+
+
+def test_the_real_peer_provider_has_no_embeddings(assistant):
+    from isharded.assistant.federation import PeerProvider
+
+    assert not hasattr(PeerProvider, "embed")
+    provider = PeerProvider(assistant.federation, "ann")
+    assistant.providers.register(provider)
+    assistant.router.set_route("embedding", ["peer:ann"])
+    assert assistant.router.can_embed() is False
+
+
+class Renamed(FakeProvider):
+    """A server that says it is something other than what it was asked for, as a peer does."""
+
+    def complete(self, request, model):
+        reply = super().complete(request, model)
+        return ModelReply(reply.text, (), "what-really-answered", "peer:abcdef", 10, 5, 1.0)
+
+
+def test_an_outcome_finds_the_numbers_of_the_candidate_that_answered(assistant):
+    provide(assistant, Renamed("peer:ann", model="models.complete"))
+    reply = assistant.router.complete(ask())
+    assistant.router.record_outcome(reply, "conversation", False)
+    rows = assistant.router.stats()
+    assert [(row["provider"], row["model"], row["runs"], row["successes"]) for row in rows] == [("peer:ann", "models.complete", 1, 0)]

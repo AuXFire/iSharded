@@ -155,6 +155,17 @@ class Turn:
     provider: str | None = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    max_tokens: int | None = None  # what a client asked for, across the whole turn
+    temperature: float | None = None
+
+    def sampling(self, default_tokens: int) -> dict[str, Any]:
+        """What the next request asks of a model. A limit covers every round, as a client sees one reply.
+
+        It can only lower what a turn gives. A provider that refuses a number backs off for
+        every user, so one client's number must not reach it.
+        """
+        tokens = default_tokens if self.max_tokens is None else min(max(self.max_tokens - self.completion_tokens, 1), default_tokens)
+        return {"max_tokens": tokens} | ({} if self.temperature is None else {"temperature": self.temperature})
 
     def messages(self, budget: int) -> list[dict[str, Any]]:
         """Everything so far. If tools have said too much, the oldest outputs give way."""
@@ -193,24 +204,30 @@ class Conversation:
 
     # The public turn
 
-    def say(self, user: str, text: str, conversation_id: str | None = None, learn: str = "now") -> TurnResult:
+    def say(
+        self, user: str, text: str, conversation_id: str | None = None, learn: str = "now", max_tokens: int | None = None, temperature: float | None = None
+    ) -> TurnResult:
         """One turn, start to finish. ``learn`` is now, background, or off."""
-        result = final_result(self._run(user, text, conversation_id, streaming=False))
+        result = final_result(self._run(user, text, conversation_id, False, max_tokens, temperature))
         self._learn_after(result, text, learn)
         return result
 
-    def stream(self, user: str, text: str, conversation_id: str | None = None, learn: str = "now") -> Iterator[str | TurnResult]:
+    def stream(
+        self, user: str, text: str, conversation_id: str | None = None, learn: str = "now", max_tokens: int | None = None, temperature: float | None = None
+    ) -> Iterator[str | TurnResult]:
         """The same turn, yielding text as it comes and the TurnResult last."""
-        for item in self._run(user, text, conversation_id, streaming=True):
+        for item in self._run(user, text, conversation_id, True, max_tokens, temperature):
             yield item
             if isinstance(item, TurnResult):
                 self._learn_after(item, text, learn)
 
-    def _run(self, user: str, text: str, conversation_id: str | None, streaming: bool) -> Iterator[str | TurnResult]:
+    def _run(
+        self, user: str, text: str, conversation_id: str | None, streaming: bool, max_tokens: int | None = None, temperature: float | None = None
+    ) -> Iterator[str | TurnResult]:
         text = text.strip()
         if not text:
             raise ValueError("Say something first")
-        turn = Turn(user, without_prefix(text), conversation_id or uuid.uuid4().hex, uuid.uuid4().hex)
+        turn = Turn(user, without_prefix(text), conversation_id or uuid.uuid4().hex, uuid.uuid4().hex, max_tokens=max_tokens, temperature=temperature)
         turn.reach = self.assistant.context.default_reach(user)
         # What a person said is kept before anything else can go wrong.
         self.assistant.memory.record_message(user, turn.conversation_id, "user", text, turn_id=turn.turn_id, reach=turn.reach)
@@ -270,7 +287,7 @@ class Conversation:
                 turn.transcript.append({"kind": "note", "text": "That was the last tool you can use this turn. Answer now with what you have."})
             turn.rounds += 1
             request = ModelRequest(
-                role=ROLE, messages=turn.messages(self.budget_tokens), tools=() if final_round else turn.offered, reach=turn.reach, max_tokens=self.reply_tokens
+                role=ROLE, messages=turn.messages(self.budget_tokens), tools=() if final_round else turn.offered, reach=turn.reach, **turn.sampling(self.reply_tokens)
             )
             partial: list[str] = []
             try:
@@ -388,6 +405,9 @@ class Conversation:
             "reach": int(turn.reach),
             "model": turn.model,
             "provider": turn.provider,
+            "completion_tokens": turn.completion_tokens,
+            "max_tokens": turn.max_tokens,
+            "temperature": turn.temperature,
             "calls": [{"capability": call.capability, "arguments": call.arguments, "call_id": call.call_id} for call in calls],
         }
         self.store.execute(
@@ -436,6 +456,7 @@ class Conversation:
         turn = Turn(
             user, state["query"], row["conversation_id"], turn_id, tainted=state["tainted"], reach=Reach(state["reach"]),
             transcript=state["transcript"], said=[], tools=state["tools"], rounds=state["rounds"], model=state["model"], provider=state["provider"],
+            completion_tokens=state.get("completion_tokens", 0), max_tokens=state.get("max_tokens"), temperature=state.get("temperature"),
         )
         try:
             result = self._carry_on(turn, state, row, approved)
@@ -501,6 +522,21 @@ class Conversation:
             (task_id, turn.user, turn.conversation_id, turn.turn_id, self.assistant.clock()),
         )
         return replace(self._finish(turn, "task", self._handed_notice(tasks, task_id, plan)), task_id=task_id)
+
+    def handed_tasks(self, user: str, conversation_id: str) -> list[dict[str, Any]]:
+        """The work this conversation handed off, and where each piece stands now."""
+        rows = self.store.query(
+            "SELECT task_id, turn_id, created_at FROM handed_tasks WHERE user = ? AND conversation_id = ? ORDER BY created_at, task_id", (user, conversation_id)
+        )
+        return [{**dict(row), **self._task_state(user, row["task_id"])} for row in rows]
+
+    def _task_state(self, user: str, task_id: str) -> dict[str, Any]:
+        tasks = getattr(self.assistant, "tasks", None)
+        try:
+            status = tasks.status(task_id, user) if tasks is not None else {}
+        except ValueError:  # the record of handing it off outlives the task
+            status = {}
+        return {"title": status.get("title"), "status": status.get("status")}
 
     @staticmethod
     def _handed_notice(tasks: Any, task_id: str, plan: dict[str, Any]) -> str:

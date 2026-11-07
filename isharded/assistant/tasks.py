@@ -16,6 +16,7 @@ is what lets a restart tell a crashed attempt from one that is still running.
 """
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -66,9 +67,10 @@ KIND_FIELDS = {
     "wait": {"seconds", "until"},
     "subtask": {"plan", "inputs"},
 }
-PLAN_FIELDS = {"title", "priority", "run_at", "every_seconds", "on_missed", "tainted", "reach", "inputs", "steps", "goal", "missing_grants", "checks_added"}
+PLAN_FIELDS = {"title", "priority", "run_at", "every_seconds", "on_missed", "tainted", "reach", "inputs", "steps", "goal", "task_type", "missing_grants", "checks_added"}
 CHECK_TYPES = ("exit_code", "ok", "regex", "json_schema", "file_exists")
 STEP_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+TASK_TYPE = re.compile(r"^[a-z0-9_-]{1,64}$")
 REFERENCE = re.compile(r"\{\{\s*((?:steps|inputs)\.[^{}]*?)\s*\}\}")
 STEP_REFERENCE = re.compile(r"^steps\.([A-Za-z0-9_-]+)\.(output|ok|data(?:\.[A-Za-z0-9_-]+)*)$")
 INPUT_REFERENCE = re.compile(r"^inputs\.([A-Za-z0-9_-]+)$")
@@ -569,10 +571,18 @@ def _top_errors(plan: Mapping[str, Any]) -> list[str]:
         found.append("priority must be a whole number.")
     if not isinstance(plan.get("inputs", {}), Mapping):
         found.append("inputs must be an object.")
+    if "task_type" in plan and not (isinstance(plan["task_type"], str) and TASK_TYPE.fullmatch(plan["task_type"])):
+        found.append("task_type must be a short lowercase word: letters, digits, dashes, or underscores.")
     reach = plan.get("reach", Reach.POOL.name.lower())
     if str(reach).upper() not in Reach.__members__:
         found.append(f"reach must be one of {', '.join(name.lower() for name in Reach.__members__)}.")
     return found
+
+
+def task_type_of(plan: Mapping[str, Any]) -> str:
+    """What kind of work a plan is. A plan may say. Otherwise the tools it uses most do."""
+    families = Counter(step["capability"].split(".")[0] for step in plan["steps"] if step.get("kind") == "tool")
+    return plan.get("task_type") or (families.most_common(1)[0][0] if families else "general")
 
 
 def count_steps(plan: Any) -> int:
@@ -966,7 +976,9 @@ class DurableTasks:
 
     def status(self, task_id: str, user: str | None = None) -> dict[str, Any]:
         task = dict(self._task(task_id, user))
-        task.pop("plan")
+        plan = json.loads(task.pop("plan"))
+        task["goal"] = plan.get("goal") or task["title"]
+        task["task_type"] = task_type_of(plan)
         counts = {
             row["step_id"]: row["attempts"]
             for row in self.store.query("SELECT step_id, COUNT(*) AS attempts FROM task_attempts WHERE task_id = ? GROUP BY step_id", (task_id,))
@@ -1591,6 +1603,8 @@ class DurableTasks:
         outcome = perform(task, step, spec, outputs, inputs)
         if outcome.ok and "expect" in spec:
             met, why = run_check(render(spec["expect"], outputs, inputs)[0], outputs, {"output": outcome.output, "data": outcome.data, "ok": True})
+            if spec["kind"] == "model":
+                self._tell_router(outcome.data, met)
             if not met:
                 outcome.ok, outcome.error = False, f"It ran, but the result failed its check: {why}."
         return outcome
@@ -1655,6 +1669,7 @@ class DurableTasks:
         target = check.get("step")
         used = {*used, target} if target in outputs else used
         passed, why = run_check(check, outputs)
+        self._tell_router_about(task["id"], used, passed)
         return Outcome(
             passed,
             f"Passed: {why}." if passed else "",
@@ -1664,6 +1679,35 @@ class DurableTasks:
             self._reach(task, outputs, used),
             Trust.VERIFIED.value,
         )
+
+    def _tell_router(self, data: Mapping[str, Any], held_up: bool) -> None:
+        """A reply counted as a success when it arrived. Checking it says whether it deserved to."""
+        report = getattr(getattr(self.assistant, "router", None), "record_outcome", None)
+        if report is not None:
+            report(data["model"], data["role"], held_up, provider=data["provider"])
+
+    def _tell_router_about(self, task_id: str, used: Iterable[str], passed: bool) -> None:
+        """Only a model step counts: a tool's data is its own, and may name any model it likes.
+
+        A reply loses its success once, however many checks it fails, or it would take
+        away successes that other replies earned.
+        """
+        for name in used:
+            row = self._step(task_id, name)
+            data = json.loads(row["data"]) if row["data"] else {}
+            if row["kind"] != "model" or data.get("failed_a_check"):
+                continue
+            if passed or self._first_to_fail(task_id, name, row["data"], data):
+                self._tell_router(data, passed)
+
+    def _first_to_fail(self, task_id: str, step_id: str, stored: str, data: Mapping[str, Any]) -> bool:
+        """Checks can run side by side, so the mark is claimed in one statement and only one wins it."""
+        with self.store.transaction():
+            updated = self.store.connection.execute(
+                "UPDATE task_steps SET data = ? WHERE task_id = ? AND step_id = ? AND data = ?",
+                (json.dumps({**data, "failed_a_check": True}), task_id, step_id, stored),
+            )
+        return updated.rowcount == 1
 
     def _settle(self, task_id: str, step_id: str, attempt: int, outcome: Outcome) -> None:
         """Write the result. One transaction, so a crash leaves all of it or none."""

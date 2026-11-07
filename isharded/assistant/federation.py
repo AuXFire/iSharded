@@ -1356,7 +1356,11 @@ class Federation:
 
 
 class PeerProvider:
-    """A peer's models at reach PEER. It holds no authority and adds no tools."""
+    """A peer's models at reach PEER. It holds no authority and adds no tools.
+
+    It has no embed method because the protocol offers only ``models.complete``, so the
+    router passes over a peer for embeddings and says why.
+    """
 
     kind = "peer"
     reach = Reach.PEER
