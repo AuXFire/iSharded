@@ -1758,6 +1758,40 @@ def verify_token(authorization: str | None) -> None:
         raise HTTPException(status_code=401, detail="a pool token or node certificate is required")
 
 
+def require_entry(input_ids: list[int]) -> None:
+    if runtime.assignment is None or runtime.assignment.start_layer != 0:
+        raise HTTPException(status_code=409, detail="this worker is not the entry stage")
+    if not input_ids:
+        raise HTTPException(status_code=400, detail="input_ids cannot be empty")
+
+
+async def stage_failure(exc: Exception) -> HTTPException:
+    """What a caller hears of a pass that failed here, once a lost stage has been replaced."""
+    if isinstance(exc, StageLost):
+        return await runtime.replace_stage(exc)
+    runtime.last_error = f"{type(exc).__name__}: {exc}"
+    return HTTPException(status_code=500, detail=runtime.last_error)
+
+
+async def entry_pass(request: InferRequest, part: PromptPart | None, arrived: float) -> dict[str, Any]:
+    """One pass from the top of the route."""
+    async with runtime.lock:
+        hidden = await asyncio.to_thread(runtime._prepare_entry, request, part)
+    runtime._record("embed", arrived)
+    result = await runtime.execute(hidden, request, None if part is None else part.places)
+    runtime._record("handler", arrived)
+    return result
+
+
+async def admitted(choose: Callable[[set[int]], int] = min) -> int:
+    """A sequence for this request, once one is free."""
+    runtime.waiting += 1
+    try:
+        return await runtime.gate.acquire(choose)
+    finally:
+        runtime.waiting -= 1
+
+
 def verify_source(source: str) -> None:
     """A model on this machine must be somewhere this machine offers models from.
 
@@ -2200,10 +2234,7 @@ async def restore_kv(
 @app.post("/v1/infer")
 async def infer(body: InferRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     verify_token(authorization)
-    if runtime.assignment is None or runtime.assignment.start_layer != 0:
-        raise HTTPException(status_code=409, detail="this worker is not the entry stage")
-    if not body.input_ids:
-        raise HTTPException(status_code=400, detail="input_ids cannot be empty")
+    require_entry(body.input_ids)
     try:
         arrived = time.perf_counter()
         part = None
@@ -2212,19 +2243,60 @@ async def infer(body: InferRequest, authorization: str | None = Header(default=N
             rows = await runtime.prompt_rows(body.input_ids, body.images)
             part = rows.part(0, len(body.input_ids))
             body = body.model_copy(update={"images": [], "next_position": part.after})
-        async with runtime.lock:
-            hidden = await asyncio.to_thread(runtime._prepare_entry, body, part)
-        runtime._record("embed", arrived)
-        result = await runtime.execute(hidden, body, None if part is None else part.places)
-        runtime._record("handler", arrived)
-        return result
+        return await entry_pass(body, part, arrived)
     except HTTPException:
         raise
-    except StageLost as exc:
-        raise await runtime.replace_stage(exc) from exc
     except Exception as exc:
-        runtime.last_error = f"{type(exc).__name__}: {exc}"
-        raise HTTPException(status_code=500, detail=runtime.last_error) from exc
+        raise await stage_failure(exc) from exc
+
+
+def token_line(token: int) -> bytes:
+    """The same bytes ``json.dumps`` would give, without building them for every token."""
+    return b'{"token_id": %d}\n' % token
+
+
+def error_line(detail: Any) -> bytes:
+    return json.dumps({"error": detail}).encode() + b"\n"
+
+
+async def reply_step(request: InferRequest, part: PromptPart | None = None) -> dict[str, Any]:
+    """One pass of a reply, along the ring where it can take it."""
+    arrived = time.perf_counter()
+    if part is None and runtime.ring_ready(request):
+        result = await runtime.ring_step(request)
+        runtime._record("handler", arrived)
+        return result
+    held = runtime.caches.get(request.session_id)
+    if held is not None and held.ring and not request.reset and request.restore_length is None:
+        # The other stages' own counts stopped when this reply took the ring.
+        raise retry_error("the ring went down during this reply")
+    return await entry_pass(request, part, arrived)
+
+
+async def state_in_reach(key: str) -> bool:
+    """Gets a state held elsewhere onto every stage, or forgets about it."""
+    try:
+        ready = await runtime.prepare_state(key)
+    except Exception as exc:  # a reread needs none of this, so it must never cost a reply
+        runtime.last_error = f"could not fetch a saved state: {exc}"
+        ready = False
+    if ready:
+        runtime.prefix.elsewhere.discard(key)
+    else:
+        runtime.prefix.drop(key)
+        runtime.state_misses += 1
+    return ready
+
+
+async def finish_reply(slot: int) -> None:
+    try:
+        pipe = runtime.pipes.pop(slot, None)
+        if pipe is not None:
+            await pipe.close()
+        await runtime.ring_settle(slot)
+    finally:
+        runtime.slot_used_at[slot] = time.monotonic()
+        await runtime.gate.release(slot)
 
 
 @app.post("/v1/generate")
@@ -2236,30 +2308,10 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
     replaying through ``/v1/infer``.
     """
     verify_token(authorization)
-    if runtime.assignment is None or runtime.assignment.start_layer != 0:
-        raise HTTPException(status_code=409, detail="this worker is not the entry stage")
-    if not body.input_ids:
-        raise HTTPException(status_code=400, detail="input_ids cannot be empty")
+    require_entry(body.input_ids)
     if runtime.waiting >= MAX_WAITING_REPLIES:
         raise HTTPException(status_code=429, detail="too many replies are waiting; try again shortly")
     stops = set(body.stop_token_ids)
-
-    async def step(request: InferRequest, part: PromptPart | None = None) -> dict[str, Any]:
-        arrived = time.perf_counter()
-        if part is None and runtime.ring_ready(request):
-            result = await runtime.ring_step(request)
-            runtime._record("handler", arrived)
-            return result
-        held = runtime.caches.get(request.session_id)
-        if held is not None and held.ring and not request.reset and request.restore_length is None:
-            # The other stages' own counts stopped when this reply took the ring.
-            raise HTTPException(status_code=503, detail={"retry": True, "message": "the ring went down during this reply"})
-        async with runtime.lock:
-            hidden = await asyncio.to_thread(runtime._prepare_entry, request, part)
-        runtime._record("embed", arrived)
-        result = await runtime.execute(hidden, request, None if part is None else part.places)
-        runtime._record("handler", arrived)
-        return result
 
     async def first_token(request: InferRequest, plan: PromptPlan, rows: PromptRows | None = None) -> int:
         """Run what the stages have not seen, in one trip along the route.
@@ -2284,7 +2336,7 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             }
         )
         pieces = prompt_parts(plan.cuts, len(prompt) - start) if PROMPT_PARTS and rows is None and len(runtime.route) > 1 else []
-        result = await (runtime.run_in_parts(whole, pieces, step) if len(pieces) > 1 else step(whole, part))
+        result = await (runtime.run_in_parts(whole, pieces, reply_step) if len(pieces) > 1 else reply_step(whole, part))
         for save in plan.saves:
             if save.replaces:
                 runtime.prefix.drop(save.replaces)
@@ -2294,13 +2346,11 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
     async def plain(request: InferRequest, plan: PromptPlan, rows: PromptRows | None = None) -> AsyncIterator[int]:
         token = await first_token(request, plan, rows)
         yield token
+        following = request.model_copy(update=GOING_ON)
         for _ in range(body.max_tokens - 1):
             if token in stops:
                 return
-            request = request.model_copy(
-                update={"input_ids": [token], "reset": False, "restore_length": None, "checkpoint_key": None}
-            )
-            token = (await step(request))["token_id"]
+            token = (await reply_step(following.model_copy(update={"input_ids": [token]})))["token_id"]
             yield token
 
     async def speculative(request: InferRequest, plan: PromptPlan) -> AsyncIterator[int]:
@@ -2324,20 +2374,18 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
         try:
             await prepared
         except LlamaError as exc:
-            await runtime.replace_draft(exc)
-            raise RuntimeError("the draft model was lost; replaying without it") from exc
+            raise await runtime.replace_draft(exc) from exc
         history = [*body.input_ids, token]
         produced = 1
         ahead = min(INITIAL_GUESSES, runtime.speculate_tokens)
-        following = request.model_copy(update={"reset": False, "restore_length": None, "checkpoint_key": None})
+        following = request.model_copy(update=GOING_ON)
 
         async def draft_guesses(text: list[int], count: int) -> list[int]:
             started = time.perf_counter()
             try:
                 guesses = await asyncio.to_thread(draft.guess, text, count, request.slot)
             except LlamaError as exc:
-                await runtime.replace_draft(exc)
-                raise RuntimeError("the draft model was lost; replaying without it") from exc
+                raise await runtime.replace_draft(exc) from exc
             runtime._record("draft", started)
             return guesses
 
@@ -2348,8 +2396,7 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             try:
                 await asyncio.to_thread(draft.rewind, keep, request.slot)
             except LlamaError as exc:
-                await runtime.replace_draft(exc)
-                raise RuntimeError("the draft model was lost; replaying without it") from exc
+                raise await runtime.replace_draft(exc) from exc
 
         pipe: Pipeline | None = None
         while produced < body.max_tokens and token not in stops:
@@ -2388,20 +2435,9 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
                 pipe = None
                 del runtime.pipes[request.slot]
             drafting = way == GUESSED
-            if drafting:
-                guesses = await draft_guesses(history, min(ahead, room))
-            position = len(history) - 1
-            result = await step(
-                request.model_copy(
-                    update={
-                        "input_ids": [token, *guesses] if drafting else [token],
-                        "reset": False,
-                        "restore_length": None,
-                        "checkpoint_key": None,
-                        "verify": drafting,
-                        "rollback_to": position,
-                    }
-                )
+            guesses = await draft_guesses(history, min(ahead, room)) if drafting else []
+            result = await reply_step(
+                following.model_copy(update={"input_ids": [token, *guesses], "verify": drafting, "rollback_to": len(history) - 1})
             )
             accepted = result["token_ids"] if drafting else [result["token_id"]]
             if drafting:
@@ -2418,15 +2454,11 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
 
     async def tokens() -> AsyncIterator[bytes]:
         request = InferRequest(**body.model_dump(exclude={"max_tokens", "stop_token_ids", "checkpoint_at", "cut_token", "images"}))
-        runtime.waiting += 1
-        try:
-            slot = await runtime.gate.acquire(runtime.choose_slot)
-        finally:
-            runtime.waiting -= 1
+        slot = await admitted(runtime.choose_slot)
         request = request.model_copy(update={"slot": slot})
         try:
             if body.epoch != runtime.epoch:
-                yield json.dumps({"error": f"pipeline epoch mismatch; worker has {runtime.epoch}"}).encode() + b"\n"
+                yield error_line(epoch_error(runtime.epoch).detail)
                 return
             # A draft reads text, so it cannot follow a prompt with images in it.
             use_draft = runtime.draft is not None and runtime.speculate_tokens and not body.images
@@ -2434,7 +2466,7 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             if caching:
                 try:
                     await runtime.sync_index()
-                except Exception as exc:  # noqa: BLE001 - this only saves work, so it must never cost a reply
+                except Exception as exc:  # this only saves work, so it must never cost a reply
                     runtime.last_error = f"could not learn what the stages hold: {exc}"
             rows: PromptRows | None = None
             answered = False
@@ -2442,48 +2474,29 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             for attempt in range(PLAN_ATTEMPTS):
                 # The last attempt reads the whole prompt, which depends on no state at all.
                 plan = plan_prompt(runtime.prefix, body.input_ids, body.cut_token, body.checkpoint_at, caching and attempt < PLAN_ATTEMPTS - 1)
-                if plan.key in runtime.prefix.elsewhere:
-                    try:
-                        ready = await runtime.prepare_state(plan.key)
-                    except Exception as exc:  # noqa: BLE001 - as above: a reread needs none of this
-                        runtime.last_error = f"could not fetch a saved state: {exc}"
-                        ready = False
-                    if not ready:
-                        runtime.prefix.drop(plan.key)
-                        runtime.state_misses += 1
-                        continue
-                    runtime.prefix.elsewhere.discard(plan.key)
+                if plan.key in runtime.prefix.elsewhere and not await state_in_reach(plan.key):
+                    continue
                 try:
                     if body.images and rows is None:
                         rows = await runtime.prompt_rows(body.input_ids, body.images)
                     source = speculative(request, plan) if use_draft else plain(request, plan, rows)
                     async for token in source:
                         answered = True
-                        yield json.dumps({"token_id": token}).encode() + b"\n"
+                        yield token_line(token)
                     return
                 except HTTPException as exc:
                     failure = exc.detail
-                except StageLost as exc:
-                    failure = (await runtime.replace_stage(exc)).detail
                 except Exception as exc:
-                    runtime.last_error = f"{type(exc).__name__}: {exc}"
-                    failure = runtime.last_error
+                    failure = (await stage_failure(exc)).detail
                 # A stage that no longer holds a state is no failure: plan without it.
                 missing = failure.get("missing") if isinstance(failure, dict) else None
                 if missing is None or answered:
                     break
                 runtime.prefix.drop(missing)
                 runtime.state_misses += 1
-            yield json.dumps({"error": failure}).encode() + b"\n"
+            yield error_line(failure)
         finally:
-            try:
-                pipe = runtime.pipes.pop(slot, None)
-                if pipe is not None:
-                    await pipe.close()
-                await runtime.ring_settle(slot)
-            finally:
-                runtime.slot_used_at[slot] = time.monotonic()
-                await runtime.gate.release(slot)
+            await finish_reply(slot)
 
     return StreamingResponse(tokens(), media_type="application/x-ndjson")
 
@@ -2494,7 +2507,7 @@ async def measure_images(body: ImagesMeasure, authorization: str | None = Header
     verify_token(authorization)
     encoder = runtime.encoder
     if encoder is None or body.epoch != runtime.epoch:
-        raise HTTPException(status_code=409, detail=f"pipeline epoch mismatch; worker has {runtime.epoch}")
+        raise epoch_error(runtime.epoch)
     try:
         return {"images": [await asyncio.to_thread(encoder.measure, base64.b64decode(item)) for item in body.images]}
     except LlamaError as exc:
@@ -2509,14 +2522,10 @@ async def embed(body: EmbedPass, authorization: str | None = Header(default=None
         raise HTTPException(status_code=400, detail="inputs cannot be empty")
     if runtime.waiting >= MAX_WAITING_REPLIES:
         raise HTTPException(status_code=429, detail="too many requests are waiting; try again shortly")
-    runtime.waiting += 1
-    try:
-        slot = await runtime.gate.acquire()
-    finally:
-        runtime.waiting -= 1
+    slot = await admitted()
     try:
         if body.epoch != runtime.epoch:
-            raise HTTPException(status_code=409, detail=f"pipeline epoch mismatch; worker has {runtime.epoch}")
+            raise epoch_error(runtime.epoch)
         if runtime.gguf is None or not runtime.gguf.embedding:
             raise HTTPException(status_code=409, detail="this worker is not running an embedding model")
         started = time.perf_counter()
@@ -2525,11 +2534,8 @@ async def embed(body: EmbedPass, authorization: str | None = Header(default=None
         runtime.inference_calls += 1
         runtime.tokens_processed += sum(map(len, body.inputs))
         return {"vectors": base64.b64encode(vectors.tobytes()).decode("ascii")}
-    except StageLost as exc:
-        raise await runtime.replace_stage(exc) from exc
     except LlamaError as exc:
-        runtime.last_error = f"{type(exc).__name__}: {exc}"
-        raise HTTPException(status_code=500, detail=runtime.last_error) from exc
+        raise await stage_failure(exc) from exc
     finally:
         await runtime.gate.release(slot)
 
@@ -2584,11 +2590,8 @@ async def forward(
         return result
     except HTTPException:
         raise
-    except StageLost as exc:
-        raise await runtime.replace_stage(exc) from exc
     except Exception as exc:
-        runtime.last_error = f"{type(exc).__name__}: {exc}"
-        raise HTTPException(status_code=500, detail=runtime.last_error) from exc
+        raise await stage_failure(exc) from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2623,7 +2626,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trusted-network", action="store_true", help="send pool credentials unencrypted, because nobody else can read this network")
     parser.add_argument(
         "--dtype",
-        choices=["auto", "bfloat16", "float32", "float16"],
+        choices=["auto", *SUPPORTED_DTYPES],
         default="auto",
         help="auto is bfloat16; float32 runs this node at full precision",
     )
