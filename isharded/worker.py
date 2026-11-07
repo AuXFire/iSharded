@@ -1593,7 +1593,7 @@ class WorkerRuntime:
                 await asyncio.wait_for(self.part_ran.wait_for(lambda: self.parts_run.get(request.slot) == wanted), seconds)
             except asyncio.TimeoutError as exc:
                 # The part before never came: this prompt failed, or was replaced by a replay.
-                raise HTTPException(status_code=503, detail={"retry": True, "message": "a part of the prompt was lost"}) from exc
+                raise retry_error("a part of the prompt was lost") from exc
 
     async def note_part(self, request: InferRequest) -> None:
         async with self.part_ran:
@@ -1640,7 +1640,7 @@ class WorkerRuntime:
         if self.assignment is None or self.model_id is None:
             raise HTTPException(status_code=409, detail="worker is not configured")
         if request.epoch != self.epoch:
-            raise HTTPException(status_code=409, detail=f"pipeline epoch mismatch; worker has {self.epoch}")
+            raise epoch_error(self.epoch)
         next_stage = self._next_stage()
         # The rows of a whole prompt, since one part can wait behind all the others.
         rows = hidden.shape[1] * request.part_count
@@ -1659,12 +1659,14 @@ class WorkerRuntime:
             self.copies.add(request.saves)
         if isinstance(outcome, dict):
             return outcome
-        hidden = outcome
+        return await self._pass_on(outcome, request, places, next_stage, rows)
 
+    async def _pass_on(
+        self, hidden: torch.Tensor, request: InferRequest, places: np.ndarray | None, next_stage: StageAssignment, rows: int
+    ) -> dict[str, Any]:
+        """Sends this stage's rows to the next one, and brings back the route's answer."""
         started = time.perf_counter()
-        headers = auth_headers(self.pool_token)
-        headers[META_HEADER] = encode_meta(request.model_dump(exclude={"images"}))
-        headers["content-type"] = "application/x-safetensors"
+        headers = self._tensor_headers(request.model_dump(exclude={"images"}))
         # A batch of FP32 rows outgrows a cold TCP window and costs extra round
         # trips. Single tokens stay exact; llama.cpp stages turn BF16 back to FP32.
         # Prompt rows always go as BF16, or a restored state that left one row to run
@@ -1696,21 +1698,16 @@ class WorkerRuntime:
             result = response.json()
             self.schedule_checkpoint(request)
             return result
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 409:
-                # The route moved on. Nothing failed, and the reply can follow it.
-                raise HTTPException(status_code=409, detail=f"pipeline epoch mismatch; worker has {self.epoch}") from exc
-            self.last_error = str(exc)
-            if exc.response.status_code in UNAVAILABLE_STATUSES:
-                raise HTTPException(status_code=502, detail={"failed_worker": next_stage.worker_id, "message": str(exc)}) from exc
-            # The next stage is up and refused this request, so blame the request.
-            raise HTTPException(status_code=500, detail={"stage_error": str(exc)}) from exc
         except httpx.HTTPError as exc:
+            status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+            if status == 409:
+                # The route moved on. Nothing failed, and the reply can follow it.
+                raise epoch_error(self.epoch) from exc
             self.last_error = str(exc)
-            raise HTTPException(
-                status_code=502,
-                detail={"failed_worker": next_stage.worker_id, "message": str(exc)},
-            ) from exc
+            if status is not None and status not in UNAVAILABLE_STATUSES:
+                # The next stage is up and refused this request, so blame the request.
+                raise HTTPException(status_code=500, detail={"stage_error": str(exc)}) from exc
+            raise HTTPException(status_code=502, detail={"failed_worker": next_stage.worker_id, "message": str(exc)}) from exc
 
 
 def failure_report(response: httpx.Response) -> dict[str, Any] | None:
