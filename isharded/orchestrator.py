@@ -68,7 +68,7 @@ from .serving import MAX_STRANGER_BYTES, AddressLimit, BodyLimit, ChunkedRespons
 from .mesh import clean_url
 from .statements import Refused, Statements, make_statement
 from .tickets import PREFIX as TICKET_PREFIX, NodeTickets, TicketChecker, TicketIdentity, client_auth, make_checker, reply_audience
-from .tls import BEHALF, BEHALF_HEADER, FORWARD_MARK, INTERCEPTED, KEY_HELD, STATEMENT, intercepted, PEER, client_verify, node_transport, stay_on_this_machine_async
+from .tls import BEHALF, BEHALF_HEADER, FORWARD_MARK, INTERCEPTED, KEY_HELD, STATEMENT, intercepted, PEER, client_verify, node_proven, node_transport, stay_on_this_machine_async
 from .tokenizer import ChatTokenizer, IncrementalText, load_tokenizer
 from .toolcalls import (
     MARKER_TOKENS,
@@ -2666,6 +2666,8 @@ def require(authorization: str | None, role: str) -> Caller:
         raise HTTPException(status_code=401, detail="a valid key is required")
     if not runtime.access.permits(caller, role):
         raise HTTPException(status_code=403, detail=f"this needs the {role} role")
+    if behalf:
+        node_proven()  # only a node can pass a person's request on
     return caller
 
 
@@ -2693,6 +2695,7 @@ def require_own_node(authorization: str | None, name: str) -> Caller:
 def verify_token(authorization: str | None) -> None:
     """Node to node. API keys do not reach this far."""
     require(authorization, ROLE_NODE)
+    node_proven()
 
 
 def verify_worker_name(worker_id: str) -> None:
