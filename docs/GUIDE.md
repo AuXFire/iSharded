@@ -1186,17 +1186,17 @@ Over HTTP, point it at `http://NODE:8209/mcp` with `Authorization: Bearer KEY`. 
 
 | Resource | What it holds |
 |---|---|
-| `isharded://mesh/status` | What `mesh_status` returns |
+| `isharded://mesh/status` | What `mesh_status` returns, with node names and no addresses |
 | `isharded://mesh/route` | Which worker holds which layers on the main route, with no addresses |
-| `isharded://mesh/model` | The loaded model: its kind, whether it can see, its architecture, layers, experts, and size, with no file paths |
+| `isharded://mesh/model` | The loaded model: its kind, whether it can see, its architecture, layers, experts, and size. The only path it can hold is the model's own id, if the model was loaded from one, as `/v1/models` shows too |
 
 The `mesh_health` prompt takes no arguments. It gives a client the status as it is now, with a request to say in plain words whether the mesh is healthy.
 
 Each tool, resource, and prompt is a call to the node's own API with your key, so a reply reached this way takes the normal path, through lanes, followers, and failover. Rate limits and the audit log apply to it, and a key can do nothing here that it could not do there. All three resources come from `GET /admin/status`, which any user key may read, and they pass on less than it does. Each read pays once. An error reading one is a protocol error, since a resource has no tool error to fail with.
 
 - Requests each stand alone, on any node. There are no sessions and no event streams, so replies arrive whole, with no progress updates.
-- A reply can be cancelled. Over stdio, and over HTTP in the older revisions, `notifications/cancelled` stops it. Over HTTP in the older revisions the cancelled request still gets an answer, error `-32800`, because the specification ends a stream only with a reply. In the current revision over HTTP, closing the connection is the cancel, and nothing is sent. In the older revisions a dropped connection is not a cancel, as the specification says, and the reply runs on.
-- A cancel over HTTP must reach the node that took the request, since a request stands alone and no other node knows of it. It reaches only your own requests: another key's cancel does nothing. If two clients on one key both have a request running with the same id, a cancel stops neither, because it cannot tell which was meant.
+- A reply can be cancelled. Over stdio, and over HTTP in the older revisions, `notifications/cancelled` stops it. Over HTTP in the older revisions the cancelled request still gets an answer, error `-32800`, because the specification ends a stream only with a reply. In the current revision over HTTP, closing the connection is the cancel, and nothing is sent. In the older revisions a dropped connection is not a cancel, as the specification says, and the reply runs on. Only a reply running on the node that took `/mcp` stops at the model. Over stdio, and for a model in a lane, a cancel ends the wait and closes a connection to a node, and a node does not watch for that during a reply that is not streamed, so the model runs on to the end of that reply and nobody reads it.
+- A cancel over HTTP must reach the node that took the request, since a request stands alone and no other node knows of it. It reaches only your own requests: another key's cancel does nothing. If two clients on one key both have a request running with the same id, a cancel stops neither, because it cannot tell which was meant. If only the other client's is running, a late cancel of yours stops it, since the older revisions have no session to tell you apart, so give such clients separate keys.
 - A web page may only reach `/mcp` from this machine or from a member of the mesh, because a page from elsewhere could otherwise use DNS rebinding to reach a node on your own network.
 - Bad arguments come back as a tool error a model can read, with `isError: true`. An unknown tool is a protocol error.
 - `/mcp` replies are chunked, with no `Content-Length`. AVG's network filter corrupts any reply that has one to a request that looks like MCP, even on loopback, so that no client can read it.

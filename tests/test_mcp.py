@@ -1172,9 +1172,15 @@ def test_a_legacy_session_cannot_read_before_it_says_hello():
     assert rpc(handler(), "resources/read", {"uri": "isharded://mesh/status"})["error"]["code"] == INVALID_REQUEST
 
 
-def test_the_status_resource_says_what_the_tool_says():
+def test_the_status_resource_says_what_the_tool_says_with_names_for_addresses():
     tool = rpc(ready(), "tools/call", {"name": "mesh_status", "arguments": {}})["result"]["structuredContent"]
-    assert read_resource(handler(), "isharded://mesh/status") == tool
+    assert tool["nodes"] == {"a": "http://a"}
+    assert read_resource(handler(), "isharded://mesh/status") == {**tool, "nodes": ["a"]}
+
+
+def test_the_health_prompt_holds_no_addresses():
+    text = modern(handler(), "prompts/get", {"name": "mesh_health"})["result"]["messages"][0]["content"]["text"]
+    assert "http://a" not in text and '"nodes": ["a"]' in text
 
 
 def test_the_route_resource_names_workers_and_layers_and_no_addresses():
@@ -1803,3 +1809,60 @@ def test_images_past_the_mesh_limit_are_named_and_the_rest_still_go():
 def test_without_anywhere_to_put_an_image_the_text_says_what_it_was():
     assert result_text({"content": [IMAGE]}).startswith("[image content omitted: image/png, ")
     assert result_text({"content": [{"type": "audio", "mimeType": "audio/wav", "data": "AAAA"}]}) == "[audio content omitted: audio/wav, 3 bytes]"
+
+
+# --- what a server says of itself, which may be anything
+
+
+class Scripted(McpConnection):
+    def __init__(self, reply) -> None:
+        self.reply = reply
+
+    def _exchange(self, method, params, timeout):
+        return self.reply(method)
+
+    def _notify(self, method):
+        pass
+
+
+@pytest.mark.parametrize(
+    "discover",
+    [
+        {"error": {"code": UNSUPPORTED_VERSION, "data": "nope"}},
+        {"result": {"supportedVersions": 5}},
+        {"result": {"_meta": "odd", "supportedVersions": "odd"}},
+    ],
+)
+def test_an_odd_handshake_means_a_legacy_server_and_no_crash(discover):
+    server = Scripted(lambda method: discover if method == "server/discover" else {"result": {"serverInfo": "just a name", "protocolVersion": 7}})
+    server.start()
+    assert server.modern_version is None and server.legacy_version == LEGACY_VERSIONS[0]
+
+
+def odd_http_server(session: str = "", version: str = "2025-11-25") -> httpx.MockTransport:
+    def answer(request: httpx.Request) -> httpx.Response:
+        message = json.loads(request.content) if request.content else {}
+        if message.get("method") == "server/discover":
+            return httpx.Response(404)
+        if "id" not in message:
+            return httpx.Response(202)
+        result = {"protocolVersion": version} if message["method"] == "initialize" else {"tools": [], "headers": dict(request.headers)}
+        return httpx.Response(200, headers=[(b"mcp-session-id", session.encode("latin-1"))] if session else [], json={"jsonrpc": "2.0", "id": message["id"], "result": result})
+
+    return httpx.MockTransport(answer)
+
+
+@pytest.mark.parametrize("options", [{"session": "café"}, {"session": "a	b"}, {"version": "café"}])
+def test_what_no_header_can_carry_is_not_sent_back(options):
+    server = HttpServer("http://x/mcp", odd_http_server(**options))
+    server.start()
+    assert server.request("tools/list", {}, 5)["tools"] == []
+    server.close()
+
+
+def test_a_body_that_could_not_be_read_cannot_write_to_a_terminal():
+    server = HttpServer("http://x/mcp", httpx.MockTransport(lambda request: httpx.Response(500, content=b"[2Jgone")))
+    with pytest.raises(ServerError) as caught:
+        server.request("tools/list", {}, 5)
+    assert "" not in str(caught.value) and "gone" in str(caught.value)
+

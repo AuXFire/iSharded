@@ -148,6 +148,11 @@ def status_view(status: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def shared_status_view(status: dict[str, Any]) -> dict[str, Any]:
+    # A member is an id and an address, and this text is made to be handed to a model.
+    return status_view(status) | {"nodes": sorted((status.get("mesh") or {}).get("members") or [])}
+
+
 def route_view(status: dict[str, Any]) -> dict[str, Any]:
     # A stage also holds its worker's address, which a reader of the route has no need of.
     stages = [{key: stage.get(key) for key in ("worker_id", "start_layer", "end_layer")} for stage in status.get("route", [])]
@@ -171,7 +176,7 @@ RESOURCES = [
     resource("model", "Loaded model", "What the loaded model is: its kind, whether it can see, and its size."),
 ]
 RESOURCE_VIEWS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
-    "isharded://mesh/status": status_view,
+    "isharded://mesh/status": shared_status_view,
     "isharded://mesh/route": route_view,
     "isharded://mesh/model": model_view,
 }
@@ -265,7 +270,7 @@ class MeshTools:
     async def prompt(self, name: str) -> dict[str, Any]:
         if name != HEALTH_PROMPT:
             raise RpcError(INVALID_PARAMS, f"Unknown prompt: {name}")
-        text = HEALTH_REQUEST + json.dumps(status_view(await self._status()), ensure_ascii=False)
+        text = HEALTH_REQUEST + json.dumps(shared_status_view(await self._status()), ensure_ascii=False)
         return {"description": PROMPTS[0]["description"], "messages": [{"role": "user", "content": {"type": "text", "text": text}}]}
 
     async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:

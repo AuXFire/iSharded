@@ -152,13 +152,13 @@ class McpConnection:
             return None
         error = reply.get("error")
         if isinstance(error, dict) and error.get("code") == UNSUPPORTED_VERSION:
-            offered = (error.get("data") or {}).get("supported") or []
+            offered = as_object(error.get("data")).get("supported")
         elif isinstance(reply.get("result"), dict):
-            offered = reply["result"].get("supportedVersions") or []
-            self.name = str(((reply["result"].get("_meta") or {}).get(SERVER_KEY) or {}).get("name") or self.name)
+            offered = reply["result"].get("supportedVersions")
+            self.name = str(as_object(as_object(reply["result"].get("_meta")).get(SERVER_KEY)).get("name") or self.name)
         else:
             return None
-        return next((version for version in MODERN_VERSIONS if version in offered), None)
+        return next((version for version in MODERN_VERSIONS if version in offered), None) if isinstance(offered, list) else None
 
     def _initialize(self) -> None:
         """The older handshake, newest revision first, since a strict server refuses the ones it does not speak."""
@@ -171,8 +171,10 @@ class McpConnection:
             except self.refusal as exc:
                 refused = exc
                 continue
-            self.name = str((result.get("serverInfo") or {}).get("name") or self.name)
-            self.legacy_version = str(result.get("protocolVersion") or version)
+            self.name = str(as_object(result.get("serverInfo")).get("name") or self.name)
+            # This goes in a header, so what a server says may not be anything at all.
+            spoken = result.get("protocolVersion")
+            self.legacy_version = spoken if spoken in LEGACY_VERSIONS else version
             self._notify("notifications/initialized")
             return
         assert refused is not None
@@ -362,7 +364,8 @@ class HttpServer(McpConnection):
             message = None
         if isinstance(message, dict) and ("result" in message or "error" in message):
             return message
-        raise ServerError(f"{self.name} answered {response.status_code}, with no reply that could be read: {body[:200].decode('utf-8', 'replace')}")
+        # This reaches a terminal, so a stranger's control characters stay escaped.
+        raise ServerError(f"{self.name} answered {response.status_code}, with no reply that could be read: {json.dumps(body[:200].decode('utf-8', 'replace'))}")
 
     def _read_stream(self, response: httpx.Response, number: int, deadline: float, headers: dict[str, str]) -> dict[str, Any]:
         for data in server_events(self._chunks(response, deadline)):
@@ -387,7 +390,9 @@ class HttpServer(McpConnection):
         message = {"jsonrpc": "2.0", "id": number, "method": method, "params": params}
         try:
             with self.client.stream("POST", self.url, json=message, headers=headers, timeout=timeout) as response:
-                self.session = response.headers.get("mcp-session-id") or self.session
+                session = response.headers.get("mcp-session-id", "")
+                if session.isascii() and session.isprintable():  # all a header can carry back
+                    self.session = session or self.session
                 kind = response.headers.get("content-type", "").split(";")[0].strip().lower()
                 if kind == "text/event-stream" and response.status_code < 300:
                     return self._read_stream(response, number, deadline, headers)
