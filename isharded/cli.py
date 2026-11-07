@@ -422,6 +422,8 @@ def add_mcp_commands(subparsers: Any, token: str | None) -> None:
     run.add_argument("--token", default=argparse.SUPPRESS, help="a user key; defaults to this machine's pool token")
     run.add_argument("--model", required=True, help="the model to use; it must support tool calling")
     run.add_argument("--server", action="append", required=True, help="the command that starts an MCP stdio server, or the http(s) URL of one; repeatable")
+    run.add_argument("--server-key-env", default=None, help="the environment variable holding the key for the one --server that is a URL")
+    run.add_argument("--server-key-file", default=None, help="the file holding the key for the one --server that is a URL")
     run.add_argument("--allow", action="append", default=[], help="a tool that may run without asking; repeatable")
     run.add_argument("--pass-env", action="append", default=[], help="an environment variable servers may see, beyond the basics; repeatable")
     run.add_argument("--max-turns", type=int, default=8, help="most times the model may be asked before giving up")
