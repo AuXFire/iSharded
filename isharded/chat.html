@@ -718,7 +718,7 @@
       setWord(tone, glyph, word, tone === 'idle' ? '' : word);
       const why = state.streaming ? '' : holdUp(status), work = why ? notice('work', 'work', why) : '';
       const cut = status.status === 'ready' && tone === 'bad' ? notice('bad', 'bad', 'Part of the route stopped answering', 'Replies may stall until the pool repairs it.') : '';
-      const failed = status.load_job?.phase === 'failed' && (status.route || []).length ? notice('bad', 'bad', `${modelName(status.load_job.model)} did not load`, `${status.load_job.error} Chat stays on the model that is running.`) : '';
+      const failed = status.load_job?.phase === 'failed' && (status.route || []).length ? notice('bad', 'bad', `${modelName(status.load_job.model)} did not load`, status.load_job.error + ' Chat stays on the model that is running.') : '';
       const test = status.model_profile === 'protocol-test' ? notice('', 'idle', 'Test model', 'It checks sharding, not language quality, so its output means nothing.') : '';
       const simulated = status.simulated ? notice('', 'idle', 'Simulated pool', 'Every name and figure on this page is a sample.') : '';
       paint($('notices'), simulated + cut + work + failed + test);
