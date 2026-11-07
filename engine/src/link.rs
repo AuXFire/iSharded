@@ -194,6 +194,17 @@ impl Outbox {
         if beat.is_some() {
             return beat;
         }
+        // Padding only warms a link nothing uses yet. A real frame queued behind it warms the
+        // link itself, and on a slow link padding would hold it back past its acknowledgement.
+        if self.frames.front().is_some_and(|frame| wire::is_pad(frame)) && self.frames.iter().any(|frame| !wire::is_pad(frame)) {
+            let mut dropped = 0;
+            self.frames.retain(|frame| {
+                let pad = wire::is_pad(frame);
+                dropped += if pad { frame.len() } else { 0 };
+                !pad
+            });
+            self.bytes -= dropped;
+        }
         let frame = self.frames.pop_front()?;
         self.bytes -= frame.len();
         Some(frame)
@@ -211,7 +222,8 @@ pub struct Link {
     work: Condvar,
     room: Condvar,
     closed: AtomicBool,
-    /// Why the writer stopped, for the next sender to hear.
+    /// Why the writer stopped, for every sender after it to hear. It stays, so a beat that
+    /// hears it first cannot hide it from the watcher that would report the link lost.
     failure: Mutex<Option<io::ErrorKind>>,
 }
 
@@ -258,7 +270,8 @@ impl Link {
     }
 
     fn closed_error(&self) -> LinkError {
-        self.failure.lock().take().map_or(LinkError::Closed, |kind| LinkError::Io(kind.into()))
+        let failure = *self.failure.lock();
+        failure.map_or(LinkError::Closed, |kind| LinkError::Io(kind.into()))
     }
 
     /// Shortens how long a stalled write may hold on, for a link with a tighter limit.
@@ -817,6 +830,35 @@ mod tests {
         assert_eq!(outbox.take(), Some(vec![1; 10]));
         assert_eq!(outbox.take(), Some(vec![2; 10]));
         assert_eq!((outbox.take(), outbox.bytes), (None, 0));
+    }
+
+    #[test]
+    fn padding_steps_aside_for_a_real_frame_and_goes_out_on_an_idle_link() {
+        let mut outbox = Outbox::default();
+        let queue = |outbox: &mut Outbox, frame: Vec<u8>| {
+            outbox.bytes += frame.len();
+            outbox.frames.push_back(frame);
+        };
+        queue(&mut outbox, wire::pad(100));
+        queue(&mut outbox, wire::pad(100));
+        assert_eq!(outbox.take(), Some(wire::pad(100)));
+        let ack = Ack { id: 7 }.encode();
+        queue(&mut outbox, ack.clone());
+        queue(&mut outbox, wire::pad(100));
+        assert_eq!(outbox.take(), Some(ack));
+        assert_eq!((outbox.take(), outbox.bytes), (None, 0));
+        assert!(!wire::is_pad(&[10; 10]));
+    }
+
+    #[test]
+    fn a_write_failure_is_heard_by_every_sender_after_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let link = Link::new(socket, None);
+        link.fail(io::ErrorKind::TimedOut);
+        assert!(matches!(link.beat(&[1]), Err(LinkError::Io(_))));
+        assert!(matches!(link.send(&[1]), Err(LinkError::Io(_))));
+        assert!(link.write_failed());
     }
 
     #[test]

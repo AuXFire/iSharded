@@ -475,6 +475,11 @@ pub fn pad(size: usize) -> Vec<u8> {
     finish_frame(frame)
 }
 
+/// Whether a whole frame is padding.
+pub fn is_pad(frame: &[u8]) -> bool {
+    frame.len() >= HEADER_BYTES && frame[..2] == MAGIC.to_le_bytes() && frame[3] == Kind::Pad as u8
+}
+
 /// What a link is for, said once when it opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
