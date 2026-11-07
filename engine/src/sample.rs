@@ -8,24 +8,23 @@ use crate::wire::Sampling;
 
 /// Candidates kept when only top-p is set, since sorting a whole vocabulary costs milliseconds.
 const NUCLEUS_CANDIDATES: usize = 4096;
+const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// A small generator. Draws follow from the seed and the position, so a replay repeats them.
 pub struct Draws {
-    state: u64,
+    /// Empty until the first draw with no seed, so greedy tokens never ask the system.
+    state: Option<u64>,
 }
 
 impl Draws {
     pub fn new(seed: Option<u64>, position: u32) -> Draws {
-        let start = match seed {
-            Some(seed) => mix(mix(seed) ^ u64::from(position).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
-            None => fresh(),
-        };
-        Draws { state: start }
+        Draws { state: seed.map(|seed| mix(mix(seed) ^ u64::from(position).wrapping_mul(GOLDEN))) }
     }
 
     fn next(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        mix(self.state)
+        let state = self.state.get_or_insert_with(fresh);
+        *state = state.wrapping_add(GOLDEN);
+        mix(*state)
     }
 
     /// A number in [0, 1).
@@ -62,6 +61,11 @@ pub fn argmax(logits: &[f32]) -> u32 {
     best as u32
 }
 
+fn normalize(chances: &mut [f64]) {
+    let total: f64 = chances.iter().sum();
+    chances.iter_mut().for_each(|chance| *chance /= total);
+}
+
 /// Token ids and probabilities after top-k, temperature, and top-p, in that order.
 pub fn filtered(logits: &[f32], sampling: &Sampling) -> (Vec<u32>, Vec<f64>) {
     let limit = if sampling.top_k > 0 {
@@ -80,8 +84,7 @@ pub fn filtered(logits: &[f32], sampling: &Sampling) -> (Vec<u32>, Vec<f64>) {
     let temperature = f64::from(sampling.temperature);
     let highest = ids.iter().map(|id| f64::from(logits[*id as usize])).fold(f64::NEG_INFINITY, f64::max);
     let mut chances: Vec<f64> = ids.iter().map(|id| ((f64::from(logits[*id as usize]) - highest) / temperature).exp()).collect();
-    let total: f64 = chances.iter().sum();
-    chances.iter_mut().for_each(|chance| *chance /= total);
+    normalize(&mut chances);
     if sampling.top_p < 1.0 {
         let mut order: Vec<usize> = (0..ids.len()).collect();
         order.sort_unstable_by(|a, b| chances[*b].total_cmp(&chances[*a]));
@@ -97,8 +100,7 @@ pub fn filtered(logits: &[f32], sampling: &Sampling) -> (Vec<u32>, Vec<f64>) {
             kept_ids.push(ids[index]);
             kept.push(chances[index]);
         }
-        let sum: f64 = kept.iter().sum();
-        kept.iter_mut().for_each(|chance| *chance /= sum);
+        normalize(&mut kept);
         return (kept_ids, kept);
     }
     (ids, chances)
@@ -158,8 +160,7 @@ pub fn speculative<'a>(mut row: impl FnMut(usize) -> &'a [f32], guesses: &[u32],
                 accepted.push(argmax(logits));
                 return accepted;
             }
-            let total: f64 = chances.iter().sum();
-            chances.iter_mut().for_each(|chance| *chance /= total);
+            normalize(&mut chances);
         }
         accepted.push(draw(&ids, &chances, draws));
         return accepted;
