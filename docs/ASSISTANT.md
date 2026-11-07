@@ -898,7 +898,7 @@ Each run is counted, or reported with `record_run(version, ok)`. Once a new vers
 | `skill evaluate VERSION` | Evaluates a candidate. Exits 1 if it cannot be promoted |
 | `skill promote VERSION` | Puts an eligible candidate into use |
 | `skill reject VERSION [--reason R]` | Turns a version down for good. On an active version with a predecessor, this is a rollback. Like promoting, it is refused to anything that is not a person |
-| `skill rollback NAME [--reason R]` | Restores the previous version |
+| `skill rollback NAME [--reason R]` | Restores the previous version. Refused to anything that is not a person, like rejecting |
 | `skill gaps` | Repeated failures by task type |
 | `skill reflect TASK [--no-draft]` | Records a finished task. `--no-draft` skips drafting a skill |
 

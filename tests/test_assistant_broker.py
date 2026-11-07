@@ -512,6 +512,12 @@ def test_only_a_person_can_decide_or_grant(broker, who):
     assert broker.approval(decision.approval_id)["status"] == "pending"
 
 
+@pytest.mark.parametrize("who", ["modeler", "models", "model-ann"])
+def test_a_person_may_have_a_name_that_starts_like_a_machines(broker, who):
+    make(broker, "demo.act", effects=(Effect.EXECUTE,))
+    assert broker.add_grant("ann", "demo.act", None, who)
+
+
 def test_every_part_asks_the_same_question_about_who_is_a_person():
     """Two lists drifted apart once, and a plugin could then approve a commit."""
     assert broker_part.is_person is mind.is_person and tasks_part.is_person is mind.is_person and plugins.is_person is mind.is_person

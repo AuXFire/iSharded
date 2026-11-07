@@ -596,10 +596,11 @@ class Skills:
 
     def rollback(self, name: str, reason: str = "", by: str | None = None, user: str | None = None) -> SkillVersion:
         """Put the previous version back. The one taken out can never return."""
+        by = self._acting_person(by, "roll back")
         version = self._active_named(name, user or self.owner)
         if not version.predecessor:
             raise SkillError(f"{version.label} has no earlier version. To stop using it, run `skill reject {version.label}`.")
-        return self._roll_back(version, reason or "rolled back by the owner", by or self.owner)
+        return self._roll_back(version, reason or "rolled back by the owner", by)
 
     def _roll_back(self, version: SkillVersion, reason: str, by: str) -> SkillVersion:
         now = self.clock()

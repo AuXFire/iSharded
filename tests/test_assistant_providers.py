@@ -160,10 +160,15 @@ def test_loose_json_refuses_what_it_cannot_trust(text):
     assert loose_json(text) is None
 
 
-@pytest.mark.parametrize("text", ['{{"a": 1}}', "{{}}", "[{[1]: 2}]", '{"a", "b"}', "{'a': {1}}", "[b'x']", "[1j]"])
+@pytest.mark.parametrize("text", ['{{"a": 1}}', "{{}}", "[{[1]: 2}]", '{"a", "b"}', "{'a': {1}}", "[b'x']", "[1j]", "{1: 2, 'a': 3}", "[{None: 1, 'a': 2}]"])
 def test_python_that_is_not_json_reads_as_not_json(text):
     """It would raise, or reach a tool as something no tool can take, and fail the whole turn."""
     assert loose_json(text) is None
+
+
+def test_nesting_too_deep_to_read_reads_as_not_json():
+    assert loose_json("[" * 50_000 + "]" * 50_000) is None
+    assert loose_json('{"a":' * 20_000 + "1" + "}" * 20_000) is None
 
 
 def test_a_reply_in_python_words_still_parses():

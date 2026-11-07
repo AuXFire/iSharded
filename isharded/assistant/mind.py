@@ -32,7 +32,8 @@ JSON_ATTEMPTS = 64  # bounded, so a reply of nested braces costs little
 PEER_PREFIX = "peer:"
 SKILL_PREFIX = "skill:"
 # Actors that act for a person but are not one. None of these may grant, decide, commit, push, promote, or reject.
-MACHINE_ACTORS = (PEER_PREFIX, SKILL_PREFIX, "task:", "model", "plugin:", "conversation")
+MACHINE_ACTORS = (PEER_PREFIX, SKILL_PREFIX, "task:", "model:", "plugin:", "conversation")
+MODEL_ACTOR = "model"  # a whole name, since as a prefix it would also catch a person called modeler
 
 
 def actor(user: str) -> str:
@@ -40,7 +41,7 @@ def actor(user: str) -> str:
 
 
 def is_person(name: str) -> bool:
-    return bool(name) and not name.startswith(MACHINE_ACTORS)
+    return bool(name) and name != MODEL_ACTOR and not name.startswith(MACHINE_ACTORS)
 
 
 def owner_of(assistant: Any) -> str:

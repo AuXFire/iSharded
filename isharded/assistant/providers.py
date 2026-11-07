@@ -199,13 +199,13 @@ def loose_json(text: str) -> Any:
     for attempt in (candidate, re.sub(r",(\s*[}\]])", r"\1", candidate)):
         try:
             return json.loads(attempt)
-        except ValueError:
+        except (RecursionError, ValueError):
             continue
     if end is None:
         return None
     try:  # single quotes and Python's True and None
         found = ast.literal_eval(re.sub(r"\btrue\b", "True", re.sub(r"\bfalse\b", "False", re.sub(r"\bnull\b", "None", candidate))))
-        json.dumps(found)  # a set or bytes is Python, not JSON, and no tool can take one
+        json.dumps(found, sort_keys=True)  # a set, bytes, or keys of mixed types are Python, not JSON, and no tool can take them
         return found
     except (TypeError, ValueError, SyntaxError, MemoryError, RecursionError):
         return None

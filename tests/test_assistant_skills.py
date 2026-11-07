@@ -483,7 +483,7 @@ def test_an_evaluation_goes_stale_when_the_active_version_changes(assistant):
 
 
 @pytest.mark.parametrize("actor", ["skill:sk_1", "peer:abc", "task:9", "model", "model:x", "plugin:weather", "conversation"])
-def test_nothing_but_the_owner_can_promote_or_reject(assistant, actor):
+def test_nothing_but_the_owner_can_promote_reject_or_roll_back(assistant, actor):
     version = candidate(assistant)
     answers(assistant, "Greet politely.", "hello")
     assistant.skills.evaluate(version.id)
@@ -491,6 +491,8 @@ def test_nothing_but_the_owner_can_promote_or_reject(assistant, actor):
         assistant.skills.promote(version.id, by=actor)
     with pytest.raises(SkillError, match="Only the owner"):
         assistant.skills.reject(version.id, by=actor)
+    with pytest.raises(SkillError, match="Only the owner"):
+        assistant.skills.rollback(version.name, by=actor)
     assert assistant.skills.version(version.id).state == CANDIDATE
 
 
