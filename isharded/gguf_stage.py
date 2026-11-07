@@ -553,6 +553,10 @@ class DraftModel:
         ``sampling`` is the reply's, for guesses at what a pipelined pass draws. See ``coupled_choice``.
         """
         text = self.text[slot]
+        if text.cut and not fresh:
+            # A cut leaves no logits for where the text now ends, as after a pipeline lands, so
+            # with nothing new to read the guess would follow a token that was cut off.
+            text.cut, text.stale = False, True
         if text.stale:
             commit, fresh = text.chain + fresh[:1], fresh[1:]
             rows = len(commit) + len(fresh) + count

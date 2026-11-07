@@ -94,6 +94,16 @@ def test_a_scratch_sequence_out_of_step_starts_again_from_the_slot():
     assert (draft.text[0].committed, draft.text[0].chain, draft.text[0].stale) == (6, [], False)
 
 
+def test_a_cut_with_nothing_new_to_read_reads_the_confirmed_text_again():
+    # As after a pipeline lands: the draft has seen the whole reply, and the guesses past it are cut off.
+    draft = draft_on(Host())
+    first = missed(draft)
+    draft.guess([], 1)
+    [(_, meta)] = draft.host.calls
+    assert meta.get("restart", True) and meta["commit"] == first and meta["position"] == 4 and meta.get("catch_up") is None
+    assert (draft.text[0].committed, draft.text[0].chain, draft.text[0].cut) == (5, [], False)
+
+
 def test_a_recurrent_draft_still_starts_again_after_a_miss():
     draft = draft_on(Host(), rewinds=False)
     first = missed(draft)
