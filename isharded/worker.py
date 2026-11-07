@@ -1102,6 +1102,8 @@ class WorkerRuntime:
         self.ring_stop()
         self.draft_choice = DraftChoice()  # a new route can change which way is faster
         self.row_clock = RowClock()
+        # The planner trusts these counts to say how this route's guesses go.
+        self.pipeline_tokens = self.pipeline_misses = 0
         adapter = create_adapter(request.architecture)
         if not isinstance(adapter, GgufAdapter) and not has_torch():
             raise ValueError(NO_TORCH)
@@ -1156,6 +1158,7 @@ class WorkerRuntime:
             key=body["key"],
             ack_timeout_ms=body.get("ack_timeout_ms", RING_ACK_MS),
             silence_timeout_ms=body.get("silence_timeout_ms", RING_ACK_MS),
+            merge_passes=self.merge_passes,
         )
         if not answer.get("engine"):
             return {"engine": False}

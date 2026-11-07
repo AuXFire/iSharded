@@ -983,6 +983,69 @@ def test_a_passs_deadline_reaches_the_engine_in_the_plan_it_already_reads() -> N
     assert plans[0]["pass_ms"] + 9 * plans[0]["row_ms"] == pass_seconds(9, 1) * 1000
 
 
+def test_a_load_that_merges_nothing_tells_the_engine_in_its_plan() -> None:
+    plans, calls = [], []
+
+    def opened(_, plan):
+        plans.append(json.loads(plan))
+        return 0
+
+    engine = native.Engine.__new__(native.Engine)
+    engine.lib, engine.handle = SimpleNamespace(isharded_engine_open=opened), None
+    engine.listen = lambda *_: {}
+    host = llama_host._Host()
+    host.stage = SimpleNamespace(engine=engine)
+    meta = {"host": "h", "port": 0, "epoch": 1, "index": 0, "count": 2, "key": "00", "ack_timeout_ms": 5, "silence_timeout_ms": 5}
+    host.ring_open({**meta, "merge_passes": False}, b"")
+    host.ring_open(meta, b"")  # a worker from before the plan carried it
+    assert [plan["merge_passes"] for plan in plans] == [False, True]
+
+    item = runtime(ring_client=None, merge_passes=False, advertised_url="http://w:1")
+    item.gguf = SimpleNamespace(ring_call=lambda kind, **fields: calls.append(fields) or {"engine": False})
+    asyncio.run(item.ring_open({"epoch": 3, "index": 0, "count": 2, "key": "00"}))
+    assert calls[0]["merge_passes"] is False
+
+
+@needs_real_stage
+def test_a_real_route_that_merges_nothing_never_merges_passes() -> None:
+    async def run(host) -> dict:
+        client = await real_ring(host, merge_passes=False)
+        send = lambda slot, tokens, position: client.send(  # noqa: E731
+            epoch=1, slot=slot, position=position, rollback_to=None, tokens=tokens, guesses=[], verify=False,
+            temperature=0.0, top_p=1.0, top_k=0, seed=None,
+        )  # fmt: skip
+        try:
+            await send(1, PROMPT, 0)
+            long = PROMPT * 8
+            # The two one-row passes from different slots wait behind the long one together.
+            await asyncio.gather(send(0, long, 0), send(1, [PROMPT[0]], len(PROMPT)), send(0, [PROMPT[0]], len(long)))
+            return host.call("ring_stats")[0]
+        finally:
+            client.close()
+
+    host, _ = real_stage()
+    try:
+        stats = asyncio.run(run(host))
+        assert stats["passes"] >= 4 and stats["merged_passes"] == 0
+    finally:
+        host.close()
+
+
+def test_a_new_load_starts_its_pipeline_counts_again(monkeypatch) -> None:
+    from isharded.protocol import ConfigureRequest
+
+    def stop(_):
+        raise ValueError("stop here")
+
+    monkeypatch.setattr(worker_module, "create_adapter", stop)
+    item = runtime(pipeline_tokens=900, pipeline_misses=40, term=5, roles={"inference"}, host_models=[], worker_id="w", ring_client=None)
+    stage = StageAssignment(worker_id="w", url="http://w", start_layer=0, end_layer=1)
+    order = ConfigureRequest(model_id="m", revision="r", architecture={}, epoch=9, assignment=stage, route=[stage], term=5)
+    with pytest.raises(ValueError, match="stop here"):
+        asyncio.run(item.configure(order))
+    assert (item.pipeline_tokens, item.pipeline_misses) == (0, 0)
+
+
 def waiting_ring(client, **fields):
     """A worker whose ring has a pass out that will never come back."""
     client.send(**FIELDS)

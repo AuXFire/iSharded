@@ -227,7 +227,7 @@ fn build_ring(count: u16, closing: bool, delay: Duration, (ack_timeout_ms, silen
         seen.push(counter);
     }
     for (index, node) in nodes.iter().enumerate() {
-        node.open(Plan { epoch: 7, index: index as u16, count, key: KEY.to_vec(), ack_timeout_ms, silence_timeout_ms });
+        node.open(Plan { epoch: 7, index: index as u16, count, key: KEY.to_vec(), ack_timeout_ms, silence_timeout_ms, merge_passes: true });
     }
     let relay = relayed.map(|door| Relay::to(doors[door].port));
     let address = |at: usize| {
@@ -930,7 +930,7 @@ fn the_local_role_is_refused_on_the_public_door() {
 fn a_route_cannot_be_joined_with_the_wrong_key_or_epoch() {
     let node = Node::new().unwrap();
     let door = listening(&node);
-    node.open(Plan { epoch: 7, index: 1, count: 2, key: KEY.to_vec(), ack_timeout_ms: 1000, silence_timeout_ms: 1000 });
+    node.open(Plan { epoch: 7, index: 1, count: 2, key: KEY.to_vec(), ack_timeout_ms: 1000, silence_timeout_ms: 1000, merge_passes: true });
     let address = format!("127.0.0.1:{}", door.port);
     assert!(link::dial(&address, Some(&door.fingerprint), b"wrong", Role::Hop, 7, Duration::from_secs(3)).is_err());
     assert!(link::dial(&address, Some(&door.fingerprint), KEY, Role::Hop, 8, Duration::from_secs(3)).is_err());
