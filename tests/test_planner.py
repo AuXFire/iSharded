@@ -1615,8 +1615,11 @@ def test_a_draft_keeps_its_vram_when_the_first_layer_has_to_spill() -> None:
     model = with_draft(600 * MIB)
     route = plan_placement(workers, [], model)
     report = memory_report(route, workers, model)
-    assert used_in(report, "cuda:0") >= 600 * MIB
-    assert not any(item.unit == "layer-00000.dense" and item.pool_id == "cuda:0" for item in route[0].placements)
+    weights = sum(item.bytes for item in route[0].placements if item.pool_id == "cuda:0")
+    assert weights + 600 * MIB == used_in(report, "cuda:0") - sum(
+        model.context_bytes(layer) for layer in range(8) if any(item.unit == f"layer-{layer:05d}.dense" and item.pool_id == "cuda:0" for item in route[0].placements)
+    )
+    assert weights <= 800 * MIB * 0.9 - 600 * MIB
     assert report["spilled_bytes"] > 0  # weights moved over so that the draft could stay
 
 
