@@ -16,8 +16,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::net::{IpAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -27,10 +27,15 @@ use parking_lot::{Condvar, Mutex, RawMutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::link::{self, Frames, Identity, Link, LinkError};
-use crate::wire::{self, Ack, Answer, Hello, Kind, Nack, Pass, Refusal, Role, FLAG_BF16, FLAG_TOKENS, HEADER_BYTES};
+use crate::wire::{self, Ack, Answer, Hello, Kind, Nack, Pass, Refusal, Role, FLAG_BF16, FLAG_TOKENS, HEADER_BYTES, MAC_BYTES};
 
 /// How many connections may be mid-handshake at once, so strangers cannot pile up threads.
-const MAX_STRANGERS: usize = 16;
+const MAX_STRANGERS: usize = 64;
+/// And how many of those from one address, so one machine cannot take every place. A stage
+/// is dialled by its neighbour and, at the entry, by the last stage: a few at most.
+const STRANGERS_PER_ADDRESS: usize = 4;
+/// Shorter than this, a key is a mistake. The coordinator makes 32 random bytes.
+const MIN_KEY_BYTES: usize = 16;
 const PING_EVERY: Duration = Duration::from_millis(1000);
 const WATCH_EVERY: Duration = Duration::from_millis(50);
 const ACCEPT_EVERY: Duration = Duration::from_millis(20);
@@ -78,13 +83,37 @@ fn can_merge(pass: &Pass) -> bool {
     pass.row_count() == 1 && !pass.verifying()
 }
 
+/// The keys of the links a stage is part of, and of no others. Each link has its own, given
+/// out by the coordinator over the authenticated control plane, so a stage can speak only
+/// where the route puts it.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Keys {
+    /// The link the stage before this one dials.
+    #[serde(default)]
+    pub back: Option<Vec<u8>>,
+    /// The link this stage dials to the next.
+    #[serde(default)]
+    pub next: Option<Vec<u8>>,
+    /// Held by the entry and the last stage only: the closing link, and the seal on answers.
+    #[serde(default)]
+    pub closing: Option<Vec<u8>>,
+}
+
+impl Keys {
+    /// Whether these are exactly the keys a place in a route needs.
+    fn fit(&self, index: u16, count: u16) -> bool {
+        let ends = count > 1 && (index == 0 || index + 1 == count);
+        let needed = [(&self.back, index > 0), (&self.next, index + 1 < count), (&self.closing, ends)];
+        index < count && needed.iter().all(|(key, wanted)| key.as_ref().map_or(!wanted, |key| *wanted && key.len() >= MIN_KEY_BYTES))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Plan {
     pub epoch: u64,
     pub index: u16,
     pub count: u16,
-    /// Shared by the route, and given out over the authenticated control plane.
-    pub key: Vec<u8>,
+    pub keys: Keys,
     #[serde(default = "default_timeout_ms")]
     pub ack_timeout_ms: u64,
     #[serde(default = "default_timeout_ms")]
@@ -131,6 +160,8 @@ pub struct Stats {
     pub answers: u64,
     pub refusals: u64,
     pub dropped: u64,
+    /// Answers the entry threw away because the last stage had not sealed them.
+    pub forged: u64,
     /// Passes and answers sent again, because their link died or nobody acknowledged them.
     pub resent: u64,
     /// Answers at the last stage still waiting for the entry's acknowledgement.
@@ -156,6 +187,7 @@ struct Counters {
     answers: AtomicU64,
     refusals: AtomicU64,
     dropped: AtomicU64,
+    forged: AtomicU64,
     resent: AtomicU64,
     compute_us: AtomicU64,
     wait_us: AtomicU64,
@@ -214,6 +246,35 @@ fn keep_newest(list: &mut VecDeque<u64>, keep: usize) {
     }
 }
 
+/// Connections that have not proven themselves yet, in all and from each address.
+#[derive(Default)]
+struct Strangers {
+    total: usize,
+    from: HashMap<IpAddr, usize>,
+}
+
+impl Strangers {
+    fn enter(&mut self, address: IpAddr) -> bool {
+        let mine = self.from.get(&address).copied().unwrap_or(0);
+        if self.total >= MAX_STRANGERS || mine >= STRANGERS_PER_ADDRESS {
+            return false;
+        }
+        self.from.insert(address, mine + 1);
+        self.total += 1;
+        true
+    }
+
+    fn leave(&mut self, address: IpAddr) {
+        if let Some(mine) = self.from.get_mut(&address) {
+            *mine -= 1;
+            self.total -= 1;
+            if *mine == 0 {
+                self.from.remove(&address);
+            }
+        }
+    }
+}
+
 struct Peer {
     link: Arc<Link>,
     stage: u16,
@@ -244,7 +305,7 @@ struct Ring {
     epoch: u64,
     index: u16,
     count: u16,
-    key: Vec<u8>,
+    keys: Keys,
     ack_timeout: Duration,
     silence_timeout: Duration,
     next: Mutex<Option<Arc<Peer>>>,
@@ -313,7 +374,7 @@ struct Inner {
     lines: Mutex<HashMap<u32, Line>>,
     ready: Condvar,
     stopping: AtomicBool,
-    strangers: AtomicUsize,
+    strangers: Mutex<Strangers>,
     counters: Counters,
     listening: Mutex<Option<Listening>>,
     accepting: Mutex<Vec<thread::JoinHandle<()>>>,
@@ -337,7 +398,7 @@ impl Node {
             lines: Mutex::default(),
             ready: Condvar::new(),
             stopping: AtomicBool::new(false),
-            strangers: AtomicUsize::new(0),
+            strangers: Mutex::default(),
             counters: Counters::default(),
             listening: Mutex::new(None),
             accepting: Mutex::new(Vec::new()),
@@ -390,12 +451,15 @@ impl Node {
     }
 
     /// Takes a place in a route. Anything from an earlier route ends here.
-    pub fn open(&self, plan: Plan) {
+    pub fn open(&self, plan: Plan) -> Result<(), String> {
+        if !plan.keys.fit(plan.index, plan.count) {
+            return Err("these keys do not fit this place in the route".to_string());
+        }
         let ring = Arc::new(Ring {
             epoch: plan.epoch,
             index: plan.index,
             count: plan.count,
-            key: plan.key,
+            keys: plan.keys,
             ack_timeout: Duration::from_millis(plan.ack_timeout_ms),
             silence_timeout: Duration::from_millis(plan.silence_timeout_ms),
             next: Mutex::new(None),
@@ -412,6 +476,7 @@ impl Node {
         if let Some(old) = self.inner.ring.write().replace(ring) {
             old.shut();
         }
+        Ok(())
     }
 
     /// Dials the next stage and, at the last stage, the entry. The closing link may fail.
@@ -465,6 +530,7 @@ impl Node {
             answers: counters.answers.load(Ordering::Relaxed),
             refusals: counters.refusals.load(Ordering::Relaxed),
             dropped: counters.dropped.load(Ordering::Relaxed),
+            forged: counters.forged.load(Ordering::Relaxed),
             resent: counters.resent.load(Ordering::Relaxed),
             answers_held: ring.as_ref().map_or(0, |item| item.answers.lock().len() as u64),
             compute_us: counters.compute_us.load(Ordering::Relaxed),
@@ -507,7 +573,8 @@ fn spawn(name: &str, work: impl FnOnce() + Send + 'static) -> io::Result<thread:
 fn connect(inner: &Arc<Inner>, links: &Links) -> Result<bool, String> {
     let ring = inner.ring.read().clone().ok_or("no route has been opened")?;
     if let Some(next) = &links.next {
-        let link = dial_with_retry(next, &ring, Role::Hop, Duration::from_millis(links.timeout_ms)).map_err(|error| error.to_string())?;
+        let key = ring.keys.next.as_deref().ok_or("this stage has no key for a next stage")?;
+        let link = dial_with_retry(next, key, &ring, Role::Hop, Duration::from_millis(links.timeout_ms)).map_err(|error| error.to_string())?;
         let peer = Peer::new(link, ring.index + 1, false);
         *ring.next.lock() = Some(peer.clone());
         start_peer(inner, &ring, &peer);
@@ -517,8 +584,9 @@ fn connect(inner: &Arc<Inner>, links: &Links) -> Result<bool, String> {
         *ring.next_door.lock() = Some(next.clone());
     }
     let mut closing = false;
-    if let Some(entry) = &links.entry {
-        if let Ok(link) = dial_with_retry(entry, &ring, Role::Closing, Duration::from_millis(links.timeout_ms)) {
+    // Without the closing key there is no closing link, and answers walk back.
+    if let (Some(entry), Some(key)) = (&links.entry, &ring.keys.closing) {
+        if let Ok(link) = dial_with_retry(entry, key, &ring, Role::Closing, Duration::from_millis(links.timeout_ms)) {
             closing = start_closing(inner, &ring, link);
         }
         let (inner, ring, entry) = (inner.clone(), ring.clone(), entry.clone());
@@ -538,6 +606,9 @@ fn start_closing(inner: &Arc<Inner>, ring: &Arc<Ring>, link: Arc<Link>) -> bool 
 /// At the last stage, for as long as the ring lasts: brings a lost closing link back, and
 /// while it is down, tries again with any answer that has heard nothing.
 fn keep_closing(inner: &Arc<Inner>, ring: &Arc<Ring>, entry: &Address) {
+    let Some(key) = ring.keys.closing.as_deref() else {
+        return;
+    };
     let mut wait = DIAL_RETRY;
     let mut next_dial = Instant::now() + wait;
     let mut began = Instant::now();
@@ -556,7 +627,7 @@ fn keep_closing(inner: &Arc<Inner>, ring: &Arc<Ring>, entry: &Address) {
         if Instant::now() < next_dial {
             continue;
         }
-        if let Ok(link) = link::dial(&entry.address, Some(&entry.fingerprint), &ring.key, Role::Closing, ring.epoch, DIAL_ATTEMPT) {
+        if let Ok(link) = link::dial(&entry.address, Some(&entry.fingerprint), key, Role::Closing, ring.epoch, DIAL_ATTEMPT) {
             began = Instant::now();
             start_closing(inner, ring, link);
             if ring.is_shut() {
@@ -568,11 +639,11 @@ fn keep_closing(inner: &Arc<Inner>, ring: &Arc<Ring>, entry: &Address) {
     }
 }
 
-fn dial_with_retry(target: &Address, ring: &Ring, role: Role, patience: Duration) -> Result<Arc<Link>, LinkError> {
+fn dial_with_retry(target: &Address, key: &[u8], ring: &Ring, role: Role, patience: Duration) -> Result<Arc<Link>, LinkError> {
     // A neighbour may still be starting, so the first refusal means little.
     let deadline = Instant::now() + patience;
     loop {
-        match link::dial(&target.address, Some(&target.fingerprint), &ring.key, role, ring.epoch, DIAL_ATTEMPT) {
+        match link::dial(&target.address, Some(&target.fingerprint), key, role, ring.epoch, DIAL_ATTEMPT) {
             Ok(link) => return Ok(link),
             Err(error) if Instant::now() >= deadline => return Err(error),
             Err(_) => thread::sleep(DIAL_RETRY),
@@ -583,40 +654,40 @@ fn dial_with_retry(target: &Address, ring: &Ring, role: Role, patience: Duration
 fn accept_loop(inner: &Arc<Inner>, listener: &TcpListener, encrypted: bool) {
     while !inner.stopping.load(Ordering::Acquire) {
         match listener.accept() {
-            Ok((socket, _)) => admit(inner, socket, encrypted),
+            Ok((socket, peer)) => admit(inner, socket, peer.ip(), encrypted),
             Err(_) => thread::sleep(ACCEPT_EVERY),
         }
     }
 }
 
-/// Gives a connection a thread, if there is room for another stranger.
-fn admit(inner: &Arc<Inner>, socket: TcpStream, encrypted: bool) {
+/// Gives a connection a thread, if there is room for another stranger from where it came.
+fn admit(inner: &Arc<Inner>, socket: TcpStream, peer: IpAddr, encrypted: bool) {
     // On some systems a socket takes this from the listener, and links block.
-    if socket.set_nonblocking(false).is_err() {
-        return;
-    }
-    if inner.strangers.fetch_add(1, Ordering::AcqRel) >= MAX_STRANGERS {
-        inner.strangers.fetch_sub(1, Ordering::AcqRel);
+    if socket.set_nonblocking(false).is_err() || !inner.strangers.lock().enter(peer) {
         return;
     }
     let serving = inner.clone();
-    if spawn("isharded-link", move || serve(&serving, socket, encrypted)).is_err() {
-        inner.strangers.fetch_sub(1, Ordering::AcqRel);
+    if spawn("isharded-link", move || serve(&serving, socket, peer, encrypted)).is_err() {
+        inner.strangers.lock().leave(peer);
     }
 }
 
+/// The key a link someone dials here must prove. Each link has its own, so holding one opens
+/// no other: only the stage before dials in as a hop, and only the last stage closes the ring.
 fn key_for(inner: &Inner, role: Role, epoch: u64, encrypted: bool) -> Option<Vec<u8>> {
+    let ring = || inner.ring.read().clone().filter(|ring| ring.epoch == epoch);
     match (role, encrypted) {
         (Role::Local, false) => Some(inner.local_key.to_vec()),
-        (Role::Hop | Role::Closing, true) => inner.ring.read().as_ref().filter(|ring| ring.epoch == epoch).map(|ring| ring.key.clone()),
+        (Role::Hop, true) => ring()?.keys.back.clone(),
+        (Role::Closing, true) => ring().filter(|ring| ring.is_entry())?.keys.closing.clone(),
         _ => None,
     }
 }
 
-fn serve(inner: &Arc<Inner>, socket: TcpStream, encrypted: bool) {
+fn serve(inner: &Arc<Inner>, socket: TcpStream, peer: IpAddr, encrypted: bool) {
     let identity = encrypted.then_some(&inner.identity);
-    let accepted = link::accept(socket, identity, |role, epoch| key_for(inner, role, epoch, encrypted));
-    inner.strangers.fetch_sub(1, Ordering::AcqRel);
+    let accepted = link::accept(socket, identity, link::HANDSHAKE, |role, epoch| key_for(inner, role, epoch, encrypted));
+    inner.strangers.lock().leave(peer);
     let Ok((link, frames, hello)) = accepted else {
         return;
     };
@@ -639,7 +710,7 @@ fn serve(inner: &Arc<Inner>, socket: TcpStream, encrypted: bool) {
         Role::Closing => {
             if let Some(ring) = attach(inner, &hello, |ring| ring.entry_closing.lock().replace(link.clone())) {
                 if keep_to_limits(&link, &ring) {
-                    serve_answers(inner, &link, frames);
+                    serve_answers(inner, &ring, &link, frames);
                 }
                 forget(&ring.entry_closing, &link);
             }
@@ -744,10 +815,10 @@ fn enqueue(inner: &Inner, pass: Pass) {
 }
 
 /// At the entry: what the last stage sends straight back.
-fn serve_answers(inner: &Inner, link: &Link, mut frames: Frames) {
+fn serve_answers(inner: &Inner, ring: &Ring, link: &Link, mut frames: Frames) {
     while let Ok((kind, body)) = frames.next() {
         match kind {
-            Kind::Result => receive_answer(inner, link, frames.whole()),
+            Kind::Result => receive_answer(inner, ring, link, frames.whole()),
             Kind::Ping if answer_ping(link, body) => {}
             _ => return,
         }
@@ -757,10 +828,16 @@ fn serve_answers(inner: &Inner, link: &Link, mut frames: Frames) {
 /// At the entry: a result, by whichever way it came. Only the first of it, for the reply now
 /// on its slot, goes on to the worker. Every copy is acknowledged, by the link it came on, as
 /// the last stage holds it until it hears, and the first acknowledgement may have been lost.
-fn receive_answer(inner: &Inner, link: &Link, frame: &[u8]) {
+/// An answer the last stage did not seal is dropped, and the link it came on stays up: the
+/// stage that lied is somewhere behind it, and the real answer may still come the same way.
+fn receive_answer(inner: &Inner, ring: &Ring, link: &Link, frame: &[u8]) {
     let Ok(answer) = Answer::decode(&frame[HEADER_BYTES..]) else {
         return;
     };
+    if !ring.keys.closing.as_deref().is_some_and(|key| answer.is_sealed_by(key)) {
+        inner.counters.forged.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     let _ = link.beat(&Ack { id: answer.id }.encode());
     let fresh = inner.lines.lock().get_mut(&answer.slot).is_some_and(|line| line.takes(&answer));
     let counter = if fresh { &inner.counters.answers } else { &inner.counters.dropped };
@@ -852,7 +929,7 @@ fn read_peer(inner: &Inner, ring: &Ring, peer: &Peer) {
                     average(&inner.counters.link_rtt_us, now.saturating_sub(stamp));
                 }
             }
-            Kind::Result if ring.is_entry() => receive_answer(inner, &peer.link, frames.whole()),
+            Kind::Result if ring.is_entry() => receive_answer(inner, ring, &peer.link, frames.whole()),
             // Coming back along the route, towards the entry.
             Kind::Result | Kind::Nack => send_back(inner, ring, frames.whole()),
             _ => return,
@@ -918,7 +995,8 @@ fn peer_lost(inner: &Arc<Inner>, ring: &Arc<Ring>, peer: &Arc<Peer>, why: &str, 
 }
 
 fn redial_next(inner: &Arc<Inner>, ring: &Arc<Ring>, door: &Address, stage: u16, why: &str) {
-    match link::dial(&door.address, Some(&door.fingerprint), &ring.key, Role::Hop, ring.epoch, REDIAL_HOP) {
+    let key = ring.keys.next.as_deref().unwrap_or_default();
+    match link::dial(&door.address, Some(&door.fingerprint), key, Role::Hop, ring.epoch, REDIAL_HOP) {
         Ok(link) if !ring.is_shut() => resume_next(inner, ring, link, stage),
         Ok(link) => link.close(),
         Err(_) => give_up_on_next(inner, ring, stage, why),
@@ -1055,7 +1133,12 @@ fn finish(inner: &Arc<Inner>, ring: &Arc<Ring>, pass: Pass, result: Result<Outpu
         Err(failure) => refuse(inner, ring, &pass, failure.refusal, failure.message),
         Ok(Output::Tokens(tokens)) => {
             inner.counters.answers.fetch_add(1, Ordering::Relaxed);
-            let frame = Answer { id: pass.id, generation: pass.generation, epoch: pass.epoch, slot: pass.slot, tokens }.encode();
+            let made = Answer { id: pass.id, generation: pass.generation, epoch: pass.epoch, slot: pass.slot, tokens, seal: [0; MAC_BYTES] };
+            let frame = match ring.keys.closing.as_deref() {
+                Some(key) => made.sealed(key),
+                None => made, // the entry is the last stage too, and nothing crosses a link
+            }
+            .encode();
             answer(inner, ring, pass.id, frame);
         }
         Ok(Output::Rows { rows, width, bf16, data }) => {
@@ -1199,15 +1282,61 @@ mod tests {
         let node = Node::new().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let _far = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (socket, _) = listener.accept().unwrap();
-        with_spawns(0, || admit(&node.inner, socket, false));
-        assert_eq!(node.inner.strangers.load(Ordering::Acquire), 0);
+        let (socket, peer) = listener.accept().unwrap();
+        with_spawns(0, || admit(&node.inner, socket, peer.ip(), false));
+        assert_eq!(node.inner.strangers.lock().total, 0);
+        assert!(node.inner.strangers.lock().from.is_empty());
+    }
+
+    #[test]
+    fn one_address_cannot_take_every_place_for_strangers() {
+        let mut strangers = Strangers::default();
+        let one: IpAddr = "10.0.0.1".parse().unwrap();
+        assert!((0..STRANGERS_PER_ADDRESS).all(|_| strangers.enter(one)));
+        assert!(!strangers.enter(one));
+        let others = (2..).map(|last| IpAddr::from([10, 0, 0, last]));
+        let admitted = others.take(MAX_STRANGERS).filter(|other| strangers.enter(*other)).count();
+        assert_eq!(admitted, MAX_STRANGERS - STRANGERS_PER_ADDRESS);
+        assert!(!strangers.enter("10.0.1.1".parse().unwrap()), "past the total");
+        strangers.leave(one);
+        assert!(strangers.enter(one), "a place given back can be taken again");
+    }
+
+    #[test]
+    fn a_place_in_a_route_needs_exactly_the_keys_of_its_own_links() {
+        let key = || Some(vec![1; MIN_KEY_BYTES]);
+        let keys = |back, next, closing| Keys { back, next, closing };
+        assert!(keys(None, None, None).fit(0, 1));
+        assert!(keys(None, key(), key()).fit(0, 3));
+        assert!(keys(key(), key(), None).fit(1, 3));
+        assert!(keys(key(), None, key()).fit(2, 3));
+        // A middle stage never holds the closing key, and nobody holds a key it has no use for.
+        assert!(!keys(key(), key(), key()).fit(1, 3));
+        assert!(!keys(key(), key(), key()).fit(0, 3));
+        assert!(!keys(None, key(), None).fit(0, 3));
+        assert!(!keys(None, Some(vec![1; MIN_KEY_BYTES - 1]), key()).fit(0, 3));
+        assert!(!keys(None, None, None).fit(1, 1));
+    }
+
+    #[test]
+    fn a_plan_whose_keys_do_not_fit_is_refused_and_the_old_route_stays() {
+        let (node, _) = stage(0);
+        let wrong = Plan { epoch: 2, index: 1, count: 3, keys: keys_for(0, 3), ack_timeout_ms: 1, silence_timeout_ms: 1 };
+        assert!(node.open(wrong).is_err());
+        assert_eq!(node.stats().epoch, Some(1));
+    }
+
+    /// The keys a place needs, the same at every node of a test route.
+    fn keys_for(index: u16, count: u16) -> Keys {
+        let hop = |edge: u16| Some(vec![edge as u8 + 1; 32]);
+        let ends = count > 1 && (index == 0 || index + 1 == count);
+        Keys { back: (index > 0).then(|| hop(index - 1)).flatten(), next: (index + 1 < count).then(|| hop(index)).flatten(), closing: ends.then(|| vec![9; 32]) }
     }
 
     fn stage(index: u16) -> (Node, Address) {
         let node = Node::new().unwrap();
         node.listen("127.0.0.1", 0).unwrap();
-        node.open(Plan { epoch: 1, index, count: 2, key: vec![7], ack_timeout_ms: 60_000, silence_timeout_ms: 60_000 });
+        node.open(Plan { epoch: 1, index, count: 2, keys: keys_for(index, 2), ack_timeout_ms: 60_000, silence_timeout_ms: 60_000 }).unwrap();
         let listening = node.inner.listening.lock();
         let door = listening.as_ref().unwrap();
         let address = Address { address: format!("127.0.0.1:{}", door.port), fingerprint: door.fingerprint.clone() };
@@ -1261,7 +1390,7 @@ mod tests {
         // No route is open at the entry yet, so it turns the dial away.
         assert_eq!(last.connect(Links { next: None, entry: Some(door), timeout_ms: 100 }), Ok(false));
         assert!(!last.stats().closing_up);
-        entry.open(Plan { epoch: 1, index: 0, count: 2, key: vec![7], ack_timeout_ms: 60_000, silence_timeout_ms: 60_000 });
+        entry.open(Plan { epoch: 1, index: 0, count: 2, keys: keys_for(0, 2), ack_timeout_ms: 60_000, silence_timeout_ms: 60_000 }).unwrap();
         let began = Instant::now();
         while !last.stats().closing_up {
             assert!(began.elapsed() < Duration::from_secs(5), "it never came up");

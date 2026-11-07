@@ -22,7 +22,8 @@ use serde::de::DeserializeOwned;
 use watchdog::{Limits, Watchdog};
 
 /// Bumped when the functions below change, so a stale library is refused and not misused.
-pub const ABI_VERSION: u32 = 2;
+/// Three: a plan carries a key for each link, and answers carry a seal.
+pub const ABI_VERSION: u32 = 3;
 
 /// One stage's engine, as Python holds it.
 pub struct Engine {
@@ -166,8 +167,10 @@ pub unsafe extern "C" fn isharded_engine_open(engine: *mut Engine, plan: *const 
     let (Some(limits), Some(plan)) = (read_json::<Limits>(plan), read_json::<Plan>(plan)) else {
         return -1;
     };
+    if (*engine).node.open(plan).is_err() {
+        return -1;
+    }
     (*engine).watchdog.set_limits(limits);
-    (*engine).node.open(plan);
     0
 }
 
