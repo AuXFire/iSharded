@@ -67,37 +67,83 @@ fn listening(node: &Node) -> Listening {
     }
 }
 
-/// Stands in the middle of one link, so a test can do to it what a network does.
+/// One connection through a relay: its sockets, and a hold on each way.
+struct Carried {
+    sockets: [TcpStream; 2],
+    forth: Arc<AtomicBool>,
+    back: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct RelayState {
+    carried: Mutex<Vec<Carried>>,
+    refusing: AtomicBool,
+    attempts: AtomicU64,
+    gone: AtomicBool,
+}
+
+/// Stands in the middle of one link, so a test can do to it what a network does. A connection
+/// made after a hold or a cut goes through, unless `refuse` says it does not.
 struct Relay {
     port: u16,
-    held: Arc<AtomicBool>,
-    sockets: Arc<Mutex<Vec<TcpStream>>>,
+    state: Arc<RelayState>,
 }
 
 impl Relay {
     fn to(port: u16) -> Relay {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let relay = Relay { port: listener.local_addr().unwrap().port(), held: Arc::default(), sockets: Arc::default() };
-        let (held, sockets) = (relay.held.clone(), relay.sockets.clone());
+        listener.set_nonblocking(true).unwrap();
+        let relay = Relay { port: listener.local_addr().unwrap().port(), state: Arc::default() };
+        let state = relay.state.clone();
         thread::spawn(move || {
-            let (near, _) = listener.accept().unwrap();
-            let far = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            sockets.lock().unwrap().extend([near.try_clone().unwrap(), far.try_clone().unwrap()]);
-            for (from, to) in [(near.try_clone().unwrap(), far.try_clone().unwrap()), (far, near)] {
-                let held = held.clone();
-                thread::spawn(move || carry(from, to, &held));
+            while !state.gone.load(Ordering::SeqCst) {
+                let Ok((near, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                };
+                state.attempts.fetch_add(1, Ordering::SeqCst);
+                if state.refusing.load(Ordering::SeqCst) {
+                    continue;
+                }
+                near.set_nonblocking(false).unwrap();
+                let far = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                let (forth, back): (Arc<AtomicBool>, Arc<AtomicBool>) = Default::default();
+                let sockets = [near.try_clone().unwrap(), far.try_clone().unwrap()];
+                state.carried.lock().unwrap().push(Carried { sockets, forth: forth.clone(), back: back.clone() });
+                let (near_copy, far_copy) = (near.try_clone().unwrap(), far.try_clone().unwrap());
+                thread::spawn(move || carry(near_copy, far_copy, &forth));
+                thread::spawn(move || carry(far, near, &back));
             }
         });
         relay
     }
 
-    /// Nothing is read or passed on any more, as when the far machine freezes.
+    /// Nothing is read or passed on any more on what is open, as when the far machine freezes.
     fn hold(&self) {
-        self.held.store(true, Ordering::SeqCst);
+        for item in self.state.carried.lock().unwrap().iter() {
+            item.forth.store(true, Ordering::SeqCst);
+            item.back.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The same, for what comes back from the far end only.
+    fn hold_back(&self) {
+        for item in self.state.carried.lock().unwrap().iter() {
+            item.back.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// New connections are closed as soon as they arrive.
+    fn refuse(&self, refusing: bool) {
+        self.state.refusing.store(refusing, Ordering::SeqCst);
+    }
+
+    fn attempts(&self) -> u64 {
+        self.state.attempts.load(Ordering::SeqCst)
     }
 
     fn cut(&self) {
-        for socket in self.sockets.lock().unwrap().iter() {
+        for socket in self.state.carried.lock().unwrap().iter().flat_map(|item| &item.sockets) {
             let _ = socket.shutdown(Shutdown::Both);
         }
     }
@@ -105,7 +151,11 @@ impl Relay {
 
 impl Drop for Relay {
     fn drop(&mut self) {
-        self.held.store(false, Ordering::SeqCst);
+        self.state.gone.store(true, Ordering::SeqCst);
+        for item in self.state.carried.lock().unwrap().iter() {
+            item.forth.store(false, Ordering::SeqCst);
+            item.back.store(false, Ordering::SeqCst);
+        }
         self.cut();
     }
 }
@@ -376,6 +426,125 @@ fn losing_the_closing_link_costs_nothing_but_speed() {
     let got = answer(&mut ring);
     assert_eq!(got, Answer { id: 2, generation: 1, epoch: 7, slot: 0, tokens: vec![5123, 9] });
     assert_eq!(ring.nodes[2].stats().refusals, 0);
+}
+
+/// Keeps a test that loses an answer from waiting for ever.
+fn patient_client(ring: &Ring) {
+    ring.client.limit_reads(Duration::from_secs(4)).unwrap();
+}
+
+#[test]
+fn an_answer_held_by_a_closing_link_that_goes_silent_arrives_by_walking_back() {
+    let ack = Duration::from_millis(600);
+    let (mut ring, relay) = ring_through(0, 3, true, Duration::ZERO, ack.as_millis() as u64);
+    patient_client(&ring);
+    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+    answer(&mut ring);
+    relay.refuse(true);
+    relay.hold();
+    let began = Instant::now();
+    ring.client.send(&pass(2, 5, 10).encode()).unwrap();
+    let got = answer(&mut ring);
+    assert_eq!(got.tokens, vec![5123, 10]);
+    assert!(began.elapsed() < ack + Duration::from_millis(400), "took {:?}", began.elapsed());
+    let last = ring.nodes[2].stats();
+    assert_eq!((last.resent, last.refusals), (1, 0));
+    wait_until("the answer's acknowledgement", || ring.nodes[2].stats().answers_held == 0);
+}
+
+#[test]
+fn an_answer_on_a_closing_link_that_is_cut_arrives_by_walking_back() {
+    let (mut ring, relay) = ring_through(0, 3, true, Duration::from_millis(100), 2000);
+    patient_client(&ring);
+    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+    answer(&mut ring);
+    relay.refuse(true);
+    relay.hold();
+    ring.client.send(&pass(2, 5, 10).encode()).unwrap();
+    wait_until("the answer leaving", || ring.nodes[2].stats().answers_held == 1);
+    relay.cut();
+    assert_eq!(answer(&mut ring).tokens, vec![5123, 10]);
+}
+
+#[test]
+fn every_answer_is_acknowledged_by_the_way_it_came() {
+    for closing in [true, false] {
+        let mut ring = ring(3, closing, Duration::ZERO, 2000);
+        for id in 1..=20 {
+            ring.client.send(&pass(id, 5, id as u32).encode()).unwrap();
+        }
+        for _ in 0..20 {
+            answer(&mut ring);
+        }
+        wait_until("every acknowledgement", || ring.nodes[2].stats().answers_held == 0);
+        assert_eq!(ring.nodes[2].stats().resent, 0);
+    }
+}
+
+#[test]
+fn an_answer_whose_acknowledgement_is_lost_reaches_the_worker_once() {
+    let (mut ring, relay) = ring_through(0, 3, true, Duration::ZERO, 500);
+    patient_client(&ring);
+    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+    answer(&mut ring);
+    relay.refuse(true);
+    relay.hold_back();
+    ring.client.send(&pass(2, 5, 10).encode()).unwrap();
+    assert_eq!(answer(&mut ring).id, 2);
+    wait_until("the repeat", || ring.nodes[0].stats().dropped == 1);
+    wait_until("its acknowledgement", || ring.nodes[2].stats().answers_held == 0);
+    ring.client.send(&pass(3, 5, 11).encode()).unwrap();
+    assert_eq!(answer(&mut ring).id, 3);
+}
+
+#[test]
+fn a_lost_closing_link_comes_back_at_both_ends() {
+    let (mut ring, relay) = ring_through(0, 3, true, Duration::ZERO, 2000);
+    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+    answer(&mut ring);
+    relay.cut();
+    wait_until("the closing link's loss", || relay.attempts() == 2);
+    wait_until("the closing link's return", || ring.nodes[2].stats().closing_up && ring.nodes[0].stats().closing_up);
+    ring.client.send(&pass(2, 5, 10).encode()).unwrap();
+    assert_eq!(answer(&mut ring).tokens, vec![5123, 10]);
+    assert_eq!(ring.nodes[2].stats().resent, 0);
+}
+
+#[test]
+fn the_entry_forgets_a_closing_link_that_died_or_went_silent() {
+    for silent in [false, true] {
+        let (ring, relay) = ring_through(0, 2, true, Duration::ZERO, 400);
+        assert!(ring.nodes[0].stats().closing_up);
+        relay.refuse(true);
+        if silent {
+            relay.hold();
+        } else {
+            relay.cut();
+        }
+        wait_until("the entry noticing", || !ring.nodes[0].stats().closing_up);
+        wait_until("the last stage noticing", || !ring.nodes[1].stats().closing_up);
+    }
+}
+
+#[test]
+fn redialling_backs_off_and_stops_with_the_ring() {
+    let (ring, relay) = ring_through(0, 2, true, Duration::ZERO, 2000);
+    relay.refuse(true);
+    relay.cut();
+    wait_until("the first redial", || relay.attempts() >= 2);
+    thread::sleep(Duration::from_millis(1800));
+    // At 0.25 s apart that would be eight more. Doubling gives three.
+    assert!(relay.attempts() <= 5, "{} attempts", relay.attempts());
+    relay.refuse(false);
+    let began = Instant::now();
+    wait_until("the closing link's return", || ring.nodes[1].stats().closing_up);
+    assert!(began.elapsed() < Duration::from_secs(3));
+    relay.refuse(true);
+    relay.cut();
+    ring.nodes[1].close_ring();
+    let attempts = relay.attempts();
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(relay.attempts(), attempts);
 }
 
 #[test]
