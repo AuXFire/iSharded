@@ -2,8 +2,9 @@
 
 Every token goes around the loop, so a route's order decides most of its speed on a mesh.
 But a route that runs has its weights in place, and they must not move or reload unless
-they must. So this only ever proposes: it tells an operator what a better order would save
-and what it would move, and nothing here changes a route.
+they must. So this only proposes: it tells an operator what a better order would save and
+what it would move. Nothing here changes a route; the coordinator applies a proposal only
+when its operator allowed that and the saving pays for the move.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from .planner import (
     MAX_LINKED_WORKERS,
     Candidate,
     ModelProfile,
+    _closest_subsets,
     _shortest_order,
     _untangled,
     holds_entry,
@@ -123,7 +125,7 @@ def _times(route: list[StageAssignment], links: Links, profile: ModelProfile, to
     }
 
 
-def propose(
+def propose_route(
     route: list[StageAssignment],
     candidates: list[Candidate],
     links: Links,
@@ -132,12 +134,16 @@ def propose(
     exit_: str | None = None,
     entry_bytes: int = 0,
     tokens_per_miss: float = 1.0,
-) -> dict[str, Any] | None:
-    """A better order of the nodes in ``route``, or None if there is none worth showing.
+    shed: bool = False,
+) -> tuple[list[StageAssignment], dict[str, Any]] | None:
+    """A better order of the nodes in ``route``, or of fewer of them, with what it costs.
+    None if nothing is worth it.
 
     ``entry`` and ``exit_`` are pins, which a proposal keeps. ``entry_bytes`` is what would
-    follow a new entry, such as a draft model. A proposal never needs more links that
-    failed, or more weights outside VRAM, than the route it would replace.
+    follow a new entry, such as a draft model. ``shed`` also weighs leaving out nodes the
+    model does not need, which only a route planned for the fewest nodes should do: one
+    that was spread has the nodes its operator asked for. A proposal never needs more
+    links that failed, or more weights outside VRAM, than the route it would replace.
     """
     profile = replace(profile, tokens_per_miss=tokens_per_miss)
     workers = {item.worker_id: item for item in with_links(candidates, links)}
@@ -147,27 +153,48 @@ def propose(
     if len(route) < 2 or not measured or any(name not in workers for name in names):
         return None
     members = [workers[name] for name in names]
-    found = plan_through(_orders(members, links, profile, entry, exit_), members, profile)
-    if found is None or [stage.worker_id for stage in found] == names:
+    groups = [members]
+    if shed:
+        # A node can join a running route without need, by a repair or by joining it.
+        # The subsets that hold the model in VRAM are ranked by loop and reads.
+        required = {name for name in (entry, exit_) if name in names}
+        groups += [group for group in _closest_subsets(members, profile, required, 0) if len(group) < len(members)]
+    now = route_faults(route, members)
+    best: tuple[float, list[StageAssignment]] | None = None
+    for group in groups:
+        found = plan_through(_orders(group, links, profile, entry, exit_), group, profile)
+        if found is None or any(then > before for then, before in zip(route_faults(found, members), now)):
+            continue
+        cost = _times(found, links, profile, tokens_per_miss)["ms_per_token"]
+        if best is None or cost < best[0]:
+            best = cost, found
+    if best is None or [stage.worker_id for stage in best[1]] == names:
         return None
-    if any(then > now for then, now in zip(route_faults(found, members), route_faults(route, members))):
-        return None
+    found = best[1]
     current, proposed = _times(route, links, profile, tokens_per_miss), _times(found, links, profile, tokens_per_miss)
     saved = current["ms_per_token"] - proposed["ms_per_token"]
     if saved < current["ms_per_token"] * MIN_SAVED_SHARE:
         return None
     moved, seconds = moved_weights(found, members, profile, entry_bytes if found[0].worker_id != names[0] else 0)
     kept = {(stage.worker_id, stage.start_layer, stage.end_layer) for stage in route}
-    return {
+    left_out = set(names) - {stage.worker_id for stage in found}
+    return found, {
         "groups": nearest_groups(names, links),
         "current": current,
         "proposed": {
             **proposed,
             "stages": [{"worker_id": stage.worker_id, "start_layer": stage.start_layer, "end_layer": stage.end_layer} for stage in found],
         },
+        "left_out": [name for name in names if name in left_out],
         "saved_ms_per_token": round(saved, 2),
         "moved_bytes": moved,
         "move_seconds": round(seconds, 1),
         "stages_changed": sum((stage.worker_id, stage.start_layer, stage.end_layer) not in kept for stage in found),
         "break_even_tokens": ceil(seconds * 1000 / saved),
     }
+
+
+def propose(*args: Any, **options: Any) -> dict[str, Any] | None:
+    """What ``propose_route`` found, without the route, which is all a person reads."""
+    found = propose_route(*args, **options)
+    return found[1] if found else None
