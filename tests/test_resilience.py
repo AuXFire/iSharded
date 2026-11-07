@@ -2729,7 +2729,7 @@ def warming_pool(handler):
     return orchestrator
 
 
-def test_a_new_route_runs_one_short_reply_and_clears_it_away() -> None:
+def test_a_new_route_runs_one_reply_of_64_rows_and_clears_it_away() -> None:
     seen = []
 
     def handler(request):
@@ -2744,7 +2744,7 @@ def test_a_new_route_runs_one_short_reply_and_clears_it_away() -> None:
     asyncio.run(run())
     (method, path, body), (cleared, gone, _) = seen
     assert (method, path) == ("POST", "/v1/generate")
-    assert (body["input_ids"], body["max_tokens"], body["epoch"]) == ([7, 8], 1, 5)
+    assert (body["input_ids"], body["max_tokens"], body["epoch"]) == ([7, 8] * 32, 1, 5)
     assert (cleared, gone) == ("DELETE", f"/internal/sessions/{body['session_id']}")
 
 

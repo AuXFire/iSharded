@@ -367,12 +367,30 @@ Each worker reports the engine's numbers in `runtime.telemetry.ring`. `link_rtt_
 
 A link can go silent with both its ends alive, and the engine treats that apart from a stage dying:
 
-- Each link has one writer thread with a bounded queue, so nothing waits on a socket. Heartbeats and acknowledgements go ahead of frames. A link is lost when nothing is heard for 5 seconds, when a pass or an answer goes 5 seconds without an acknowledgement, or when its queue stays full past the write limit of 2.5 seconds.
+- Each link has one writer thread with a bounded queue, so nothing waits on a socket. Heartbeats and acknowledgements go ahead of frames. The stage that dialled a link sends a heartbeat every 100 ms and the other end answers it. A link is lost when nothing is heard for 5 seconds, when a pass or an answer goes 5 seconds without an acknowledgement, or when its queue stays full past the write limit of 2.5 seconds.
 - A stage keeps each pass until the next stage acknowledges it. If that link goes silent, the stage dials once, for up to 2 seconds, and sends what it kept. If the dial fails, or the lost link had never answered, or the link closed while its far end was still answering, the stage refuses at once and the reply replays.
 - The last stage keeps each answer until the entry acknowledges it. If the closing link dies or goes silent, it sends what it holds by walking back, and goes on doing that for new answers until it has redialled the link. Redials start 0.25 seconds apart and double up to 5 seconds.
 - If the closing link stays down past 30 seconds, the coordinator reopens the ring. On some routes that link can never exist, and reopening makes running replies replay, so that wait doubles each time, up to 30 minutes, until the link has been seen up.
 - Each reply on a slot has a random 64-bit generation, carried by every pass, result, and refusal. A stage drops what is queued from an older generation, and the entry drops any result from one, so nothing left over from a reply can reach the next. Repeats are dropped by generation and pass id. The frames carry a version, and nodes on different versions refuse each other's links and stay on HTTP.
 - The entry waits for an answer for 5 seconds plus twice the round trip it has measured, and at least 10 seconds. With nothing measured yet it waits as long as the HTTP path would.
+
+Links are kept warm, because Linux slows a connection down after a pause. With its default `net.ipv4.tcp_slow_start_after_idle=1`, a connection that sent nothing for one retransmission timeout, never under 200 ms, starts again from a window of about 14 KB. A row bigger than that then waits one or more extra round trips. The 100 ms heartbeat keeps both ways of every link from sitting that long. A ring also sends 1 MiB of padding on each link it dials, before any pass, so the first long prompt finds the window already open. Padding is a frame the receiver drops; a link dialled again after a failure is not padded, because it carries the passes it kept at once. On an emulated 100 ms round trip with Linux defaults:
+
+| One message after a pause | Heartbeat every second | Every 100 ms |
+|---|---|---|
+| 16.6 KB after 0.7, 7 or 60 s | 151 ms | 50 ms |
+| 57 KB after 7 or 60 s | 251 ms | 51 ms |
+| 287 KB after 7 or 60 s | 452 ms | 53 ms |
+
+| First message on a new link | No padding | 1 MiB of padding |
+|---|---|---|
+| 57 KB | 251 ms | 51 ms |
+| 287 KB | 452 ms | 53 ms |
+| 1 MiB | 653 ms | 151 ms |
+
+A stand-in ring with the round trips of the seven-node 235B route, 16.6 KB a token, went from 1,220 to 454 ms a token with the faster heartbeat, the same with no pause between tokens or 0.7 or 7 seconds of it.
+
+A link's heartbeats cost about 380 bytes a second each way inside TLS, near 900 with TCP and IP headers, and no CPU time that could be told apart from an idle node's. An operator who controls the kernel can instead run `sysctl -w net.ipv4.tcp_slow_start_after_idle=0`, and add the line to `/etc/sysctl.conf` to keep it. That stops the slowdown after a pause for every connection on the machine, not only iSharded's, and a connection that resumes after a long pause may then send a whole window into a network that has changed since. It does nothing for a new connection, which is what the padding is for.
 
 ### Any node can coordinate
 
@@ -588,7 +606,7 @@ If the connection to a node drops, retry against another node. Replies survive a
 | A split GGUF, by any part | `owner/repo:Q6_K/model-00001-of-00004.gguf` | Each worker fetches only its share, from whichever parts hold it |
 | A local safetensors folder | `D:\models\qwen3-8b` | That machine. In a secured pool it must be in `--model-dir` |
 
-Once a route is up, the coordinator runs a one-token reply through it, so that the first real reply does not pay for first use. On two local GPU stages of a 0.6B model that took the first reply from 175 to 92 ms on a quiet machine, and from 659 to 169 ms on a busy one, the medians of three and four loads. On CPU it made little difference, 308 to 280 ms. A stage restart gets no such pass, because the reply that found the stage dead has already paid.
+Once a route is up, the coordinator runs a reply through it, 64 rows in and one token out, so that the first real reply does not pay for first use. On two local GPU stages of a 0.6B model a one-row reply took the first reply from 175 to 92 ms on a quiet machine, and from 659 to 169 ms on a busy one, the medians of three and four loads. On CPU it made little difference, 308 to 280 ms. A long prompt still paid, because it runs in passes of many rows: on two CPU stages, the first prompt of about 1,500 tokens took 0.40 to 0.75 s longer than the next one after one row, and 0.06 to 0.10 s longer after 64, over three loads each. A stage restart gets no such pass, because the reply that found the stage dead has already paid most of it: after a stage process was killed and that reply replayed, the next long prompt took 0.17 to 0.18 s longer than the one after it, in two runs.
 
 Loading a model replaces the main one. To run another beside it, see [Several models at once](#several-models-at-once). To see where a model would go without moving anything, use [isharded plan](#isharded-plan), `POST /admin/plan`, or the picker on the chat page.
 

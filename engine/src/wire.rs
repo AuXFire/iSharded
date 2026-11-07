@@ -9,8 +9,9 @@ use std::fmt;
 use ring::hmac;
 
 pub const MAGIC: u16 = 0x5369;
-/// Two added a generation to passes, answers and refusals. Three added the seal on answers.
-/// Nodes that differ refuse each other.
+/// Two added a generation to passes, answers and refusals. Three added the seal on answers,
+/// and padding, which an older node would take for a broken link. Nodes that differ refuse
+/// each other.
 pub const VERSION: u8 = 3;
 pub const HEADER_BYTES: usize = 8;
 /// The most a body may hold. Enough for a 512 row pass at a width of 32,768 in FP32.
@@ -38,6 +39,8 @@ pub enum Kind {
     Nack = 7,
     Ping = 8,
     Pong = 9,
+    /// Bytes that only open a link's window. The receiver drops them unread.
+    Pad = 10,
 }
 
 impl Kind {
@@ -52,6 +55,7 @@ impl Kind {
             7 => Kind::Nack,
             8 => Kind::Ping,
             9 => Kind::Pong,
+            10 => Kind::Pad,
             _ => return None,
         })
     }
@@ -464,6 +468,13 @@ pub fn read_beat(body: &[u8]) -> Result<u64, WireError> {
     Ok(stamp)
 }
 
+/// A frame of `size` zero bytes that carries nothing.
+pub fn pad(size: usize) -> Vec<u8> {
+    let mut frame = start_frame(Kind::Pad, size);
+    frame.resize(HEADER_BYTES + size, 0);
+    finish_frame(frame)
+}
+
 /// What a link is for, said once when it opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -669,6 +680,16 @@ mod tests {
         assert!(decoded.is_sealed_by(b"key"));
         let frame = sealed.encode();
         assert!(Answer::decode(&body(&frame)[..body(&frame).len() - 1]).is_err());
+    }
+
+    #[test]
+    fn padding_is_a_frame_of_its_own_kind_and_size() {
+        let frame = pad(1000);
+        let mut header = [0; HEADER_BYTES];
+        header.copy_from_slice(&frame[..HEADER_BYTES]);
+        assert_eq!(parse_header(&header), Ok((Kind::Pad, 1000)));
+        assert_eq!(frame.len(), HEADER_BYTES + 1000);
+        assert_eq!(parse_header(&pad(0)[..HEADER_BYTES].try_into().unwrap()), Ok((Kind::Pad, 0)));
     }
 
     #[test]
