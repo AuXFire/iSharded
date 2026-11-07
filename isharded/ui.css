@@ -742,7 +742,8 @@ dialog::backdrop { background: var(--overlay); }
 
 .who { color: var(--ink-2); font-size: var(--t-sm); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 button.state-word { padding: 0; border: 0; background: none; font: inherit; }
-button.state-word:hover span { text-decoration: underline; text-underline-offset: 3px; }
+button.state-word:disabled { cursor: default; }
+button.state-word:not(:disabled):hover span { text-decoration: underline; text-underline-offset: 3px; }
 .panel-tabs { display: flex; flex-wrap: wrap; gap: 0 var(--s-2); margin-bottom: var(--s-3); border-bottom: 1px solid var(--edge); }
 .panel-tab { display: inline-flex; align-items: center; gap: var(--s-1); min-height: 32px; margin-bottom: -1px; padding: 0 1px; border: 0; border-bottom: 2px solid transparent; background: none; color: var(--ink-2); font: 400 var(--t-sm)/16px var(--font-narrow); white-space: nowrap; }
 .panel-tab:hover { color: var(--ink); }

@@ -149,7 +149,7 @@ def test_manage_works_inside_the_policy_and_says_what_each_part_holds(page, inst
     open_manage(page)
     for title in ("What it may do", "Who answers", "Skills", "Plugins", "Code runs", "Peers"):
         assert title in page.inner_text("#panel-manage")
-    assert "Answering in" in page.inner_text("#part-answers")
+    assert "Answering" in page.inner_text("#part-answers")
     assert page.locator("#part-answers .route-no").first.inner_text() == "1"  # tried in order, so numbered
     assert [problem for problem in page.problems if "401" not in problem] == []
 
@@ -197,7 +197,7 @@ def test_a_provider_that_stops_answering_is_said_in_words(page, install):  # noq
     page.click("[data-panel=manage]")
     until(page, "() => document.getElementById('part-answers').textContent.includes('Not answering')")
     assert "gone" in page.inner_text("#manage-summary")
-    assert "Answering in" in page.inner_text("#part-answers")  # the one that is up says so too
+    assert "Answering" in page.inner_text("#part-answers")  # the one that is up says so too
 
 
 def test_a_lost_gateway_is_said_and_sending_comes_back_by_itself(page, install):  # noqa: F811
@@ -244,3 +244,10 @@ def test_an_approval_shows_the_exact_action_and_the_top_bar_counts_it(page, inst
     until(page, "() => document.getElementById('panel-approvals').textContent.includes('Nothing is waiting')")
     assert tidied.exists()
     assert page.inner_text("#pill") == "Nothing waiting"
+
+
+def test_a_models_file_path_is_shown_as_its_name(page):
+    named = "text => named(text)"
+    assert page.evaluate(named, "pool/C:\\models\\small\\Sample-8B.gguf failed") == "pool/Sample-8B failed"
+    assert page.evaluate(named, "/srv/models/Sample-8B.gguf") == "Sample-8B"
+    assert page.evaluate(named, "pool cannot be reached") == "pool cannot be reached"

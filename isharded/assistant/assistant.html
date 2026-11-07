@@ -207,6 +207,7 @@
       const pill = $('pill'), mark = $('pill-glyph'), name = state.name || 'iSharded assistant';
       const signedIn = Boolean($('who').textContent);
       pill.hidden = !signedIn;
+      pill.disabled = !state.waiting;
       pill.classList.remove('tone-warn', 'tone-bad');
       pill.classList.toggle('quiet-state', !state.lost && !state.waiting);
       if (state.lost) {
@@ -549,7 +550,7 @@
       for (const row of rows) {
         if (row.role === 'user') addTurn('user').body.textContent = row.content;
         if (row.role === 'assistant') renderText(addTurn('assistant').body, row.content);
-        if (row.role === 'notice') addTurn('assistant').body.append(make('p', 'quiet-text', row.content));
+        if (row.role === 'notice') addTurn('assistant').body.append(make('p', 'quiet-text', named(row.content)));
       }
       scrollDown();
     }
@@ -990,7 +991,6 @@
     async function readPeers(body) {
       const { fingerprint, peers } = await api('/assistant/peers');
       state.needs.peers = peers.filter(item => item.state === 'awaiting_owner').length;
-      state.fingerprint = fingerprint;
       const own = make('div', 'card-note', 'This install\'s fingerprint: ');
       own.append(make('code', 'fingerprint', fingerprint));
       body.replaceChildren(own, ...peers.map(peerRow));
