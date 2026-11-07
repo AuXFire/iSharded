@@ -503,11 +503,12 @@ class LlamaLibrary:
 class LlamaStage:
     """A loaded stage file with its own KV and recurrent state, for each sequence.
 
-    Saved states are the one way a sequence is shared, and they work for attention
-    and recurrent state alike. ``llama_memory_seq_cp`` is no use for this: with a cache
-    per sequence, as stages have, copying part of a sequence aborts the process, and
-    with a shared cache a hybrid model keeps its newest recurrent state and gives
-    wrong answers without any error. ``llama_memory_seq_rm`` refuses to rewind one.
+    Saved states are how a stage shares a sequence, and they work for attention and
+    recurrent state alike. ``llama_memory_seq_cp`` is no use for that: with a cache per
+    sequence, as stages have, copying part of a sequence aborts the process, and with a
+    shared cache a hybrid model keeps its newest recurrent state, so a part gives wrong
+    answers without any error. Copying a whole sequence on a shared cache is sound, and
+    a draft relies on that. ``llama_memory_seq_rm`` refuses to rewind recurrent state.
     """
 
     def __init__(
@@ -718,22 +719,36 @@ class LlamaStage:
         self._decode(hidden.shape[0], position, True, hidden=hidden, sequence_id=slot)
         return speculative_choice(self.logits_at, guesses, temperature, top_p, top_k, step_random(seed, position))
 
-    def guess(self, commit: list[int], position: int, count: int, slot: int = 0, scratch: int = 1) -> list[int]:
-        """Extend a draft model's committed text, then guess ``count`` tokens after it.
+    def guess(
+        self,
+        commit: list[int],
+        position: int,
+        count: int,
+        slot: int = 0,
+        scratch: int = 1,
+        fresh: Sequence[int] = (),
+        restart: bool = True,
+    ) -> list[int]:
+        """Guess ``count`` tokens after a draft model's text.
 
-        Guesses run on a second sequence that is thrown away afterward, because
-        recurrent state cannot rewind across separate single-token passes.
+        Confirmed text lives on ``slot``, and anything unconfirmed on ``scratch``, because
+        recurrent state cannot go back. A wrong chain is dropped whole. ``restart`` does that:
+        ``commit`` goes on ``slot`` in one batch, and ``scratch`` starts again as a copy of it.
+        Otherwise the chain on ``scratch`` is still good, and ``position`` is where it ends.
+        ``fresh`` then extends it, so a guess costs one decode however long the text.
         """
         lib = self.library.llama
-        self.decode_tokens(commit, position, sequence_id=slot)
-        guesses = [self.best_token()]
-        if count > 1:
-            lib.llama_memory_seq_cp(self.memory, slot, scratch, -1, -1)
-            cursor = position + len(commit)
-            for offset in range(count - 1):
-                self.decode_tokens(guesses[-1:], cursor + offset, sequence_id=scratch)
-                guesses.append(self.best_token())
+        if restart:
             lib.llama_memory_seq_rm(self.memory, scratch, -1, -1)
+            self.decode_tokens(commit, position, sequence_id=slot)
+            lib.llama_memory_seq_cp(self.memory, slot, scratch, -1, -1)
+            position += len(commit)
+        self.decode_tokens(list(fresh), position, sequence_id=scratch)
+        position += len(fresh)
+        guesses = [self.best_token()]
+        for offset in range(count - 1):
+            self.decode_tokens(guesses[-1:], position + offset, sequence_id=scratch)
+            guesses.append(self.best_token())
         return guesses
 
     def forward(

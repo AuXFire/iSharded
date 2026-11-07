@@ -72,20 +72,20 @@ class Draft:
         self.right = right
         self.random = random.Random(seed)
         self.calls = 0
-        self.committed = 0
+        self.text: list[int] = []
         self.rewinds: list[int] = []
 
-    async def guess(self, text: list[int]) -> int:
+    async def guess(self, fresh: list[int]) -> int:
         self.calls += 1
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        self.committed = len(text)
-        truth = model(text)
+        self.text += fresh
+        truth = model(self.text)
         return truth if self.random.random() < self.right else (truth + 1) % 500
 
     async def rewind(self, keep: int) -> None:
         self.rewinds.append(keep)
-        self.committed = min(self.committed, keep)
+        del self.text[keep:]
 
 
 def plain(prompt: list[int], first: int, count: int, stops=()) -> list[int]:
@@ -209,20 +209,18 @@ def test_a_wrong_guess_is_answered_without_waiting_for_the_draft() -> None:
         route = Route(history[:-1], length=1)
         order: list[str] = []
         released = asyncio.Event()
+        draft = Draft(0.0)  # always wrong
 
         async def wait(answer: asyncio.Future[list[int]]) -> int:
             return (await answer)[0]
 
-        async def guess(text: list[int]) -> int:
+        async def guess(fresh: list[int]) -> int:
             if len(order) >= 2:
                 await released.wait()  # the draft is slow, and the route is not
             order.append("guess")
-            return (model(text) + 1) % 500  # always wrong
+            return await draft.guess(fresh)
 
-        async def rewind(_: int) -> None:
-            return None
-
-        pipe = Pipeline(history, 6, (), 4, 6, route.send, wait, guess, rewind)
+        pipe = Pipeline(history, 6, (), 4, 6, route.send, wait, guess, draft.rewind)
         made = []
         async for token in pipe.tokens(3):
             made.append(token)
@@ -260,10 +258,10 @@ def test_a_guess_for_a_place_already_answered_is_thrown_away() -> None:
         draft = Draft(1.0)  # always right, and slower than the route
         slow = draft.guess
 
-        async def guess(text: list[int]) -> int:
+        async def guess(fresh: list[int]) -> int:
             for _ in range(12):
                 await asyncio.sleep(0)
-            return await slow(text)
+            return await slow(fresh)
 
         async def wait(answer: asyncio.Future[list[int]]) -> int:
             return (await answer)[0]
@@ -316,8 +314,41 @@ def test_landing_leaves_the_reply_ready_to_go_on_another_way() -> None:
         return history, draft, route
 
     history, draft, _ = asyncio.run(run())
-    assert draft.committed <= len(history) - 1
+    assert len(draft.text) <= len(history) - 1
     assert history[3:] == plain([5, 6], model([5, 6]), 12)[1:]
+
+
+@pytest.mark.parametrize("right", [1.0, 0.7, 0.0])
+def test_the_draft_hears_only_what_it_has_not_seen(right: float) -> None:
+    async def run() -> tuple[list[int], list[int], Pipeline]:
+        prompt = list(range(3, 5000))
+        history = [*prompt, model(prompt)]
+        route, draft = Route(history[:-1]), Draft(right)
+        draft.text = history[:-1]
+        heard: list[int] = []
+
+        async def guess(fresh: list[int]) -> int:
+            heard.append(len(fresh))
+            answer = await draft.guess(fresh)
+            # Its text must be the reply so far, then the guesses out there. A miss can
+            # land while a guess runs, and then that guess is thrown away anyway.
+            if pipe.guessing_for[0] == pipe.misses:
+                assert draft.text[: len(history)] == history[: len(draft.text)]
+            return answer
+
+        async def wait(answer: asyncio.Future[list[int]]) -> int:
+            return (await answer)[0]
+
+        pipe = Pipeline(history, 60, (), 4, 6, route.send, wait, guess, draft.rewind, told=len(prompt))
+        made = [token async for token in pipe.tokens(60)]
+        await pipe.close()
+        return made, heard, pipe
+
+    made, heard, pipe = asyncio.run(run())
+    prompt = list(range(3, 5000))
+    assert made == plain(prompt, model(prompt), 61)[1:]
+    assert heard and max(heard) <= 2  # never the history, however long it is
+    assert (pipe.misses == 0) == (right == 1.0)
 
 
 def test_a_prompt_divides_where_a_whole_prompt_would_stop() -> None:

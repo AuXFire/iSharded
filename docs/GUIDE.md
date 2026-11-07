@@ -1263,6 +1263,8 @@ Guessing does not always pay, so the entry measures. It keeps whichever way has 
 
 For `qwen3`, `qwen3moe`, `qwen35`, and `qwen35moe` models the draft is chosen automatically (`Qwen3-0.6B` or `Qwen3.5-0.8B`, which share their vocabulary). Name another with `--draft`, or turn this off with `--no-draft`. A named draft must have the same vocabulary as the model, and a draft that cannot load leaves the model running without one.
 
+A draft keeps confirmed text on one sequence and its guesses on a scratch sequence, one of each per conversation. A guess that lands costs one decode. A wrong one drops the scratch sequence, adds what was confirmed in one batch, and copies the result to scratch again. Recurrent state cannot go back, so every draft works this way, and a miss costs the same however long the conversation is. The scratch sequences share the draft's cache and do not make it bigger.
+
 ### Conversation reuse
 
 The same tokens are computed once per stage and reused. Every stage saves its state in two places: where a chat's system prompt and tool list end, which other conversations share, and where its settled history ends, which is where the conversation picks up next turn. If a prompt starts with exactly those tokens, stages restore the state and process only what is new. An image counts as tokens, by a digest of its bytes, so the same words about a different image share nothing past that image. Anything else, such as an edited history, reads the whole prompt. Plain text sent to `/v1/completions` has no turns to go by, so it is saved once two prompts turn out to share 512 tokens or more, and a third can reuse them. This covers GGUF models.

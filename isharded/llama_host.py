@@ -178,19 +178,22 @@ class _Host:
         return {"tokens": self.stage.verify(hidden, meta["position"], **sampling)}, b""
 
     def load_draft(self, meta: dict[str, Any], _: bytes) -> Reply:
+        slots = meta.get("slots", 1)
         self.library = LlamaLibrary.load(meta["folder"], tuple(meta["extra_paths"]))
         self.stage = LlamaStage(
             self.library,
             meta["path"],
             last=True,
-            context_tokens=meta["context_tokens"],
+            # Every slot has a scratch sequence, but a copy shares its cells, so scratch
+            # needs only room for guesses and the shared cache stays the size it was.
+            context_tokens=meta["context_tokens"] * (slots + 1) // (2 * slots),
             gpu_layers=meta["gpu_layers"],
             threads=meta["threads"],
-            sequences=meta.get("slots", 1) + 1,
+            sequences=2 * slots,
             unified_cache=True,
             map_file=False,
         )
-        self.scratch = meta.get("slots", 1)
+        self.scratch = slots
         self.states = StateStore(None, DRAFT_STATE_BYTES, 0)
         return {}, b""
 
@@ -217,7 +220,10 @@ class _Host:
 
     def guess(self, meta: dict[str, Any], _: bytes) -> Reply:
         assert self.stage is not None
-        tokens = self.stage.guess(meta["commit"], meta["position"], meta["count"], meta.get("slot", 0), self.scratch)
+        slot = meta.get("slot", 0)
+        tokens = self.stage.guess(
+            meta["commit"], meta["position"], meta["count"], slot, self.scratch + slot, meta.get("fresh", ()), meta.get("restart", True)
+        )
         return {"tokens": tokens}, b""
 
     @property

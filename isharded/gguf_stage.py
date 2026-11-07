@@ -429,13 +429,26 @@ def next_guess_count(current: int, right: int, limit: int) -> int:
     return current
 
 
+@dataclass(slots=True)
+class DraftText:
+    """What a draft holds for one slot."""
+
+    # Tokens on the slot's sequence, which only ever holds confirmed text.
+    committed: int = 0
+    # Tokens after those. They run on the scratch sequence, and may still prove wrong.
+    chain: list[int] = field(default_factory=list)
+    # The scratch sequence has more than ``chain``, so it must start again from the slot.
+    stale: bool = True
+
+
 class DraftModel:
     """A small whole model on the entry worker, kept in step with the real text."""
 
     def __init__(
         self, folder: str, extra_paths: tuple[str, ...], path: Path, context_tokens: int, threads: int, slots: int = 1
     ) -> None:
-        self.committed: dict[int, int] = {}
+        self.slots = slots
+        self.text: dict[int, DraftText] = {}
         self.host = start_host(
             "load_draft",
             {
@@ -451,47 +464,61 @@ class DraftModel:
 
     def _commit(self, tokens: list[int], slot: int) -> None:
         if tokens:
-            self.host.call("commit", tokens=tokens, position=self.committed[slot], slot=slot)
-            self.committed[slot] += len(tokens)
+            text = self.text[slot]
+            self.host.call("commit", tokens=tokens, position=text.committed, slot=slot)
+            text.committed += len(tokens)
 
     def prepare(self, prompt: list[int], plan: PromptPlan, slot: int = 0) -> None:
         """Catch up with a prompt, reusing and saving checkpoints like the stages do."""
-        self.committed[slot] = 0
+        text = self.text[slot] = DraftText()
+        self.host.call("clear", slot=self.slots + slot)  # the last reply's guesses hold cells this one may need
         try:
             if plan.start:
                 self.host.call("restore", key=plan.key, slot=slot)
-                self.committed[slot] = plan.start
+                text.committed = plan.start
         except StageLost:
             raise
         except LlamaError:
             pass  # this one is only a guesser: it can read the whole prompt instead
-        if not self.committed[slot]:
+        if not text.committed:
             self.host.call("clear", slot=slot)
         for save in plan.saves:
-            if save.length > self.committed[slot]:
-                self._commit(prompt[self.committed[slot] : save.length], slot)
+            if save.length > text.committed:
+                self._commit(prompt[text.committed : save.length], slot)
                 self.host.call("save", slot=slot, **save.model_dump())
-        self._commit(prompt[self.committed[slot] :], slot)
+        self._commit(prompt[text.committed :], slot)
+
+    def seen(self, slot: int = 0) -> int:
+        """How much of the text this draft has read, guesses included."""
+        text = self.text[slot]
+        return text.committed + len(text.chain)
 
     def rewind(self, keep: int, slot: int = 0) -> None:
-        """Forget text from ``keep`` on, because the guesses it held did not land."""
-        if self.committed[slot] <= keep:
-            return
-        try:
-            self.host.call("truncate", keep=keep, slot=slot)
-            self.committed[slot] = keep
-        except StageLost:
-            raise
-        except LlamaError:
-            # A recurrent draft cannot go back. It reads the text again instead.
-            self.host.call("clear", slot=slot)
-            self.committed[slot] = 0
+        """Forget text from ``keep`` on, because the guesses it held did not land.
 
-    def guess(self, history: list[int], count: int, slot: int = 0) -> list[int]:
-        """Guess what follows ``history``, feeding it only the tokens it has not seen."""
-        seen = self.committed[slot]
-        answer, _ = self.host.call("guess", commit=history[seen:], position=seen, count=count, slot=slot)
-        self.committed[slot] = len(history)
+        What came before is confirmed now. The next guess does the work, so a miss costs one
+        trip to the draft and not two, and it relies on what a rewind means: the model has
+        said what goes at ``keep``, so the next token after a rewind is confirmed too.
+        """
+        text = self.text[slot]
+        right = max(keep - text.committed, 0)
+        if right < len(text.chain):
+            del text.chain[right:]
+            text.stale = True
+
+    def guess(self, fresh: list[int], count: int, slot: int = 0) -> list[int]:
+        """Guess what follows the text so far and ``fresh``, the tokens this draft has not seen."""
+        text = self.text[slot]
+        if text.stale:
+            commit, fresh = text.chain + fresh[:1], fresh[1:]
+            answer, _ = self.host.call("guess", commit=commit, position=text.committed, count=count, slot=slot, fresh=fresh)
+            text.committed += len(commit)
+            text.chain = []
+            text.stale = False
+        else:
+            answer, _ = self.host.call("guess", commit=[], position=self.seen(slot), count=count, slot=slot, fresh=fresh, restart=False)
+        # The newest guess has not run yet. If it lands, it comes back as fresh text.
+        text.chain += fresh + answer["tokens"][:-1]
         return answer["tokens"]
 
     def close(self) -> None:

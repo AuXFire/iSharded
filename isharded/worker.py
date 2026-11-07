@@ -2351,23 +2351,20 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
         ahead = min(INITIAL_GUESSES, runtime.speculate_tokens)
         following = request.model_copy(update=GOING_ON)
 
-        async def draft_guesses(text: list[int], count: int) -> list[int]:
+        async def draft_guesses(fresh: list[int], count: int) -> list[int]:
             started = time.perf_counter()
             try:
-                guesses = await asyncio.to_thread(draft.guess, text, count, request.slot)
+                guesses = await asyncio.to_thread(draft.guess, fresh, count, request.slot)
             except LlamaError as exc:
                 raise await runtime.replace_draft(exc) from exc
             runtime._record("draft", started)
             return guesses
 
-        async def next_guess(text: list[int]) -> int:
-            return (await draft_guesses(text, 1))[0]
+        async def next_guess(fresh: list[int]) -> int:
+            return (await draft_guesses(fresh, 1))[0]
 
         async def rewind_draft(keep: int) -> None:
-            try:
-                await asyncio.to_thread(draft.rewind, keep, request.slot)
-            except LlamaError as exc:
-                raise await runtime.replace_draft(exc) from exc
+            draft.rewind(keep, request.slot)
 
         pipe: Pipeline | None = None
         while produced < body.max_tokens and token not in stops:
@@ -2390,6 +2387,7 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
                         guess=next_guess,
                         rewind=rewind_draft,
                         sharing=lambda: runtime.gate.size - len(runtime.gate.free),
+                        told=draft.seen(request.slot),
                     )
                     runtime.pipes[request.slot] = pipe
                 made, misses = pipe.tokens_made, pipe.misses
@@ -2406,7 +2404,7 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
                 pipe = None
                 del runtime.pipes[request.slot]
             drafting = way == GUESSED
-            guesses = await draft_guesses(history, min(ahead, room)) if drafting else []
+            guesses = await draft_guesses(history[draft.seen(request.slot) :], min(ahead, room)) if drafting else []
             result = await reply_step(
                 following.model_copy(update={"input_ids": [token, *guesses], "verify": drafting, "rollback_to": len(history) - 1})
             )
@@ -2422,6 +2420,8 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
                 if token in stops:
                     return
             history.extend(accepted)
+            if drafting:
+                draft.rewind(len(history) - 1, request.slot)  # the newest token is the model's own
 
     async def tokens() -> AsyncIterator[bytes]:
         request = InferRequest(**body.model_dump(exclude={"max_tokens", "stop_token_ids", "checkpoint_at", "cut_token", "images"}))
