@@ -23,6 +23,7 @@ import time
 from typing import Any
 
 from .access import canonical
+from .pool import _write_key
 from .tickets import TicketChecker
 
 NAME_PREFIX = "n-"
@@ -57,8 +58,6 @@ def make_identity(folder: Path | str) -> str:
     from cryptography.hazmat.primitives.asymmetric import ec
     from cryptography.x509.oid import NameOID
 
-    from .pool import _write_private
-
     root = Path(folder)
     if certificate_file(root).is_file():
         return identity_name(root)
@@ -77,10 +76,7 @@ def make_identity(folder: Path | str) -> str:
         .not_valid_after(now + datetime.timedelta(days=365 * IDENTITY_YEARS))
         .sign(key, hashes.SHA256())
     )
-    _write_private(
-        key_file(root),
-        key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()),
-    )
+    _write_key(key_file(root), key)
     certificate_file(root).write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
     return name
 
@@ -229,6 +225,3 @@ class CommonsChecker(TicketChecker):
         name = super().name(ticket)
         return name if name and self.commons.accepts(name) else None
 
-
-def ownerless_folder() -> str | None:
-    return os.getenv("ISHARDED_OWNERLESS") or None
