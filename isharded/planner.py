@@ -60,6 +60,8 @@ AUTO_SLACK = (0, 2, 6)
 # Kept back on accelerators for activations and allocator overhead.
 WORKSPACE_BYTES = 256 * 1024**2
 WORKSPACE_SHARE = 0.1
+# Least time a layer takes on a GPU, measured at 0.5 to 0.75 ms on an RX 7900 XT.
+LAYER_FLOOR_MS = 0.5
 # Reading the embedding touches one row per token, which is effectively free.
 EMBEDDING_ACTIVE_FRACTION = 0.0
 # Rate at which FP8 weights can be expanded per use, in GB of FP8 per second.
@@ -141,6 +143,9 @@ class ModelProfile:
     # Whether stages pass tokens around a closed loop, instead of each waiting for
     # the next stage's reply. It sets what a route's network time is.
     ring: bool = False
+    # Tokens a reply makes per wrong guess, as measured on a route. One means nothing
+    # has been measured, and then only the time around the loop counts.
+    tokens_per_miss: float = 1.0
 
     def __post_init__(self) -> None:
         # The layer search asks for the same sizes thousands of times, and a
@@ -384,17 +389,23 @@ def _spilled_bytes(placements: list[UnitPlacement], pools: list[MemoryPool]) -> 
     return sum(item.bytes for item in placements if item.pool_id in below)
 
 
+def _fetch(candidate: Candidate, profile: ModelProfile, start: int, end: int) -> tuple[int, float]:
+    """The bytes a stage would have to fetch onto this worker, and the seconds that takes."""
+    rate = candidate.fetch_bytes_per_second or DEFAULT_FETCH_BYTES_PER_SECOND
+    peer_rate = max(rate, PEER_FETCH_BYTES_PER_SECOND)
+    size, seconds = 0, 0.0
+    for item in _stage_items(profile, start, end):
+        if item.unit.name not in candidate.cached:
+            size += item.unit.nbytes
+            seconds += item.unit.nbytes / (peer_rate if item.unit.name in candidate.peer_units else rate)
+    return size, seconds
+
+
 def _download_ms(candidate: Candidate, profile: ModelProfile, start: int, end: int) -> float:
     """A stage's download time, spread across the tokens it must pay back over."""
     if not profile.amortize_tokens:
         return 0.0
-    rate = candidate.fetch_bytes_per_second or DEFAULT_FETCH_BYTES_PER_SECOND
-    peer_rate = max(rate, PEER_FETCH_BYTES_PER_SECOND)
-    seconds = 0.0
-    for item in _stage_items(profile, start, end):
-        if item.unit.name not in candidate.cached:
-            seconds += item.unit.nbytes / (peer_rate if item.unit.name in candidate.peer_units else rate)
-    return seconds * 1000 / profile.amortize_tokens
+    return _fetch(candidate, profile, start, end)[1] * 1000 / profile.amortize_tokens
 
 
 def _weight_room(pool: MemoryPool, workspace: int) -> int:
@@ -493,6 +504,27 @@ def route_network_ms(route: list[StageAssignment], links: dict[tuple[str, str], 
     return _network_ms(forward, link_ms(links, names[-1], names[0]) if names else 0.0, ring)
 
 
+def ms_per_token(loop_ms: float, pace_ms: float, tokens_per_miss: float = 1.0, rewind_ms: float = 0.0) -> float:
+    """One reply's time per token, with passes overlapping on the route.
+
+    After a miss the next token has to come all the way around the loop and the draft
+    has to rewind. The others that hit follow at the pace of the slowest stage. So
+    tokens per second is L / (R + w + (L - 1) p), and with no draft L is 1 and only the
+    loop counts.
+    """
+    return (loop_ms + rewind_ms + (tokens_per_miss - 1) * pace_ms) / tokens_per_miss
+
+
+def route_times(route: list[StageAssignment], links: dict[tuple[str, str], float], ring: bool) -> tuple[float, float]:
+    """A planned route's time around the loop, and its slowest stage, in ms.
+
+    Bandwidth alone flatters small active sets, such as a MoE's: every layer still costs
+    its kernel launches, and every stage boundary costs a network hop.
+    """
+    stages = [max(stage.estimated_ms_per_token, (stage.end_layer - stage.start_layer) * LAYER_FLOOR_MS) for stage in route]
+    return sum(stages) + route_network_ms(route, links, ring), max(stages, default=0.0)
+
+
 class _Packer:
     """Packs stages for one set of capacities, for the searches to compare.
 
@@ -523,100 +555,6 @@ class _Packer:
         return self.shared[key]
 
 
-def _partition(
-    candidates: list[Candidate],
-    profile: ModelProfile,
-    packer: _Packer,
-    spread: bool,
-    required: set[str],
-    costs: dict[tuple[str, int, int], float],
-) -> list[tuple[Candidate, int, int]] | None:
-    """Choose contiguous layer ranges with a dynamic program.
-
-    A token crosses the stages one after another, so total latency is what a
-    user feels, and that is what both modes minimize. ``spread`` must use every
-    candidate; otherwise workers outside ``required`` may be skipped, which
-    favors fewer stages. ``costs`` is shared between orders, because a stage's
-    cost depends on its worker and layers and not on who comes before it.
-    """
-    layers = profile.num_layers
-    count = len(candidates)
-
-    def table(fill: Any) -> list[list[Any]]:
-        return [[fill] * (layers + 1) for _ in range(count + 1)]
-
-    def stage_cost(index: int, start: int, end: int) -> float:
-        candidate = candidates[index]
-        key = (candidate.worker_id, start, end)
-        if key not in costs:
-            filled = packer.pack(candidate, start, end)
-            costs[key] = INFEASIBLE if filled is None else filled[1] + _download_ms(candidate, profile, start, end)
-        return costs[key]
-
-    # best[i][j]: lowest cost covering layers [0, j) using candidates [0, i).
-    best = table(INFEASIBLE)
-    choice: list[list[int | None]] = table(None)
-    # The workers that best path starts and ends on, since the next hop starts at one
-    # and a loop closes at the other, and what its hops have cost so far.
-    ending: list[list[Candidate | None]] = table(None)
-    opening: list[list[Candidate | None]] = table(None)
-    walked = table(0.0)
-    best[0][0] = 0.0
-    for index in range(1, count + 1):
-        candidate = candidates[index - 1]
-        skippable = not spread and candidate.worker_id not in required
-        for end in range(layers + 1):
-            if skippable and best[index - 1][end] < best[index][end]:
-                best[index][end] = best[index - 1][end]
-                choice[index][end] = end  # this worker is skipped
-                ending[index][end] = ending[index - 1][end]
-                opening[index][end] = opening[index - 1][end]
-                walked[index][end] = walked[index - 1][end]
-            # A stage too long to pack stays too long if it grows, so with no RAM to
-            # fall back on most ranges need not be packed at all. A hybrid stage can
-            # also be too short, which says nothing about a longer one.
-            earliest = 0
-            for start in reversed(range(0, end, profile.layer_step)):
-                allowed = holds_both_kinds(start, end, profile.attention_interval)
-                if allowed and best[index - 1][start] != INFEASIBLE and stage_cost(index - 1, start, end) == INFEASIBLE:
-                    earliest = start + profile.layer_step
-                    break
-            for start in range(earliest, end, profile.layer_step):
-                previous = best[index - 1][start]
-                if previous == INFEASIBLE:
-                    continue
-                cost = stage_cost(index - 1, start, end)
-                if cost == INFEASIBLE:
-                    continue
-                before = ending[index - 1][start]
-                hop = _one_way_ms(_hop_ms(before, candidate), profile.ring) if start and before else 0.0
-                total = _with_stage(previous, cost, hop)
-                first = opening[index - 1][start] or candidate
-                gone = walked[index - 1][start] + hop
-                if profile.ring and end == layers and first is not candidate:
-                    total += _closing_ms(_hop_ms(candidate, first), gone)
-                if total < best[index][end]:
-                    best[index][end] = total
-                    choice[index][end] = start
-                    ending[index][end] = candidate
-                    opening[index][end] = first
-                    walked[index][end] = gone
-    if best[count][layers] == INFEASIBLE:
-        return None
-
-    ranges: list[tuple[Candidate, int, int]] = []
-    end = layers
-    for index in range(count, 0, -1):
-        start = choice[index][end]
-        if start is None:
-            return None
-        if start != end:
-            ranges.append((candidates[index - 1], start, end))
-        end = start
-    ranges.reverse()
-    return ranges
-
-
 # Layers of fast memory left open, bytes outside it, read time, and a stage's cost
 # or a route's total. A route's score ends with what its hops have cost so far.
 _Score = tuple[Any, ...]
@@ -640,6 +578,15 @@ def _extended(
         total += _closing_ms(_hop_ms(candidate, first), walked)
     dead = DEAD_LINK_PENALTY if round_trip >= UNREACHABLE_LINK_MS else 0
     return score[0] + open_layers + dead, score[1] + slow, max(score[2], read), total, walked
+
+
+def _paced(profile: ModelProfile) -> Callable[[_Score], float]:
+    """What a search minimizes: a route's total with the law's pace added in.
+
+    The pace is a maximum, so a walk can only weigh the slowest stage so far. A route
+    is judged in full by ``_route_cost``, once it is whole.
+    """
+    return lambda score: score[3] + (profile.tokens_per_miss - 1) * score[2]
 
 
 def _stage_scorer(profile: ModelProfile, packer: _Packer) -> Callable[[Candidate, int, int], _Score | None]:
@@ -682,7 +629,8 @@ def _stage_scorer(profile: ModelProfile, packer: _Packer) -> Callable[[Candidate
                 room = sum(shares[group] for group in {pool.capacity_group for pool in fast.values()})
                 open_layers = max(room - fast_bytes(placements, fast), 0) // largest - room // largest
                 slow = sum(item.bytes for item in placements if item.pool_id not in fast)
-                cost = milliseconds + _download_ms(candidate, profile, start, end)
+                # A search compares L times the time per token, so a download counts L times.
+                cost = milliseconds + profile.tokens_per_miss * _download_ms(candidate, profile, start, end)
                 known[key] = (open_layers, slow, milliseconds, cost)
         return known[key]
 
@@ -694,16 +642,25 @@ def _cuts(profile: ModelProfile) -> list[int]:
     return [*range(0, profile.num_layers, profile.layer_step), profile.num_layers]
 
 
-def _search_order(
+def _walk_order(
     order: list[Candidate],
     profile: ModelProfile,
     stage: Callable[[Candidate, int, int], _Score | None],
     spread: bool,
     required: set[str],
-    rank: Callable[[_Score], tuple[Any, ...]],
-    slowest_allowed: float,
+    rank: Callable[[_Score], Any],
+    slowest_allowed: float = INFEASIBLE,
+    fewer_on_a_tie: bool = False,
 ) -> tuple[_Score, list[tuple[Candidate, int, int]]] | None:
-    """Choose stages through one order of workers, when every order is too many."""
+    """Choose contiguous layer ranges through one order of workers.
+
+    ``spread`` must use every worker. Otherwise workers outside ``required`` may be
+    skipped, which favors fewer stages. ``stage`` gives a stage's score and ``rank``
+    compares what they add up to. Scoring stages is shared between orders, because a
+    stage's cost does not depend on who comes before it. ``fewer_on_a_tie`` keeps an
+    earlier worker over a later one just like it, which matters on a pool of equals:
+    a different choice there would move weights for nothing.
+    """
     cuts = _cuts(profile)
     last = len(cuts) - 1
     # best[i][cut]: the best way to reach this cut with the first i workers.
@@ -722,7 +679,7 @@ def _search_order(
             before = ending.get((index, here))
             first = opening.get((index, here), candidate)
             held = best[index + 1][here]
-            if skippable and (held is None or rank(score) < rank(held)):
+            if skippable and (held is None or rank(score) < rank(held) or (fewer_on_a_tie and rank(score) == rank(held))):
                 best[index + 1][here] = score
                 came[index + 1, here] = here
                 if before is not None:
@@ -730,7 +687,14 @@ def _search_order(
                     opening[index + 1, here] = first
             for there in range(here + 1, last + 1):
                 found = stage(candidate, cuts[here], cuts[there])
-                if found is None or found[2] > slowest_allowed:
+                if found is None:
+                    # A stage too long to pack stays too long if it grows, so with no RAM
+                    # to fall back on most ranges need not be packed at all. A hybrid stage
+                    # can also be too short, which says nothing about a longer one.
+                    if holds_both_kinds(cuts[here], cuts[there], profile.attention_interval):
+                        break
+                    continue
+                if found[2] > slowest_allowed:
                     continue
                 reached = _extended(score, found, before, candidate, first if there == last else None, profile.ring)
                 held = best[index + 1][there]
@@ -751,6 +715,21 @@ def _search_order(
         here = previous
     ranges.reverse()
     return final, ranges
+
+
+def _search_order(
+    orders: list[list[Candidate]],
+    profile: ModelProfile,
+    stage: Callable[[Candidate, int, int], _Score | None],
+    spread: bool,
+    required: set[str],
+    rank: Callable[[_Score], tuple[Any, ...]],
+    slowest_allowed: float,
+) -> list[tuple[Candidate, int, int]] | None:
+    """The best ranges through any of these orders, for when every order is too many."""
+    found = (_walk_order(order, profile, stage, spread, required, rank, slowest_allowed) for order in orders)
+    best = min((item for item in found if item), key=lambda item: rank(item[0]), default=None)
+    return best[1] if best else None
 
 
 def _search_blocks(
@@ -849,7 +828,8 @@ def _fill_fast_memory(
     slow = _slow_bytes(fastest, candidates)
     if not slow or not any(pool.kind in FAST_MEMORY for pool in _all_pools(candidates)):
         return fastest
-    fullest = search(lambda score: (score[0], score[3])) or fastest
+    paced = _paced(profile)
+    fullest = search(lambda score: (score[0], paced(score))) or fastest
     if _slow_bytes(fullest, candidates) >= slow:
         fullest = fastest
     reads = [stage.estimated_ms_per_token for stage in fullest]
@@ -999,9 +979,19 @@ def _dead_links(route: list[StageAssignment], candidates: list[Candidate]) -> in
     return sum(hop >= UNREACHABLE_LINK_MS for hop in _round_trips(route, candidates)[0])
 
 
+def route_faults(route: list[StageAssignment], candidates: list[Candidate]) -> tuple[int, int]:
+    """What outranks speed: forward links that failed, then bytes outside fast memory."""
+    return _dead_links(route, candidates), _slow_bytes(route, candidates)
+
+
 def _route_cost(route: list[StageAssignment], candidates: list[Candidate], profile: ModelProfile) -> float:
-    reads = sum(stage.estimated_ms_per_token for stage in route)
-    return reads + _hops_ms(route, candidates, profile) + _moved_ms(route, candidates, profile)
+    """A route's time per token, with what it moves spread over the tokens to pay it back.
+
+    A draft's rewind is the same on every route, so it changes no comparison.
+    """
+    reads = [stage.estimated_ms_per_token for stage in route]
+    loop = sum(reads) + _hops_ms(route, candidates, profile)
+    return ms_per_token(loop, max(reads, default=0.0), profile.tokens_per_miss) + _moved_ms(route, candidates, profile)
 
 
 def _sampled(
@@ -1015,14 +1005,14 @@ def _sampled(
     """The fastest route through the orders worth trying, with the packer that found it."""
     for shrink in shrinks:
         packer = _Packer(profile, _capacities(candidates, shrink, profile.stage_workspace_bytes))
-        costs: dict[tuple[str, int, int], float] = {}
+        stage = _stage_scorer(profile, packer)
         best: list[StageAssignment] | None = None
         best_cost = INFEASIBLE
         for order in orders:
-            ranges = _partition(order, profile, packer, spread, required, costs)
-            if ranges is None:
+            walked = _walk_order(order, profile, stage, spread, required, _paced(profile), fewer_on_a_tie=True)
+            if walked is None:
                 continue
-            route = _build_route(ranges, profile, packer.capacities)
+            route = _build_route(walked[1], profile, packer.capacities)
             if route is None:
                 continue
             cost = _route_cost(route, candidates, profile)
@@ -1064,13 +1054,49 @@ def _attempt(
         if every_order:
             ranges = _search_blocks(candidates, profile, stage, spread, entry, exit_, rank, slowest)
         else:
-            found = (_search_order(order, profile, stage, spread, required, rank, slowest) for order in orders)
-            best = min((item for item in found if item), key=lambda item: rank(item[0]), default=None)
-            ranges = best[1] if best else None
+            ranges = _search_order(orders, profile, stage, spread, required, rank, slowest)
         return None if ranges is None else _build_route(ranges, profile, packer.capacities)
 
-    fastest = search(lambda score: (score[3], score[0], score[1], score[2])) if every_order else sampled
+    paced = _paced(profile)
+    fastest = search(lambda score: (paced(score), score[0], score[1], score[2])) if every_order else sampled
     return None if fastest is None else _fill_fast_memory(fastest, search, candidates, profile)
+
+
+def plan_through(orders: list[list[Candidate]], candidates: list[Candidate], profile: ModelProfile) -> list[StageAssignment] | None:
+    """The best route that keeps to one of these orders and uses every worker in it.
+
+    VRAM comes before speed here as everywhere, and on a tie the earliest order stands.
+    """
+    paced = _paced(profile)
+
+    def worth(route: list[StageAssignment]) -> tuple[int, int, float]:
+        return *route_faults(route, candidates), _route_cost(route, candidates, profile)
+
+    for shrink in PACKING_RETRIES:
+        packer = _Packer(profile, _capacities(candidates, shrink, profile.stage_workspace_bytes))
+        stage = _stage_scorer(profile, packer)
+        walks = (_walk_order(order, profile, stage, True, set(), lambda score: (score[1], paced(score))) for order in orders)
+        routes = [route for walk in walks if walk and (route := _build_route(walk[1], profile, packer.capacities))]
+        if routes:
+            return min(routes, key=worth)
+    return None
+
+
+def moved_weights(route: list[StageAssignment], candidates: list[Candidate], profile: ModelProfile, entry_bytes: int = 0) -> tuple[int, float]:
+    """What a route would fetch, and the seconds that takes with nodes fetching side by side.
+
+    ``entry_bytes`` is what its first worker would also need, such as a draft model.
+    """
+    workers = {candidate.worker_id: candidate for candidate in candidates}
+    fetches = [_fetch(workers[stage.worker_id], profile, stage.start_layer, stage.end_layer) for stage in route]
+    first = workers[route[0].worker_id]
+    fetches[0] = fetches[0][0] + entry_bytes, fetches[0][1] + entry_bytes / (first.fetch_bytes_per_second or DEFAULT_FETCH_BYTES_PER_SECOND)
+    return sum(size for size, _ in fetches), max(seconds for _, seconds in fetches)
+
+
+def holds_entry(candidate: Candidate, profile: ModelProfile) -> bool:
+    """Whether what the entry stage carries, such as a draft, fits this worker's VRAM."""
+    return _fast_room(candidate, profile.stage_workspace_bytes) >= profile.entry_extra_bytes
 
 
 def _build_route(
@@ -1307,7 +1333,7 @@ def _plan_auto(
     held = [item for item in group if item.cached or item.worker_id in required]
 
     def worth(route: list[StageAssignment]) -> tuple[int, int, float]:
-        return _dead_links(route, group), _slow_bytes(route, group), _route_cost(route, group, profile)
+        return *route_faults(route, group), _route_cost(route, group, profile)
 
     best: list[StageAssignment] | None = None
     tried: set[frozenset[str]] = set()
@@ -1434,6 +1460,7 @@ def plan_placement(
     exit_worker: str | None = None,
     links: dict[tuple[str, str], float] | None = None,
     ring: bool | None = None,
+    tokens_per_miss: float | None = None,
 ) -> list[StageAssignment]:
     """Plan a route, adding standby workers only if the model needs them.
 
@@ -1442,10 +1469,13 @@ def plan_placement(
     machines hold the two ends. A worker holds one stage, so pinning one worker to
     both ends means it runs the whole model. ``links`` holds measured round trips in
     ms, from one worker to another, and a hop that has none costs ``HOP_MS``. ``ring``
-    costs a route as a closed loop, and otherwise it comes from the profile.
+    costs a route as a closed loop, and ``tokens_per_miss`` is what a route has measured.
+    Otherwise both come from the profile.
     """
     if ring is not None and ring != profile.ring:
         profile = replace(profile, ring=ring)
+    if tokens_per_miss is not None and tokens_per_miss != profile.tokens_per_miss:
+        profile = replace(profile, tokens_per_miss=tokens_per_miss)
     preferred, standby = with_links(preferred, links), with_links(standby, links)
     usable = [candidate for candidate in preferred if candidate.pools]
     reserve = [candidate for candidate in standby if candidate.pools]
@@ -1472,7 +1502,7 @@ def plan_placement(
             attempts.append(by_speed(everyone))
 
     def rank(route: list[StageAssignment]) -> tuple[int, int]:
-        return _dead_links(route, everyone), _slow_bytes(route, everyone)
+        return route_faults(route, everyone)
 
     # A standby worker with VRAM comes before RAM, like any other VRAM.
     standby_vram = any(pool.kind in FAST_MEMORY for pool in _all_pools(reserve))

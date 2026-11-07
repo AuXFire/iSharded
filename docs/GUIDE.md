@@ -565,7 +565,7 @@ If the connection to a node drops, retry against another node. Replies survive a
 | A split GGUF, by any part | `owner/repo:Q6_K/model-00001-of-00004.gguf` | Each worker fetches only its share, from whichever parts hold it |
 | A local safetensors folder | `D:\models\qwen3-8b` | That machine. In a secured pool it must be in `--model-dir` |
 
-Loading a model replaces the main one. To run another beside it, see [Several models at once](#several-models-at-once). To see where a model would go without moving anything, use `POST /admin/plan`, or the picker on the chat page.
+Loading a model replaces the main one. To run another beside it, see [Several models at once](#several-models-at-once). To see where a model would go without moving anything, use [isharded plan](#isharded-plan), `POST /admin/plan`, or the picker on the chat page.
 
 Gated models need `HF_TOKEN` set on each worker.
 
@@ -887,6 +887,16 @@ Loads a model on a running pool and shows progress. `model` is any [model id](#l
 
 `isharded lane list` shows the pool's lanes, and `isharded lane remove NAME` stops one and frees its memory on every node. Both take `--url` and `--token` (`--pool-token`), as `load` does.
 
+### isharded plan
+
+Shows where a model would go, and whether the running route has a shorter order. It moves nothing. It takes the model to plan, and with none it plans the one running.
+
+```bash
+isharded plan --url http://node-a:8209 --token YOUR_ADMIN_KEY
+```
+
+It needs an admin key, like `POST /admin/plan`, which it calls. See [A shorter loop](#a-shorter-loop) for what it prints.
+
 ### isharded net
 
 For a [network nobody owns](#a-network-nobody-owns).
@@ -1163,7 +1173,7 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `POST` | `/mcp` | User key | [MCP](#mcp) over Streamable HTTP. `GET` and `DELETE` answer 405, since there is no stream or session |
 | `GET` | `/admin/status` | User key | Workers and their `country`, memory pools, route, measured [`links`](#what-a-route-costs), epoch, mesh, lanes, load progress, and the last answer check |
 | `GET` | `/admin/catalog` | User key | Suggested models and supported architectures |
-| `POST` | `/admin/plan` | Admin key | Show where a model would run, without moving anything |
+| `POST` | `/admin/plan` | Admin key | Show where a model would run, and any [shorter loop](#a-shorter-loop) for the route already running, without moving anything |
 | `POST` | `/admin/load` | Admin key | Load a model |
 | `POST` | `/admin/load/cancel` | Admin key | Stop a load. Finished units stay cached |
 | `DELETE` | `/admin/lanes/{name}` | Admin key | Stop a lane and free its memory on every node |
@@ -1812,6 +1822,44 @@ Each stage in `route` and in `active_plan.route` has a `read_bytes` object, with
 | `head` | The output head, on the exit stage. On one worker a tied table counts once, here, and `embedding` is 0 |
 
 A route restored from a node running an older version shows zeros here until the model loads again.
+
+Passes overlap on a route, so one reply's speed follows two times, and not their sum:
+
+```text
+tokens per second = L / (R + w + (L - 1) p)
+```
+
+`R` is the loop time: every stage's read, plus every link once, the one that closes the loop included. `p` is the pace, the time of the slowest stage. `L` is tokens made per wrong guess, and `w` is the draft's rewind. With no draft `L` is 1, and only `R` counts.
+
+The planner compares routes by this. When it replans the running model, as a rebalance does, it takes `L` from the entry node's count of tokens and misses since that node started, once that count has reached 256 tokens. Until then `L` is 1, which is the same choice as a route's plain sum, and so is a new load or a plan from `POST /admin/plan`, which have measured nothing yet. `w` is the same on every route, so it changes no comparison, and the planner leaves it out. What a route would download still counts in full, spread over 20,000 tokens.
+
+A plan, and `active_plan` in `/admin/status`, shows these. All are estimates from measured links and estimated reads, and `ms_per_token` leaves `w` out:
+
+| Field | Meaning |
+|---|---|
+| `loop_ms` | `R` |
+| `pace_ms` | `p` |
+| `tokens_per_miss` | `L`, or 1 if nothing was measured |
+| `ms_per_token` | Time per token by the law |
+
+### A shorter loop
+
+A route keeps the order it loaded with, even when a better one exists, because weights must not move or reload unless they must. So iSharded only proposes. `POST /admin/plan` for the model that is running has a `proposal` field, and [isharded plan](#isharded-plan) prints it. It is `null` if the model is not running, if any link between the route's nodes has not been measured, if a node on the route has left, or if no order of the same nodes saves at least 1% of a token's time.
+
+To find one, nodes with a link of 15 ms or less are grouped as a site, and the route's nodes are toured with the closing link counted. A dozen nodes or fewer get the exact shortest tour. More go site by site, and then uncross. Any node of a loop can be the entry for the same network time, so the entry goes where what it carries fits: a draft needs that much VRAM. The current entry stands if nothing is gained. Pins on the entry and exit stay. A proposal never needs more failed links, or more weights outside VRAM, than the route it would replace.
+
+| Field | Meaning |
+|---|---|
+| `groups` | The route's nodes by site |
+| `current` | `order`, `loop_ms`, `pace_ms`, and `ms_per_token` of the running route |
+| `proposed` | The same for the new order, and `stages`, with the layers each node would hold |
+| `saved_ms_per_token` | What it saves |
+| `moved_bytes` | Bytes nodes would have to fetch, counting a draft or projector if the entry changes, even if the new entry holds one already |
+| `move_seconds` | How long that takes with nodes fetching side by side, at each node's measured rate. A node with no measured rate counts as 40 MB/s, and a copy from a peer as at least 100 MB/s |
+| `stages_changed` | Stages that would restart with other layers. Their reload is not in `move_seconds` |
+| `break_even_tokens` | Tokens until the saving has paid for the move |
+
+Nothing applies a proposal yet. `POST /admin/rebalance` and `POST /admin/load` plan afresh and cannot be told an order, and pins only fix the two ends. So a proposal is there to read, and to decide on.
 
 ### Mixed hardware
 

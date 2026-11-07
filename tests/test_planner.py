@@ -6,10 +6,12 @@ import random
 import time
 from types import SimpleNamespace
 
+from fastapi.testclient import TestClient
 import httpx
 import pytest
 
-from isharded import cli, planner
+from isharded import cli, geometry, planner
+from isharded import orchestrator as orchestrator_module
 from isharded.gguf import holds_both_kinds
 from isharded.orchestrator import Orchestrator
 from isharded.planner import Candidate, ModelProfile, PlacementError, keep_layers, memory_report, plan_placement, stored_bytes
@@ -1596,3 +1598,423 @@ def test_less_ram_decides_between_plans_with_the_same_room_open() -> None:
 def test_auto_is_the_default_placement() -> None:
     assert LoadModelRequest(model_id="m").placement == "auto"
     assert cli.build_parser().parse_args(["load", "m"]).placement == "auto"
+
+
+def with_mesh_links(workers: list[Candidate]) -> list[Candidate]:
+    return planner.with_links(workers, LINKS)
+
+
+def uneven_pool() -> list[Candidate]:
+    """One card three times as fast as the other, so the quickest loop is the most lopsided."""
+    return [card("fast", 300, 900), card("slow", 300, 300)]
+
+
+def reads_of(route) -> list[float]:
+    return [stage.estimated_ms_per_token for stage in route]
+
+
+def test_the_law_gives_the_runs_it_was_fitted_to() -> None:
+    assert 1000 / planner.ms_per_token(36, 12, 2.5, 9) == pytest.approx(39.7, abs=0.05)
+    assert 1000 / planner.ms_per_token(86, 12, 2.5, 9) == pytest.approx(22.1, abs=0.05)
+
+
+def test_with_no_draft_only_the_loop_counts() -> None:
+    assert planner.ms_per_token(250, 90) == 250
+
+
+@pytest.mark.parametrize(
+    "model, before",
+    [
+        (block_profile([2.72] * 32), [("b", 0, 8), ("e1", 8, 12), ("e2", 12, 16), ("c", 16, 20), ("a", 20, 32)]),
+        (moe_profile(), [("b", 0, 20), ("e2", 20, 34), ("e1", 34, 54), ("c", 54, 74), ("a", 74, 94)]),
+    ],
+    ids=["block rule", "no block rule"],
+)
+def test_a_route_with_nothing_measured_plans_as_it_did(model, before) -> None:
+    # These layouts came from the planner as it was before the law.
+    assert layout_of(plan_placement(mesh_cards(), [], model, links=LINKS)) == before
+    assert layout_of(plan_placement(mesh_cards(), [], model, links=LINKS, tokens_per_miss=1.0)) == before
+
+
+@pytest.mark.parametrize("model", [block_profile([2.72] * 32), moe_profile()], ids=["block rule", "no block rule"])
+def test_a_measured_draft_trades_some_loop_for_an_evener_pace(model) -> None:
+    quickest = plan_placement(uneven_pool(), [], model)
+    paced = plan_placement(uneven_pool(), [], model, tokens_per_miss=6)
+    assert sum(reads_of(paced)) > sum(reads_of(quickest))
+    assert max(reads_of(paced)) < max(reads_of(quickest))
+    law = [planner.ms_per_token(sum(reads_of(route)), max(reads_of(route)), 6) for route in (quickest, paced)]
+    assert law[1] < law[0]
+
+
+def test_a_route_cost_follows_the_law_and_still_charges_a_move_in_full() -> None:
+    model = replace(moe_profile(amortize=20_000), tokens_per_miss=2.5)
+    workers = with_mesh_links(mesh_cards())
+    route = plan_placement(workers, [], model)
+    reads = reads_of(route)
+    loop = sum(reads) + planner._hops_ms(route, workers, model)
+    moved = planner._moved_ms(route, workers, model)
+    assert moved > 0
+    assert planner._route_cost(route, workers, model) == pytest.approx((loop + 1.5 * max(reads)) / 2.5 + moved)
+
+
+def test_a_tie_on_a_pool_of_equals_keeps_the_earlier_worker() -> None:
+    route = plan_placement([ram_worker("a", 4 * GIB), ram_worker("b", 4 * GIB)], [], profile(), spread=False)
+    assert names_of(route) == ["a"]
+
+
+def law_runtime(telemetry: dict, model: str = "m") -> Orchestrator:
+    runtime = Orchestrator()
+    runtime.active = SimpleNamespace(model_id=model)
+    runtime.route = plan_placement([ram_worker("a")], [], profile())
+    runtime.workers = {"a": SimpleNamespace(health={"telemetry": telemetry})}
+    return runtime
+
+
+@pytest.mark.parametrize(
+    "counts, expected",
+    [
+        ({"tokens": 1000, "misses": 400}, 2.5),
+        ({"tokens": 300, "misses": 0}, 300),
+        ({"tokens": 100, "misses": 40}, 1.0),  # too few to believe
+        ({"tokens": 300, "misses": 400}, 1.0),  # a miss can come with no token
+        ({}, 1.0),
+    ],
+)
+def test_tokens_per_miss_comes_from_the_entry_stage(counts, expected) -> None:
+    runtime = law_runtime({"pipeline": counts})
+    assert runtime.tokens_per_miss(runtime.active) == expected
+
+
+def test_a_target_that_is_not_running_has_measured_nothing() -> None:
+    runtime = law_runtime({"pipeline": {"tokens": 1000, "misses": 400}})
+    assert runtime.tokens_per_miss(SimpleNamespace(model_id="m")) == 1.0
+
+
+def test_a_plan_shows_its_loop_and_pace(monkeypatch) -> None:
+    model = moe_profile()
+    runtime = law_runtime({"pipeline": {"tokens": 1000, "misses": 400}})
+    runtime.links = dict(LINKS)
+    monkeypatch.setattr(orchestrator_module, "runtime", runtime)
+    route = plan_placement(mesh_cards(), [], model, links=LINKS)
+    adapter = SimpleNamespace(config={}, num_layers=model.num_layers)
+    units = {item.name: item for item in model.units}
+    target = SimpleNamespace(model_id="m", adapter=adapter, profile=model, units=units, held={}, draft=None, embedding=False, projector=None)
+    runtime.active = target
+    plan = orchestrator_module.describe_plan(target, route)
+    loop, pace = planner.route_times(route, LINKS, model.ring)
+    assert plan["loop_ms"] == pytest.approx(loop, abs=0.01)
+    assert plan["pace_ms"] == pytest.approx(pace, abs=0.01)
+    assert plan["tokens_per_miss"] == 2.5
+    assert plan["ms_per_token"] == pytest.approx((loop + 1.5 * pace) / 2.5, abs=0.01)
+    assert plan["estimated_tokens_per_second"] == pytest.approx(1000 / loop, abs=0.05)  # as it always was
+
+
+ZIGZAG = ["a", "e1", "b", "e2", "c"]
+
+
+def zigzag(model: ModelProfile, order: list[str] = ZIGZAG, workers: list[Candidate] | None = None, links=LINKS):
+    """A route that runs in this order, its nodes holding what they run."""
+    workers = planner.with_links(workers or mesh_cards(), links)
+    by_name = {item.worker_id: item for item in workers}
+    route = planner.plan_through([[by_name[name] for name in order]], [by_name[name] for name in order], model)
+    assert names_of(route) == order
+    held = {stage.worker_id: frozenset(item.unit.name for item in planner._stage_items(model, stage.start_layer, stage.end_layer)) for stage in route}
+    return route, [replace(item, cached=held.get(item.worker_id, frozenset()), fetch_bytes_per_second=50e6) for item in workers]
+
+
+def ring_model(**fields) -> ModelProfile:
+    return replace(moe_profile(amortize=20_000), ring=True, **fields)
+
+
+def test_nodes_group_by_their_shortest_links() -> None:
+    groups = geometry.nearest_groups(list(MESH_SPEEDS), LINKS)
+    assert sorted(map(sorted, groups)) == [["a"], ["b"], ["c"], ["e1", "e2"]]
+
+
+def test_a_chain_of_short_links_is_one_group() -> None:
+    assert geometry.nearest_groups(["x", "y", "z"], {("x", "y"): 3.0, ("y", "z"): 4.0}) == [["x", "y", "z"]]
+
+
+def test_a_failed_or_unmeasured_link_groups_nothing() -> None:
+    links = {("x", "y"): planner.UNREACHABLE_LINK_MS}
+    assert geometry.nearest_groups(["x", "y", "z"], links) == [["x"], ["y"], ["z"]]
+
+
+def loop_of(names: list[str]) -> tuple[int, float]:
+    """Failed forward links, then the time around, the closing edge included."""
+    forward = list(zip(names, names[1:]))
+    dead = sum(LINKS[hop] >= planner.UNREACHABLE_LINK_MS for hop in forward)
+    walked = sum(LINKS[hop] / 2 for hop in forward)
+    closing = LINKS[names[-1], names[0]]
+    return dead, walked + (walked if closing >= planner.UNREACHABLE_LINK_MS else closing / 2)
+
+
+def test_a_tour_counts_the_edge_that_closes_it() -> None:
+    order = geometry.tour(with_mesh_links(mesh_cards()), LINKS)
+    best = min(loop_of(["a", *rest]) for rest in permutations(["b", "c", "e1", "e2"]))
+    assert loop_of(names_of_workers(order)) == best
+
+
+def names_of_workers(workers: list[Candidate]) -> list[str]:
+    return [item.worker_id for item in workers]
+
+
+def test_past_a_dozen_nodes_a_tour_goes_site_by_site() -> None:
+    sites = {name: name[0] for name in (f"{site}{index}" for site in "xyz" for index in range(5))}
+    links = {(left, right): (1.0 if sites[left] == sites[right] else 80.0) for left in sites for right in sites if left != right}
+    workers = planner.with_links([ram_worker(name) for name in sorted(sites, key=lambda name: name[1])], links)
+    assert len(workers) > planner.MAX_LINKED_WORKERS
+    order = [sites[name] for name in names_of_workers(geometry.tour(workers, links))]
+    assert sorted(order) == sorted(sites.values())
+    assert sum(left != right for left, right in zip(order, order[1:] + order[:1])) == 3
+
+
+def test_a_proposal_is_a_better_order_of_the_same_nodes() -> None:
+    model = ring_model()
+    route, workers = zigzag(model)
+    proposal = geometry.propose(route, workers, LINKS, model)
+    assert sorted(proposal["proposed"]["order"]) == sorted(ZIGZAG)
+    assert proposal["current"]["order"] == ZIGZAG
+    assert proposal["proposed"]["loop_ms"] < proposal["current"]["loop_ms"]
+    assert proposal["saved_ms_per_token"] == pytest.approx(proposal["current"]["ms_per_token"] - proposal["proposed"]["ms_per_token"], abs=0.01)
+    stages = proposal["proposed"]["stages"]
+    assert [stage["worker_id"] for stage in stages] == proposal["proposed"]["order"]
+    assert stages[0]["start_layer"] == 0 and stages[-1]["end_layer"] == model.num_layers
+    assert ["e1", "e2"] in map(sorted, proposal["groups"])
+
+
+def test_a_proposal_says_what_would_move_and_how_long_it_takes() -> None:
+    model = ring_model()
+    route, workers = zigzag(model)
+    proposal = geometry.propose(route, workers, LINKS, model)
+    held = {item.worker_id: item.cached for item in workers}
+    by_worker = {
+        stage["worker_id"]: sum(
+            item.unit.nbytes
+            for item in planner._stage_items(model, stage["start_layer"], stage["end_layer"])
+            if item.unit.name not in held[stage["worker_id"]]
+        )
+        for stage in proposal["proposed"]["stages"]
+    }
+    assert proposal["moved_bytes"] == sum(by_worker.values()) > 0
+    assert proposal["move_seconds"] == pytest.approx(max(by_worker.values()) / 50e6, abs=0.05)
+    assert proposal["break_even_tokens"] == pytest.approx(proposal["move_seconds"] * 1000 / proposal["saved_ms_per_token"], rel=0.01)
+    assert proposal["stages_changed"] > 0
+
+
+def test_a_proposal_changes_nothing_it_was_given() -> None:
+    model = ring_model()
+    route, workers = zigzag(model)
+    before = [stage.model_dump() for stage in route]
+    geometry.propose(route, workers, LINKS, model)
+    assert [stage.model_dump() for stage in route] == before
+
+
+def test_the_shortest_loop_has_nothing_to_propose() -> None:
+    model = ring_model()
+    shortest = names_of_workers(geometry.tour(with_mesh_links(mesh_cards()), LINKS))
+    route, workers = zigzag(model, shortest)
+    assert geometry.propose(route, workers, LINKS, model) is None
+
+
+def test_with_no_measured_link_there_is_nothing_to_propose() -> None:
+    model = ring_model()
+    route, workers = zigzag(model, links={})
+    assert geometry.propose(route, workers, {}, model) is None
+
+
+def test_a_node_that_left_ends_the_proposal() -> None:
+    model = ring_model()
+    route, workers = zigzag(model)
+    assert geometry.propose(route, [item for item in workers if item.worker_id != "c"], LINKS, model) is None
+
+
+def test_one_stage_has_no_loop_to_shorten() -> None:
+    model = ring_model()
+    route, workers = zigzag(model, ["a"], [card("a", 500, 900)])
+    assert geometry.propose(route, workers, LINKS, model) is None
+
+
+def test_a_saving_inside_a_links_swing_is_not_worth_showing() -> None:
+    names = ["a", "b", "c", "d"]
+    links = {(left, right): 20.0 for left in names for right in names if left != right}
+    links["a", "b"] = links["b", "a"] = 20.3
+    model = ring_model()
+    route, workers = zigzag(model, names, [card(name, 60, 800) for name in names], links)
+    assert geometry.propose(route, workers, links, model) is None
+
+
+def test_a_proposal_never_adds_spill(monkeypatch) -> None:
+    model = ring_model()
+    route, workers = zigzag(model)
+    monkeypatch.setattr(geometry, "route_faults", lambda found, _: (0, 0 if found is route else 1))
+    assert geometry.propose(route, workers, LINKS, model) is None
+
+
+def test_pins_stay_where_they_are() -> None:
+    model = ring_model()
+    route, workers = zigzag(model)
+    proposal = geometry.propose(route, workers, LINKS, model, entry="a", exit_="c")
+    assert proposal["proposed"]["order"][0] == "a"
+    assert proposal["proposed"]["order"][-1] == "c"
+
+
+def draft_cards(room: tuple[str, ...]) -> list[Candidate]:
+    return [card(name, 70 if name in room else 48, speed) for name, speed in MESH_SPEEDS.items()]
+
+
+def test_the_entry_stays_put_if_turning_the_loop_gains_nothing() -> None:
+    model = ring_model(entry_extra_bytes=50 * GIB)
+    route, workers = zigzag(replace(model, entry_extra_bytes=0), workers=draft_cards(("a", "c")))
+    proposal = geometry.propose(route, workers, LINKS, model, entry_bytes=5 * GIB)
+    assert proposal["proposed"]["order"][0] == "a"
+
+
+def test_the_entry_goes_where_the_draft_fits() -> None:
+    model = ring_model(entry_extra_bytes=50 * GIB)
+    route, workers = zigzag(replace(model, entry_extra_bytes=0), workers=draft_cards(("e1",)))
+    assert route[0].worker_id == "a"
+    without = geometry.propose(route, workers, LINKS, replace(model, entry_extra_bytes=0))
+    proposal = geometry.propose(route, workers, LINKS, model, entry_bytes=5 * GIB)
+    assert proposal["proposed"]["order"][0] == "e1"
+    assert proposal["moved_bytes"] > 5 * GIB
+    assert without["proposed"]["order"][0] == "a"
+
+
+def test_a_draft_that_follows_the_entry_counts_as_moved() -> None:
+    model = moe_profile()
+    route, workers = zigzag(model)
+    assert planner.moved_weights(route, workers, model) == (0, 0.0)
+    assert planner.moved_weights(route, workers, model, 5 * 10**8) == (5 * 10**8, 10.0)
+
+
+def running_pool(monkeypatch):
+    """A control plane with a zigzag route running, and what stops it moving anything."""
+    model = ring_model()
+    route, workers = zigzag(model)
+    runtime = Orchestrator()
+    active = SimpleNamespace(model_id="m", profile=model, draft=None, projector=None, entry_worker=None, exit_worker=None, held={}, serving=set(), reuse_cached=True)
+    runtime.active, runtime.route, runtime.links, runtime.epoch = active, route, dict(LINKS), 7
+
+    async def nothing(*args):
+        return {}
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a plan must not touch a route")
+
+    runtime.gguf_sources = runtime.refresh_worker_metrics = runtime.refresh_holdings = runtime.measure_links = nothing
+    runtime.candidate_groups = lambda: (workers, [])
+    runtime._with_holdings = lambda group, target: group
+    runtime.plan_or_refuse = lambda target, **options: route
+    runtime.plan_memory = lambda target, plan: {}
+    runtime._activate = runtime._prefetch = runtime.deploy = refuse
+    monkeypatch.setattr(orchestrator_module, "runtime", runtime)
+    monkeypatch.setattr(orchestrator_module, "build_target", lambda *args: SimpleNamespace(model_id=args[0].model_id))
+    monkeypatch.setattr(orchestrator_module, "row_bytes", lambda target: 0)
+    monkeypatch.setattr(orchestrator_module, "describe_plan", lambda target, plan: {"model": target.model_id})
+    return runtime
+
+
+def test_the_plan_route_shows_a_proposal_and_moves_nothing(monkeypatch) -> None:
+    runtime = running_pool(monkeypatch)
+    before = [stage.model_dump() for stage in runtime.route]
+    answer = TestClient(orchestrator_module.app).post("/admin/plan", json={"model_id": "m"})
+    assert answer.status_code == 200
+    assert answer.json()["proposal"]["current"]["order"] == ZIGZAG
+    assert [stage.model_dump() for stage in runtime.route] == before
+    assert runtime.epoch == 7
+
+
+def test_a_model_that_is_not_running_has_no_proposal(monkeypatch) -> None:
+    running_pool(monkeypatch)
+    answer = TestClient(orchestrator_module.app).post("/admin/plan", json={"model_id": "other"})
+    assert answer.status_code == 200
+    assert answer.json()["proposal"] is None
+
+
+def answers(plan: dict, status: dict | None = None):
+    asked = []
+
+    def get(url, **kwargs):
+        asked.append(("GET", url, None))
+        return SimpleNamespace(status_code=200, json=lambda: status or {})
+
+    def post(url, json, **kwargs):
+        asked.append(("POST", url, json))
+        return SimpleNamespace(status_code=200, json=lambda: plan, text="")
+
+    return SimpleNamespace(get=get, post=post, HTTPError=httpx.HTTPError), asked
+
+
+def plan_args(*words: str):
+    return cli.build_parser().parse_args(["plan", *words, "--url", "http://node:8209", "--token", "key"])
+
+
+def test_the_plan_command_shows_times_and_bytes_and_says_nothing_moved(monkeypatch, capsys) -> None:
+    model = ring_model()
+    route, workers = zigzag(model)
+    proposal = geometry.propose(route, workers, LINKS, model)
+    fake, asked = answers({"route": [stage.model_dump() for stage in route], "loop_ms": 400.0, "proposal": proposal}, {"model": "m"})
+    monkeypatch.setattr(cli, "httpx", fake)
+    assert cli.run_plan(plan_args()) == 0
+    printed = capsys.readouterr().out
+    assert asked[-1] == ("POST", "http://node:8209/admin/plan", {"model_id": "m"})
+    assert " > ".join(proposal["proposed"]["order"]) in printed
+    assert f"{proposal['moved_bytes'] / GIB:.1f} GiB" in printed
+    assert "Nothing has moved" in printed
+
+
+def test_the_plan_command_says_when_there_is_nothing_to_propose(monkeypatch, capsys) -> None:
+    fake, asked = answers({"route": [{"worker_id": "a"}], "loop_ms": 5.0, "proposal": None})
+    monkeypatch.setattr(cli, "httpx", fake)
+    assert cli.run_plan(plan_args("some-model")) == 0
+    assert "No shorter order" in capsys.readouterr().out
+    assert [item[0] for item in asked] == ["POST"]
+
+
+def test_the_plan_command_needs_a_model_from_somewhere(monkeypatch, capsys) -> None:
+    fake, _ = answers({}, {"model": None})
+    monkeypatch.setattr(cli, "httpx", fake)
+    assert cli.run_plan(plan_args()) == 1
+
+
+def test_a_proposal_never_buys_a_working_link_with_spill(monkeypatch) -> None:
+    model = ring_model()
+    route, workers = zigzag(model)
+    monkeypatch.setattr(geometry, "route_faults", lambda found, _: (1, 0) if found is route else (0, 1))
+    assert geometry.propose(route, workers, LINKS, model) is None
+
+
+def test_a_link_nobody_measured_is_no_reason_to_propose() -> None:
+    model = ring_model()
+    route, workers = zigzag(model)
+    assert geometry.propose(route, workers, LINKS, model) is not None
+    guessed = {hop: milliseconds for hop, milliseconds in LINKS.items() if set(hop) != {"a", "b"}}
+    assert geometry.propose(route, workers, guessed, model) is None
+
+
+def test_pins_stay_past_a_dozen_nodes_off_a_ring() -> None:
+    names = [f"n{index:02d}" for index in range(planner.MAX_LINKED_WORKERS + 2)]
+    links = {(left, right): 5.0 + abs(index - other) for index, left in enumerate(names) for other, right in enumerate(names) if left != right}
+    members = [ram_worker(name) for name in reversed(names)]
+    orders = geometry._orders(members, links, profile(), names[3], None)
+    assert all(order[0].worker_id == names[3] for order in orders)
+
+
+def test_a_load_that_lands_during_a_proposal_ends_it(monkeypatch) -> None:
+    runtime = running_pool(monkeypatch)
+    others = SimpleNamespace(model_id="m")
+
+    async def swapped(target):
+        runtime.active = others
+
+    runtime.refresh_holdings = swapped
+    assert asyncio.run(runtime.propose_order(SimpleNamespace(model_id="m"))) is None
+
+
+def test_the_plan_command_says_when_it_was_refused(monkeypatch, capsys) -> None:
+    refused = SimpleNamespace(status_code=401, text="bad key", json=lambda: {"detail": "bad key"})
+    monkeypatch.setattr(cli, "httpx", SimpleNamespace(get=lambda url, **kwargs: refused))
+    assert cli.run_plan(plan_args()) == 1
+    said = capsys.readouterr().err
+    assert "bad key" in said and "No model is running" not in said

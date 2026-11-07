@@ -251,6 +251,41 @@ def run_audit(args: argparse.Namespace) -> int:
         time.sleep(args.every)
 
 
+def run_plan(args: argparse.Namespace) -> int:
+    """Show where a model would go, and any shorter loop for the route already running."""
+    base = args.url.rstrip("/")
+    headers = bearer_headers(args.pool_token)
+    model = args.model
+    if not model:
+        status = httpx.get(base + "/admin/status", headers=headers, timeout=30.0)
+        if status.status_code >= 400:
+            print(f"Refused: {status.text}", file=sys.stderr)
+            return 1
+        model = status.json().get("model")
+    if not model:
+        print("No model is running, so name one.", file=sys.stderr)
+        return 1
+    response = httpx.post(base + "/admin/plan", json={"model_id": model}, headers=headers, timeout=300.0)
+    if response.status_code >= 400:
+        print(f"Refused: {response.text}", file=sys.stderr)
+        return 1
+    plan = response.json()
+    print(f"{model} would run on {' > '.join(stage['worker_id'] for stage in plan['route'])}: {plan['loop_ms']:.0f} ms around the loop.")
+    proposal = plan.get("proposal")
+    if proposal is None:
+        print("No shorter order of the running nodes to propose.")
+        return 0
+    now, then = proposal["current"], proposal["proposed"]
+    print(f"Running:  {' > '.join(now['order'])}, {now['loop_ms']:.0f} ms around the loop, {now['ms_per_token']:.0f} ms a token")
+    print(f"Proposed: {' > '.join(then['order'])}, {then['loop_ms']:.0f} ms around the loop, {then['ms_per_token']:.0f} ms a token")
+    print(
+        f"It would move {proposal['moved_bytes'] / 1024**3:.1f} GiB, about {proposal['move_seconds']:.0f} s, and restart "
+        f"{proposal['stages_changed']} stages. That pays back after {proposal['break_even_tokens']} tokens."
+    )
+    print("Nothing has moved, and iSharded cannot apply this yet.")
+    return 0
+
+
 def run_lane(args: argparse.Namespace) -> int:
     base = args.url.rstrip("/")
     headers = bearer_headers(args.pool_token)
@@ -567,6 +602,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_url(check)
     add_token(check, token, "an admin key for this node")
     check.set_defaults(handler=run_audit)
+    plan = subparsers.add_parser("plan", help="show where a model would go, and any shorter loop for the running route; moves nothing")
+    plan.add_argument("model", nargs="?", default=None, help="the model to plan; default is the one running")
+    add_url(plan)
+    add_token(plan, token, "an admin key; defaults to this machine's pool token")
+    plan.set_defaults(handler=run_plan)
     lane = subparsers.add_parser("lane", help="see or remove models running beside the main one")
     lane_commands = lane.add_subparsers(dest="lane_command", required=True)
     for name, text in (("list", "show the pool's lanes"), ("remove", "stop a lane and free its memory on every node")):

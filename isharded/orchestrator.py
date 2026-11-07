@@ -40,7 +40,8 @@ from .lanes import LaneDoor
 from .mcp_server import INVALID_REQUEST, PAID_AT_THE_API, McpHandler, MeshTools, RpcError, answer_http
 from .mesh import GOSSIP_SECONDS, ControlMesh
 from .models import Adapter, GgufAdapter, SUPPORTED_TYPES, UnsupportedModel, create_adapter
-from .planner import AMORTIZE_TOKENS, UNREACHABLE_LINK_MS, Candidate, ModelProfile, PlacementError, keep_layers, memory_report, plan_placement, route_network_ms, with_links
+from .geometry import propose
+from .planner import AMORTIZE_TOKENS, UNREACHABLE_LINK_MS, Candidate, ModelProfile, PlacementError, keep_layers, memory_report, ms_per_token, plan_placement, route_times, with_links
 from .protocol import (
     hosts_model,
     pass_seconds,
@@ -91,8 +92,8 @@ PROGRESS_POLL_SECONDS = 0.5
 # Missed progress polls in a row before a fetching worker counts as gone.
 MAX_MISSED_POLLS = 6
 
-# Least time a layer takes on a GPU, measured at 0.5 to 0.75 ms on an RX 7900 XT.
-LAYER_FLOOR_MS = 0.5
+# Tokens a route must make with passes overlapping before its count of misses is believed.
+LAW_MIN_TOKENS = 256
 # Small models that share a vocabulary with a family, for speculative decoding.
 AUTO_DRAFTS = {
     "qwen3": "unsloth/Qwen3-0.6B-GGUF:Qwen3-0.6B-Q8_0.gguf",
@@ -492,11 +493,8 @@ def check_image_marker(target: ModelTarget) -> None:
 
 def describe_plan(target: ModelTarget, route: list[StageAssignment]) -> dict[str, Any]:
     """Summarize a plan for people: what goes where, and what it will cost."""
-    # Bandwidth alone flatters small active sets, such as a MoE's: every layer still
-    # costs its kernel launches, and every stage boundary costs a network hop.
-    milliseconds = sum(
-        max(stage.estimated_ms_per_token, (stage.end_layer - stage.start_layer) * LAYER_FLOOR_MS) for stage in route
-    ) + route_network_ms(route, runtime.links, target.profile.ring)
+    loop, pace = route_times(route, runtime.links, target.profile.ring)
+    tokens_per_miss = runtime.tokens_per_miss(target)
     download = sum(
         target.units[item.unit].nbytes
         for stage in route
@@ -516,7 +514,11 @@ def describe_plan(target: ModelTarget, route: list[StageAssignment]) -> dict[str
         "route": [stage.model_dump() for stage in route],
         "entry_worker": route[0].worker_id,
         "exit_worker": route[-1].worker_id,
-        "estimated_tokens_per_second": round(1000 / milliseconds, 1) if milliseconds else None,
+        "estimated_tokens_per_second": round(1000 / loop, 1) if loop else None,
+        "loop_ms": round(loop, 2),
+        "pace_ms": round(pace, 2),
+        "tokens_per_miss": round(tokens_per_miss, 2),
+        "ms_per_token": round(ms_per_token(loop, pace, tokens_per_miss), 2),
     }
 
 
@@ -1534,12 +1536,39 @@ class Orchestrator:
         preferred = with_links(self._with_holdings(preferred, target), self.links)
         standby = with_links(self._with_holdings(standby, target), self.links)
         kept = None if honor_pins_strictly else self._keep_stages(target, preferred, standby, available, pins)
-        route = kept or plan_placement(preferred, standby, target.profile, spread=target.spread, links=self.links, **pins)
+        route = kept or plan_placement(
+            preferred, standby, target.profile, spread=target.spread, links=self.links, tokens_per_miss=self.tokens_per_miss(target), **pins
+        )
         if target.embedding and len(route) > 1:
             # Pooling happens at the end of the model, in llama.cpp, for whole
             # sequences, so a stage boundary has nothing correct to pass along.
             raise PlacementError(f"{target.model_id} would take {len(route)} stages here, and an embedding model cannot be split; it needs one worker that can hold it all")
         return route
+
+    def tokens_per_miss(self, target: ModelTarget) -> float:
+        """L in the law, from the entry stage's count. Only the target that is running has one."""
+        if target is not self.active or not self.route:
+            return 1.0
+        counts = telemetry_of(self.workers.get(self.route[0].worker_id)).get("pipeline") or {}
+        tokens = counts.get("tokens", 0)
+        return max(tokens / max(counts.get("misses", 0), 1), 1.0) if tokens >= LAW_MIN_TOKENS else 1.0
+
+    async def propose_order(self, target: ModelTarget) -> dict[str, Any] | None:
+        """A shorter loop through the nodes the running route uses, if this is its model.
+
+        This only looks. Nothing can apply it yet: a load or a rebalance plans afresh.
+        """
+        active = self.active
+        if active is None or not self.route or active.model_id != target.model_id:
+            return None
+        await self.refresh_holdings(active)
+        if active is not self.active:
+            return None  # a load landed while the nodes answered, and the route is another model's
+        preferred, standby = self.candidate_groups()
+        workers = self._with_holdings(preferred + standby, active)
+        extra = sum(item.file_size for item in (active.draft, active.projector) if item)
+        pins = {"entry": active.entry_worker, "exit_": active.exit_worker, "entry_bytes": extra, "tokens_per_miss": self.tokens_per_miss(active)}
+        return await asyncio.to_thread(propose, list(self.route), workers, dict(self.links), active.profile, **pins)
 
     def plan_or_refuse(self, target: ModelTarget, **options: bool) -> list[StageAssignment]:
         try:
@@ -3192,7 +3221,7 @@ async def preview_plan(body: LoadModelRequest, authorization: str | None = Heade
     await runtime.refresh_holdings(target)
     await runtime.measure_links(row_bytes(target))
     route = runtime.plan_or_refuse(target, honor_pins_strictly=True)
-    return {**describe_plan(target, route), "memory": runtime.plan_memory(target, route)}
+    return {**describe_plan(target, route), "memory": runtime.plan_memory(target, route), "proposal": await runtime.propose_order(target)}
 
 
 @app.get("/admin/keys")
