@@ -1784,3 +1784,117 @@ def test_a_repair_slower_than_the_restart_wait_is_still_waited_for(monkeypatch):
 
     assert asyncio.run(scenario()), "a new stream carries on exactly, and the slow way does not"
 
+
+# A GGUF reply resumes from what it wrote, one row at a time, on the entry worker.
+
+
+def gguf_pool(**records):
+    orchestrator = pool(**(records or {"w1": record()}))
+    orchestrator.active = SimpleNamespace(adapter=GgufAdapter.__new__(GgufAdapter))
+    return orchestrator
+
+
+def test_a_gguf_reply_resumes_with_what_it_wrote_and_not_as_a_prompt():
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            return stream_lines({"token_id": 5}, {"token_id": 6}, {"error": {"retry": True, "message": "stage died"}})
+        return stream_lines({"token_id": 7}, {"token_id": 99})
+
+    assert reply_through(gguf_pool(), handler) == [5, 6, 7, 99]
+    assert requests[0]["input_ids"] == [1, 2] and requests[0]["written"] == []
+    assert requests[1]["input_ids"] == [1, 2], "the prompt is read as it always is"
+    assert requests[1]["written"] == [5, 6]
+    assert requests[1]["max_tokens"] == 4, "only what comes after counts"
+
+
+def test_every_new_stream_carries_all_that_was_written():
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        if len(requests) < 3:
+            return stream_lines({"token_id": 4 + len(requests)}, {"error": {"retry": True, "message": "again"}})
+        return stream_lines({"token_id": 99})
+
+    assert reply_through(gguf_pool(), handler) == [5, 6, 99]
+    assert [item["written"] for item in requests] == [[], [5], [5, 6]]
+    assert {tuple(item["input_ids"]) for item in requests} == {(1, 2)}
+
+
+def test_a_prompt_with_images_still_replays_as_rows():
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            return stream_lines({"token_id": 5}, {"error": {"retry": True, "message": "stage died"}})
+        return stream_lines({"token_id": 99})
+
+    async def scenario():
+        orchestrator = gguf_pool()
+        orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        orchestrator.route = [stage("w1")]
+        orchestrator.tokenizer = type("Stops", (), {"stop_token_ids": {99}})()
+        session = SessionState(tokens=[1, 2], epoch=0, needs_reset=True)
+        session.images = ["aW1hZ2U="]
+        async for token in orchestrator.token_stream(session, 5, 0.0, 1.0, 0, None):
+            session.tokens.append(token)
+        await orchestrator.close()
+
+    asyncio.run(scenario())
+    assert requests[1]["input_ids"] == [1, 2, 5] and requests[1]["written"] == []
+
+
+def test_a_pytorch_reply_still_replays_as_rows():
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            return stream_lines({"token_id": 5}, {"error": {"retry": True, "message": "stage died"}})
+        return stream_lines({"token_id": 99})
+
+    orchestrator = pool(w1=record())
+    orchestrator.active = SimpleNamespace(adapter=object())
+    assert reply_through(orchestrator, handler) == [5, 99]
+    assert requests[1]["input_ids"] == [1, 2, 5] and requests[1]["written"] == []
+
+
+def lost_stream_pool(answers):
+    """A stream whose connection drops part way, on a worker that does or does not still answer."""
+    requests = []
+
+    def handler(request):
+        if request.url.path == "/health":
+            return httpx.Response(200 if answers else 503, json={})
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            raise httpx.ReadError("connection lost")
+        return stream_lines({"token_id": 99})
+
+    return requests, handler
+
+
+def test_a_lost_connection_to_a_worker_that_answers_opens_a_new_stream():
+    requests, handler = lost_stream_pool(answers=True)
+    orchestrator = gguf_pool(w1=record())
+    assert reply_through(orchestrator, handler) == [99]
+    assert len(requests) == 2 and not orchestrator.workers["w1"].quarantined
+
+
+def test_an_entry_worker_that_died_is_repaired_and_the_reply_resumes():
+    """The slow way would read the reply back as prompt rows."""
+    requests, handler = lost_stream_pool(answers=False)
+    orchestrator = gguf_pool(w1=record())
+    repairs = []
+
+    async def rebalance():
+        repairs.append(True)
+        orchestrator.workers["w1"].quarantined = False
+
+    orchestrator.rebalance = rebalance
+    assert reply_through(orchestrator, handler) == [99]
+    assert repairs and len(requests) == 2

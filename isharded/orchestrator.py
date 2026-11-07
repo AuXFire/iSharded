@@ -1965,11 +1965,13 @@ class Orchestrator:
     ) -> AsyncIterator[int]:
         """Yield generated tokens. The caller adds each one to ``session.tokens``.
 
-        The entry worker runs the loop while the route holds. If its stream ends
-        early for any reason, the rest goes one token at a time through
-        ``next_token``, which replays the session and recovers the pipeline.
+        The entry worker runs the loop while the route holds. A stream that ends early
+        is opened again where recovery allows, carrying what the reply already wrote.
+        Failing that, the rest goes one token at a time through ``next_token``, which
+        replays the session and recovers the pipeline.
         """
         produced = 0
+        prompt_length = len(session.tokens)
         stops = self.tokenizer.stop_token_ids if self.tokenizer else set()
         # Whatever opens the reply opens every other turn too, so it marks the cuts.
         cut_token = None if boundary is None else session.tokens[boundary]
@@ -1979,10 +1981,12 @@ class Orchestrator:
                 break
             entry = self.route[0]
             epoch = self.epoch
+            resumes = self._resumes(session)
             request = GenerateRequest(
                 session_id=session.session_id,
                 epoch=epoch,
-                input_ids=session.tokens,
+                input_ids=session.tokens[:prompt_length] if resumes else session.tokens,
+                written=session.tokens[prompt_length:] if resumes else [],
                 reset=True,
                 temperature=temperature,
                 top_p=top_p,
@@ -2030,7 +2034,7 @@ class Orchestrator:
                 failure = {"failed_worker": entry.worker_id, "message": str(exc)}
                 self.add_event("failure", "Generation stream lost", str(exc)[:200])
             except (httpx.HTTPError, ValueError) as exc:
-                failure = f"lost: {exc}"
+                failure = {"lost": entry.worker_id, "message": str(exc)} if resumes else f"lost: {exc}"
                 self.add_event("failure", "Generation stream lost", str(exc)[:200])
             # Workers may hold more or less than the session does now.
             session.needs_reset = True
@@ -2039,6 +2043,14 @@ class Orchestrator:
                 break
         for _ in range(max_tokens - produced):
             yield await self.next_token(session, temperature, top_p, top_k, seed)
+
+    def _resumes(self, session: SessionState) -> bool:
+        """Whether the entry worker can carry on from what a reply already wrote.
+
+        It runs those tokens one row at a time, as plain decoding did, so a reply carries
+        on exactly. Other replies read them back as prompt rows.
+        """
+        return isinstance(getattr(self.active, "adapter", None), GgufAdapter) and not session.images
 
     async def _lines_from(self, response: httpx.Response, worker_id: str) -> AsyncIterator[str]:
         """A worker's stream, which ends if the worker stops checking in.
@@ -2105,6 +2117,10 @@ class Orchestrator:
                 return self.epoch != epoch
             await self._await_route_change(epoch)
             return True
+        if isinstance(failure, dict) and failure.get("lost"):
+            if await self._answers(failure["lost"]):
+                return True  # only this connection went
+            failure = {"failed_worker": failure["lost"], "message": failure.get("message")}
         if isinstance(failure, dict) and failure.get("failed_worker"):
             worker = str(failure["failed_worker"])
             if self.coordinating:
