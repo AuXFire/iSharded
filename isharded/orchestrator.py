@@ -33,7 +33,7 @@ from .gguf import GgufHeader, parse_source, split_parts
 from .llamacpp import KV_TYPES, PINNED_BUILD
 from .statestore import stage_namespace
 from . import audit
-from .compat import Node as CompatNode, mount as mount_compat
+from .compat import Node as CompatNode, model_listing, mount as mount_compat
 from .discovery import start_beacon
 from .lanes import LaneDoor
 from .mcp_server import INVALID_REQUEST, PAID_AT_THE_API, McpHandler, MeshTools, RpcError, answer_http
@@ -63,7 +63,7 @@ from .protocol import (
     auth_headers,
 )
 from .pool import LOOPBACK, check_exposure, home as pool_home, load_token, read_membership_request
-from .replies import event_stream, render_prompts, scanned, usage_of, whole_reply
+from .replies import event_stream, first_stop, render_prompts, scanned, usage_of, whole_reply
 from .serving import MAX_STRANGER_BYTES, AddressLimit, BodyLimit, ChunkedResponses, client_address, serve, where_everything_is
 from .mesh import clean_url
 from .statements import Refused, Statements, make_statement
@@ -2402,6 +2402,7 @@ class Orchestrator:
         generated: list[int] = []
         sent = 0  # characters of the reply yielded so far
         finish_reason = "length"
+        matched: str | None = None  # the stop string that ended the reply
         started = time.perf_counter()
         first_token_at: float | None = None
 
@@ -2421,18 +2422,18 @@ class Orchestrator:
                     # Only the end of the reply is in hand. A stop string finishing now
                     # starts inside it, as one in the settled text would have ended the reply.
                     text = decoder.add(token)
-                    hits = [text.index(marker) for marker in markers if marker in text]
-                    if hits:
-                        text = text[: min(hits)]
+                    matched = first_stop(text, markers)
+                    if matched:
+                        text = text[: text.index(matched)]
                         finish_reason = "stop"
-                    ready = text if hits else text[: len(text) - holdback]
-                    if ready.endswith("�") and not hits:
+                    ready = text if matched else text[: len(text) - holdback]
+                    if ready.endswith("�") and not matched:
                         continue
                     if decoder.start + len(ready) > sent:
                         delta = ready[sent - decoder.start :]
                         sent = decoder.start + len(ready)
                         yield {"text": delta}
-                    if hits:
+                    if matched:
                         break
                     decoder.forget(holdback)  # all but the holdback is sent by now
         finally:
@@ -2442,9 +2443,9 @@ class Orchestrator:
             self.spawn(self.clear_session(session.session_id))
 
         text = reader.decode(generated)
-        hits = [text.index(marker) for marker in markers if marker in text]
-        if hits:
-            text = text[: min(hits)]
+        matched = first_stop(text, markers)
+        if matched:
+            text = text[: text.index(matched)]
         if len(text) > sent:
             yield {"text": text[sent:]}
         finished = time.perf_counter()
@@ -2457,6 +2458,7 @@ class Orchestrator:
             "tokens_per_second": (
                 round((len(generated) - 1) / decode_seconds, 2) if len(generated) > 1 and decode_seconds else None
             ),
+            **({"stop_sequence": matched} if matched else {}),
         }
 
     async def clear_session(self, session_id: str) -> None:
@@ -3394,7 +3396,7 @@ async def models(authorization: str | None = Header(default=None)) -> dict[str, 
     verify_user(authorization)
     rows = {runtime.model_id: runtime.model_kind()} if runtime.model_id else {}
     rows |= {name: kind for name, kind in runtime.lanes.model_kinds().items() if name not in rows}
-    return {"object": "list", "data": [{"id": name, "object": "model", "owned_by": "isharded", **kind} for name, kind in rows.items()]}
+    return model_listing(rows, runtime.started_at)
 
 
 async def check_request(model: str | None, embedding: bool = False) -> None:
@@ -3525,12 +3527,13 @@ async def chat_completions(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     limit = reply_limit(body.max_tokens, body.max_completion_tokens, uses_tools(body.tools, body.messages))
     scanner = None
+    in_thought = opens_in_thought(prompt)
     if plan:
         opening = forced_opening(plan)
-        in_thought = opens_in_thought(prompt)
         # Some templates open reasoning whatever they are told.
         prompt += ("\n</think>\n\n" if opening and in_thought else "") + opening
-        scanner = ReplyScanner(plan, in_thought and not opening, opening)
+        in_thought = in_thought and not opening
+        scanner = ReplyScanner(plan, in_thought, opening)
     options = (limit, body.temperature, body.top_p, body.top_k, body.seed, body.stop, history, images)
     items = runtime.stream_tokens(prompt, *options, keep_markers=scanner is not None)
     if scanner:
@@ -3549,7 +3552,8 @@ async def chat_completions(
                     "finish_reason": reason,
                 },
                 route_now,
-                {"role": "assistant"},
+                # The reply will not say so itself, and the routes that sort reasoning out need to know.
+                {"role": "assistant", **({"isharded": {"in_thought": True}} if in_thought else {})},
             ),
             media_type="text/event-stream",
         )

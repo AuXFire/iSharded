@@ -109,6 +109,8 @@ def template_messages(messages: list[Any]) -> list[dict[str, Any]]:
         name = message.name or (names.get(message.tool_call_id or "") if message.role == "tool" else None)
         if name:
             item["name"] = name
+        if message.reasoning_content:
+            item["reasoning_content"] = message.reasoning_content
         rendered.append(item)
     return rendered
 
@@ -205,6 +207,69 @@ def without_reasoning(text: str) -> str:
     """The answer in a reply, for callers who only want that."""
     _, closed, answer = text.rpartition(THINK_CLOSE)
     return answer.strip() if closed else text.strip()
+
+
+class ThoughtSplitter:
+    """Sorts a reply's reasoning from its answer, as it arrives, for APIs that keep them apart.
+
+    Only reasoning at the very start counts, since an answer may well quote the tag.
+    ``feed`` and ``finish`` return items: ``{"thinking": ...}`` or ``{"text": ...}``.
+    With ``split`` off, everything is text.
+    """
+
+    def __init__(self, split: bool = True) -> None:
+        self.state = "start" if split else "text"
+        self.buffer = ""
+        self.said = False  # any reasoning sent yet
+
+    def open(self) -> None:
+        """Some templates start the reply inside <think>, so it never writes the opening tag."""
+        if self.state == "start":
+            self.state = "think"
+
+    def feed(self, text: str) -> list[dict[str, Any]]:
+        self.buffer += text
+        items: list[dict[str, Any]] = []
+        if self.state == "start":
+            start = self.buffer.lstrip()
+            if THINK_OPEN.startswith(start):
+                return items
+            self.buffer, self.state = (start[len(THINK_OPEN) :], "think") if start.startswith(THINK_OPEN) else (self.buffer, "text")
+        if self.state == "think":
+            self.buffer = self.buffer if self.said else self.buffer.lstrip()
+            thought, closed, after = self.buffer.partition(THINK_CLOSE)
+            if not closed:
+                # Space before the tag is the template's, and only the tag can tell.
+                thought = self.buffer[: len(self.buffer) - _unfinished(self.buffer, (THINK_CLOSE,))]
+                self._think(items, thought)
+                self.buffer = self.buffer[len(thought.rstrip()) :]
+                return items
+            self._think(items, thought)
+            self.buffer, self.state = after, "gap"
+        if self.state == "gap":
+            self.buffer = self.buffer.lstrip()
+            if not self.buffer:
+                return items
+            self.state = "text"
+        if self.buffer:
+            items.append({"text": self.buffer})
+            self.buffer = ""
+        return items
+
+    def _think(self, items: list[dict[str, Any]], text: str) -> None:
+        if text.strip():
+            items.append({"thinking": text.rstrip()})
+            self.said = True
+
+    def finish(self) -> list[dict[str, Any]]:
+        """Settle what is held. A call or the end of the reply closes any reasoning."""
+        items: list[dict[str, Any]] = []
+        if self.state == "think":
+            self._think(items, self.buffer)
+        elif self.state != "gap" and self.buffer:
+            items.append({"text": self.buffer})
+        self.state, self.buffer = "text", ""
+        return items
 
 
 def forced_opening(plan: ToolPlan) -> str:

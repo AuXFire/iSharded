@@ -1111,7 +1111,8 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `POST` | `/v1/chat/completions` | User key | Chat, streaming with `stream: true`, and [tool calling](#tool-calling) |
 | `POST` | `/v1/completions` | User key | Text completion, one prompt per request |
 | `POST` | `/v1/embeddings` | User key | Vectors for text, from an embedding model. See [Embeddings](#embeddings) |
-| `GET` | `/v1/models` | User key | Every running model, and what each is for |
+| `GET` | `/v1/models` | User key | Every running model, and what each is for, with the fields OpenAI and Claude clients read. Takes the key as `x-api-key` too |
+| `GET` | `/v1/models/{model_id:path}` | User key | The same row for one model, or a 404. Takes the key as `x-api-key` too |
 | `POST` | `/v1/messages` | User key | [Claude Messages](#claude-messages), streaming with `stream: true`. Takes the key as `x-api-key` too |
 | `POST` | `/v1/messages/count_tokens` | User key | How many tokens a Messages request comes to. Takes the key as `x-api-key` too |
 | `POST` | `/v1/responses` | User key | [OpenAI Responses](#openai-responses), streaming with `stream: true` |
@@ -1122,8 +1123,8 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `GET` | `/api/tags` | User key | Every running model, in Ollama's shape |
 | `POST` | `/api/show` | User key | What Ollama clients ask about one running model |
 | `GET` | `/api/ps` | User key | Running models, in Ollama's shape |
-| `GET` | `/api/version` | User key | This node's iSharded version |
-| `POST` | `/api/pull`, `/api/push`, `/api/create`, `/api/copy` | User key | Refused with a 400 that says to load models through iSharded |
+| `GET` | `/api/version` | User key | An Ollama version clients accept, and iSharded's own in `isharded` |
+| `POST` | `/api/pull`, `/api/push`, `/api/create`, `/api/copy`, `/api/blobs/{digest}` | User key | Refused with a 400 that says to load models through iSharded |
 | `DELETE` | `/api/delete` | User key | The same |
 | `POST` | `/mcp` | User key | [MCP](#mcp) over Streamable HTTP. `GET` and `DELETE` answer 405, since there is no stream or session |
 | `GET` | `/admin/status` | User key | Workers and their `country`, memory pools, route, measured [`links`](#what-a-route-costs), epoch, mesh, lanes, load progress, and the last answer check |
@@ -1334,21 +1335,21 @@ client = Anthropic(base_url="http://NODE:8209", api_key="KEY")
 reply = client.messages.create(model=MODEL, max_tokens=1024, messages=[{"role": "user", "content": "Say hello."}])
 ```
 
-Other tools usually read `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`. The key may come as `x-api-key` or as `Authorization: Bearer`. If both are sent, `Authorization` is the one used. `x-api-key` works on these two routes only, and it is taken off the request before anything else sees it, so it stays on the node you gave it to.
+Other tools usually read `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`. The key may come as `x-api-key` or as `Authorization: Bearer`. If both are sent, `Authorization` is the one used. `x-api-key` works on these routes and on `/v1/models`, and nowhere else. It is taken off every request on every path before anything else sees it, so it stays on the node you gave it to.
 
 | Field | What happens to it |
 |---|---|
 | `max_tokens` | Required, as it is at Anthropic |
 | `system` | A string or a list of text blocks |
-| `messages` | `content` is a string or a list of `text`, `image`, `tool_use`, and `tool_result` blocks. `thinking` blocks sent back are dropped. An image comes as base64, and a URL is refused as in [Vision](#vision). A `tool_result` with `is_error` reaches the model starting with `Error:`, and one holding anything but text is refused |
+| `messages` | `content` is a string or a list of `text`, `image`, `thinking`, `tool_use`, and `tool_result` blocks. A `thinking` block sent back reaches the model's template as `reasoning_content`, and most templates use it only for the turn in progress. A `redacted_thinking` block is dropped. An image comes as base64, and a URL is refused as in [Vision](#vision). A `tool_result` with `is_error` reaches the model starting with `Error:`, and one holding anything but text is refused |
 | `temperature`, `top_p`, `top_k` | As on the [chat route](#chat-and-completion-requests) |
-| `stop_sequences` | Ends the reply, as `stop` does |
-| `stream` | Sends `message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, and `message_stop`. Tool calls come as `tool_use` blocks with `input_json_delta`, each one whole in a single delta. The prompt's token count arrives in `message_delta`, since `message_start` goes out before it is known |
+| `stop_sequences` | Ends the reply, as `stop` does. It ends with `stop_reason: "stop_sequence"` and the one it met in `stop_sequence` |
+| `stream` | Sends `message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, and `message_stop`. Reasoning comes as a `thinking` block with `thinking_delta`, closed by a `signature_delta`. Tool calls come as `tool_use` blocks with `input_json_delta`, each one whole in a single delta. The prompt's token count arrives in `message_delta`, since `message_start` goes out before it is known |
 | `tools` | Your own tools, with `input_schema`. Tools Anthropic runs for you, such as web search, are refused with a 400 |
 | `tool_choice` | `auto`, `any`, `none`, or `tool` with a `name`. `disable_parallel_tool_use` keeps only the first call |
-| `thinking` | `type: "disabled"` turns reasoning off on models with a switch, and any other type turns it on. `budget_tokens` is not used |
+| `thinking` | `type: "disabled"` turns reasoning off on models with a switch, and any other type turns it on. `display: "omitted"` keeps the block and leaves out its words. `budget_tokens` is not used |
 
-A reply stopped by a stop sequence says `stop_reason: "end_turn"`, with `stop_sequence` null, because the chat path does not say which ending it met. Errors have Anthropic's shape, with `type: "error"`, an `error` holding `type` and `message`, and a `request_id`. A failure during a stream is an `error` event. `POST /v1/messages/count_tokens` takes the same fields without `max_tokens` and runs the model's template, and an image counts only as its marker.
+A reply that starts with reasoning gives it as a `thinking` block before its text, whatever `thinking` asked for, because a model with no switch reasons anyway. Reasoning found later in a reply stays in the text. A block's `signature` is a hash of its words, there for clients that expect one. It proves nothing, since nobody here can sign for Anthropic, and it is not checked when it comes back. Cache counts in `usage` are always 0, because this usage counts every prompt token as `input_tokens`. Errors have Anthropic's shape, with `type: "error"`, an `error` holding `type` and `message`, and a `request_id`. A failure during a stream is an `error` event. `POST /v1/messages/count_tokens` takes the same fields without `max_tokens` and runs the model's template, and an image counts only as its marker.
 
 #### OpenAI Responses
 
@@ -1361,7 +1362,7 @@ print(client.responses.create(model=MODEL, input="Say hello.", max_output_tokens
 
 | Field | What happens to it |
 |---|---|
-| `input` | A string, or a list of items: messages with a role of `user`, `assistant`, `system`, or `developer`, then `function_call` and `function_call_output`. `reasoning` items are dropped. Parts are `input_text`, `output_text`, and `input_image` with a data URL in `image_url`. A `function_call_output` holding anything but text is refused |
+| `input` | A string, or a list of items: messages with a role of `user`, `assistant`, `system`, or `developer`, then `function_call` and `function_call_output`. `reasoning` items are dropped, and a reply's own reasoning stays in its text, inside the model's tags. Parts are `input_text`, `output_text`, and `input_image` with a data URL in `image_url`. A `function_call_output` holding anything but text is refused |
 | `instructions` | The system message |
 | `max_output_tokens` | The reply limit. A reply that reaches it ends with `status: "incomplete"` |
 | `temperature`, `top_p` | As on the [chat route](#chat-and-completion-requests) |
@@ -1391,16 +1392,16 @@ A tool with no way to set a header cannot reach a mesh with keys.
 
 | Field | What happens to it |
 |---|---|
-| `messages` | Roles and `content`, with `images` as base64, `tool_calls`, and `tool` results by `tool_name` |
+| `messages` | Roles and `content`, with `images` as base64, `tool_calls`, `thinking`, and `tool` results by `tool_name` |
 | `prompt`, `system`, `images` | On `/api/generate`, they go through the model's template. With `raw: true`, `prompt` goes in as it is, and `images` are refused |
-| `options` | `temperature`, `top_p`, `top_k`, `seed`, `num_predict`, and `stop`. Others, such as `num_ctx`, do nothing, since a route's context is set when it loads |
+| `options` | `temperature`, `top_p`, `top_k`, `seed`, `num_predict`, and `stop`. A `seed` of -1 means no seed. Others, such as `num_ctx`, do nothing, since a route's context is set when it loads |
 | `tools` | As on the [chat route](#tool-calling) |
-| `think` | Switches reasoning on models that support it |
+| `think` | Switches reasoning on models that support it. A level such as `"high"` counts as on. A reply that starts with reasoning gives it in `thinking`, on `message` or beside `response`. With `raw: true` it stays in the text |
 | `format` | Refused with a 400. The chat path cannot hold a reply to JSON or a schema, and asking the model nicely would only look as if it worked |
 | `suffix`, `template` | Refused with a 400 |
 | `keep_alive` | Does nothing. A model stays until it is replaced |
 
-A request with no `prompt`, or an empty `messages` list, answers `done_reason: "load"` if the model is running, and runs nothing. `/api/embed` and `/api/embeddings` need an [embedding model](#embeddings). In `/api/tags`, `/api/show`, and `/api/ps`, sizes, family, and context length are known for the main model and left empty for a lane's, and `size_vram` is always 0, because a model here is spread over many machines. `/api/version` gives iSharded's version, not Ollama's. Pulling, pushing, creating, copying, and deleting are refused: load models with [isharded load](#isharded-load) or `POST /admin/load`.
+A request with no `prompt`, or an empty `messages` list, answers `done_reason: "load"` if the model is running, and runs nothing. `/api/embed` and `/api/embeddings` need an [embedding model](#embeddings). In `/api/tags`, `/api/show`, and `/api/ps`, sizes, family, and context length are known for the main model and left empty for a lane's, and `size_vram` is always 0, because a model here is spread over many machines. `/api/version` gives a recent Ollama version in `version`, because clients compare it with the release they need, and iSharded's own in `isharded`. `/api/show` lists `thinking` in `capabilities` for a template that closes reasoning. `quantization_level` comes from the GGUF. Pulling, pushing, creating, copying, and deleting are refused: load models with [isharded load](#isharded-load) or `POST /admin/load`.
 
 ## MCP
 
