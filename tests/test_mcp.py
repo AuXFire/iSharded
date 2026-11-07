@@ -1644,3 +1644,42 @@ def test_a_call_written_whole_before_the_limit_still_runs(started):
     assert run_loop(httpx.Client(transport=httpx.MockTransport(answer), base_url="http://mesh"), Toolbox([started()])) == "3"
 
 
+# --- tool names that collide
+
+
+class FakeServer(McpConnection):
+    """A server's answers, written down, for what does not need a process."""
+
+    def __init__(self, name: str, tools=(), result=None) -> None:
+        self.name = name
+        self.names = list(tools)
+        self.result = result or {}
+
+    def list_tools(self):
+        return [{"name": name} for name in self.names]
+
+    def request(self, method, params, timeout):
+        return self.result
+
+
+def test_a_renamed_tool_never_replaces_the_tool_already_there(capsys):
+    first, second = FakeServer("a", ["search", "b_search"]), FakeServer("b", ["search"])
+    toolbox = Toolbox([first, second])
+    assert set(toolbox.tools) == {"search", "b_search", "b_search_2"}
+    assert toolbox.tools["b_search"][0] is first and toolbox.tools["b_search_2"][0] is second
+    assert toolbox.tools["b_search_2"][1]["name"] == "search", "the server still hears its own name"
+    assert '"b" offers that tool as "b_search_2"' in capsys.readouterr().err
+
+
+def test_three_servers_with_one_name_all_stay(capsys):
+    servers = [FakeServer("same", ["search"]) for _ in range(3)]
+    toolbox = Toolbox(servers)
+    assert set(toolbox.tools) == {"search", "same_search", "same_search_2"}
+    assert [toolbox.tools[name][0] for name in ("search", "same_search", "same_search_2")] == servers
+
+
+def test_a_rename_is_said_in_a_way_a_tool_cannot_use_to_write_to_the_terminal(capsys):
+    Toolbox([FakeServer("a", ["x\x1b[2J"]), FakeServer("b\x1b[2J", ["x\x1b[2J"])])
+    assert "\x1b" not in capsys.readouterr().err
+
+

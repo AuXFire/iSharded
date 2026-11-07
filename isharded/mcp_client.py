@@ -440,11 +440,19 @@ class Toolbox:
         self.tools: dict[str, tuple[McpConnection, dict[str, Any]]] = {}
         for server in servers:
             for tool in server.list_tools():
-                name = tool["name"]
-                # Two servers may both have a "search". The model must be able to pick.
-                if name in self.tools:
-                    name = f"{server.name}_{name}"
-                self.tools[name] = (server, tool)
+                self.tools[self._free_name(server, tool["name"])] = (server, tool)
+
+    def _free_name(self, server: McpConnection, name: str) -> str:
+        """Two servers may both have a "search". The model must be able to pick, and no tool may replace another."""
+        if name not in self.tools:
+            return name
+        free = prefixed = f"{server.name}_{name}"
+        for number in count(2):
+            if free not in self.tools:
+                break
+            free = f"{prefixed}_{number}"
+        print(f"The name {json.dumps(name)} is taken, so {json.dumps(server.name)} offers that tool as {json.dumps(free)}.", file=sys.stderr)
+        return free
 
     def for_model(self) -> list[dict[str, Any]]:
         schema = {"type": "object", "properties": {}}
