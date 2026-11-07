@@ -12,11 +12,12 @@ pub mod node;
 pub mod sample;
 pub mod wire;
 
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::ffi::{c_char, c_void, CStr};
 use std::sync::Arc;
 
 use llama::{Capture, LlamaCompute, StageApi, TensorApi};
 use node::{Links, Node, Plan};
+use serde::de::DeserializeOwned;
 
 /// Bumped when the functions below change, so a stale library is refused and not misused.
 pub const ABI_VERSION: u32 = 1;
@@ -48,6 +49,12 @@ unsafe fn read_text<'a>(text: *const c_char) -> Option<&'a str> {
     CStr::from_ptr(text).to_str().ok()
 }
 
+/// # Safety
+/// `text` must be a NUL-terminated string.
+unsafe fn read_json<T: DeserializeOwned>(text: *const c_char) -> Option<T> {
+    serde_json::from_str(read_text(text)?).ok()
+}
+
 #[no_mangle]
 pub extern "C" fn isharded_engine_abi() -> u32 {
     ABI_VERSION
@@ -62,11 +69,10 @@ pub unsafe extern "C" fn isharded_engine_new(target: *const c_char, tensors: *co
     if target.is_null() || tensors.is_null() {
         return std::ptr::null_mut();
     }
-    let name = CStr::from_ptr(target).to_owned();
     let Ok(node) = Node::new() else {
         return std::ptr::null_mut();
     };
-    let capture = Arc::new(Capture::new(CString::from(name), *tensors));
+    let capture = Arc::new(Capture::new(CStr::from_ptr(target).to_owned(), *tensors));
     Box::into_raw(Box::new(Engine { capture, node }))
 }
 
@@ -142,7 +148,7 @@ pub unsafe extern "C" fn isharded_engine_listen(engine: *mut Engine, host: *cons
 /// `plan` must be a NUL-terminated JSON string.
 #[no_mangle]
 pub unsafe extern "C" fn isharded_engine_open(engine: *mut Engine, plan: *const c_char) -> i32 {
-    let Some(plan) = read_text(plan).and_then(|text| serde_json::from_str::<Plan>(text).ok()) else {
+    let Some(plan) = read_json::<Plan>(plan) else {
         return -1;
     };
     (*engine).node.open(plan);
@@ -155,7 +161,7 @@ pub unsafe extern "C" fn isharded_engine_open(engine: *mut Engine, plan: *const 
 /// `links` must be a NUL-terminated JSON string.
 #[no_mangle]
 pub unsafe extern "C" fn isharded_engine_connect(engine: *mut Engine, links: *const c_char) -> i32 {
-    let Some(links) = read_text(links).and_then(|text| serde_json::from_str::<Links>(text).ok()) else {
+    let Some(links) = read_json::<Links>(links) else {
         return -1;
     };
     (*engine).node.connect_in_background(links);
