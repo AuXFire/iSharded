@@ -41,11 +41,15 @@ from isharded.mcp_client import (
 from isharded.mcp_server import (
     HEADER_MISMATCH,
     INVALID_PARAMS,
+    INTERNAL_ERROR,
     INVALID_REQUEST,
     LEGACY_VERSIONS,
     METHOD_NOT_FOUND,
     MODERN_VERSIONS,
+    NAME_PARAMETERS,
     PARSE_ERROR,
+    REQUEST_CANCELLED,
+    RESOURCE_NOT_FOUND,
     SERVER_KEY,
     SUPPORTED_VERSIONS,
     TOOLS,
@@ -145,7 +149,7 @@ def test_a_legacy_session_lists_and_calls_tools():
 def test_discover_says_what_is_supported_without_any_handshake():
     result = modern(handler(), "server/discover")["result"]
     assert result["supportedVersions"] == list(SUPPORTED_VERSIONS)
-    assert result["capabilities"] == {"tools": {}}
+    assert result["capabilities"] == {"tools": {}, "resources": {}, "prompts": {}}
     assert result["resultType"] == "complete"
     assert result["_meta"][SERVER_KEY]["name"] == "isharded"
     assert result["ttlMs"] > 0 and result["cacheScope"] in {"public", "private"}
@@ -191,7 +195,7 @@ def test_malformed_messages_are_named(message, code):
 
 
 def test_an_unknown_method_is_method_not_found():
-    assert rpc(ready(), "resources/list")["error"]["code"] == METHOD_NOT_FOUND == -32601
+    assert rpc(ready(), "resources/subscribe")["error"]["code"] == METHOD_NOT_FOUND == -32601
 
 
 def test_notifications_and_stray_answers_get_no_reply():
@@ -486,8 +490,8 @@ def legacy_post(site, method, params=None, identifier=1, **headers):
 def modern_post(site, method, params=None, version=MODERN, **headers):
     message = {"jsonrpc": "2.0", "id": 1, "method": method, "params": {**(params or {}), "_meta": {**META, VERSION_KEY: version}}}
     sent = {"Accept": WANTS, "MCP-Protocol-Version": version, "Mcp-Method": method}
-    if method == "tools/call":
-        sent["Mcp-Name"] = (params or {}).get("name", "")
+    if method in NAME_PARAMETERS:
+        sent["Mcp-Name"] = (params or {}).get(NAME_PARAMETERS[method], "")
     return site.client.post("/mcp", json=message, headers={**sent, **headers})
 
 
@@ -562,12 +566,12 @@ def test_an_unsupported_version_header_is_a_400_naming_what_works(site):
 
 
 def test_an_unknown_modern_method_is_a_404_with_a_json_rpc_body(site):
-    answer = modern_post(site, "resources/list")
+    answer = modern_post(site, "resources/subscribe")
     assert answer.status_code == 404 and answer.json()["error"]["code"] == METHOD_NOT_FOUND
 
 
 def test_a_legacy_unknown_method_stays_a_json_rpc_error(site):
-    answer = legacy_post(site, "resources/list", **{"MCP-Protocol-Version": "2025-11-25"})
+    answer = legacy_post(site, "resources/subscribe", **{"MCP-Protocol-Version": "2025-11-25"})
     assert answer.status_code == 200 and answer.json()["error"]["code"] == METHOD_NOT_FOUND
 
 
@@ -1047,6 +1051,10 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 async def exercise(client):
     tools = await client.list_tools()
+    resources = await client.list_resources()
+    route = await client.read_resource("isharded://mesh/route")
+    prompts = await client.list_prompts()
+    prompt = await client.get_prompt("mesh_health")
     models = await client.call_tool("list_models", {})
     bad = await client.call_tool("chat", {})
     try:
@@ -1054,7 +1062,7 @@ async def exercise(client):
         unknown = None
     except Exception as exc:
         unknown = str(exc)
-    return {"protocol": client.protocol_version, "tools": [tool.name for tool in tools.tools], "models_error": models.is_error, "bad_error": bad.is_error, "bad_text": bad.content[0].text, "unknown": unknown}
+    return {"protocol": client.protocol_version, "tools": [tool.name for tool in tools.tools], "models_error": models.is_error, "bad_error": bad.is_error, "bad_text": bad.content[0].text, "unknown": unknown, "resources": sorted(str(item.uri) for item in resources.resources), "route": route.contents[0].text, "prompts": [item.name for item in prompts.prompts], "prompt_text": prompt.messages[0].content.text}
 
 async def main():
     python, cwd, url, token_file = sys.argv[1:5]
@@ -1095,10 +1103,13 @@ def test_the_official_client_works_in_both_eras_over_both_transports(real_socket
     assert len(results) == 4
     for name, result in results.items():
         assert result["protocol"] == (MODERN if name.endswith("auto") else LEGACY_VERSIONS[0]), name
-        assert result["tools"] == ["chat", "list_models", "mesh_status"], name
+        assert result["tools"] == ["chat", "embed", "list_models", "mesh_status"], name
         assert result["models_error"] is False, name
         assert result["bad_error"] is True and "prompt is required" in result["bad_text"], name
         assert "Unknown tool" in result["unknown"], name
+        assert result["resources"] == ["isharded://mesh/model", "isharded://mesh/route", "isharded://mesh/status"], name
+        assert json.loads(result["route"])["stages"] == [], name
+        assert result["prompts"] == ["mesh_health"] and "plain words" in result["prompt_text"], name
 
 
 @needs_official
@@ -1115,3 +1126,103 @@ def test_our_client_works_with_an_official_server(tmp_path):
         assert "error" in toolbox.call("multiply", {"a": "six", "b": 7}, 30).lower()
     finally:
         server.close()
+
+
+# --- resources and prompts
+
+
+def status_with_secrets(request: httpx.Request) -> httpx.Response:
+    """What /admin/status really holds, which is more than a resource should pass on."""
+    if request.url.path != "/admin/status":
+        return fake_mesh(request)
+    stage = {"worker_id": "a-cpu", "url": "http://10.0.0.9:8301", "start_layer": 0, "end_layer": 28, "placements": [{"unit": "x"}]}
+    plan = {"architecture": "qwen3", "layers": 28, "experts": 0, "model_bytes": 1234, "mmproj": "/home/someone/projector.gguf", "draft_model": "/home/someone/draft.gguf"}
+    status = {"status": "ready", "model": "small", "kind": "chat", "vision": False, "epoch": 3, "route": [stage], "active_plan": plan, "cache_url": "http://10.0.0.9:9000"}
+    return httpx.Response(200, json=status)
+
+
+def read_resource(target: McpHandler, uri: str) -> dict:
+    return json.loads(modern(target, "resources/read", {"uri": uri})["result"]["contents"][0]["text"])
+
+
+def test_the_mesh_lists_its_resources_and_prompts_in_both_eras():
+    uris = {item["uri"] for item in modern(handler(), "resources/list")["result"]["resources"]}
+    assert uris == {"isharded://mesh/status", "isharded://mesh/route", "isharded://mesh/model"}
+    assert rpc(ready(), "resources/list")["result"]["resources"][0]["mimeType"] == "application/json"
+    assert [item["name"] for item in rpc(ready(), "prompts/list")["result"]["prompts"]] == ["mesh_health"]
+    assert rpc(ready(), "resources/templates/list")["result"] == {"resourceTemplates": []}
+    assert modern(handler(), "prompts/list")["result"]["cacheScope"] == "private"
+
+
+def test_initialize_says_resources_and_prompts_are_there():
+    capabilities = rpc(handler(), "initialize", {"protocolVersion": LEGACY_VERSIONS[0]})["result"]["capabilities"]
+    assert capabilities["resources"] == {"listChanged": False} and capabilities["prompts"] == {"listChanged": False}
+
+
+def test_a_legacy_session_cannot_read_before_it_says_hello():
+    assert rpc(handler(), "resources/read", {"uri": "isharded://mesh/status"})["error"]["code"] == INVALID_REQUEST
+
+
+def test_the_status_resource_says_what_the_tool_says():
+    tool = rpc(ready(), "tools/call", {"name": "mesh_status", "arguments": {}})["result"]["structuredContent"]
+    assert read_resource(handler(), "isharded://mesh/status") == tool
+
+
+def test_the_route_resource_names_workers_and_layers_and_no_addresses():
+    route = read_resource(handler(status_with_secrets), "isharded://mesh/route")
+    assert route == {"model": "small", "epoch": 3, "stages": [{"worker_id": "a-cpu", "start_layer": 0, "end_layer": 28}]}
+
+
+def test_the_model_resource_describes_the_model_and_no_paths():
+    model = read_resource(handler(status_with_secrets), "isharded://mesh/model")
+    assert model == {"model": "small", "kind": "chat", "vision": False, "dimensions": None, "architecture": "qwen3", "layers": 28, "experts": 0, "model_bytes": 1234}
+
+
+@pytest.mark.parametrize("uri", ["isharded://mesh/status", "isharded://mesh/route", "isharded://mesh/model"])
+def test_no_resource_passes_on_an_address_or_a_path(uri):
+    contents = modern(handler(status_with_secrets), "resources/read", {"uri": uri})["result"]["contents"][0]
+    assert contents["uri"] == uri and contents["mimeType"] == "application/json"
+    assert "10.0.0.9" not in contents["text"] and "/home/someone" not in contents["text"]
+
+
+def test_an_unknown_or_missing_resource_is_a_protocol_error():
+    assert modern(handler(), "resources/read", {"uri": "isharded://mesh/keys"})["error"]["code"] == RESOURCE_NOT_FOUND
+    assert modern(handler(), "resources/read")["error"]["code"] == INVALID_PARAMS
+
+
+def test_a_resource_says_when_the_mesh_will_not_answer():
+    def down(request):
+        raise httpx.ConnectError("refused")
+
+    error = modern(handler(down), "resources/read", {"uri": "isharded://mesh/status"})["error"]
+    assert error["code"] == INTERNAL_ERROR and "did not answer" in error["message"]
+
+
+def test_the_prompt_holds_the_status_as_it_is_now():
+    result = modern(handler(), "prompts/get", {"name": "mesh_health"})["result"]
+    (message,) = result["messages"]
+    assert message["role"] == "user" and '"coordinator": "a"' in message["content"]["text"]
+    assert modern(handler(), "prompts/get", {"name": "nothing"})["error"]["code"] == INVALID_PARAMS
+
+
+def test_resources_are_behind_the_same_keys_and_pay_once(site):
+    key = keyed(site, requests_per_minute=1)
+    assert legacy_post(site, "resources/read", {"uri": "isharded://mesh/status"}).status_code == 401
+    bearer = {"Authorization": f"Bearer {key}"}
+    assert json.loads(legacy_post(site, "resources/read", {"uri": "isharded://mesh/status"}, **bearer).json()["result"]["contents"][0]["text"])["status"] == "ready"
+    limited = legacy_post(site, "resources/read", {"uri": "isharded://mesh/status"}, **bearer).json()["error"]
+    assert limited["code"] == INTERNAL_ERROR and "429" in limited["message"]
+
+
+def test_a_resource_read_mirrors_its_uri_in_the_name_header(site):
+    uri = {"uri": "isharded://mesh/route"}
+    assert modern_post(site, "resources/read", uri).status_code == 200
+    answer = modern_post(site, "resources/read", uri, **{"Mcp-Name": "isharded://mesh/status"})
+    assert answer.status_code == 400 and answer.json()["error"]["code"] == HEADER_MISMATCH
+
+
+def test_a_prompt_mirrors_its_name_in_the_name_header(site):
+    assert modern_post(site, "prompts/get", {"name": "mesh_health"}).status_code == 200
+    assert modern_post(site, "prompts/get", {"name": "mesh_health"}, **{"Mcp-Name": "other"}).status_code == 400
+
+

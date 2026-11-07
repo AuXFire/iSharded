@@ -42,8 +42,17 @@ PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
+INTERNAL_ERROR = -32603
+RESOURCE_NOT_FOUND = -32002
 HEADER_MISMATCH = -32020
 UNSUPPORTED_VERSION = -32022
+# The older HTTP era ends a request's stream only with a reply, so even a cancelled one gets this.
+REQUEST_CANCELLED = -32800
+
+# Which parameter a request's Mcp-Name header mirrors.
+NAME_PARAMETERS = {"tools/call": "name", "prompts/get": "name", "resources/read": "uri"}
+# Each of these reaches the node's own API, which charges for it there.
+PAID_AT_THE_API = frozenset(NAME_PARAMETERS)
 
 
 class RpcError(Exception):
@@ -124,6 +133,59 @@ TOOLS: list[dict[str, Any]] = [
 JSON_KINDS: dict[str, tuple[type, ...]] = {"string": (str,), "integer": (int,), "number": (int, float), "boolean": (bool,)}
 
 
+def status_view(status: dict[str, Any]) -> dict[str, Any]:
+    mesh = status.get("mesh") or {}
+    return {
+        "status": status.get("status"),
+        "model": status.get("model"),
+        "epoch": status.get("epoch"),
+        "coordinator": mesh.get("leader"),
+        "nodes": mesh.get("members"),
+        "route": [stage.get("worker_id") for stage in status.get("route", [])],
+        "workers": {name: worker.get("state") for name, worker in status.get("workers", {}).items()},
+        "lanes": [{key: lane.get(key) for key in ("name", "model", "ready", "workers")} for lane in status.get("lanes", [])],
+        "tokens_per_second": (status.get("metrics") or {}).get("tokens_per_second_ema"),
+    }
+
+
+def route_view(status: dict[str, Any]) -> dict[str, Any]:
+    # A stage also holds its worker's address, which a reader of the route has no need of.
+    stages = [{key: stage.get(key) for key in ("worker_id", "start_layer", "end_layer")} for stage in status.get("route", [])]
+    return {"model": status.get("model"), "epoch": status.get("epoch"), "stages": stages}
+
+
+def model_view(status: dict[str, Any]) -> dict[str, Any]:
+    # The plan also says where the files came from, which can be a path on someone's disk.
+    plan = status.get("active_plan") or {}
+    details = {key: plan.get(key) for key in ("architecture", "layers", "experts", "model_bytes")}
+    return {key: status.get(key) for key in ("model", "kind", "vision", "dimensions")} | details
+
+
+def resource(name: str, title: str, description: str) -> dict[str, Any]:
+    return {"uri": f"isharded://mesh/{name}", "name": name, "title": title, "description": description, "mimeType": "application/json"}
+
+
+RESOURCES = [
+    resource("status", "Mesh status", "Whether the mesh can answer, what it runs, and which nodes hold which stages."),
+    resource("route", "Route", "Which worker holds which layers of the model on the main route."),
+    resource("model", "Loaded model", "What the loaded model is: its kind, whether it can see, and its size."),
+]
+RESOURCE_VIEWS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
+    "isharded://mesh/status": status_view,
+    "isharded://mesh/route": route_view,
+    "isharded://mesh/model": model_view,
+}
+HEALTH_PROMPT = "mesh_health"
+PROMPTS = [
+    {
+        "name": HEALTH_PROMPT,
+        "title": "Check the mesh",
+        "description": "The mesh's status as it is now, with a request to say in plain words whether it is healthy.",
+    }
+]
+HEALTH_REQUEST = "Here is the status of an iSharded mesh. Say in plain words whether it can answer, and name anything that looks wrong.\n\n"
+
+
 def check_arguments(schema: dict[str, Any], arguments: dict[str, Any]) -> None:
     properties = schema.get("properties", {})
     for name in schema.get("required", []):
@@ -184,20 +246,27 @@ class MeshTools:
         return as_result({"models": [item["id"] for item in reply.get("data", [])]})
 
     async def mesh_status(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        status = await self._ask("GET", "/admin/status")
-        mesh = status.get("mesh") or {}
-        summary = {
-            "status": status.get("status"),
-            "model": status.get("model"),
-            "epoch": status.get("epoch"),
-            "coordinator": mesh.get("leader"),
-            "nodes": mesh.get("members"),
-            "route": [stage.get("worker_id") for stage in status.get("route", [])],
-            "workers": {name: worker.get("state") for name, worker in status.get("workers", {}).items()},
-            "lanes": [{key: lane.get(key) for key in ("name", "model", "ready", "workers")} for lane in status.get("lanes", [])],
-            "tokens_per_second": (status.get("metrics") or {}).get("tokens_per_second_ema"),
-        }
-        return as_result(summary)
+        return as_result(status_view(await self._ask("GET", "/admin/status")))
+
+    async def _status(self) -> dict[str, Any]:
+        """The status for a resource or a prompt, which have no tool error to fail with."""
+        try:
+            return await self._ask("GET", "/admin/status")
+        except ToolFailed as exc:
+            raise RpcError(INTERNAL_ERROR, str(exc)) from exc
+
+    async def read(self, uri: str) -> dict[str, Any]:
+        view = RESOURCE_VIEWS.get(uri)
+        if view is None:
+            raise RpcError(RESOURCE_NOT_FOUND, "Resource not found", {"uri": uri})
+        text = json.dumps(view(await self._status()), ensure_ascii=False)
+        return {"contents": [{"uri": uri, "mimeType": "application/json", "text": text}]}
+
+    async def prompt(self, name: str) -> dict[str, Any]:
+        if name != HEALTH_PROMPT:
+            raise RpcError(INVALID_PARAMS, f"Unknown prompt: {name}")
+        text = HEALTH_REQUEST + json.dumps(status_view(await self._status()), ensure_ascii=False)
+        return {"description": PROMPTS[0]["description"], "messages": [{"role": "user", "content": {"type": "text", "text": text}}]}
 
     async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         tool = next((tool for tool in TOOLS if tool["name"] == name), None)
@@ -221,6 +290,14 @@ def modern_result(result: dict[str, Any]) -> dict[str, Any]:
 def as_object(value: Any) -> dict[str, Any]:
     """What a stranger sent, where only an object means anything."""
     return value if isinstance(value, dict) else {}
+
+
+LISTS: dict[str, tuple[str, list[dict[str, Any]]]] = {
+    "tools/list": ("tools", TOOLS),
+    "resources/list": ("resources", RESOURCES),
+    "resources/templates/list": ("resourceTemplates", []),
+    "prompts/list": ("prompts", PROMPTS),
+}
 
 
 class McpHandler:
@@ -264,7 +341,7 @@ class McpHandler:
             return modern_result(
                 {
                     "supportedVersions": list(SUPPORTED_VERSIONS),
-                    "capabilities": {"tools": {}},
+                    "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
                     "instructions": INSTRUCTIONS,
                     "ttlMs": TOOL_LIST_TTL_MS,
                     "cacheScope": "public",
@@ -274,20 +351,32 @@ class McpHandler:
             return {}  # removed from the modern protocol
         if not modern and not self.ready:
             raise RpcError(INVALID_REQUEST, "Send initialize first, or name a protocol version in _meta")
-        if method == "tools/list":
-            result = self._list_tools(params, modern)
+        if method in LISTS:
+            result = self._list(LISTS[method], params, modern)
         elif method == "tools/call":
             result = await self._call_tool(params)
+        elif method == "resources/read":
+            result = await self.tools.read(self._named(params, "uri", method))
+        elif method == "prompts/get":
+            result = await self.tools.prompt(self._named(params, "name", method))
         else:
             raise RpcError(METHOD_NOT_FOUND, f"Method not found: {method}")
         return modern_result(result) if modern else result
 
     @staticmethod
-    def _list_tools(params: dict[str, Any], modern: bool) -> dict[str, Any]:
+    def _named(params: dict[str, Any], key: str, method: str) -> str:
+        value = params.get(key)
+        if not isinstance(value, str):
+            raise RpcError(INVALID_PARAMS, f"{method} needs a {key}")
+        return value
+
+    @staticmethod
+    def _list(kind: tuple[str, list[dict[str, Any]]], params: dict[str, Any], modern: bool) -> dict[str, Any]:
+        key, items = kind
         if params.get("cursor") is not None:
-            raise RpcError(INVALID_PARAMS, "Invalid cursor: there is only one page of tools")
+            raise RpcError(INVALID_PARAMS, f"Invalid cursor: there is only one page of {key}")
         # The caller's key decides who sees this, so nothing shared may keep it.
-        return {"tools": TOOLS, "ttlMs": TOOL_LIST_TTL_MS, "cacheScope": "private"} if modern else {"tools": TOOLS}
+        return {key: items, "ttlMs": TOOL_LIST_TTL_MS, "cacheScope": "private"} if modern else {key: items}
 
     async def _call_tool(self, params: dict[str, Any]) -> dict[str, Any]:
         name, arguments = params.get("name"), params.get("arguments", {})
@@ -305,7 +394,7 @@ class McpHandler:
         return {
             # Anything unknown gets our own choice, and the client decides whether it can use that.
             "protocolVersion": requested if requested in LEGACY_VERSIONS else LEGACY_VERSIONS[0],
-            "capabilities": {"tools": {"listChanged": False}},
+            "capabilities": {"tools": {"listChanged": False}, "resources": {"listChanged": False}, "prompts": {"listChanged": False}},
             "serverInfo": SERVER_INFO,
             "instructions": INSTRUCTIONS,
         }
@@ -329,6 +418,11 @@ def check_modern_headers(headers: Mapping[str, str], message: dict[str, Any], ve
         raise RpcError(HEADER_MISMATCH, f"Header mismatch: MCP-Protocol-Version is {version}, and _meta says {claimed}")
     if headers.get("mcp-method") != message.get("method"):
         raise RpcError(HEADER_MISMATCH, f"Header mismatch: Mcp-Method does not match the method {message.get('method')}")
+    named = NAME_PARAMETERS.get(str(message.get("method")))
+    if named and header_value(headers.get("mcp-name", "")) != params.get(named):
+        raise RpcError(HEADER_MISMATCH, f"Header mismatch: Mcp-Name does not match the {named} {params.get(named)}")
+
+
     if message.get("method") == "tools/call" and header_value(headers.get("mcp-name", "")) != params.get("name"):
         raise RpcError(HEADER_MISMATCH, f"Header mismatch: Mcp-Name does not match the tool {params.get('name')}")
 

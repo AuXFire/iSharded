@@ -34,7 +34,7 @@ from .statestore import stage_namespace
 from . import audit
 from .discovery import start_beacon
 from .lanes import LaneDoor
-from .mcp_server import INVALID_REQUEST, McpHandler, MeshTools, RpcError, answer_http
+from .mcp_server import INVALID_REQUEST, PAID_AT_THE_API, McpHandler, MeshTools, RpcError, answer_http
 from .mesh import GOSSIP_SECONDS, ControlMesh
 from .models import Adapter, GgufAdapter, SUPPORTED_TYPES, UnsupportedModel, create_adapter
 from .planner import AMORTIZE_TOKENS, UNREACHABLE_LINK_MS, Candidate, ModelProfile, PlacementError, keep_layers, memory_report, plan_placement, route_network_ms, with_links
@@ -3489,8 +3489,8 @@ async def mcp_endpoint(request: Request, authorization: str | None = Header(defa
         raise
 
     def charge(method: str) -> None:
-        # tools/call pays when it reaches /v1, which is enough.
-        if method != "tools/call":
+        # Whatever reaches the API pays there, which is enough.
+        if method not in PAID_AT_THE_API:
             verify_user(authorization)
 
     async with own_api(request, authorization) as client:
