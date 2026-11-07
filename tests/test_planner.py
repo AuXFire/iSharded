@@ -1674,12 +1674,13 @@ def law_runtime(telemetry: dict, model: str = "m") -> Orchestrator:
     ],
 )
 def test_tokens_per_miss_comes_from_the_entry_stage(counts, expected) -> None:
-    assert law_runtime({"pipeline": counts}).tokens_per_miss(SimpleNamespace(model_id="m")) == expected
+    runtime = law_runtime({"pipeline": counts})
+    assert runtime.tokens_per_miss(runtime.active) == expected
 
 
-def test_another_model_has_measured_nothing() -> None:
+def test_a_target_that_is_not_running_has_measured_nothing() -> None:
     runtime = law_runtime({"pipeline": {"tokens": 1000, "misses": 400}})
-    assert runtime.tokens_per_miss(SimpleNamespace(model_id="other")) == 1.0
+    assert runtime.tokens_per_miss(SimpleNamespace(model_id="m")) == 1.0
 
 
 def test_a_plan_shows_its_loop_and_pace(monkeypatch) -> None:
@@ -1691,6 +1692,7 @@ def test_a_plan_shows_its_loop_and_pace(monkeypatch) -> None:
     adapter = SimpleNamespace(config={}, num_layers=model.num_layers)
     units = {item.name: item for item in model.units}
     target = SimpleNamespace(model_id="m", adapter=adapter, profile=model, units=units, held={}, draft=None, embedding=False, projector=None)
+    runtime.active = target
     plan = orchestrator_module.describe_plan(target, route)
     loop, pace = planner.route_times(route, LINKS, model.ring)
     assert plan["loop_ms"] == pytest.approx(loop, abs=0.01)

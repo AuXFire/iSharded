@@ -1796,7 +1796,7 @@ tokens per second = L / (R + w + (L - 1) p)
 
 `R` is the loop time: every stage's read, plus every link once, the one that closes the loop included. `p` is the pace, the time of the slowest stage. `L` is tokens made per wrong guess, and `w` is the draft's rewind. With no draft `L` is 1, and only `R` counts.
 
-The planner compares routes by this. For the model that is running, it takes `L` from the entry node's count of tokens and misses since that node started, once that count has reached 256 tokens. Until then `L` is 1, which is the same choice as a route's plain sum. `w` is the same on every route, so it changes no comparison, and the planner leaves it out. What a route would download still counts in full, spread over 20,000 tokens.
+The planner compares routes by this. When it replans the running model, as a rebalance does, it takes `L` from the entry node's count of tokens and misses since that node started, once that count has reached 256 tokens. Until then `L` is 1, which is the same choice as a route's plain sum, and so is a new load or a plan from `POST /admin/plan`, which have measured nothing yet. `w` is the same on every route, so it changes no comparison, and the planner leaves it out. What a route would download still counts in full, spread over 20,000 tokens.
 
 A plan, and `active_plan` in `/admin/status`, shows these. All are estimates from measured links and estimated reads, and `ms_per_token` leaves `w` out:
 

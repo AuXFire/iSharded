@@ -273,7 +273,7 @@ def run_plan(args: argparse.Namespace) -> int:
     print(f"Running:  {' > '.join(now['order'])}, {now['loop_ms']:.0f} ms around the loop, {now['ms_per_token']:.0f} ms a token")
     print(f"Proposed: {' > '.join(then['order'])}, {then['loop_ms']:.0f} ms around the loop, {then['ms_per_token']:.0f} ms a token")
     print(
-        f"It would move {proposal['moved_bytes'] / 1024**3:.1f} GiB, about {proposal['move_seconds'] / 60:.1f} minutes, and restart "
+        f"It would move {proposal['moved_bytes'] / 1024**3:.1f} GiB, about {proposal['move_seconds']:.0f} s, and restart "
         f"{proposal['stages_changed']} stages. That pays back after {proposal['break_even_tokens']} tokens."
     )
     print("Nothing has moved, and iSharded cannot apply this yet.")

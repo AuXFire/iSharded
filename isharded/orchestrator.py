@@ -1414,8 +1414,8 @@ class Orchestrator:
         return route
 
     def tokens_per_miss(self, target: ModelTarget) -> float:
-        """L in the law for this model, from the entry stage's count. One if nothing was measured."""
-        if self.active is None or self.active.model_id != target.model_id or not self.route:
+        """L in the law, from the entry stage's count. Only the target that is running has one."""
+        if target is not self.active or not self.route:
             return 1.0
         counts = telemetry_of(self.workers.get(self.route[0].worker_id)).get("pipeline") or {}
         tokens = counts.get("tokens", 0)
