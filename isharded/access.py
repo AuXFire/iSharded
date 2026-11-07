@@ -571,7 +571,8 @@ class AuditLog:
         line = json.dumps(entry) + "\n"
         with self.lock:
             handle = self._open()
-            if handle.tell() > AUDIT_ROTATE_BYTES:  # an open file knows its size, so nothing else need look
+            # An open file knows its size, so nothing else need look. A pipe has none, and nothing to rotate.
+            if handle.seekable() and handle.tell() > AUDIT_ROTATE_BYTES:
                 handle.close()
                 self.path.replace(self.path.with_suffix(self.path.suffix + ".1"))
                 handle = self._open()

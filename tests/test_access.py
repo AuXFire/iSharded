@@ -1,3 +1,4 @@
+import io
 import json
 from pathlib import Path
 import shutil
@@ -105,6 +106,29 @@ def test_the_audit_log_makes_its_folder_once_and_again_if_it_goes(tmp_path, monk
     shutil.rmtree(tmp_path / "logs")
     log.record("a", "GET", "/", 200, None)
     assert len(path.read_bytes().splitlines()) == 1
+
+
+def test_the_audit_log_can_write_to_a_stream_that_cannot_seek(tmp_path, monkeypatch):
+    """--audit-file /dev/stdout under a container: Linux refuses tell() on a pipe, and Windows does not."""
+
+    class Pipe(io.StringIO):
+        written = ""
+
+        def seekable(self) -> bool:
+            return False
+
+        def tell(self) -> int:
+            raise io.UnsupportedOperation("underlying stream is not seekable")
+
+        def close(self) -> None:
+            Pipe.written += self.getvalue()
+            super().close()
+
+    log = AuditLog(str(tmp_path / "stdout"), "n")
+    monkeypatch.setattr(log, "_open", Pipe)
+    log.record("a", "POST", "/v1/chat/completions", 200, None)
+    assert json.loads(Pipe.written)["actor"] == "a"
+    assert not (tmp_path / "stdout.1").exists()
 
 
 def test_gossip_hashes_a_document_only_when_two_of_one_version_differ(tmp_path, monkeypatch):
