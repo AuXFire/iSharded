@@ -1488,7 +1488,7 @@ A pool that measures 0 bytes free counts as full. A pool that was never measured
 
 `/admin/status` publishes what the planner works from, so a route can be modelled from outside with a user key.
 
-`links` lists every link measured so far, by worker id and never by address. It stays empty until the first load or plan. A later load or plan measures a link again once it is ten minutes old, or at once for a model with rows of another size.
+`links` lists every link measured so far, by worker id and never by address. Links are not shared across the mesh, so it stays empty on each coordinator until that coordinator's first load or plan. A later load or plan measures a link again once it is ten minutes old, or at once for a model with rows of another size.
 
 | Field | Meaning |
 |---|---|
@@ -1506,7 +1506,7 @@ Each stage in `route` and in `active_plan.route` has a `read_bytes` object, with
 | `dense` | Attention and other dense weights of its layers |
 | `experts` | Routed experts of its layers, already multiplied by the share a token uses |
 | `embedding` | The whole embedding table, on the entry stage. A token touches one row of it, so the planner counts this as free. Leave it out of a sum of bytes read |
-| `head` | The output head, on the exit stage |
+| `head` | The output head, on the exit stage. On one worker a tied table counts once, here, and `embedding` is 0 |
 
 A route restored from a node running an older version shows zeros here until the model loads again.
 

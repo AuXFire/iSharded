@@ -128,7 +128,11 @@ def door_to_a_lane(monkeypatch, *failures: Exception) -> tuple[LaneDoor, list[st
     return door, asked
 
 
-@pytest.mark.parametrize("failure", [httpx.ConnectError("down"), httpx.ReadError("reset"), httpx.RemoteProtocolError("cut off")], ids=["connect", "read", "protocol"])
+@pytest.mark.parametrize(
+    "failure",
+    [httpx.ConnectError("down"), httpx.ConnectTimeout("silent"), httpx.ReadError("reset"), httpx.RemoteProtocolError("cut off")],
+    ids=["connect", "connect-timeout", "read", "protocol"],
+)
 def test_asking_a_lane_waits_out_a_lost_coordinator(monkeypatch, failure: Exception) -> None:
     door, asked = door_to_a_lane(monkeypatch, failure)
     assert asyncio.run(door.ask("a", {}, None)) == "hello"
@@ -143,11 +147,25 @@ def test_asking_a_lane_gives_up_the_same_way_as_with_no_coordinator(monkeypatch)
     assert len(asked) == LANE_ASK_ATTEMPTS
 
 
-def test_a_lane_silent_for_the_whole_wait_is_not_asked_again(monkeypatch) -> None:
-    door, asked = door_to_a_lane(monkeypatch, httpx.ReadTimeout("silent"))
-    with pytest.raises(httpx.ReadTimeout):
+@pytest.mark.parametrize("failure", [httpx.ReadTimeout("silent"), httpx.WriteTimeout("stuck"), httpx.PoolTimeout("full")], ids=["read", "write", "pool"])
+def test_a_lane_silent_for_the_whole_wait_is_not_asked_again(monkeypatch, failure: Exception) -> None:
+    door, asked = door_to_a_lane(monkeypatch, failure)
+    with pytest.raises(type(failure)):
         asyncio.run(door.ask("a", {}, None))
     assert len(asked) == 1
+
+
+def test_a_silent_host_costs_a_try_seconds_and_not_the_whole_wait(monkeypatch) -> None:
+    door, _ = door_to_a_lane(monkeypatch)
+    allowed = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        allowed.append(request.extensions["timeout"])
+        return httpx.Response(200, json={"choices": [{"message": {"content": "hello"}}]})
+
+    door.runtime.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    asyncio.run(door.ask("a", {}, None))
+    assert (allowed[0]["connect"], allowed[0]["read"]) == (10.0, 300.0)
 
 
 def test_followers_learn_lanes_from_the_leader_only() -> None:
