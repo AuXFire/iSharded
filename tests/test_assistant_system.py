@@ -123,6 +123,12 @@ class ScriptedModel:
         """When a person's or a tool's words anywhere in the request contain these."""
         self.rules.append((lambda body: words in spoken(body), [reply] if not isinstance(reply, list) else list(reply)))
 
+    @property
+    def turns(self) -> list[dict[str, Any]]:
+        """The requests for a turn. Learning runs beside a turn, so it can land after one."""
+        with self.lock:
+            return [body for body in self.requests if LEARN not in str(body["messages"][0].get("content"))]
+
     def on_prompt(self, words: str, reply: Any) -> None:
         """When the system prompt contains these, ahead of anything set with on()."""
         self.rules.insert(0, (lambda body: words in str(body["messages"][0].get("content")), [reply]))
@@ -326,8 +332,8 @@ def test_the_same_identity_reaches_every_model(install):
     for name in ("first", "second"):
         install.assistant.router.set_route("conversation", [name])
         install.say("Good morning")
-    assert first.requests[-1]["messages"][0]["content"].split("\n")[0] == second.requests[-1]["messages"][0]["content"].split("\n")[0]
-    assert "Juniper" in first.requests[-1]["messages"][0]["content"]
+    assert first.turns[-1]["messages"][0]["content"].split("\n")[0] == second.turns[-1]["messages"][0]["content"].split("\n")[0]
+    assert "Juniper" in first.turns[-1]["messages"][0]["content"]
     first.close()
     second.close()
 
@@ -471,10 +477,10 @@ def test_only_what_a_person_granted_is_offered_to_a_model(install, model, tmp_pa
     """With every part attached the list used to fill up and drop shell.run even when granted."""
     install.use(model, tools="auto")
     assert install.say("Hello there")["status"] == "done"
-    assert "tools" not in model.requests[-1]
+    assert "tools" not in model.turns[-1]
     install.grant("shell.run", str(tmp_path))
     install.say("Hello there")
-    assert [tool["function"]["name"] for tool in model.requests[-1]["tools"]] == [native_name("shell.run")]
+    assert [tool["function"]["name"] for tool in model.turns[-1]["tools"]] == [native_name("shell.run")]
 
 
 def test_a_grant_for_one_folder_does_not_stretch_and_the_model_is_told_how_a_person_can_allow_it(install, model, tmp_path):
@@ -571,10 +577,10 @@ def test_poisoned_text_is_labeled_and_cannot_use_a_standing_grant(install, model
     assert not loot.exists()
     assert "untrusted text" in stopped["pending_approval"]["reason"]
     # The model saw it fenced, as data, under a value the page could not have known.
-    fenced = model.requests[-1]["messages"][-1]["content"]
+    fenced = model.turns[-1]["messages"][-1]["content"]
     marker = re.search(r"<<data (\w+)", fenced).group(1)
     assert fenced.index(f"<<data {marker}") < fenced.index(POISON) < fenced.index(f"<<end data {marker}>>")
-    assert marker in model.requests[-1]["messages"][0]["content"]
+    assert marker in model.turns[-1]["messages"][0]["content"]
     assert marker not in POISON
     held = audited(install.assistant, "broker.check")[-1]
     assert (held["detail"]["verdict"], held["detail"]["tainted"]) == ("ask", True)
@@ -936,7 +942,7 @@ def test_a_skill_can_never_do_more_than_its_user_was_granted(install, model, tmp
     refused = skills.execute(active.name, "Read the other one", OWNER)
     assert (refused["ok"], refused["status"]) == (False, "denied")
     assert "No model" not in refused["text"]
-    assert "Nobody granted" not in str(model.requests[-1])
+    assert "Nobody granted" not in str(model.turns[-1])
 
     # Being granted is not enough either. A model is told only what the skill declared,
     # so a call to anything else is just words, and never reaches the broker at all.
@@ -998,7 +1004,7 @@ def test_a_skill_in_use_reaches_the_model_labeled(install, model, tmp_path):
     active = learned_skill(install, model, report)
     model.on("general knowledge", "Understood.")
     answered = install.say("A question of general knowledge for you")
-    assert "Read the file you are given" in model.requests[-1]["messages"][0]["content"]
+    assert "Read the file you are given" in model.turns[-1]["messages"][0]["content"]
     seen = install.http.get(f"/assistant/why/{answered['turn']}").json()["seen"]
     assert [(item["source_id"], item["trust"]) for item in seen if item["source"] == "skill"] == [(active.id, "verified")]
 
