@@ -1609,3 +1609,38 @@ def test_a_server_that_refuses_every_version_is_refused(started, tmp_path):
         started("--only-version", "1999-01-01")
 
 
+# --- a reply cut off at the token limit
+
+
+def cut_model(text: str):
+    def answer(request):
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "length"}]})
+
+    return httpx.Client(transport=httpx.MockTransport(answer), base_url="http://mesh")
+
+
+def test_a_reply_cut_off_at_the_limit_is_not_passed_off_as_finished(started):
+    with pytest.raises(CutOff, match="token limit") as caught:
+        run_loop(cut_model("<think>x</think>\n\nThe answer is"), Toolbox([started()]))
+    assert caught.value.answer == "The answer is"
+
+
+def test_the_command_prints_what_it_has_and_says_it_is_not_finished(monkeypatch, capsys):
+    client = cut_model("The answer is")
+    monkeypatch.setattr(mcp_client.httpx, "Client", lambda **options: client)
+    assert run_agent(agent_arguments(server_command())) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "The answer is\n", "stdout stays for the answer alone"
+    assert "cut off" in captured.err and "--max-tokens" in captured.err
+
+
+def test_a_call_written_whole_before_the_limit_still_runs(started):
+    calls = [{"id": "call_0", "type": "function", "function": {"name": "add", "arguments": json.dumps({"a": 1, "b": 2})}}]
+    replies = [{"message": {"role": "assistant", "content": None, "tool_calls": calls}, "finish_reason": "length"}, {"message": {"role": "assistant", "content": "3"}, "finish_reason": "stop"}]
+
+    def answer(request):
+        return httpx.Response(200, json={"choices": [replies.pop(0)]})
+
+    assert run_loop(httpx.Client(transport=httpx.MockTransport(answer), base_url="http://mesh"), Toolbox([started()])) == "3"
+
+

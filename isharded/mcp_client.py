@@ -519,7 +519,7 @@ def agent_loop(
     client: httpx.Client, toolbox: Toolbox, model: str, prompt: str, allowed: set[str], max_turns: int, max_tokens: int | None, timeout: float,
     ask: Callable[[str, dict[str, Any]], bool] = ask_at_terminal,
 ) -> str:
-    """Let the model call tools until it answers. Returns the answer."""
+    """Let the model call tools until it answers. Returns the answer, or raises CutOff with what there is of it."""
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
     tools = toolbox.for_model()
     for _ in range(max_turns):
@@ -530,7 +530,10 @@ def agent_loop(
         message = choice["message"]
         calls = message.get("tool_calls") or []
         if not calls:
-            return without_reasoning(message.get("content") or "")
+            answer = without_reasoning(message.get("content") or "")
+            if choice.get("finish_reason") == "length":
+                raise CutOff(answer)
+            return answer
         messages.append(message)
         for call in calls:
             messages.append({"role": "tool", "tool_call_id": call["id"], "content": run_call(toolbox, call, allowed, timeout, ask)})
@@ -557,6 +560,10 @@ def run_agent(args: Any) -> int:
             answer = agent_loop(client, toolbox, args.model, args.prompt, allowed, args.max_turns, args.max_tokens, args.tool_timeout)
         print(answer)
         return 0
+    except CutOff as exc:
+        print(exc.answer)  # all there is, and the exit code says it is not whole
+        print(f"isharded mcp run: {exc}", file=sys.stderr)
+        return 1
     except (ServerError, ToolRefused, httpx.HTTPError) as exc:
         print(f"isharded mcp run: {exc}", file=sys.stderr)
         return 1
