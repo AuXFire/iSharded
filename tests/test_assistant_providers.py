@@ -984,3 +984,26 @@ def test_provider_test_exits_1_when_it_is_down_and_says_why(tmp_path, capsys):
 def test_provider_test_names_a_provider_that_does_not_exist(tmp_path, capsys):
     assert run_cli(tmp_path, "provider", "test", "nobody") == 1
     assert "no provider nobody" in capsys.readouterr().err
+
+
+# A refusal that comes after the headers
+
+
+@pytest.mark.parametrize("code, kept_back", [(400, 0), (422, 0), (409, 1), (503, 1)])
+def test_a_refusal_inside_a_stream_is_judged_by_its_code(assistant, code, kept_back):
+    """A mesh counts a prompt after its headers went out, so a prompt too long for it is an event and no status."""
+    with FakeModelServer([Reply(text="Hello.", error_after=0, error_code=code), Reply(text="Hello.")]) as server:
+        router = through_the_router(assistant, server, True)
+        with pytest.raises(AllFailed):
+            router.complete(request())
+        assert backed_off(assistant) == kept_back
+
+
+def test_one_bad_request_does_not_change_how_a_mesh_is_offered_tools():
+    tool = Capability(name="files.read", summary="Read a file", effects=frozenset({Effect.READ}))
+    with FakeModelServer([Reply(status=400), Reply(status=400), Reply(text="Hello.")]) as server:
+        mesh = MeshProvider("mesh", server.url)
+        with pytest.raises(RequestRefused):
+            mesh.complete(request(tools=(tool,)), "m")
+        assert mesh.tool_mode == "auto"  # it failed without tools too, so that says nothing about tools
+        assert mesh.complete(request(tools=(tool,)), "m").text == "Hello."

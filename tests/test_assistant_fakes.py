@@ -41,6 +41,7 @@ class Reply:
     silent_after: int | None = None  # the same, after this many stream pieces
     cut_after: int | None = None  # close the connection after this many pieces
     error_after: int | None = None  # an error event after this many pieces, as the mesh sends
+    error_code: int = 503
     no_finish: bool = False  # end cleanly without saying it finished
     model: str | None = None
     finish: str = "stop"  # the finish_reason it reports
@@ -179,7 +180,7 @@ class FakeModelServer:
             if index == reply.cut_after:
                 return
             if index == reply.error_after:
-                send({"error": {"message": "a stage was lost", "code": 503}})
+                send({"error": {"message": "a stage was lost", "code": reply.error_code}})
                 send("[DONE]")
                 return
             send({"model": reply.model or "fake-model", "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]})

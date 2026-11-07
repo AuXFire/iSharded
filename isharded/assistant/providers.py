@@ -743,9 +743,9 @@ class OpenAICompatible:
             finish_reason="length" if ended == "length" else "stop",
         )
 
-    def stream(self, request: ModelRequest, model: str) -> Iterator[str | ModelReply]:
+    def stream(self, request: ModelRequest, model: str, native: bool | None = None) -> Iterator[str | ModelReply]:
         """Text as it comes, then the finished ModelReply last."""
-        native = self._native(request)
+        native = self._native(request) if native is None else native
         if native and not self.streams_tool_calls:
             # Native calls arrive in pieces. Only the finished reply can be parsed safely.
             reply = self.complete(request, model)
@@ -792,8 +792,10 @@ class OpenAICompatible:
         except httpx.HTTPError as error:
             raise self._unreachable(error, "dropped the connection") from None
         if refused:
-            self.tool_mode = "prompt"  # this model has no tool calling of its own
-            yield from self.stream(request, model)
+            for item in self.stream(request, model, False):
+                if isinstance(item, ModelReply):
+                    self.tool_mode = "prompt"  # it worked this way, so this model has no tool calling of its own
+                yield item
             return
         if not finished:
             raise ProviderError(f"{self.name} stopped before finishing its reply")
@@ -816,8 +818,10 @@ class OpenAICompatible:
             if event.get("error"):
                 # Headers are long gone by now, so failures travel in the stream.
                 error = event["error"]
-                detail = error.get("message") if isinstance(error, dict) else error
-                raise ProviderError(f"{self.name} failed partway: {self._clean(str(detail))}")
+                detail, code = (error.get("message"), error.get("code")) if isinstance(error, dict) else (error, None)
+                # A mesh counts a prompt after its headers went out, so this is where it says one is too long.
+                kind = RequestRefused if code in REQUEST_FAULT_STATUSES else ProviderError
+                raise kind(f"{self.name} failed partway: {self._clean(str(detail))}")
             yield event
 
     def embed(self, model: str, texts: Sequence[str]) -> list[list[float]]:
