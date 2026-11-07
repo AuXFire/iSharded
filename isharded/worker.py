@@ -505,6 +505,9 @@ class WorkerRuntime:
         self.tokens_processed = 0
         self.activation_bytes_sent = 0
         self.compute_ms_ema: float | None = None
+        # A reply's pass on this stage, which is what a load counts as a row when it chooses slots.
+        self.row_ms_ema: float | None = None
+        self.ring_counted: tuple[int, int, int] | None = None
         self.downstream_ms_ema: float | None = None
         self.last_error: str | None = None
         self.kv_snapshots_sent = 0
@@ -555,6 +558,25 @@ class WorkerRuntime:
     @staticmethod
     def _ema(previous: float | None, value: float, weight: float = 0.2) -> float:
         return value if previous is None else previous * (1 - weight) + value * weight
+
+    def _note_row(self, ms: float) -> None:
+        self.row_ms_ema = round(self._ema(self.row_ms_ema, ms), 3)
+
+    def note_ring(self, stats: dict[str, Any] | None) -> None:
+        """Count the engine's passes into this stage's rows.
+
+        The engine keeps an average of each batch it runs, and a batch can hold several replies,
+        so the batch's time is shared out among the passes run since the last look.
+        """
+        if not stats or stats.get("passes") is None:
+            return
+        counted = (int(stats["passes"]), int(stats.get("merged_passes") or 0), int(stats.get("merged_rows") or 0))
+        before, self.ring_counted = self.ring_counted, counted
+        if before is None or counted[0] < before[0]:
+            return  # a first look, or an engine that started again, has nothing to compare
+        passes, merges, merged = (now - then for now, then in zip(counted, before))
+        if passes > 0 and stats.get("compute_us"):
+            self._note_row(stats["compute_us"] / 1000 * (passes - merged + merges) / passes)
 
     def _record(self, phase: str, started: float) -> None:
         elapsed = (time.perf_counter() - started) * 1000
@@ -1111,6 +1133,8 @@ class WorkerRuntime:
         self.ring_stop()
         self.draft_choice = DraftChoice()  # a new route can change which way is faster
         self.row_clock = RowClock()
+        self.row_ms_ema = None  # another stage's rows say nothing about this one's
+        self.ring_counted = None
         adapter = create_adapter(request.architecture)
         if not isinstance(adapter, GgufAdapter) and not has_torch():
             raise ValueError(NO_TORCH)
@@ -1598,9 +1622,12 @@ class WorkerRuntime:
         entry.length = entry.length + tokens if request.next_position is None else request.next_position
         self.inference_calls += 1
         self.tokens_processed += tokens
+        elapsed = (time.perf_counter() - started) * 1000
         if request.prompt_rows:
             self.prompt_tokens_computed += tokens
-        self.compute_ms_ema = self._ema(self.compute_ms_ema, (time.perf_counter() - started) * 1000)
+        else:
+            self._note_row(elapsed)
+        self.compute_ms_ema = self._ema(self.compute_ms_ema, elapsed)
         return hidden
 
     def _sample(self, hidden: torch.Tensor, request: InferRequest, logits: torch.Tensor | None = None) -> int:
@@ -1869,6 +1896,7 @@ class WorkerRuntime:
             self.merged_rows += len(ready)
             self.inference_calls += len(ready)
             self.tokens_processed += len(ready)
+            self._note_row((time.perf_counter() - started) * 1000 / len(ready))  # each reply had its share
         self.compute_ms_ema = self._ema(self.compute_ms_ema, (time.perf_counter() - started) * 1000)
         return [results[index] for index in range(len(steps))]
 
@@ -2122,6 +2150,8 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
             raise HTTPException(status_code=503, detail=runtime.last_error)
         await asyncio.to_thread(runtime.gguf.refresh_states)
     assignment = runtime.assignment.model_dump() if runtime.assignment else None
+    ring = await asyncio.to_thread(runtime.gguf.ring_stats) if runtime.gguf is not None else None
+    runtime.note_ring(ring)
     return {
         "status": "ok",
         "worker_id": runtime.worker_id,
@@ -2143,6 +2173,7 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
             "tokens_processed": runtime.tokens_processed,
             "activation_bytes_sent": runtime.activation_bytes_sent,
             "compute_ms_ema": runtime.compute_ms_ema,
+            "row_ms_ema": runtime.row_ms_ema,
             "downstream_ms_ema": runtime.downstream_ms_ema,
             "last_error": runtime.last_error,
             "kv_snapshots_sent": runtime.kv_snapshots_sent,
@@ -2158,7 +2189,7 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
             "checkpoints_dropped": runtime.checkpoints_dropped,
             "cache": runtime.cache_report(),
             "phases_ms": runtime.phases,
-            "ring": await asyncio.to_thread(runtime.gguf.ring_stats) if runtime.gguf is not None else None,
+            "ring": ring,
             "ring_live": runtime.ring_live,
             "hop_direct": runtime.hop is not None,
             "hop_fallbacks": runtime.hop_fallbacks,

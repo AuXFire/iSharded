@@ -603,7 +603,9 @@ def stage_devices(route: list[StageAssignment], candidates: list[Candidate]) -> 
     return list(map(device, route))
 
 
-def wanted_slots(route: list[StageAssignment], devices: list[str], links: dict[tuple[str, str], float], ring: bool) -> dict[str, Any] | None:
+def wanted_slots(
+    route: list[StageAssignment], devices: list[str], links: dict[tuple[str, str], float], ring: bool, rows: list[float] | None = None
+) -> dict[str, Any] | None:
     """How many replies keep a route's busiest device working, or None if a link on it has no reading.
 
     While one reply goes round, that device can serve round trip / row time others, and only
@@ -611,6 +613,7 @@ def wanted_slots(route: list[StageAssignment], devices: list[str], links: dict[t
     with a CPU and a GPU stage, a trip of 1.8 rows gave two replies 58 tokens/s on two slots and 65
     to 112 on one. Stages on one device take turns on it, so their rows add up, and a route on a single
     device has nothing to overlap: two stages on one GPU went from 128 to 70 at two slots.
+    A row is each stage's measured time when ``rows`` gives it, and its memory's speed otherwise.
     """
     names = [stage.worker_id for stage in route]
     hops = list(pairwise(names)) + ([(names[-1], names[0])] if ring and len(names) > 1 else [])
@@ -618,12 +621,18 @@ def wanted_slots(route: list[StageAssignment], devices: list[str], links: dict[t
     if any(reading is None or reading >= UNREACHABLE_LINK_MS for reading in readings):
         return None  # a probe that failed reads as 10 s, and that says nothing about the trip
     busy: Counter[str] = Counter()
-    for stage, device in zip(route, devices):
-        busy[device] += stage_ms(stage)
+    for device, row in zip(devices, rows or map(stage_ms, route)):
+        busy[device] += row
     row = max(busy.values())
     round_trip = sum(busy.values()) + route_network_ms(route, links, ring)
     wanted = min(math.floor(round_trip / row), MAX_PARALLEL) if len(busy) > 1 else 1
-    return {"round_trip_ms": round(round_trip, 2), "row_ms": round(row, 2), "devices": len(busy), "wanted": wanted}
+    return {"round_trip_ms": round(round_trip, 2), "row_ms": round(row, 2), "devices": len(busy), "wanted": wanted, "measured": rows is not None}
+
+
+def row_key(target: ModelTarget, stage: StageAssignment, device: str, last: bool) -> tuple[str, str, str, str, bool]:
+    """What a stage's measured row is kept under, per layer. The last stage also runs the output
+    head, which on a small model weighs as much as many layers, so it is kept apart."""
+    return (target.model_id, target.manifest.revision, stage.worker_id, device, last)
 
 
 def describe_plan(target: ModelTarget, route: list[StageAssignment], links: dict[tuple[str, str], float] | None = None) -> dict[str, Any]:
@@ -708,6 +717,7 @@ class Orchestrator:
         self.link_readings: dict[tuple[str, str], dict[str, Any]] = {}  # what /admin/status publishes
         # The running route's shorter loop and the epoch it was worked out for. Status only reads it.
         self.proposal: tuple[int, dict[str, Any] | None] = (0, None)
+        self.row_readings: dict[tuple[str, str, str, str, bool], float] = {}  # ms a layer, see row_key
         # The proven address each link of the route uses, where it is not the advertised one.
         self.hops: dict[tuple[str, str], str] = {}
         self.hops_checked_at = float("-inf")
@@ -1094,6 +1104,7 @@ class Orchestrator:
 
     async def maintenance_pass(self) -> None:
         await self.refresh_worker_metrics()
+        self.note_rows()
         if not self.coordinating:
             return
         self._review_quarantine()
@@ -1839,30 +1850,90 @@ class Orchestrator:
         if not preview:
             self.add_event("model", f"{target.slots} at once", target.parallel["reason"])
 
-    async def _fit_slots(self, target: ModelTarget, route: list[StageAssignment], links: dict[tuple[str, str], float]) -> dict[str, Any]:
-        """As many slots as the route wants and can hold, on the same workers, with no more spilled."""
+    def note_rows(self) -> None:
+        """Keep what the running route's stages measured a row to take, for a later load of the model.
+
+        Only a worker's report for the stage it holds now counts. It is kept per layer, because
+        the next load may plan a few layers more or fewer on the same device.
+        """
+        target = self.active
+        if target is None or not self.route:
+            return
         preferred, standby = self.candidate_groups()
-        wanted = wanted_slots(route, stage_devices(route, preferred + standby), links, target.profile.ring)
-        if wanted is None:
+        for index, (stage, device) in enumerate(zip(self.route, stage_devices(self.route, preferred + standby))):
+            record = self.workers.get(stage.worker_id)
+            health = (record.health if record else None) or {}
+            held = health.get("assignment") or {}
+            row = telemetry_of(record).get("row_ms_ema")
+            same = health.get("model") == target.model_id and health.get("epoch") == self.epoch
+            if row and same and (held.get("start_layer"), held.get("end_layer")) == (stage.start_layer, stage.end_layer):
+                key = row_key(target, stage, device, index == len(self.route) - 1)
+                self.row_readings[key] = float(row) / (stage.end_layer - stage.start_layer)
+
+    def measured_rows(self, target: ModelTarget, route: list[StageAssignment], devices: list[str]) -> list[float] | None:
+        """Each stage's row as this model measured it before on the same device, or None unless all are known."""
+        rows = []
+        for index, (stage, device) in enumerate(zip(route, devices)):
+            per_layer = self.row_readings.get(row_key(target, stage, device, index == len(route) - 1))
+            if per_layer is None:
+                return None
+            rows.append(per_layer * (stage.end_layer - stage.start_layer))
+        return rows
+
+    async def _fit_slots(self, target: ModelTarget, route: list[StageAssignment], links: dict[tuple[str, str], float]) -> dict[str, Any]:
+        """As many slots as the route wants and can hold, on the same workers, with no more spilled.
+
+        Each slot's cache can push layers onto a slower device of the same workers, which spills
+        nothing but makes a row longer. So each count is judged by the route it would get.
+        A row's time from memory speed is the best a device can do, and on a laptop CPU real ones
+        took two to four times as long. So until the model has run on these devices, a load takes
+        half of what that wants, and a later load uses what the stages measured.
+        """
+        preferred, standby = self.candidate_groups()
+
+        def wants(plan: list[StageAssignment]) -> dict[str, Any] | None:
+            devices = stage_devices(plan, preferred + standby)
+            return wanted_slots(plan, devices, links, target.profile.ring, self.measured_rows(target, plan, devices))
+
+        def goal(choice: dict[str, Any]) -> int:
+            return choice["wanted"] if choice["measured"] else max(choice["wanted"] // 2, 1)
+
+        chosen = wants(route)
+        if chosen is None:
             return {"auto": True, "slots": 1, "reason": "a link on this route has not been measured, so nothing says more would help"}
         workers = {stage.worker_id for stage in route}
         spilled = self.plan_memory(target, route)["spilled_bytes"]
+        crowded: set[int] = set()  # counts that would fit, but on a route that wants fewer
 
-        async def fits(slots: int) -> bool:
+        async def judged(slots: int) -> dict[str, Any] | None:
+            """What the route at this many slots wants, if it holds them as it should."""
             await asyncio.sleep(0)  # a plan on a big pool takes seconds, and heartbeats must not wait for several
             with_slots(target, slots)
             plan = self._route_or_none(target, links)
-            return plan is not None and {stage.worker_id for stage in plan} == workers and self.plan_memory(target, plan)["spilled_bytes"] <= spilled
+            if plan is None or {stage.worker_id for stage in plan} != workers or self.plan_memory(target, plan)["spilled_bytes"] > spilled:
+                return None
+            choice = wants(plan)
+            if choice is not None and slots <= goal(choice):
+                return choice
+            crowded.add(slots)
+            return None
 
-        low, high = (wanted["wanted"], wanted["wanted"] + 1) if await fits(wanted["wanted"]) else (1, wanted["wanted"])
+        low, high = 1, goal(chosen) + 1
         while high - low > 1:
             middle = (low + high) // 2
-            low, high = (middle, high) if await fits(middle) else (low, middle)
+            choice = await judged(middle)
+            low, high, chosen = (middle, high, choice) if choice is not None else (low, middle, chosen)
         with_slots(target, low)
-        trip = f"a {wanted['round_trip_ms']:.1f} ms round trip at {wanted['row_ms']:.1f} ms a row wants {wanted['wanted']}"
-        if wanted["devices"] == 1:
+        trip = f"a {chosen['round_trip_ms']:.1f} ms round trip at {chosen['row_ms']:.1f} ms a row"
+        if chosen["devices"] == 1:
             trip = "every stage runs on one device, so replies could only take turns on it"
-        return {"auto": True, "slots": low, **wanted, "reason": trip if low == wanted["wanted"] else f"{trip}, and {low} fit in memory"}
+        elif chosen["measured"]:
+            trip = f"{trip}, as this model measured on these devices, wants {goal(chosen)}"
+        else:
+            trip = f"{trip}, from memory speeds, would want {chosen['wanted']}; with nothing measured yet a load takes {goal(chosen)}"
+        if low < goal(chosen):
+            trip += f", and {low + 1} would put layers on slower devices" if low + 1 in crowded else f", and {low} fit in memory"
+        return {"auto": True, "slots": low, **chosen, "reason": trip}
 
     def plan_or_refuse(self, target: ModelTarget, **options: Any) -> list[StageAssignment]:
         try:
