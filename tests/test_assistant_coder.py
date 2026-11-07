@@ -1064,3 +1064,33 @@ def test_a_command_tells_the_owner_what_to_do(tmp_path, capsys):
         assert "code list" in capsys.readouterr().out
         assert run_command(bare, "code", "start", "--repo", str(tmp_path), "x") == 1
         assert "needs the router part" in capsys.readouterr().out
+
+
+# What testing the work tells the router
+
+
+class Told(ScriptedRouter):
+    def __init__(self, *arguments, **options) -> None:
+        super().__init__(*arguments, **options)
+        self.outcomes: list[tuple] = []
+
+    def record_outcome(self, model, role, success, provider=None) -> None:
+        self.outcomes.append((model, role, success, provider))
+
+
+def test_tests_that_pass_and_fail_tell_the_router_about_the_coding_model(assistant, repo):
+    assistant.router = Told([f"<<<FILE calc.py\n{BROKEN}# still wrong\n>>>FILE\n", FIX_AS_FILE])
+    assert assistant.coder.start(repo, "Fix add").state == READY
+    assert assistant.router.outcomes == [("coding-model", "coding", False, "local"), ("coding-model", "coding", True, "local")]
+
+
+def test_a_reply_that_cannot_be_applied_counts_against_it(assistant, repo):
+    assistant.router = Told(["nothing usable here", FIX_AS_FILE])
+    assert assistant.coder.start(repo, "Fix add").state == READY
+    assert assistant.router.outcomes[0] == ("coding-model", "coding", False, "local")
+
+
+def test_a_reviewers_opinion_is_not_a_check(assistant, repo):
+    assistant.router = Told([FIX_AS_FILE], ['{"verdict": "changes", "notes": "Hm."}', '{"verdict": "accept", "notes": "Fine."}'])
+    assistant.coder.start(repo, "Fix add")
+    assert {row[1] for row in assistant.router.outcomes} == {"coding"}

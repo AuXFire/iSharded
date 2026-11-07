@@ -1608,6 +1608,8 @@ class DurableTasks:
         outcome = perform(task, step, spec, outputs, inputs)
         if outcome.ok and "expect" in spec:
             met, why = run_check(render(spec["expect"], outputs, inputs)[0], outputs, {"output": outcome.output, "data": outcome.data, "ok": True})
+            if spec["kind"] == "model":
+                self._tell_router(outcome.data, met)
             if not met:
                 outcome.ok, outcome.error = False, f"It ran, but the result failed its check: {why}."
         return outcome
@@ -1672,6 +1674,7 @@ class DurableTasks:
         target = check.get("step")
         used = {*used, target} if target in outputs else used
         passed, why = run_check(check, outputs)
+        self._tell_router_about(task["id"], used, passed)
         return Outcome(
             passed,
             f"Passed: {why}." if passed else "",
@@ -1681,6 +1684,29 @@ class DurableTasks:
             self._reach(task, outputs, used),
             Trust.VERIFIED.value,
         )
+
+    def _tell_router(self, data: Mapping[str, Any], held_up: bool) -> None:
+        """A reply counted as a success when it arrived. Checking it says whether it deserved to."""
+        report = getattr(getattr(self.assistant, "router", None), "record_outcome", None)
+        if report is not None:
+            report(data["model"], data["role"], held_up, provider=data["provider"])
+
+    def _tell_router_about(self, task_id: str, used: Iterable[str], passed: bool) -> None:
+        """Only a model step counts: a tool's data is its own, and may name any model it likes.
+
+        A reply loses its success once, however many checks it fails, or it would take
+        away successes that other replies earned.
+        """
+        for name in used:
+            row = self._step(task_id, name)
+            data = json.loads(row["data"]) if row["data"] else {}
+            if row["kind"] != "model" or data.get("failed_a_check"):
+                continue
+            self._tell_router(data, passed)
+            if not passed:
+                self.store.execute(
+                    "UPDATE task_steps SET data = ? WHERE task_id = ? AND step_id = ?", (json.dumps({**data, "failed_a_check": True}), task_id, name)
+                )
 
     def _settle(self, task_id: str, step_id: str, attempt: int, outcome: Outcome) -> None:
         """Write the result. One transaction, so a crash leaves all of it or none."""

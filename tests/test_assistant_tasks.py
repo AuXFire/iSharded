@@ -1974,3 +1974,86 @@ def test_a_plan_with_no_tools_is_general_and_its_title_is_its_goal(engine):
 def test_a_bad_task_type_is_refused(engine, value):
     with pytest.raises(ValueError, match="task_type"):
         engine.submit("ann", {"task_type": value, "steps": [{"id": "a", "kind": "wait", "seconds": 1}]})
+
+
+# What checks tell the router
+
+
+class Answers:
+    """A router that answers, and keeps what it is told about how those answers held up."""
+
+    def __init__(self, text="ok"):
+        self.text = text
+        self.outcomes = []
+
+    def complete(self, request):
+        return ModelReply(self.text, (), "m", "p", 1, 1, 0.0)
+
+    def record_outcome(self, model, role, success, provider=None):
+        self.outcomes.append((model, role, success, provider))
+
+
+def model_step(step_id="answer", **fields):
+    return {"id": step_id, "kind": "model", "role": "worker", "prompt": "Say it.", **fields}
+
+
+def check_of(step_id, target="answer", pattern="yes"):
+    return {"id": step_id, "kind": "check", "depends_on": [target], "check": {"type": "regex", "text": f"{{{{steps.{target}.output}}}}", "pattern": pattern}}
+
+
+def test_a_check_that_fails_tells_the_router_about_the_model_it_checked(assistant, engine):
+    assistant.router = Answers("no")
+    run(engine, {"title": "t", "steps": [model_step(), check_of("c")]})
+    assert assistant.router.outcomes == [("m", "worker", False, "p")]
+
+
+def test_a_check_that_passes_says_so_too(assistant, engine):
+    assistant.router = Answers("yes")
+    run(engine, {"title": "t", "steps": [model_step(), check_of("c")]})
+    assert assistant.router.outcomes == [("m", "worker", True, "p")]
+
+
+def test_a_reply_loses_its_success_once_however_many_checks_it_fails(assistant, engine):
+    assistant.router = Answers("no")
+    steps = [model_step(), {**check_of("c1"), "on_failure": "continue"}, {**check_of("c2"), "on_failure": "continue"}]
+    run(engine, {"title": "t", "steps": steps})
+    assert assistant.router.outcomes == [("m", "worker", False, "p")]
+
+
+def test_an_expectation_on_a_model_step_is_a_check_of_that_reply(assistant, engine):
+    assistant.router = Answers("no")
+    run(engine, {"title": "t", "steps": [model_step(expect={"type": "regex", "pattern": "yes"}, retries=1, backoff_seconds=0)]})
+    assert assistant.router.outcomes == [("m", "worker", False, "p")] * 2  # each try was its own reply
+
+
+def test_a_tool_cannot_blame_a_model_through_its_own_data(assistant, engine):
+    """A plugin writes its own data, so what it says there about a model counts for nothing."""
+    assistant.router = Answers()
+
+    def lying(arguments, context):
+        return {"output": "no", "model": "good-model", "provider": "p", "role": "worker"}
+
+    tool(assistant, "liar.run", lying)
+    step = tool_step("answer", "liar.run")
+    run(engine, {"title": "t", "steps": [step, check_of("c")]})
+    assert assistant.router.outcomes == []
+
+
+def test_a_real_failed_check_takes_a_success_back_from_the_models_numbers(assistant, engine):
+    from test_assistant_fakes import FakeProvider
+
+    assistant.providers.register(FakeProvider("p", text="no", model="m"))
+    assistant.router.set_route("worker", ["p"])
+    run(engine, {"title": "t", "steps": [model_step(), check_of("c")]})
+    row = next(row for row in assistant.router.stats("worker"))
+    assert (row["runs"], row["successes"]) == (1, 0)
+
+
+def test_tasks_run_with_a_router_that_cannot_be_told(assistant, engine):
+    class Plain:
+        def complete(self, request):
+            return ModelReply("yes", (), "m", "p", 1, 1, 0.0)
+
+    assistant.router = Plain()
+    task = run(engine, {"title": "t", "steps": [model_step(), check_of("c")]})
+    assert status(engine, task) == "done"

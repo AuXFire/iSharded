@@ -612,6 +612,7 @@ class Coder:
             self._check_result(run)
         except UnusableChange as error:
             self._restore(run)
+            self._tell_router(run, False)
             self.audit.record("coder", "coder.change_refused", run.branch, {"run": run.id, "reason": str(error)})
             self._retry_or_stop(run, f"Your last reply could not be applied: {error}", str(error))
             return
@@ -667,13 +668,22 @@ class Coder:
 
     def _test(self, run: Run) -> None:
         if not run.applied:
+            self._tell_router(run, False)
             self._retry_or_stop(run, "Your last reply changed nothing.", "the model changed nothing")
             return
         result = self._run_tests(run, run.test_command, run.round)
+        self._tell_router(run, self._passed(result))
         if self._passed(result):
             self._save(run.id, state=REVIEWING, feedback="")
         else:
             self._retry_or_stop(run, f"The tests failed:\n{self._output(result)}", "the tests still fail")
+
+    def _tell_router(self, run: Run, held_up: bool) -> None:
+        """A coding reply counted as a success when it arrived. Applying and testing it say whether it deserved to."""
+        report = getattr(self.assistant.router, "record_outcome", None)
+        row = self.store.one("SELECT model, provider FROM coder_models WHERE run_id = ? AND round = ? AND role = 'coding' ORDER BY id DESC", (run.id, run.round))
+        if report is not None and row is not None:
+            report(row["model"], "coding", held_up, provider=row["provider"])
 
     @staticmethod
     def _passed(result: SandboxResult) -> bool:
