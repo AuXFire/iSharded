@@ -84,7 +84,12 @@ def stage(name, start, end, ms):
 def test_a_route_wants_its_round_trip_over_its_slowest_row():
     route = [stage("a", 0, 4, 10.0), stage("b", 4, 8, 20.0)]
     # 10 + 20 of work, and 25 + 1 ms each way round the ring.
-    assert wanted_slots(route, ["a", "b"], {("a", "b"): 50.0}, True) == {"round_trip_ms": 82.0, "row_ms": 20.0, "devices": 2, "wanted": 5}
+    assert wanted_slots(route, ["a", "b"], {("a", "b"): 50.0}, True) == {"round_trip_ms": 82.0, "row_ms": 20.0, "devices": 2, "wanted": 4}
+
+
+def test_a_trip_of_less_than_two_rows_stays_at_one():
+    route = [stage("a", 0, 4, 2.0), stage("b", 4, 8, 12.0)]
+    assert wanted_slots(route, ["a", "b"], {("a", "b"): 6.0}, True)["wanted"] == 1
 
 
 def test_a_lone_stage_has_nothing_to_overlap():
@@ -165,7 +170,7 @@ def test_a_load_with_room_takes_what_the_route_wants(pool):
     choose(pool, wanted)
     route = pool.plan(wanted)
     assert wanted.slots == wanted.parallel["slots"] == wanted.parallel["wanted"] > 1
-    assert wanted.slots == math.ceil(wanted.parallel["round_trip_ms"] / wanted.parallel["row_ms"])
+    assert wanted.slots == math.floor(wanted.parallel["round_trip_ms"] / wanted.parallel["row_ms"])
     assert wanted.profile.kv_bytes_per_token == [KV_PER_TOKEN * wanted.slots] * LAYERS
     assert str(wanted.slots) in wanted.parallel["reason"]
     assert {item.worker_id for item in route} == {"a", "b"}

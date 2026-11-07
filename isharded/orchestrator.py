@@ -553,10 +553,11 @@ def stage_devices(route: list[StageAssignment], candidates: list[Candidate]) -> 
 def wanted_slots(route: list[StageAssignment], devices: list[str], links: dict[tuple[str, str], float], ring: bool) -> dict[str, Any] | None:
     """How many replies keep a route's busiest device working, or None if a link on it is unmeasured.
 
-    While one reply goes round, that device can serve round trip / row time others. Stages on
-    one device take turns on it, so their rows add up. A route on a single device has nothing
-    to overlap: measured with two stages on one GPU, two slots took two replies from 128 to 70
-    tokens/s, because neither stage can run while the other does.
+    While one reply goes round, that device can serve round trip / row time others, and only
+    whole rows count. Replies that share a route without sharing passes cost each other: measured
+    with a CPU and a GPU stage, a trip of 1.8 rows gave two replies 58 tokens/s on two slots and 70
+    on one. Stages on one device take turns on it, so their rows add up, and a route on a single
+    device has nothing to overlap: two stages on one GPU went from 128 to 70 at two slots.
     """
     names = [stage.worker_id for stage in route]
     hops = list(pairwise(names)) + ([(names[-1], names[0])] if ring and len(names) > 1 else [])
@@ -567,7 +568,7 @@ def wanted_slots(route: list[StageAssignment], devices: list[str], links: dict[t
         busy[device] += stage_ms(stage)
     row = max(busy.values())
     round_trip = sum(busy.values()) + route_network_ms(route, links, ring)
-    wanted = min(math.ceil(round_trip / row), MAX_PARALLEL) if len(busy) > 1 else 1
+    wanted = min(math.floor(round_trip / row), MAX_PARALLEL) if len(busy) > 1 else 1
     return {"round_trip_ms": round(round_trip, 2), "row_ms": round(row, 2), "devices": len(busy), "wanted": wanted}
 
 

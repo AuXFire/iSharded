@@ -1567,7 +1567,7 @@ No reply waits for a copy to be sent. A newer turn replaces one still queued, so
 
 `--parallel 3` gives every stage three independent sequences, each with its own context memory, which the planner counts. Replies from any node queue at the entry worker, and take the sequence idle longest. Any sequence can take any saved state, so conversations past `--parallel` wait their turn and do not reread their history. While one reply is away at the next stage, this stage works on another.
 
-Leave `--parallel` out and the load chooses, as `min(ceil(R / T), fits)`, kept between 1 and 64:
+Leave `--parallel` out and the load chooses, as `min(floor(R / T), fits)`, kept between 1 and 64:
 
 | Part | What it is |
 |---|---|
@@ -1575,7 +1575,7 @@ Leave `--parallel` out and the load chooses, as `min(ceil(R / T), fits)`, kept b
 | `T` | The time the busiest device spends on one row. Stages that share a device add up on it |
 | `fits` | The most slots the same workers can hold without moving more weights out of the fastest memory. The draft's cache counts on the entry |
 
-Stages that all run on one device stay at 1, because they can only take turns on it: two stages on one GPU went from 128 tokens per second for two replies to 70 with two slots. A link nobody has measured also means 1. `--parallel` always wins.
+Only whole rows count, because replies that share a route without sharing passes cost each other: with a CPU stage and a GPU stage and a trip of 1.8 rows, two replies made 70 tokens per second on one slot and 58 on two. Stages that all run on one device stay at 1, because they can only take turns on it: two stages on one GPU went from 128 tokens per second for two replies to 70 with two slots. A link nobody has measured also means 1. `--parallel` always wins, and on one machine it can pay: on CPU stages, eight replies went from about 14 tokens per second to about 27 at `--parallel 8`, because they share passes, and their first tokens came in 1 second and not 15, though each reply ran about four times slower.
 
 `active_plan.parallel` in `/admin/status` is the number, and `active_plan.parallel_choice` says why, with `reason`, `round_trip_ms`, `row_ms`, `devices`, and `wanted`. `POST /admin/plan` shows what a load would choose. Slots are part of what a stage is, so changing them restarts it. The choice therefore stands through repairs, a coordinator restart, and the same load again. It is made afresh only by another load, or when the pool has lost so much that the model would not fit at it.
 
