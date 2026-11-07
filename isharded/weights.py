@@ -805,7 +805,7 @@ def fetch_from_peer(
     expected = len(prefix) + unit.nbytes
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_name(f"{destination.name}.{os.getpid()}.{threading.get_ident()}.peer.part")
-    owned = client or httpx.Client(event_hooks={"request": [stay_on_this_machine]}, timeout=httpx.Timeout(60.0, connect=5.0), verify=client_verify(), auth=client_auth())
+    owned = client or httpx.Client(event_hooks={"request": [stay_on_this_machine]}, timeout=httpx.Timeout(60.0, connect=5.0), trust_env=False, verify=client_verify(), auth=client_auth())
     headers = auth_headers(token)
     params = {"model_id": model_id, "revision": revision, "unit": unit.name}
     received = 0

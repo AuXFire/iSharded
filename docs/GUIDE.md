@@ -1125,7 +1125,7 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `POST` | `/api/pull`, `/api/push`, `/api/create`, `/api/copy` | User key | Refused with a 400 that says to load models through iSharded |
 | `DELETE` | `/api/delete` | User key | The same |
 | `POST` | `/mcp` | User key | [MCP](#mcp) over Streamable HTTP. `GET` and `DELETE` answer 405, since there is no stream or session |
-| `GET` | `/admin/status` | User key | Workers and their `country`, memory pools, route, epoch, mesh, lanes, load progress, and the last answer check |
+| `GET` | `/admin/status` | User key | Workers and their `country`, memory pools, route, measured [`links`](#what-a-route-costs), epoch, mesh, lanes, load progress, and the last answer check |
 | `GET` | `/admin/catalog` | User key | Suggested models and supported architectures |
 | `POST` | `/admin/plan` | Admin key | Show where a model would run, without moving anything |
 | `POST` | `/admin/load` | Admin key | Load a model |
@@ -1719,6 +1719,34 @@ The ends of the pipeline are not equal: the exit reads the whole output head for
 An explicit `--gpu-memory-gb` is a hard allocator limit on CUDA and ROCm. RAM and disk budgets are enforced by placement. Disk is a capacity tier: expect it to be far slower than RAM once a model outgrows the OS page cache.
 
 The dashboard's "Memory for weights" counts weights only. Real use is higher, because KV cache, compute buffers, a draft model, and each worker's GPU context come on top.
+
+A pool that measures 0 bytes free counts as full. A pool that was never measured, which shows as no size at all, keeps its budget.
+
+### What a route costs
+
+`/admin/status` publishes what the planner works from, so a route can be modelled from outside with a user key.
+
+`links` lists every link measured so far, by worker id and never by address. Links are not shared across the mesh, so it stays empty on each coordinator until that coordinator's first load or plan. A later load or plan measures a link again once it is ten minutes old, or at once for a model with rows of another size.
+
+| Field | Meaning |
+|---|---|
+| `source`, `target` | Worker ids. The link is timed from `source`, the end that would send |
+| `median_ms`, `max_ms` | Round trip of a 100-byte probe over HTTP. Both are `null` if the link failed |
+| `cost_ms` | What the planner charges for this link: the median, half the swing up to the maximum, and the transfer time of one row. A failed link costs 10000 |
+| `checked_at` | When it was measured, in Unix time |
+
+A row is `hidden_size * 4` bytes. Its transfer time is how much longer the median round trip takes with a row than with the 100-byte probe, and never less than zero. Only that difference counts, because the probe's HTTP overhead is already in the base cost.
+
+Each stage in `route` and in `active_plan.route` has a `read_bytes` object, with what the stage reads per token at the size its pools hold it:
+
+| Field | Meaning |
+|---|---|
+| `dense` | Attention and other dense weights of its layers |
+| `experts` | Routed experts of its layers, already multiplied by the share a token uses |
+| `embedding` | The whole embedding table, on the entry stage. A token touches one row of it, so the planner counts this as free. Leave it out of a sum of bytes read |
+| `head` | The output head, on the exit stage. On one worker a tied table counts once, here, and `embedding` is 0 |
+
+A route restored from a node running an older version shows zeros here until the model loads again.
 
 ### Mixed hardware
 

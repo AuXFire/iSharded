@@ -326,11 +326,14 @@ class LaneDoor:
             try:
                 url, target = self._target(name)
                 path = "/v1/chat/completions"
-                response = await self.runtime.client.post(url + path, timeout=300.0, **self._sending(caller, path, target, payload))
+                # A silent host fails to connect in seconds, or ten tries would wait the whole 300 s each.
+                response = await self.runtime.client.post(url + path, timeout=httpx.Timeout(300.0, connect=10.0), **self._sending(caller, path, target, payload))
                 if response.status_code != 503:
                     response.raise_for_status()
                     return str(response.json()["choices"][0]["message"]["content"])
-            except HTTPException:
+            except (httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout):
+                raise  # silent for the whole wait is no change of coordinator, and ten more would take an hour
+            except (HTTPException, httpx.TransportError):
                 pass  # no coordinator this moment
             await asyncio.sleep(3.0)
             await self._look(name)
