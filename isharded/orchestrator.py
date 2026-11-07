@@ -2098,6 +2098,19 @@ class Orchestrator:
     ) -> list[StageAssignment]:
         """Plan, fetch, and activate, replanning around workers that fail."""
         job.total_bytes = target.profile.total_bytes
+        tables = (self.links, self.links_checked, self.link_readings)
+        kept = self.link_row_bytes, [dict(table) for table in tables]
+        try:
+            return await self._deploy(target, job, generation_lock_held=generation_lock_held)
+        except BaseException:
+            # Those costs were measured at this load's row size. The route still running plans by its own.
+            self.link_row_bytes = kept[0]
+            for table, before in zip(tables, kept[1]):
+                table.clear()
+                table.update(before)
+            raise
+
+    async def _deploy(self, target: ModelTarget, job: LoadJob, *, generation_lock_held: bool) -> list[StageAssignment]:
         for _ in range(MAX_DEPLOY_ATTEMPTS):
             await self.refresh_worker_metrics()
             await self.refresh_holdings(target)

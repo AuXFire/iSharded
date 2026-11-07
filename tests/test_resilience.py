@@ -320,6 +320,29 @@ def test_a_live_node_failing_never_moves_the_whole_model(monkeypatch):
     assert not orchestrator.workers["w1"].quarantined
 
 
+def test_a_failed_load_leaves_the_running_routes_link_costs_as_they_were(monkeypatch):
+    orchestrator, _ = deploy_pool(monkeypatch, [{"w1": "out of memory"}] * 3, 15 * 1024**3)
+    orchestrator.link_row_bytes = 4096
+    orchestrator.links[("w1", "w2")] = 5.0
+    orchestrator.link_readings[("w1", "w2")] = {"cost_ms": 5.0}
+    orchestrator.links_checked[("w1", "w2")] = 1.0
+
+    async def measure_links(row):
+        orchestrator.link_row_bytes = row
+        orchestrator.links[("w1", "w2")] = orchestrator.links[("w2", "w1")] = 80.0
+        orchestrator.link_readings[("w1", "w2")] = {"cost_ms": 80.0}
+        orchestrator.links_checked[("w1", "w2")] = 2.0
+
+    orchestrator.measure_links = measure_links
+    monkeypatch.setattr(orchestrator_module, "row_bytes", lambda target: 65536)
+    with pytest.raises(orchestrator_module.HTTPException):
+        run_deploy(orchestrator)
+    assert orchestrator.link_row_bytes == 4096
+    assert orchestrator.links == {("w1", "w2"): 5.0}
+    assert orchestrator.link_readings == {("w1", "w2"): {"cost_ms": 5.0}}
+    assert orchestrator.links_checked == {("w1", "w2"): 1.0}
+
+
 def test_a_small_replan_around_a_failing_node_goes_ahead(monkeypatch):
     failure = {"w1": "out of memory"}
     orchestrator, attempts = deploy_pool(monkeypatch, [failure, failure, failure, {}], 1024)
