@@ -1045,6 +1045,22 @@ def test_a_reply_with_nothing_to_guess_with_runs_as_it_always_did(lookup_only, m
     assert lookup_only[1].rollback_to is None, "this is the plain path"
 
 
+def test_the_first_pass_off_a_pipeline_does_not_count_against_the_way_it_went_to(lookup_only, monkeypatch) -> None:
+    ring = Ring()
+    on_ring(monkeypatch, ring)
+    notes: list[tuple[str, int]] = []
+
+    class Noted(worker_module.DraftChoice):
+        def note(self, way: str, tokens: int, seconds: float) -> None:
+            notes.append((way, tokens))
+            super().note(way, tokens, seconds)
+
+    monkeypatch.setattr(worker_module.runtime, "draft_choice", Noted())
+    body = GenerateRequest(session_id="s", epoch=1, input_ids=QUOTING_PROMPT, max_tokens=7, reset=True)
+    assert len(asyncio.run(stream_of(body))) == 7
+    assert notes == [("pipelined", 4), ("plain", 1)], "the pass that landed the pipeline went unmeasured"
+
+
 def test_the_choice_can_leave_a_lookup_pipeline_and_come_back(lookup_only, monkeypatch) -> None:
     ring = Ring()
     on_ring(monkeypatch, ring)

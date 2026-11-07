@@ -2474,6 +2474,7 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
                 runtime.pipeline_depth = pipe.depth()
                 runtime.draft_choice.note(way, pipe.tokens_made - made, time.perf_counter() - began)
                 continue
+            landing = pipe is not None
             if pipe is not None:
                 await pipe.land()
                 pipe = None
@@ -2488,7 +2489,10 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
                 runtime.draft_passes += 1
                 runtime.draft_accepted += len(accepted)
                 ahead = next_guess_count(ahead, len(accepted) - 1, runtime.speculate_tokens)
-            runtime.draft_choice.note(way, len(accepted), time.perf_counter() - began)
+            # The first pass off a pipeline waits behind what was out, which says nothing about
+            # this way, and a trial is too short to carry that. The next pass is the trial.
+            if not landing:
+                runtime.draft_choice.note(way, len(accepted), time.perf_counter() - began)
             for token in accepted[:room]:
                 yield token
                 produced += 1
