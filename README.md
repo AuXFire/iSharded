@@ -51,7 +51,7 @@ The [full list](docs/GUIDE.md#what-it-does) is in the guide.
 
 ## Install
 
-You need Python 3.10 or newer. These install iSharded for your user only, and pick a PyTorch build for your hardware.
+One step, with nothing to install first and no administrator. It sets up Python, picks a PyTorch build for your hardware, adds the native engine from the latest release, and starts a node. It offers to join a mesh it finds on your network, and ends with the chat page open.
 
 On Windows, in PowerShell:
 
@@ -65,7 +65,7 @@ On Linux or macOS:
 curl -fsSL https://raw.githubusercontent.com/AuXFire/iSharded/main/install.sh | sh
 ```
 
-Then `isharded doctor` checks the machine, and says what to fix if anything is missing. To install by hand, see [Install](docs/GUIDE.md#install).
+Or take a one-click package from the [releases](https://github.com/AuXFire/iSharded/releases): `iSharded-Setup.exe`, `iSharded.pkg`, or a `.deb`. They are not signed yet, so [Windows and macOS warn once](docs/GUIDE.md#unsigned-packages). `isharded doctor` checks the machine, and says what to fix. For options, or to install by hand, see [Install](docs/GUIDE.md#install).
 
 ## Quick start
 

@@ -1,0 +1,11 @@
+Package: isharded
+Version: __VERSION__
+Architecture: __ARCHITECTURE__
+Maintainer: The iSharded project <https://github.com/AuXFire/iSharded/issues>
+Section: net
+Priority: optional
+Homepage: https://github.com/AuXFire/iSharded
+Depends: ca-certificates, libgomp1, curl | wget
+Description: Run one language model across a decentralized pool of machines
+ This package holds the installer and this release's wheel. iSharded itself
+ installs for each person who runs it, in ~/.isharded, and needs no root.

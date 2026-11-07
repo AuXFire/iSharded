@@ -1,0 +1,6 @@
+#!/bin/sh
+# What opening iSharded.app runs. The first run needs Terminal: it shows the install, and may ask about a mesh.
+if [ -x "$HOME/.isharded/app/bin/isharded" ] && [ -f "$HOME/.isharded/up/settings.json" ]; then
+  exec "$HOME/.isharded/app/bin/isharded" up --background
+fi
+exec open -a Terminal "$(dirname "$0")/../Resources/first-run.command"

@@ -1,0 +1,16 @@
+#!/bin/sh
+# The package installs as root, and iSharded installs for a person, so this hands over to them.
+# A failure here must not leave dpkg with a broken package: the isharded command tries again.
+set -e
+[ "$1" = configure ] || exit 0
+
+user=${SUDO_USER:-}
+if [ -z "$user" ] || [ "$user" = root ]; then
+  echo "Run isharded up, or open iSharded from your applications, to finish installing."
+  exit 0
+fi
+home=$(getent passwd "$user" | cut -d: -f6)
+wheel=$(ls /usr/lib/isharded/isharded-*.whl)
+runuser -u "$user" -- env HOME="$home" ISHARDED_SOURCE="$wheel" sh /usr/lib/isharded/install.sh ||
+  echo "iSharded did not finish installing. Run isharded up to try again."
+exit 0

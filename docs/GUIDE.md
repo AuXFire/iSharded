@@ -61,7 +61,7 @@ More detail lives in [Operating iSharded](OPERATIONS.md), [iSharded security](SE
 
 ## Install
 
-You need Python 3.10 or newer. These install iSharded for your user only, and pick a PyTorch build for your hardware.
+One step on each platform, and you do not need Python first. These install iSharded for your user only, with no administrator, and start it.
 
 On Windows, in PowerShell:
 
@@ -75,9 +75,76 @@ On Linux or macOS:
 curl -fsSL https://raw.githubusercontent.com/AuXFire/iSharded/main/install.sh | sh
 ```
 
-Then `isharded doctor` checks the machine, and says what to fix if anything is missing.
+Or use a [one-click package](#one-click-packages). The end is the same: the node is running in the background, and the chat page is open.
 
-The installers pick a CUDA build of PyTorch where they find an NVIDIA GPU. They pick a CPU build on Windows without one, and on Linux with no GPU tools at all. Anywhere else they take PyTorch's default build, which on Linux is not a ROCm one. A GPU PyTorch cannot see, such as an AMD card on Windows, still works for GGUF models: the node finds it through llama.cpp's Vulkan build. See [Any GPU](#any-gpu).
+### What the installers do
+
+1. Fetch [uv](https://github.com/astral-sh/uv) at a pinned version, and check it against a pinned SHA-256. uv then provides Python 3.12 and the environment, beside the install.
+2. Pick a PyTorch build. They pick a CUDA build where they find an NVIDIA GPU. They pick a CPU build on Windows without one, and on Linux with no GPU tools at all. Anywhere else they take PyTorch's default build, which on Linux is not a ROCm one. A GPU PyTorch cannot see, such as an AMD card on Windows, still works for GGUF models: the node finds it through llama.cpp's Vulkan build. See [Any GPU](#any-gpu).
+3. Pick this platform's wheel from the latest GitHub Release, which has the [native engine](#the-native-engine) in it, and check it against the release's `SHA256SUMS`. A file that fails the check stops the install. There are wheels for Linux on x86_64 and aarch64 with glibc 2.28 or newer, Windows on x86_64, and macOS on Apple Silicon. Other machines get the pure wheel, which has no engine.
+4. Add `isharded` to your PATH. On Linux and macOS that means a link in `~/.local/bin`, and a line in your shell's profile if that folder is not on your PATH yet.
+5. On Linux, check for the one system library GGUF models need, and say how to add it if it is missing.
+6. Run `isharded up --background`, which works out the address, encryption, GPU, RAM, CPU, and model folders, prints what it found, and offers to join a mesh it finds on your LAN or tailnet. Then the chat page opens, and the last lines say what to do next.
+
+With no release yet, or no way to reach one, they fall back to the source archive. That install has no native engine, and they say so, because the fast path is then off. Run them again once a release has a wheel for your machine, or build the engine yourself. `isharded doctor` says at any time whether the engine is there, and a node without it says so in its events.
+
+Run them again to upgrade. They stop a running node first, and start it again unless you say `--no-start`.
+
+The Linux and macOS script takes options after `sh -s --`. The PowerShell script takes the same ones through a script block:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AuXFire/iSharded/main/install.sh | sh -s -- --no-start
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/AuXFire/iSharded/main/install.ps1))) --no-start
+```
+
+| Option | What it does |
+|---|---|
+| `--no-start` | Install the files, and start nothing |
+| `--service` | Also start this node at login, through `isharded service install` |
+
+| Setting | What it does |
+|---|---|
+| `ISHARDED_INSTALL_DIR` | Where the environment goes. uv and its Python go beside it. Default: `%LOCALAPPDATA%\iSharded\venv` on Windows, `~/.isharded/app` elsewhere |
+| `ISHARDED_SOURCE` | A wheel, archive, or URL to install in place of the release. Its hash is not checked, because you chose it |
+| `ISHARDED_RELEASE_URL` | Where a mirror keeps a release's files, with its `SHA256SUMS`. The same checks apply |
+| `ISHARDED_UV_URL` | Where a mirror keeps uv's files. The pinned hash still applies |
+
+On a closed network, set `ISHARDED_RELEASE_URL` and `ISHARDED_UV_URL`, and uv's own `UV_PYTHON_INSTALL_MIRROR` for Python.
+
+Antivirus that inspects HTTPS breaks tools that bring their own certificates. The installers set uv's `UV_SYSTEM_CERTS=1`, so uv trusts what this machine trusts. With `pip`, add `--use-feature=truststore` for the same effect.
+
+### One-click packages
+
+Each [release](https://github.com/AuXFire/iSharded/releases) has these, and each carries that release's wheel. They run the install above, so they also need the internet, for uv, Python, and PyTorch.
+
+| Platform | File | What you get |
+|---|---|---|
+| Windows | `iSharded-Setup.exe` | A per-user install with no administrator. A window shows the install, and the Start Menu gets Open iSharded, Stop iSharded, and Uninstall iSharded |
+| macOS on Apple Silicon | `iSharded.pkg` | `iSharded.app` in Applications, which needs your password as any package there does. The install then runs for you in Terminal. Opening the app starts the node if it is stopped, and opens the chat page |
+| Debian and Ubuntu | `isharded_VERSION_amd64.deb`, `isharded_VERSION_arm64.deb` | Install with `sudo apt install ./isharded_VERSION_amd64.deb`, which installs iSharded for you and starts it. Anyone else on the machine gets their own install the first time they run `isharded`, and the applications menu gets iSharded |
+
+The Windows installer offers two choices, both off unless you tick them. One starts the node when you log in. The other adds Windows Firewall rules so other machines on a private network can reach this node. Only that one asks for an administrator. You do not need it over Tailscale. It opens TCP ports 8200 to 8209 and those of the lanes, and UDP port 8208 for the search for a mesh, to any program on this machine. It also opens the ports direct links use, TCP 49152 to 65535, for this install's Python only. The rules cover private and domain networks, not public ones, and assume the default ports. See `packaging/windows/firewall.ps1`.
+
+`packaging/homebrew/isharded.rb` is a Homebrew cask, and each release publishes it filled in as `isharded.rb`. Homebrew reads casks from a tap, and the project does not have one yet, so copy that file into a tap of your own: `brew tap-new NAME/isharded`, then copy it to `Casks/` in the folder that `brew --repository NAME/isharded` names, then `brew install --cask NAME/isharded/isharded`.
+
+### Unsigned packages
+
+The packages are not signed yet, because the project has no signing certificates, so each system warns once.
+
+On Windows, SmartScreen says "Windows protected your PC". Choose **More info**, then **Run anyway**. Ticking the firewall choice shows an administrator prompt that names an unknown publisher.
+
+On macOS, Gatekeeper refuses `iSharded.pkg`, saying Apple could not verify it or that it is from an unidentified developer. Choose **Done**, open **System Settings**, then **Privacy & Security**, scroll to **Security**, and choose **Open Anyway**. The same is done in Terminal with `xattr -d com.apple.quarantine iSharded.pkg`.
+
+Check any package against the release's `SHA256SUMS` first. That shows it is the file the release built, which is what a signature would otherwise tell you.
+
+### Removing it
+
+Run `isharded stop`, then `isharded service remove` if you set that up. On Windows, Uninstall iSharded does both, and removes the firewall rules, which asks for an administrator if you added them. Elsewhere, remove the package if you used one, then delete `~/.isharded/app`, `~/.isharded/python`, `~/.isharded/uv`, and the link `~/.local/bin/isharded`.
+
+The mesh's folder stays, in `%LOCALAPPDATA%\iSharded\up` or `~/.isharded/up`. It holds the mesh's keys, so delete it yourself, and only if you are done with that mesh.
 
 ### By hand
 
@@ -102,6 +169,8 @@ This installs `isharded`, `isharded-node`, `isharded-orchestrator`, and `isharde
 For GGUF models, nodes download a pinned, hash-checked llama.cpp build for their hardware to `%LOCALAPPDATA%\iSharded\llama` on Windows or `~/.cache/isharded/llama` elsewhere. On a minimal Linux install, add the one system library it needs with `sudo apt-get install libgomp1`. On a closed network, give each node a build with `--llama-dir`.
 
 On a machine where antivirus intercepts HTTPS, `pip` may fail with a certificate error. Add `--use-feature=truststore` so it uses the system's trusted certificates.
+
+A release is built by `.github/workflows/release.yml`, on a tag `v*` or by hand. `python scripts/build_wheel.py` makes the pure wheel, and `python scripts/build_wheel.py --target x86_64-unknown-linux-gnu` one with the engine in it. Linux targets need `cargo-zigbuild` and `zig`, which link against glibc 2.28 from any machine, and the build fails if the library asks for anything newer. `--library` takes an engine already built.
 
 ## Quick start
 
@@ -267,13 +336,13 @@ With the [native engine](#the-native-engine), a pass moves from stage to stage o
 
 The engine is a Rust library loaded into each stage process. It runs the passes that happen for every token: a stage hands a pass on without waiting, and the last stage sends the answer straight back to the entry over a closing link. Links use TLS 1.3 with certificates pinned through the control plane, and a key for each route.
 
-Build it with [Rust](https://rustup.rs) installed. It lands in `isharded/native`, where the package finds it:
+The installers put it in place on Linux, Windows, and Apple Silicon, from a release's wheel. To build it yourself, with [Rust](https://rustup.rs) installed, run this. It lands in `isharded/native`, where the package finds it:
 
 ```bash
 python scripts/build_engine.py
 ```
 
-iSharded runs without it, over the slower Python path, and any failure on a direct link falls back to the recovery the Python path already has. Prompts, restored states, and images stay on the Python path. On the laptop test, three stages of Qwen3-0.6B went from 47.5 to 128.6 tokens/s with identical replies.
+`--target` builds for one of the release's targets. iSharded runs without it, over the slower Python path, and any failure on a direct link falls back to the recovery the Python path already has. Prompts, restored states, and images stay on the Python path. On the laptop test, three stages of Qwen3-0.6B went from 47.5 to 128.6 tokens/s with identical replies.
 
 ### Any node can coordinate
 
@@ -634,6 +703,7 @@ Starts a node with everything worked out, and is the easy way in. See [Quick sta
 | `--gguf-dir` | LM Studio's folders | A folder of GGUF files. Repeatable |
 | `--model` | None | Load this model once the node is up, and say when it is ready or why it could not load. This needs an admin key, so it is refused on an invited machine |
 | `--no-browser` | Off | Do not open the chat page |
+| `--background` | Off | Leave the node running on its own, and return once it is up. Its output goes to `up.log` in its folder. If it is already up, this only opens its page, so `--model` then does nothing. The installers and shortcuts use this |
 | `--find` | Off | Ask to join the one mesh on this network, without asking you first |
 | `--new-mesh` | Off | Start a new mesh even if one is on this network |
 | `--no-discovery` | Off | Do not look for a mesh, and do not answer machines looking for this one |
@@ -641,6 +711,12 @@ Starts a node with everything worked out, and is the easy way in. See [Quick sta
 | `--joining` | `vouched` | With `--ownerless`: who this node accepts, `open` or `vouched` |
 | `--trust` | None | With `--ownerless`: a node to accept from the start. Repeatable |
 | `--join` | None | With `--ownerless`: any node already in the network |
+
+A folder runs one node. Running `isharded up` again while it is up points you at the node, and starts nothing.
+
+### isharded stop
+
+Stops the node `isharded up` started on this machine, in the foreground or the background, as Ctrl+C would. It waits up to a minute, then kills the node's processes. A start-at-login task stays in place, so the node comes back at the next login.
 
 ### isharded invite
 
@@ -652,7 +728,7 @@ Makes a code that adds a machine to this mesh, on the machine that made it. `--u
 
 ### isharded doctor
 
-Checks this machine and says what to fix: Python, the `cryptography` package, addresses, the port, memory, disk, local models, and on Linux the `libgomp` library. It exits with 1 if anything needs fixing.
+Checks this machine and says what to fix: Python, the `cryptography` package, addresses, the port, memory, disk, local models, the native engine, and on Linux the `libgomp` library. It exits with 1 if anything needs fixing. A missing native engine does not count, because a node runs without it, but it says so and how to get it. The engine counts as present only if it loads.
 
 ### isharded service
 
@@ -1014,7 +1090,8 @@ A flag takes priority over its variable.
 | `ISHARDED_FETCH_CONCURRENCY` | Units a worker fetches at once. Default 4 |
 | `ISHARDED_ACCESS_LOG` | Set to `1` to log every request while debugging. Off by default, because nodes poll each other constantly |
 | `ISHARDED_MAX_CONNECTIONS` | Connections one process holds before it answers 503. Default 2048. Raise it for a pool of many nodes |
-| `ISHARDED_INSTALL_DIR`, `ISHARDED_SOURCE` | For the install scripts only: where to install, and the package to install in place of the one on GitHub |
+| `ISHARDED_INSTALL_DIR`, `ISHARDED_SOURCE`, `ISHARDED_RELEASE_URL`, `ISHARDED_UV_URL` | For the install scripts only. See [Install](#install) |
+| `ISHARDED_INSTALL_TEST` | For the tests only: `1` loads an install script's functions without installing |
 | `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` | Hugging Face token, for gated models. Needed on each worker |
 | `HF_ENDPOINT` | Another Hugging Face address, such as a mirror |
 
@@ -1814,6 +1891,7 @@ A node started with `isharded up` keeps its route state, keys, and audit log in 
 | Far slower than usual | VRAM spilled to shared memory, or a stray process holds the GPU | Check GPU memory per process. A stage with a large "shared" figure needs a reload |
 | A reply went quiet | A stage or link is stuck | Read `GET /internal/diag/tasks` on each node to see what everything is waiting on |
 | `the rest of the pool cannot hold this model` | A cordon would leave nowhere for that node's layers | Add memory, or load a smaller model first |
+| A node's events say `No native engine` or `Native path off` | The node has no engine, so its replies use the slower Python path | `isharded doctor` says why. See [The native engine](#the-native-engine) |
 | `libgomp.so.1: cannot open shared object file` | A minimal Linux install lacks a library llama.cpp needs | `sudo apt-get install libgomp1` |
 | A browser warns about the certificate | `isharded up` used TLS with the mesh's own certificate, off Tailscale | Accept it once, or use Tailscale, which needs no warning |
 | `nobody signed this request` | The owner's machine is off, or the invite ran out | Start `isharded up` on the owner's machine, and make a new invite |
@@ -1900,7 +1978,12 @@ Adapter tests compare every family with the reference `transformers` implementat
 
 | Script | What it does |
 |---|---|
-| `install.sh`, `install.ps1` | Install for one user, picking a PyTorch build |
+| `install.sh`, `install.ps1` | Install for one user, with nothing needed first, and start the node |
+| `scripts/build_engine.py` | Builds the native engine |
+| `scripts/build_wheel.py` | Builds a wheel, with the engine in it or without |
+| `packaging/windows/isharded.iss` | The Windows installer, built with Inno Setup |
+| `packaging/macos/build_pkg.sh` | Builds the macOS package. Needs macOS |
+| `packaging/linux/build_deb.sh` | Builds the Debian package |
 | `scripts/build_tiny_model.py` | Builds the offline test model |
 | `scripts/verify_model.py` | Compares a running checkpoint with an unsharded reference |
 | `scripts/build_diagrams.py` | Redraws the diagrams in this file |
@@ -1947,7 +2030,7 @@ Trust and status:
 
 - Seven machines is the most this has run on, for about two hours, so everything about larger meshes is design, not measurement. See [Scaling to many nodes](#scaling-to-many-nodes). The longest continuous soak ran under an hour. No human has audited it, and reviews by AI do not show it is free of flaws.
 - A node in the route can read prompts. It can return wrong answers too: [checking answers](#checking-answers) catches a route that disagrees with others, but not one that only misbehaves when it is not being tested, and it has been measured only with every route on one machine. Certificates limit who is in a pool. They do not make a hostile member safe.
-- The [native engine](#the-native-engine) is new, and the installers do not build it. Its direct links have known gaps: a frame over 64 KiB closes a TLS link, so multi-row passes on wide models fall back to HTTP; a closing link that goes silent can hold a reply for minutes before it replays; a stage that hangs without dying takes minutes to notice; and a route's stages share one key, so one stage can forge another's answers. Use it only among nodes you trust.
+- The [native engine](#the-native-engine) is new. Macs with Intel chips, and Linux without glibc 2.28, get no wheel with it. Its direct links have known gaps: a frame over 64 KiB closes a TLS link, so multi-row passes on wide models fall back to HTTP; a closing link that goes silent can hold a reply for minutes before it replays; a stage that hangs without dying takes minutes to notice; and a route's stages share one key, so one stage can forge another's answers. Use it only among nodes you trust.
 - An owned network has an owner.
 - A network nobody owns passed 27 of 27 checks on real processes, but as three nodes on one machine, not between strangers. Identities are free, so `--joining open` lets one person run many nodes, and a low name can be ground out to win coordination. A coordinator can stall a route. Traffic is not encrypted, so run it over a network that is, such as Tailscale. Use `--joining vouched` with a quorum unless you accept all of that.
 - Several models run in lanes with fixed memory shares, and each lane adds two processes to a node. The main model's planner does not see a lane's memory, so moving layers after a failure can run a node short. Workers started with `--no-control` do not join lanes.

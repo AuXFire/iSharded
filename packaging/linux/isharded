@@ -1,0 +1,9 @@
+#!/bin/sh
+# The command the .deb puts on PATH. iSharded lives in each person's home, so the first use installs it.
+folder=${ISHARDED_INSTALL_DIR:-$HOME/.isharded/app}
+if [ ! -x "$folder/bin/isharded" ]; then
+  ISHARDED_SOURCE=$(ls /usr/lib/isharded/isharded-*.whl)
+  export ISHARDED_SOURCE
+  sh /usr/lib/isharded/install.sh --no-start || exit 1
+fi
+exec "$folder/bin/isharded" "$@"

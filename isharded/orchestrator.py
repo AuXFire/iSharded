@@ -28,6 +28,7 @@ from starlette.background import BackgroundTask
 from . import __version__
 from .access import INVITE_FIELDS, load_authority, NeedsAuthority, node_of, ROLE_ADMIN, ROLE_MEMBER, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, Caller
 from .embedding import POOLED_TYPES, dimensions_problem, encoded, inputs_problem, length_problem, passes, shaped, smallest_dimensions
+from .engine import find_library
 from .gguf import GgufHeader, parse_source, split_parts
 from .llamacpp import KV_TYPES, PINNED_BUILD
 from .statestore import stage_namespace
@@ -520,6 +521,7 @@ class Orchestrator:
         self.workers: dict[str, WorkerRecord] = {}
         self.ring_epoch: int | None = None
         self.ring_tried: int | None = None
+        self.no_engine_told: int | None = None
         self.ring_tried_at = 0.0
         self.links: dict[tuple[str, str], float] = {}  # round trip in ms, from one worker to another
         self.links_checked: dict[tuple[str, str], float] = {}
@@ -587,6 +589,8 @@ class Orchestrator:
         self.recoveries_total = 0
         self.token_latency_ms_ema: float | None = None
         self.events: deque[dict[str, Any]] = deque(maxlen=40)
+        if find_library() is None:
+            self.add_event("pool", "No native engine", "This node's stages run on the slower Python path. isharded doctor says how to get it")
         self.add_event("pool", "Orchestrator online", "Control plane is accepting workers")
 
     @staticmethod
@@ -1258,6 +1262,10 @@ class Orchestrator:
                 *(ask(stage, "/internal/ring/open", {"epoch": epoch, "index": index, "count": len(route), "key": key}) for index, stage in enumerate(route))
             )
             if not all(door.get("engine") for door in doors):
+                without = [stage.worker_id for stage, door in zip(route, doors) if not door.get("engine")]
+                if self.no_engine_told != epoch:  # asked again every few seconds, but said once
+                    self.no_engine_told = epoch
+                    self.add_event("mesh", "Native path off", f"No native engine on {', '.join(without)}, so replies stay on HTTP")
                 return
             links = [{"address": door["address"], "fingerprint": door["fingerprint"]} for door in doors]
             last = len(route) - 1

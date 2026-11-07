@@ -1,0 +1,6 @@
+#!/bin/sh
+# The package installs as root, and iSharded installs for a person, so this hands over to them.
+user=$(stat -f %Su /dev/console)
+case "$user" in root | loginwindow | "") exit 0 ;; esac
+launchctl asuser "$(id -u "$user")" sudo -u "$user" open -a Terminal "$2/iSharded.app/Contents/Resources/first-run.command" || true
+exit 0
