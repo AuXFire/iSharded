@@ -10,7 +10,7 @@
 //! proven: a reply replays, and a lost worker is replaced.
 
 use std::collections::VecDeque;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -38,6 +38,7 @@ pub enum Output {
     Tokens(Vec<u32>),
 }
 
+#[derive(Clone)]
 pub struct Failure {
     pub refusal: Refusal,
     pub message: String,
@@ -54,7 +55,7 @@ pub trait Compute: Send {
 }
 
 /// Whether a pass can share a trip through the model with others. A verify pass has rows
-/// that belong together, and a rewind has to finish before the sequence runs again.
+/// that belong together.
 fn can_merge(pass: &Pass) -> bool {
     pass.row_count() == 1 && !pass.verifying()
 }
@@ -66,17 +67,13 @@ pub struct Plan {
     pub count: u16,
     /// Shared by the route, and given out over the authenticated control plane.
     pub key: Vec<u8>,
-    #[serde(default = "default_ack_ms")]
+    #[serde(default = "default_timeout_ms")]
     pub ack_timeout_ms: u64,
-    #[serde(default = "default_silence_ms")]
+    #[serde(default = "default_timeout_ms")]
     pub silence_timeout_ms: u64,
 }
 
-fn default_ack_ms() -> u64 {
-    5000
-}
-
-fn default_silence_ms() -> u64 {
+fn default_timeout_ms() -> u64 {
     5000
 }
 
@@ -464,13 +461,18 @@ fn attach(inner: &Inner, hello: &Hello, put: impl Fn(&Ring) -> Option<Arc<Link>>
     Some(ring)
 }
 
+/// Answers a heartbeat. False means the link is finished.
+fn answer_ping(link: &Link, body: &[u8]) -> bool {
+    wire::read_beat(body).is_ok_and(|stamp| link.send(&wire::beat(Kind::Pong, stamp)).is_ok())
+}
+
 /// Reads passes off a link. Taking one off is what the acknowledgement means, so a stage
 /// busy with a long pass still answers its link and is not taken for dead.
-fn serve_passes(inner: &Arc<Inner>, link: &Arc<Link>, mut frames: Frames, acknowledge: bool) {
+fn serve_passes(inner: &Inner, link: &Link, mut frames: Frames, acknowledge: bool) {
     while let Ok((kind, body)) = frames.next() {
         match kind {
             Kind::Pass => {
-                let Ok(pass) = Pass::decode(&body) else {
+                let Ok(pass) = Pass::decode(body) else {
                     return;
                 };
                 if acknowledge && link.send(&Ack { id: pass.id }.encode()).is_err() {
@@ -478,14 +480,7 @@ fn serve_passes(inner: &Arc<Inner>, link: &Arc<Link>, mut frames: Frames, acknow
                 }
                 enqueue(inner, pass);
             }
-            Kind::Ping => {
-                let Ok(stamp) = wire::read_beat(&body) else {
-                    return;
-                };
-                if link.send(&wire::beat(Kind::Pong, stamp)).is_err() {
-                    return;
-                }
-            }
+            Kind::Ping if answer_ping(link, body) => {}
             _ => return,
         }
     }
@@ -507,34 +502,17 @@ fn enqueue(inner: &Inner, pass: Pass) {
 }
 
 /// At the entry: what the last stage sends straight back.
-fn serve_answers(inner: &Arc<Inner>, link: &Arc<Link>, mut frames: Frames) {
+fn serve_answers(inner: &Inner, link: &Link, mut frames: Frames) {
     while let Ok((kind, body)) = frames.next() {
         match kind {
             Kind::Result => {
                 inner.counters.answers.fetch_add(1, Ordering::Relaxed);
-                to_local(inner, &frame_of(kind, &body));
+                to_local(inner, frames.whole());
             }
-            Kind::Ping => {
-                let Ok(stamp) = wire::read_beat(&body) else {
-                    return;
-                };
-                if link.send(&wire::beat(Kind::Pong, stamp)).is_err() {
-                    return;
-                }
-            }
+            Kind::Ping if answer_ping(link, body) => {}
             _ => return,
         }
     }
-}
-
-fn frame_of(kind: Kind, body: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(wire::HEADER_BYTES + body.len());
-    frame.extend_from_slice(&wire::MAGIC.to_le_bytes());
-    frame.push(wire::VERSION);
-    frame.push(kind as u8);
-    frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    frame.extend_from_slice(body);
-    frame
 }
 
 fn to_local(inner: &Inner, frame: &[u8]) {
@@ -579,7 +557,7 @@ fn read_peer(inner: &Inner, ring: &Ring, peer: &Peer) {
         *peer.heard.lock() = Instant::now();
         match kind {
             Kind::Ack => {
-                let Ok(ack) = Ack::decode(&body) else {
+                let Ok(ack) = Ack::decode(body) else {
                     return;
                 };
                 let mut unacked = peer.unacked.lock();
@@ -588,7 +566,7 @@ fn read_peer(inner: &Inner, ring: &Ring, peer: &Peer) {
                 }
             }
             Kind::Pong => {
-                let Ok(stamp) = wire::read_beat(&body) else {
+                let Ok(stamp) = wire::read_beat(body) else {
                     return;
                 };
                 let now = peer.born.elapsed().as_micros() as u64;
@@ -597,7 +575,7 @@ fn read_peer(inner: &Inner, ring: &Ring, peer: &Peer) {
                 }
             }
             // Coming back along the route, towards the entry.
-            Kind::Result | Kind::Nack => send_back(inner, ring, &frame_of(kind, &body)),
+            Kind::Result | Kind::Nack => send_back(inner, ring, frames.whole()),
             _ => return,
         }
     }
@@ -605,7 +583,6 @@ fn read_peer(inner: &Inner, ring: &Ring, peer: &Peer) {
 
 fn watch_peer(inner: &Inner, ring: &Ring, peer: &Peer) {
     let mut pinged = Instant::now();
-    let clock = peer.born;
     // A link with nothing to carry must still be heard from, well inside its limit.
     let ping_every = PING_EVERY.min(ring.silence_timeout / 3);
     while !peer.lost.load(Ordering::Acquire) && !peer.link.is_closed() {
@@ -621,7 +598,7 @@ fn watch_peer(inner: &Inner, ring: &Ring, peer: &Peer) {
         }
         if pinged.elapsed() >= ping_every {
             pinged = Instant::now();
-            let stamp = clock.elapsed().as_micros() as u64;
+            let stamp = peer.born.elapsed().as_micros() as u64;
             if peer.link.send(&wire::beat(Kind::Ping, stamp)).is_err() {
                 peer_lost(inner, ring, peer, "the link failed");
                 return;
@@ -647,21 +624,23 @@ fn peer_lost(inner: &Inner, ring: &Ring, peer: &Peer, why: &str) {
     send_back(inner, ring, &nack.encode());
 }
 
-fn compute_loop(inner: &Arc<Inner>) {
-    loop {
-        let batch = {
-            let mut jobs = inner.jobs.lock();
-            loop {
-                if inner.stopping.load(Ordering::Acquire) {
-                    return;
-                }
-                if let Some(job) = jobs.pop_front() {
-                    break take_batch(job, &mut jobs);
-                }
-                inner.ready.wait(&mut jobs);
-            }
-        };
+fn compute_loop(inner: &Inner) {
+    while let Some(batch) = next_batch(inner) {
         handle(inner, batch);
+    }
+}
+
+/// Waits for work. Nothing comes back once the node is stopping.
+fn next_batch(inner: &Inner) -> Option<Vec<Job>> {
+    let mut jobs = inner.jobs.lock();
+    loop {
+        if inner.stopping.load(Ordering::Acquire) {
+            return None;
+        }
+        if let Some(job) = jobs.pop_front() {
+            return Some(take_batch(job, &mut jobs));
+        }
+        inner.ready.wait(&mut jobs);
     }
 }
 
@@ -672,16 +651,11 @@ fn take_batch(first: Job, jobs: &mut VecDeque<Job>) -> Vec<Job> {
     if !can_merge(&batch[0].pass) {
         return batch;
     }
-    while batch.len() < MAX_MERGED {
-        let fits = jobs.front().is_some_and(|job| {
-            can_merge(&job.pass) && job.pass.epoch == batch[0].pass.epoch && batch.iter().all(|item| item.pass.slot != job.pass.slot)
-        });
-        if !fits {
-            break;
-        }
-        if let Some(job) = jobs.pop_front() {
-            batch.push(job);
-        }
+    let fits = |batch: &[Job], job: &Job| {
+        can_merge(&job.pass) && job.pass.epoch == batch[0].pass.epoch && batch.iter().all(|item| item.pass.slot != job.pass.slot)
+    };
+    while batch.len() < MAX_MERGED && jobs.front().is_some_and(|job| fits(&batch, job)) {
+        batch.extend(jobs.pop_front());
     }
     batch
 }
@@ -692,7 +666,7 @@ fn refuse(inner: &Inner, ring: &Ring, pass: &Pass, refusal: Refusal, message: St
     send_back(inner, ring, &nack.encode());
 }
 
-fn handle(inner: &Arc<Inner>, jobs: Vec<Job>) {
+fn handle(inner: &Inner, jobs: Vec<Job>) {
     let Some(ring) = inner.ring.read().clone() else {
         // No route: the link that carried this has nothing to do any more. Say so at the entry.
         for job in &jobs {
@@ -731,7 +705,7 @@ fn handle(inner: &Arc<Inner>, jobs: Vec<Job>) {
     }
 }
 
-fn finish(inner: &Arc<Inner>, ring: &Arc<Ring>, pass: Pass, result: Result<Output, Failure>) {
+fn finish(inner: &Inner, ring: &Ring, pass: Pass, result: Result<Output, Failure>) {
     match result {
         Err(failure) => refuse(inner, ring, &pass, failure.refusal, failure.message),
         Ok(Output::Tokens(tokens)) => {
@@ -775,9 +749,4 @@ fn forward(inner: &Inner, ring: &Ring, pass: &Pass) {
     if let Err(error) = peer.link.send(&pass.encode()) {
         peer_lost(inner, ring, &peer, &error.to_string());
     }
-}
-
-/// For tests and tools: an address this node's data port can be reached on.
-pub fn local_address(port: u16) -> String {
-    SocketAddr::from(([127, 0, 0, 1], port)).to_string()
 }
