@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-import torch
+from ..optional import torch
 
 from ..gguf import LAYER_NAME, GgufHeader
 from ..protocol import TensorRef

@@ -15,7 +15,6 @@ from isharded.models import create_adapter
 from isharded.planner import Candidate, ModelProfile, plan_placement
 from isharded.protocol import MemoryPool, TensorRef, WeightUnit
 from isharded.weights import (
-    FP8,
     FetchProgress,
     UnitCache,
     build_manifest,
@@ -28,6 +27,7 @@ from test_adapters import CASES, build_reference
 MIB = 1024**2
 GIB = 1024**3
 BLOCK = 128
+FP8 = torch.float8_e4m3fn
 
 
 def quantize(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

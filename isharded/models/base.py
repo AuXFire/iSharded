@@ -12,14 +12,13 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
-import torch
-import torch.nn.functional as F
-
+from ..optional import functional as F
+from ..optional import torch
 from ..protocol import TensorRef, WeightUnit
 
-Weights = dict[str, torch.Tensor]
+Weights = dict[str, "torch.Tensor"]
 # Per-session, per-layer state: KV tensors, or conv and recurrent state.
-LayerState = dict[str, torch.Tensor]
+LayerState = dict[str, "torch.Tensor"]
 
 
 def layer_unit(layer: int, part: str) -> str:

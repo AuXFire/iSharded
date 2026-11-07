@@ -22,11 +22,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
-import torch
-import torch.nn.functional as F
+from ..optional import functional as F
+from ..optional import torch
 
 from ..protocol import TensorRef
-from ..weights import FP8, FP8_SCALE_SUFFIX, dequantize_fp8
+from ..weights import FP8_SCALE_SUFFIX, dequantize_fp8
 from .base import Adapter, LayerState, UnsupportedModel, Weights, attend
 
 HYBRID_TYPES = {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"}
@@ -37,7 +37,7 @@ QK_NORM_TYPES = {"qwen3", "qwen3_moe"} | HYBRID_TYPES
 def matrix(weights: Weights, name: str, like: torch.Tensor) -> torch.Tensor:
     """A weight matrix ready to multiply, expanding it if the pool kept it as FP8."""
     weight = weights[name]
-    if weight.dtype == FP8:
+    if weight.dtype == torch.float8_e4m3fn:
         return dequantize_fp8(weight, weights[name + FP8_SCALE_SUFFIX], like.dtype)
     return weight
 
@@ -305,7 +305,7 @@ class QwenAdapter(Adapter):
         # Routed experts may live in another pool than attention. Only the
         # activations cross, a few kilobytes per token, never the weights.
         sample = next(iter(bank.values()))
-        compute_dtype = flat.dtype if sample.dtype == FP8 else sample.dtype
+        compute_dtype = flat.dtype if sample.dtype == torch.float8_e4m3fn else sample.dtype
         local = flat.to(sample.device, compute_dtype)
         chosen = chosen.to(sample.device)
         scores = scores.to(sample.device, compute_dtype)
