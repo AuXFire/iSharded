@@ -436,6 +436,19 @@ fn stopping_frees_a_nodes_ports_at_once() {
 }
 
 #[test]
+fn hop_time_is_a_round_trip_that_leaves_out_the_next_stages_work() {
+    let delay = Duration::from_millis(300);
+    let mut ring = ring(2, true, delay, 2000);
+    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+    answer(&mut ring);
+    wait_until("a hop time", || ring.nodes[0].stats().hop_us > 0);
+    let stats = ring.nodes[0].stats();
+    assert!(stats.hop_us < delay.as_micros() as u64, "{}", stats.hop_us);
+    assert_eq!(serde_json::to_value(&stats).unwrap()["hop_us"], stats.hop_us);
+    assert_eq!(ring.nodes[1].stats().hop_us, 0);
+}
+
+#[test]
 fn nobody_reaches_the_local_door_without_its_key() {
     let node = Node::new().unwrap();
     let door = listening(&node);

@@ -118,6 +118,8 @@ pub struct Stats {
     pub compute_us: u64,
     pub wait_us: u64,
     pub link_rtt_us: u64,
+    /// A pass's trip to the next stage and its acknowledgement's trip back.
+    pub hop_us: u64,
     pub next_up: bool,
     pub closing_up: bool,
     pub epoch: Option<u64>,
@@ -137,6 +139,7 @@ struct Counters {
     compute_us: AtomicU64,
     wait_us: AtomicU64,
     link_rtt_us: AtomicU64,
+    hop_us: AtomicU64,
 }
 
 fn average(slot: &AtomicU64, sample: u64) {
@@ -346,6 +349,7 @@ impl Node {
             compute_us: counters.compute_us.load(Ordering::Relaxed),
             wait_us: counters.wait_us.load(Ordering::Relaxed),
             link_rtt_us: counters.link_rtt_us.load(Ordering::Relaxed),
+            hop_us: counters.hop_us.load(Ordering::Relaxed),
             next_up: ring.as_ref().is_some_and(|item| item.next.lock().is_some()),
             closing_up: ring.as_ref().is_some_and(|item| item.closing.lock().is_some() || item.entry_closing.lock().is_some()),
             epoch: ring.as_ref().map(|item| item.epoch),
@@ -595,8 +599,11 @@ fn read_peer(inner: &Inner, ring: &Ring, peer: &Peer) {
                     return;
                 };
                 let mut unacked = peer.unacked.lock();
-                if let Some(at) = unacked.iter().position(|(id, _)| *id == ack.id) {
-                    unacked.remove(at);
+                let at = unacked.iter().position(|(id, _)| *id == ack.id);
+                // A round trip that carried a real row, so unlike a heartbeat it shows
+                // what the row's size costs. It adds no traffic.
+                if let Some((_, sent)) = at.and_then(|at| unacked.remove(at)) {
+                    average(&inner.counters.hop_us, sent.elapsed().as_micros() as u64);
                 }
             }
             Kind::Pong => {
