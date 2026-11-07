@@ -1746,6 +1746,8 @@ Measured on the laptop, a Ryzen 9 6900HS with 8 cores and an RTX 3060, with Qwen
 
 The same laptop with its GPU idle and one CPU stage holding the whole model made a token in 40.3 to 41.8 ms on 8 threads and 29.7 to 37.5 ms on 4, in the seven of nine rounds where nothing else was busy. That is why the rule asks only whether the machine has a GPU. A machine with no GPU was not measured, and neither was a prompt's time, which more threads can shorten, so those keep the old default.
 
+Several CPU stages on one machine also tax each other: llama.cpp's threads keep spinning for a while after a pass, on cores the next stage needs. Three CPU stages of Qwen3-0.6B in WSL on the same laptop made a token in 39.9 to 42.2 ms at the default threads, against 18.5 to 23.8 ms for one stage. With `--cpu-threads 4` on each they took 26.2 to 27.0 ms. Give each stage its share of the cores when you run several on one machine.
+
 ### How a model loads
 
 1. The coordinator reads the model's description: a GGUF header, or `config.json`, the tokenizer, and each safetensors header. This costs a few megabytes and pins one revision for every node.
