@@ -133,6 +133,9 @@ RING_CLOSING_SECONDS = 30.0
 RING_CLOSING_MOST_SECONDS = 1800.0
 RING_CALL_SECONDS = 30.0
 WARM_PROMPT = "Hello"
+# A long prompt runs in passes of many rows, and a stage's first pass of that size pays for
+# setting it up. One row did not cover it.
+WARM_ROWS = 64
 WARM_SECONDS = 120.0
 LINK_TTL_SECONDS = 600.0
 LINK_PROBE_ROUNDS = 5
@@ -2021,16 +2024,20 @@ class Orchestrator:
         return {}
 
     async def _warm_route(self, epoch: int) -> None:
-        """Run a one-token reply, so that a new route's first real reply does not pay for first use.
+        """Run a 64-row reply with one token out, so that a new route's first real reply does not pay for first use.
 
-        On two local GPU stages of a 0.6B model this took a first reply from 175 to 92 ms on a quiet
-        machine and 659 to 169 on a busy one, against 308 to 280 on CPU. A restarted stage showed no such gain: the reply that found it dead has
+        On two local GPU stages of a 0.6B model one row took a first reply from 175 to 92 ms on a quiet
+        machine and 659 to 169 on a busy one, against 308 to 280 on CPU. Yet the first long prompt still
+        paid: on two CPU stages it took 0.40 to 0.75 s longer than the next one, and after 64 rows 0.06
+        to 0.10 s. A restarted stage showed no gain from one row: the reply that found it dead has
         already paid. Nobody waits for this one, so a failure only means the next reply pays.
         """
         active = self.active
         if active is None or active.embedding or self.tokenizer is None or not self.route or self.epoch != epoch or self.replies_in_flight:
             return
-        session = SessionState(tokens=await asyncio.to_thread(self.tokenizer.encode, WARM_PROMPT), epoch=epoch)
+        word = await asyncio.to_thread(self.tokenizer.encode, WARM_PROMPT)
+        tokens = (word * (WARM_ROWS // max(len(word), 1) + 1))[:WARM_ROWS]
+        session = SessionState(tokens=tokens, epoch=epoch)
         request = GenerateRequest(session_id=session.session_id, epoch=epoch, input_ids=session.tokens, reset=True, temperature=0.0, max_tokens=1)
         url = self.route[0].url.rstrip("/") + "/v1/generate"
         with suppress(httpx.HTTPError):
