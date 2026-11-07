@@ -589,8 +589,8 @@ class Builtins:
     def _git(self, name: str, repo: str, words: list[str], timeout: float = GIT_SECONDS, data: dict[str, Any] | None = None) -> ToolResult:
         folder = self._usable(repo)
         environment = self._git_env()
-        self._git_refuse_unsafe(folder, environment)
         try:
+            self._git_refuse_unsafe(folder, environment)
             ran = run_tree(["git", *self._git_flags(), *words], folder, environment, timeout=timeout, output_bytes=GIT_OUTPUT_BYTES)
         except OSError:
             raise Refusal("git is not installed.") from None

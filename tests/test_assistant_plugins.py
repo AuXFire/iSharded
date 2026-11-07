@@ -15,7 +15,7 @@ import pytest
 from isharded.assistant import cli
 from isharded.assistant.app import Assistant
 from isharded.assistant.contracts import CallContext, Effect, ToolCall, Trust, Verdict
-from isharded.assistant.plugins import MAX_FAILURES, fingerprint, parse_effects, text_of
+from isharded.assistant.plugins import MAX_FAILURES, MAX_MEMORY_MB, MIN_MEMORY_MB, fingerprint, parse_effects, text_of
 
 PYTHON = sys.executable
 
@@ -326,6 +326,15 @@ def test_only_a_person_installs_or_removes(assistant, tmp_path):
         ({"command": []}, "list of words"),
         ({"protocol": "carrier-pigeon"}, "json or mcp"),
         ({"timeout_seconds": 0}, "timeout_seconds"),
+        ({"memory_mb": "lots"}, "memory_mb"),
+        ({"memory_mb": None}, "memory_mb"),
+        ({"memory_mb": []}, "memory_mb"),
+        ({"memory_mb": True}, "memory_mb"),
+        ({"memory_mb": float("inf")}, "memory_mb"),
+        ({"memory_mb": 0}, "memory_mb"),  # the sandbox reads 0 as no limit at all
+        ({"memory_mb": -1}, "memory_mb"),
+        ({"memory_mb": MIN_MEMORY_MB - 1}, "memory_mb"),
+        ({"memory_mb": MAX_MEMORY_MB + 1}, "memory_mb"),
         ({"capabilities": []}, "list of capabilities"),
         ({"capabilities": [{"name": "../x"}]}, "letters, digits"),
         ({"capabilities": [{"name": "x", "effects": ["magic"]}]}, "not an effect"),
@@ -338,6 +347,15 @@ def test_a_bad_manifest_is_refused_plainly(assistant, tmp_path, change, words):
     with pytest.raises(ValueError, match=words):
         assistant.plugins.add(path)
     assert assistant.plugins.list() == []
+
+
+@pytest.mark.parametrize("given, kept", [(MIN_MEMORY_MB, MIN_MEMORY_MB), (MAX_MEMORY_MB, MAX_MEMORY_MB), ("512", 512)])
+def test_a_memory_limit_in_range_is_kept(assistant, tmp_path, given, kept):
+    path = write_plugin(tmp_path, ECHO)
+    path.write_text(json.dumps({**json.loads(path.read_text(encoding="utf-8")), "memory_mb": given}), encoding="utf-8")
+    assistant.plugins.add(path)
+    row = assistant.store.one("SELECT spec FROM plugins WHERE name = 'demo'")
+    assert json.loads(row["spec"])["memory_mb"] == kept
 
 
 def test_an_unreadable_manifest_is_refused_plainly(assistant, tmp_path):

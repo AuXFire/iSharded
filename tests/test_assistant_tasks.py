@@ -1239,7 +1239,7 @@ def test_there_must_be_something_to_retry(assistant, engine):
         engine.retry(task, "ann", step="a")
 
 
-@pytest.mark.parametrize("who", ["skill:x", "peer:y", "task:z", "conversation", ""])
+@pytest.mark.parametrize("who", ["skill:x", "peer:y", "task:z", "model", "model:x", "plugin:w", "conversation", ""])
 def test_only_a_person_decides_a_retry(assistant, engine, who):
     tool(assistant, "demo.bad", flaky(9))
     task = run(engine, plan_of(tool_step("a", "demo.bad")))

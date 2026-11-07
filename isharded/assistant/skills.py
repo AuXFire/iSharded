@@ -32,7 +32,7 @@ from .contracts import (
     Trust,
     Verdict,
 )
-from .mind import MACHINE_ACTORS, first_json_object, owner_of, printing
+from .mind import first_json_object, is_person, owner_of, printing
 from .store import canonical
 
 CANDIDATE, ACTIVE, RETIRED, REJECTED = "candidate", "active", "retired", "rejected"
@@ -541,11 +541,15 @@ class Skills:
     def _may_promote_alone(self, version: SkillVersion) -> bool:
         return self.auto_promote and not version.source_tainted and not self._consequential(version)
 
+    def _acting_person(self, by: str | None, action: str) -> str:
+        by = by or self.owner
+        if not is_person(by):
+            raise SkillError(f"{by} cannot {action} a skill. Only the owner can.")
+        return by
+
     def promote(self, reference: str, by: str | None = None, user: str | None = None) -> SkillVersion:
         """The owner's decision. It holds only for the exact text and comparison that was tested."""
-        by = by or self.owner
-        if by.startswith(MACHINE_ACTORS):
-            raise SkillError(f"{by} cannot promote a skill. Only the owner can.")
+        by = self._acting_person(by, "promote")
         version = self.version(reference, user)
         if version.state != CANDIDATE:
             raise SkillError(f"{version.label} is {version.state}, so it cannot be promoted.")
@@ -576,12 +580,13 @@ class Skills:
         return self.version(version.id)
 
     def reject(self, reference: str, reason: str = "", by: str | None = None, user: str | None = None) -> SkillVersion:
+        by = self._acting_person(by, "reject")
         version = self.version(reference, user)
         if version.state == ACTIVE and version.predecessor:
             return self.rollback(version.name, reason or "rejected by the owner", by, version.user)
         if version.state not in (CANDIDATE, ACTIVE):
             raise SkillError(f"{version.label} is already {version.state}.")
-        self._end(version, REJECTED, reason or "rejected by the owner", by or self.owner, "skills.rejected")
+        self._end(version, REJECTED, reason or "rejected by the owner", by, "skills.rejected")
         return self.version(version.id)
 
     def _end(self, version: SkillVersion, state: str, reason: str, by: str, action: str) -> None:
@@ -591,10 +596,11 @@ class Skills:
 
     def rollback(self, name: str, reason: str = "", by: str | None = None, user: str | None = None) -> SkillVersion:
         """Put the previous version back. The one taken out can never return."""
+        by = self._acting_person(by, "roll back")
         version = self._active_named(name, user or self.owner)
         if not version.predecessor:
             raise SkillError(f"{version.label} has no earlier version. To stop using it, run `skill reject {version.label}`.")
-        return self._roll_back(version, reason or "rolled back by the owner", by or self.owner)
+        return self._roll_back(version, reason or "rolled back by the owner", by)
 
     def _roll_back(self, version: SkillVersion, reason: str, by: str) -> SkillVersion:
         now = self.clock()

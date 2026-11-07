@@ -22,7 +22,7 @@ from .context import ContextTooSmall, TurnNotFound, merged
 from .contracts import CallContext, Capability, ContextItem, Effect, ModelReply, ModelRequest, Provenance, Reach, ToolCall, Trust, Verdict
 from .memory import KINDS
 from .mind import actor, add_user_option, emit, plainly
-from .providers import estimate_tokens, loose_json
+from .providers import CHARS_PER_TOKEN, estimate_tokens, loose_json
 
 ROLE = "conversation"
 MAX_ROUNDS = 6
@@ -30,7 +30,6 @@ BUDGET_TOKENS = 6144
 REPLY_TOKENS = 1024
 TOOLS_SHARE = 4  # tool descriptions may take a quarter of the budget, and no more
 TOOL_OUTPUT_SHARE = 4  # so may any one tool's output; all of it is still kept in the record
-CHARS_PER_TOKEN = 3
 MAX_LEARNED = 3
 MAX_LEARNED_CHARS = 500
 LEARN_MIN_WORDS = 4

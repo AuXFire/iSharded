@@ -12,7 +12,8 @@ import threading
 import pytest
 
 from isharded.assistant import broker as broker_part
-from isharded.assistant import cli
+from isharded.assistant import cli, memory, mind, plugins, router
+from isharded.assistant import tasks as tasks_part
 from isharded.assistant.app import Assistant
 from isharded.assistant.broker import argument_hash, path_within, redacted, scope_kind, url_host
 from isharded.assistant.contracts import (
@@ -499,7 +500,7 @@ def test_one_approval_cannot_be_spent_twice_at_the_same_moment(broker):
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("who", ["skill:tidy", "peer:bob", "task:1", "conversation", "model:x", "plugin:y", ""])
+@pytest.mark.parametrize("who", ["skill:tidy", "peer:bob", "task:1", "conversation", "model", "model:x", "plugin:y", ""])
 def test_only_a_person_can_decide_or_grant(broker, who):
     make(broker, "demo.act", effects=(Effect.EXECUTE,))
     broker.add_grant("ann", "demo.act", None, "ann")
@@ -509,6 +510,24 @@ def test_only_a_person_can_decide_or_grant(broker, who):
     with pytest.raises(ValueError, match="not a person"):
         broker.add_grant("ann", "demo.act", None, who)
     assert broker.approval(decision.approval_id)["status"] == "pending"
+
+
+@pytest.mark.parametrize("who", ["modeler", "models", "model-ann"])
+def test_a_person_may_have_a_name_that_starts_like_a_machines(broker, who):
+    make(broker, "demo.act", effects=(Effect.EXECUTE,))
+    assert broker.add_grant("ann", "demo.act", None, who)
+
+
+def test_every_part_asks_the_same_question_about_who_is_a_person():
+    """Two lists drifted apart once, and a plugin could then approve a commit."""
+    assert broker_part.is_person is mind.is_person and tasks_part.is_person is mind.is_person and plugins.is_person is mind.is_person
+    assert not hasattr(broker_part, "NOT_A_PERSON") and not hasattr(tasks_part, "NOT_A_PERSON")
+    assert mind.is_person("ann") and mind.is_person("user:ann") and mind.is_person(mind.LOCAL_USER)
+
+
+def test_a_shared_constant_has_one_home():
+    assert not hasattr(broker_part, "DEFAULT_USER") and not hasattr(tasks_part, "DEFAULT_USER") and not hasattr(plugins, "DEFAULT_USER")
+    assert memory.SECONDS_PER_DAY is mind.SECONDS_PER_DAY and router.SECONDS_PER_DAY is mind.SECONDS_PER_DAY
 
 
 def test_a_decision_can_be_limited_to_the_users_own_approvals(broker):

@@ -36,15 +36,11 @@ from .contracts import (
     Trust,
     Verdict,
 )
+from .mind import is_person, LOCAL_USER, PEER_PREFIX, SKILL_PREFIX
 from .schema import errors
 from .store import canonical
 
 ANY_SCOPE = "*"
-DEFAULT_USER = "owner"
-PEER_PREFIX = "peer:"
-SKILL_PREFIX = "skill:"
-# Actors that act for a person but are not one. None of these may grant or decide.
-NOT_A_PERSON = (PEER_PREFIX, SKILL_PREFIX, "task:", "model:", "plugin:", "conversation")
 PATH_FIELDS = {"path", "file", "dir", "directory", "folder", "cwd", "workdir", "root", "repo", "repository"}
 PATH_SUFFIXES = ("path", "dir", "file", "folder")
 URL_SUFFIXES = ("url", "uri")
@@ -90,10 +86,6 @@ SCHEMA = [
 
 def argument_hash(arguments: Any) -> str:
     return hashlib.sha256(canonical(arguments).encode("utf-8", "surrogatepass")).hexdigest()
-
-
-def is_person(name: str) -> bool:
-    return bool(name) and not name.startswith(NOT_A_PERSON)
 
 
 def redacted(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -580,8 +572,8 @@ def add_commands(commands: Any) -> None:
     add = actions.add_parser("add", help="allow a capability within a scope")
     add.add_argument("capability", help="the capability, such as files.read")
     add.add_argument("scope", nargs="?", default=None, help="a folder, a host, or a glob; * allows everything, on purpose")
-    add.add_argument("--user", default=DEFAULT_USER, help="who this is for")
-    add.add_argument("--by", default=DEFAULT_USER, help="the person granting it, for the record")
+    add.add_argument("--user", default=LOCAL_USER, help="who this is for")
+    add.add_argument("--by", default=LOCAL_USER, help="the person granting it, for the record")
     add.add_argument("--expires-in", type=float, default=None, help="seconds until it ends; default is never")
     add.add_argument("--uses", type=int, default=None, help="how many times it works; default is no limit")
     add.set_defaults(run=run_grant_add)
@@ -592,7 +584,7 @@ def add_commands(commands: Any) -> None:
     listing.set_defaults(run=run_grant_list)
     revoke = actions.add_parser("revoke", help="end a grant at once")
     revoke.add_argument("id", help="the grant, from grant list")
-    revoke.add_argument("--by", default=DEFAULT_USER, help="the person revoking it, for the record")
+    revoke.add_argument("--by", default=LOCAL_USER, help="the person revoking it, for the record")
     revoke.set_defaults(run=run_grant_revoke)
 
     approvals = commands.add_parser("approvals", help="actions waiting for a person")
@@ -604,7 +596,7 @@ def add_commands(commands: Any) -> None:
     for name, approved, words in (("approve", True, "allow this one exact action, once"), ("deny", False, "refuse it")):
         choice = choices.add_parser(name, help=words)
         choice.add_argument("id", help="the approval, from approvals list")
-        choice.add_argument("--by", default=DEFAULT_USER, help="the person deciding, for the record")
+        choice.add_argument("--by", default=LOCAL_USER, help="the person deciding, for the record")
         choice.set_defaults(run=partial(_decide_from_command, approved=approved))
 
 

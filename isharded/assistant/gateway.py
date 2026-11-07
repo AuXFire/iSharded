@@ -35,12 +35,11 @@ from pydantic import BaseModel, Field
 from isharded.pool import LOOPBACK
 from isharded.serving import BodyLimit, keep_listening, NoDelayHTTPProtocol
 
-from .broker import PEER_PREFIX
 from .context import TurnNotFound
 from .contracts import Provenance, Reach, Trust
 from .conversation import TurnResult, decide_approval
 from .memory import KINDS, MemoryNotFound, MemoryRefused
-from .mind import LOCAL_USER, actor, emit, table
+from .mind import LOCAL_USER, PEER_PREFIX, actor, emit, table
 
 KEY_PREFIX = "sma-"
 USER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")

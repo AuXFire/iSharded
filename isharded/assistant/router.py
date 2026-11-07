@@ -15,7 +15,7 @@ import time
 from typing import Any
 
 from .contracts import ModelReply, ModelRequest, Reach
-from .mind import actor, emit, LOCAL_USER, plainly, table
+from .mind import actor, emit, LOCAL_USER, plainly, SECONDS_PER_DAY, table
 from .providers import VisibleText, estimate_tokens
 
 ROLES = ("conversation", "planning", "coding", "worker", "decision", "vision", "embedding", "verification")
@@ -25,7 +25,6 @@ Z_95 = 1.96
 MEASURED_RUNS = 3
 BACKOFF_SECONDS = 15.0
 MAX_BACKOFF_SECONDS = 300.0
-SECONDS_PER_DAY = 86_400
 
 SCHEMA = [
     """

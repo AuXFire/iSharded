@@ -615,6 +615,8 @@ A plugin is someone else's code. It runs as a separate process with a scrubbed e
 }
 ```
 
+`memory_mb` is the most memory the plugin may use. It can be from 16 to 262144, and leaving it out gives 2048.
+
 The command runs in the manifest's folder. Each call starts it, writes one line of JSON to its stdin, and reads one JSON object from its stdout:
 
 ```text
@@ -895,8 +897,8 @@ Each run is counted, or reported with `record_run(version, ok)`. Once a new vers
 | `skill show VERSION` | Its text, rules, tests, review, reason, success rate, and last evaluation |
 | `skill evaluate VERSION` | Evaluates a candidate. Exits 1 if it cannot be promoted |
 | `skill promote VERSION` | Puts an eligible candidate into use |
-| `skill reject VERSION [--reason R]` | Turns a version down for good. On an active version with a predecessor, this is a rollback |
-| `skill rollback NAME [--reason R]` | Restores the previous version |
+| `skill reject VERSION [--reason R]` | Turns a version down for good. On an active version with a predecessor, this is a rollback. Like promoting, it is refused to anything that is not a person |
+| `skill rollback NAME [--reason R]` | Restores the previous version. Refused to anything that is not a person, like rejecting |
 | `skill gaps` | Repeated failures by task type |
 | `skill reflect TASK [--no-draft]` | Records a finished task. `--no-draft` skips drafting a skill |
 
@@ -968,7 +970,7 @@ A pass means the command exited 0. A test run that finds no tests, or times out,
 
 `git.commit` runs in the worktree, outside the sandbox, so it runs with hooks off: `core.hooksPath` is pinned to an empty folder on the command line, so a `pre-commit` hook cannot run generated code on this machine. A test commits in a repository holding such a hook and checks that it never ran.
 
-`code push` uses `git.push`, which is denied unless granted, and only ever pushes the run's own branch. `code reject` removes the worktree and the branch. If the run was already committed, the branch stays, as that was the owner's decision.
+`code push` uses `git.push`, which is denied unless granted, and only ever pushes the run's own branch. `code reject` removes the worktree and the branch. If the run was already committed, the branch stays, as that was the owner's decision. Approving, pushing, and rejecting are for a person: a skill, peer, task, model, plugin, or conversation is refused.
 
 There is deliberately no capability for approving or pushing, so no model, task, or peer can reach them. Calls name their arguments from what `git.commit` and `git.push` declare in `input_schema`, and send only what the tool takes. The worktree is the repository named, so a scoped grant must cover the assistant's `coder` folder: `grant add git.commit HOME/coder`, where `HOME` is the assistant's folder. That folder is listed in `assistant.open_folders`, so file and git tools may reach it, and nothing else of the assistant's own.
 

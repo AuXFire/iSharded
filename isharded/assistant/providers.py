@@ -35,6 +35,7 @@ WHOLE_REPLY_SECONDS = 300.0  # a reply with no stream has nothing to read until 
 HEALTH_SECONDS = 5.0
 MODELS_FRESH_SECONDS = 30.0
 MAX_TOOL_JSON = 200_000
+CHARS_PER_TOKEN = 3
 ERROR_CHARS = 300
 PROVIDER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
@@ -81,7 +82,7 @@ class ToolsNotSupported(Exception):
 
 def estimate_tokens(text: str) -> int:
     """A rough count, used only when a server does not report one."""
-    return len(text) // 3 + 1
+    return len(text) // CHARS_PER_TOKEN + 1
 
 
 def is_loopback(url: str) -> bool:
@@ -198,13 +199,15 @@ def loose_json(text: str) -> Any:
     for attempt in (candidate, re.sub(r",(\s*[}\]])", r"\1", candidate)):
         try:
             return json.loads(attempt)
-        except ValueError:
+        except (RecursionError, ValueError):
             continue
     if end is None:
         return None
     try:  # single quotes and Python's True and None
-        return ast.literal_eval(re.sub(r"\btrue\b", "True", re.sub(r"\bfalse\b", "False", re.sub(r"\bnull\b", "None", candidate))))
-    except (ValueError, SyntaxError, MemoryError, RecursionError):
+        found = ast.literal_eval(re.sub(r"\btrue\b", "True", re.sub(r"\bfalse\b", "False", re.sub(r"\bnull\b", "None", candidate))))
+        json.dumps(found, sort_keys=True)  # a set, bytes, or keys of mixed types are Python, not JSON, and no tool can take them
+        return found
+    except (TypeError, ValueError, SyntaxError, MemoryError, RecursionError):
         return None
 
 

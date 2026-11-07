@@ -18,6 +18,7 @@ from .contracts import Reach
 
 # Who the command line acts for. Over HTTP a person's key says who they are.
 LOCAL_USER = "owner"
+SECONDS_PER_DAY = 86_400
 
 WORD = re.compile(r"\w+", re.UNICODE)
 # Dropped from searches, or every memory with the word "my" answers every question.
@@ -28,16 +29,24 @@ STOP_WORDS = frozenset(
 )
 MAX_SEARCH_WORDS = 32
 JSON_ATTEMPTS = 64  # bounded, so a reply of nested braces costs little
-MACHINE_ACTORS = ("skill:", "peer:", "task:", "model")  # none of these may commit, push, or promote
+PEER_PREFIX = "peer:"
+SKILL_PREFIX = "skill:"
+# Actors that act for a person but are not one. None of these may grant, decide, commit, push, promote, or reject.
+MACHINE_ACTORS = (PEER_PREFIX, SKILL_PREFIX, "task:", "model:", "plugin:", "conversation")
+MODEL_ACTOR = "model"  # a whole name, since as a prefix it would also catch a person called modeler
 
 
 def actor(user: str) -> str:
     return f"user:{user}"
 
 
+def is_person(name: str) -> bool:
+    return bool(name) and name != MODEL_ACTOR and not name.startswith(MACHINE_ACTORS)
+
+
 def owner_of(assistant: Any) -> str:
     identity = getattr(assistant, "identity", None)
-    return getattr(identity, "owner", None) or os.environ.get("ISHARDED_ASSISTANT_USER") or "owner"
+    return getattr(identity, "owner", None) or os.environ.get("ISHARDED_ASSISTANT_USER") or LOCAL_USER
 
 
 def emit(text: str = "", end: str = "\n", stream: TextIO | None = None) -> None:

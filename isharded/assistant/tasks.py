@@ -32,9 +32,9 @@ import time
 from typing import Any
 
 from .contracts import CallContext, ModelRequest, Reach, ToolCall, Trust
+from .mind import is_person, LOCAL_USER
 from .schema import errors as schema_errors
 
-DEFAULT_USER = "owner"
 STEP_KINDS = ("tool", "model", "check", "approval", "subtask", "wait")
 ON_FAILURE = ("stop", "continue", "escalate")
 ON_MISSED = ("run_once", "skip")
@@ -52,7 +52,6 @@ MAX_BACKOFF = 3600.0
 DEFAULT_WORKERS = 8
 DEFAULT_ESCALATION = ("planning",)
 GATE_CAPABILITY = "task.approval"
-NOT_A_PERSON = ("peer:", "skill:", "task:", "model:", "plugin:", "conversation")  # the broker's list; importing it would make tasks need the broker part
 
 TASK_ENDED = ("done", "partial", "failed", "cancelled", "missed")
 STEP_ENDED = ("done", "failed", "skipped", "cancelled")
@@ -847,10 +846,6 @@ def process_alive(pid: int, started: float) -> bool:
         return abs(process.create_time() - started) < 1.0 and process.status() != psutil.STATUS_ZOMBIE
     except psutil.Error:
         return False
-
-
-def is_person(name: str) -> bool:
-    return bool(name) and not name.startswith(NOT_A_PERSON)
 
 
 def ladder(spec: Mapping[str, Any]) -> list[str]:
@@ -1832,7 +1827,7 @@ def add_commands(commands: Any) -> None:
     actions = task.add_subparsers(dest="task_command", required=True)
     run = actions.add_parser("run", help="run a plan from a JSON file")
     run.add_argument("plan", help="the plan file; see docs/ASSISTANT.md")
-    run.add_argument("--user", default=DEFAULT_USER, help="who this runs for")
+    run.add_argument("--user", default=LOCAL_USER, help="who this runs for")
     run.add_argument("--detach", action="store_true", help="queue it and return, for an engine already running")
     run.set_defaults(run=run_task_run)
     listing = actions.add_parser("list", help="show tasks, newest first")
@@ -1847,18 +1842,18 @@ def add_commands(commands: Any) -> None:
     for name, handler, words in (("pause", run_task_pause, "start no new steps"), ("cancel", run_task_cancel, "stop it, including anything running in the sandbox")):
         action = actions.add_parser(name, help=words)
         action.add_argument("id", help="the task")
-        action.add_argument("--by", default=DEFAULT_USER, help="the person doing this, for the record")
+        action.add_argument("--by", default=LOCAL_USER, help="the person doing this, for the record")
         action.set_defaults(run=handler)
     resume = actions.add_parser("resume", help="carry on after a pause, or settle a blocked step")
     resume.add_argument("id", help="the task")
     resume.add_argument("--step", default=None, help="the blocked step a person has decided")
     resume.add_argument("--as", dest="decided", choices=("done", "failed"), default=None, help="what really happened to that step")
-    resume.add_argument("--by", default=DEFAULT_USER, help="the person deciding, for the record")
+    resume.add_argument("--by", default=LOCAL_USER, help="the person deciding, for the record")
     resume.set_defaults(run=run_task_resume)
     retry = actions.add_parser("retry", help="run failed or undecided steps again")
     retry.add_argument("id", help="the task")
     retry.add_argument("--step", default=None, help="only this step, and what was skipped because of it")
-    retry.add_argument("--by", default=DEFAULT_USER, help="the person deciding, for the record")
+    retry.add_argument("--by", default=LOCAL_USER, help="the person deciding, for the record")
     retry.set_defaults(run=run_task_retry)
     work = actions.add_parser("work", help="run tasks and schedules here until stopped")
     work.add_argument("--once", action="store_true", help="stop when nothing can move")
