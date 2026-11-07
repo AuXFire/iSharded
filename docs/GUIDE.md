@@ -1734,7 +1734,7 @@ Past `--parallel`, replies queue at the entry worker, and past 32 waiting they a
 
 ### CPU threads
 
-A stage gives llama.cpp half the logical cores, which is every physical core on most machines. A stage with no layers on a GPU, on a machine that has one, gives it half the physical cores instead, because a GPU stage beside it needs cores to feed its card, and every core there slowed both. `--cpu-threads` overrides either. A machine with no GPU keeps half the logical cores.
+A stage gives llama.cpp half the logical cores, which is every physical core on most machines. A stage with no layers on a GPU, on a machine that has one, gives it half the physical cores instead, because a GPU stage beside it needs cores to feed its card, and every core there slowed both. `--cpu-threads` overrides either. A machine with no GPU keeps half the logical cores. To tell, the worker asks only what is cheap: `nvidia-smi`, PyTorch if it has already loaded it, and a Vulkan GPU it has already found for itself. It never fetches a build to look, so a Mac, or a worker started with `--device cpu` beside a GPU only Vulkan sees, keeps the old default.
 
 Measured on the laptop, a Ryzen 9 6900HS with 8 cores and an RTX 3060, with Qwen3-0.6B, one CPU worker beside one GPU worker, 3 rounds each, layers as the planner placed them:
 

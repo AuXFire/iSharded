@@ -40,6 +40,8 @@ from .memory import (
     build_pools,
     discover_accelerators,
     live_free_bytes,
+    nvidia_accelerators,
+    vulkan_accelerators,
 )
 from .engine import REFUSE_EPOCH, REFUSE_STAGE_ERROR, EngineClient, EngineRefusal
 from .geo import country_code, node_country
@@ -269,13 +271,25 @@ def stage_threads(asked: int, beside_gpu: bool) -> int:
     if asked:
         return asked
     if beside_gpu:
-        return max((psutil.cpu_count(logical=False) or 2) // 2, 1)
+        # With no count of physical cores, take two logical ones to a core.
+        physical = psutil.cpu_count(logical=False) or (os.cpu_count() or 4) // 2
+        return max(physical // 2, 1)
     return max((os.cpu_count() or 4) // 2, 1)
 
 
 def machine_has_gpu() -> bool:
+    """Whether this machine has a GPU another stage could be using, asked only where it is cheap.
+
+    It never imports PyTorch or fetches a llama.cpp build to look, so a worker told to use the
+    CPU loads as fast as before, on a closed network too. A GPU only Vulkan sees counts once
+    this worker has looked for it already.
+    """
     try:
-        return bool(discover_accelerators("auto"))
+        if torch_loaded() and torch.cuda.is_available():
+            return True
+        if nvidia_accelerators():
+            return True
+        return bool(vulkan_accelerators.cache_info().currsize and vulkan_accelerators())
     except (OSError, ValueError, RuntimeError):
         return False  # a probe that fails leaves the default as it was
 

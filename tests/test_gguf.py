@@ -6,6 +6,7 @@ import struct
 import subprocess
 import threading
 import time
+import types
 
 import httpx
 import numpy as np
@@ -1935,15 +1936,32 @@ def test_a_cpu_stage_beside_a_gpu_takes_half_the_physical_cores(monkeypatch) -> 
     assert worker.stage_threads(0, beside_gpu=False) == 8  # half the logical cores, as before
     assert worker.stage_threads(0, beside_gpu=True) == 4
     assert worker.stage_threads(6, beside_gpu=True) == 6  # the operator's choice stands
+    # No count of physical cores: two logical cores to one, never a single thread.
     monkeypatch.setattr(worker.psutil, "cpu_count", lambda logical=True: None)
-    assert worker.stage_threads(0, beside_gpu=True) == 1
+    assert worker.stage_threads(0, beside_gpu=True) == 4
 
 
 def test_a_gpu_probe_that_fails_leaves_the_default_alone(monkeypatch) -> None:
     from isharded import worker
 
-    def broken(_: str) -> list:
+    def broken() -> tuple:
         raise OSError("no driver")
 
-    monkeypatch.setattr(worker, "discover_accelerators", broken)
+    monkeypatch.setattr(worker, "torch_loaded", lambda: False)
+    monkeypatch.setattr(worker, "nvidia_accelerators", broken)
     assert worker.machine_has_gpu() is False
+
+
+def test_the_gpu_probe_never_imports_torch_or_fetches_a_build(monkeypatch) -> None:
+    from isharded import worker
+
+    def fetch() -> tuple:
+        raise AssertionError("fetched a build to look for a GPU")
+
+    fetch.cache_info = lambda: types.SimpleNamespace(currsize=0)
+    monkeypatch.setattr(worker, "torch_loaded", lambda: False)
+    monkeypatch.setattr(worker, "nvidia_accelerators", lambda: ())
+    monkeypatch.setattr(worker, "vulkan_accelerators", fetch)
+    assert worker.machine_has_gpu() is False
+    monkeypatch.setattr(worker, "nvidia_accelerators", lambda: ("cuda:0",))
+    assert worker.machine_has_gpu() is True
