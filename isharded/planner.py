@@ -523,100 +523,6 @@ class _Packer:
         return self.shared[key]
 
 
-def _partition(
-    candidates: list[Candidate],
-    profile: ModelProfile,
-    packer: _Packer,
-    spread: bool,
-    required: set[str],
-    costs: dict[tuple[str, int, int], float],
-) -> list[tuple[Candidate, int, int]] | None:
-    """Choose contiguous layer ranges with a dynamic program.
-
-    A token crosses the stages one after another, so total latency is what a
-    user feels, and that is what both modes minimize. ``spread`` must use every
-    candidate; otherwise workers outside ``required`` may be skipped, which
-    favors fewer stages. ``costs`` is shared between orders, because a stage's
-    cost depends on its worker and layers and not on who comes before it.
-    """
-    layers = profile.num_layers
-    count = len(candidates)
-
-    def table(fill: Any) -> list[list[Any]]:
-        return [[fill] * (layers + 1) for _ in range(count + 1)]
-
-    def stage_cost(index: int, start: int, end: int) -> float:
-        candidate = candidates[index]
-        key = (candidate.worker_id, start, end)
-        if key not in costs:
-            filled = packer.pack(candidate, start, end)
-            costs[key] = INFEASIBLE if filled is None else filled[1] + _download_ms(candidate, profile, start, end)
-        return costs[key]
-
-    # best[i][j]: lowest cost covering layers [0, j) using candidates [0, i).
-    best = table(INFEASIBLE)
-    choice: list[list[int | None]] = table(None)
-    # The workers that best path starts and ends on, since the next hop starts at one
-    # and a loop closes at the other, and what its hops have cost so far.
-    ending: list[list[Candidate | None]] = table(None)
-    opening: list[list[Candidate | None]] = table(None)
-    walked = table(0.0)
-    best[0][0] = 0.0
-    for index in range(1, count + 1):
-        candidate = candidates[index - 1]
-        skippable = not spread and candidate.worker_id not in required
-        for end in range(layers + 1):
-            if skippable and best[index - 1][end] < best[index][end]:
-                best[index][end] = best[index - 1][end]
-                choice[index][end] = end  # this worker is skipped
-                ending[index][end] = ending[index - 1][end]
-                opening[index][end] = opening[index - 1][end]
-                walked[index][end] = walked[index - 1][end]
-            # A stage too long to pack stays too long if it grows, so with no RAM to
-            # fall back on most ranges need not be packed at all. A hybrid stage can
-            # also be too short, which says nothing about a longer one.
-            earliest = 0
-            for start in reversed(range(0, end, profile.layer_step)):
-                allowed = holds_both_kinds(start, end, profile.attention_interval)
-                if allowed and best[index - 1][start] != INFEASIBLE and stage_cost(index - 1, start, end) == INFEASIBLE:
-                    earliest = start + profile.layer_step
-                    break
-            for start in range(earliest, end, profile.layer_step):
-                previous = best[index - 1][start]
-                if previous == INFEASIBLE:
-                    continue
-                cost = stage_cost(index - 1, start, end)
-                if cost == INFEASIBLE:
-                    continue
-                before = ending[index - 1][start]
-                hop = _one_way_ms(_hop_ms(before, candidate), profile.ring) if start and before else 0.0
-                total = _with_stage(previous, cost, hop)
-                first = opening[index - 1][start] or candidate
-                gone = walked[index - 1][start] + hop
-                if profile.ring and end == layers and first is not candidate:
-                    total += _closing_ms(_hop_ms(candidate, first), gone)
-                if total < best[index][end]:
-                    best[index][end] = total
-                    choice[index][end] = start
-                    ending[index][end] = candidate
-                    opening[index][end] = first
-                    walked[index][end] = gone
-    if best[count][layers] == INFEASIBLE:
-        return None
-
-    ranges: list[tuple[Candidate, int, int]] = []
-    end = layers
-    for index in range(count, 0, -1):
-        start = choice[index][end]
-        if start is None:
-            return None
-        if start != end:
-            ranges.append((candidates[index - 1], start, end))
-        end = start
-    ranges.reverse()
-    return ranges
-
-
 # Layers of fast memory left open, bytes outside it, read time, and a stage's cost
 # or a route's total. A route's score ends with what its hops have cost so far.
 _Score = tuple[Any, ...]
@@ -694,16 +600,25 @@ def _cuts(profile: ModelProfile) -> list[int]:
     return [*range(0, profile.num_layers, profile.layer_step), profile.num_layers]
 
 
-def _search_order(
+def _walk_order(
     order: list[Candidate],
     profile: ModelProfile,
     stage: Callable[[Candidate, int, int], _Score | None],
     spread: bool,
     required: set[str],
-    rank: Callable[[_Score], tuple[Any, ...]],
-    slowest_allowed: float,
+    rank: Callable[[_Score], Any],
+    slowest_allowed: float = INFEASIBLE,
+    fewer_on_a_tie: bool = False,
 ) -> tuple[_Score, list[tuple[Candidate, int, int]]] | None:
-    """Choose stages through one order of workers, when every order is too many."""
+    """Choose contiguous layer ranges through one order of workers.
+
+    ``spread`` must use every worker. Otherwise workers outside ``required`` may be
+    skipped, which favors fewer stages. ``stage`` gives a stage's score and ``rank``
+    compares what they add up to. Scoring stages is shared between orders, because a
+    stage's cost does not depend on who comes before it. ``fewer_on_a_tie`` keeps an
+    earlier worker over a later one just like it, which matters on a pool of equals:
+    a different choice there would move weights for nothing.
+    """
     cuts = _cuts(profile)
     last = len(cuts) - 1
     # best[i][cut]: the best way to reach this cut with the first i workers.
@@ -722,7 +637,7 @@ def _search_order(
             before = ending.get((index, here))
             first = opening.get((index, here), candidate)
             held = best[index + 1][here]
-            if skippable and (held is None or rank(score) < rank(held)):
+            if skippable and (held is None or rank(score) < rank(held) or (fewer_on_a_tie and rank(score) == rank(held))):
                 best[index + 1][here] = score
                 came[index + 1, here] = here
                 if before is not None:
@@ -730,7 +645,14 @@ def _search_order(
                     opening[index + 1, here] = first
             for there in range(here + 1, last + 1):
                 found = stage(candidate, cuts[here], cuts[there])
-                if found is None or found[2] > slowest_allowed:
+                if found is None:
+                    # A stage too long to pack stays too long if it grows, so with no RAM
+                    # to fall back on most ranges need not be packed at all. A hybrid stage
+                    # can also be too short, which says nothing about a longer one.
+                    if holds_both_kinds(cuts[here], cuts[there], profile.attention_interval):
+                        break
+                    continue
+                if found[2] > slowest_allowed:
                     continue
                 reached = _extended(score, found, before, candidate, first if there == last else None, profile.ring)
                 held = best[index + 1][there]
@@ -751,6 +673,21 @@ def _search_order(
         here = previous
     ranges.reverse()
     return final, ranges
+
+
+def _search_order(
+    orders: list[list[Candidate]],
+    profile: ModelProfile,
+    stage: Callable[[Candidate, int, int], _Score | None],
+    spread: bool,
+    required: set[str],
+    rank: Callable[[_Score], tuple[Any, ...]],
+    slowest_allowed: float,
+) -> list[tuple[Candidate, int, int]] | None:
+    """The best ranges through any of these orders, for when every order is too many."""
+    found = (_walk_order(order, profile, stage, spread, required, rank, slowest_allowed) for order in orders)
+    best = min((item for item in found if item), key=lambda item: rank(item[0]), default=None)
+    return best[1] if best else None
 
 
 def _search_blocks(
@@ -1015,14 +952,14 @@ def _sampled(
     """The fastest route through the orders worth trying, with the packer that found it."""
     for shrink in shrinks:
         packer = _Packer(profile, _capacities(candidates, shrink, profile.stage_workspace_bytes))
-        costs: dict[tuple[str, int, int], float] = {}
+        stage = _stage_scorer(profile, packer)
         best: list[StageAssignment] | None = None
         best_cost = INFEASIBLE
         for order in orders:
-            ranges = _partition(order, profile, packer, spread, required, costs)
-            if ranges is None:
+            walked = _walk_order(order, profile, stage, spread, required, lambda score: score[3], fewer_on_a_tie=True)
+            if walked is None:
                 continue
-            route = _build_route(ranges, profile, packer.capacities)
+            route = _build_route(walked[1], profile, packer.capacities)
             if route is None:
                 continue
             cost = _route_cost(route, candidates, profile)
@@ -1064,9 +1001,7 @@ def _attempt(
         if every_order:
             ranges = _search_blocks(candidates, profile, stage, spread, entry, exit_, rank, slowest)
         else:
-            found = (_search_order(order, profile, stage, spread, required, rank, slowest) for order in orders)
-            best = min((item for item in found if item), key=lambda item: rank(item[0]), default=None)
-            ranges = best[1] if best else None
+            ranges = _search_order(orders, profile, stage, spread, required, rank, slowest)
         return None if ranges is None else _build_route(ranges, profile, packer.capacities)
 
     fastest = search(lambda score: (score[3], score[0], score[1], score[2])) if every_order else sampled
