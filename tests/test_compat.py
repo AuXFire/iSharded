@@ -91,11 +91,15 @@ def test_a_claude_reply_has_the_published_shape(plain):
     assert re.fullmatch(r"msg_\w+", answer.pop("id"))
     usage = answer.pop("usage")
     assert usage["input_tokens"] > 0 and usage["output_tokens"] > 0
+    assert (usage["cache_creation_input_tokens"], usage["cache_read_input_tokens"]) == (0, 0)
     assert answer == {
         "type": "message",
         "role": "assistant",
         "model": "scripted",
         "content": [{"type": "text", "text": "Hello there"}],
+        "container": None,
+        "diagnostics": None,
+        "stop_details": None,
         "stop_reason": "end_turn",
         "stop_sequence": None,
     }
@@ -210,7 +214,7 @@ def test_a_claude_stream_is_the_real_event_sequence(plain):
     assert events[1][1]["content_block"] == {"type": "text", "text": ""} and events[1][1]["index"] == 0
     assert "".join(body["delta"]["text"] for name, body in events if name == "content_block_delta") == "Hello there"
     closing = events[-2][1]
-    assert closing["delta"] == {"stop_reason": "end_turn", "stop_sequence": None}
+    assert closing["delta"] == {"container": None, "stop_details": None, "stop_reason": "end_turn", "stop_sequence": None}
     assert closing["usage"]["output_tokens"] > 0 and closing["usage"]["input_tokens"] > 0
 
 
@@ -630,10 +634,13 @@ def test_api_show_refuses_what_is_not_running(plain):
     assert answer.status_code == 404 and answer.json() == {"error": "model 'nope' is not loaded"}
 
 
-def test_api_version(plain):
+def test_api_version_is_a_version_an_ollama_client_accepts(plain):
     from isharded import __version__
 
-    assert plain.client.get("/api/version").json() == {"version": __version__}
+    answer = plain.client.get("/api/version").json()
+    assert answer == {"version": compat.OLLAMA_VERSION, "isharded": __version__}
+    # Clients gate on the release they need: thinking came with 0.9.
+    assert tuple(map(int, answer["version"].split("."))) >= (0, 9, 0)
 
 
 @pytest.mark.parametrize("method, path", [("POST", "/api/pull"), ("POST", "/api/push"), ("POST", "/api/create"), ("POST", "/api/copy"), ("DELETE", "/api/delete")])
@@ -838,6 +845,15 @@ def test_x_api_key_never_leaves_the_node_it_was_given_to(follower):
     assert "x-api-key" not in seen
 
 
+@pytest.mark.parametrize("path", ["/v1/models", "/v1/models/scripted", "/admin/status", "/api/tags", "/v1/chat/completions"])
+def test_x_api_key_goes_on_every_path_that_forwards(follower, path):
+    """Only some paths read this header, and every path that forwards must drop it."""
+    node, seen, client = follower
+    client.get(path, headers={"x-api-key": node.key, "Authorization": f"Bearer {node.key}"})
+    assert seen["url"] == f"http://boss:9{path}"
+    assert "x-api-key" not in seen
+
+
 def lane_stream(*chunks):
     body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
     return body.encode()
@@ -936,6 +952,284 @@ def test_leaving_a_stream_closes_the_reply_behind_it(stream):
     assert closed
 
 
+# --- how a reply ended, and what it reasoned
+
+
+THOUGHT = "<think>\nLet me see.\n</think>\n\nHello there"
+OPENS_THINKING = "{% for message in messages %}{{ message.content }}{% endfor %}<think>\n"
+
+
+def blocks_of(events: list[tuple[str, dict]]) -> list[tuple[str, str]]:
+    """Each content block as its type and all that was written into it."""
+    blocks = []
+    for name, body in events:
+        if name == "content_block_start":
+            blocks.append([body["content_block"]["type"], ""])
+        elif name == "content_block_delta":
+            delta = body["delta"]
+            blocks[-1][1] += delta.get("text", "") + delta.get("thinking", "")
+    return [tuple(block) for block in blocks]
+
+
+def test_a_stop_sequence_is_named_in_a_claude_reply(mesh):
+    mesh.use(QWEN3, "Hello END there STOP")
+    answer = claude(mesh, stop_sequences=["STOP", "END"]).json()
+    assert answer["content"] == [{"type": "text", "text": "Hello "}]
+    assert (answer["stop_reason"], answer["stop_sequence"]) == ("stop_sequence", "END")
+
+
+def test_a_stop_sequence_is_named_in_a_claude_stream(mesh):
+    mesh.use(QWEN3, "Hello END there")
+    events = events_of(claude(mesh, stream=True, stop_sequences=["END"]).text)
+    assert blocks_of(events) == [("text", "Hello ")]
+    assert events[-2][1]["delta"] == {"container": None, "stop_details": None, "stop_reason": "stop_sequence", "stop_sequence": "END"}
+
+
+def test_a_stop_sequence_that_never_came_is_not_named(plain):
+    answer = claude(plain, stop_sequences=["NOPE"]).json()
+    assert (answer["stop_reason"], answer["stop_sequence"]) == ("end_turn", None)
+
+
+def test_a_call_ends_a_claude_reply_as_a_call_even_with_stop_sequences(mesh):
+    mesh.use(QWEN3, CALL + "END")
+    answer = claude(mesh, tools=[CLAUDE_TOOL], stop_sequences=["END"]).json()
+    assert (answer["stop_reason"], answer["stop_sequence"]) == ("tool_use", None)
+
+
+def test_the_chat_stream_says_which_stop_string_ended_it(mesh):
+    mesh.use(QWEN3, "Hello END")
+    body = {"model": "scripted", "messages": [{"role": "user", "content": "hi"}], "stream": True, "stop": ["END"], "max_tokens": 64}
+    lines = [json.loads(line[6:]) for line in mesh.client.post("/v1/chat/completions", json=body).text.split("\n\n") if line.startswith("data: {")]
+    assert lines[-1]["isharded"]["stop_sequence"] == "END" and lines[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+@pytest.mark.parametrize("size", [1, 3, 100])
+def test_a_claude_reply_gives_its_reasoning_a_block(mesh, size):
+    mesh.use(QWEN3, THOUGHT, size=size)
+    content = claude(mesh).json()["content"]
+    assert content[0]["type"] == "thinking" and content[0]["thinking"] == "Let me see." and content[0]["signature"]
+    assert content[1:] == [{"type": "text", "text": "Hello there"}]
+
+
+def test_a_claude_stream_gives_reasoning_its_own_block_with_a_signature_last(mesh):
+    mesh.use(QWEN3, THOUGHT)
+    events = events_of(claude(mesh, stream=True).text)
+    assert blocks_of(events) == [("thinking", "Let me see."), ("text", "Hello there")]
+    start = next(body for name, body in events if name == "content_block_start")
+    assert start["content_block"] == {"type": "thinking", "thinking": "", "signature": ""} and start["index"] == 0
+    first = [(name, body) for name, body in events if body.get("index") == 0]
+    assert first[-1][0] == "content_block_stop" and first[-2][1]["delta"]["type"] == "signature_delta"
+    assert first[-2][1]["delta"]["signature"] == claude(mesh).json()["content"][0]["signature"]
+    assert [body["index"] for name, body in events if name == "content_block_stop"] == [0, 1]
+
+
+def test_a_template_that_opens_reasoning_still_gets_a_block(mesh):
+    mesh.use(OPENS_THINKING, "Let me see.\n</think>\n\nHello there")
+    assert [block["type"] for block in claude(mesh).json()["content"]] == ["thinking", "text"]
+    assert blocks_of(events_of(claude(mesh, stream=True).text)) == [("thinking", "Let me see."), ("text", "Hello there")]
+
+
+def test_only_a_template_that_opens_reasoning_marks_the_chat_stream(mesh):
+    body = {"model": "scripted", "messages": [{"role": "user", "content": "hi"}], "stream": True, "max_tokens": 64}
+    for template, marked in ((OPENS_THINKING, True), (QWEN3, False)):
+        mesh.use(template, "Hello")
+        first = json.loads(mesh.client.post("/v1/chat/completions", json=body).text.split("\n\n")[0][6:])
+        assert first["choices"][0]["delta"] == {"role": "assistant", **({"isharded": {"in_thought": True}} if marked else {})}
+
+
+def test_a_reply_that_only_mentions_the_tag_is_all_text(mesh):
+    mesh.use(QWEN3, "Models write <think> first, then </think> after.")
+    assert claude(mesh).json()["content"] == [{"type": "text", "text": "Models write <think> first, then </think> after."}]
+
+
+def test_reasoning_cut_off_by_the_limit_is_still_reasoning(mesh):
+    mesh.use(QWEN3, "<think>\nThis goes on and on and on", size=2)
+    answer = claude(mesh, max_tokens=6).json()
+    assert [block["type"] for block in answer["content"]] == ["thinking"] and answer["stop_reason"] == "max_tokens"
+
+
+def test_reasoning_comes_before_a_call(mesh):
+    mesh.use(QWEN3, "<think>\nI should look.\n</think>\n\n" + CALL)
+    answer = claude(mesh, tools=[CLAUDE_TOOL]).json()
+    assert [block["type"] for block in answer["content"]] == ["thinking", "tool_use"] and answer["content"][0]["thinking"] == "I should look."
+    assert blocks_of(events_of(claude(mesh, stream=True, tools=[CLAUDE_TOOL]).text))[0] == ("thinking", "I should look.")
+
+
+def test_omitted_thinking_keeps_the_block_and_loses_the_words(mesh):
+    mesh.use(QWEN3, THOUGHT)
+    asked = {"thinking": {"type": "enabled", "budget_tokens": 1024, "display": "omitted"}}
+    block = claude(mesh, **asked).json()["content"][0]
+    assert block["type"] == "thinking" and block["thinking"] == "" and block["signature"]
+    events = events_of(claude(mesh, stream=True, **asked).text)
+    assert blocks_of(events) == [("thinking", ""), ("text", "Hello there")]
+    assert [body["delta"]["type"] for name, body in events if name == "content_block_delta" and body["index"] == 0] == ["thinking_delta", "signature_delta"]
+
+
+def test_a_lane_reply_is_sorted_and_named_like_any_other():
+    stream = lane_stream(
+        {"choices": [{"index": 0, "delta": {"role": "assistant", "isharded": {"in_thought": True}}, "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {"content": "hmm</think>\n\nHi"}, "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}, "isharded": {"stop_sequence": "END"}},
+    )
+
+    async def collect() -> list[dict]:
+        async def chunks():
+            yield stream
+
+        return [item async for item in compat.reply_items(SimpleNamespace(body_iterator=chunks(), background=None), compat.ThoughtSplitter())]
+
+    items = asyncio.run(collect())
+    assert items[:2] == [{"thinking": "hmm"}, {"text": "Hi"}] and items[2]["stop_sequence"] == "END"
+    assert compat.stop_fields(items[2]) == {"stop_reason": "stop_sequence", "stop_sequence": "END"}
+
+
+def test_thinking_in_history_reaches_the_template(mesh):
+    mesh.use("{% for message in messages %}[{{ message.reasoning_content }}|{{ message.content }}]{% endfor %}", "Hello")
+    turns = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [{"type": "thinking", "thinking": "I thought", "signature": "abc"}, {"type": "redacted_thinking", "data": "sealed"}, {"type": "text", "text": "said"}]},
+        {"role": "user", "content": "more"},
+    ]
+    assert claude(mesh, messages=turns).status_code == 200
+    assert "[I thought|said]" in mesh.prompt and "sealed" not in mesh.prompt
+
+
+def test_a_message_of_only_thinking_is_no_message(mesh):
+    mesh.use(QWEN3, "Hello")
+    turns = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": [{"type": "redacted_thinking", "data": "sealed"}]}, {"role": "user", "content": "more"}]
+    assert claude(mesh, messages=turns).status_code == 200
+
+
+@pytest.mark.parametrize("cut", range(1, len(THOUGHT)))
+def test_reasoning_is_found_wherever_the_text_is_cut(cut):
+    splitter = compat.ThoughtSplitter()
+    items = splitter.feed(THOUGHT[:cut]) + splitter.feed(THOUGHT[cut:]) + splitter.finish()
+    assert "".join(item.get("thinking", "") for item in items) == "Let me see."
+    assert "".join(item.get("text", "") for item in items) == "Hello there"
+
+
+def test_with_splitting_off_a_reply_is_left_alone():
+    splitter = compat.ThoughtSplitter(False)
+    splitter.open()
+    assert splitter.feed(THOUGHT) == [{"text": THOUGHT}] and splitter.finish() == []
+
+
+def test_a_reply_of_nothing_but_space_comes_out_as_it_went_in():
+    splitter = compat.ThoughtSplitter()
+    assert splitter.feed("  ") == [] and splitter.finish() == [{"text": "  "}]
+
+
+# --- Ollama's reasoning, seed and version
+
+
+def test_ollama_chat_gives_reasoning_its_own_field(mesh):
+    mesh.use(QWEN3, THOUGHT)
+    answer = mesh.client.post("/api/chat", json={"model": "scripted", "messages": SAY["messages"], "stream": False}).json()
+    assert answer["message"] == {"role": "assistant", "content": "Hello there", "thinking": "Let me see."}
+
+
+def test_an_ollama_stream_sends_reasoning_first(mesh):
+    mesh.use(QWEN3, THOUGHT)
+    lines = lines_of(mesh.client.post("/api/chat", json={"model": "scripted", "messages": SAY["messages"]}).text)
+    assert lines[0]["message"]["thinking"] and lines[0]["message"]["content"] == "" and lines[0]["done"] is False
+    assert "".join(line["message"].get("thinking", "") for line in lines) == "Let me see."
+    assert "".join(line["message"]["content"] for line in lines) == "Hello there"
+    assert lines[-1]["done"] is True
+
+
+def test_ollama_generate_gives_reasoning_its_own_field(mesh):
+    mesh.use(QWEN3, THOUGHT)
+    answer = mesh.client.post("/api/generate", json={"model": "scripted", "prompt": "hi", "stream": False}).json()
+    assert (answer["response"], answer["thinking"]) == ("Hello there", "Let me see.")
+
+
+def test_raw_ollama_generate_leaves_the_text_as_it_came(mesh):
+    mesh.use(QWEN3, THOUGHT)
+    answer = mesh.client.post("/api/generate", json={"model": "scripted", "prompt": "hi", "raw": True, "stream": False}).json()
+    assert answer["response"] == THOUGHT and "thinking" not in answer
+
+
+def test_ollama_history_passes_its_thinking_on():
+    messages = compat.ollama_messages({"messages": [{"role": "assistant", "content": "said", "thinking": "I thought"}]})
+    assert messages == [{"role": "assistant", "content": "said", "reasoning_content": "I thought"}]
+
+
+@pytest.mark.parametrize("options, seed", [({"seed": -1}, None), ({"seed": 0}, 0), ({"seed": 42}, 42), ({}, None)])
+def test_ollama_seed_minus_one_means_no_seed(options, seed):
+    assert compat.ollama_chat({"messages": [{"role": "user", "content": "hi"}], "options": options}).seed == seed
+
+
+def test_ollama_seed_minus_one_is_answered(plain):
+    answer = plain.client.post("/api/generate", json={"model": "scripted", "prompt": "hi", "stream": False, "options": {"seed": -1, "temperature": 0.5}})
+    assert answer.status_code == 200 and answer.json()["response"] == "Hello there"
+
+
+def test_api_show_says_a_model_can_think_where_its_template_can(plain):
+    template = QWEN3 + "<think></think>"
+    plain.use(template, "Hello", template)
+    capabilities = plain.client.post("/api/show", json={"model": "scripted"}).json()["capabilities"]
+    assert "thinking" in capabilities
+
+
+def test_a_model_row_reads_its_quantization_from_the_file():
+    from isharded.gguf import quantization_name
+
+    assert quantization_name({"general.file_type": 15}) == "Q4_K_M" and quantization_name({"general.file_type": 7}) == "Q8_0"
+    assert quantization_name({}) is None
+
+
+def test_blob_uploads_are_refused_in_ollamas_shape(plain):
+    answer = plain.client.post("/api/blobs/sha256:abc")
+    assert answer.status_code == 400 and "isharded load" in answer.json()["error"]
+
+
+# --- models, for Claude and OpenAI clients alike
+
+
+def test_v1_models_takes_x_api_key(keyed):
+    good = keyed.client.get("/v1/models", headers={"x-api-key": keyed.key})
+    assert good.status_code == 200 and good.json()["data"][0]["id"] == "scripted"
+    assert keyed.client.get("/v1/models", headers={"x-api-key": "isk-wrong"}).status_code == 401
+    assert keyed.client.get("/v1/models").status_code == 401
+
+
+def test_one_model_takes_x_api_key_and_follows_the_same_rules(keyed):
+    good = keyed.client.get("/v1/models/scripted", headers={"x-api-key": keyed.key})
+    assert good.status_code == 200 and good.json()["id"] == "scripted"
+    refused = keyed.client.get("/v1/models/scripted", headers={"x-api-key": "isk-wrong"})
+    assert refused.status_code == 401 and refused.json()["error"]["type"] == "authentication_error"
+    assert keyed.client.get("/v1/models/scripted").status_code == 401
+
+
+def test_the_model_list_has_both_published_shapes(plain):
+    answer = plain.client.get("/v1/models").json()
+    row = answer["data"][0]
+    assert answer["object"] == "list" and (row["object"], row["owned_by"]) == ("model", "isharded")
+    assert (answer["first_id"], answer["last_id"], answer["has_more"]) == ("scripted", "scripted", False)
+    assert (row["type"], row["display_name"], row["lifecycle"]) == ("model", "scripted", "active")
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", row["created_at"])
+    assert all(row[name] is None for name in ("capabilities", "deprecated_at", "line", "max_input_tokens", "max_tokens", "retires_at"))
+
+
+def test_a_display_name_leaves_folders_out():
+    assert compat.model_row(r"C:\models\Qwen3-8B.gguf", {}, 0)["display_name"] == "Qwen3-8B.gguf"
+    assert compat.model_row("org/Qwen3-8B", {}, 0)["display_name"] == "Qwen3-8B"
+
+
+def test_an_empty_list_of_models_has_no_ids():
+    assert compat.model_listing({}, 0) == {"object": "list", "data": [], "first_id": None, "has_more": False, "last_id": None}
+
+
+def test_a_model_that_is_not_here_is_a_404_in_claudes_shape(plain):
+    answer = plain.client.get("/v1/models/nope")
+    assert answer.status_code == 404 and answer.json()["error"]["type"] == "not_found_error"
+
+
+@pytest.mark.parametrize("status, kind", [(409, "conflict_error"), (504, "timeout_error"), (529, "overloaded_error"), (503, "api_error"), (422, "invalid_request_error")])
+def test_errors_use_the_published_names(status, kind):
+    assert compat.anthropic_error(status, "no")["error"]["type"] == kind
+
+
 # --- what the guide says
 
 
@@ -981,6 +1275,38 @@ def test_the_real_anthropic_client(mesh, served):
     with pytest.raises(anthropic.NotFoundError) as refused:
         client.messages.create(model="nope", max_tokens=64, messages=SAY["messages"])
     assert refused.value.body["error"]["type"] == "not_found_error"
+
+
+def test_the_real_anthropic_client_reads_how_a_reply_ended_and_what_it_reasoned(mesh, served):
+    anthropic = pytest.importorskip("anthropic")
+    client = anthropic.Anthropic(base_url=served, api_key="unused", max_retries=0)
+    mesh.use(QWEN3, "Hello END there")
+    reply = client.messages.create(model="scripted", max_tokens=64, messages=SAY["messages"], stop_sequences=["END"])
+    assert (reply.stop_reason, reply.stop_sequence, reply.content[0].text) == ("stop_sequence", "END", "Hello ")
+    mesh.use(QWEN3, THOUGHT)
+    reply = client.messages.create(model="scripted", max_tokens=64, messages=SAY["messages"])
+    assert [block.type for block in reply.content] == ["thinking", "text"] and reply.content[0].thinking == "Let me see." and reply.content[0].signature
+    mesh.use(QWEN3, THOUGHT)
+    with client.messages.stream(model="scripted", max_tokens=64, messages=SAY["messages"]) as stream:
+        final = stream.get_final_message()
+    assert final.content[0].thinking == "Let me see." and final.content[0].signature and final.content[1].text == "Hello there"
+    mesh.use(QWEN3, "Sure")
+    history = [*SAY["messages"], {"role": "assistant", "content": [block.model_dump() for block in reply.content]}, {"role": "user", "content": "more"}]
+    assert client.messages.create(model="scripted", max_tokens=64, messages=history).content[0].text == "Sure"
+
+
+def test_the_real_anthropic_client_lists_models(keyed, served):
+    anthropic = pytest.importorskip("anthropic")
+    client = anthropic.Anthropic(base_url=served, api_key=keyed.key, max_retries=0)
+    assert [model.id for model in client.models.list()] == ["scripted"]
+    assert client.models.retrieve("scripted").display_name == "scripted"
+
+
+def test_the_real_ollama_client_reads_reasoning_and_takes_seed_minus_one(mesh, served):
+    ollama_library = pytest.importorskip("ollama")
+    mesh.use(QWEN3, THOUGHT)
+    reply = ollama_library.Client(host=served).chat(model="scripted", messages=SAY["messages"], options={"seed": -1})
+    assert reply.message.thinking == "Let me see." and reply.message.content == "Hello there"
 
 
 def test_the_real_anthropic_client_sends_its_key_as_x_api_key(keyed, served):

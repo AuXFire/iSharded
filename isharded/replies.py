@@ -17,6 +17,11 @@ def usage_of(summary: dict[str, Any]) -> dict[str, int]:
     return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
 
 
+def first_stop(text: str, markers: list[str]) -> str | None:
+    """The stop string this text meets first, if it meets one."""
+    return min((marker for marker in markers if marker in text), key=text.index, default=None)
+
+
 def server_sent(payload: dict[str, Any] | str) -> str:
     return f"data: {payload if isinstance(payload, str) else json.dumps(payload)}\n\n"
 
@@ -57,6 +62,7 @@ async def event_stream(
                 "time_to_first_token_ms": item["time_to_first_token_ms"],
                 "tokens_per_second": item["tokens_per_second"],
                 **route_now(),
+                **({"stop_sequence": item["stop_sequence"]} if item.get("stop_sequence") else {}),
             }
             yield server_sent(
                 {
@@ -102,16 +108,20 @@ async def scanned(tokens: AsyncIterator[dict[str, Any]], scanner: ReplyScanner) 
 async def whole_reply(items: AsyncIterator[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
     """The assistant message a reply comes to, and its summary."""
     pieces: list[str] = []
+    thoughts: list[str] = []
     calls: list[dict[str, Any]] = []
     summary: dict[str, Any] = {}
     async for item in items:
         if "text" in item:
             pieces.append(item["text"])
+        elif "thinking" in item:
+            thoughts.append(item["thinking"])
         elif "tool_call" in item:
             calls.append(item["tool_call"])
         else:
             summary = item
     text = "".join(pieces)
+    reasoned = {"thinking": "".join(thoughts)} if thoughts else {}
     if calls:
-        return {"role": "assistant", "content": text or None, "tool_calls": calls}, summary
-    return {"role": "assistant", "content": text}, summary
+        return {"role": "assistant", "content": text or None, "tool_calls": calls, **reasoned}, summary
+    return {"role": "assistant", "content": text, **reasoned}, summary

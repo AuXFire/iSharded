@@ -794,11 +794,44 @@ async def real_ring(host, **limits) -> EngineClient:
     return await EngineClient.open(door["local_port"], bytes(door["local_key"]))
 
 
-def real_pass(client, tokens, position, rollback_to=None, keep=False, temperature=0.0, seed=None):
+def real_pass(client, tokens, position, rollback_to=None, keep=False, temperature=0.0, seed=None, top_k=0):
     return client.send(
         epoch=1, slot=0, position=position, rollback_to=rollback_to, tokens=tokens, guesses=[], verify=False,
-        temperature=temperature, top_p=1.0, top_k=0, seed=seed, keep=keep,
+        temperature=temperature, top_p=1.0, top_k=top_k, seed=seed, keep=keep,
     )  # fmt: skip
+
+
+@needs_real_stage
+def test_a_seeded_top_k_reply_is_the_same_in_the_engine_and_on_the_python_path() -> None:
+    """A reply leaves the ring when a stage fails, and must not change course when it does."""
+    sampling = {"temperature": 1.0, "top_k": 40, "seed": 7}
+
+    async def engine_reply(host) -> list[int]:
+        client = await real_ring(host)
+        try:
+            await real_pass(client, PROMPT[:-1], 0, **sampling)
+            made = PROMPT[-1:]
+            for position in range(len(PROMPT) - 1, len(PROMPT) + 24):
+                made += (await real_pass(client, made[-1:], position, **sampling))[:1]
+            return made
+        finally:
+            client.close()
+
+    def python_reply(host) -> list[int]:
+        host.call("commit", tokens=PROMPT[:-1], position=0)
+        made = PROMPT[-1:]
+        for position in range(len(PROMPT) - 1, len(PROMPT) + 24):
+            rows = host.call("embed", tokens=made[-1:])[1]
+            made += host.call("verify", rows, position=position, guesses=[], top_p=1.0, **sampling)[0]["tokens"]
+        return made
+
+    host, _ = real_stage()
+    try:
+        ringed = asyncio.run(engine_reply(host))
+        host.call("clear", slot=0)
+        assert python_reply(host) == ringed
+    finally:
+        host.close()
 
 
 @needs_real_stage

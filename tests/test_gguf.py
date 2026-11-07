@@ -1437,6 +1437,27 @@ def test_a_seeded_plain_pass_on_a_gguf_stage_draws_as_the_engine_does(monkeypatc
         assert runtime._sample(None, request) == draw(ids, chances, Draws(5, length - 1))
 
 
+def test_candidates_come_highest_first_and_ties_by_id():
+    from isharded.llamacpp import filtered_distribution
+
+    logits = np.array([2.0, 5.0, 2.0, 7.0, 2.0, 2.0, -0.0, 0.0], dtype=np.float32)
+    assert filtered_distribution(logits, 1.0, 1.0, 4)[0].tolist() == [3, 1, 0, 2]
+    assert filtered_distribution(logits, 1.0, 1.0, 8)[0].tolist() == [3, 1, 0, 2, 4, 5, 6, 7]
+
+
+def test_seeded_top_k_follows_the_engine():
+    """The same logits and draws as `a_seeded_top_k_reply_draws_what_the_python_path_draws` in engine/src/sample.rs."""
+    from isharded.llamacpp import Draws, speculative_choice
+
+    state, values = 12345, []
+    for _ in range(1000):
+        state = (state * 6364136223846793005 + 1442695040888963407) % 2**64
+        values.append((state >> 40) % 64 / 8.0)
+    logits = np.array(values, dtype=np.float32)
+    made = [speculative_choice(lambda _: logits, [], 0.75, 1.0, 40, Draws(7, position))[0] for position in range(12)]
+    assert made == [575, 613, 168, 912, 575, 815, 668, 290, 899, 216, 815, 575]
+
+
 def test_an_unseeded_gguf_pass_samples_as_it_always_did(monkeypatch):
     import torch
 

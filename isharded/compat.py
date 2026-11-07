@@ -25,17 +25,29 @@ import httpx
 from pydantic import ValidationError
 
 from . import __version__
+from .gguf import quantization_name
 from .protocol import ChatCompletionRequest, ChatMessage, CompletionRequest, EmbeddingRequest
 from .replies import render_prompts, whole_reply
-from .toolcalls import ToolRequestError, plan_tools, template_messages, tool_format
+from .toolcalls import THINK_CLOSE, ThoughtSplitter, ToolRequestError, plan_tools, template_messages, tool_format
 from .vision import ImageRefused, chat_images
 
 # The chat route's own limit. Clients here often ask for more, and mean "as much as there is".
 MOST_REPLY_TOKENS = 32768
 # Ollama's way of saying a model stays loaded for good.
 NEVER = "2318-08-31T00:00:00Z"
-KEY_PATHS = {"/v1/messages", "/v1/messages/count_tokens"}
-STATUS_KINDS = {401: "authentication_error", 403: "permission_error", 404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error"}
+# Ollama clients compare this with the release they need, and iSharded's own numbers mean nothing there.
+OLLAMA_VERSION = "0.12.0"
+KEY_PATHS = {"/v1/messages", "/v1/messages/count_tokens", "/v1/models"}
+STATUS_KINDS = {
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    409: "conflict_error",
+    413: "request_too_large",
+    429: "rate_limit_error",
+    504: "timeout_error",
+    529: "overloaded_error",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,18 +67,18 @@ class Node:
 class KeyHeader:
     """Claude clients send their key as x-api-key, and everything else reads Authorization.
 
-    This runs first, and the header goes: a person's key must not leave their
-    node, and forwarding only knows to drop Authorization.
+    This runs first, and the header goes on every path: a person's key must not
+    leave their node, and forwarding only knows to drop Authorization.
     """
 
     def __init__(self, app: Any) -> None:
         self.app = app
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-        if scope["type"] == "http" and scope["path"] in KEY_PATHS:
+        if scope["type"] == "http":
             sent = dict(scope["headers"])
             headers = [(name, value) for name, value in scope["headers"] if name != b"x-api-key"]
-            if b"x-api-key" in sent and b"authorization" not in sent:
+            if b"x-api-key" in sent and b"authorization" not in sent and (scope["path"] in KEY_PATHS or scope["path"].startswith("/v1/models/")):
                 headers.append((b"authorization", b"Bearer " + sent[b"x-api-key"]))
             scope = {**scope, "headers": headers}
         await self.app(scope, receive, send)
@@ -179,8 +191,8 @@ async def server_events(response: Any) -> AsyncIterator[dict[str, Any]]:
             await response.background()
 
 
-async def reply_items(response: Any) -> AsyncIterator[dict[str, Any]]:
-    """A /v1 stream as ``scanned`` gave it: text, tool calls, and a closing summary."""
+async def reply_items(response: Any, thoughts: ThoughtSplitter) -> AsyncIterator[dict[str, Any]]:
+    """A /v1 stream as ``scanned`` gave it: text, tool calls, and a closing summary, with reasoning sorted by ``thoughts``."""
     heads: dict[int, dict[str, Any]] = {}
     finished = False
     try:
@@ -190,17 +202,24 @@ async def reply_items(response: Any) -> AsyncIterator[dict[str, Any]]:
                     raise refuse(str(event["error"].get("message")), int(event["error"].get("code") or 500))
                 choice = event["choices"][0]
                 delta = choice.get("delta") or {}
+                if (delta.get("isharded") or {}).get("in_thought"):
+                    thoughts.open()
                 text = delta.get("content") or choice.get("text")
                 if text:
-                    yield {"text": text}
+                    for item in thoughts.feed(text):
+                        yield item
                 for part in delta.get("tool_calls") or []:
                     if "id" in part:
                         heads[part["index"]] = part
                     else:
+                        for item in thoughts.finish():
+                            yield item
                         head = heads[part["index"]]
                         yield {"tool_call": called(head["id"], head["function"]["name"], part["function"]["arguments"])}
                 if choice.get("finish_reason"):
                     finished = True
+                    for item in thoughts.finish():
+                        yield item
                     yield {"finish_reason": choice["finish_reason"], **event.get("usage", {}), **event.get("isharded", {})}
     except httpx.HTTPError as exc:
         raise refuse(f"the reply was lost on its way here: {exc}", 503) from exc
@@ -208,12 +227,15 @@ async def reply_items(response: Any) -> AsyncIterator[dict[str, Any]]:
         raise refuse("the reply stopped before it was finished", 503)
 
 
-async def reply(call: Callable[..., Any], request: Any, authorization: str | None) -> AsyncIterator[dict[str, Any]]:
-    """Run a request through its /v1 handler. A refusal is raised here, before any reply starts."""
+async def reply(call: Callable[..., Any], request: Any, authorization: str | None, thoughts: bool = False) -> AsyncIterator[dict[str, Any]]:
+    """Run a request through its /v1 handler. A refusal is raised here, before any reply starts.
+
+    With ``thoughts``, a reply's reasoning arrives as ``thinking`` items, for APIs with a place for it.
+    """
     response = await call(request.model_copy(update={"stream": True}), authorization)
     if response.status_code != 200:
         await whole_answer(response)
-    return reply_items(response)
+    return reply_items(response, ThoughtSplitter(thoughts))
 
 
 def answering_model(node: Node, request: Any) -> str:
@@ -250,6 +272,7 @@ def anthropic_messages(body: dict[str, Any]) -> list[dict[str, Any]]:
         content = message["content"]
         parts: list[dict[str, Any]] = []
         calls: list[dict[str, Any]] = []
+        thoughts: list[str] = []
         for block in [{"type": "text", "text": content}] if isinstance(content, str) else content:
             kind = block["type"]
             if kind == "text":
@@ -260,10 +283,13 @@ def anthropic_messages(body: dict[str, Any]) -> list[dict[str, Any]]:
                 calls.append(called(block["id"], block["name"], json.dumps(block.get("input") or {})))
             elif kind == "tool_result":
                 messages.append(anthropic_result(block))  # Claude puts these first, and they come before the words
-            elif kind not in {"thinking", "redacted_thinking"}:
-                raise refuse(f"a content block of type {kind!r} is not supported here; send text, image, tool_use and tool_result")
+            elif kind == "thinking":
+                thoughts.append(block.get("thinking") or "")
+            elif kind != "redacted_thinking":  # that one is sealed, and nothing here can open it
+                raise refuse(f"a content block of type {kind!r} is not supported here; send text, image, thinking, tool_use and tool_result")
         if parts or calls:
-            messages.append({"role": message["role"], "content": parts or None, **({"tool_calls": calls} if calls else {})})
+            reasoned = {"reasoning_content": "\n".join(thoughts)} if any(thoughts) else {}
+            messages.append({"role": message["role"], "content": parts or None, **({"tool_calls": calls} if calls else {}), **reasoned})
     return messages
 
 
@@ -298,17 +324,31 @@ def anthropic_chat(body: dict[str, Any]) -> ChatCompletionRequest:
     )
 
 
-def stop_reason(finish_reason: str | None) -> str:
-    return {"length": "max_tokens", "tool_calls": "tool_use"}.get(finish_reason or "", "end_turn")
+def stop_fields(summary: dict[str, Any]) -> dict[str, Any]:
+    """How a reply ended, as Claude says it."""
+    finish_reason, matched = summary["finish_reason"], summary.get("stop_sequence")
+    if matched and finish_reason != "tool_calls":
+        return {"stop_reason": "stop_sequence", "stop_sequence": matched}
+    return {"stop_reason": {"length": "max_tokens", "tool_calls": "tool_use"}.get(finish_reason, "end_turn"), "stop_sequence": None}
+
+
+def claude_usage(summary: dict[str, Any]) -> dict[str, Any]:
+    return {"input_tokens": summary["prompt_tokens"], "output_tokens": summary["completion_tokens"], "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+
+
+def thought_signature(thought: str) -> str:
+    """Clients hand a block's signature back and must have one. Nobody here can sign for Anthropic, so it proves nothing."""
+    return hashlib.sha256(thought.encode()).hexdigest()
 
 
 def server_event(name: str, data: dict[str, Any]) -> str:
     return f"event: {name}\ndata: {json.dumps(data)}\n\n"
 
 
-async def anthropic_stream(items: AsyncIterator[dict[str, Any]], opening: dict[str, Any]) -> AsyncIterator[str]:
+async def anthropic_stream(items: AsyncIterator[dict[str, Any]], opening: dict[str, Any], show_thinking: bool = True) -> AsyncIterator[str]:
     index = 0
-    open_text = False
+    open_block: str | None = None  # text or thinking, while a block of either is being written
+    thought = ""
 
     def block_stop() -> str:
         return server_event("content_block_stop", {"type": "content_block_stop", "index": index})
@@ -319,19 +359,36 @@ async def anthropic_stream(items: AsyncIterator[dict[str, Any]], opening: dict[s
     def block_start(block: dict[str, Any]) -> str:
         return server_event("content_block_start", {"type": "content_block_start", "index": index, "content_block": block})
 
+    def end_block() -> list[str]:
+        nonlocal index, open_block, thought
+        if open_block is None:
+            return []
+        ended = [block_stop()]
+        if open_block == "thinking":
+            hidden = [] if show_thinking else [block_delta({"type": "thinking_delta", "thinking": ""})]
+            ended = [*hidden, block_delta({"type": "signature_delta", "signature": thought_signature(thought)}), *ended]
+        index, open_block, thought = index + 1, None, ""
+        return ended
+
     yield server_event("message_start", {"type": "message_start", "message": opening})
     try:
         async with aclosing(items) as source:
             async for item in source:
-                if "text" in item and not open_text:
-                    yield block_start({"type": "text", "text": ""})
-                    open_text = True
-                if "text" in item:
+                kind = next((name for name in ("text", "thinking") if name in item), None)
+                if kind != open_block:
+                    for line in end_block():
+                        yield line
+                if kind and open_block is None:
+                    yield block_start({"type": "text", "text": ""} if kind == "text" else {"type": "thinking", "thinking": "", "signature": ""})
+                    open_block = kind
+                if kind == "text":
                     yield block_delta({"type": "text_delta", "text": item["text"]})
                     continue
-                if open_text:
-                    yield block_stop()
-                    index, open_text = index + 1, False
+                if kind == "thinking":
+                    thought += item["thinking"]
+                    if show_thinking:
+                        yield block_delta({"type": "thinking_delta", "thinking": item["thinking"]})
+                    continue
                 if "tool_call" in item:
                     call = item["tool_call"]
                     yield block_start({"type": "tool_use", "id": call["id"], "name": call["function"]["name"], "input": {}})
@@ -339,14 +396,7 @@ async def anthropic_stream(items: AsyncIterator[dict[str, Any]], opening: dict[s
                     yield block_stop()
                     index += 1
                     continue
-                yield server_event(
-                    "message_delta",
-                    {
-                        "type": "message_delta",
-                        "delta": {"stop_reason": stop_reason(item["finish_reason"]), "stop_sequence": None},
-                        "usage": {"input_tokens": item["prompt_tokens"], "output_tokens": item["completion_tokens"]},
-                    },
-                )
+                yield server_event("message_delta", {"type": "message_delta", "delta": {"container": None, "stop_details": None, **stop_fields(item)}, "usage": claude_usage(item)})
                 yield server_event("message_stop", {"type": "message_stop"})
     except HTTPException as exc:
         # Headers are long gone, so the failure has to travel in the stream.
@@ -358,17 +408,22 @@ async def anthropic_reply(node: Node, request: Request, authorization: str | Non
     if not a_count(body.get("max_tokens")):
         raise refuse("max_tokens: a whole number above 0 is required")
     chat = translate(anthropic_chat, body)
-    items = await reply(node.chat, chat, authorization)
-    frame = {"id": f"msg_{uuid.uuid4().hex}", "type": "message", "role": "assistant", "model": answering_model(node, chat)}
+    items = await reply(node.chat, chat, authorization, thoughts=True)
+    show_thinking = (body.get("thinking") or {}).get("display") != "omitted"
+    frame = {"id": f"msg_{uuid.uuid4().hex}", "type": "message", "role": "assistant", "model": answering_model(node, chat), "container": None, "diagnostics": None, "stop_details": None}
     if body.get("stream"):
-        opening = {**frame, "content": [], "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}
-        return StreamingResponse(anthropic_stream(items, opening), media_type="text/event-stream")
+        opening = {**frame, "content": [], "stop_reason": None, "stop_sequence": None, "usage": claude_usage({"prompt_tokens": 0, "completion_tokens": 0})}
+        return StreamingResponse(anthropic_stream(items, opening, show_thinking), media_type="text/event-stream")
     message, summary = await whole_reply(items)
-    content: list[dict[str, Any]] = [{"type": "text", "text": message["content"]}] if message["content"] else []
+    content: list[dict[str, Any]] = []
+    if "thinking" in message:
+        thought = message["thinking"]
+        content.append({"type": "thinking", "thinking": thought if show_thinking else "", "signature": thought_signature(thought)})
+    if message["content"]:
+        content.append({"type": "text", "text": message["content"]})
     for call in message.get("tool_calls", []):
         content.append({"type": "tool_use", "id": call["id"], "name": call["function"]["name"], "input": json.loads(call["function"]["arguments"])})
-    usage = {"input_tokens": summary["prompt_tokens"], "output_tokens": summary["completion_tokens"]}
-    return {**frame, "content": content, "stop_reason": stop_reason(summary["finish_reason"]), "stop_sequence": None, "usage": usage}
+    return {**frame, "content": content, **stop_fields(summary), "usage": claude_usage(summary)}
 
 
 async def anthropic_count(node: Node, request: Request, authorization: str | None) -> Any:
@@ -595,7 +650,10 @@ def ollama_time() -> str:
 
 def ollama_options(body: dict[str, Any]) -> dict[str, Any]:
     options = body.get("options") or {}
-    return {"max_tokens": reply_tokens(options.get("num_predict")), **picked(options, "temperature", "top_p", "top_k", "seed", "stop")}
+    chosen = picked(options, "temperature", "top_p", "top_k", "seed", "stop")
+    if chosen.get("seed") == -1:  # Ollama's way of saying no seed
+        del chosen["seed"]
+    return {"max_tokens": reply_tokens(options.get("num_predict")), **chosen}
 
 
 def ollama_images(images: list[str]) -> list[dict[str, Any]]:
@@ -612,7 +670,7 @@ def ollama_messages(body: dict[str, Any]) -> list[dict[str, Any]]:
     waiting: list[dict[str, Any]] = []  # Ollama's tool results carry a name at most, so calls are matched up here
     for message in body["messages"]:
         role = message["role"]
-        item = {"role": role, "content": ollama_content(message.get("content") or "", message.get("images"))}
+        item = {"role": role, "content": ollama_content(message.get("content") or "", message.get("images")), **picked({"reasoning_content": message.get("thinking")}, "reasoning_content")}
         if message.get("tool_calls"):
             waiting = [
                 called(call.get("id") or f"call_{len(messages)}_{index}", call["function"]["name"], json.dumps(call["function"].get("arguments") or {}))
@@ -669,13 +727,13 @@ def ollama_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def ollama_message(text: str, calls: list[dict[str, Any]]) -> dict[str, Any]:
-    message: dict[str, Any] = {"role": "assistant", "content": text}
+def ollama_message(text: str, calls: list[dict[str, Any]], thinking: str = "") -> dict[str, Any]:
+    message: dict[str, Any] = {"role": "assistant", "content": text, **({"thinking": thinking} if thinking else {})}
     return {"message": {**message, "tool_calls": ollama_calls(calls)} if calls else message}
 
 
-def ollama_response(text: str, calls: list[dict[str, Any]]) -> dict[str, Any]:
-    return {"response": text}
+def ollama_response(text: str, calls: list[dict[str, Any]], thinking: str = "") -> dict[str, Any]:
+    return {"response": text, **({"thinking": thinking} if thinking else {})}
 
 
 def ollama_timing(summary: dict[str, Any], started: float) -> dict[str, Any]:
@@ -705,6 +763,8 @@ async def ollama_stream(items: AsyncIterator[dict[str, Any]], frame: dict[str, A
                 now = {**frame, "created_at": ollama_time()}
                 if "text" in item:
                     yield json_line({**now, **shape(item["text"], []), "done": False})
+                elif "thinking" in item:
+                    yield json_line({**now, **shape("", [], item["thinking"]), "done": False})
                 elif "tool_call" in item:
                     yield json_line({**now, **shape("", [item["tool_call"]]), "done": False})
                 else:
@@ -715,12 +775,12 @@ async def ollama_stream(items: AsyncIterator[dict[str, Any]], frame: dict[str, A
 
 async def ollama_answer(node: Node, call: Any, request: Any, body: dict[str, Any], shape: Callable[..., dict[str, Any]], authorization: str | None) -> Any:
     started = time.perf_counter()
-    items = await reply(call, request, authorization)
+    items = await reply(call, request, authorization, thoughts=isinstance(request, ChatCompletionRequest))
     frame = {"model": answering_model(node, request)}
     if body.get("stream") is not False:  # Ollama streams unless told not to, and null tells it nothing
         return StreamingResponse(ollama_stream(items, frame, shape, started), media_type="application/x-ndjson")
     message, summary = await whole_reply(items)
-    return {**frame, "created_at": ollama_time(), **shape(message["content"] or "", message.get("tool_calls", [])), **ollama_timing(summary, started)}
+    return {**frame, "created_at": ollama_time(), **shape(message["content"] or "", message.get("tool_calls", []), message.get("thinking", "")), **ollama_timing(summary, started)}
 
 
 async def ollama_load(node: Node, body: dict[str, Any], shape: Callable[..., dict[str, Any]], authorization: str | None) -> dict[str, Any]:
@@ -800,7 +860,7 @@ def ollama_row(node: Node, row: dict[str, Any]) -> dict[str, Any]:
             "family": family,
             "families": [family] if family else None,
             "parameter_size": str(header.get("general.size_label") or ""),
-            "quantization_level": "",
+            "quantization_level": quantization_name(header) or "",
         },
     }
 
@@ -835,6 +895,7 @@ async def ollama_show(node: Node, request: Request, authorization: str | None) -
     capabilities = ["embedding"] if row.get("kind") == "embedding" else ["completion"]
     capabilities += ["tools"] if tool_format(template) else []
     capabilities += ["vision"] if row.get("vision") else []
+    capabilities += ["thinking"] if template and THINK_CLOSE in template else []
     info = {"general.architecture": family, **({f"{family}.context_length": active.profile.context_tokens} if active and family else {})}
     return {
         "modelfile": "",
@@ -849,16 +910,57 @@ async def ollama_show(node: Node, request: Request, authorization: str | None) -
 
 async def ollama_version(node: Node, request: Request, authorization: str | None) -> Any:
     node.charge(authorization)
-    return {"version": __version__}
+    return {"version": OLLAMA_VERSION, "isharded": __version__}
 
 
 async def ollama_refused(node: Node, request: Request, authorization: str | None) -> Any:
     raise refuse("iSharded does not change models through this API; load one with isharded load or POST /admin/load")
 
 
+# --- Models
+#
+# One row serves OpenAI and Claude clients, and each reads the fields it knows.
+
+
+def model_row(name: str, kind: dict[str, Any], started_at: float) -> dict[str, Any]:
+    return {
+        "id": name,
+        "object": "model",
+        "owned_by": "isharded",
+        **kind,
+        "type": "model",
+        "display_name": name.replace("\\", "/").rpartition("/")[2],
+        "created_at": datetime.fromtimestamp(started_at, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "lifecycle": "active",
+        **dict.fromkeys(("capabilities", "deprecated_at", "line", "max_input_tokens", "max_tokens", "retires_at")),
+    }
+
+
+def model_listing(models: dict[str, dict[str, Any]], started_at: float) -> dict[str, Any]:
+    """Everything this node serves, as one page: there are never enough for more."""
+    names = list(models)
+    return {
+        "object": "list",
+        "data": [model_row(name, kind, started_at) for name, kind in models.items()],
+        "first_id": names[0] if names else None,
+        "has_more": False,
+        "last_id": names[-1] if names else None,
+    }
+
+
+async def model_info(node: Node, request: Request, authorization: str | None) -> Any:
+    listing = await node.models(authorization)
+    name = request.path_params["model_id"]
+    row = next((row for row in listing["data"] if row["id"] == name), None)
+    if row is None:
+        raise refuse(f"model {name!r} is not loaded", 404)
+    return row
+
+
 ROUTES: list[tuple[str, str, Any, Callable[[int, str], dict[str, Any]]]] = [
     ("POST", "/v1/messages", anthropic_reply, anthropic_error),
     ("POST", "/v1/messages/count_tokens", anthropic_count, anthropic_error),
+    ("GET", "/v1/models/{model_id:path}", model_info, anthropic_error),
     ("POST", "/v1/responses", responses_reply, openai_error),
     ("POST", "/api/chat", ollama_chat_reply, ollama_error),
     ("POST", "/api/generate", ollama_generate, ollama_error),
@@ -872,6 +974,7 @@ ROUTES: list[tuple[str, str, Any, Callable[[int, str], dict[str, Any]]]] = [
     ("POST", "/api/push", ollama_refused, ollama_error),
     ("POST", "/api/create", ollama_refused, ollama_error),
     ("POST", "/api/copy", ollama_refused, ollama_error),
+    ("POST", "/api/blobs/{digest}", ollama_refused, ollama_error),
     ("DELETE", "/api/delete", ollama_refused, ollama_error),
 ]
 

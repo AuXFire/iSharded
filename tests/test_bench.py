@@ -31,7 +31,7 @@ def status(pipeline_tokens: int = 100, epoch: int = 3, reused: int = 0, ready: s
             "code_version": "0.3.0",
             "country": country,
             "control_latency_ms": 2.5,
-            "hardware": {"host_id": MACHINE, "device": "cuda:0", "accelerator_name": gpu, "memory_pools": [{"label": MACHINE}]},
+            "hardware": {"host_id": MACHINE, "device": "cuda:0", "accelerator_name": gpu, "memory_pools": [{"label": MACHINE, "dtype": "bfloat16"}, {"label": MACHINE, "dtype": "checkpoint"}]},
             "runtime": {
                 "telemetry": {
                     "pipeline": {"tokens": tokens, "misses": tokens // 10, "depth": 3},
@@ -48,9 +48,11 @@ def status(pipeline_tokens: int = 100, epoch: int = 3, reused: int = 0, ready: s
 
     return {
         "status": ready,
+        "commit": "0123456789ab",
         "model": MODEL_PATH,
         "epoch": epoch,
-        "active_plan": {"architecture": "qwen3", "layers": 36, "draft_model": DRAFT_PATH},
+        "active_plan": {"architecture": "qwen3", "layers": 36, "draft_model": DRAFT_PATH, "slots": 4, "quantization": "Q4_K_M", "context_tokens": 8192},
+        "links": [{"source": f"{MACHINE}-1", "target": f"{MACHINE}-2", "median_ms": 3.25, "max_ms": 4.0, "cost_ms": 3.6, "checked_at": 1}],
         "route": [
             {"worker_id": f"{MACHINE}-1", "url": ADDRESS, "start_layer": 0, "end_layer": 20},
             {"worker_id": f"{MACHINE}-2", "url": ADDRESS, "start_layer": 20, "end_layer": 36},
@@ -341,10 +343,10 @@ def test_a_short_reply_is_noted():
 def test_the_report_explains_the_numbers():
     node = FakeNode()
     result = run(node)
-    assert result["model"] == {"name": "Qwen3-8B-Q4_K_M.gguf", "quantization": "Q4_K_M", "architecture": "qwen3", "layers": 36, "draft_model": "Qwen3-0.6B-Q8_0.gguf"}
+    assert result["model"] == {"name": "Qwen3-8B-Q4_K_M.gguf", "quantization": "Q4_K_M", "architecture": "qwen3", "layers": 36, "draft_model": "Qwen3-0.6B-Q8_0.gguf", "slots": 4, "context_tokens": 8192}
     assert result["route"][0] == {
-        "stage": 1, "start_layer": 0, "end_layer": 20, "country": "DE", "gpu": "RTX 3060",
-        "link_ms": 1.5, "next_stage_ms": 22.0, "compute_ms": 11.0, "control_ms": 2.5,
+        "stage": 1, "start_layer": 0, "end_layer": 20, "country": "DE", "gpu": "RTX 3060", "precision": "bfloat16",
+        "link_ms": 1.5, "probe_ms": 3.25, "next_stage_ms": 22.0, "compute_ms": 11.0, "control_ms": 2.5,
     }  # fmt: skip
     assert result["route"][1]["gpu"] == "RX 7900 XT" and result["route"][1]["link_ms"] is None
     assert result["native_engine"] is True
@@ -367,7 +369,7 @@ def test_a_live_ring_no_pass_crossed_does_not_count():
 
 
 def test_layers_are_shown_as_people_count_them():
-    assert "1: layers 0-19, RTX 3060, DE, link 1.5 ms; 2: layers 20-35, RX 7900 XT, country not shown" in bench.as_text(run(FakeNode()))
+    assert "1: layers 0-19, RTX 3060, bfloat16, DE, link 1.5 ms, probe 3.25 ms; 2: layers 20-35, RX 7900 XT, bfloat16, country not shown" in bench.as_text(run(FakeNode()))
 
 
 def test_a_route_that_moved_is_noted():
@@ -465,12 +467,178 @@ def test_the_command_prints_a_table_and_writes_both_files(monkeypatch, tmp_path,
     shown = capsys.readouterr().out
     assert "Tokens/s per reply" in shown and "Model: Qwen3-8B-Q4_K_M.gguf" in shown and "|" not in shown
     saved = json.loads(data.read_text(encoding="utf-8"))
-    assert saved["format"] == 1 and saved["options"]["tokens"] == 11
+    assert saved["format"] == 2 and saved["options"]["tokens"] == 11
     lines = page.read_text(encoding="utf-8").splitlines()
     assert "- **Quantization:** Q4_K_M" in lines
     table = [line for line in lines if line.startswith("|")]
     assert len(table) == 3 and table[1].startswith("| --- |")
     assert {line.count("|") for line in table} == {6}
+
+
+def test_a_report_says_what_ran():
+    report = run(FakeNode())
+    assert (report["model"]["slots"], report["model"]["quantization"], report["model"]["context_tokens"]) == (4, "Q4_K_M", 8192)
+    assert report["commit"] == "0123456789ab" and report["machines"] == 1
+    assert report["route"][0]["probe_ms"] == 3.25 and report["route"][1]["probe_ms"] is None
+    assert report["route"][0]["precision"] == "bfloat16"
+    shown = dict(bench.facts(report))
+    assert shown["Slots"] == "4" and shown["Machines"] == "1" and "node at commit 0123456789ab" in shown["iSharded"]
+    assert "probe 3.25 ms" in shown["Stages"] and "bfloat16" in shown["Stages"]
+
+
+def test_status_gives_what_a_report_needs(monkeypatch):
+    from types import SimpleNamespace
+
+    from isharded import orchestrator
+    from isharded.models import GgufAdapter
+    from isharded.protocol import StageAssignment
+
+    monkeypatch.setattr(orchestrator, "source_commit", lambda: "0123456789ab")
+    assert orchestrator.Orchestrator().status()["commit"] == "0123456789ab"
+    adapter = object.__new__(GgufAdapter)
+    adapter.header = {"general.file_type": 15}
+    adapter.config, adapter.num_layers = {"model_type": "qwen3"}, 2
+    target = SimpleNamespace(
+        model_id="m", adapter=adapter, slots=4, draft=None, embedding=False, projector=None, units={}, held={},
+        profile=SimpleNamespace(total_bytes=1, ring=False, context_tokens=8192),
+    )  # fmt: skip
+    route = [StageAssignment(worker_id="w", url="http://worker", start_layer=0, end_layer=2)]
+    plan = orchestrator.describe_plan(target, route)
+    assert (plan["slots"], plan["quantization"], plan["context_tokens"]) == (4, "Q4_K_M", 8192)
+
+
+def test_a_checkout_knows_its_commit_and_an_install_does_not(monkeypatch, tmp_path):
+    import isharded
+
+    isharded.source_commit.cache_clear()
+    assert isharded.source_commit() is None or len(isharded.source_commit()) == 12
+    monkeypatch.setattr(isharded, "__file__", str(tmp_path / "isharded" / "__init__.py"))
+    isharded.source_commit.cache_clear()
+    assert isharded.source_commit() is None
+    isharded.source_commit.cache_clear()
+
+
+def test_the_quantization_a_node_reports_outranks_the_file_name():
+    node = FakeNode()
+    node.statuses[1]["active_plan"]["quantization"] = "Q6_K"
+    assert run(node)["model"]["quantization"] == "Q6_K"
+
+
+def test_a_node_too_old_to_say_is_reported_as_silent():
+    node = FakeNode()
+    del node.statuses[1]["commit"]
+    for name in ("slots", "quantization", "context_tokens"):
+        del node.statuses[1]["active_plan"][name]
+    report = run(node)
+    assert report["model"]["quantization"] == "Q4_K_M"  # still in the file's name
+    shown = dict(bench.facts(report))
+    assert shown["Slots"] == "not reported" and "node reported no commit" in shown["iSharded"]
+
+
+def test_machines_are_counted_without_being_named():
+    status_now = status()
+    status_now["workers"][f"{MACHINE}-2"]["hardware"]["host_id"] = "another-desk"
+    assert bench.machine_count(status_now) == 2
+
+
+def test_a_report_says_how_it_was_measured():
+    report = run(FakeNode())
+    page = bench.as_markdown(report)
+    assert page.startswith("## iSharded bench: Qwen3-8B-Q4_K_M.gguf\n") and "### How this was measured" in page
+    assert "/v1/chat/completions" in page and "2 rounds" in page and report["at"] in page
+    assert "/v1/chat/completions" in bench.as_text(report)
+
+
+def test_where_it_was_asked_from_is_said_and_no_address_with_it():
+    assert run(FakeNode())["asked_from"] == "on the node's own machine"
+    node = FakeNode()
+    remote = bench.Bench(node.client(), "http://node", {}, options("--url", ADDRESS), node.clock).run()
+    assert remote["asked_from"] == "over the network" and "203.0.113" not in json.dumps(remote)
+
+
+def saved_run(tmp_path, name: str, **changes) -> str:
+    report = run(FakeNode())
+    report |= {"commit": name * 12}
+    for level, scale in changes.get("scale", {}).items():
+        for result in report["results"]:
+            for row in result["levels"]:
+                row[level] = {key: value * scale if key != "samples" else value for key, value in row[level].items()}
+    report["model"] |= changes.get("model", {})
+    path = tmp_path / f"{name}.json"
+    path.write_text(json.dumps(report), encoding="utf-8")
+    return str(path)
+
+
+def compare(*arguments: str) -> int:
+    return bench.run_bench(cli.build_parser().parse_args(["bench", "--compare", *arguments]))
+
+
+def test_compare_sets_two_runs_side_by_side(tmp_path, capsys):
+    old = saved_run(tmp_path, "a")
+    new = saved_run(tmp_path, "b", scale={"reply_tokens_per_second": 2.0, "first_token_ms": 2.0})
+    assert compare(old, new) == 0
+    shown = capsys.readouterr().out
+    assert "aaaaaaaaaaaa" in shown and "bbbbbbbbbbbb" in shown and "The same setup ran both times." in shown
+    assert "+100%) better" in shown and "+100%) worse" in shown
+
+
+def test_compare_calls_overlapping_ranges_noise():
+    wide = {"median": 10.0, "min": 8.0, "max": 12.0, "samples": 3}
+    near = {"median": 11.0, "min": 9.0, "max": 13.0, "samples": 3}
+    assert bench.change(wide, near, True) == {"old": 10.0, "new": 11.0, "percent": 10.0, "verdict": "within noise"}
+    far = {"median": 20.0, "min": 19.0, "max": 21.0, "samples": 3}
+    assert bench.change(wide, far, True)["verdict"] == "better" and bench.change(wide, far, False)["verdict"] == "worse"
+    assert bench.change(None, far, True) is None and bench.change(wide, None, True) is None
+    alone = {"median": 20.0, "min": 20.0, "max": 20.0, "samples": 1}
+    assert bench.change(wide, alone, True)["verdict"] == "within noise" and bench.change(alone, wide, True)["verdict"] == "within noise"
+
+
+def test_compare_warns_when_the_runs_measured_different_things(tmp_path, capsys):
+    assert compare(saved_run(tmp_path, "a"), saved_run(tmp_path, "b", model={"quantization": "Q8_0", "slots": 8})) == 0
+    shown = capsys.readouterr().out
+    assert "What ran differently:" in shown and "Q4_K_M" in shown and "Q8_0" in shown
+    assert "may come from that and not from the code" in shown
+
+
+def test_compare_says_what_only_one_run_measured(tmp_path, capsys):
+    old, new = saved_run(tmp_path, "a"), tmp_path / "b.json"
+    report = json.loads(Path(old).read_text(encoding="utf-8"))
+    report["results"][0]["wanted_prompt_tokens"] = 999
+    new.write_text(json.dumps(report), encoding="utf-8")
+    assert compare(old, str(new)) == 0
+    shown = capsys.readouterr().out
+    assert "no case in common" in shown and "Prompts of 999 tokens, 1 at once, ran in only one of these." in shown
+
+
+def test_compare_reads_a_report_from_before_nodes_said_what_ran(tmp_path, capsys):
+    old = tmp_path / "old.json"
+    report = json.loads(Path(saved_run(tmp_path, "a")).read_text(encoding="utf-8"))
+    report["format"] = 1
+    for name in ("machines", "asked_from", "bench_commit"):
+        del report[name]
+    del report["model"]["slots"]
+    for stage in report["route"]:
+        del stage["precision"], stage["probe_ms"]
+    old.write_text(json.dumps(report), encoding="utf-8")
+    assert compare(str(old), saved_run(tmp_path, "b")) == 0
+    assert "not reported" in capsys.readouterr().out
+
+
+def test_compare_writes_both_files_and_measures_nothing(tmp_path, capsys):
+    data, page = tmp_path / "out.json", tmp_path / "out.md"
+    assert compare(saved_run(tmp_path, "a"), saved_run(tmp_path, "b"), "--json", str(data), "--markdown", str(page)) == 0
+    assert json.loads(data.read_text(encoding="utf-8"))["new"]["commit"] == "b" * 12
+    text = page.read_text(encoding="utf-8")
+    assert text.startswith("## iSharded bench comparison\n") and "| --- |" in text
+
+
+@pytest.mark.parametrize("content, words", [(None, "cannot read"), ("not json", "cannot read"), ('{"a": 1}', "not a report"), ("[1]", "not a report")])
+def test_compare_refuses_what_is_not_a_report(tmp_path, capsys, content, words):
+    bad = tmp_path / "bad.json"
+    if content is not None:
+        bad.write_text(content, encoding="utf-8")
+    assert compare(str(bad), saved_run(tmp_path, "a")) == 1
+    assert words in capsys.readouterr().err
 
 
 def test_a_file_it_cannot_write_does_not_cost_the_results(monkeypatch, tmp_path, capsys):

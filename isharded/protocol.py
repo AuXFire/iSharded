@@ -429,6 +429,8 @@ class ChatMessage(BaseModel):
     name: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
     tool_call_id: str | None = None
+    # What an earlier reply reasoned, which templates that can use it read by this name.
+    reasoning_content: str | None = None
 
 
 class ChatCompletionRequest(BaseModel):

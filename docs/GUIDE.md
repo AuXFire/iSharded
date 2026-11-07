@@ -930,6 +930,7 @@ Measures a running mesh and gives numbers others can compare. It asks a node ove
 isharded bench
 isharded bench --url http://node-a:8209 --key YOUR_KEY --markdown result.md
 isharded bench --prompt-tokens 128 --parallel 1,2 --repeat 5 --text code --json result.json
+isharded bench --compare before.json after.json
 ```
 
 | Option | Default | What it does |
@@ -947,6 +948,7 @@ isharded bench --prompt-tokens 128 --parallel 1,2 --repeat 5 --text code --json 
 | `--markdown` | Off | Also write the results to this file as Markdown, ready to paste |
 | `--url` | This machine's node | Any node's address |
 | `--key` | This machine's own | An API key. A user key is enough. See below |
+| `--compare` | Off | Two files saved with `--json`, old then new. Sets them side by side and measures nothing. `--json` and `--markdown` save the comparison |
 
 With no `--url` it reads the `up` folder, so `isharded bench` on a node just works. The saved key, or the pool token, goes only to this machine's own node. For any other `--url`, give `--key`, so that benching someone else's mesh cannot hand them your key. In the same way this mesh's certificate authority is used only for this machine's own node. For a node elsewhere whose certificate comes from a mesh's own authority, name that authority's file in `ISHARDED_CA_FILE`.
 
@@ -962,7 +964,11 @@ What it reports:
 | Total tokens/s | All the tokens of a round, divided by the whole round, reading prompts included. This is what the mesh delivers |
 | Repeat of a seeded reply identical | The same seeded request, sent twice. `NO` deserves a look, as one route should repeat itself. It does not fail the run |
 
-Each number is the median of the measurements, with the lowest and highest in brackets. The report also says what explains them: the model and its quantization (read from the name), each stage's layers, GPU and country, link times where the status has them, the pipeline's tokens, misses and depth, any draft's passes in this run and its tokens per pass since the stage started, whether the native engine was on, the iSharded version nodes report, and the commit of the copy running the bench, if it is a git checkout. It leaves out addresses, keys, machine names and paths, so it is safe to post. Countries appear only where a node's operator shows one.
+Each number is the median of the measurements, with the lowest and highest in brackets. The report also says what explains them: the model, its quantization (what the GGUF says, or else what its name says) and its slots, how many machines the route spans, each stage's layers, GPU, precision and country, link times, the pipeline's tokens, misses and depth, any draft's passes in this run and its tokens per pass since the stage started, whether the native engine was on, the iSharded version nodes report, the commit of the node that was asked and of the copy running the bench, where each is a git checkout, and how the numbers were taken. A link is the direct link's own round trip to the next stage, and a probe is the same trip over HTTP, measured when the route was planned. It leaves out addresses, keys, machine names and paths, so it is safe to post. Countries appear only where a node's operator shows one.
+
+`--compare` shows what ran differently, then each case both runs have, as old and new median with the change in percent. A change counts as better or worse only if the two runs' lowest-to-highest ranges do not overlap, and otherwise it says within noise. A case with one sample has no range, so it says within noise too. If the two runs differ in what ran, it says so first, because the change may come from that. It exits with 1 if a file is not a report.
+
+`GET /admin/status` gives what this needs: `commit` beside `status`, and `slots`, `quantization` and `context_tokens` in `active_plan`.
 
 Notes under the table say when something bent the numbers: a route that moved, cache use nobody asked for, `--cached` with no cache behind it, replies that ended before `--tokens`, sizes skipped. A node keeps prompt states only with room for them, in `--state-ram-gb` or `--state-disk-gb`. It exits with 1 if any reply failed, or if nothing could be measured. A repeat that differs does not fail it, and neither does a size the model has no room for.
 
@@ -1156,7 +1162,8 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `POST` | `/v1/chat/completions` | User key | Chat, streaming with `stream: true`, and [tool calling](#tool-calling) |
 | `POST` | `/v1/completions` | User key | Text completion, one prompt per request |
 | `POST` | `/v1/embeddings` | User key | Vectors for text, from an embedding model. See [Embeddings](#embeddings) |
-| `GET` | `/v1/models` | User key | Every running model, and what each is for |
+| `GET` | `/v1/models` | User key | Every running model, and what each is for, with the fields OpenAI and Claude clients read. Takes the key as `x-api-key` too |
+| `GET` | `/v1/models/{model_id:path}` | User key | The same row for one model, or a 404. Takes the key as `x-api-key` too |
 | `POST` | `/v1/messages` | User key | [Claude Messages](#claude-messages), streaming with `stream: true`. Takes the key as `x-api-key` too |
 | `POST` | `/v1/messages/count_tokens` | User key | How many tokens a Messages request comes to. Takes the key as `x-api-key` too |
 | `POST` | `/v1/responses` | User key | [OpenAI Responses](#openai-responses), streaming with `stream: true` |
@@ -1167,8 +1174,8 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `GET` | `/api/tags` | User key | Every running model, in Ollama's shape |
 | `POST` | `/api/show` | User key | What Ollama clients ask about one running model |
 | `GET` | `/api/ps` | User key | Running models, in Ollama's shape |
-| `GET` | `/api/version` | User key | This node's iSharded version |
-| `POST` | `/api/pull`, `/api/push`, `/api/create`, `/api/copy` | User key | Refused with a 400 that says to load models through iSharded |
+| `GET` | `/api/version` | User key | An Ollama version clients accept, and iSharded's own in `isharded` |
+| `POST` | `/api/pull`, `/api/push`, `/api/create`, `/api/copy`, `/api/blobs/{digest}` | User key | Refused with a 400 that says to load models through iSharded |
 | `DELETE` | `/api/delete` | User key | The same |
 | `POST` | `/mcp` | User key | [MCP](#mcp) over Streamable HTTP. `GET` and `DELETE` answer 405, since there is no stream or session |
 | `GET` | `/admin/status` | User key | Workers and their `country`, memory pools, route, measured [`links`](#what-a-route-costs), epoch, mesh, lanes, load progress, and the last answer check |
@@ -1379,21 +1386,21 @@ client = Anthropic(base_url="http://NODE:8209", api_key="KEY")
 reply = client.messages.create(model=MODEL, max_tokens=1024, messages=[{"role": "user", "content": "Say hello."}])
 ```
 
-Other tools usually read `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`. The key may come as `x-api-key` or as `Authorization: Bearer`. If both are sent, `Authorization` is the one used. `x-api-key` works on these two routes only, and it is taken off the request before anything else sees it, so it stays on the node you gave it to.
+Other tools usually read `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`. The key may come as `x-api-key` or as `Authorization: Bearer`. If both are sent, `Authorization` is the one used. `x-api-key` works on these routes and on `/v1/models`, and nowhere else. It is taken off every request on every path before anything else sees it, so it stays on the node you gave it to. `/v1/models` gives everything as one page, so `limit` and the paging ids do nothing there, and fields such as `max_tokens` are null.
 
 | Field | What happens to it |
 |---|---|
 | `max_tokens` | Required, as it is at Anthropic |
 | `system` | A string or a list of text blocks |
-| `messages` | `content` is a string or a list of `text`, `image`, `tool_use`, and `tool_result` blocks. `thinking` blocks sent back are dropped. An image comes as base64, and a URL is refused as in [Vision](#vision). A `tool_result` with `is_error` reaches the model starting with `Error:`, and one holding anything but text is refused |
+| `messages` | `content` is a string or a list of `text`, `image`, `thinking`, `tool_use`, and `tool_result` blocks. A `thinking` block sent back reaches the model's template as `reasoning_content`, and most templates use it only for the turn in progress. A `redacted_thinking` block is dropped. An image comes as base64, and a URL is refused as in [Vision](#vision). A `tool_result` with `is_error` reaches the model starting with `Error:`, and one holding anything but text is refused |
 | `temperature`, `top_p`, `top_k` | As on the [chat route](#chat-and-completion-requests) |
-| `stop_sequences` | Ends the reply, as `stop` does |
-| `stream` | Sends `message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, and `message_stop`. Tool calls come as `tool_use` blocks with `input_json_delta`, each one whole in a single delta. The prompt's token count arrives in `message_delta`, since `message_start` goes out before it is known |
+| `stop_sequences` | Ends the reply, as `stop` does. It ends with `stop_reason: "stop_sequence"` and the one it met in `stop_sequence` |
+| `stream` | Sends `message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, and `message_stop`. Reasoning comes as a `thinking` block with `thinking_delta`, closed by a `signature_delta`. Tool calls come as `tool_use` blocks with `input_json_delta`, each one whole in a single delta. The prompt's token count arrives in `message_delta`, since `message_start` goes out before it is known |
 | `tools` | Your own tools, with `input_schema`. Tools Anthropic runs for you, such as web search, are refused with a 400 |
 | `tool_choice` | `auto`, `any`, `none`, or `tool` with a `name`. `disable_parallel_tool_use` keeps only the first call |
-| `thinking` | `type: "disabled"` turns reasoning off on models with a switch, and any other type turns it on. `budget_tokens` is not used |
+| `thinking` | `type: "disabled"` turns reasoning off on models with a switch, and any other type turns it on. `display: "omitted"` keeps the block and leaves out its words. `budget_tokens` is not used |
 
-A reply stopped by a stop sequence says `stop_reason: "end_turn"`, with `stop_sequence` null, because the chat path does not say which ending it met. Errors have Anthropic's shape, with `type: "error"`, an `error` holding `type` and `message`, and a `request_id`. A failure during a stream is an `error` event. `POST /v1/messages/count_tokens` takes the same fields without `max_tokens` and runs the model's template, and an image counts only as its marker.
+A reply that starts with reasoning gives it as a `thinking` block before its text, whatever `thinking` asked for, because a model with no switch reasons anyway. Reasoning found later in a reply stays in the text. A block's `signature` is a hash of its words, there for clients that expect one. It proves nothing, since nobody here can sign for Anthropic, and it is not checked when it comes back. Cache counts in `usage` are always 0, because this usage counts every prompt token as `input_tokens`. Errors have Anthropic's shape, with `type: "error"`, an `error` holding `type` and `message`, and a `request_id`. A failure during a stream is an `error` event. `POST /v1/messages/count_tokens` takes the same fields without `max_tokens` and runs the model's template, and an image counts only as its marker.
 
 #### OpenAI Responses
 
@@ -1406,7 +1413,7 @@ print(client.responses.create(model=MODEL, input="Say hello.", max_output_tokens
 
 | Field | What happens to it |
 |---|---|
-| `input` | A string, or a list of items: messages with a role of `user`, `assistant`, `system`, or `developer`, then `function_call` and `function_call_output`. `reasoning` items are dropped. Parts are `input_text`, `output_text`, and `input_image` with a data URL in `image_url`. A `function_call_output` holding anything but text is refused |
+| `input` | A string, or a list of items: messages with a role of `user`, `assistant`, `system`, or `developer`, then `function_call` and `function_call_output`. `reasoning` items are dropped, and a reply's own reasoning stays in its text, inside the model's tags. Parts are `input_text`, `output_text`, and `input_image` with a data URL in `image_url`. A `function_call_output` holding anything but text is refused |
 | `instructions` | The system message |
 | `max_output_tokens` | The reply limit. A reply that reaches it ends with `status: "incomplete"` |
 | `temperature`, `top_p` | As on the [chat route](#chat-and-completion-requests) |
@@ -1436,16 +1443,16 @@ A tool with no way to set a header cannot reach a mesh with keys.
 
 | Field | What happens to it |
 |---|---|
-| `messages` | Roles and `content`, with `images` as base64, `tool_calls`, and `tool` results by `tool_name` |
+| `messages` | Roles and `content`, with `images` as base64, `tool_calls`, `thinking`, and `tool` results by `tool_name` |
 | `prompt`, `system`, `images` | On `/api/generate`, they go through the model's template. With `raw: true`, `prompt` goes in as it is, and `images` are refused |
-| `options` | `temperature`, `top_p`, `top_k`, `seed`, `num_predict`, and `stop`. Others, such as `num_ctx`, do nothing, since a route's context is set when it loads |
+| `options` | `temperature`, `top_p`, `top_k`, `seed`, `num_predict`, and `stop`. A `seed` of -1 means no seed. Others, such as `num_ctx`, do nothing, since a route's context is set when it loads |
 | `tools` | As on the [chat route](#tool-calling) |
-| `think` | Switches reasoning on models that support it |
+| `think` | Switches reasoning on models that support it. A level such as `"high"` counts as on. A reply that starts with reasoning gives it in `thinking`, on `message` or beside `response`. With `raw: true` it stays in the text |
 | `format` | Refused with a 400. The chat path cannot hold a reply to JSON or a schema, and asking the model nicely would only look as if it worked |
 | `suffix`, `template` | Refused with a 400 |
 | `keep_alive` | Does nothing. A model stays until it is replaced |
 
-A request with no `prompt`, or an empty `messages` list, answers `done_reason: "load"` if the model is running, and runs nothing. `/api/embed` and `/api/embeddings` need an [embedding model](#embeddings). In `/api/tags`, `/api/show`, and `/api/ps`, sizes, family, and context length are known for the main model and left empty for a lane's, and `size_vram` is always 0, because a model here is spread over many machines. `/api/version` gives iSharded's version, not Ollama's. Pulling, pushing, creating, copying, and deleting are refused: load models with [isharded load](#isharded-load) or `POST /admin/load`.
+A request with no `prompt`, or an empty `messages` list, answers `done_reason: "load"` if the model is running, and runs nothing. `/api/embed` and `/api/embeddings` need an [embedding model](#embeddings). In `/api/tags`, `/api/show`, and `/api/ps`, sizes, family, and context length are known for the main model and left empty for a lane's, and `size_vram` is always 0, because a model here is spread over many machines. `/api/version` gives a recent Ollama version in `version`, because clients compare it with the release they need, and iSharded's own in `isharded`. `/api/show` lists `thinking` in `capabilities` for a template that closes reasoning. `quantization_level` comes from the GGUF. Pulling, pushing, creating, copying, and deleting are refused: load models with [isharded load](#isharded-load) or `POST /admin/load`.
 
 ## MCP
 
@@ -1899,6 +1906,8 @@ So an AMD card needs no ROCm for GGUF models, and that is the reason to use Vulk
 
 Workers run in BF16 by default. Add `--dtype float32` to a node to run its VRAM and RAM at full precision, which doubles the memory each layer takes. The planner accounts for that, so BF16 and FP32 nodes can share a route. Published Qwen checkpoints are BF16, so FP32 raises the precision of computation and not of the stored weights. The disk tier always runs in the checkpoint's own dtype.
 
+To get replies that do not depend on how the layers are split, set `--dtype float32` on every node of a GGUF route. Rows then cross between stages unrounded, so a stage boundary changes nothing. On CPU stages on one machine, with no draft, every reply matched one stage holding the whole model, greedy and seeded: 36 of 36 on Qwen3-0.6B over three other splits, and 36 of 36 on the hybrid Qwen3.5-0.8B over two other splits and two stages run twice. In BF16 the same comparison matched 11 of 36 and 7 of 36. This holds for the same build and the same kind of device. GPUs, or two kinds of machine in one route, have not been checked, and they round differently from each other whatever the dtype.
+
 An FP8 release halves the download. In memory, the planner chooses per unit between two forms:
 
 | Form | Memory | Speed measured on an RTX 3060 and a laptop CPU |
@@ -2215,9 +2224,9 @@ Behavior:
 - There is one active RAM checkpoint service per route, for PyTorch models. Snapshots are not yet replicated or compressed. If the store is behind when a stage fails, recovery replays the prompt.
 - Cutting prompts into the same passes every time has a cost. A long chat of short messages, read with nothing saved, runs as many small passes: 1,770 tokens in 49 messages took 17.6 s where it took 13.5 s before, on CPU. Prompts with few turns cost the same as before. Turns under 64 tokens can also reread up to 64 tokens more than the last turn did.
 - A saved state is only good for the layers it came from. If a node is lost with no spare, the survivors split the layers differently and the prompt is read in full, with or without copies.
-- A different split of the layers can change a near-tie at temperature 0, because rows round to BF16 at each stage boundary. So a reply is the same with the cache on or off for a given split, and not across splits.
+- A different split of the layers can change a near-tie at temperature 0, because rows round to BF16 at each stage boundary. So a reply is the same with the cache on or off for a given split, and not across splits, unless every node runs `--dtype float32`. See [Precision](#precision) for what that was measured on.
 - A GGUF reply that recovers from a failure reads its prompt as usual, then runs each token it already wrote as its own one-row pass, as plain decoding did. So it carries on exactly while its layers stay where they were. With a stage process killed mid-reply on three local stages of Qwen3-0.6B, 26 of 26 replies matched an unbroken run, greedy and seeded, with direct links and without. Reading back as prompt rows had changed 10 of 11. This has not run on a real mesh, with a draft model, or with other replies running beside it.
-- A recovered reply can still differ from an unbroken run at a near-tie in these cases. A prompt with images, or a PyTorch model, still reads the reply back as prompt rows. A reply that moved to other layers meets the limit above. A reply a draft checked several rows at a time had those tokens rounded differently the first time, and so did one that shared merged passes with other conversations. A seeded reply using `top_k` without `top_p` changes course if it leaves direct links, because the native engine and the Python path keep those candidates in different orders: 3 of 3 did.
+- A recovered reply can still differ from an unbroken run at a near-tie in these cases. A prompt with images, or a PyTorch model, still reads the reply back as prompt rows. A reply that moved to other layers meets the limit above. A reply a draft checked several rows at a time had those tokens rounded differently the first time, and so did one that shared merged passes with other conversations.
 - Recovery costs one pass for each token already written. A failed stage takes the direct links down, so those passes usually run over HTTP, one at a time. On the same local stages that took 21 ms a token, and 4.7 ms on direct links, where they go 16 at a time. On a slow route a long reply takes much longer to resume than the one batched pass did.
 - Copies of saved states are sent whole on every turn, so a long conversation on a slow link falls behind. Recovery then uses an older state, or none.
 - Saved states are not deleted when a conversation ends, and are stored unencrypted. See [the security notes](SECURITY.md#saved-conversations).

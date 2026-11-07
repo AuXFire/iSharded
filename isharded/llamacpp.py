@@ -290,16 +290,24 @@ def draw(ids: np.ndarray, probabilities: np.ndarray, generator: Draws | np.rando
 
 
 def filtered_distribution(logits: np.ndarray, temperature: float, top_p: float, top_k: int) -> tuple[np.ndarray, np.ndarray]:
-    """Token ids and probabilities after top-k, temperature, and top-p, in that order."""
+    """Token ids and probabilities after top-k, temperature, and top-p, in that order.
+
+    A draw walks the candidates in order, so this order is part of a seeded reply. Highest
+    logit first and the lower id on a tie, as the engine's ``filtered`` keeps them, so a
+    reply that leaves the engine carries on as it would have.
+    """
     limit = top_k or (NUCLEUS_CANDIDATES if top_p < 1.0 else 0)
-    ids = np.argpartition(logits, -limit)[-limit:] if 0 < limit < logits.size else np.arange(logits.size)
-    scaled = logits[ids].astype(np.float64) / temperature
-    scaled -= scaled.max()
-    probabilities = np.exp(scaled)
+    ids = np.arange(logits.size)
+    if limit:
+        if limit < logits.size:
+            line = np.partition(logits, -limit)[-limit]
+            above = np.flatnonzero(logits > line)
+            ids = np.concatenate((above, np.flatnonzero(logits == line)[: limit - above.size]))
+        ids = ids[np.lexsort((ids, -logits[ids]))]
+    values = logits[ids].astype(np.float64)
+    probabilities = np.exp((values - values.max()) / temperature)
     probabilities /= probabilities.sum()
     if top_p < 1.0:
-        order = np.argsort(probabilities)[::-1]
-        ids, probabilities = ids[order], probabilities[order]
         keep = np.cumsum(probabilities) - probabilities <= top_p
         ids, probabilities = ids[keep], probabilities[keep]
         probabilities = probabilities / probabilities.sum()

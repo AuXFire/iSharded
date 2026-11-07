@@ -67,6 +67,10 @@ fn normalize(chances: &mut [f64]) {
 }
 
 /// Token ids and probabilities after top-k, temperature, and top-p, in that order.
+///
+/// A draw walks the candidates in order, so this order is part of a seeded reply. Highest
+/// logit first and the lower id on a tie, as `filtered_distribution` keeps them, so a reply
+/// that leaves the engine carries on as it would have.
 pub fn filtered(logits: &[f32], sampling: &Sampling) -> (Vec<u32>, Vec<f64>) {
     let limit = if sampling.top_k > 0 {
         sampling.top_k as usize
@@ -76,32 +80,32 @@ pub fn filtered(logits: &[f32], sampling: &Sampling) -> (Vec<u32>, Vec<f64>) {
         0
     };
     let mut ids: Vec<u32> = (0..logits.len() as u32).collect();
-    if limit > 0 && limit < logits.len() {
-        let order = |a: &u32, b: &u32| logits[*b as usize].total_cmp(&logits[*a as usize]);
-        ids.select_nth_unstable_by(limit - 1, order);
-        ids.truncate(limit);
+    if limit > 0 {
+        // Adding zero makes -0.0 and 0.0 the tie they are in Python.
+        let logit = |id: &u32| logits[*id as usize] + 0.0;
+        let order = |a: &u32, b: &u32| logit(b).total_cmp(&logit(a)).then(a.cmp(b));
+        if limit < logits.len() {
+            ids.select_nth_unstable_by(limit - 1, order);
+            ids.truncate(limit);
+        }
+        ids.sort_unstable_by(order);
     }
     let temperature = f64::from(sampling.temperature);
     let highest = ids.iter().map(|id| f64::from(logits[*id as usize])).fold(f64::NEG_INFINITY, f64::max);
     let mut chances: Vec<f64> = ids.iter().map(|id| ((f64::from(logits[*id as usize]) - highest) / temperature).exp()).collect();
     normalize(&mut chances);
     if sampling.top_p < 1.0 {
-        let mut order: Vec<usize> = (0..ids.len()).collect();
-        order.sort_unstable_by(|a, b| chances[*b].total_cmp(&chances[*a]));
         let top_p = f64::from(sampling.top_p);
         let mut before = 0.0;
-        let mut kept_ids = Vec::new();
-        let mut kept = Vec::new();
-        for index in order {
-            if before > top_p {
-                break;
-            }
-            before += chances[index];
-            kept_ids.push(ids[index]);
-            kept.push(chances[index]);
-        }
-        normalize(&mut kept);
-        return (kept_ids, kept);
+        let kept = chances.iter().take_while(|chance| {
+            let keep = before <= top_p;
+            before += **chance;
+            keep
+        });
+        let count = kept.count();
+        ids.truncate(count);
+        chances.truncate(count);
+        normalize(&mut chances);
     }
     (ids, chances)
 }
@@ -190,6 +194,29 @@ mod tests {
         let (mut ids, _) = filtered(&[1.0, 9.0, 3.0, 8.0], &Sampling { top_k: 2, ..WARM });
         ids.sort_unstable();
         assert_eq!(ids, vec![1, 3]);
+    }
+
+    #[test]
+    fn candidates_come_highest_first_and_ties_by_id() {
+        let logits = [2.0, 5.0, 2.0, 7.0, 2.0, 2.0, -0.0, 0.0];
+        let (ids, _) = filtered(&logits, &Sampling { top_k: 4, ..WARM });
+        assert_eq!(ids, vec![3, 1, 0, 2]);
+        let (ids, _) = filtered(&logits, &Sampling { top_k: 8, ..WARM });
+        assert_eq!(ids, vec![3, 1, 0, 2, 4, 5, 6, 7]);
+    }
+
+    /// The same logits and draws as `test_seeded_top_k_follows_the_engine` in tests/test_gguf.py.
+    #[test]
+    fn a_seeded_top_k_reply_draws_what_the_python_path_draws() {
+        let mut state = 12345u64;
+        let logits: Vec<f32> = (0..1000)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((state >> 40) % 64) as f32 / 8.0
+            })
+            .collect();
+        let got: Vec<u32> = (0..12).map(|position| choose(&logits, &Sampling { top_k: 40, temperature: 0.75, ..WARM }, &mut Draws::new(Some(7), position))).collect();
+        assert_eq!(got, vec![575, 613, 168, 912, 575, 815, 668, 290, 899, 216, 815, 575]);
     }
 
     #[test]
