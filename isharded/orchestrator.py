@@ -141,6 +141,8 @@ LINK_PROBE_SECONDS = 30.0
 # How often a route's links try their other addresses, and how long one try may take.
 HOP_CHECK_SECONDS = 60.0
 HOP_PROBE_SECONDS = 10.0
+# How long a worker's health may take to answer, retries and all. Status waits for it.
+PROBE_SECONDS = 3.0
 # Noise must not move a live link, and the ring has to redial for it.
 HOP_SWITCH_RATIO = 0.9
 # Replanning around a worker that is alive but failed may move this much at most.
@@ -2098,6 +2100,19 @@ class Orchestrator:
     ) -> list[StageAssignment]:
         """Plan, fetch, and activate, replanning around workers that fail."""
         job.total_bytes = target.profile.total_bytes
+        tables = (self.links, self.links_checked, self.link_readings)
+        kept = self.link_row_bytes, [dict(table) for table in tables]
+        try:
+            return await self._deploy(target, job, generation_lock_held=generation_lock_held)
+        except BaseException:
+            # Those costs were measured at this load's row size. The route still running plans by its own.
+            self.link_row_bytes = kept[0]
+            for table, before in zip(tables, kept[1]):
+                table.clear()
+                table.update(before)
+            raise
+
+    async def _deploy(self, target: ModelTarget, job: LoadJob, *, generation_lock_held: bool) -> list[StageAssignment]:
         for _ in range(MAX_DEPLOY_ATTEMPTS):
             await self.refresh_worker_metrics()
             await self.refresh_holdings(target)
@@ -2984,6 +2999,8 @@ class Orchestrator:
             state = "offline"
         elif record.quarantined:
             state = "quarantined"
+        elif (record.health or {}).get("status") == "unreachable":
+            state = "unreachable"  # still checking in, but its last probe found nobody answering
         elif active:
             state = "active"
         else:
@@ -3060,14 +3077,18 @@ class Orchestrator:
     async def probe(self, record: WorkerRecord) -> None:
         started = time.perf_counter()
         try:
-            response = await self.client.get(
-                worker_url(record) + "/health",
-                headers=auth_headers(self.pool_token),
-                timeout=3.0,
+            # The bound is on the whole probe. The client tries a refused connection again, and
+            # on Windows each refusal takes two seconds, so a dead worker held status for ten.
+            response = await asyncio.wait_for(
+                self.client.get(worker_url(record) + "/health", headers=auth_headers(self.pool_token), timeout=PROBE_SECONDS),
+                PROBE_SECONDS,
             )
             response.raise_for_status()
             record.control_latency_ms = round((time.perf_counter() - started) * 1000, 2)
             record.health = response.json()
+        except asyncio.TimeoutError:
+            record.control_latency_ms = None
+            record.health = {"status": "unreachable", "error": f"no answer in {PROBE_SECONDS:.0f} s"}
         except (httpx.HTTPError, ValueError) as exc:
             record.control_latency_ms = None
             record.health = {"status": "unreachable", "error": str(exc)}

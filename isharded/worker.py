@@ -1113,6 +1113,9 @@ class WorkerRuntime:
             self._release_weights()
             raise
         self.adapter = adapter
+        if request.model_id != self.model_id:
+            # The planner trusts these counts to say how this model's guesses go.
+            self.pipeline_tokens = self.pipeline_misses = 0
         self.model_id = request.model_id
         self.epoch = request.epoch
         self.assignment = request.assignment
@@ -1156,6 +1159,7 @@ class WorkerRuntime:
             key=body["key"],
             ack_timeout_ms=body.get("ack_timeout_ms", RING_ACK_MS),
             silence_timeout_ms=body.get("silence_timeout_ms", RING_ACK_MS),
+            merge_passes=self.merge_passes,
         )
         if not answer.get("engine"):
             return {"engine": False}
@@ -1287,6 +1291,7 @@ class WorkerRuntime:
                 return
             left -= SETTLE_LOOK_SECONDS
         self.ring_live = False
+        await client.settled(slot, 0)  # it ends the reply's generation, which a lost ring still needs
 
     def ring_refused(self, refused: EngineRefusal) -> HTTPException:
         """The error the HTTP path would have raised, so recovery is the same."""
@@ -1805,8 +1810,17 @@ class WorkerRuntime:
         ready.sort(key=lambda item: item[1].request.slot)
         if ready:
             rows = np.concatenate([np.asarray(step.hidden[0], dtype=np.float32) for _, step, _ in ready])
-            output = self.gguf.forward_many(rows, [entry.length for _, _, entry in ready], [step.request.slot for _, step, _ in ready])
+            try:
+                output = list(self.gguf.forward_many(rows, [entry.length for _, _, entry in ready], [step.request.slot for _, step, _ in ready]))
+            except StageLost:
+                raise
+            except LlamaError:
+                # llama.cpp refuses a whole batch over one bad row. Alone, only that row is refused.
+                output = [self._forward_alone(step, entry) for _, step, entry in ready]
             for row, (index, step, entry) in zip(output, ready):
+                if isinstance(row, LlamaError):
+                    results[index] = row
+                    continue
                 entry.length += 1
                 if self.gguf.last:
                     try:
@@ -1821,6 +1835,16 @@ class WorkerRuntime:
             self.tokens_processed += len(ready)
         self.compute_ms_ema = self._ema(self.compute_ms_ema, (time.perf_counter() - started) * 1000)
         return [results[index] for index in range(len(steps))]
+
+    def _forward_alone(self, step: MergedStep, entry: CacheEntry) -> np.ndarray | LlamaError:
+        """One step of a merge the stage refused, or why the stage refuses it too."""
+        assert self.gguf is not None
+        try:
+            return self.gguf.forward(np.asarray(step.hidden[0], dtype=np.float32), entry.length, step.request.slot).reshape(-1)
+        except StageLost:
+            raise
+        except LlamaError as exc:
+            return exc
 
     async def await_part(self, request: InferRequest, index: int, seconds: float) -> None:
         """Waits for a part of a prompt to have run on this stage."""
@@ -2575,9 +2599,11 @@ async def state_in_reach(key: str) -> bool:
 async def finish_reply(slot: int) -> None:
     try:
         pipe = runtime.pipes.pop(slot, None)
-        if pipe is not None:
-            await pipe.close()
-        await runtime.ring_settle(slot)
+        try:
+            if pipe is not None:
+                await pipe.close()
+        finally:
+            await runtime.ring_settle(slot)  # it ends the reply's generation, so it always runs
     finally:
         runtime.slot_used_at[slot] = time.monotonic()
         await runtime.gate.release(slot)

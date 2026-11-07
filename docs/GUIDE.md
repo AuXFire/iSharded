@@ -1208,7 +1208,7 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `POST` | `/api/pull`, `/api/push`, `/api/create`, `/api/copy`, `/api/blobs/{digest}` | User key | Refused with a 400 that says to load models through iSharded |
 | `DELETE` | `/api/delete` | User key | The same |
 | `POST` | `/mcp` | User key | [MCP](#mcp) over Streamable HTTP. `GET` and `DELETE` answer 405, since there is no stream or session |
-| `GET` | `/admin/status` | User key | Workers and their `country`, memory pools, route, measured [`links`](#what-a-route-costs), epoch, mesh, lanes, load progress, the last answer check, and how many [replies run at once](#several-conversations-at-once) and why |
+| `GET` | `/admin/status` | User key | Workers and their `country`, memory pools, route, measured [`links`](#what-a-route-costs), epoch, mesh, lanes, load progress, the last answer check, and how many [replies run at once](#several-conversations-at-once) and why. It asks every worker for its health and waits up to 3 s for each, so it answers within about that. A worker that still checks in but did not answer shows `state` `unreachable` |
 | `GET` | `/admin/catalog` | User key | Suggested models and supported architectures |
 | `POST` | `/admin/plan` | Admin key | Show where a model would run, and any [shorter loop](#a-shorter-loop) for the route already running, without moving anything |
 | `POST` | `/admin/load` | Admin key | Load a model |
@@ -1698,7 +1698,7 @@ Only whole rows count, because replies that share a route without sharing passes
 
 `active_plan.parallel` in `/admin/status` is the number, and `active_plan.parallel_choice` says why, with `reason`, `round_trip_ms`, `row_ms`, `devices`, and `wanted`. `POST /admin/plan` shows what a load would choose. Slots are part of what a stage is, so changing them restarts it. The choice therefore stands through repairs, a coordinator restart, and the same load again. It is made afresh only by another load, or when the pool has lost so much that the model would not fit at it.
 
-Single-token steps from different conversations also share a pass through a stage, because reading the weights is what a pass costs. On one stage, four conversations went from 12 to 32 tokens per second. Across two stages the same load gained only 10%, from 34 to 37, because the stages stagger the conversations. A merge takes every waiting step it can, wherever it sits in the queue, and a reply's own steps still run in order. A step a stage refuses is refused alone, and the rest of its merge runs. Steps with speculative guesses do not merge, so a draft limits this. `--no-merge-passes` turns it off.
+Single-token steps from different conversations also share a pass through a stage, because reading the weights is what a pass costs. On one stage, four conversations went from 12 to 32 tokens per second. Across two stages the same load gained only 10%, from 34 to 37, because the stages stagger the conversations. A merge takes every waiting step it can, wherever it sits in the queue, and a reply's own steps still run in order. A step a stage refuses is refused alone, and the rest of its merge runs. Steps with speculative guesses do not merge, so a draft limits this. `--no-merge-passes` turns it off, on the native path as well as over HTTP.
 
 Past `--parallel`, replies queue at the entry worker, and past 32 waiting they are refused with a 429.
 

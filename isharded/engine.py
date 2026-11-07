@@ -194,8 +194,9 @@ class Engine:
             raise OSError(out.value.decode("utf-8", "replace") or "the engine could not listen")
         return json.loads(out.value)
 
-    def open(self, epoch: int, index: int, count: int, key: bytes, ack_timeout_ms: int, silence_timeout_ms: int, pass_ms: int = 0, row_ms: int = 0) -> None:
+    def open(self, epoch: int, index: int, count: int, key: bytes, ack_timeout_ms: int, silence_timeout_ms: int, pass_ms: int = 0, row_ms: int = 0, merge_passes: bool = True) -> None:
         plan = {
+            "merge_passes": merge_passes,
             "epoch": epoch,
             "index": index,
             "count": count,
