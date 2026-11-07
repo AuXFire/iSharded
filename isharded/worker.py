@@ -1114,10 +1114,11 @@ class WorkerRuntime:
     def ring_pipelines(self, request: InferRequest) -> bool:
         """Whether this reply can keep several passes on the route.
 
-        A wrong guess is undone by rewinding past passes that have finished, which recurrent
-        state cannot do, and one stage has nothing to overlap with.
+        A wrong guess is undone by rewinding past passes that have finished. The ring means
+        the engine is there, and it can do that for recurrent state too. One stage has nothing
+        to overlap with.
         """
-        return self.rewinds and len(self.route) > 1 and self.ring_ready(request)
+        return len(self.route) > 1 and self.ring_ready(request)
 
     def _ring_entry(self, request: InferRequest) -> CacheEntry:
         """This session's entry, marked as having left the Python path."""
@@ -1155,7 +1156,8 @@ class WorkerRuntime:
         self.inference_calls += 1
         self.tokens_processed += 1
         try:
-            return self.ring_client.send(**self._ring_pass(request, position, rollback_to, [token]))
+            # Attention rewinds by itself, so only recurrent state pays for a snapshot.
+            return self.ring_client.send(**self._ring_pass(request, position, rollback_to, [token]), keep=not self.rewinds)
         except EngineRefusal as refused:
             raise self.ring_refused(refused) from refused
 
