@@ -2833,6 +2833,7 @@ def page(name: str) -> HTMLResponse:
     folder = Path(__file__).parent
     styles = (folder / "ui.css").read_text(encoding="utf-8")
     content = (folder / name).read_text(encoding="utf-8").replace("/* isharded:ui.css */", styles)
+    content = content.replace("/* isharded:ui.js */", (folder / "ui.js").read_text(encoding="utf-8"))
     content = content.replace("<!-- isharded:flags.svg -->", (folder / "flags.svg").read_text(encoding="utf-8"))
     return HTMLResponse(content, headers={"Cache-Control": "no-store"})
 

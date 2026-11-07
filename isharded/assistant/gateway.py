@@ -52,6 +52,7 @@ PUBLIC_PATHS = frozenset({"/", "/assistant", "/assistant/", "/healthz"})
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
 HTML_FILE = Path(__file__).with_name("assistant.html")
 SHARED_STYLES = Path(__file__).parent.parent / "ui.css"  # the design system every page in iSharded uses
+SHARED_SCRIPT = Path(__file__).parent.parent / "ui.js"  # the drawing code those pages share
 
 BACKUP_MAGIC = b"SMAB1\n"
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2**15, 8, 1
@@ -683,7 +684,7 @@ def include_parts(app: Any, assistant: Any) -> None:
 def page_response() -> HTMLResponse:
     nonce = secrets.token_urlsafe(16)
     styles = SHARED_STYLES.read_text(encoding="utf-8")
-    html = HTML_FILE.read_text(encoding="utf-8").replace("/* isharded:ui.css */", styles).replace("__CSP_NONCE__", nonce)
+    html = HTML_FILE.read_text(encoding="utf-8").replace("/* isharded:ui.css */", styles).replace("/* isharded:ui.js */", SHARED_SCRIPT.read_text(encoding="utf-8")).replace("__CSP_NONCE__", nonce)
     policy = (
         f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; connect-src 'self'; "
         "img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"

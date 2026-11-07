@@ -39,7 +39,7 @@ isharded-worker = "isharded.worker:main"
 include = ["isharded*"]
 
 [tool.setuptools.package-data]
-isharded = ["dashboard.html", "chat.html", "ui.css", "flags.svg", "countries.bin", "native/*"]
+isharded = ["dashboard.html", "chat.html", "ui.css", "ui.js", "flags.svg", "countries.bin", "native/*"]
 "isharded.assistant" = ["assistant.html"]
 
 [tool.pytest.ini_options]
