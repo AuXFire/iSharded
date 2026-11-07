@@ -29,6 +29,8 @@ ABI_VERSION = 1
 MAGIC = 0x5369
 WIRE_VERSION = 1
 HEADER = struct.Struct("<HBBI")
+RESULT_HEAD = struct.Struct("<QQI")
+NACK_HEAD = struct.Struct("<QQBHI")
 KIND_HELLO, KIND_HELLO_OK, KIND_AUTH, KIND_PASS, KIND_ACK, KIND_RESULT, KIND_NACK, KIND_PING, KIND_PONG = range(1, 10)
 ROLE_LOCAL = 3
 FLAG_VERIFY, FLAG_TOKENS = 1, 2
@@ -62,6 +64,22 @@ class StageApi(C.Structure):
     ]
 
 
+# Each call into the library, after ``isharded_engine_``: its arguments, and what it returns.
+SIGNATURES: dict[str, tuple[list[Any], Any]] = {
+    "new": ([C.c_char_p, C.POINTER(TensorApi)], C.c_void_p),
+    "capture_begin": ([C.c_void_p], None),
+    "lock": ([C.c_void_p], None),
+    "unlock": ([C.c_void_p], None),
+    "close_ring": ([C.c_void_p], None),
+    "capture_read": ([C.c_void_p, C.c_void_p, C.c_size_t], C.c_size_t),
+    "attach": ([C.c_void_p, C.POINTER(StageApi)], None),
+    "listen": ([C.c_void_p, C.c_char_p, C.c_uint16, C.c_char_p, C.c_size_t], C.c_int32),
+    "open": ([C.c_void_p, C.c_char_p], C.c_int32),
+    "connect": ([C.c_void_p, C.c_char_p], C.c_int32),
+    "stats": ([C.c_void_p, C.c_char_p, C.c_size_t], C.c_int32),
+}
+
+
 def library_name() -> str:
     if sys.platform == "win32":
         return "isharded_engine.dll"
@@ -91,24 +109,10 @@ class Engine:
         lib.isharded_engine_abi.restype = C.c_uint32
         if lib.isharded_engine_abi() != ABI_VERSION:
             raise OSError(f"{path} is a different version of the engine")
-        lib.isharded_engine_new.argtypes = [C.c_char_p, C.POINTER(TensorApi)]
-        lib.isharded_engine_new.restype = C.c_void_p
-        for name in ("capture_begin", "lock", "unlock", "close_ring"):
+        for name, (arguments, answer) in SIGNATURES.items():
             function = getattr(lib, f"isharded_engine_{name}")
-            function.argtypes = [C.c_void_p]
-            function.restype = None
-        lib.isharded_engine_capture_read.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t]
-        lib.isharded_engine_capture_read.restype = C.c_size_t
-        lib.isharded_engine_attach.argtypes = [C.c_void_p, C.POINTER(StageApi)]
-        lib.isharded_engine_attach.restype = None
-        lib.isharded_engine_listen.argtypes = [C.c_void_p, C.c_char_p, C.c_uint16, C.c_char_p, C.c_size_t]
-        lib.isharded_engine_listen.restype = C.c_int32
-        lib.isharded_engine_open.argtypes = [C.c_void_p, C.c_char_p]
-        lib.isharded_engine_open.restype = C.c_int32
-        lib.isharded_engine_connect.argtypes = [C.c_void_p, C.c_char_p]
-        lib.isharded_engine_connect.restype = C.c_int32
-        lib.isharded_engine_stats.argtypes = [C.c_void_p, C.c_char_p, C.c_size_t]
-        lib.isharded_engine_stats.restype = C.c_int32
+            function.argtypes = arguments
+            function.restype = answer
         base = library.ggml_base
         tensors = TensorApi(_address(base.ggml_get_name), _address(base.ggml_nbytes), _address(base.ggml_backend_tensor_get))
         self.handle = lib.isharded_engine_new(target, C.byref(tensors))
@@ -120,7 +124,7 @@ class Engine:
         self.table_anchor: Any = None
 
     @classmethod
-    def create(cls, target: bytes, library: Any) -> "Engine | None":
+    def create(cls, target: bytes, library: Any) -> Engine | None:
         path = find_library()
         if path is None:
             return None
@@ -228,10 +232,13 @@ def pass_frame(
 ) -> bytes:
     flags = FLAG_TOKENS | (FLAG_VERIFY if verify else 0)
     rollback = NO_ROLLBACK if rollback_to is None else rollback_to
-    body = struct.pack("<QQIIIBffIBQ", identity, epoch, slot, position, rollback, flags, temperature, top_p, top_k, seed is not None, (seed or 0) & (2**64 - 1))
-    body += struct.pack(f"<I{len(guesses)}I", len(guesses), *guesses)
-    body += struct.pack(f"<I{len(tokens)}I", len(tokens), *tokens)
-    body += struct.pack("<II", 0, 0)
+    body = struct.pack(
+        f"<QQIIIBffIBQI{len(guesses)}II{len(tokens)}III",
+        identity, epoch, slot, position, rollback, flags, temperature, top_p, top_k, seed is not None, (seed or 0) & (2**64 - 1),
+        len(guesses), *guesses,
+        len(tokens), *tokens,
+        0, 0,
+    )  # fmt: skip
     return _frame(KIND_PASS, body)
 
 
@@ -249,7 +256,7 @@ class EngineClient:
         self.task: asyncio.Task[None] | None = None
 
     @classmethod
-    async def open(cls, port: int, key: bytes) -> "EngineClient":
+    async def open(cls, port: int, key: bytes) -> EngineClient:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         raw = writer.get_extra_info("socket")
         if raw is not None:
@@ -282,14 +289,14 @@ class EngineClient:
             while True:
                 kind, body = await self._read_frame(self.reader)
                 if kind == KIND_RESULT:
-                    identity, _epoch, count = struct.unpack_from("<QQI", body)
-                    tokens = list(struct.unpack_from(f"<{count}I", body, 20))
+                    identity, _epoch, count = RESULT_HEAD.unpack_from(body)
+                    tokens = list(struct.unpack_from(f"<{count}I", body, RESULT_HEAD.size))
                     future = self.waiting.pop(identity, None)
                     if future is not None and not future.done():
                         future.set_result(tokens)
                 elif kind == KIND_NACK:
-                    identity, _epoch, refusal, stage, length = struct.unpack_from("<QQBHI", body)
-                    message = body[23 : 23 + length].decode("utf-8", "replace")
+                    identity, _epoch, refusal, stage, length = NACK_HEAD.unpack_from(body)
+                    message = body[NACK_HEAD.size : NACK_HEAD.size + length].decode("utf-8", "replace")
                     refused = EngineRefusal(refusal, stage, message)
                     if identity:
                         future = self.waiting.pop(identity, None)

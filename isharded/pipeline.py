@@ -28,6 +28,7 @@ from typing import Any
 
 # A guess this unlikely to count is not worth sending, however idle the stages are.
 WORTH_SENDING = 0.03
+WORTH_LOG = math.log(WORTH_SENDING)
 # How far the share of guesses that land moves with each guess, and where it starts.
 RIGHT_WEIGHT = 0.05
 FIRST_RIGHT = 0.6
@@ -100,7 +101,7 @@ class Pipeline:
         filled = self.stages + 1
         if self.trip is not None and self.step:
             filled = math.ceil(self.trip / self.step) + 1
-        worth = math.ceil(math.log(WORTH_SENDING) / math.log(min(max(self.right, 0.05), 0.99)))
+        worth = math.ceil(WORTH_LOG / math.log(min(max(self.right, 0.05), 0.99)))
         return max(1, -(-min(filled, worth, self.limit) // max(1, self.sharing())))
 
     def _launch(self, token: int, position: int, rollback_to: int | None = None) -> None:
@@ -165,6 +166,7 @@ class Pipeline:
 
     def _follow(self, token: int, position: int) -> None:
         """The model said ``token`` goes at ``position``. Keeps what is out, or starts again."""
+        rollback_to = None
         if self.flights:
             landed = self.flights[0].token == token
             self.right += (float(landed) - self.right) * RIGHT_WEIGHT
@@ -173,11 +175,9 @@ class Pipeline:
             self.misses += 1
             self._abandon()
             self.wrong_from = position if self.wrong_from is None else min(self.wrong_from, position)
-            self.ending = False
-            self._launch(token, position, position)
-            return
+            rollback_to = position
         self.ending = False
-        self._launch(token, position)
+        self._launch(token, position, rollback_to)
 
     async def tokens(self, count: int) -> AsyncIterator[int]:
         """The next ``count`` tokens, or fewer if the reply ends."""
