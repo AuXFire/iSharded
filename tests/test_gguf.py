@@ -6,6 +6,7 @@ import struct
 import subprocess
 import threading
 import time
+import types
 
 import httpx
 import numpy as np
@@ -1925,3 +1926,42 @@ def test_a_named_draft_that_leaves_the_model_no_room_is_refused(local_model, tmp
     with pytest.raises(HTTPException) as refused:
         node.plan_or_refuse(target)
     assert refused.value.status_code == 507 and target.draft is not None
+
+
+def test_a_cpu_stage_beside_a_gpu_takes_half_the_physical_cores(monkeypatch) -> None:
+    from isharded import worker
+
+    monkeypatch.setattr(worker.os, "cpu_count", lambda: 16)
+    monkeypatch.setattr(worker.psutil, "cpu_count", lambda logical=True: 16 if logical else 8)
+    assert worker.stage_threads(0, beside_gpu=False) == 8  # half the logical cores, as before
+    assert worker.stage_threads(0, beside_gpu=True) == 4
+    assert worker.stage_threads(6, beside_gpu=True) == 6  # the operator's choice stands
+    # No count of physical cores: two logical cores to one, never a single thread.
+    monkeypatch.setattr(worker.psutil, "cpu_count", lambda logical=True: None)
+    assert worker.stage_threads(0, beside_gpu=True) == 4
+
+
+def test_a_gpu_probe_that_fails_leaves_the_default_alone(monkeypatch) -> None:
+    from isharded import worker
+
+    def broken() -> tuple:
+        raise OSError("no driver")
+
+    monkeypatch.setattr(worker, "torch_loaded", lambda: False)
+    monkeypatch.setattr(worker, "nvidia_accelerators", broken)
+    assert worker.machine_has_gpu() is False
+
+
+def test_the_gpu_probe_never_imports_torch_or_fetches_a_build(monkeypatch) -> None:
+    from isharded import worker
+
+    def fetch() -> tuple:
+        raise AssertionError("fetched a build to look for a GPU")
+
+    fetch.cache_info = lambda: types.SimpleNamespace(currsize=0)
+    monkeypatch.setattr(worker, "torch_loaded", lambda: False)
+    monkeypatch.setattr(worker, "nvidia_accelerators", lambda: ())
+    monkeypatch.setattr(worker, "vulkan_accelerators", fetch)
+    assert worker.machine_has_gpu() is False
+    monkeypatch.setattr(worker, "nvidia_accelerators", lambda: ("cuda:0",))
+    assert worker.machine_has_gpu() is True

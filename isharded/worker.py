@@ -40,6 +40,8 @@ from .memory import (
     build_pools,
     discover_accelerators,
     live_free_bytes,
+    nvidia_accelerators,
+    vulkan_accelerators,
 )
 from .engine import REFUSE_EPOCH, REFUSE_STAGE_ERROR, EngineClient, EngineRefusal
 from .geo import country_code, node_country
@@ -78,6 +80,7 @@ from .protocol import (
 )
 from .gguf import parse_source
 from .gguf_stage import (
+    FAST_POOLS,
     GUESSED,
     INITIAL_GUESSES,
     PIPELINE_STRETCH,
@@ -256,6 +259,39 @@ class NextHop:
     @property
     def options(self) -> dict[str, Any]:
         return reach_options(self.via)
+
+
+def stage_threads(asked: int, beside_gpu: bool) -> int:
+    """Threads for llama.cpp, unless the operator chose. Half the logical cores by default.
+
+    A CPU stage on a machine with a GPU gets half the physical cores instead, as the GPU stage
+    beside it needs cores to feed its card. Measured on an 8-core laptop, every core there made
+    both stages slower than half of them.
+    """
+    if asked:
+        return asked
+    if beside_gpu:
+        # With no count of physical cores, take two logical ones to a core.
+        physical = psutil.cpu_count(logical=False) or (os.cpu_count() or 4) // 2
+        return max(physical // 2, 1)
+    return max((os.cpu_count() or 4) // 2, 1)
+
+
+def machine_has_gpu() -> bool:
+    """Whether this machine has a GPU another stage could be using, asked only where it is cheap.
+
+    It never imports PyTorch or fetches a llama.cpp build to look, so a worker told to use the
+    CPU loads as fast as before, on a closed network too. A GPU only Vulkan sees counts once
+    this worker has looked for it already.
+    """
+    try:
+        if torch_loaded() and torch.cuda.is_available():
+            return True
+        if nvidia_accelerators():
+            return True
+        return bool(vulkan_accelerators.cache_info().currsize and vulkan_accelerators())
+    except (OSError, ValueError, RuntimeError):
+        return False  # a probe that fails leaves the default as it was
 
 
 def free_memory() -> None:
@@ -1029,7 +1065,8 @@ class WorkerRuntime:
         self.materialize_done = 0
         on_vulkan = any(pool.device.startswith("vulkan") for pool in self.pools.values())
         folder = self.llama_dir or str(ensure_build(pick_build("vulkan" if on_vulkan else self.requested_device)))
-        threads = self.cpu_threads or max((os.cpu_count() or 4) // 2, 1)
+        on_cpu = not any(self.pools[item.pool_id].kind in FAST_POOLS for item in placements if item.pool_id in self.pools)
+        threads = stage_threads(self.cpu_threads, on_cpu and not self.cpu_threads and machine_has_gpu())
         # A state means nothing to another model or other layers, so those go now.
         namespace = self.state_namespace(request)
         clear_other_stores(self.state_root, {namespace, HELD_FOLDER})
@@ -3001,7 +3038,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--location", type=country_code, default=os.getenv("ISHARDED_LOCATION") or None, help="two letter country code to report, or none to report no country; default is looked up from the advertised address")
     parser.add_argument("--device", default=os.getenv("ISHARDED_DEVICE", "auto"), help="auto, cpu, cuda:0, mps, or xpu:0")
     parser.add_argument("--roles", default=os.getenv("ISHARDED_ROLES", "inference"), help="inference, or kv-cache,checkpoint for a memory worker")
-    parser.add_argument("--cpu-threads", type=int, default=int(os.getenv("ISHARDED_CPU_THREADS", "0")), help="CPU threads; 0 uses half the cores for a stage")
+    parser.add_argument("--cpu-threads", type=int, default=int(os.getenv("ISHARDED_CPU_THREADS", "0")), help="CPU threads; 0 uses half the logical cores, or half the physical cores for a CPU stage on a machine with a GPU")
     parser.add_argument("--ram-budget-gb", type=float, default=float(os.getenv("ISHARDED_RAM_BUDGET_GB", "0")), help="RAM for KV checkpoints, not weights")
     parser.add_argument("--state-ram-gb", type=float, default=float(os.getenv("ISHARDED_STATE_RAM_GB", "1")), help="RAM for saved prompt states on each stage")
     parser.add_argument("--state-disk-gb", type=float, default=float(os.getenv("ISHARDED_STATE_DISK_GB", "8")), help="disk for saved prompt states; 0 keeps them in RAM only")

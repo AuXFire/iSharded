@@ -1118,6 +1118,29 @@ def test_a_real_route_that_merges_nothing_never_merges_passes() -> None:
         host.close()
 
 
+@needs_real_stage
+def test_a_real_stage_reports_its_compute_totals_and_hop_trace() -> None:
+    async def run(host) -> dict:
+        client = await real_ring(host)
+        try:
+            made = [(await real_pass(client, PROMPT, 0))[0]]
+            for position in range(len(PROMPT), len(PROMPT) + 4):
+                made += (await real_pass(client, made[-1:], position))[:1]
+            return host.call("ring_stats")[0]
+        finally:
+            client.close()
+
+    host, _ = real_stage()
+    try:
+        stats = asyncio.run(run(host))
+    finally:
+        host.close()
+    assert stats["batches_total"] == 5 and stats["compute_us_total"] >= stats["batches_total"]
+    # One stage is the entry and the last: it picks tokens and waits on its worker.
+    assert stats["sample_us"] > 0 and stats["turnaround_us"] > 0
+    assert {"queue_us", "write_us", "enqueue_us", "wait_us"} <= stats.keys()
+
+
 def test_a_load_of_another_model_starts_its_pipeline_counts_again(monkeypatch) -> None:
     """A stage that restarts reloads the same model, and its counts still describe it."""
     from isharded.protocol import ConfigureRequest
