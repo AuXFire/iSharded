@@ -180,7 +180,7 @@ def test_a_plan_preview_says_what_goes_unused_on_every_node(monkeypatch) -> None
         orchestrator.refresh_holdings = nothing
         monkeypatch.setattr(orchestrator_module, "runtime", orchestrator)
         monkeypatch.setattr(orchestrator_module, "build_target", lambda *args: target)
-        monkeypatch.setattr(orchestrator_module, "describe_plan", lambda target, route: {"model": "m"})
+        monkeypatch.setattr(orchestrator_module, "describe_plan", lambda target, route, links=None: {"model": "m"})
         response = TestClient(orchestrator_module.app).post("/admin/plan", json={"model_id": "m"})
         assert response.status_code == 200
         plan = response.json()

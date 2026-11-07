@@ -713,6 +713,7 @@ class WorkerRuntime:
                 return retry
             self.last_error = str(lost)
             self.caches.clear()
+            self.ring_stop()  # its links died with the process, and this says so to whoever reopens them
             draft = self.draft
             try:
                 assert self.gguf is not None

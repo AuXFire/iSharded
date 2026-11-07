@@ -392,6 +392,16 @@ def check_pooling(request: LoadModelRequest, adapter: Adapter) -> None:
         raise UnsupportedModel(f"{request.model_id} is an embedding model; load it with --embedding")
 
 
+def draft_cache_bytes(draft: DraftModel, context_tokens: int, slots: int) -> int:
+    """What a draft's cache takes, sized as ``load_draft`` sizes it.
+
+    Every slot has two sequences. Scratch shares the confirmed text's cells, so together
+    they take one context per slot and one more for guesses.
+    """
+    cells = context_tokens * (slots + 1)
+    return draft.kv_bytes_per_token * cells + draft.state_bytes * 2 * slots
+
+
 def holders_of(sources: dict[str, list[str]], model: str) -> list[str]:
     located = parse_source(model)
     if not located:
@@ -479,13 +489,13 @@ def check_image_marker(target: ModelTarget) -> None:
         raise UnsupportedModel(f"this model's chat template has no {marker} for images, so {target.projector.file} cannot be used with it")
 
 
-def describe_plan(target: ModelTarget, route: list[StageAssignment]) -> dict[str, Any]:
+def describe_plan(target: ModelTarget, route: list[StageAssignment], links: dict[tuple[str, str], float] | None = None) -> dict[str, Any]:
     """Summarize a plan for people: what goes where, and what it will cost."""
     # Bandwidth alone flatters small active sets, such as a MoE's: every layer still
     # costs its kernel launches, and every stage boundary costs a network hop.
     milliseconds = sum(
         max(stage.estimated_ms_per_token, (stage.end_layer - stage.start_layer) * LAYER_FLOOR_MS) for stage in route
-    ) + route_network_ms(route, runtime.links, target.profile.ring)
+    ) + route_network_ms(route, runtime.links if links is None else links, target.profile.ring)
     download = sum(
         target.units[item.unit].nbytes
         for stage in route
@@ -1332,16 +1342,35 @@ class Orchestrator:
         that would send, and a link that fails stays on record so that no route needs it.
         A slow link also feels how big a token's row is, so ``row`` is probed as well.
         """
-        urls = {
-            worker_id: worker_url(record)
-            for worker_id, record in self.workers.items()
-            if record.live and not record.quarantined
-        }
-        now = time.monotonic()
-        sizes = [LINK_PROBE_BYTES, row] if row > LINK_PROBE_BYTES else [LINK_PROBE_BYTES]
         if row != self.link_row_bytes:
             self.link_row_bytes = row
             self.links_checked.clear()  # those costs were for another model's rows
+        urls = self._link_urls()
+        for table in (self.links, self.links_checked, self.link_readings):
+            for pair in [pair for pair in table if not urls.keys() >= set(pair)]:
+                del table[pair]  # a pool that changes members would otherwise grow these forever
+        await self._probe_links(urls, row, self.links, self.links_checked, self.link_readings)
+
+    async def preview_links(self, row: int) -> dict[tuple[str, str], float]:
+        """What links would cost a model that is not loaded, kept apart from the running one's."""
+        same = row == self.link_row_bytes
+        links, checked = (dict(self.links), dict(self.links_checked)) if same else ({}, {})
+        await self._probe_links(self._link_urls(), row, links, checked, {})
+        return links
+
+    def _link_urls(self) -> dict[str, str]:
+        return {worker_id: worker_url(record) for worker_id, record in self.workers.items() if record.live and not record.quarantined}
+
+    async def _probe_links(
+        self,
+        urls: dict[str, str],
+        row: int,
+        links: dict[tuple[str, str], float],
+        checked: dict[tuple[str, str], float],
+        readings: dict[tuple[str, str], dict[str, Any]],
+    ) -> None:
+        now = time.monotonic()
+        sizes = [LINK_PROBE_BYTES, row] if row > LINK_PROBE_BYTES else [LINK_PROBE_BYTES]
 
         async def probe(source: str, target: str) -> None:
             reading: dict[str, Any] = {"median_ms": None, "max_ms": None, "cost_ms": UNREACHABLE_LINK_MS}
@@ -1357,13 +1386,13 @@ class Orchestrator:
                 reading = link_reading(response.json(), sizes)
             except (httpx.HTTPError, KeyError, TypeError, ValueError):
                 pass
-            self.links[source, target] = reading["cost_ms"]
-            self.link_readings[source, target] = {**reading, "checked_at": int(time.time())}
-            self.links_checked[source, target] = now
+            links[source, target] = reading["cost_ms"]
+            readings[source, target] = {**reading, "checked_at": int(time.time())}
+            checked[source, target] = now
 
         async def from_one(source: str) -> None:
             for target in urls:
-                if target != source and now - self.links_checked.get((source, target), -LINK_TTL_SECONDS) >= LINK_TTL_SECONDS:
+                if target != source and now - checked.get((source, target), -LINK_TTL_SECONDS) >= LINK_TTL_SECONDS:
                     await probe(source, target)
 
         allowed = LINK_PROBE_SECONDS * len(sizes)
@@ -1385,12 +1414,15 @@ class Orchestrator:
         candidates += [self._candidate(name, self.workers[name]) for name in sorted(running) if name in self.workers]
         return memory_report(route, candidates, target.profile)
 
-    def plan(self, target: ModelTarget, *, honor_pins_strictly: bool = False) -> list[StageAssignment]:
+    def plan(
+        self, target: ModelTarget, *, honor_pins_strictly: bool = False, links: dict[tuple[str, str], float] | None = None
+    ) -> list[StageAssignment]:
         """Plan a route. A pin on a lost worker is dropped, not fatal.
 
         Recovery must not fail because a preferred machine died, so only an
         explicit request treats an unavailable pin as an error.
         """
+        links = self.links if links is None else links
         preferred, standby = self.candidate_groups()
         available = {candidate.worker_id for candidate in preferred + standby}
         pins: dict[str, str | None] = {"entry_worker": target.entry_worker, "exit_worker": target.exit_worker}
@@ -1399,17 +1431,17 @@ class Orchestrator:
                 if worker_id and worker_id not in available:
                     self.add_event("failure", f"{worker_id} is unavailable", f"Planning without its {role} pin")
                     pins[role] = None
-        preferred = with_links(self._with_holdings(preferred, target), self.links)
-        standby = with_links(self._with_holdings(standby, target), self.links)
+        preferred = with_links(self._with_holdings(preferred, target), links)
+        standby = with_links(self._with_holdings(standby, target), links)
         kept = None if honor_pins_strictly else self._keep_stages(target, preferred, standby, available, pins)
-        route = kept or plan_placement(preferred, standby, target.profile, spread=target.spread, links=self.links, **pins)
+        route = kept or plan_placement(preferred, standby, target.profile, spread=target.spread, links=links, **pins)
         if target.embedding and len(route) > 1:
             # Pooling happens at the end of the model, in llama.cpp, for whole
             # sequences, so a stage boundary has nothing correct to pass along.
             raise PlacementError(f"{target.model_id} would take {len(route)} stages here, and an embedding model cannot be split; it needs one worker that can hold it all")
         return route
 
-    def plan_or_refuse(self, target: ModelTarget, **options: bool) -> list[StageAssignment]:
+    def plan_or_refuse(self, target: ModelTarget, **options: Any) -> list[StageAssignment]:
         try:
             return self.plan(target, **options)
         except PlacementError as exc:
@@ -3060,9 +3092,11 @@ async def preview_plan(body: LoadModelRequest, authorization: str | None = Heade
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     await runtime.refresh_worker_metrics()
     await runtime.refresh_holdings(target)
-    await runtime.measure_links(row_bytes(target))
-    route = runtime.plan_or_refuse(target, honor_pins_strictly=True)
-    return {**describe_plan(target, route), "memory": runtime.plan_memory(target, route)}
+    # A preview is one model among several that might load. Its costs must not reach the
+    # running route's next repair, which would plan by another model's rows.
+    links = await runtime.preview_links(row_bytes(target))
+    route = runtime.plan_or_refuse(target, honor_pins_strictly=True, links=links)
+    return {**describe_plan(target, route, links), "memory": runtime.plan_memory(target, route)}
 
 
 @app.get("/admin/keys")
