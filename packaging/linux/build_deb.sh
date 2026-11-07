@@ -10,6 +10,7 @@ out=$4
 here=$(cd "$(dirname "$0")" && pwd)
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
+chmod 755 "$stage"  # mktemp's 700 would go into the package as the mode of its ./ entry
 
 mkdir -p "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/lib/isharded" "$stage/usr/share/applications"
 sed -e "s/__VERSION__/$version/" -e "s/__ARCHITECTURE__/$architecture/" "$here/control" >"$stage/DEBIAN/control"

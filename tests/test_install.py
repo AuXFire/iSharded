@@ -291,6 +291,20 @@ def test_the_release_publishes_only_what_was_checked() -> None:
         assert (ROOT / path.replace("\\", "/")).is_file(), path
 
 
+def test_a_release_by_hand_builds_the_tag_it_publishes() -> None:
+    release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    assert release.count("uses: actions/checkout@v4") == release.count("ref: ${{ inputs.tag || github.ref }}") + 1  # publish checks out $TAG itself
+
+
+def test_an_upgrade_through_the_windows_installer_drops_the_old_wheel() -> None:
+    script = (ROOT / "packaging" / "windows" / "isharded.iss").read_text(encoding="utf-8")
+    assert 'Type: files; Name: "{app}\\isharded-*.whl"' in script
+
+
+def test_a_debian_package_does_not_carry_mktemps_mode() -> None:
+    assert 'chmod 755 "$stage"' in (ROOT / "packaging" / "linux" / "build_deb.sh").read_text(encoding="utf-8")
+
+
 def test_the_windows_installer_asks_for_an_administrator_only_for_the_firewall() -> None:
     script = (ROOT / "packaging" / "windows" / "isharded.iss").read_text(encoding="utf-8")
     assert "PrivilegesRequired=lowest" in script

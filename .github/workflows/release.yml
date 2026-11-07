@@ -32,6 +32,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}  # a run by hand starts on a branch, and must build the tag it publishes
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -54,6 +56,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}  # a run by hand starts on a branch, and must build the tag it publishes
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -72,6 +76,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/download-artifact@v4
         with:
           name: wheel-x86_64-pc-windows-msvc
@@ -82,7 +88,8 @@ jobs:
           choco install innosetup --no-progress -y
           $wheel = (Get-ChildItem dist/*.whl).FullName
           $version = (Split-Path -Leaf $wheel).Split("-")[1]
-          $iscc = (Get-Item "${env:ProgramFiles(x86)}\Inno Setup *\iscc.exe" | Select-Object -Last 1).FullName
+          $iscc = (Get-Item "${env:ProgramFiles(x86)}\Inno Setup *\iscc.exe", "$env:ProgramFiles\Inno Setup *\iscc.exe" | Select-Object -Last 1).FullName
+          if (-not $iscc) { throw "Inno Setup's iscc.exe was not found" }
           & $iscc "/DAppVersion=$version" "/DWheel=$wheel" packaging\windows\isharded.iss
           if ($LASTEXITCODE -ne 0) { throw "iscc failed" }
       - uses: actions/upload-artifact@v4
@@ -96,6 +103,8 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/download-artifact@v4
         with:
           name: wheel-aarch64-apple-darwin
@@ -124,6 +133,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/download-artifact@v4
         with:
           name: wheel-${{ matrix.target }}

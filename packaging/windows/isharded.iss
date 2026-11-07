@@ -27,6 +27,10 @@ UninstallDisplayName=iSharded
 Name: service; Description: "Start iSharded when I log in"; Flags: unchecked
 Name: firewall; Description: "Let other machines on my private network reach this node through Windows Firewall. Windows asks for an administrator for this one step. Leave it off if this machine links to others over Tailscale"; Flags: unchecked
 
+[InstallDelete]
+; An upgrade would otherwise leave the old wheel here, and setup.ps1 would install it.
+Type: files; Name: "{app}\isharded-*.whl"
+
 [Files]
 Source: "..\..\install.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "setup.ps1"; DestDir: "{app}"; Flags: ignoreversion
