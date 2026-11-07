@@ -59,6 +59,7 @@ SCHEMA = [
         installed_at REAL NOT NULL
     );
     """,
+    "ALTER TABLE plugins ADD COLUMN drift TEXT;",
 ]
 
 
@@ -145,7 +146,6 @@ class Plugins:
         self.audit = assistant.audit
         self.clock = assistant.clock
         self.sessions: dict[str, McpSession] = {}
-        self.drift: dict[str, dict[str, list[str]]] = {}  # what each server offers now that differs from its install
         self.lock = threading.Lock()
         self.starting: dict[str, threading.Lock] = {}
         self.store.migrate("plugins", SCHEMA)
@@ -286,14 +286,13 @@ class Plugins:
         same = existing == spec
         with self.lock:
             self._drop_session(name)
-        self.drift.pop(name, None)  # a person has looked again
         if existing is not None and not same:
             self._forget(existing, by)  # what was granted was for the old claims
         with self.store.transaction():
             self.store.execute(
                 "INSERT INTO plugins (name, protocol, spec, enabled, failures, installed_by, installed_at) VALUES (?, ?, ?, 1, 0, ?, ?) "
                 "ON CONFLICT(name) DO UPDATE SET protocol = excluded.protocol, spec = excluded.spec, enabled = 1, failures = 0, "
-                "disabled_reason = NULL, installed_by = excluded.installed_by, installed_at = excluded.installed_at",
+                "disabled_reason = NULL, installed_by = excluded.installed_by, installed_at = excluded.installed_at, drift = NULL",  # a person has looked again
                 (name, spec["protocol"], json.dumps(spec), by, self.clock()),
             )
             self.audit.record(by, "plugin.add", name, {"protocol": spec["protocol"], "capabilities": [entry["name"] for entry in spec["capabilities"]]})
@@ -332,7 +331,6 @@ class Plugins:
             return False
         with self.lock:
             self._drop_session(name)
-        self.drift.pop(name, None)
         self._forget(json.loads(row["spec"]), by)
         with self.store.transaction():
             self.store.execute("DELETE FROM plugins WHERE name = ?", (name,))
@@ -341,7 +339,7 @@ class Plugins:
 
     def list(self) -> list[dict[str, Any]]:
         rows = self.store.query("SELECT * FROM plugins ORDER BY name")
-        return [{**dict(row), "spec": json.loads(row["spec"]), "drift": self.drift.get(row["name"], {})} for row in rows]
+        return [{**dict(row), "spec": json.loads(row["spec"]), "drift": json.loads(row["drift"] or "{}")} for row in rows]
 
     # Calling.
 
@@ -444,20 +442,26 @@ class Plugins:
                 raise ToolChanged(entry["tool"])
         self._note_drift(name, spec, set(offered))
 
+    def _drift(self, name: str) -> dict[str, list[str]]:
+        """What a server offers that differs from its install. It is kept in the store because `plugin list` is another process."""
+        row = self.store.one("SELECT drift FROM plugins WHERE name = ?", (name,))
+        return json.loads(row["drift"]) if row is not None and row["drift"] else {"vanished": [], "added": []}
+
     def _note_drift(self, name: str, spec: dict[str, Any], offered: set[str]) -> None:
         """Neither of these breaks a promise, so neither turns a plugin off. A person still ought to know."""
         installed = {entry["tool"] for entry in spec["capabilities"]}
         # A name we could not take at install is no news now.
         added = sorted(tool for tool in offered - installed if TOOL_NAME.match(tool))
         drift = {"vanished": sorted(installed - offered), "added": added}
-        if drift != self.drift.get(name, {"vanished": [], "added": []}):
-            self.audit.record("plugins", "plugin.drift", name, drift)
-        self.drift[name] = drift
+        if drift != self._drift(name):
+            with self.store.transaction():
+                self.store.execute("UPDATE plugins SET drift = ? WHERE name = ?", (json.dumps(drift), name))
+                self.audit.record("plugins", "plugin.drift", name, drift)
 
     def _call_mcp(self, name: str, spec: dict[str, Any], entry: dict[str, Any], arguments: dict[str, Any]) -> ToolResult:
         try:
             session = self._session(name, spec)
-            if entry["tool"] in self.drift.get(name, {}).get("vanished", []):
+            if entry["tool"] in self._drift(name)["vanished"]:
                 return self._result(name, False, f"Tool {entry['tool']} is no longer offered by this server. It was there when plugin {name} was installed.")
             result = session.request("tools/call", {"name": entry["tool"], "arguments": arguments}, spec["timeout"])
         except ToolChanged as changed:

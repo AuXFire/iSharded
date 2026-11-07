@@ -710,7 +710,52 @@ def test_a_name_refused_at_install_is_not_news_later(assistant, mcp):
     (name,) = assistant.plugins.add(mcp.manifest([SEARCH, tool_named("not a valid name")]))
     grant(assistant, name)
     assert invoke(assistant, name, q="x").ok
-    assert assistant.plugins.list()[0]["drift"] == {"vanished": [], "added": []}
+    assert assistant.plugins.list()[0]["drift"] == {}
+
+
+def test_drift_reaches_plugin_list_in_another_process(assistant, mcp, home, capsys):
+    """Each `plugin list` is a process of its own, so memory is no way to hear of this."""
+    names = assistant.plugins.add(mcp.manifest([SEARCH, tool_named("other")]))
+    for name in names:
+        grant(assistant, name)
+    mcp.manifest([SEARCH, tool_named("new")])
+    assert invoke(assistant, "mcp.srv.search", q="x").ok
+    with Assistant(home) as later:
+        assert run_plugin_list(later, argparse.Namespace()) == 0
+    out = capsys.readouterr().out
+    assert "no longer offered: other" in out and "not offered until you install it again: new" in out
+
+
+def test_a_vanished_tool_is_said_once_across_restarts(assistant, mcp, home):
+    (name,) = assistant.plugins.add(mcp.manifest())
+    grant(assistant, name)
+    mcp.manifest([SEARCH, tool_named("new")])
+    invoke(assistant, name, q="x")
+    with Assistant(home) as later:
+        grant(later, name)
+        assert invoke(later, name, q="x").ok
+        later.plugins.close()
+    rows = [row for row in assistant.audit.read(limit=500) if row["action"] == "plugin.drift"]
+    assert len(rows) == 1
+
+
+def test_a_server_with_an_odd_identity_still_installs(assistant, tmp_path):
+    """The handshake now reads what a plugin says of itself, which it once ignored."""
+    body = """
+        import json, sys
+        for line in sys.stdin:
+            message = json.loads(line)
+            if "id" not in message:
+                continue
+            method = message["method"]
+            result = {"tools": [{"name": "search", "inputSchema": {"type": "object"}}]} if method == "tools/list" else {"protocolVersion": 7, "serverInfo": "just a name"}
+            print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+    """
+    script = tmp_path / "odd.py"
+    script.write_text(textwrap.dedent(body), encoding="utf-8")
+    manifest = tmp_path / "odd.json"
+    manifest.write_text(json.dumps({"name": "odd", "protocol": "mcp", "command": [sys.executable, str(script)]}), encoding="utf-8")
+    assert assistant.plugins.add(manifest) == ["mcp.odd.search"]
 
 
 def test_installing_again_clears_what_was_reported(assistant, mcp):
