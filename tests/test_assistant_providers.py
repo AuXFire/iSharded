@@ -8,6 +8,7 @@ import time
 
 import pytest
 
+from isharded.assistant import conversation, providers
 from isharded.assistant.app import Assistant
 from isharded.assistant.cli import add_arguments, run
 from isharded.assistant.contracts import Capability, Effect, ModelReply, ModelRequest, Reach, ToolCall
@@ -18,6 +19,7 @@ from isharded.assistant.providers import (
     ProviderRefused,
     VisibleText,
     api_root,
+    estimate_tokens,
     key_reference,
     loose_json,
     parse_tool_calls,
@@ -156,6 +158,16 @@ def test_thinking_is_stripped():
 @pytest.mark.parametrize("text", ["", "   ", "no json", "{unclosed", "[1, 2"])
 def test_loose_json_refuses_what_it_cannot_trust(text):
     assert loose_json(text) is None
+
+
+@pytest.mark.parametrize("text", ['{{"a": 1}}', "{{}}", "[{[1]: 2}]", '{"a", "b"}', "{'a': {1}}", "[b'x']", "[1j]"])
+def test_python_that_is_not_json_reads_as_not_json(text):
+    """It would raise, or reach a tool as something no tool can take, and fail the whole turn."""
+    assert loose_json(text) is None
+
+
+def test_a_reply_in_python_words_still_parses():
+    assert loose_json("{'a': True, 'b': None, 'c': [1, 2]}") == {"a": True, "b": None, "c": [1, 2]}
 
 
 def test_loose_json_refuses_something_absurdly_long():

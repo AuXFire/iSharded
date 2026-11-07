@@ -203,8 +203,10 @@ def loose_json(text: str) -> Any:
     if end is None:
         return None
     try:  # single quotes and Python's True and None
-        return ast.literal_eval(re.sub(r"\btrue\b", "True", re.sub(r"\bfalse\b", "False", re.sub(r"\bnull\b", "None", candidate))))
-    except (ValueError, SyntaxError, MemoryError, RecursionError):
+        found = ast.literal_eval(re.sub(r"\btrue\b", "True", re.sub(r"\bfalse\b", "False", re.sub(r"\bnull\b", "None", candidate))))
+        json.dumps(found)  # a set or bytes is Python, not JSON, and no tool can take one
+        return found
+    except (TypeError, ValueError, SyntaxError, MemoryError, RecursionError):
         return None
 
 
