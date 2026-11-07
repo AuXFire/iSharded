@@ -813,7 +813,8 @@ mod tests {
         assert!(matches!(writer.join().unwrap(), LinkError::Io(_)));
         assert!(began.elapsed() < limit * 3);
         assert!(link.is_closed());
-        assert!(matches!(link.send(b"more"), Err(LinkError::Closed)));
+        // Every sender after the failure hears why, not only the first.
+        assert!(matches!(link.send(b"more"), Err(LinkError::Io(_))));
         drop(finish);
         far.join().unwrap();
     }
@@ -907,7 +908,7 @@ mod tests {
         assert!(matches!(error, LinkError::Io(_)));
         assert!(began.elapsed() < limit * 3);
         assert!(link.is_closed());
-        assert!(matches!(link.beat(b"more"), Err(LinkError::Closed)));
+        assert!(matches!(link.beat(b"more"), Err(LinkError::Io(_))));
         drop(finish);
         far.join().unwrap();
     }

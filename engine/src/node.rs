@@ -779,7 +779,7 @@ fn forget(place: &Mutex<Option<Arc<Link>>>, link: &Arc<Link>) {
 /// Answers a heartbeat. False means the link is finished.
 fn answer_ping(link: &Link, body: &[u8]) -> bool {
     // A pong that finds no room is only a missed heartbeat.
-    wire::read_beat(body).is_ok_and(|stamp| !matches!(link.beat(&wire::beat(Kind::Pong, stamp)), Err(LinkError::Closed)))
+    wire::read_beat(body).is_ok_and(|stamp| !matches!(link.beat(&wire::beat(Kind::Pong, stamp)), Err(LinkError::Closed | LinkError::Io(_))))
 }
 
 /// Reads passes off a link. Taking one off is what the acknowledgement means, so a stage
