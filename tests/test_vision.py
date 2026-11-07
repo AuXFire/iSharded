@@ -374,7 +374,7 @@ def fake_request(**changes):
 
 def merge_runtime():
     runtime = worker_module.WorkerRuntime.__new__(worker_module.WorkerRuntime)
-    runtime.merge_passes = True
+    runtime.merge_passes, runtime.exact, runtime.exactness = True, False, None
     runtime.gguf = object()
     return runtime
 
@@ -414,6 +414,7 @@ def stage_runtime(stage):
     runtime.caches = {"s": worker_module.CacheEntry(epoch=1, slot=0, length=7)}
     runtime.inference_calls = runtime.tokens_processed = 0
     runtime.compute_ms_ema = runtime.row_ms_ema = None
+    runtime.batch_ms = {}
     return runtime
 
 

@@ -438,6 +438,7 @@ def gguf_runtime():
     runtime.adapter = runtime.assignment = object()
     runtime.gguf = Stage()
     runtime.compute_ms_ema = runtime.row_ms_ema = None
+    runtime.batch_ms = {}
     runtime.inference_calls = runtime.tokens_processed = runtime.merged_passes = runtime.merged_rows = 0
     runtime._pass_entry = lambda request: SimpleNamespace(length=0)
     return runtime
