@@ -152,11 +152,12 @@ class Store:
             for step in steps[version:]:
                 for statement in split_statements(step):
                     connection.execute(statement)
-            connection.execute(
-                "INSERT INTO schema_versions (module, version) VALUES (?, ?) "
-                "ON CONFLICT(module) DO UPDATE SET version = excluded.version",
-                (module, len(steps)),
-            )
+            if row is None or version < len(steps):  # at every start most parts are current, and a write waits on the disk
+                connection.execute(
+                    "INSERT INTO schema_versions (module, version) VALUES (?, ?) "
+                    "ON CONFLICT(module) DO UPDATE SET version = excluded.version",
+                    (module, len(steps)),
+                )
 
     def close(self) -> None:
         connection = getattr(self._local, "connection", None)

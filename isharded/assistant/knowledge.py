@@ -125,7 +125,7 @@ class IndexReport:
     seconds: float = 0.0
     problems: list[str] = field(default_factory=list)
 
-    def merge(self, other: "IndexReport") -> None:
+    def merge(self, other: IndexReport) -> None:
         for name in ("added", "updated", "unchanged", "removed", "skipped", "chunks", "embedded"):
             setattr(self, name, getattr(self, name) + getattr(other, name))
         self.seconds += other.seconds
@@ -293,8 +293,7 @@ def chunk_pdf(path: str, limit: int = MAX_CHUNK_CHARS) -> list[Chunk]:
     chunks = []
     for number, page in enumerate(PdfReader(path).pages, 1):
         text = (page.extract_text() or "").strip()
-        for start in range(0, len(text), limit):
-            chunks.append(Chunk(text[start : start + limit], page=number))
+        chunks.extend(Chunk(text[start : start + limit], page=number) for start in range(0, len(text), limit))
     return chunks
 
 
@@ -357,8 +356,7 @@ class Library:
         return [dict(row) for row in rows]
 
     def _root(self, user: str, root: int | str) -> Any:
-        by_number = str(root).isdigit()
-        if by_number:
+        if str(root).isdigit():
             row = self.store.one("SELECT * FROM library_roots WHERE id = ? AND user = ?", (int(str(root)), user))
         else:
             row = self.store.one("SELECT * FROM library_roots WHERE path = ? AND user = ?", (str(Path(str(root)).resolve()), user))
@@ -491,7 +489,7 @@ class Library:
 
     def _embedder(self) -> Any:
         router = getattr(self.assistant, "router", None)
-        return router if router is not None and hasattr(router, "embed") and getattr(router, "can_embed", lambda: False)() else None
+        return router if getattr(router, "can_embed", lambda: False)() else None
 
     def _embed_missing(self, root: Any, report: IndexReport) -> None:
         router = self._embedder()
@@ -536,7 +534,7 @@ class Library:
         usable = [row for row in rows if len(row["vector"]) == wanted.nbytes]
         if not usable:
             return []
-        matrix = np.stack([np.frombuffer(row["vector"], dtype=np.float32) for row in usable])
+        matrix = np.frombuffer(b"".join(row["vector"] for row in usable), dtype=np.float32).reshape(len(usable), wanted.size)
         norms = np.linalg.norm(matrix, axis=1) * (np.linalg.norm(wanted) or 1.0)
         similarity = matrix @ wanted / np.where(norms == 0, 1.0, norms)
         order = np.argsort(-similarity, kind="stable")[:limit]
@@ -557,10 +555,7 @@ class Library:
         )
         keyword = [row["id"] for row in rows]
         nearest = self._nearest(user, query, limit * 3, reach)
-        if nearest:
-            scores = fuse([keyword, nearest])
-        else:
-            scores = {row["id"]: -row["rank"] for row in rows}
+        scores = fuse([keyword, nearest]) if nearest else {row["id"]: -row["rank"] for row in rows}
         best = sorted(scores, key=lambda chunk_id: (-scores[chunk_id], chunk_id))[:limit]
         return self._items(user, best, scores)
 
@@ -585,15 +580,17 @@ class Library:
 
     def chunk_text(self, user: str, source_id: str) -> str | None:
         """What a citation currently says, for looking back at what a model saw."""
+        paged = "#page=" in source_id
+        base, _, tail = source_id.rpartition("#page=" if paged else ":")
+        column = "c.page" if paged else "c.line"
+        number = int(tail) if tail.isdigit() else -1
         for row in self.store.query("SELECT id, path FROM library_roots WHERE user = ?", (user,)):
             if not source_id.startswith(row["path"]):
                 continue
-            base, _, tail = source_id.rpartition("#page=") if "#page=" in source_id else source_id.rpartition(":")
             relative = os.path.relpath(base, row["path"]).replace(os.sep, "/")
-            column = "c.page" if "#page=" in source_id else "c.line"
             match = self.store.one(
                 f"SELECT c.text FROM library_chunks c JOIN library_files f ON f.id = c.file_id WHERE f.root_id = ? AND f.path = ? AND {column} = ?",
-                (row["id"], relative, int(tail) if tail.isdigit() else -1),
+                (row["id"], relative, number),
             )
             if match:
                 return match["text"]

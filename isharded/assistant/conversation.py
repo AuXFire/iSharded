@@ -9,7 +9,7 @@ turn is tainted, so a poisoned result cannot use a standing grant to act.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 import json
@@ -18,11 +18,11 @@ from typing import Any
 import uuid
 
 from . import gateway_cli
-from .context import ContextTooSmall, TurnNotFound, estimate_tokens, merged
+from .context import ContextTooSmall, TurnNotFound, merged
 from .contracts import CallContext, Capability, ContextItem, Effect, ModelReply, ModelRequest, Provenance, Reach, ToolCall, Trust, Verdict
 from .memory import KINDS
 from .mind import actor, add_user_option, emit, plainly
-from .providers import loose_json
+from .providers import estimate_tokens, loose_json
 
 ROLE = "conversation"
 MAX_ROUNDS = 6
@@ -79,6 +79,10 @@ def decide_approval(assistant: Any, approval_id: str, approved: bool, by: str) -
     return broker is not None and broker.decide(approval_id, approved, by)
 
 
+def tool_tokens(tool: Capability) -> int:
+    return estimate_tokens(tool.name + tool.summary + str(tool.input_schema))
+
+
 SCHEMA = [
     """
     CREATE TABLE paused_turns (
@@ -124,6 +128,16 @@ class TurnResult:
     completion_tokens: int = 0
 
 
+def final_result(items: Iterable[str | TurnResult]) -> TurnResult:
+    """Run a turn to its end and keep only the result."""
+    result = None
+    for item in items:
+        if isinstance(item, TurnResult):
+            result = item
+    assert result is not None
+    return result
+
+
 @dataclass
 class Turn:
     user: str
@@ -131,6 +145,7 @@ class Turn:
     conversation_id: str
     turn_id: str
     built: Any = None
+    offered: tuple[Capability, ...] = ()  # the tools chosen when the context was built
     tainted: bool = False
     reach: Reach = Reach.POOL
     transcript: list[dict[str, Any]] = field(default_factory=list)  # what happened after the context was built
@@ -145,23 +160,23 @@ class Turn:
     def messages(self, budget: int) -> list[dict[str, Any]]:
         """Everything so far. If tools have said too much, the oldest outputs give way."""
         room = budget - self.built.tokens
-        kept: list[dict[str, Any]] = []
+        newest_first: list[dict[str, Any]] = []
         for entry in reversed(self.transcript):
             text = entry["text"]
             cost = estimate_tokens(text)
             if entry["kind"] == "tool" and cost > room:
                 text, cost = "(This output was removed to save space. It is still in the record.)", 20
             room -= cost
-            kept.append({**entry, "text": text})
-        result = list(self.built.messages)
-        for entry in reversed(kept):
-            if entry["kind"] == "assistant":
-                result.append({"role": "assistant", "content": entry["text"]})
-            elif entry["kind"] == "tool":
-                result.append({"role": "user", "content": self.built.wrap(entry["text"], f"tool: {entry['capability']}")})
-            else:
-                result.append({"role": "user", "content": f"[From the assistant's own software, not the person] {entry['text']}"})
-        return [result[0], *merged(result[1:])]
+            newest_first.append(self._message(entry, text))
+        system, *rest = self.built.messages
+        return [system, *merged([*rest, *reversed(newest_first)])]
+
+    def _message(self, entry: dict[str, Any], text: str) -> dict[str, Any]:
+        if entry["kind"] == "assistant":
+            return {"role": "assistant", "content": text}
+        if entry["kind"] == "tool":
+            return {"role": "user", "content": self.built.wrap(text, f"tool: {entry['capability']}")}
+        return {"role": "user", "content": f"[From the assistant's own software, not the person] {text}"}
 
 
 class Conversation:
@@ -181,11 +196,7 @@ class Conversation:
 
     def say(self, user: str, text: str, conversation_id: str | None = None, learn: str = "now") -> TurnResult:
         """One turn, start to finish. ``learn`` is now, background, or off."""
-        result = None
-        for item in self._run(user, text, conversation_id, streaming=False):
-            if isinstance(item, TurnResult):
-                result = item
-        assert result is not None
+        result = final_result(self._run(user, text, conversation_id, streaming=False))
         self._learn_after(result, text, learn)
         return result
 
@@ -217,8 +228,8 @@ class Conversation:
         yield from self._advance(turn, streaming)
 
     def _build(self, turn: Turn) -> None:
-        tools = self._tools(turn.user)
-        reserve = sum(estimate_tokens(tool.name + tool.summary + str(tool.input_schema)) for tool in tools)
+        turn.offered = tuple(self._tools(turn.user))
+        reserve = sum(tool_tokens(tool) for tool in turn.offered)
         built = self.assistant.context.build(
             turn.user, turn.query, ROLE, self.budget_tokens, turn.conversation_id, turn.turn_id, reserve_tokens=reserve, exclude_turn=turn.turn_id,
         )
@@ -240,7 +251,7 @@ class Conversation:
         usable = [tool for tool in broker.capabilities() if tool.name in granted or Effect.PHYSICAL in tool.effects]
         offered, spent = [], 0
         for tool in sorted(usable, key=lambda item: (item.consequential, item.name)):
-            spent += estimate_tokens(tool.name + tool.summary + str(tool.input_schema))
+            spent += tool_tokens(tool)
             if spent > self.budget_tokens // TOOLS_SHARE:
                 break
             offered.append(tool)
@@ -249,19 +260,18 @@ class Conversation:
     # The loop
 
     def _advance(self, turn: Turn, streaming: bool, pending: Sequence[ToolCall] = ()) -> Iterator[str | TurnResult]:
-        tools = self._tools(turn.user)
-        if pending:
-            paused = self._run_calls(turn, pending)
+        calls = pending
+        while True:
+            paused = self._run_calls(turn, calls)
             if paused is not None:
                 yield paused
                 return
-        while True:
             final_round = turn.rounds >= self.max_rounds
             if final_round:
                 turn.transcript.append({"kind": "note", "text": "That was the last tool you can use this turn. Answer now with what you have."})
             turn.rounds += 1
             request = ModelRequest(
-                role=ROLE, messages=turn.messages(self.budget_tokens), tools=() if final_round else tuple(tools), reach=turn.reach, max_tokens=self.reply_tokens
+                role=ROLE, messages=turn.messages(self.budget_tokens), tools=() if final_round else turn.offered, reach=turn.reach, max_tokens=self.reply_tokens
             )
             partial: list[str] = []
             try:
@@ -273,10 +283,7 @@ class Conversation:
             if not reply.tool_calls or final_round:
                 yield self._finish(turn, "done", "")
                 return
-            paused = self._run_calls(turn, reply.tool_calls)
-            if paused is not None:
-                yield paused
-                return
+            calls = reply.tool_calls
 
     def _ask(self, request: ModelRequest, streaming: bool, partial: list[str]) -> Iterator[str]:
         router = self.assistant.router
@@ -452,12 +459,7 @@ class Conversation:
         except ContextTooSmall as error:
             return self._finish(turn, "failed", str(error))
         calls = [ToolCall(item["capability"], item["arguments"], item["call_id"]) for item in state["calls"]]
-        result = None
-        for item in self._advance(turn, False, calls):
-            if isinstance(item, TurnResult):
-                result = item
-        assert result is not None
-        return result
+        return final_result(self._advance(turn, False, calls))
 
     # Small or full
 
@@ -651,8 +653,7 @@ def run_resume(assistant: Any, args: argparse.Namespace) -> int:
 
 def run_chat(assistant: Any, args: argparse.Namespace) -> int:
     conversation_id = args.conversation or uuid.uuid4().hex
-    name = assistant.identity.name
-    emit(f"Talking with {name}. /new starts over, /quit leaves.")
+    emit(f"Talking with {assistant.identity.name}. /new starts over, /quit leaves.")
     while True:
         try:
             line = input("> ").strip()

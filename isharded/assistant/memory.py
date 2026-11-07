@@ -11,6 +11,7 @@ missing clause shows up as a bug in one place and not as a leak somewhere else.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -26,6 +27,13 @@ RECENCY_HALF_LIFE_DAYS = 30.0
 SECONDS_PER_DAY = 86_400.0
 # bm25 cannot see trust or age, so ask it for more than will be returned.
 SEARCH_POOL = 4
+# A memory and everything it replaced. Takes the id, then the user twice.
+CHAIN = (
+    "WITH RECURSIVE chain (id) AS ("
+    "SELECT id FROM memories WHERE id = ? AND user = ? "
+    "UNION SELECT m.id FROM memories m JOIN chain c ON m.superseded_by = c.id WHERE m.user = ?"
+    ") "
+)
 
 SCHEMA = [
     """
@@ -122,6 +130,9 @@ class MemoryStore:
         self.store = assistant.store
         self.store.migrate("memory", SCHEMA)
 
+    def _dicts(self, sql: str, parameters: Sequence[Any]) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.store.query(sql, parameters)]
+
     # What was said
 
     def record_message(
@@ -151,26 +162,22 @@ class MemoryStore:
 
     def recent(self, user: str, conversation_id: str, limit: int = 40) -> list[dict[str, Any]]:
         """The latest messages of one conversation, oldest first."""
-        rows = self.store.query(
-            "SELECT * FROM messages WHERE user = ? AND conversation_id = ? ORDER BY id DESC LIMIT ?", (user, conversation_id, limit)
-        )
-        return [dict(row) for row in reversed(rows)]
+        rows = self._dicts("SELECT * FROM messages WHERE user = ? AND conversation_id = ? ORDER BY id DESC LIMIT ?", (user, conversation_id, limit))
+        return rows[::-1]
 
     def turn_messages(self, user: str, turn_id: str) -> list[dict[str, Any]]:
-        rows = self.store.query("SELECT * FROM messages WHERE user = ? AND turn_id = ? ORDER BY id", (user, turn_id))
-        return [dict(row) for row in rows]
+        return self._dicts("SELECT * FROM messages WHERE user = ? AND turn_id = ? ORDER BY id", (user, turn_id))
 
     def message(self, user: str, message_id: int) -> dict[str, Any] | None:
         row = self.store.one("SELECT * FROM messages WHERE user = ? AND id = ?", (user, message_id))
         return dict(row) if row else None
 
     def conversations(self, user: str, limit: int = 50) -> list[dict[str, Any]]:
-        rows = self.store.query(
+        return self._dicts(
             "SELECT conversation_id, count(*) AS messages, max(created_at) AS last_at FROM messages "
             "WHERE user = ? GROUP BY conversation_id ORDER BY last_at DESC LIMIT ?",
             (user, limit),
         )
-        return [dict(row) for row in rows]
 
     def search_messages(self, user: str, query: str, limit: int = 8, conversation_id: str | None = None) -> list[dict[str, Any]]:
         terms = search_terms(query)
@@ -180,12 +187,11 @@ class MemoryStore:
         if conversation_id:
             clause = "AND m.conversation_id = ?"
             parameters.append(conversation_id)
-        rows = self.store.query(
+        return self._dicts(
             "SELECT m.* FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid "
             f"WHERE messages_fts MATCH ? AND m.user = ? {clause} ORDER BY bm25(messages_fts) LIMIT ?",
             [*parameters, limit],
         )
-        return [dict(row) for row in rows]
 
     def forget_conversation(self, user: str, conversation_id: str) -> int:
         self._secure()
@@ -286,16 +292,7 @@ class MemoryStore:
         self._secure()
         with self.store.transaction():
             row = self._row(user, memory_id)
-            ids = [
-                item["id"]
-                for item in self.store.query(
-                    "WITH RECURSIVE chain (id) AS ("
-                    "SELECT id FROM memories WHERE id = ? AND user = ? "
-                    "UNION SELECT m.id FROM memories m JOIN chain c ON m.superseded_by = c.id WHERE m.user = ?"
-                    ") SELECT id FROM chain",
-                    (row["id"], user, user),
-                )
-            ]
+            ids = [item["id"] for item in self.store.query(f"{CHAIN}SELECT id FROM chain", (row["id"], user, user))]
             marks = ",".join("?" * len(ids))
             self.store.execute(f"DELETE FROM memories WHERE user = ? AND id IN ({marks})", [user, *ids])
             self.assistant.audit.record(actor(user), "memory.forget", f"memory:{row['id']}", {"rows": len(ids)})
@@ -329,20 +326,15 @@ class MemoryStore:
     def history(self, user: str, memory_id: str | int) -> list[dict[str, Any]]:
         """A memory and what it replaced, newest first."""
         row = self._row(user, memory_id)
-        rows = self.store.query(
-            "WITH RECURSIVE chain (id) AS ("
-            "SELECT id FROM memories WHERE id = ? AND user = ? "
-            "UNION SELECT m.id FROM memories m JOIN chain c ON m.superseded_by = c.id WHERE m.user = ?"
-            ") SELECT memories.* FROM memories JOIN chain ON chain.id = memories.id WHERE memories.user = ? ORDER BY memories.id DESC",
+        return self._dicts(
+            f"{CHAIN}SELECT memories.* FROM memories JOIN chain ON chain.id = memories.id WHERE memories.user = ? ORDER BY memories.id DESC",
             (row["id"], user, user, user),
         )
-        return [dict(item) for item in rows]
 
     def entries(self, user: str, limit: int = 100, offset: int = 0, include_superseded: bool = False) -> list[dict[str, Any]]:
         current = "" if include_superseded else "AND superseded_by IS NULL AND (expires_at IS NULL OR expires_at > ?)"
         parameters: list[Any] = [user] if include_superseded else [user, self.assistant.clock()]
-        rows = self.store.query(f"SELECT * FROM memories WHERE user = ? {current} ORDER BY id DESC LIMIT ? OFFSET ?", [*parameters, limit, offset])
-        return [dict(row) for row in rows]
+        return self._dicts(f"SELECT * FROM memories WHERE user = ? {current} ORDER BY id DESC LIMIT ? OFFSET ?", [*parameters, limit, offset])
 
     def search(self, user: str, query: str, limit: int = 8, kinds: tuple[str, ...] | None = None) -> list[ContextItem]:
         """The best current memories, by relevance, trust, and how recent they are."""
@@ -365,13 +357,11 @@ class MemoryStore:
 
     def export(self, user: str) -> dict[str, Any]:
         """Everything held for one person, in a form they can take away."""
-        memories = self.store.query("SELECT * FROM memories WHERE user = ? ORDER BY id", (user,))
-        messages = self.store.query("SELECT * FROM messages WHERE user = ? ORDER BY id", (user,))
         return {
             "user": user,
             "exported_at": self.assistant.clock(),
-            "memories": [dict(row) for row in memories],
-            "messages": [dict(row) for row in messages],
+            "memories": self._dicts("SELECT * FROM memories WHERE user = ? ORDER BY id", (user,)),
+            "messages": self._dicts("SELECT * FROM messages WHERE user = ? ORDER BY id", (user,)),
         }
 
 
