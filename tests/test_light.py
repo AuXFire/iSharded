@@ -135,6 +135,13 @@ def test_pytorch_code_with_no_pytorch_says_how_to_add_it():
     assert "--full" in str(refused.value)
 
 
+def test_a_lazy_module_is_the_module_once_it_has_loaded():
+    lazy = optional.LazyModule("json")
+    assert lazy.dumps([1]) == "[1]" and "dumps" in vars(lazy)
+    with pytest.raises(AttributeError):
+        lazy.no_such_name
+
+
 def test_has_torch_follows_what_can_be_imported(no_torch):
     assert not optional.has_torch() and not optional.torch_loaded()
 

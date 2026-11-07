@@ -8,7 +8,6 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import sys
-from types import ModuleType
 from typing import Any
 
 NO_TORCH = (
@@ -35,15 +34,15 @@ class LazyModule:
 
     def __init__(self, name: str) -> None:
         self._name = name
-        self._module: ModuleType | None = None
 
     def __getattr__(self, attribute: str) -> Any:
-        if self._module is None:
-            try:
-                self._module = importlib.import_module(self._name)
-            except ImportError as exc:
-                raise TorchMissing(NO_TORCH) from exc
-        return getattr(self._module, attribute)
+        try:
+            module = importlib.import_module(self._name)
+        except ImportError as exc:
+            raise TorchMissing(NO_TORCH) from exc
+        # A layer looks names up many times per token, so later lookups skip this method.
+        vars(self).update(vars(module))
+        return getattr(module, attribute)
 
 
 torch = LazyModule("torch")

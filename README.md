@@ -51,7 +51,7 @@ The [full list](docs/GUIDE.md#what-it-does) is in the guide.
 
 ## Install
 
-One step, with nothing to install first and no administrator. It sets up Python, picks a PyTorch build for your hardware, adds the native engine from the latest release, and starts a node. It offers to join a mesh it finds on your network, and ends with the chat page open.
+One step, with nothing to install first and no administrator. It sets up Python, adds the native engine from the latest release, and starts a node. It leaves out PyTorch, since GGUF models never use it. Add `--full` to run safetensors models too. It offers to join a mesh it finds on your network, and ends with the chat page open.
 
 On Windows, in PowerShell:
 

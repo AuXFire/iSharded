@@ -80,7 +80,7 @@ Or use a [one-click package](#one-click-packages). The end is the same: the node
 ### What the installers do
 
 1. Fetch [uv](https://github.com/astral-sh/uv) at a pinned version, and check it against a pinned SHA-256. uv then provides Python 3.12 and the environment, beside the install.
-2. Pick a PyTorch build. They pick a CUDA build where they find an NVIDIA GPU. They pick a CPU build on Windows without one, and on Linux with no GPU tools at all. Anywhere else they take PyTorch's default build, which on Linux is not a ROCm one. A GPU PyTorch cannot see, such as an AMD card on Windows, still works for GGUF models: the node finds it through llama.cpp's Vulkan build. See [Any GPU](#any-gpu).
+2. With `--full`, pick a PyTorch build. They pick a CUDA build where they find an NVIDIA GPU. They pick a CPU build on Windows without one, and on Linux with no GPU tools at all. Anywhere else they take PyTorch's default build, which on Linux is not a ROCm one. Without `--full` they leave PyTorch out, which is what most nodes want. See [Light and full installs](#light-and-full-installs).
 3. Pick this platform's wheel from the latest GitHub Release, which has the [native engine](#the-native-engine) in it, and check it against the release's `SHA256SUMS`. A file that fails the check stops the install. There are wheels for Linux on x86_64 and aarch64 with glibc 2.28 or newer, Windows on x86_64, and macOS on Apple Silicon. Other machines get the pure wheel, which has no engine.
 4. Add `isharded` to your PATH. On Linux and macOS that means a link in `~/.local/bin`, and a line in your shell's profile if that folder is not on your PATH yet.
 5. On Linux, check for the one system library GGUF models need, and say how to add it if it is missing.
@@ -104,6 +104,7 @@ curl -fsSL https://raw.githubusercontent.com/AuXFire/iSharded/main/install.sh | 
 |---|---|
 | `--no-start` | Install the files, and start nothing |
 | `--service` | Also start this node at login, through `isharded service install` |
+| `--full` | Also add PyTorch, so this node can run safetensors models. See [Light and full installs](#light-and-full-installs) |
 
 | Setting | What it does |
 |---|---|
@@ -116,9 +117,27 @@ On a closed network, set `ISHARDED_RELEASE_URL` and `ISHARDED_UV_URL`, and uv's 
 
 Antivirus that inspects HTTPS breaks tools that bring their own certificates. The installers set uv's `UV_SYSTEM_CERTS=1`, so uv trusts what this machine trusts. With `pip`, add `--use-feature=truststore` for the same effect.
 
+### Light and full installs
+
+The light install is the default. It runs GGUF models, a coordinator, the pages, and the assistant, with no PyTorch. Only safetensors models need PyTorch, so only a node that runs them needs `--full`, or `pip install "isharded[torch]"` by hand.
+
+| Install | Size on disk | Packages |
+|---|---|---|
+| Light | 104 MiB | 40 |
+| `--full`, with PyTorch's CPU build | 641 MiB | 45 |
+| `--full`, with PyTorch's CUDA 12.4 build | 4,610 MiB | 45 |
+
+Those are fresh environments on Windows with Python 3.12, before any llama.cpp build or model. uv's Python sits beside them, at 67 MiB.
+
+A light node finds its GPU without PyTorch. It asks `nvidia-smi` for NVIDIA cards and uses llama.cpp's CUDA build, takes an Apple Silicon Mac's Metal GPU as it is, and asks llama.cpp's Vulkan build for anything else. An AMD card on Linux goes through Vulkan, because only a PyTorch ROCm install points a node at the ROCm build. It cannot time a GPU's memory, so it assumes 300 GB/s for placing layers, as Vulkan does, and it times RAM with numpy.
+
+A light node tells the pool it has no PyTorch, which shows as `pytorch: false` under its `hardware` in `/admin/status`. The planner keeps safetensors models off it, and says so if that leaves too little room. Asked directly, the node refuses with how to add PyTorch, before it downloads anything. Rows cross the network in the same bytes whichever install sent them, so light and full nodes mix freely on GGUF models.
+
+Upgrading a full install with the plain command keeps its PyTorch. To go light, remove the install's folder first.
+
 ### One-click packages
 
-Each [release](https://github.com/AuXFire/iSharded/releases) has these, and each carries that release's wheel. They run the install above, so they also need the internet, for uv, Python, and PyTorch.
+Each [release](https://github.com/AuXFire/iSharded/releases) has these, and each carries that release's wheel. They run the install above, the light form, so they also need the internet, for uv and Python.
 
 | Platform | File | What you get |
 |---|---|---|
@@ -148,7 +167,7 @@ The mesh's folder stays, in `%LOCALAPPDATA%\iSharded\up` or `~/.isharded/up`. It
 
 ### By hand
 
-You need PyTorch built for your hardware. Install PyTorch first, because the default package may not match your GPU. See [pytorch.org](https://pytorch.org/get-started/locally/) for CUDA, ROCm, and CPU builds.
+A GGUF node needs nothing first. To run safetensors models you need PyTorch built for your hardware. Install it first, because the default package may not match your GPU. See [pytorch.org](https://pytorch.org/get-started/locally/) for CUDA, ROCm, and CPU builds, then use `.[torch]` below.
 
 ```bash
 git clone https://github.com/AuXFire/iSharded.git
@@ -162,7 +181,7 @@ cd iSharded
 python -m pip install -e .
 ```
 
-The `test` extra adds what the test suite needs.
+The `test` extra adds what the test suite needs, and the `torch` extra adds PyTorch.
 
 This installs `isharded`, `isharded-node`, `isharded-orchestrator`, and `isharded-worker`. From a checkout with the dependencies in place, `python -m isharded` works the same way without installing.
 
@@ -554,7 +573,7 @@ isharded load Qwen3-0.6B-Q8_0.gguf --lane small --url http://node-a:8209
 
 Each node then starts a control plane and a worker for that lane, on ports 1000 above its own for the first lane, 2000 for the second, and so on. A pool runs up to 7 lanes, and a lane's name is up to 32 lowercase letters, digits, and hyphens. Open those ports wherever a firewall sits between nodes. The lane gets only what each node has spare under the limits its owner set, and `--lane-gpu-gb` and `--lane-ram-gb` lower that. A node started with `--no-lanes` hosts only the main model.
 
-A lane costs memory before any weights load. Its control plane and worker each import PyTorch, at about 0.41 GB resident and 1.13 GB committed each, measured at import. A node running the main model and 2 lanes therefore holds 6 such processes.
+A lane costs memory before any weights load. Its control plane holds about 82 MiB resident, measured at import, and never loads PyTorch. Its worker holds about 69 MiB on a [light install](#light-and-full-installs). On a full install the worker loads PyTorch as it starts, which takes it to about 0.41 GB resident and 1.13 GB committed. A node running the main model and 2 lanes therefore holds 3 control planes and 3 workers.
 
 `GET /v1/models` lists every running model on every node, and a request goes to the model it names. The chat page shows a picker once two models run. A request that names no model goes to the main one. Keys stay with each node's main control plane, which checks the key and the rate limit before passing a request on.
 
@@ -1794,9 +1813,9 @@ Differences between backends can change sampling when logits are nearly tied. Bi
 
 ### Any GPU
 
-A node uses PyTorch to find GPUs. If PyTorch sees none, the node asks llama.cpp's Vulkan build instead, in a process of its own, so a GPU with a working Vulkan driver takes part whatever its maker. `--gpu-device vulkan` chooses this on purpose. It downloads a pinned build the first time, as other builds do.
+A node uses PyTorch to find GPUs, where it has PyTorch. If PyTorch sees none, the node asks llama.cpp's Vulkan build instead, in a process of its own, so a GPU with a working Vulkan driver takes part whatever its maker. `--gpu-device vulkan` chooses this on purpose. It downloads a pinned build the first time, as other builds do.
 
-Vulkan runs GGUF models only, because safetensors models run on PyTorch. The planner keeps those off such a node. It also cannot time the GPU's memory, so it assumes 300 GB/s when placing layers.
+Vulkan runs GGUF models only, because safetensors models run on PyTorch. The planner keeps those off such a node, as it does a node with no PyTorch. It also cannot time the GPU's memory, so it assumes 300 GB/s when placing layers.
 
 Measured one reply at a time. Each pair gave the same text:
 
@@ -2024,12 +2043,14 @@ Planner estimates leave out the draft and are rough. The figures above were meas
 ## Development
 
 ```bash
-python -m pip install -e ".[test]"
+python -m pip install -e ".[test,torch]"
 ```
 
 ```bash
 python -m pytest tests -q
 ```
+
+Without the `torch` extra, the tests that need PyTorch skip themselves. One CI job runs that way, because it is what most nodes install.
 
 The last full run on Windows passed 3,474 tests and skipped 21, with real models for text, embeddings, and vision. From a clean clone on Linux, with the current FastAPI, 3,451 passed and 40 skipped.
 
@@ -2071,6 +2092,7 @@ Adapter tests compare every family with the reference `transformers` implementat
 | `isharded/vision.py`, `isharded/mtmd.py` | Images in chat, and the binding to llama.cpp's `mtmd` library |
 | `isharded/commons.py` | A network nobody owns: self-made identities, vouches, and each node's view |
 | `isharded/inventory.py`, `isharded/gpu_probe.py` | What a node reports about itself, and how it finds GPUs PyTorch cannot see |
+| `isharded/optional.py` | PyTorch as an extra: loads it on first use, and says how to add it where it is missing |
 | `isharded/audit.py` | Comparing routes that serve the same model |
 | `isharded/mesh.py` | Membership and leader election, as pure logic |
 | `isharded/planner.py`, `isharded/memory.py` | Placement, and memory pool discovery |
