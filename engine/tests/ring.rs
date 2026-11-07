@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use isharded_engine::link::{self, Frames, Link};
 use isharded_engine::watchdog::{Limits, Watchdog};
 use isharded_engine::node::{Address, Compute, Failure, Links, Node, Output, Plan};
-use isharded_engine::wire::{Answer, Kind, Nack, Pass, Refusal, Role, Sampling, FLAG_TOKENS};
+use isharded_engine::wire::{self, Answer, Kind, Nack, Pass, Refusal, Role, Sampling, FLAG_TOKENS};
 
 const KEY: &[u8] = b"a route key for testing";
 const WIDTH: u32 = 4;
@@ -240,7 +240,12 @@ fn build_ring(count: u16, closing: bool, delay: Duration, (ack_timeout_ms, silen
         node.connect(Links { next, entry, timeout_ms: 3000 }).unwrap();
     }
     let client = link::dial(&format!("127.0.0.1:{}", doors[0].local_port), None, &doors[0].local_key, Role::Local, 0, Duration::from_secs(3)).unwrap();
-    let frames = client.reader(1 << 20);
+    let mut frames = client.reader(1 << 20);
+    // The entry takes this link as its worker's only after the handshake, on its own thread.
+    // A test that fails a stage at once would lose the refusal to that moment, so wait for it:
+    // the answer to a beat comes from that same thread.
+    client.beat(&wire::beat(Kind::Ping, 1)).unwrap();
+    assert_eq!(frames.next().unwrap().0, Kind::Pong);
     Ring { nodes, seen, client, frames, relay, doors }
 }
 
@@ -935,4 +940,71 @@ fn a_route_cannot_be_joined_with_the_wrong_key_or_epoch() {
     assert!(link::dial(&address, Some(&door.fingerprint), b"wrong", Role::Hop, 7, Duration::from_secs(3)).is_err());
     assert!(link::dial(&address, Some(&door.fingerprint), KEY, Role::Hop, 8, Duration::from_secs(3)).is_err());
     assert!(link::dial(&address, Some(&door.fingerprint), KEY, Role::Hop, 7, Duration::from_secs(3)).is_ok());
+}
+
+/// What a next stage that only listens heard from a ring's first stage.
+struct Heard {
+    padding: usize,
+    padding_after_the_pass: usize,
+    pings_in_a_second_and_a_half: usize,
+}
+
+/// Stands in for a next stage: takes the link a ring dials, reads it without answering, and
+/// counts what came. It stops a second and a half after the first pass.
+fn listen_as_next_stage() -> (Address, thread::JoinHandle<Heard>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let identity = link::Identity::generate().unwrap();
+    let address = Address { address: listener.local_addr().unwrap().to_string(), fingerprint: identity.fingerprint.clone() };
+    let reading = thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        let key_for = |role, epoch| (role == Role::Hop && epoch == 7).then(|| KEY.to_vec());
+        let (_link, mut frames, _) = link::accept(socket, Some(&identity), key_for).unwrap();
+        let mut heard = Heard { padding: 0, padding_after_the_pass: 0, pings_in_a_second_and_a_half: 0 };
+        let mut passed: Option<Instant> = None;
+        while passed.is_none_or(|at| at.elapsed() < Duration::from_millis(1500)) {
+            let (kind, body) = frames.next().unwrap();
+            match (kind, passed) {
+                (Kind::Pad, None) => heard.padding += body.len(),
+                (Kind::Pad, Some(_)) => heard.padding_after_the_pass += body.len(),
+                (Kind::Pass, None) => passed = Some(Instant::now()),
+                (Kind::Ping, Some(_)) => heard.pings_in_a_second_and_a_half += 1,
+                _ => {}
+            }
+        }
+        heard
+    });
+    (address, reading)
+}
+
+#[test]
+fn a_ring_pads_the_link_it_dials_before_any_pass_and_beats_ten_times_a_second() {
+    let node = Node::new().unwrap();
+    let door = listening(&node);
+    node.set_compute(Box::new(Adder { stage: 1, last: false, delay: Duration::ZERO, seen: Arc::default() }));
+    node.open(Plan { epoch: 7, index: 0, count: 2, key: KEY.to_vec(), ack_timeout_ms: 5000, silence_timeout_ms: 5000 });
+    let (next, reading) = listen_as_next_stage();
+    node.connect(Links { next: Some(next), entry: None, timeout_ms: 3000 }).unwrap();
+    let client = link::dial(&format!("127.0.0.1:{}", door.local_port), None, &door.local_key, Role::Local, 0, Duration::from_secs(3)).unwrap();
+    client.send(&pass(1, 5, 9).encode()).unwrap();
+    let heard = reading.join().unwrap();
+    assert_eq!(heard.padding, 1 << 20);
+    assert_eq!(heard.padding_after_the_pass, 0);
+    // Once a second before, so even a slow machine stays far from that.
+    assert!((7..=16).contains(&heard.pings_in_a_second_and_a_half), "{} pings", heard.pings_in_a_second_and_a_half);
+    node.stop();
+}
+
+#[test]
+fn padding_is_dropped_by_whoever_gets_it_and_what_follows_still_arrives() {
+    let mut ring = ring(3, true, Duration::ZERO, 2000);
+    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+    let first = answer(&mut ring);
+    // Every link of this ring was padded as it opened, and none of them was lost for it.
+    assert!(ring.nodes.iter().all(|node| node.stats().resent == 0 && node.stats().refusals == 0));
+    assert!(ring.nodes[2].stats().closing_up);
+    let voice = closing_voice(&ring);
+    voice.send(&wire::pad(1000)).unwrap();
+    voice.send(&Answer { id: 2, ..first }.encode()).unwrap();
+    assert_eq!(answer(&mut ring).id, 2);
+    voice.close();
 }

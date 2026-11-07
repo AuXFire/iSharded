@@ -29,7 +29,7 @@ import numpy as np
 
 ABI_VERSION = 2
 MAGIC = 0x5369
-WIRE_VERSION = 2
+WIRE_VERSION = 3
 HEADER = struct.Struct("<HBBI")
 RESULT_HEAD = struct.Struct("<QQQII")
 NACK_HEAD = struct.Struct("<QQQBHI")

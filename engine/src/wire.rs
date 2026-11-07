@@ -7,8 +7,9 @@
 use std::fmt;
 
 pub const MAGIC: u16 = 0x5369;
-/// Two added a generation to passes, answers and refusals. Nodes that differ refuse each other.
-pub const VERSION: u8 = 2;
+/// Two added a generation to passes, answers and refusals. Three added padding, which an
+/// older node would take for a broken link. Nodes that differ refuse each other.
+pub const VERSION: u8 = 3;
 pub const HEADER_BYTES: usize = 8;
 /// The most a body may hold. Enough for a 512 row pass at a width of 32,768 in FP32.
 pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -35,6 +36,8 @@ pub enum Kind {
     Nack = 7,
     Ping = 8,
     Pong = 9,
+    /// Bytes that only open a link's window. The receiver drops them unread.
+    Pad = 10,
 }
 
 impl Kind {
@@ -49,6 +52,7 @@ impl Kind {
             7 => Kind::Nack,
             8 => Kind::Ping,
             9 => Kind::Pong,
+            10 => Kind::Pad,
             _ => return None,
         })
     }
@@ -434,6 +438,13 @@ pub fn read_beat(body: &[u8]) -> Result<u64, WireError> {
     Ok(stamp)
 }
 
+/// A frame of `size` zero bytes that carries nothing.
+pub fn pad(size: usize) -> Vec<u8> {
+    let mut frame = start_frame(Kind::Pad, size);
+    frame.resize(HEADER_BYTES + size, 0);
+    finish_frame(frame)
+}
+
 /// What a link is for, said once when it opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -619,6 +630,16 @@ mod tests {
         assert_eq!(Ack::decode(body(&Ack { id: 8 }.encode())).unwrap().id, 8);
         let hello = Hello { role: Role::Closing, epoch: 9, nonce: [3; NONCE_BYTES] };
         assert_eq!(Hello::decode(body(&hello.encode())).unwrap(), hello);
+    }
+
+    #[test]
+    fn padding_is_a_frame_of_its_own_kind_and_size() {
+        let frame = pad(1000);
+        let mut header = [0; HEADER_BYTES];
+        header.copy_from_slice(&frame[..HEADER_BYTES]);
+        assert_eq!(parse_header(&header), Ok((Kind::Pad, 1000)));
+        assert_eq!(frame.len(), HEADER_BYTES + 1000);
+        assert_eq!(parse_header(&pad(0)[..HEADER_BYTES].try_into().unwrap()), Ok((Kind::Pad, 0)));
     }
 
     #[test]

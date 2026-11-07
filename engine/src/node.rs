@@ -31,7 +31,14 @@ use crate::wire::{self, Ack, Answer, Hello, Kind, Nack, Pass, Refusal, Role, FLA
 
 /// How many connections may be mid-handshake at once, so strangers cannot pile up threads.
 const MAX_STRANGERS: usize = 16;
-const PING_EVERY: Duration = Duration::from_millis(1000);
+/// Linux starts a connection over from a small window when it has sent nothing for one
+/// retransmission timeout, which is never under 200 ms. Beats this often keep both ways of a
+/// link from ever sitting that long, so a row after a pause is not held back a round trip.
+const PING_EVERY: Duration = Duration::from_millis(100);
+/// Padding a ring sends on each link it dials, before any pass, so the first long prompt finds
+/// the window already open. A fresh connection starts at about 14 KB.
+const WARM_BYTES: usize = 1 << 20;
+const WARM_PIECE: usize = 64 << 10;
 const WATCH_EVERY: Duration = Duration::from_millis(50);
 const ACCEPT_EVERY: Duration = Duration::from_millis(20);
 const DIAL_ATTEMPT: Duration = Duration::from_secs(5);
@@ -514,18 +521,34 @@ fn connect(inner: &Arc<Inner>, links: &Links) -> Result<bool, String> {
         if peer.lost.load(Ordering::Acquire) {
             return Err("the link to the next stage could not start".to_string());
         }
+        warm(&peer.link);
         *ring.next_door.lock() = Some(next.clone());
     }
     let mut closing = false;
     if let Some(entry) = &links.entry {
         if let Ok(link) = dial_with_retry(entry, &ring, Role::Closing, Duration::from_millis(links.timeout_ms)) {
-            closing = start_closing(inner, &ring, link);
+            closing = start_closing(inner, &ring, link.clone());
+            if closing {
+                warm(&link);
+            }
         }
         let (inner, ring, entry) = (inner.clone(), ring.clone(), entry.clone());
         // With no thread for this, answers still walk back. Only speed is lost.
         let _ = spawn("isharded-closing", move || keep_closing(&inner, &ring, &entry));
     }
     Ok(closing)
+}
+
+/// Queues padding ahead of the first pass. The queue holds far more than this, so nothing
+/// waits, and a link that fails here is found by its watcher like any other. A link dialled
+/// again later carries passes it kept at once, so it is not padded.
+fn warm(link: &Link) {
+    let piece = wire::pad(WARM_PIECE);
+    for _ in 0..WARM_BYTES / WARM_PIECE {
+        if link.send(&piece).is_err() {
+            return;
+        }
+    }
 }
 
 fn start_closing(inner: &Arc<Inner>, ring: &Arc<Ring>, link: Arc<Link>) -> bool {
@@ -697,6 +720,7 @@ fn serve_passes(inner: &Inner, link: &Link, mut frames: Frames, acknowledge: boo
                 pass_on_acknowledgement(inner, ack);
             }
             Kind::Ping if answer_ping(link, body) => {}
+            Kind::Pad => {}
             _ => return,
         }
     }
@@ -749,6 +773,7 @@ fn serve_answers(inner: &Inner, link: &Link, mut frames: Frames) {
         match kind {
             Kind::Result => receive_answer(inner, link, frames.whole()),
             Kind::Ping if answer_ping(link, body) => {}
+            Kind::Pad => {}
             _ => return,
         }
     }
@@ -855,6 +880,7 @@ fn read_peer(inner: &Inner, ring: &Ring, peer: &Peer) {
             Kind::Result if ring.is_entry() => receive_answer(inner, &peer.link, frames.whole()),
             // Coming back along the route, towards the entry.
             Kind::Result | Kind::Nack => send_back(inner, ring, frames.whole()),
+            Kind::Pad => {}
             _ => return,
         }
     }
@@ -878,8 +904,12 @@ fn watch_peer(inner: &Arc<Inner>, ring: &Arc<Ring>, peer: &Arc<Peer>) {
         if pinged.elapsed() >= ping_every {
             pinged = Instant::now();
             let stamp = peer.born.elapsed().as_micros() as u64;
-            // No room means the writer is stuck, and the deadlines here will say so.
-            let _ = peer.link.beat(&wire::beat(Kind::Ping, stamp));
+            // No room means the writer is stuck, and the deadlines here will say so. A write
+            // that failed is told once, to whoever asks first, so a beat that hears it must act.
+            if let Err(LinkError::Io(_)) = peer.link.beat(&wire::beat(Kind::Ping, stamp)) {
+                peer_lost(inner, ring, peer, "a write did not finish in time", true);
+                return;
+            }
         }
     }
     // A write that ran out of time closes the link from the writer's thread. On Windows that
