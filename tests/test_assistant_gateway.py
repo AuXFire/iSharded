@@ -847,6 +847,7 @@ def test_each_load_of_the_page_has_its_own_nonce(live):
 
 def test_the_page_is_one_file_that_loads_nothing_from_elsewhere():
     source = gateway.HTML_FILE.read_text(encoding="utf-8").replace("http://www.w3.org/2000/svg", "")  # a name, which nothing fetches
+    source = re.sub(r"placeholder: '[^']*'", "", source)  # an example in an empty field, which nothing fetches either
     assert not re.search(r"https?://", source)
     assert not re.search(r"<(script|link|img|iframe)[^>]*\s(src|href)=\"(?!data:)", source)
     assert "@import" not in source and "url(" not in source
