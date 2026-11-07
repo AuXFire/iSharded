@@ -470,11 +470,11 @@ An earlier mesh of seven machines on the Python path, in four countries and two 
 
 ### Chat page and dashboard
 
-Every node serves a chat page at `/chat` and a console at `/dashboard`. The dashboard at the top of this page is from a real pool of three local CPU workers. The chat page below is from the [seven-machine mesh](#measured-across-data-centers), and its speed estimates are the planner's, from before it used measured links, so go by the measured figures in that section.
+Every node serves a chat page at `/chat` and a console at `/dashboard`. The dashboard at the top of this page is from a real pool of three local CPU workers. The chat page below is from the same kind of pool, with one worker's process killed during the reply, so the reply shows where it paused and the top bar shows that the pool needs you.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="screenshots/chat-dark.png">
-  <img alt="The chat page: a reply with its speed, and the stages it ran on." src="screenshots/chat-light.png">
+  <img alt="The chat page: conversations on the left, a reply with a dotted line where the pool repaired its route, and on the right the stages the model runs on." src="screenshots/chat-light.png">
 </picture>
 
 The dashboard is built to stay readable at 200 workers. What needs you is grouped by cause, machines become a field of marks with trouble first, and only the stages that matter are named. No pool this size has run yet, so this view uses simulated data, and the page says so at the top:
@@ -488,10 +488,14 @@ Every node serves both, so any node's address works.
 
 | Page | What it shows |
 |---|---|
-| `/chat` | A chat window. It asks for a key, shows where a model would run and how fast before anything downloads, and colors each layer by the memory holding it. |
+| `/chat` | A chat window. Conversations are listed on the left, and the stages the model runs on, with each stage's memory and time, on the right. It asks for a key, and shows where a model would run and how fast before anything downloads. |
 | `/dashboard` | The state of the pool as a sentence, then the route board: the model's layers along the top, one pass in time along the bottom, and a band for each stage, so the slowest thing is the widest. Below it are what needs you, machines, memory, activity, the stage table, readings, and facts. Select a stage or machine for detail, and use the arrow keys to walk the stages. |
 
-If the node serving your chat dies mid-reply, the page asks before sending your key and conversation to another member, then restarts the reply there.
+Conversations are kept in your browser, the latest 50, because the pool stores none. Signing out forgets them, and a browser that runs out of room keeps the words and drops the images.
+
+If a stage is lost during a reply and the pool repairs the route, the reply carries on, and a dotted line marks where it paused and for how long. The page learns this from the pool's count of repairs, so a repair for another reply at the same moment can show there too. If the node serving your chat dies mid-reply, the page asks before sending your key and conversation to another member, then starts the reply again there, marks that it did, and keeps what the first node wrote under a link. Any other failure stays in the turn with what had already arrived, and Try again sends it again.
+
+Reply settings has a Tools button. Paste function definitions as JSON and the model can ask for a call. Nothing runs on its own: the page shows the call, you type what it returned, and the model carries on from that.
 
 The dashboard shows a flag beside each worker whose country is known, with the name on hover and in the worker's details. The country comes from a table in the package, so no outside service sees a node's address. Only a public address can be looked up. A private, loopback, or Tailscale address shows nothing, and so does a host name, because resolving it would tell a DNS server. A node on Tailscale or a LAN therefore needs `--location` to show a flag.
 
