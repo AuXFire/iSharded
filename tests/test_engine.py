@@ -206,6 +206,34 @@ def test_a_stage_with_no_engine_leaves_every_reply_on_http() -> None:
     assert orchestrator.ring_epoch is None
 
 
+def test_a_stage_with_no_engine_is_named_once_for_each_route() -> None:
+    def handler(item):
+        return httpx.Response(200, json={"engine": item.url.host != "b", "address": "x:1", "fingerprint": "f"})
+
+    orchestrator = pool(handler)
+    run_ring(orchestrator)
+    orchestrator.ring_tried = None  # the retry a later check would make
+    run_ring(orchestrator)
+    said = [event for event in orchestrator.events if event["title"] == "Native path off"]
+    assert len(said) == 1 and "on b," in said[0]["detail"]
+    orchestrator.epoch = 5
+    run_ring(orchestrator)
+    assert sum(event["title"] == "Native path off" for event in orchestrator.events) == 2
+
+
+def test_a_node_without_the_engine_says_so_when_it_starts(monkeypatch) -> None:
+    monkeypatch.setenv("ISHARDED_ENGINE", "0")
+    assert any(event["title"] == "No native engine" for event in Orchestrator().events)
+
+
+def test_a_node_with_the_engine_has_nothing_to_say(tmp_path: Path, monkeypatch) -> None:
+    made = tmp_path / library_name()
+    made.write_bytes(b"x")
+    monkeypatch.setenv("ISHARDED_ENGINE_LIB", str(made))
+    monkeypatch.delenv("ISHARDED_ENGINE", raising=False)
+    assert not any(event["title"] == "No native engine" for event in Orchestrator().events)
+
+
 def test_a_failed_ring_is_reported_and_tried_again_later() -> None:
     def handler(item):
         return httpx.Response(502, json={"detail": "no route to host"})

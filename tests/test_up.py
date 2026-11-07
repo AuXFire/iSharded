@@ -3,9 +3,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
+import time
 
 import httpx
+import psutil
 import pytest
 
 pytest.importorskip("cryptography")
@@ -318,6 +323,187 @@ def test_autostart_files_run_up_for_this_user(system: str, suffix: str, tmp_path
 
 def test_doctor_gives_a_fix_for_everything_it_flags() -> None:
     assert all(advice for good, _, advice in up.checks() if not good)
+
+
+def test_a_launch_agent_restarts_a_crash_but_not_a_stop(tmp_path: Path) -> None:
+    _, body = up.service_definition("/opt/venv/bin/python", "Darwin", tmp_path)
+    assert "<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>" in body  # isharded stop exits cleanly
+
+
+def test_doctor_reports_the_engine_without_calling_it_a_failure(monkeypatch) -> None:
+    monkeypatch.setenv("ISHARDED_ENGINE", "0")
+    line = next(item for item in up.checks() if "native engine" in item[1].lower())
+    assert line[0] is True and "turned off" in line[1] and "build_engine.py" in line[2]
+
+
+def test_doctor_does_not_blame_a_port_on_this_machines_own_node(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ISHARDED_UP_HOME", str(tmp_path))
+    up.claim_node(tmp_path)
+    assert (True, "A node is running here", "") in up.checks()
+    assert not any("Port" in item[1] for item in up.checks())
+
+
+def test_an_engine_only_counts_if_it_loads(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("ISHARDED_ENGINE", raising=False)
+    monkeypatch.setattr(up, "find_library", lambda: None)
+    assert up.native_engine() == (False, "not installed")
+    bad = tmp_path / "engine"
+    bad.write_bytes(b"not a library")
+    monkeypatch.setattr(up, "find_library", lambda: bad)
+    good, why = up.native_engine()
+    assert not good and "will not load" in why
+
+
+def test_what_was_found_is_said_in_a_few_lines(monkeypatch) -> None:
+    monkeypatch.setenv("ISHARDED_ENGINE", "0")
+    found = settings() | {"address": "100.64.0.1", "tls": False, "cpu_threads": 4, "gguf_dirs": ["/models"]}
+    lines = "\n".join(up.describe_machine(found, "A GPU (8 GiB)"))
+    for text in ("100.64.0.1", "Tailscale", "A GPU (8 GiB)", "4 of", "/models", "slower path"):
+        assert text in lines
+    assert "TLS with this mesh's own certificate" in "\n".join(up.describe_machine(found | {"address": "192.168.1.5", "tls": True}, ""))
+
+
+def test_one_folder_runs_one_node(tmp_path: Path) -> None:
+    assert up.running_node(tmp_path) is None
+    assert up.claim_node(tmp_path)
+    assert up.running_node(tmp_path).pid == os.getpid()
+    assert not up.claim_node(tmp_path)
+
+
+@pytest.mark.parametrize("record", ["[1, 0]", "not json", "[]"])
+def test_a_stale_claim_does_not_block_a_new_node(tmp_path: Path, record: str) -> None:
+    (tmp_path / "up.pid").write_text(record, encoding="utf-8")
+    assert up.running_node(tmp_path) is None  # PID 1 lives on, but this is not the process that claimed
+    assert up.claim_node(tmp_path)
+
+
+def test_a_reused_pid_is_not_taken_for_the_node(tmp_path: Path) -> None:
+    (tmp_path / "up.pid").write_text(json.dumps([os.getpid(), psutil.Process().create_time() - 100]), encoding="utf-8")
+    assert up.running_node(tmp_path) is None
+
+
+def fake_node_args(*flags: str) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    up.add_arguments(parser.add_subparsers())
+    return parser.parse_args(["up", *flags])
+
+
+def test_up_points_at_a_node_that_is_already_running(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("ISHARDED_UP_HOME", str(tmp_path))
+    up.write_settings(tmp_path, settings() | {"address": "100.64.0.1", "tls": False})
+    up.claim_node(tmp_path)
+    monkeypatch.setattr(up, "run_node", lambda _: pytest.fail("a second node started"))
+    assert up.run_up(fake_node_args()) == 0
+    assert "already running" in capsys.readouterr().out
+    assert (tmp_path / "up.pid").is_file()  # the running node keeps its claim
+
+
+def test_up_gives_up_its_claim_when_the_node_ends(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ISHARDED_UP_HOME", str(tmp_path))
+    up.write_settings(tmp_path, settings() | {"address": "100.64.0.1", "tls": False})
+    monkeypatch.setattr(up, "keep_watch", lambda *_: None)
+    claimed = []
+    monkeypatch.setattr(up, "run_node", lambda _: claimed.append((tmp_path / "up.pid").is_file()) or 0)
+    assert up.run_up(fake_node_args()) == 0
+    assert claimed == [True] and not (tmp_path / "up.pid").exists()
+
+
+def background(tmp_path: Path, monkeypatch, healthy: bool = True) -> tuple[list, list]:
+    started: list = []
+    opened: list = []
+    monkeypatch.setattr(up.subprocess, "Popen", lambda command, **options: started.append((command, options)))
+    monkeypatch.setattr(up, "wait_until_healthy", lambda *_: healthy)
+    monkeypatch.setattr(up, "wait_until_settled", lambda *_: True)
+    monkeypatch.setattr(up.webbrowser, "open", opened.append)
+    return started, opened
+
+
+def test_background_starts_a_node_that_outlives_it_and_opens_the_page(tmp_path: Path, monkeypatch, capsys) -> None:
+    started, opened = background(tmp_path, monkeypatch)
+    (tmp_path / "admin.key").write_text("the-key", encoding="utf-8")
+    found = settings() | {"address": "100.64.0.1", "port": 8209, "tls": False}
+    assert up.start_in_background(tmp_path, found, fake_node_args("--background", "--model", "m")) == 0
+    command, options = started[0]
+    assert command[-4:] == ["up", "--no-browser", "--model", "m"] and "--background" not in command  # or it would start itself for ever
+    assert options["stdin"] == subprocess.DEVNULL and ("creationflags" in options or options["start_new_session"])
+    assert options["cwd"] == tmp_path  # not this folder, which may hold another copy of the package
+    assert str(Path(up.__file__).resolve().parents[1]) in options["env"]["PYTHONPATH"].split(os.pathsep)
+    assert opened == ["http://127.0.0.1:8209/chat#key=the-key"]
+    said = capsys.readouterr().out
+    assert "http://127.0.0.1:8209/chat" in said and "the-key" not in said and "isharded stop" in said and "Next:" in said
+
+
+def test_background_opens_the_page_of_a_running_node_and_starts_nothing(tmp_path: Path, monkeypatch) -> None:
+    started, opened = background(tmp_path, monkeypatch)
+    up.claim_node(tmp_path)
+    found = settings() | {"address": "100.64.0.1", "port": 8209, "tls": False}
+    assert up.start_in_background(tmp_path, found, fake_node_args("--background")) == 0
+    assert not started and opened == ["http://127.0.0.1:8209/chat"]  # an invited machine holds no key, and still opens
+
+
+def test_background_says_where_to_look_when_the_node_never_comes_up(tmp_path: Path, monkeypatch, capsys) -> None:
+    _, opened = background(tmp_path, monkeypatch, healthy=False)
+    found = settings() | {"address": "100.64.0.1", "port": 8209, "tls": False}
+    assert up.start_in_background(tmp_path, found, fake_node_args("--background")) == 1
+    assert "up.log" in capsys.readouterr().err and not opened
+
+
+def test_no_browser_opens_nothing(tmp_path: Path, monkeypatch) -> None:
+    _, opened = background(tmp_path, monkeypatch)
+    found = settings() | {"address": "100.64.0.1", "port": 8209, "tls": False}
+    assert up.start_in_background(tmp_path, found, fake_node_args("--background", "--no-browser")) == 0
+    assert not opened
+
+
+STOPPABLE = """
+import sys, threading, time
+from pathlib import Path
+from isharded import up
+home = Path(sys.argv[1])
+assert up.claim_node(home)
+threading.Thread(target=up.watch_for_stop, args=(home, threading.Event()), daemon=True).start()
+print("ready", flush=True)
+try:
+    while True:
+        time.sleep(0.1)
+except KeyboardInterrupt:
+    (home / "stopped").touch()  # run_node stops its services on exactly this
+"""
+
+
+def test_stop_reaches_a_real_node_process_as_a_ctrl_c(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("ISHARDED_UP_HOME", str(tmp_path))
+    process = subprocess.Popen([sys.executable, "-c", STOPPABLE, str(tmp_path)], stdout=subprocess.PIPE, text=True, cwd=Path(__file__).resolve().parents[1])
+    try:
+        assert process.stdout.readline().strip() == "ready"
+        assert up.run_stop(argparse.Namespace()) == 0
+        assert process.wait(timeout=10) == 0
+    finally:
+        process.kill()
+    assert (tmp_path / "stopped").is_file() and not (tmp_path / "stop.request").exists()
+    assert "Stopped." in capsys.readouterr().out
+
+
+def test_stop_kills_a_node_that_will_not_stop(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("ISHARDED_UP_HOME", str(tmp_path))
+    monkeypatch.setattr(up, "STOP_WAIT_SECONDS", 0.2)
+    code = "import json, os, sys, time, psutil; open(sys.argv[1], 'w').write(json.dumps([os.getpid(), psutil.Process().create_time()])); time.sleep(120)"
+    process = subprocess.Popen([sys.executable, "-c", code, str(tmp_path / "up.pid")])
+    try:
+        deadline = time.monotonic() + 30
+        while up.running_node(tmp_path) is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert up.run_stop(argparse.Namespace()) == 0
+        process.wait(timeout=10)
+    finally:
+        process.kill()
+    assert "killed" in capsys.readouterr().out
+
+
+def test_stop_with_nothing_running_says_so(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("ISHARDED_UP_HOME", str(tmp_path))
+    assert up.run_stop(argparse.Namespace()) == 0
+    assert "No node is running" in capsys.readouterr().out
 
 
 def test_a_person_approving_needs_no_invite_and_a_denial_is_signed(tmp_path: Path) -> None:

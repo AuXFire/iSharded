@@ -12,7 +12,10 @@ stays there. Nothing else in the mesh can admit anyone.
 """
 from __future__ import annotations
 
+import _thread
 import argparse
+from contextlib import suppress
+import ctypes
 import hashlib
 import hmac
 import json
@@ -36,6 +39,7 @@ import psutil
 from .access import create_key, digest, new_key
 from .commons import identity_name, make_identity, write_policy
 from .discovery import find_meshes
+from .engine import ABI_VERSION, find_library
 from .geo import country_code
 from .inventory import ram
 from .node import add_node_arguments, detect_address, run_node
@@ -52,6 +56,8 @@ APPROVAL_WAIT_SECONDS = 180.0
 PERSON_WAIT_SECONDS = 1800.0  # someone has to come and click
 HEALTH_WAIT_SECONDS = 180.0
 SETTLE_WAIT_SECONDS = 60.0  # a node answers about 9 s before it can take a load
+STOP_WAIT_SECONDS = 60.0  # each process gets 10 s, and a node can run several
+ENGINE_ADVICE = "Tokens take the slower Python path. Run the installer again for a release that has the engine, or build it with python scripts/build_engine.py"
 
 
 def up_home() -> Path:
@@ -432,6 +438,21 @@ def sign_in_machines(home: Path, client: httpx.Client, base: str, key: str) -> N
             print(f"Could not check for new machines: {exc}", flush=True)
 
 
+def say_ready(home: Path, settings: dict[str, Any], client: httpx.Client, no_browser: bool) -> bool:
+    """Says where the node is and what to do next, and opens its page. True once it can load."""
+    base, key = local_url(settings), sign_in_key(home)
+    settled = wait_until_settled(client, base, key)
+    page = f"{base}/chat"
+    print(f"\niSharded is up as {settings['name']}.\n  Chat and dashboard: {page}\n  Next:               choose a model on that page", flush=True)
+    if (home / "ca.key").is_file():
+        print("  Add a machine:      isharded invite\n", flush=True)
+    if not settled:
+        print(f"It has no coordinator or worker yet, so it cannot load a model. Its log is {home / 'node.log'}.", flush=True)
+    if not no_browser:
+        webbrowser.open(f"{page}#key={key}" if key else page)
+    return settled
+
+
 def keep_watch(home: Path, settings: dict[str, Any], args: argparse.Namespace) -> None:
     """Runs beside the node: says it is ready, and signs in invited machines."""
     base = local_url(settings)
@@ -440,21 +461,119 @@ def keep_watch(home: Path, settings: dict[str, Any], args: argparse.Namespace) -
         if not wait_until_healthy(client, base):
             print(f"The node did not come up. Its log is {home / 'node.log'}.", flush=True)
             return
-        settled = wait_until_settled(client, base, key)
-        page = f"{base}/chat"
+        settled = say_ready(home, settings, client, args.no_browser)
         holds_authority = (home / "ca.key").is_file()
-        print(f"\niSharded is up as {settings['name']}.\n  Chat and dashboard: {page}", flush=True)
-        if holds_authority:
-            print("  Add a machine:      isharded invite\n", flush=True)
-        if not settled:
-            print(f"It has no coordinator or worker yet, so it cannot load a model. Its log is {home / 'node.log'}.", flush=True)
-        if key and not args.no_browser:
-            webbrowser.open(f"{page}#key={key}")
         if args.model and settled:
             # A big model takes minutes, and invited machines should not wait behind it.
             threading.Thread(target=load_first_model, args=(settings, home, key, args.model), daemon=True).start()
         if holds_authority and not settings.get("ownerless"):
             sign_in_machines(home, client, base, key or "")
+
+
+def running_node(home: Path) -> psutil.Process | None:
+    """The node started from this folder, if it is still alive. Its start time rules out a reused PID."""
+    try:
+        pid, started = json.loads((home / "up.pid").read_text(encoding="utf-8"))
+        process = psutil.Process(pid)
+        return process if abs(process.create_time() - started) < 1 else None
+    except (OSError, TypeError, ValueError, psutil.Error):
+        return None
+
+
+def claim_node(home: Path) -> bool:
+    """Makes this process the folder's one node. False if another has it."""
+    path = home / "up.pid"
+    if running_node(home):
+        return False
+    path.unlink(missing_ok=True)
+    try:
+        handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return False
+    with os.fdopen(handle, "w", encoding="utf-8") as output:
+        json.dump([os.getpid(), psutil.Process().create_time()], output)
+    (home / "stop.request").unlink(missing_ok=True)
+    return True
+
+
+def watch_for_stop(home: Path, finished: threading.Event) -> None:
+    """Ctrl+C by file: a node started in the background has no console to send one to."""
+    while not finished.wait(1.0):
+        if (home / "stop.request").exists():
+            _thread.interrupt_main()  # run_node stops its services on this, as for a person's Ctrl+C
+            return
+
+
+def detached() -> dict[str, Any]:
+    """How to start a process that outlives this one, with no window of its own."""
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def start_in_background(home: Path, settings: dict[str, Any], args: argparse.Namespace) -> int:
+    """Starts the node apart from this process, then answers once it is up.
+
+    The installers and shortcuts use this, so running it again only opens the page.
+    """
+    if running_node(home) is None:
+        command = [sys.executable, "-m", "isharded", "up", "--no-browser", *(["--model", args.model] if args.model else [])]
+        # Run from the mesh's folder: python -m would prefer any isharded folder in this one.
+        code = str(Path(__file__).resolve().parents[1])
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(item for item in (code, os.getenv("PYTHONPATH")) if item)}
+        with open(home / "up.log", "ab") as log:
+            subprocess.Popen(command, cwd=home, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, **detached())
+    with client_for(settings, home) as client:
+        if not wait_until_healthy(client, local_url(settings)):
+            print(f"The node did not come up. Its logs are {home / 'up.log'} and {home / 'node.log'}.", file=sys.stderr)
+            return 1
+        say_ready(home, settings, client, args.no_browser)
+    print("It runs in the background. Stop it with: isharded stop", flush=True)
+    return 0
+
+
+def native_engine() -> tuple[bool, str]:
+    """Whether the fast path is here. Loading it is the real test: a file can be for another machine."""
+    path = find_library()
+    if path is None:
+        return False, "turned off by ISHARDED_ENGINE=0" if os.getenv("ISHARDED_ENGINE") == "0" else "not installed"
+    try:
+        library = ctypes.CDLL(str(path))
+        library.isharded_engine_abi.restype = ctypes.c_uint32
+        if library.isharded_engine_abi() != ABI_VERSION:
+            return False, f"{path} is a different version"
+    except (OSError, AttributeError) as exc:
+        return False, f"{path} will not load: {exc}"
+    return True, str(path)
+
+
+def describe_gpus(settings: dict[str, Any]) -> str:
+    if settings.get("no_gpu"):
+        return "not used"
+    from .memory import discover_accelerators  # brings in PyTorch, which only this line needs
+
+    try:
+        found = discover_accelerators("auto")
+    except (OSError, RuntimeError, ValueError) as exc:
+        return f"could not look: {exc}"
+    return ", ".join(f"{item.name} ({item.total_bytes / 1024**3:.0f} GiB)" for item in found) or "none found, so this node uses the CPU"
+
+
+def describe_machine(settings: dict[str, Any], gpus: str) -> list[str]:
+    """What was worked out, for someone seeing this machine set up for the first time."""
+    address = settings["address"]
+    link = "Tailscale or another private link" if _private_link(address) and not settings["tls"] else "TLS with this mesh's own certificate" if settings["tls"] else "none, as you said this network is trusted"
+    memory = ram()
+    has_engine, engine_note = native_engine()
+    folders = settings.get("gguf_dirs") or []
+    return [
+        f"  Name:       {settings['name']}, at {address}",
+        f"  Encryption: {link}",
+        f"  GPU:        {gpus}",
+        f"  Memory:     {memory.available / 1024**3:.1f} GiB of RAM free, {settings['cpu_threads']} of {os.cpu_count() or 1} CPU threads",
+        f"  Models:     {', '.join(folders) if folders else 'no local folders, so models download when you load one'}",
+        f"  Engine:     {'native, the fast path' if has_engine else f'Python, the slower path ({engine_note})'}",
+    ]
 
 
 def choose_mesh(found: list[dict[str, str]], args: argparse.Namespace) -> dict[str, str] | None:
@@ -533,6 +652,7 @@ def run_up(args: argparse.Namespace) -> int:
     os.environ["ISHARDED_STATE_FILE"] = str(home / "orchestrator-state.json")
     os.environ["ISHARDED_AUDIT_FILE"] = str(home / "audit.jsonl")
     settings = read_settings(home)
+    is_new = settings is None
     try:
         if args.invite:
             if settings:
@@ -561,8 +681,41 @@ def run_up(args: argparse.Namespace) -> int:
         print("Using TLS with this mesh's own certificate, so a browser will warn once. Tailscale avoids that.", flush=True)
     if settings.get("discoverable"):
         os.environ["ISHARDED_DISCOVERABLE"] = "1"
+    if is_new:
+        print("Found on this machine:", *describe_machine(settings, describe_gpus(settings)), sep="\n", flush=True)
+    if args.background:
+        return start_in_background(home, settings, args)
+    if not claim_node(home):
+        print(f"A node is already running from {home}, at {local_url(settings)}/chat. Stop it with: isharded stop", flush=True)
+        return 0
+    finished = threading.Event()
+    threading.Thread(target=watch_for_stop, args=(home, finished), daemon=True).start()
     threading.Thread(target=keep_watch, args=(home, settings, args), daemon=True).start()
-    return run_node(node_arguments(settings, home))
+    try:
+        return run_node(node_arguments(settings, home))
+    finally:
+        finished.set()
+        (home / "up.pid").unlink(missing_ok=True)
+
+
+def run_stop(_: argparse.Namespace) -> int:
+    """Stops the node started from this machine's folder, foreground or background."""
+    home = up_home()
+    process = running_node(home)
+    if process is None:
+        print(f"No node is running from {home}.")
+        return 0
+    (home / "stop.request").touch()
+    try:
+        process.wait(STOP_WAIT_SECONDS)
+    except psutil.TimeoutExpired:
+        for item in [*process.children(recursive=True), process]:
+            with suppress(psutil.Error):
+                item.kill()
+        print("The node did not stop in time, so it was killed.", flush=True)
+    (home / "stop.request").unlink(missing_ok=True)
+    print("Stopped.")
+    return 0
 
 
 def run_invite(args: argparse.Namespace) -> int:
@@ -600,7 +753,8 @@ def service_definition(python: str, system: str, user_home: Path) -> tuple[Path 
             '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>'
             "<key>Label</key><string>ai.isharded.node</string>"
             f"<key>ProgramArguments</key><array><string>{python}</string><string>-m</string><string>isharded</string><string>up</string><string>--no-browser</string></array>"
-            "<key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>\n"
+            # Restart on a crash only, as the systemd unit does, so isharded stop stays stopped.
+            "<key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict></dict></plist>\n"
         )
         return user_home / "Library" / "LaunchAgents" / "ai.isharded.node.plist", body
     body = f"[Unit]\nDescription=iSharded node\nAfter=network-online.target\n\n[Service]\nExecStart={python} -m isharded up --no-browser\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n"
@@ -647,15 +801,20 @@ def checks() -> list[tuple[bool, str, str]]:
     check(True, f"This machine would advertise {address}" + (" (encrypted by Tailscale)" if private else ""), "")
     if not private:
         found.append((True, "No Tailscale address found", "Nodes will use TLS with their own certificates. Tailscale is the easier way to link machines in different places"))
-    with socket.socket() as probe:
-        free = probe.connect_ex(("127.0.0.1", DEFAULT_PORT)) != 0
-    check(free, f"Port {DEFAULT_PORT} is free" if free else f"Port {DEFAULT_PORT} is in use", "Stop what uses it, or run isharded up --port with another port")
+    if running_node(up_home()):
+        found.append((True, "A node is running here", ""))
+    else:
+        with socket.socket() as probe:
+            free = probe.connect_ex(("127.0.0.1", DEFAULT_PORT)) != 0
+        check(free, f"Port {DEFAULT_PORT} is free" if free else f"Port {DEFAULT_PORT} is in use", "Stop what uses it, or run isharded up --port with another port")
     memory = ram()
     check(memory.available > 2 * 1024**3, f"{memory.available / 1024**3:.1f} GiB of RAM free", "A node needs at least 2 GiB free")
     disk = shutil.disk_usage(str(Path.home()))
     check(disk.free > 10 * 1024**3, f"{disk.free / 1024**3:.0f} GiB of disk free", "Models need room. Free some disk first")
     folders = model_folders()
     found.append((True, f"Found models in {', '.join(folders)}" if folders else "No local model folders found", "" if folders else "Models will download when you load one"))
+    has_engine, engine_note = native_engine()
+    found.append((True, f"Native engine: {engine_note}" if has_engine else f"No native engine: {engine_note}", "" if has_engine else ENGINE_ADVICE))
     if platform.system() == "Linux":
         missing = not any(Path(folder, "libgomp.so.1").exists() for folder in ("/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/usr/lib64", "/usr/lib"))
         check(not missing, "libgomp is installed" if not missing else "libgomp is missing", "sudo apt-get install libgomp1")
@@ -688,6 +847,7 @@ def add_arguments(subparsers: Any) -> None:
     up.add_argument("--gguf-dir", action="append", default=None, help="a folder of GGUF files; LM Studio's is found for you. Repeatable")
     up.add_argument("--model", default=None, help="load this model once the node is up")
     up.add_argument("--no-browser", action="store_true", help="do not open the chat page")
+    up.add_argument("--background", action="store_true", help="leave the node running on its own and return once it is up; if it is already up, only open its page")
     up.add_argument("--find", action="store_true", help="ask to join the one mesh on this network, without asking you first")
     up.add_argument("--new-mesh", action="store_true", help="start a new mesh even if one is on this network")
     up.add_argument("--no-discovery", action="store_true", help="do not look for a mesh, and do not answer machines looking for this one")
@@ -706,6 +866,7 @@ def add_arguments(subparsers: Any) -> None:
         change.set_defaults(handler=run_approve, join_command=name)
     doctor = subparsers.add_parser("doctor", help="check this machine, and say what to fix")
     doctor.set_defaults(handler=run_doctor)
+    subparsers.add_parser("stop", help="stop the node isharded up started on this machine").set_defaults(handler=run_stop)
     service = subparsers.add_parser("service", help="start this node when you log in")
     service_commands = service.add_subparsers(dest="service_command", required=True)
     service_commands.add_parser("install", help="start at login, for this user").set_defaults(handler=run_service)
