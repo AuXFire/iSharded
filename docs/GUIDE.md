@@ -1998,7 +1998,7 @@ The coordinator also works it out again when the direct links have [moved the pr
 
 Nothing applies a proposal unless the operator asks. `POST /admin/rebalance` and `POST /admin/load` plan afresh and cannot be told an order, and pins only fix the two ends. With `ISHARDED_APPLY_LOOP=1` on the coordinator, it applies the kept proposal by itself, on its maintenance pass:
 
-- Each pass first probes links that were never measured or are ten minutes old, so that a node which joined since the load can count. Probes are not sent otherwise.
+- Each pass first probes links that were never measured or are ten minutes old, so that a node which joined since the load can count. Links measured more recently are left alone.
 - Only with no reply running, and only if `break_even_tokens` is at most `ISHARDED_APPLY_LOOP_TOKENS`, 20000 by default. It works the proposal out once more first, on the links as they are then.
 - The nodes fetch what the new layout needs while the old route keeps serving. If a fetch fails, or the route changes meanwhile, the old route stays and nothing was lost. Units already fetched stay cached for a later try.
 - Then it waits for a moment with no reply running, for up to 2 minutes, and switches as a rebalance does: replies that arrive during the switch wait for it. If replies keep running, the switch waits for a later pass.
