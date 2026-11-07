@@ -144,6 +144,35 @@ def test_chat_has_one_model_selector():
     assert 'id="modelChoice"' in bar
 
 
+def test_chat_draws_the_shared_route_and_not_its_old_stacks():
+    text = source("chat.html")
+    assert "drawRouteList(" in text and "drawRail(" in text
+    for retired in ("core-stage", "ribbon", "class=\"pill"):
+        assert retired not in text and retired not in STYLES
+
+
+def test_chat_keeps_conversations_in_the_browser_and_forgets_them_on_sign_out():
+    text = source("chat.html")
+    handler = text[text.index("$('signOut').onclick"):text.index("$('themeButton').onclick")]
+    assert "store.drop(CHATS_KEY)" in handler and "state.chats = []" in handler
+    assert "'isharded-chats'" in text
+
+
+def test_chat_sends_tools_only_when_someone_set_them():
+    assert "tools: state.tools.length ? state.tools : undefined" in source("chat.html")
+
+
+def test_a_recovered_reply_comes_from_the_pools_own_count():
+    text = source("chat.html")
+    assert "recoveries_total" in text and "seamHtml" in text
+    assert ".seam" in STYLES
+
+
+def test_moving_a_reply_still_asks_first():
+    text = source("chat.html")
+    assert "await askToMove(" in text and 'id="move"' in text
+
+
 @pytest.mark.parametrize("name", PAGES)
 def test_a_page_links_to_the_other_and_has_a_real_shape(name):
     text = source(name)
@@ -190,9 +219,10 @@ SCRIPT = (PACKAGE / "ui.js").read_text(encoding="utf-8")
 FIXTURES = sorted((ROOT / "tests" / "fixtures" / "status").glob("*.json"))
 
 
-def test_the_dashboard_inlines_the_shared_drawing_once():
-    assert source("dashboard.html").count(SCRIPT_MARKER) == 1
-    page = served("dashboard.html")
+@pytest.mark.parametrize("name", PAGES)
+def test_a_page_inlines_the_shared_drawing_once(name):
+    assert source(name).count(SCRIPT_MARKER) == 1
+    page = served(name)
     assert SCRIPT_MARKER not in page and SCRIPT in page
     assert '"ui.js"' in (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
