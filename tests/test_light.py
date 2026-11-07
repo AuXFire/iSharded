@@ -458,6 +458,26 @@ def test_merged_rows_stay_in_numpy(no_torch):
     assert all(isinstance(item, np.ndarray) and item.shape == (1, 1, 4) and (item == 2).all() for item in results)
 
 
+def test_a_step_a_stage_refuses_is_refused_alone_and_the_rest_of_its_merge_runs(no_torch):
+    from isharded.llamacpp import LlamaError
+
+    class Picky(Stage):
+        def forward_many(self, rows, positions, slots):
+            raise LlamaError("llama_decode failed with status 1")
+
+        def forward(self, rows, position, slot, *where):
+            if slot == 1:
+                raise LlamaError("llama_decode failed with status 1")
+            return rows * 2
+
+    runtime = gguf_runtime()
+    runtime.gguf = Picky()
+    steps = [SimpleNamespace(hidden=np.ones((1, 1, 4), dtype=np.float32), request=InferRequest(session_id=f"s{slot}", epoch=1, input_ids=[1], slot=slot)) for slot in range(3)]
+    results = runtime._run_merged(steps)
+    assert isinstance(results[1], LlamaError)
+    assert all(isinstance(results[slot], np.ndarray) and results[slot].shape == (1, 1, 4) and (results[slot] == 2).all() for slot in (0, 2))
+
+
 def last_stage():
     runtime = worker.WorkerRuntime.__new__(worker.WorkerRuntime)
     runtime.gguf = object()
