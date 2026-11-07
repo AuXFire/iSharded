@@ -1877,3 +1877,93 @@ def test_a_draft_that_follows_the_entry_counts_as_moved() -> None:
     route, workers = zigzag(model)
     assert planner.moved_weights(route, workers, model) == (0, 0.0)
     assert planner.moved_weights(route, workers, model, 5 * 10**8) == (5 * 10**8, 10.0)
+
+
+def running_pool(monkeypatch):
+    """A control plane with a zigzag route running, and what stops it moving anything."""
+    model = ring_model()
+    route, workers = zigzag(model)
+    runtime = Orchestrator()
+    active = SimpleNamespace(model_id="m", profile=model, draft=None, projector=None, entry_worker=None, exit_worker=None, held={}, serving=set(), reuse_cached=True)
+    runtime.active, runtime.route, runtime.links, runtime.epoch = active, route, dict(LINKS), 7
+
+    async def nothing(*args):
+        return {}
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a plan must not touch a route")
+
+    runtime.gguf_sources = runtime.refresh_worker_metrics = runtime.refresh_holdings = runtime.measure_links = nothing
+    runtime.candidate_groups = lambda: (workers, [])
+    runtime._with_holdings = lambda group, target: group
+    runtime.plan_or_refuse = lambda target, **options: route
+    runtime.plan_memory = lambda target, plan: {}
+    runtime._activate = runtime._prefetch = runtime.deploy = refuse
+    monkeypatch.setattr(orchestrator_module, "runtime", runtime)
+    monkeypatch.setattr(orchestrator_module, "build_target", lambda *args: SimpleNamespace(model_id=args[0].model_id))
+    monkeypatch.setattr(orchestrator_module, "row_bytes", lambda target: 0)
+    monkeypatch.setattr(orchestrator_module, "describe_plan", lambda target, plan: {"model": target.model_id})
+    return runtime
+
+
+def test_the_plan_route_shows_a_proposal_and_moves_nothing(monkeypatch) -> None:
+    runtime = running_pool(monkeypatch)
+    before = [stage.model_dump() for stage in runtime.route]
+    answer = TestClient(orchestrator_module.app).post("/admin/plan", json={"model_id": "m"})
+    assert answer.status_code == 200
+    assert answer.json()["proposal"]["current"]["order"] == ZIGZAG
+    assert [stage.model_dump() for stage in runtime.route] == before
+    assert runtime.epoch == 7
+
+
+def test_a_model_that_is_not_running_has_no_proposal(monkeypatch) -> None:
+    running_pool(monkeypatch)
+    answer = TestClient(orchestrator_module.app).post("/admin/plan", json={"model_id": "other"})
+    assert answer.status_code == 200
+    assert answer.json()["proposal"] is None
+
+
+def answers(plan: dict, status: dict | None = None):
+    asked = []
+
+    def get(url, **kwargs):
+        asked.append(("GET", url, None))
+        return SimpleNamespace(status_code=200, json=lambda: status or {})
+
+    def post(url, json, **kwargs):
+        asked.append(("POST", url, json))
+        return SimpleNamespace(status_code=200, json=lambda: plan, text="")
+
+    return SimpleNamespace(get=get, post=post, HTTPError=httpx.HTTPError), asked
+
+
+def plan_args(*words: str):
+    return cli.build_parser().parse_args(["plan", *words, "--url", "http://node:8209", "--token", "key"])
+
+
+def test_the_plan_command_shows_times_and_bytes_and_says_nothing_moved(monkeypatch, capsys) -> None:
+    model = ring_model()
+    route, workers = zigzag(model)
+    proposal = geometry.propose(route, workers, LINKS, model)
+    fake, asked = answers({"route": [stage.model_dump() for stage in route], "loop_ms": 400.0, "proposal": proposal}, {"model": "m"})
+    monkeypatch.setattr(cli, "httpx", fake)
+    assert cli.run_plan(plan_args()) == 0
+    printed = capsys.readouterr().out
+    assert asked[-1] == ("POST", "http://node:8209/admin/plan", {"model_id": "m"})
+    assert " > ".join(proposal["proposed"]["order"]) in printed
+    assert f"{proposal['moved_bytes'] / GIB:.1f} GiB" in printed
+    assert "Nothing has moved" in printed
+
+
+def test_the_plan_command_says_when_there_is_nothing_to_propose(monkeypatch, capsys) -> None:
+    fake, asked = answers({"route": [{"worker_id": "a"}], "loop_ms": 5.0, "proposal": None})
+    monkeypatch.setattr(cli, "httpx", fake)
+    assert cli.run_plan(plan_args("some-model")) == 0
+    assert "No shorter order" in capsys.readouterr().out
+    assert [item[0] for item in asked] == ["POST"]
+
+
+def test_the_plan_command_needs_a_model_from_somewhere(monkeypatch, capsys) -> None:
+    fake, _ = answers({}, {"model": None})
+    monkeypatch.setattr(cli, "httpx", fake)
+    assert cli.run_plan(plan_args()) == 1

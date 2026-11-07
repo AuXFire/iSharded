@@ -39,6 +39,7 @@ from .lanes import LaneDoor
 from .mcp_server import INVALID_REQUEST, PAID_AT_THE_API, McpHandler, MeshTools, RpcError, answer_http
 from .mesh import GOSSIP_SECONDS, ControlMesh
 from .models import Adapter, GgufAdapter, SUPPORTED_TYPES, UnsupportedModel, create_adapter
+from .geometry import propose
 from .planner import AMORTIZE_TOKENS, UNREACHABLE_LINK_MS, Candidate, ModelProfile, PlacementError, keep_layers, memory_report, ms_per_token, plan_placement, route_times, with_links
 from .protocol import (
     hosts_model,
@@ -1419,6 +1420,21 @@ class Orchestrator:
         counts = telemetry_of(self.workers.get(self.route[0].worker_id)).get("pipeline") or {}
         tokens = counts.get("tokens", 0)
         return max(tokens / max(counts.get("misses", 0), 1), 1.0) if tokens >= LAW_MIN_TOKENS else 1.0
+
+    async def propose_order(self, target: ModelTarget) -> dict[str, Any] | None:
+        """A shorter loop through the nodes the running route uses, if this is its model.
+
+        This only looks. Nothing can apply it yet: a load or a rebalance plans afresh.
+        """
+        active = self.active
+        if active is None or not self.route or active.model_id != target.model_id:
+            return None
+        await self.refresh_holdings(active)
+        preferred, standby = self.candidate_groups()
+        workers = self._with_holdings(preferred + standby, active)
+        extra = sum(item.file_size for item in (active.draft, active.projector) if item)
+        pins = {"entry": active.entry_worker, "exit_": active.exit_worker, "entry_bytes": extra, "tokens_per_miss": self.tokens_per_miss(active)}
+        return await asyncio.to_thread(propose, list(self.route), workers, dict(self.links), active.profile, **pins)
 
     def plan_or_refuse(self, target: ModelTarget, **options: bool) -> list[StageAssignment]:
         try:
@@ -3070,7 +3086,7 @@ async def preview_plan(body: LoadModelRequest, authorization: str | None = Heade
     await runtime.refresh_holdings(target)
     await runtime.measure_links(row_bytes(target))
     route = runtime.plan_or_refuse(target, honor_pins_strictly=True)
-    return {**describe_plan(target, route), "memory": runtime.plan_memory(target, route)}
+    return {**describe_plan(target, route), "memory": runtime.plan_memory(target, route), "proposal": await runtime.propose_order(target)}
 
 
 @app.get("/admin/keys")
