@@ -8,7 +8,7 @@ It works on a closed network, a LAN, across VLANs, over Tailscale, or between re
 
 It is for people and small groups who trust each other and want to pool machines to run a model none of them could hold alone. A public mesh open to anyone is not ready: a node in the route can read prompts, and [iSharded security](docs/SECURITY.md) lists what stays unanswered.
 
-Each token crosses every machine in the route. The largest run so far is seven machines in four countries. Its security has been reviewed by AI only, not by a person. [Current limits](docs/GUIDE.md#current-limits) says what that means for you.
+Each token crosses every machine in the route. It is built to grow to many nodes. The largest run so far is seven machines in four countries, and [Scaling to many nodes](docs/GUIDE.md#scaling-to-many-nodes) separates what is proven from what comes next. iSharded's security has been reviewed by AI only, not by a person. [Current limits](docs/GUIDE.md#current-limits) says what that means for you.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/dashboard-dark.png">
@@ -19,7 +19,7 @@ Each token crosses every machine in the route. The largest run so far is seven m
 
 ## Measured results
 
-Qwen3-235B-A22B Instruct at Q5_K_M, 155 GiB and 94 layers, ran on four rented A40s in one data center in Sweden, over TLS, with the native engine and a 0.6B draft. A fifth GPU in Romania, about 40 ms away, joined for the two-country rows.
+Qwen3-235B-A22B Instruct at Q5_K_M, 155 GiB and 94 layers, ran on four rented A40s in one data center in Sweden, over TLS, with the native engine and a 0.6B draft. A fifth GPU in Romania, about 40 ms away, joined for the two-country rows. A stage is one machine's share of the model. With stages overlapping, several passes are on the route at once, so every GPU has work.
 
 | What | Result |
 |---|---|
@@ -42,7 +42,7 @@ After a failure, the last words of a reply can differ from an unbroken run where
 - Runs GGUF models on stock llama.cpp, on any GPU with a Vulkan driver, and safetensors models on its own PyTorch code.
 - Runs several models at once on the same mesh.
 - Serves an OpenAI-shaped API with streaming, tool calling, and image input, plus a chat page and a live dashboard on every node.
-- Speaks MCP both ways.
+- Speaks MCP both ways: MCP clients can use a mesh, and models on a mesh can use the tools of MCP servers.
 - Keeps replies going through a crashed stage, a dead node, a dead coordinator, a silent link, or a split network.
 - Runs as a network one person owns, or as one nobody owns.
 - Comes with an assistant that each person runs for themselves, with a mesh as its model.
@@ -75,7 +75,7 @@ Start a mesh on the first machine:
 isharded up
 ```
 
-It finds the hardware, picks an address, makes the mesh's certificates, and opens the chat page signed in as the owner, where you choose a model.
+It finds the hardware, picks an address, makes the mesh's certificates, and opens the chat page signed in as the owner, where you choose a model. Off Tailscale, the mesh uses TLS with its own certificate, so a browser warns once.
 
 Add a machine. On the machine that made the mesh:
 
@@ -89,13 +89,21 @@ It prints one command to run on the new machine, with a code that works once and
 isharded up --invite CODE
 ```
 
-Chat on the page that opened, at `/chat` on port 8209 of any node. The dashboard is at `/dashboard`. To call the API instead, make a key with `isharded key create NAME` and send it to any node:
+Chat on the page that opened, at `/chat` on port 8209 of any node. The dashboard is at `/dashboard`.
+
+To call the API instead, make a key on the machine that made the mesh. `FOLDER` is where `isharded up` keeps its files: `~/.isharded/up`, or `%LOCALAPPDATA%\iSharded\up` on Windows.
 
 ```bash
-curl http://NODE:8209/v1/chat/completions -H "Authorization: Bearer YOUR_KEY" -H "Content-Type: application/json" -d "{\"messages\":[{\"role\":\"user\",\"content\":\"Say hello.\"}],\"max_tokens\":64}"
+isharded key create NAME --dir FOLDER --url https://127.0.0.1:8209
 ```
 
-Off Tailscale, the mesh uses TLS with its own certificate, so the address starts with `https`. [Quick start](docs/GUIDE.md#quick-start) has the rest, and [Calling the API](docs/GUIDE.md#calling-the-api) shows the OpenAI client.
+It prints the key once. Send it to any node, where `NODE` is that node's address and `ca.pem` lets curl trust the mesh's certificate:
+
+```bash
+curl --cacert FOLDER/ca.pem https://NODE:8209/v1/chat/completions -H "Authorization: Bearer YOUR_KEY" -H "Content-Type: application/json" -d "{\"messages\":[{\"role\":\"user\",\"content\":\"Say hello.\"}],\"max_tokens\":64}"
+```
+
+On Tailscale the mesh adds no TLS, so use `http` in both commands and leave out `--cacert`. [Quick start](docs/GUIDE.md#quick-start) has the rest, and [Calling the API](docs/GUIDE.md#calling-the-api) shows the OpenAI client.
 
 ## Documentation
 

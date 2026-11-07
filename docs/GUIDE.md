@@ -425,7 +425,7 @@ The table records who holds an address, which is not always where the machine is
 
 ### Calling the API
 
-Any node's control address works. With curl:
+Any node's control address works. On a mesh with TLS, the address starts with `https`, and clients need the mesh's `ca.pem`: curl takes `--cacert ca.pem`. With curl:
 
 ```bash
 curl http://100.64.0.1:8209/v1/chat/completions -H "Authorization: Bearer YOUR_KEY" -H "Content-Type: application/json" -d "{\"messages\":[{\"role\":\"user\",\"content\":\"Say hello.\"}],\"max_tokens\":64}"
@@ -821,7 +821,7 @@ Hashes a model on a copy you trust, for `load --hashes`. It reads the whole mode
 
 ### isharded key
 
-`key create NAME` makes an API key and shows it once. `key remove NAME` removes one for good, and needs the authority. An admin key made before this version acts only as `user` when another node passes its requests on, so [make a new one](SECURITY.md#keys-made-before-verifiers) if you use it through more than one node.
+`key create NAME` makes an API key and shows it once. It needs `--file`, or `--dir` and `--url`. On a mesh from `isharded up`, run it on the owner's machine with `--dir` set to the folder `isharded up` uses and `--url` set to `https://127.0.0.1:8209`, or `http` on Tailscale. `key remove NAME` removes one for good, and needs the authority. An admin key made before this version acts only as `user` when another node passes its requests on, so [make a new one](SECURITY.md#keys-made-before-verifiers) if you use it through more than one node.
 
 | Option | Applies to | Default | What it does |
 |---|---|---|---|
