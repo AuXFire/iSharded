@@ -202,7 +202,7 @@ def fake_entry(monkeypatch, results):
     runtime = SimpleNamespace(
         assignment=SimpleNamespace(start_layer=0), waiting=0, gate=Gate(), epoch=1, gguf=object(), draft=None, speculate_tokens=0,
         prompt_cache=True, prefix=PrefixIndex(), slot_used_at={}, state_misses=0, last_error=None, lock=asyncio.Lock(),
-        choose_slot=min, _record=lambda *args: None, ring_ready=lambda request: False, caches={}, _prepare_entry=lambda request, part: request, passes=[], prepared=[], can_fetch=True,
+        choose_slot=min, _record=lambda *args: None, ring_ready=lambda request: False, caches={}, _prepare_entry=lambda request, part: request, passes=[], prepared=[], can_fetch=True, pipes={}, route=[],
     )
 
     async def sync_index():
@@ -219,7 +219,10 @@ def fake_entry(monkeypatch, results):
             raise result
         return result
 
-    runtime.execute, runtime.sync_index, runtime.prepare_state = execute, sync_index, prepare_state
+    async def ring_settle(slot):
+        pass
+
+    runtime.execute, runtime.sync_index, runtime.prepare_state, runtime.ring_settle = execute, sync_index, prepare_state, ring_settle
     monkeypatch.setattr(worker, "runtime", runtime)
     monkeypatch.setattr(worker, "verify_token", lambda authorization: None)
     return runtime

@@ -1490,3 +1490,35 @@ def test_a_stage_gone_silent_is_not_waited_on_for_a_state(tmp_path, monkeypatch)
 
     ready, spent = timed_against_a_silent_peer(work)
     assert not ready and spent < 3
+
+
+def test_a_step_from_an_old_route_does_not_stop_the_steps_beside_it() -> None:
+    import torch
+
+    from isharded import worker as worker_module
+    from isharded.protocol import InferRequest
+
+    runtime = worker_module.WorkerRuntime.__new__(worker_module.WorkerRuntime)
+    runtime.epoch, runtime.gguf, runtime.lock, runtime.merge_queue = 2, object(), asyncio.Lock(), []
+
+    async def alone(hidden, request):
+        return {"token_id": 7}
+
+    runtime._step_alone = alone
+
+    async def run():
+        steps = [
+            worker_module.MergedStep(
+                torch.zeros(1, 1, 4),
+                InferRequest(session_id=name, epoch=epoch, input_ids=[1]),
+                asyncio.get_running_loop().create_future(),
+            )
+            for name, epoch in (("old", 1), ("new", 2))
+        ]
+        runtime.merge_queue = list(steps)
+        await asyncio.wait_for(runtime._run_merge_queue(), 5)
+        return steps
+
+    old, new = asyncio.run(run())
+    assert old.outcome.exception().status_code == 409
+    assert new.outcome.result() == {"token_id": 7}
