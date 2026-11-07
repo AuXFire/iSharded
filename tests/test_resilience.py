@@ -2,11 +2,15 @@ import asyncio
 import json
 from pathlib import Path
 import time
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+from fastapi.testclient import TestClient
 import httpx
 import pytest
 
 from isharded import orchestrator as orchestrator_module
+from isharded.models import GgufAdapter
 from isharded.node import Service
 from isharded.orchestrator import Orchestrator, WorkerRecord
 from isharded.planner import ModelProfile, _stage_items
@@ -1522,3 +1526,261 @@ def test_a_step_from_an_old_route_does_not_stop_the_steps_beside_it() -> None:
     old, new = asyncio.run(run())
     assert old.outcome.exception().status_code == 409
     assert new.outcome.result() == {"token_id": 7}
+
+
+# A route and a tokenizer say a reply could run. Only the workers say it can.
+
+
+def serving_pool(**fields):
+    fields.setdefault("health", {"status": "ok", "epoch": 3})
+    orchestrator = pool(w1=record("w1", **fields))
+    orchestrator.epoch = 3
+    orchestrator.route = [stage("w1")]
+    orchestrator.tokenizer = object()
+    return orchestrator
+
+
+def test_a_route_whose_workers_hold_their_stages_is_serving():
+    orchestrator = serving_pool()
+    assert orchestrator.serving() and orchestrator.status()["status"] == "ready"
+    done(orchestrator)
+
+
+def lose_the_route(orchestrator):
+    orchestrator.route = []
+
+
+def lose_the_tokenizer(orchestrator):
+    orchestrator.tokenizer = None
+
+
+def lose_the_worker(orchestrator):
+    del orchestrator.workers["w1"]
+
+
+def go_silent(orchestrator):
+    orchestrator.workers["w1"].last_seen -= 60
+
+
+def quarantine(orchestrator):
+    orchestrator.workers["w1"].quarantined = True
+
+
+def cordon(orchestrator):
+    orchestrator.access.cordoned = {"w1"}
+
+
+def restart_empty(orchestrator):
+    orchestrator.workers["w1"].health = {"status": "ok", "epoch": 0}
+
+
+@pytest.mark.parametrize("change", [lose_the_route, lose_the_tokenizer, lose_the_worker, go_silent, quarantine, cordon, restart_empty])
+def test_a_route_is_not_serving_unless_every_stage_is_held(change):
+    orchestrator = serving_pool()
+    change(orchestrator)
+    assert not orchestrator.serving()
+    done(orchestrator)
+
+
+def test_asking_whether_a_route_is_serving_changes_nothing():
+    orchestrator = serving_pool()
+    restart_empty(orchestrator)
+    orchestrator.serving()
+    assert not orchestrator.need_reconfigure, "that belongs to the repair loop"
+    done(orchestrator)
+
+
+def test_a_worker_that_cannot_be_reached_right_now_keeps_its_place():
+    """One missed health check must not turn a load balancer away. Heartbeats decide this."""
+    orchestrator = serving_pool(health={"status": "unreachable"})
+    assert orchestrator.serving()
+    done(orchestrator)
+
+
+def test_a_route_saved_from_before_a_restart_says_repairing_and_not_ready(monkeypatch):
+    orchestrator = serving_pool()
+    restart_empty(orchestrator)
+    monkeypatch.setattr(orchestrator_module, "runtime", orchestrator)
+    assert orchestrator.status()["status"] == "repairing"
+    answer = TestClient(orchestrator_module.app).get("/ready")
+    assert answer.status_code == 503 and answer.json() == {"ready": False}
+    done(orchestrator)
+
+
+def test_a_broken_route_says_loading_during_a_load():
+    orchestrator = serving_pool()
+    restart_empty(orchestrator)
+    orchestrator.job = orchestrator_module.LoadJob(job_id="j", model_id="m")
+    assert orchestrator.status()["status"] == "loading"
+    done(orchestrator)
+
+
+def test_a_new_layout_being_prepared_leaves_a_whole_route_ready():
+    orchestrator = serving_pool()
+    orchestrator.job = orchestrator_module.LoadJob(job_id="j", model_id="m")
+    assert orchestrator.status()["status"] == "ready"
+    done(orchestrator)
+
+
+def test_a_lane_is_only_ready_when_it_is_serving(monkeypatch):
+    orchestrator = serving_pool()
+    restart_empty(orchestrator)
+    monkeypatch.setattr(orchestrator_module, "runtime", orchestrator)
+    monkeypatch.setattr(orchestrator_module, "verify_token", lambda authorization: None)
+    assert asyncio.run(orchestrator_module.lane_status(None))["ready"] is False
+    orchestrator.workers["w1"].health = {"status": "ok", "epoch": 3}
+    assert asyncio.run(orchestrator_module.lane_status(None))["ready"] is True
+    done(orchestrator)
+
+
+def test_a_new_route_is_ready_at_once_and_not_after_the_next_health_check(monkeypatch):
+    """Each worker's last report is about the old epoch until the next check, ten seconds off."""
+    orchestrator = pool(w1=record("w1", health={"status": "ok", "epoch": 3}))
+    orchestrator.epoch = 3
+    orchestrator.tokenizer = object()
+    orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json={})))
+    monkeypatch.setattr(orchestrator_module, "ConfigureRequest", MagicMock(return_value=MagicMock(model_dump=dict)))
+    orchestrator.save_state = lambda target: None
+    target = MagicMock()
+    target.adapter.supports_kv_snapshots = False
+
+    async def scenario():
+        assert await orchestrator._activate(target, [stage("w1")]) == {}
+        assert orchestrator.serving()
+        await asyncio.gather(*orchestrator.background, return_exceptions=True)
+        await orchestrator.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("known", [True, False])
+def test_a_stage_that_registers_is_checked_at_once(monkeypatch, known):
+    """It may have restarted empty, and until the next check it would pass for one that holds its stage."""
+    orchestrator = serving_pool()
+    if not known:
+        del orchestrator.workers["w1"]
+    orchestrator.client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"status": "ok", "epoch": 0}))
+    )
+    monkeypatch.setattr(orchestrator_module, "runtime", orchestrator)
+    monkeypatch.setattr(orchestrator_module, "verify_token", lambda authorization: None)
+    monkeypatch.setattr(orchestrator_module, "verify_worker_name", lambda worker_id: None)
+
+    async def scenario():
+        await orchestrator_module.register(registration("w1"), None)
+        await asyncio.gather(*orchestrator.background)
+        assert not orchestrator.serving()
+        await orchestrator.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_reply_arriving_during_a_repair_waits_for_it():
+    orchestrator = serving_pool()
+    restart_empty(orchestrator)
+    orchestrator.active = object()
+
+    async def scenario():
+        async def repair():
+            await asyncio.sleep(0.05)
+            orchestrator.workers["w1"].health = {"status": "ok", "epoch": 3}
+
+        repaired = asyncio.ensure_future(repair())
+        await orchestrator.wait_for_route()
+        assert repaired.done()
+        await orchestrator.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("field", ["saved_state", "job"])
+def test_a_reply_arriving_before_a_route_is_back_waits_for_it(field):
+    """With nothing installed yet there is no active model to go by."""
+    orchestrator = pool(w1=record("w1"))
+    setattr(orchestrator, field, {"route": []} if field == "saved_state" else orchestrator_module.LoadJob(job_id="j", model_id="m"))
+
+    async def scenario():
+        async def back():
+            await asyncio.sleep(0.05)
+            orchestrator.route = [stage("w1")]
+
+        returned = asyncio.ensure_future(back())
+        await orchestrator.wait_for_route()
+        assert returned.done()
+        await orchestrator.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_reply_does_not_wait_forever_for_a_repair(monkeypatch):
+    monkeypatch.setattr(orchestrator_module, "MOVE_WAIT_SECONDS", 0.05)
+    orchestrator = serving_pool()
+    restart_empty(orchestrator)
+    orchestrator.active = object()
+    asyncio.run(orchestrator.wait_for_route())
+    assert not orchestrator.serving()
+    done(orchestrator)
+
+
+def test_a_load_gets_longer_than_a_repair(monkeypatch):
+    monkeypatch.setattr(orchestrator_module, "MOVE_WAIT_SECONDS", 0.0)
+    monkeypatch.setattr(orchestrator_module, "LOAD_WAIT_SECONDS", 0.5)
+    orchestrator = serving_pool()
+    restart_empty(orchestrator)
+    orchestrator.active = object()
+    orchestrator.job = orchestrator_module.LoadJob(job_id="j", model_id="m")
+    started = time.monotonic()
+    asyncio.run(orchestrator.wait_for_route())
+    assert time.monotonic() - started >= 0.5
+    done(orchestrator)
+
+
+def test_a_reply_that_arrives_during_a_repair_goes_ahead_when_it_is_done():
+    """The real failure: a reply reached stages that were still empty, and came back a 502."""
+    orchestrator = serving_pool()
+    restart_empty(orchestrator)
+    orchestrator.active = object()
+    asked = []
+
+    def handler(request):
+        asked.append(orchestrator.workers["w1"].health["epoch"])
+        return stream_lines({"token_id": 7}, {"token_id": 99})
+
+    async def repair():
+        await asyncio.sleep(0.05)
+        orchestrator.workers["w1"].health = {"status": "ok", "epoch": 3}
+
+    async def scenario():
+        orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        repaired = asyncio.ensure_future(repair())
+        session = SessionState(tokens=[1, 2], epoch=3, needs_reset=True)
+        got = [token async for token in orchestrator.token_stream(session, 5, 0.0, 1.0, 0, None)]
+        await repaired
+        await orchestrator.close()
+        return got
+
+    orchestrator.tokenizer = type("Stops", (), {"stop_token_ids": {99}})()
+    assert asyncio.run(scenario()) == [7, 99]
+    assert asked == [3], "it reached the stages only once they held their layers"
+
+
+def test_a_repair_slower_than_the_restart_wait_is_still_waited_for(monkeypatch):
+    monkeypatch.setattr(orchestrator_module, "RESTART_WAIT_SECONDS", 0.05)
+    orchestrator = serving_pool()
+    restart_empty(orchestrator)
+    orchestrator.active = object()
+
+    async def scenario():
+        async def repair():
+            await asyncio.sleep(0.3)
+            orchestrator.epoch = 4
+            orchestrator.workers["w1"].health = {"status": "ok", "epoch": 4}
+
+        repaired = asyncio.ensure_future(repair())
+        goes_on = await orchestrator._recover_stream("epoch", 3)
+        await repaired
+        await orchestrator.close()
+        return goes_on
+
+    assert asyncio.run(scenario()), "a new stream carries on exactly, and the slow way does not"
+

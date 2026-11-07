@@ -144,6 +144,8 @@ STREAM_ATTEMPTS = 6
 DRAIN_WAIT_SECONDS = 45.0
 # Long enough for a planned move to finish, for a reply that arrives during one.
 MOVE_WAIT_SECONDS = 90.0
+# A load shows it is getting somewhere, and a big model takes minutes to read back in.
+LOAD_WAIT_SECONDS = 600.0
 # How often a reply with nothing arriving checks that its entry worker is still there.
 STREAM_CHECK_SECONDS = 5.0
 # How long workers get to come back before a saved route is rebuilt from scratch.
@@ -839,6 +841,8 @@ class Orchestrator:
         self.active_cache_url = None
         self.epoch = int(state["epoch"])
         self.installed_epoch = self.epoch
+        # A worker not heard from yet would pass for one that holds its stage.
+        self.spawn(self.refresh_worker_metrics())
 
     async def _gossip(self) -> None:
         while True:
@@ -932,15 +936,28 @@ class Orchestrator:
         async with self.control_lock:
             await self.run_job(self.job, self.load(request, self.job))
 
+    def _lost_its_stage(self, worker_id: str) -> bool:
+        """Restarted workers come back live but empty, having lost their stage."""
+        health = self.workers[worker_id].health or {}
+        return health.get("status") == "ok" and health.get("epoch") != self.epoch
+
+    def _route_whole(self) -> bool:
+        return bool(self.route) and all(self._usable(stage.worker_id) and not self._lost_its_stage(stage.worker_id) for stage in self.route)
+
+    def serving(self) -> bool:
+        """Whether a reply can run now.
+
+        A route and a tokenizer alone say little: a new coordinator has both from the
+        saved or replicated state, before any worker holds its stage.
+        """
+        return bool(self.tokenizer) and self._route_whole()
+
     def _absent_from_route(self) -> set[str]:
         absent = set()
         for stage in self.route:
             if not self._usable(stage.worker_id):
                 absent.add(stage.worker_id)
-                continue
-            # Restarted workers come back live but empty, having lost their stage.
-            health = self.workers[stage.worker_id].health or {}
-            if health.get("status") == "ok" and health.get("epoch") != self.epoch:
+            elif self._lost_its_stage(stage.worker_id):
                 self.need_reconfigure.add(stage.worker_id)
             else:
                 self.need_reconfigure.discard(stage.worker_id)
@@ -1537,6 +1554,11 @@ class Orchestrator:
         self.model_id = target.model_id
         if target.tokenizer is not None:
             self.tokenizer = target.tokenizer
+        for stage in route:
+            # Each has just taken this epoch, and its last report is from before that.
+            record = self.workers.get(stage.worker_id)
+            if record is not None and record.health:
+                record.health = {**record.health, "epoch": new_epoch}
         self.route = route
         self.active_cache_url = cache_url
         self.epoch = new_epoch
@@ -1580,10 +1602,22 @@ class Orchestrator:
         drained, self.drained = self.drained, set()
         await asyncio.gather(*(self._tell(url.rstrip("/") + "/internal/release", timeout=5.0) for url in drained))
 
+    def _loading(self) -> bool:
+        return self.job is not None and self.job.finished_at is None
+
+    def _route_expected(self) -> bool:
+        """Whether a load, a repair, or a restart should bring a whole route."""
+        return self.active is not None or self.saved_state is not None or self._loading() or bool(self.mesh and self.mesh.replica)
+
     async def wait_for_route(self) -> None:
-        """A reply arriving during a move waits for it, rather than being turned away."""
-        deadline = time.monotonic() + MOVE_WAIT_SECONDS
-        while not self.route and self.active is not None and time.monotonic() < deadline:
+        """A reply arriving during a load or repair waits for it, rather than being turned away.
+
+        The wait is bounded, and then the reply goes ahead and finds out for itself.
+        """
+        began = time.monotonic()
+        while not self._route_whole() and self._route_expected():
+            if time.monotonic() - began >= (LOAD_WAIT_SECONDS if self._loading() else MOVE_WAIT_SECONDS):
+                return
             await asyncio.sleep(0.25)
 
     async def deploy(
@@ -1940,6 +1974,7 @@ class Orchestrator:
         # Whatever opens the reply opens every other turn too, so it marks the cuts.
         cut_token = None if boundary is None else session.tokens[boundary]
         for _ in range(STREAM_ATTEMPTS):
+            await self.wait_for_route()
             if not self.route:
                 break
             entry = self.route[0]
@@ -2066,6 +2101,7 @@ class Orchestrator:
                 # A stage restarted empty, and the next repair gives it back its layers.
                 # Only a stream can restore a saved state, so it is worth waiting for that.
                 await self._await_route_change(epoch, RESTART_WAIT_SECONDS)
+                await self.wait_for_route()
                 return self.epoch != epoch
             await self._await_route_change(epoch)
             return True
@@ -2465,11 +2501,19 @@ class Orchestrator:
             "runtime": record.health,
         }
 
+    def _state(self) -> str:
+        if self.serving():
+            return "ready"
+        if self._loading():
+            return "loading"
+        if self.route and self.tokenizer:
+            return "repairing"
+        return "recovering" if self.saved_state else "waiting"
+
     def status(self) -> dict[str, Any]:
-        loading = self.job is not None and self.job.finished_at is None
         on_route = {stage.worker_id for stage in self.route}
         return {
-            "status": "ready" if self.route and self.tokenizer else "loading" if loading else "recovering" if self.saved_state else "waiting",
+            "status": self._state(),
             "mesh": (
                 {"node": self.mesh.node_id, "leader": self.mesh.leader_id, "term": self.mesh.term, "members": self.mesh.alive()}
                 if self.mesh
@@ -2513,23 +2557,23 @@ class Orchestrator:
             "events": list(self.events),
         }
 
-    async def refresh_worker_metrics(self) -> None:
-        async def probe(record: WorkerRecord) -> None:
-            started = time.perf_counter()
-            try:
-                response = await self.client.get(
-                    worker_url(record) + "/health",
-                    headers=auth_headers(self.pool_token),
-                    timeout=3.0,
-                )
-                response.raise_for_status()
-                record.control_latency_ms = round((time.perf_counter() - started) * 1000, 2)
-                record.health = response.json()
-            except (httpx.HTTPError, ValueError) as exc:
-                record.control_latency_ms = None
-                record.health = {"status": "unreachable", "error": str(exc)}
+    async def probe(self, record: WorkerRecord) -> None:
+        started = time.perf_counter()
+        try:
+            response = await self.client.get(
+                worker_url(record) + "/health",
+                headers=auth_headers(self.pool_token),
+                timeout=3.0,
+            )
+            response.raise_for_status()
+            record.control_latency_ms = round((time.perf_counter() - started) * 1000, 2)
+            record.health = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            record.control_latency_ms = None
+            record.health = {"status": "unreachable", "error": str(exc)}
 
-        await asyncio.gather(*map(probe, self.workers.values()))
+    async def refresh_worker_metrics(self) -> None:
+        await asyncio.gather(*map(self.probe, self.workers.values()))
 
 
 runtime = Orchestrator()
@@ -2776,7 +2820,7 @@ app.add_middleware(ChunkedResponses, path="/mcp")
 @app.get("/ready")
 async def ready() -> JSONResponse:
     """For load balancers: can this node serve a reply right now?"""
-    serving = bool(runtime.route and runtime.tokenizer)
+    serving = runtime.serving()
     return JSONResponse(status_code=200 if serving else 503, content={"ready": serving})
 
 
@@ -2821,6 +2865,9 @@ async def register(
         runtime.add_event("failure", f"{body.worker_id} refused", detail)
         raise HTTPException(status_code=426, detail=detail)
     runtime.register(body)
+    if any(stage.worker_id == body.worker_id for stage in runtime.route):
+        # A worker registers when it starts, so what it last reported may no longer hold.
+        runtime.spawn(runtime.probe(runtime.workers[body.worker_id]))
     return {"status": "registered", "active_epoch": runtime.epoch, **pool_news()}
 
 
@@ -3187,7 +3234,7 @@ async def lane_status(authorization: str | None = Header(default=None)) -> dict[
     return {
         "lane": runtime.lane_name,
         "model": runtime.model_id or state.get("request", {}).get("model_id"),
-        "ready": bool(runtime.tokenizer and runtime.route),
+        "ready": runtime.serving(),
         "leader": runtime.mesh.leader_id if runtime.mesh else None,
         "leader_url": runtime.mesh.leader_url if runtime.mesh else None,
         "entries_held": runtime.access.entries_held,

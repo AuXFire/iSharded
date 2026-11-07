@@ -87,6 +87,7 @@ def serving(monkeypatch):
     monkeypatch.setattr(runtime, "model_id", "embed.gguf")
     monkeypatch.setattr(runtime, "tokenizer", Tokens())
     monkeypatch.setattr(runtime, "route", [SimpleNamespace(url="http://entry:1", worker_id="w")])
+    monkeypatch.setitem(runtime.workers, "w", SimpleNamespace(live=True, quarantined=False, health=None))
     monkeypatch.setattr(runtime, "epoch", 4)
     monkeypatch.setattr(
         runtime,

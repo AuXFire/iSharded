@@ -562,6 +562,7 @@ def control(monkeypatch):
     monkeypatch.setattr(runtime, "model_id", "see.gguf")
     monkeypatch.setattr(runtime, "tokenizer", Words())
     monkeypatch.setattr(runtime, "route", [SimpleNamespace(url="http://entry:1", worker_id="w")])
+    monkeypatch.setitem(runtime.workers, "w", SimpleNamespace(live=True, quarantined=False, health=None))
     monkeypatch.setattr(runtime, "epoch", 4)
     active = SimpleNamespace(
         embedding=False,
