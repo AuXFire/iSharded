@@ -2095,7 +2095,7 @@ Trust and status:
 - An owned network has an owner.
 - A network nobody owns passed 27 of 27 checks on real processes, but as three nodes on one machine, not between strangers. Identities are free, so `--joining open` lets one person run many nodes, and a low name can be ground out to win coordination. A coordinator can stall a route. Traffic is not encrypted, so run it over a network that is, such as Tailscale. Use `--joining vouched` with a quorum unless you accept all of that.
 - Several models run in lanes with fixed memory shares, and each lane adds two processes to a node. The main model's planner does not see a lane's memory, so moving layers after a failure can run a node short. Workers started with `--no-control` do not join lanes.
-- GitHub Actions runs the tests on Linux and Windows for every push. Those jobs run on CPU, so real GPU runs are measured by hand.
+- GitHub Actions runs the tests on Linux, Windows and macOS for every push. Those jobs run on CPU, so real GPU runs are measured by hand.
 - Linux GPUs have run real nodes on rented A40 machines. macOS has not run a real model yet, although its builds are pinned and download by themselves.
 - Adding a machine with an invite needs the owner's machine running at that moment. The mesh keeps working without it.
 

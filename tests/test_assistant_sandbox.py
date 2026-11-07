@@ -222,7 +222,7 @@ def test_the_statement_is_true_the_process_level_really_can_reach_the_network(sa
 def test_asking_for_the_network_needs_no_warning(sandbox, tmp_path):
     result = sandbox.run(python("print('ok')"), tmp_path, network=True)
     assert NETWORK_NOT_BLOCKED not in result.notes
-    assert result.stderr == ""
+    assert result.stderr == (MEMORY_NOT_LIMITED if sys.platform == "darwin" else "")
 
 
 def test_the_process_level_says_it_runs_as_this_user(sandbox, tmp_path):
