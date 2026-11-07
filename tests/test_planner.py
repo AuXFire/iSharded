@@ -15,7 +15,7 @@ from isharded import orchestrator as orchestrator_module
 from isharded.gguf import holds_both_kinds
 from isharded.orchestrator import Orchestrator
 from isharded.planner import Candidate, ModelProfile, PlacementError, keep_layers, memory_report, plan_placement, stored_bytes
-from isharded.protocol import LoadModelRequest, MemoryPool, TensorRef, WeightUnit
+from isharded.protocol import LoadModelRequest, MemoryPool, StageAssignment, TensorRef, WeightUnit
 
 MIB = 1024**2
 GIB = 1024**3
@@ -1893,7 +1893,7 @@ def running_pool(monkeypatch):
     model = ring_model()
     route, workers = zigzag(model)
     runtime = Orchestrator()
-    active = SimpleNamespace(model_id="m", profile=model, draft=None, projector=None, entry_worker=None, exit_worker=None, held={}, serving=set(), reuse_cached=True)
+    active = SimpleNamespace(model_id="m", profile=model, draft=None, projector=None, entry_worker=None, exit_worker=None, held={}, serving=set(), reuse_cached=True, spread=False)
     runtime.active, runtime.route, runtime.links, runtime.epoch = active, route, dict(LINKS), 7
 
     async def nothing(*args, **kwargs):
@@ -2053,7 +2053,7 @@ def test_status_reads_the_kept_proposal_and_never_proposes(monkeypatch) -> None:
     def refuse(*args, **kwargs):
         raise AssertionError("status must not propose")
 
-    monkeypatch.setattr(orchestrator_module, "propose", refuse)
+    monkeypatch.setattr(orchestrator_module, "propose_route", refuse)
     assert runtime.status()["proposal"] == kept and kept["saved_ms_per_token"] > 0
 
 
@@ -2258,3 +2258,261 @@ def test_keeping_layers_holds_a_draft_for_a_spare_at_the_entry() -> None:
     assert keep_layers(route, [small, stays], [], model) is None
     big = worker("big", pool("cuda:3", "vram", 4 * GIB, 300))
     assert keep_layers(route, [big, stays], [], model)[0].worker_id == "big"
+
+
+# What the ring measures itself, priced in place of the probes.
+
+
+def ring_pool() -> Orchestrator:
+    """A running route of three stages whose ring is up, with no telemetry yet."""
+    runtime = Orchestrator()
+    runtime.route = [StageAssignment(worker_id=name, url=f"http://{name}", start_layer=index, end_layer=index + 1) for index, name in enumerate("abc")]
+    runtime.epoch = runtime.ring_epoch = 4
+    runtime.workers = {name: SimpleNamespace(health=None) for name in "abc"}
+    return runtime
+
+
+def report(runtime: Orchestrator, name: str, rtt_us: int, hop_us: int, passes: int, epoch: int = 4) -> None:
+    runtime.workers[name].health = {"telemetry": {"ring": {"epoch": epoch, "link_rtt_us": rtt_us, "hop_us": hop_us, "passes": passes}}}
+
+
+def feed(runtime: Orchestrator, name: str, hops_us: list[int], rtt_us: int = 40_000) -> None:
+    """Reports from a stage, each after one more pass, as the maintenance loop would read them."""
+    for hop_us in hops_us:
+        passes = orchestrator_module.telemetry_of(runtime.workers[name]).get("ring", {}).get("passes", 0) + 1
+        report(runtime, name, rtt_us, hop_us, passes)
+        runtime.price_ring_links()
+
+
+def test_a_ring_link_is_charged_its_row_trip_less_the_way_back() -> None:
+    # 40 ms a heartbeat and 42 ms a row with its acknowledgement: the row took 22 ms one way.
+    charged = orchestrator_module.ring_link_ms(40_000, 42_000)
+    assert charged == 42.0
+    assert planner._one_way_ms(charged, True) == 42 - 40 / 2
+    # A link quicker than the hop constant is charged that constant and nothing more.
+    assert orchestrator_module.ring_link_ms(100, 150) == 0.0
+
+
+def test_the_ring_prices_its_links_by_the_median_of_its_samples() -> None:
+    runtime = ring_pool()
+    feed(runtime, "a", [42_000, 60_000])
+    assert ("a", "b") not in runtime.links  # two samples are too few
+    feed(runtime, "a", [43_000])
+    assert runtime.links["a", "b"] == 44.0  # of 42, 78 and 44
+    reading = runtime.link_readings["a", "b"]
+    assert reading["timed_by"] == "ring" and reading["median_ms"] == 40.0 and reading["hop_ms"] == 43.0
+    assert ("c", "a") not in runtime.ring_links  # the closing link has no heartbeat, so a probe prices it
+
+
+def test_a_ring_price_moves_only_past_its_bounds() -> None:
+    runtime = ring_pool()
+    feed(runtime, "a", [42_000, 60_000, 43_000])
+    assert runtime.ring_links["a", "b"]["cost_ms"] == 44.0
+    feed(runtime, "a", [43_500])
+    assert runtime.links["a", "b"] == 44.0  # the median moved half a ms, inside 10%
+    feed(runtime, "a", [55_000] * 5)
+    assert runtime.links["a", "b"] == 68.0  # once most of the window says so
+
+
+def test_a_quiet_link_or_another_epoch_adds_no_sample() -> None:
+    runtime = ring_pool()
+    feed(runtime, "a", [42_000])
+    for _ in range(5):
+        runtime.price_ring_links()  # the same report, with no pass since
+    report(runtime, "a", 40_000, 42_000, 9, epoch=3)
+    runtime.price_ring_links()
+    assert list(runtime.ring_samples["a", "b"]) == [42.0]
+    runtime.ring_epoch = None
+    feed(runtime, "a", [42_000] * 3)
+    assert list(runtime.ring_samples["a", "b"]) == [42.0]
+
+
+def test_a_ring_price_stands_over_a_probe_until_it_grows_old() -> None:
+    runtime = ring_pool()
+    feed(runtime, "a", [42_000] * 3)
+    runtime.links["a", "b"] = 99.0  # an address probe over HTTP, as the hop check makes
+    runtime.price_ring_links()
+    assert runtime.links["a", "b"] == 42.0
+    runtime.ring_links["a", "b"]["at"] -= orchestrator_module.LINK_TTL_SECONDS
+    runtime.price_ring_links()
+    assert ("a", "b") not in runtime.ring_links and ("a", "b") not in runtime.links_checked
+
+
+def test_probes_leave_the_links_the_ring_prices_alone() -> None:
+    runtime = ring_pool()
+    feed(runtime, "a", [42_000] * 3)
+    probed = []
+
+    async def post(url, json, **kwargs):
+        probed.append((url, json["url"]))
+        raise httpx.ConnectError("nobody there")
+
+    runtime.client = SimpleNamespace(post=post)
+    urls = {name: f"http://{name}" for name in "ab"}
+    asyncio.run(runtime._probe_links(urls, 0, runtime.links, runtime.links_checked, runtime.link_readings))
+    assert probed == [("http://b/internal/diag/probe", "http://a")]
+    assert runtime.links["a", "b"] == 42.0
+
+
+# Applying a shorter loop, which only an operator turns on.
+
+
+def applying_pool(monkeypatch):
+    runtime = proposing_pool(monkeypatch)
+    runtime.apply_loop = True
+    runtime.apply_loop_tokens = 100_000  # this route moves 57 GB to save 13 ms a token, paid back in 43,918 tokens
+    asyncio.run(runtime.keep_proposal())
+    calls: list[tuple[str, list[str]]] = []
+
+    async def prefetch(target, route, job):
+        calls.append(("fetch", names_of(route)))
+        return {}
+
+    async def activate(target, route):
+        calls.append(("activate", names_of(route)))
+        runtime.route, runtime.epoch = route, runtime.epoch + 1
+        return {}
+
+    runtime._prefetch, runtime._activate = prefetch, activate
+    return runtime, calls
+
+
+def test_a_shorter_loop_is_not_applied_unless_the_operator_asks(monkeypatch) -> None:
+    monkeypatch.delenv("ISHARDED_APPLY_LOOP", raising=False)
+    assert Orchestrator().apply_loop is False
+    monkeypatch.setenv("ISHARDED_APPLY_LOOP", "1")
+    monkeypatch.setenv("ISHARDED_APPLY_LOOP_TOKENS", "500")
+    asked = Orchestrator()
+    assert asked.apply_loop is True and asked.apply_loop_tokens == 500
+    runtime, calls = applying_pool(monkeypatch)
+    runtime.apply_loop = False
+    assert asyncio.run(runtime.apply_proposal()) is False
+    assert calls == [] and names_of(runtime.route) == ZIGZAG
+
+
+def test_an_allowed_loop_that_pays_back_is_fetched_then_switched_to(monkeypatch) -> None:
+    runtime, calls = applying_pool(monkeypatch)
+    proposed = runtime.latest_proposal()["proposed"]["order"]
+    assert asyncio.run(runtime.apply_proposal()) is True
+    assert calls == [("fetch", proposed), ("activate", proposed)]
+    assert names_of(runtime.route) == proposed
+    assert any(event["title"] == "Applying a shorter loop" for event in runtime.events)
+    assert runtime.job.phase == "ready"
+
+
+def test_a_loop_that_pays_back_too_late_is_left_alone(monkeypatch) -> None:
+    runtime, calls = applying_pool(monkeypatch)
+    runtime.apply_loop_tokens = runtime.latest_proposal()["break_even_tokens"] - 1
+    assert asyncio.run(runtime.apply_proposal()) is False
+    assert calls == []
+
+
+def test_a_reply_in_flight_holds_the_route_where_it_is(monkeypatch) -> None:
+    runtime, calls = applying_pool(monkeypatch)
+    runtime.replies_in_flight = 1
+    assert asyncio.run(runtime.apply_proposal()) is False
+    assert calls == []
+
+
+def test_a_fetch_that_fails_leaves_the_old_route_serving(monkeypatch) -> None:
+    runtime, calls = applying_pool(monkeypatch)
+
+    async def prefetch(target, route, job):
+        calls.append(("fetch", names_of(route)))
+        return {"e1": "stopped reporting download progress"}
+
+    runtime._prefetch = prefetch
+    assert asyncio.run(runtime.apply_proposal()) is False
+    assert [call[0] for call in calls] == ["fetch"]
+    assert names_of(runtime.route) == ZIGZAG and runtime.epoch == 7
+    assert runtime.events[0]["title"] == "Shorter loop not applied"
+
+
+def test_replies_that_keep_running_after_the_fetch_hold_the_switch(monkeypatch) -> None:
+    runtime, calls = applying_pool(monkeypatch)
+    monkeypatch.setattr(orchestrator_module, "APPLY_QUIET_SECONDS", 0.3)
+
+    async def prefetch(target, route, job):
+        runtime.replies_in_flight = 1  # a reply arrived while the stages fetched
+        return {}
+
+    runtime._prefetch = prefetch
+    assert asyncio.run(runtime.apply_proposal()) is False
+    assert calls == [] and names_of(runtime.route) == ZIGZAG
+
+
+def test_a_route_that_moved_during_the_fetch_is_not_switched(monkeypatch) -> None:
+    runtime, calls = applying_pool(monkeypatch)
+    repaired = list(reversed(runtime.route))
+
+    async def prefetch(target, route, job):
+        runtime.route = repaired  # a repair landed meanwhile
+        return {}
+
+    runtime._prefetch = prefetch
+    assert asyncio.run(runtime.apply_proposal()) is False
+    assert calls == [] and runtime.route == repaired
+
+
+def test_a_switch_that_fails_is_planned_afresh(monkeypatch) -> None:
+    runtime, calls = applying_pool(monkeypatch)
+    replanned = []
+
+    async def activate(target, route):
+        runtime.route = []
+        return {"e1": "out of memory"}
+
+    async def deploy(target, job, *, generation_lock_held):
+        replanned.append(generation_lock_held)
+        return runtime.route
+
+    async def fine(target, failed):
+        return None
+
+    runtime._activate, runtime._deploy, runtime._refuse_big_move = activate, deploy, fine
+    asyncio.run(runtime.apply_proposal())
+    assert replanned == [False]
+    assert any(event["title"] == "Shorter loop failed to start" for event in runtime.events)
+
+
+def test_an_applied_loop_waits_before_another(monkeypatch) -> None:
+    runtime, calls = applying_pool(monkeypatch)
+    assert asyncio.run(runtime.apply_proposal()) is True
+    runtime.proposal = (runtime.epoch, {"break_even_tokens": 0})
+    assert asyncio.run(runtime.apply_proposal()) is False
+    assert len(calls) == 2
+
+
+def test_only_a_route_planned_for_the_fewest_nodes_may_lose_one(monkeypatch) -> None:
+    runtime = proposing_pool(monkeypatch)
+    asked = []
+
+    def found(*args, **options):
+        asked.append(options["shed"])
+
+    monkeypatch.setattr(orchestrator_module, "propose_route", found)
+    asyncio.run(runtime.propose_order(runtime.active))
+    runtime.active.spread = None
+    asyncio.run(runtime.propose_order(runtime.active))
+    assert asked == [False, True]
+
+
+# The draft, counted on its device only when the operator says so.
+
+
+def test_a_draft_counts_on_the_entry_stage_only_when_asked() -> None:
+    workers = [worker("one", pool("cuda:0", "vram", 4 * GIB, 300))]
+    plain = plan_placement(workers, [], with_draft(600 * MIB))
+    counted = plan_placement(workers, [], replace(with_draft(600 * MIB), draft_bytes=600 * MIB))
+    assert counted[0].estimated_ms_per_token == pytest.approx(plain[0].estimated_ms_per_token + 600 * MIB / (300 * 1e6), abs=0.01)
+    loop, pace = planner.route_times(counted, {}, False)
+    assert pace == planner.stage_ms(counted[0]) and loop == pace
+
+
+def test_the_draft_setting_is_off_by_default(monkeypatch) -> None:
+    draft = SimpleNamespace(file_size=600 * MIB)
+    monkeypatch.delenv("ISHARDED_DRAFT_SHARES_DEVICE", raising=False)
+    assert orchestrator_module.draft_reads(draft) == 0
+    monkeypatch.setenv("ISHARDED_DRAFT_SHARES_DEVICE", "1")
+    assert orchestrator_module.draft_reads(draft) == 600 * MIB
+    assert orchestrator_module.draft_reads(None) == 0

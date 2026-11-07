@@ -1188,6 +1188,9 @@ A flag takes priority over its variable.
 | `ISHARDED_ENGINE_LIB` | The native engine's library, if it is not in `isharded/native` |
 | `ISHARDED_DRAFT_APART` | Set to `1` on the entry worker to run the draft in a process of its own, not beside the entry stage. Use it to compare the two on a real mesh |
 | `ISHARDED_RING` | Set to `0` on the coordinator to keep replies off the direct links between stages |
+| `ISHARDED_APPLY_LOOP` | Set to `1` on the coordinator to let it apply a [shorter loop](#a-shorter-loop) by itself, between replies. Off by default, because it moves weights |
+| `ISHARDED_APPLY_LOOP_TOKENS` | The most tokens an applied loop may take to pay back its move. Default 20000 |
+| `ISHARDED_DRAFT_SHARES_DEVICE` | Set to `1` on the coordinator to count each guess of the draft on the entry stage's device when planning. Off by default; see [Speculative decoding](#speculative-decoding) |
 | `ISHARDED_PROMPT_PARTS` | Set to `0` on the entry worker to send each prompt whole instead of in parts |
 | `ISHARDED_DATA_PORT` | The port for direct links between stages. It must be reachable from the other stages. Default: any free port |
 | `ISHARDED_REACH_HOSTS` | The worker's `--reach-hosts` |
@@ -1672,6 +1675,8 @@ For `qwen3`, `qwen3moe`, `qwen35`, and `qwen35moe` models the draft is chosen au
 
 A draft keeps confirmed text on one sequence and its guesses on a scratch sequence, one of each per conversation. A guess that lands costs one decode. A wrong one drops the scratch sequence, adds what was confirmed in one batch, and copies the result to scratch again. Recurrent state cannot go back, so every draft works this way. A miss costs what was confirmed since the last one, however long the conversation is. The scratch sequences share the draft's key-value cache and do not make it bigger.
 
+The draft runs beside the entry stage, on its device. If the two take turns on that device, each guess adds to the entry stage's time a token, and so to the pace `p` in [the law](#what-a-route-costs). On the 235B mesh a guess cost about 11 ms on the entry's GPU, which fits a 0.6B draft and an 8 ms stage adding up, but no GPU run has yet confirmed that they share it this way. So the planner leaves the draft out by default. `ISHARDED_DRAFT_SHARES_DEVICE=1` on the coordinator counts it: the draft's file is read once a guess, at the speed of the memory that holds the entry's first layer, and that time goes on the entry stage's `estimated_ms_per_token`. That changes which route a load picks only where the entry's device is slow or the draft is large. Kernel launches are not in it, so on a fast GPU it likely counts too little.
+
 ### Conversation reuse
 
 The same tokens are computed once per stage and reused. Every stage saves its state in two places: where a chat's system prompt and tool list end, which other conversations share, and where its settled history ends, which is where the conversation picks up next turn. If a prompt starts with exactly those tokens, stages restore the state and process only what is new. An image counts as tokens, by a digest of its bytes, so the same words about a different image share nothing past that image. Anything else, such as an edited history, reads the whole prompt. Plain text sent to `/v1/completions` has no turns to go by, so it is saved once two prompts turn out to share 512 tokens or more, and a third can reuse them. This covers GGUF models.
@@ -1929,8 +1934,12 @@ A pool that measures 0 bytes free counts as full. A pool that was never measured
 | `median_ms`, `max_ms` | Round trip of a 100-byte probe over HTTP. Both are `null` if the link failed |
 | `cost_ms` | What the planner charges for this link: the median, half the swing up to the maximum, and the transfer time of one row. A failed link costs 10000 |
 | `checked_at` | When it was measured, in Unix time |
+| `timed_by` | `ring` on a link the direct links timed themselves, as below. Absent on a probed link |
+| `hop_ms` | On a link the ring timed: a row's trip to the next stage with its acknowledgement back |
 
 A row is `hidden_size * 4` bytes. Its transfer time is how much longer the median round trip takes with a row than with the 100-byte probe, and never less than zero. Only that difference counts, because the probe's HTTP overhead is already in the base cost.
+
+On a ring a token crosses each link one way, so the planner charges half of each round trip, plus 1 ms a hop for the software at each end. That 1 ms is a guess, and the direct links measure better. Once they are up, each stage times the link to its next stage: a heartbeat's round trip every 100 ms, and each row's trip with its acknowledgement. That is the path tokens really take, where a probe pays for HTTP. So the coordinator prices those links from these times instead. A row crosses in its trip less the acknowledgement's way back, half a heartbeat, and `cost_ms` is the round trip the planner turns into that: twice the one way, less the 1 ms twice. What a row and the software add past a heartbeat is so counted for each link, in place of the guess. The readings swing with load, so a price is the median of a link's last 9 readings, from 3 on, and it changes only when that median moves by more than 10% and more than 0.5 ms. A reading is taken only after a pass has crossed since the last one. Here `median_ms` and `max_ms` are both the heartbeat's round trip. The closing link has no heartbeat, so a probe still prices it, as it does every link off the route. A price from the ring holds for ten minutes after its last reading, as a probe's does, and stands over any probe meanwhile.
 
 Each stage in `route` and in `active_plan.route` has a `read_bytes` object, with what the stage reads per token at the size its pools hold it:
 
@@ -1964,7 +1973,9 @@ A plan, and `active_plan` in `/admin/status`, shows these. All are estimates fro
 
 ### A shorter loop
 
-A route keeps the order it loaded with, even when a better one exists, because weights must not move or reload unless they must. So iSharded only proposes. `POST /admin/plan` for the model that is running has a `proposal` field, and [isharded plan](#isharded-plan) prints it. It is `null` if the model is not running, if any link between the route's nodes has not been measured, if a node on the route has left, or if no order of the same nodes saves at least 1% of a token's time.
+A route keeps the order it loaded with, even when a better one exists, because weights must not move or reload unless they must. So by default iSharded only proposes. `POST /admin/plan` for the model that is running has a `proposal` field, and [isharded plan](#isharded-plan) prints it. It is `null` if the model is not running, if any link between the route's nodes has not been measured, if a node on the route has left, or if no order of the same nodes, or of fewer of them, saves at least 1% of a token's time.
+
+A route loaded with `--placement auto`, the default, takes the fewest nodes that hold the model in VRAM. A node can still end up on it without need, by a repair or by joining while it ran. So for such a route the proposal also weighs leaving nodes out: the subsets of the route's nodes that hold the model in VRAM, ranked as a load ranks them, by loop and reads. A node left out stays a spare. A spread route keeps every node, because that is what its operator asked for, and a pinned entry or exit is never left out.
 
 To find one, nodes with a link of 15 ms or less are grouped as a site, and the route's nodes are toured with the closing link counted. A dozen nodes or fewer get the exact shortest tour. More go site by site, and then uncross. Any node of a loop can be the entry for the same network time, so the entry goes where what it carries fits: a draft needs that much VRAM. The current entry stands if nothing is gained. Pins on the entry and exit stay. A proposal never needs more failed links, or more weights outside VRAM, than the route it would replace.
 
@@ -1976,12 +1987,23 @@ To find one, nodes with a link of 15 ms or less are grouped as a site, and the r
 | `saved_ms_per_token` | What it saves |
 | `moved_bytes` | Bytes nodes would have to fetch, counting a draft or projector if the entry changes, even if the new entry holds one already |
 | `move_seconds` | How long that takes with nodes fetching side by side, at each node's measured rate. A node with no measured rate counts as 40 MB/s, and a copy from a peer as at least 100 MB/s |
+| `left_out` | Nodes the proposal leaves out. Empty for an order of the same nodes |
 | `stages_changed` | Stages that would restart with other layers. Their reload is not in `move_seconds` |
 | `break_even_tokens` | Tokens until the saving has paid for the move |
 
 `/admin/status` has the same `proposal` for the route that is running, or `null`. The coordinator works it out once each load, repair or rebalance has measured its links, off the event loop, because proposing grows slow on a big pool. Status only reads what was kept, and a new route clears it. The dashboard shows it under Needs you as information: the time a token would save, the bytes that would move, the tokens until the move pays for itself, and the `isharded plan` command to look closer.
 
-Nothing applies a proposal yet. `POST /admin/rebalance` and `POST /admin/load` plan afresh and cannot be told an order, and pins only fix the two ends. So a proposal is there to read, and to decide on.
+The coordinator also works it out again when the direct links have [moved the price](#what-a-route-costs) of a link.
+
+Nothing applies a proposal unless the operator asks. `POST /admin/rebalance` and `POST /admin/load` plan afresh and cannot be told an order, and pins only fix the two ends. With `ISHARDED_APPLY_LOOP=1` on the coordinator, it applies the kept proposal by itself, on its maintenance pass:
+
+- Only with no reply running, and only if `break_even_tokens` is at most `ISHARDED_APPLY_LOOP_TOKENS`, 20000 by default. It works the proposal out once more first, on the links as they are then.
+- The nodes fetch what the new layout needs while the old route keeps serving. If a fetch fails, or the route changes meanwhile, the old route stays and nothing was lost. Units already fetched stay cached for a later try.
+- Then it waits for a moment with no reply running, for up to 2 minutes, and switches as a rebalance does: replies that arrive during the switch wait for it. If replies keep running, the switch waits for a later pass.
+- If a stage fails to start on the new layout, the route is planned afresh, as after a failed load.
+- After one shorter loop, the next waits at least 10 minutes, so a route cannot flap.
+
+A reply on the new route matches a fresh load of that layout. It can differ from one on the old layout at near-ties, because moving a layer boundary changes where prompt rows round to BF16 (see [Precision](#precision)). Weights move only on an apply that passes its break-even, and `break_even_tokens` counts fetching only: a stage that restarts with other layers also reloads them, which it leaves out.
 
 ### Mixed hardware
 

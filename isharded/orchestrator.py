@@ -9,6 +9,7 @@ import os
 import secrets
 import re
 import socket
+import statistics
 import time
 import uuid
 from collections import Counter, deque
@@ -42,9 +43,9 @@ from .lanes import LaneDoor
 from .mcp_server import INVALID_REQUEST, PAID_AT_THE_API, McpHandler, MeshTools, RpcError, answer_http
 from .mesh import GOSSIP_SECONDS, ControlMesh
 from .models import Adapter, GgufAdapter, SUPPORTED_TYPES, UnsupportedModel, create_adapter
-from .geometry import propose
+from .geometry import propose_route
 from .optional import ADD_TORCH
-from .planner import AMORTIZE_TOKENS, UNREACHABLE_LINK_MS, Candidate, ModelProfile, PlacementError, keep_layers, memory_report, ms_per_token, plan_placement, route_network_ms, route_times, stage_ms, with_links
+from .planner import AMORTIZE_TOKENS, RING_HOP_MS, UNREACHABLE_LINK_MS, Candidate, ModelProfile, PlacementError, keep_layers, memory_report, ms_per_token, plan_placement, route_network_ms, route_times, stage_ms, with_links
 from .protocol import (
     hosts_model,
     needs_pytorch,
@@ -141,6 +142,16 @@ LINK_TTL_SECONDS = 600.0
 LINK_PROBE_ROUNDS = 5
 LINK_PROBE_BYTES = 100
 LINK_PROBE_SECONDS = 30.0
+# Ring telemetry swings with load, so a link the ring times is priced by the median of
+# its last samples, from a few on, and only a move past both bounds changes the price.
+RING_LINK_SAMPLES = 9
+RING_LINK_MIN_SAMPLES = 3
+RING_LINK_MOVE_SHARE = 0.1
+RING_LINK_MOVE_MS = 0.5
+# Least time between two shorter loops applied by themselves, so a route cannot flap.
+APPLY_LOOP_SECONDS = 600.0
+# How long an applied loop waits for a moment with no reply running, once it has fetched.
+APPLY_QUIET_SECONDS = 120.0
 # How often a route's links try their other addresses, and how long one try may take.
 HOP_CHECK_SECONDS = 60.0
 HOP_PROBE_SECONDS = 10.0
@@ -392,6 +403,7 @@ def build_target(
         stage_workspace_bytes=GGUF_STAGE_WORKSPACE_BYTES if isinstance(adapter, GgufAdapter) else 0,
         ring=isinstance(adapter, GgufAdapter) and os.getenv("ISHARDED_RING", "1") != "0",
         entry_extra_bytes=entry_bytes(draft, projector, request.context_tokens, slots),
+        draft_bytes=draft_reads(draft),
         attention_interval=getattr(adapter, "interval", 0),
     )
     hosted_copy = manifest.revision.startswith("local-") and control_source != request.model_id
@@ -449,6 +461,14 @@ def entry_bytes(draft: DraftModel | None, projector: DraftModel | None, context_
     return drafting + (projector.file_size + PROJECTOR_WORKSPACE_BYTES if projector else 0)
 
 
+def draft_reads(draft: DraftModel | None) -> int:
+    """What a guess reads, for the planner to count on the entry's device, if the operator says it shares it.
+
+    Off by default: no GPU run has yet confirmed that a guess takes its time from the entry stage's.
+    """
+    return draft.file_size if draft and os.getenv("ISHARDED_DRAFT_SHARES_DEVICE", "0") == "1" else 0
+
+
 def with_slots(target: ModelTarget, slots: int) -> None:
     """Size a target for this many slots, and for the draft and guesses it has now."""
     assert target.request is not None
@@ -457,6 +477,7 @@ def with_slots(target: ModelTarget, slots: int) -> None:
         target.profile,
         **context_sizes(target.adapter, target.request, slots, target.speculate_tokens),
         entry_extra_bytes=entry_bytes(target.draft, target.projector, target.request.context_tokens, slots),
+        draft_bytes=draft_reads(target.draft),
     )
 
 
@@ -687,6 +708,18 @@ def link_reading(measured: dict[str, Any], sizes: list[int]) -> dict[str, float]
     return {"median_ms": median, "max_ms": float(small.get("max_ms", median)), "cost_ms": round(link_cost(small) + transfer, 2)}
 
 
+def ring_link_ms(rtt_us: float, hop_us: float) -> float:
+    """The round trip to charge a link the ring timed itself, where the probe paid for HTTP.
+
+    A token crosses a link one way: a row's trip with its acknowledgement, less the
+    acknowledgement's way back, which is half a heartbeat. The planner charges half a round
+    trip plus ``RING_HOP_MS`` a hop, so this is the round trip that comes to that one way.
+    What the row and the software add past a heartbeat is that link's own hop cost.
+    """
+    one_way = (hop_us - rtt_us / 2) / 1000
+    return round(max(2 * (one_way - RING_HOP_MS), 0.0), 2)
+
+
 def same_load(held: ModelTarget, target: ModelTarget) -> bool:
     """Whether a load asks for what is already running. How it waits changes nothing."""
     asked = [item.request.model_dump(exclude={"wait"}) for item in (held, target) if item.request]
@@ -717,6 +750,14 @@ class Orchestrator:
         self.link_readings: dict[tuple[str, str], dict[str, Any]] = {}  # what /admin/status publishes
         # The running route's shorter loop and the epoch it was worked out for. Status only reads it.
         self.proposal: tuple[int, dict[str, Any] | None] = (0, None)
+        # Links the ring times itself: recent samples, the price kept, and the passes last seen.
+        self.ring_samples: dict[tuple[str, str], deque[float]] = {}
+        self.ring_links: dict[tuple[str, str], dict[str, Any]] = {}
+        self.ring_passes: dict[tuple[str, str], tuple[int, int]] = {}
+        # Moving weights is the operator's choice, so a shorter loop is only applied if asked.
+        self.apply_loop = os.getenv("ISHARDED_APPLY_LOOP", "0") == "1"
+        self.apply_loop_tokens = int(os.getenv("ISHARDED_APPLY_LOOP_TOKENS", str(AMORTIZE_TOKENS)))
+        self.applied_at = float("-inf")
         self.row_readings: dict[tuple[str, str, str, str, bool], float] = {}  # ms a layer, see row_key
         # The proven address each link of the route uses, where it is not the advertised one.
         self.hops: dict[tuple[str, str], str] = {}
@@ -1112,6 +1153,9 @@ class Orchestrator:
         await self._repair_route()
         self._check_ring()
         await self._aim_hops()
+        if self.price_ring_links():
+            await self.keep_proposal()  # the proposal was made on the old prices
+        await self.apply_proposal()
         self._redial_moved_ring()
         await self._start_ring()
 
@@ -1656,6 +1700,44 @@ class Orchestrator:
             self.add_event("mesh", "Direct links up", f"Tokens now cross {len(route)} stages on the native path")
         return True
 
+    def price_ring_links(self) -> bool:
+        """Price the route's links from the ring's own times, where it has them.
+
+        Each stage times the link to the next stage, with heartbeats and with the rows it
+        sends, on the path tokens really take. The closing link has no heartbeat, so a probe
+        still prices it, as it does every link off the route. A price the ring set holds for
+        as long as a probe's would. Returns whether a price moved.
+        """
+        now = time.monotonic()
+        for key in [key for key, held in self.ring_links.items() if now - held["at"] >= LINK_TTL_SECONDS]:
+            del self.ring_links[key]
+            self.links_checked.pop(key, None)  # so the next measuring probes it again
+        moved = False
+        names = [stage.worker_id for stage in self.route] if self.ring_epoch == self.epoch else []
+        for key in pairwise(names):
+            ring = telemetry_of(self.workers.get(key[0])).get("ring") or {}
+            rtt, hop, passes = ring.get("link_rtt_us") or 0, ring.get("hop_us") or 0, (self.epoch, ring.get("passes") or 0)
+            # A row's time changes only when a pass crossed, and a quiet link would fill the window with one reading.
+            if ring.get("epoch") != self.epoch or not rtt or not hop or self.ring_passes.get(key) == passes:
+                continue
+            self.ring_passes[key] = passes
+            samples = self.ring_samples.setdefault(key, deque(maxlen=RING_LINK_SAMPLES))
+            samples.append(ring_link_ms(rtt, hop))
+            if len(samples) < RING_LINK_MIN_SAMPLES:
+                continue
+            price, held = round(statistics.median(samples), 2), self.ring_links.get(key)
+            reading = {"median_ms": round(rtt / 1000, 2), "hop_ms": round(hop / 1000, 2), "at": now}
+            if held is None or abs(price - held["cost_ms"]) > max(RING_LINK_MOVE_SHARE * held["cost_ms"], RING_LINK_MOVE_MS):
+                self.ring_links[key] = {**reading, "cost_ms": price}
+                moved = True
+            else:
+                held.update(reading)
+        for key, held in self.ring_links.items():
+            # An address probe over HTTP may have priced the link since, and the ring's price is the better one.
+            self.links[key], self.links_checked[key] = held["cost_ms"], now
+            self.link_readings[key] = {"median_ms": held["median_ms"], "max_ms": held["median_ms"], "cost_ms": held["cost_ms"], "hop_ms": held["hop_ms"], "timed_by": "ring", "checked_at": int(time.time())}
+        return moved
+
     async def measure_links(self, row: int = 0) -> None:
         """Time the links between workers, which the planner routes by.
 
@@ -1663,14 +1745,18 @@ class Orchestrator:
         spans cities these round trips set the speed. Each is measured from the end
         that would send, and a link that fails stays on record so that no route needs it.
         A slow link also feels how big a token's row is, so ``row`` is probed as well.
+        Where the ring has timed a link itself, that time stands in for the probe.
         """
+        rings = (self.ring_links, self.ring_samples, self.ring_passes)
         if row != self.link_row_bytes:
             self.link_row_bytes = row
-            self.links_checked.clear()  # those costs were for another model's rows
+            for table in (self.links_checked, *rings):
+                table.clear()  # those costs were for another model's rows
         urls = self._link_urls()
-        for table in (self.links, self.links_checked, self.link_readings):
+        for table in (self.links, self.links_checked, self.link_readings, *rings):
             for pair in [pair for pair in table if not urls.keys() >= set(pair)]:
                 del table[pair]  # a pool that changes members would otherwise grow these forever
+        self.price_ring_links()
         await self._probe_links(urls, row, self.links, self.links_checked, self.link_readings)
 
     async def preview_links(self, row: int) -> dict[tuple[str, str], float]:
@@ -1714,8 +1800,8 @@ class Orchestrator:
 
         async def from_one(source: str) -> None:
             for target in urls:
-                # A link on a shorter address is timed there, and the long way would overwrite it.
-                kept = links is self.links and (source, target) in self.hops
+                # A link on a shorter address is timed there, and one the ring times is timed better.
+                kept = links is self.links and ((source, target) in self.hops or (source, target) in self.ring_links)
                 if target != source and not kept and now - checked.get((source, target), -LINK_TTL_SECONDS) >= LINK_TTL_SECONDS:
                     await probe(source, target)
 
@@ -1778,8 +1864,12 @@ class Orchestrator:
     async def propose_order(self, target: ModelTarget) -> dict[str, Any] | None:
         """A shorter loop through the nodes the running route uses, if this is its model.
 
-        This only looks. Nothing can apply it yet: a load or a rebalance plans afresh.
+        This only looks. Only ``apply_proposal`` moves anything, and only if allowed.
         """
+        found = await self._propose_route(target)
+        return found[1] if found else None
+
+    async def _propose_route(self, target: ModelTarget) -> tuple[list[StageAssignment], dict[str, Any]] | None:
         active = self.active
         if active is None or not self.route or active.model_id != target.model_id:
             return None
@@ -1790,10 +1880,64 @@ class Orchestrator:
         workers = self._with_holdings(preferred + standby, active)
         extra = sum(item.file_size for item in (active.draft, active.projector) if item)
         pins = {"entry": active.entry_worker, "exit_": active.exit_worker, "entry_bytes": extra, "tokens_per_miss": self.tokens_per_miss(active)}
-        return await asyncio.to_thread(propose, list(self.route), workers, dict(self.links), active.profile, **pins)
+        # Only a route planned for the fewest nodes may lose one. A spread route keeps what was asked.
+        shed = active.spread is None
+        return await asyncio.to_thread(propose_route, list(self.route), workers, dict(self.links), active.profile, **pins, shed=shed)
+
+    async def apply_proposal(self) -> bool:
+        """Move the route to its shorter loop, if the operator allowed it and the move pays soon.
+
+        It starts only with no reply running. The old route serves while the new stages
+        fetch, and if fetching fails it stays, having lost nothing: units already fetched
+        are kept for a later try. Replies that arrive during the switch wait for it, as they
+        do for any rebalance. Returns whether the route moved.
+        """
+        kept = self.latest_proposal()
+        if not self.apply_loop or not self.coordinating or kept is None or self.replies_in_flight or self.control_lock.locked():
+            return False
+        if kept["break_even_tokens"] > self.apply_loop_tokens or time.monotonic() - self.applied_at < APPLY_LOOP_SECONDS:
+            return False
+        async with self.control_lock:
+            active, old = self.active, list(self.route)
+            assert active is not None  # a kept proposal is for the running route
+            found = await self._propose_route(active)  # links may have moved since it was kept
+            if found is None or found[1]["break_even_tokens"] > self.apply_loop_tokens or self.route != old:
+                return False
+            route, proposal = found
+            self.applied_at = time.monotonic()
+            saved = proposal["saved_ms_per_token"]
+            self.add_event("rebalance", "Applying a shorter loop", f"{' > '.join(proposal['proposed']['order'])}, {saved:.1f} ms a token less, paid back in {proposal['break_even_tokens']} tokens")
+            self.job = LoadJob(job_id=uuid.uuid4().hex, model_id=active.model_id)
+            moved = await self.run_job(self.job, self._move_route(active, route, old, self.job))
+        return moved == route
+
+    async def _move_route(self, target: ModelTarget, route: list[StageAssignment], old: list[StageAssignment], job: LoadJob) -> list[StageAssignment]:
+        job.total_bytes, job.route, job.workers, job.phase = target.profile.total_bytes, route, {}, "fetching"
+        failed = await self._prefetch(target, route, job)
+        if failed or job.cancelled or self.route != old:
+            self.add_event("rebalance", "Shorter loop not applied", "; ".join(f"{name}: {reason}" for name, reason in failed.items())[:300] or "the route changed meanwhile")
+            return self.route
+        job.phase = "loading"
+        async with self.generation_lock:
+            began = time.monotonic()
+            while self.replies_in_flight and time.monotonic() - began < APPLY_QUIET_SECONDS:
+                await asyncio.sleep(0.25)
+            if self.replies_in_flight or self.route != old:
+                self.add_event("rebalance", "Shorter loop not applied", "replies kept running, so the fetched units wait for a later try")
+                return self.route
+            failed = await self._activate(target, route)
+        if not failed:
+            return route
+        # The stages were half switched, so the route is planned afresh, as a failed load would be.
+        self.add_event("failure", "Shorter loop failed to start", "; ".join(f"{name}: {reason}" for name, reason in failed.items())[:300])
+        await self._refuse_big_move(target, failed)
+        for worker_id, reason in failed.items():
+            self._quarantine(worker_id, reason)
+        return await self._deploy(target, job, generation_lock_held=False)
 
     async def keep_proposal(self) -> None:
-        """Work out the running route's shorter loop once, after its links were measured.
+        """Work out the running route's shorter loop after its links were measured, and again
+        when the ring has moved the price of one.
 
         Proposing grows slow on a big pool, far too slow for every status call.
         A failure here costs only the proposal, so it is said and nothing else changes.
