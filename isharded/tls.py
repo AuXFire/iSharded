@@ -12,6 +12,7 @@ on every request.
 from __future__ import annotations
 
 from contextvars import ContextVar
+from functools import lru_cache
 import os
 import ssl
 from typing import Any
@@ -35,6 +36,11 @@ OWN_ADDRESS = "ISHARDED_OWN_ADDRESS"
 CONNECT_RETRIES = 3
 
 
+@lru_cache(maxsize=8)
+def _own_addresses(setting: str) -> frozenset[str]:
+    return frozenset(item.strip() for item in setting.split(",") if item.strip())
+
+
 def stay_on_this_machine(request: Any) -> None:
     """Send a request for this node's own public address over loopback.
 
@@ -45,7 +51,10 @@ def stay_on_this_machine(request: Any) -> None:
     The setting is a host, or for a node behind a relay it is a list of host:port,
     as other nodes can share that host.
     """
-    own = {item.strip() for item in os.getenv(OWN_ADDRESS, "").split(",") if item.strip()}
+    setting = os.getenv(OWN_ADDRESS)
+    if not setting:
+        return
+    own = _own_addresses(setting)
     if request.url.host in own or f"{request.url.host}:{request.url.port}" in own:
         request.url = request.url.copy_with(host="127.0.0.1")
 
