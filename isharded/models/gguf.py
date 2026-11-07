@@ -11,14 +11,13 @@ from typing import Any
 
 import torch
 
-from ..gguf import GgufHeader
+from ..gguf import LAYER_NAME, GgufHeader
 from ..protocol import TensorRef
 from .base import Adapter, LayerState, UnsupportedModel, Weights
 
 # Families whose graph ends each layer in an ``l_out`` tensor and that need no
 # per-layer inputs beyond the hidden state. Stage splitting relies on both.
 SUPPORTED_ARCHITECTURES = {"llama", "qwen2", "qwen2moe", "qwen3", "qwen3moe", "qwen35", "qwen35moe"}
-LAYER_TENSOR = re.compile(r"^blk\.(\d+)\.(.+)$")
 EXPERT_TENSOR = re.compile(r"^ffn_(gate|up|down|gate_up)_exps\.")
 
 
@@ -48,7 +47,7 @@ class GgufAdapter(Adapter):
             return "embed", None
         if name in {"output.weight", "output_norm.weight"}:
             return "head", None
-        match = LAYER_TENSOR.match(name)
+        match = LAYER_NAME.match(name)
         if not match:
             return None
         layer = int(match.group(1))

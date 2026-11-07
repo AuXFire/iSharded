@@ -229,8 +229,7 @@ def parse_header(read: Callable[[int, int], bytes], file_size: int) -> GgufHeade
         value, item_kind = _read_value(cursor, kind)
         end = cursor.position
         cursor.position = start
-        raw = _take_span(cursor, end - start)
-        keys[key] = KeyValue(key, kind, raw, value, item_kind)
+        keys[key] = KeyValue(key, kind, cursor.take(end - start), value, item_kind)
 
     alignment = int(keys["general.alignment"].value) if "general.alignment" in keys else DEFAULT_ALIGNMENT
     tensors: dict[str, TensorInfo] = {}
@@ -264,15 +263,6 @@ def join_parts(parts: list[GgufHeader]) -> GgufHeader:
     return GgufHeader(first.version, keys, tensors, 0, sum(part.file_size for part in parts), first.alignment)
 
 
-def _take_span(cursor: _Cursor, count: int) -> bytes:
-    pieces = []
-    while count:
-        piece = min(count, READ_CHUNK)
-        pieces.append(cursor.take(piece))
-        count -= piece
-    return b"".join(pieces)
-
-
 def read_file_header(path: str) -> GgufHeader:
     with open(path, "rb") as handle:
         handle.seek(0, 2)
@@ -292,10 +282,6 @@ def _align(value: int, alignment: int) -> int:
 def _string(value: str) -> bytes:
     encoded = value.encode("utf-8")
     return struct.pack("<Q", len(encoded)) + encoded
-
-
-def _key_bytes(entry: KeyValue) -> bytes:
-    return _string(entry.key) + struct.pack("<I", entry.kind) + entry.raw
 
 
 def _scalar(key: str, kind: int, value: Any) -> KeyValue:
@@ -321,10 +307,6 @@ class StagePlan:
     tensors: list[tuple[str, TensorInfo]]
     stubs: list[TensorInfo] = field(default_factory=list)  # zero-filled placeholders
 
-    @property
-    def fetch_bytes(self) -> int:
-        return sum(tensor.nbytes for _, tensor in self.tensors)
-
 
 STUB_VOCAB = 4
 
@@ -338,21 +320,9 @@ def holds_both_kinds(start: int, end: int, interval: int) -> bool:
     return not interval or (end - start >= 2 and end // interval > start // interval)
 
 
-def plan_stage(header: GgufHeader, start: int, end: int, *, last: bool) -> StagePlan:
-    """Describe a stage file for layers ``start`` to ``end - 1``.
-
-    Stages take hidden states as input and iSharded does its own tokenizing, so
-    llama.cpp's vocabulary and embedding table are only there to satisfy its
-    loader. They become placeholders, and so does anything else the stage never
-    evaluates. The last stage keeps the real vocabulary size for its logits.
-    """
-    if not 0 <= start < end <= header.layer_count:
-        raise GgufError(f"layers {start}..{end - 1} are outside 0..{header.layer_count - 1}")
+def _stage_keys(header: GgufHeader, start: int, end: int, interval: int) -> list[KeyValue]:
+    """The model's keys, with whatever counts layers cut down to these, and no tokenizer."""
     arch = header.architecture
-    interval = int(header.arch_key("full_attention_interval") or 0)
-    if not holds_both_kinds(start, end, interval):
-        raise GgufError(f"a {arch} stage needs a full attention layer and a recurrent one, and {start}..{end - 1} does not have both")
-
     block_key = f"{arch}.block_count"
     source_blocks = int(header.get(block_key))
     replaced: dict[str, KeyValue] = {block_key: _scalar(block_key, header.keys[block_key].kind, end - start)}
@@ -375,6 +345,23 @@ def plan_stage(header: GgufHeader, start: int, end: int, *, last: bool) -> Stage
         flags = [int((layer + 1) % interval != 0) for layer in range(start, end)]
         raw = struct.pack("<IQ", T_UINT32, len(flags)) + struct.pack(f"<{len(flags)}I", *flags)
         keys.append(KeyValue(recurrent_key, T_ARRAY, raw, len(flags), T_UINT32))
+    return keys
+
+
+def plan_stage(header: GgufHeader, start: int, end: int, *, last: bool) -> StagePlan:
+    """Describe a stage file for layers ``start`` to ``end - 1``.
+
+    Stages take hidden states as input and iSharded does its own tokenizing, so
+    llama.cpp's vocabulary and embedding table are only there to satisfy its
+    loader. They become placeholders, and so does anything else the stage never
+    evaluates. The last stage keeps the real vocabulary size for its logits.
+    """
+    if not 0 <= start < end <= header.layer_count:
+        raise GgufError(f"layers {start}..{end - 1} are outside 0..{header.layer_count - 1}")
+    interval = int(header.arch_key("full_attention_interval") or 0)
+    if not holds_both_kinds(start, end, interval):
+        raise GgufError(f"a {header.architecture} stage needs a full attention layer and a recurrent one, and {start}..{end - 1} does not have both")
+
     tensors: list[tuple[str, TensorInfo]] = []
     for layer in range(start, end):
         for tensor in header.layer_tensors(layer):
@@ -397,7 +384,7 @@ def plan_stage(header: GgufHeader, start: int, end: int, *, last: bool) -> Stage
         stubs.append(TensorInfo("output_norm.weight", list(norm.dims), norm.ggml_type, 0, norm.nbytes))
         stubs.append(TensorInfo("token_embd.weight", [width, STUB_VOCAB], GGML_F32, 0, width * STUB_VOCAB * 4))
         vocabulary = STUB_VOCAB
-    return StagePlan(keys + _stub_vocabulary(vocabulary), tensors, stubs)
+    return StagePlan(_stage_keys(header, start, end, interval) + _stub_vocabulary(vocabulary), tensors, stubs)
 
 
 def _stub_vocabulary(size: int) -> list[KeyValue]:
@@ -461,7 +448,7 @@ def write_stage(
 
     out.write(MAGIC + struct.pack("<IQQ", 3, len(entries), len(plan.keys)))
     for entry in plan.keys:
-        out.write(_key_bytes(entry))
+        out.write(_string(entry.key) + struct.pack("<I", entry.kind) + entry.raw)
     for info in infos:
         out.write(info)
     position = out.tell()

@@ -102,7 +102,8 @@ class QwenAdapter(Adapter):
         self.attention_bias = self.model_type in BIASED_ATTENTION_TYPES or bool(config.get("attention_bias"))
         self.qk_norm = self.model_type in QK_NORM_TYPES
         self.output_gate = bool(config.get("attn_output_gate", self.hybrid))
-        self.prefix = "model.language_model." if self._nested_weights() else "model."
+        # Multimodal wrappers keep the language model one level deeper.
+        self.prefix = "model.language_model." if config.get("_multimodal_wrapper", False) else "model."
         self._layer_pattern = re.compile(rf"^{re.escape(self.prefix)}layers\.(\d+)\.(.+)$")
 
         rope = config.get("rope_parameters") or config.get("rope_scaling") or {}
@@ -137,10 +138,6 @@ class QwenAdapter(Adapter):
         if self.num_experts:
             self.expert_active_fraction = self.top_k / self.num_experts
 
-    def _nested_weights(self) -> bool:
-        # Multimodal wrappers keep the language model one level deeper.
-        return self.config.get("_multimodal_wrapper", False)
-
     def classify(self, name: str) -> tuple[str, int | None] | None:
         match = self._layer_pattern.match(name)
         if match:
@@ -169,9 +166,13 @@ class QwenAdapter(Adapter):
         table = weights["embed_tokens.weight"]
         return F.embedding(input_ids.to(table.device), table)
 
+    def _rms(self, x: torch.Tensor) -> torch.Tensor:
+        """Scale to unit root mean square, in float32."""
+        wide = x.float()
+        return wide * torch.rsqrt(wide.pow(2).mean(-1, keepdim=True) + self.epsilon)
+
     def _norm(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        normalized = x.float()
-        normalized = normalized * torch.rsqrt(normalized.pow(2).mean(-1, keepdim=True) + self.epsilon)
+        normalized = self._rms(x)
         if self.hybrid:
             # Hybrid releases store the norm scale as an offset from one.
             return (normalized * (1.0 + weight.float())).type_as(x)
@@ -262,9 +263,7 @@ class QwenAdapter(Adapter):
         # Gated RMSNorm per value head, then the output projection.
         core = core.reshape(-1, self.linear_value_dim)
         gate = gate.reshape(-1, self.linear_value_dim)
-        normalized = core.float()
-        normalized = normalized * torch.rsqrt(normalized.pow(2).mean(-1, keepdim=True) + self.epsilon)
-        normalized = weights["linear_attn.norm.weight"] * normalized.to(core.dtype)
+        normalized = weights["linear_attn.norm.weight"] * self._rms(core).to(core.dtype)
         normalized = (normalized * F.silu(gate.float())).to(core.dtype)
         flattened = normalized.reshape(1, tokens, value_width)
         return F.linear(flattened, matrix(weights, "linear_attn.out_proj.weight", flattened))
