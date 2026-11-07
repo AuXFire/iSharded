@@ -1038,7 +1038,9 @@ def test_merged_passes_stay_off_unless_asked_for():
 
     step = SimpleNamespace(verify=False, reset=False, prompt_rows=False, restore_length=None, next_position=None)
     hidden = torch.zeros(1, 1, 4)
-    held = SimpleNamespace(merge_passes=False, gguf=object())
+    # The real merge_most, which reads merge_passes, so turning merging on below counts.
+    held = type("Held", (), {"merge_most": WorkerRuntime.merge_most, "exact": False, "exactness": None})()
+    held.merge_passes, held.gguf = False, object()
     assert not WorkerRuntime._can_merge(held, hidden, step)
     held.merge_passes = True
     assert WorkerRuntime._can_merge(held, hidden, step)
@@ -1804,6 +1806,7 @@ def test_a_step_from_an_old_route_does_not_stop_the_steps_beside_it() -> None:
 
     runtime = worker_module.WorkerRuntime.__new__(worker_module.WorkerRuntime)
     runtime.epoch, runtime.gguf, runtime.lock, runtime.merge_queue = 2, object(), asyncio.Lock(), []
+    runtime.merge_passes, runtime.exact, runtime.exactness = True, False, None
 
     async def alone(hidden, request):
         return {"token_id": 7}

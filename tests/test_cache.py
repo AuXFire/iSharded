@@ -693,7 +693,7 @@ def test_prompt_rows_never_merge_with_other_conversations():
     import torch
 
     step = SimpleNamespace(verify=False, reset=False, prompt_rows=True, restore_length=None, next_position=None)
-    assert not worker.WorkerRuntime._can_merge(SimpleNamespace(merge_passes=True, gguf=object()), torch.zeros(1, 1, 4), step)
+    assert not worker.WorkerRuntime._can_merge(type("Held", (), {"merge_most": worker.WorkerRuntime.merge_most, "merge_passes": True, "exact": False, "exactness": None, "gguf": object()})(), torch.zeros(1, 1, 4), step)
 
 
 def test_a_save_point_crosses_stages_intact():
