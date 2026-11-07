@@ -1101,7 +1101,7 @@ Every path needs a key except `GET /`, `GET /assistant`, `GET /assistant/`, `GET
 | Route | Does |
 |---|---|
 | `GET /v1/models` | The assistant, under its own name |
-| `POST /v1/chat/completions` | Any OpenAI client. `stream` works, and `conversation_id` or an `X-Conversation-Id` header names a conversation. `max_tokens`, or `max_completion_tokens`, limits the whole reply, and `temperature` is from 0 to 2. Tools it cannot honour are a 400 |
+| `POST /v1/chat/completions` | Any OpenAI client. `stream` works, and `conversation_id` or an `X-Conversation-Id` header names a conversation. `max_tokens`, or `max_completion_tokens`, limits the whole reply, up to `reply_tokens`, and `temperature` is from 0 to 2. Tools it cannot honour are a 400 |
 | `GET /assistant/whoami` | Who this key is |
 | `GET /assistant/identity` | The persona, as it applies to this person |
 | `GET /assistant/identity/history` | How the name, style, and voice changed, newest first. `limit` |
@@ -1168,7 +1168,7 @@ Every path needs a key except `GET /`, `GET /assistant`, `GET /assistant/`, `GET
 
 Three rules decide who may do what. A key reads its own data, and `user` names someone else's only for the owner, otherwise a 403. Where a row says Owner, a member gets a 403, because that route reaches this machine, spends what everyone shares, or gives a permission. Anything that decides is done in the key holder's own name, which never comes from a request, and a key whose name the broker would not take for a person, or that starts as a machine's does, decides nothing. A route that ends something and keeps its record says `revoke` or `reject`, and one that removes it is a `DELETE`. Where something does not exist the answer is 404, and a part refusing something in its current state is 409. For skills and runs the owner gives `user` to act on someone else's, so an id alone does not reach across people.
 
-A chat request's `tools` and `functions` are a 400, as is any `tool_choice` or `function_call` other than `auto` or `none`, because the assistant uses its own tools, behind its broker, and never calls a client's. `tool_choice: none` is honoured with or without `tools`, as is an empty list. `max_tokens` covers a whole turn, so what a round of tools spent comes out of it. A turn that waits for a person keeps these. `finish_reason` is always `stop`, even when the limit cut a reply short.
+A chat request's `tools` and `functions` are a 400, as is any `tool_choice` or `function_call` other than `auto` or `none`, because the assistant uses its own tools, behind its broker, and never calls a client's. `tool_choice: none` is honoured with or without `tools`, as is an empty list. `max_tokens` covers a whole turn, so what a round of tools spent comes out of it. It can only lower what a turn gives, so asking for more than `reply_tokens` gets that many: a provider that refuses a number backs off for every user, and one client's number must not cause that. A turn that waits for a person keeps these. `finish_reason` is always `stop`, even when the limit cut a reply short.
 
 Only the newest user message in a chat request is new. A client's earlier messages and system prompt are not believed, since the assistant keeps its own record and its own identity. The OpenAI `user` field changes nothing. The real model is in the `assistant` object on the reply, or in the last event of a stream.
 

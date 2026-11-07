@@ -160,8 +160,12 @@ class Turn:
     temperature: float | None = None
 
     def sampling(self, default_tokens: int) -> dict[str, Any]:
-        """What the next request asks of a model. A limit covers every round, as a client sees one reply."""
-        tokens = default_tokens if self.max_tokens is None else max(self.max_tokens - self.completion_tokens, 1)
+        """What the next request asks of a model. A limit covers every round, as a client sees one reply.
+
+        It can only lower what a turn gives. A provider that refuses a number backs off for
+        every user, so one client's number must not reach it.
+        """
+        tokens = default_tokens if self.max_tokens is None else min(max(self.max_tokens - self.completion_tokens, 1), default_tokens)
         return {"max_tokens": tokens} | ({} if self.temperature is None else {"temperature": self.temperature})
 
     def messages(self, budget: int) -> list[dict[str, Any]]:

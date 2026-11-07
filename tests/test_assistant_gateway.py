@@ -1199,3 +1199,7 @@ def test_tools_this_endpoint_cannot_call_are_refused_and_nothing_happens(alice, 
 def test_a_request_that_asks_for_no_tools_is_honoured(alice, assistant, extra):
     assistant.router = ScriptedRouter("Fine.", skip_workers=True)
     assert chat(alice, "Hi", **extra)["choices"][0]["message"]["content"] == "Fine."
+
+
+def test_a_client_cannot_ask_for_a_longer_reply_than_a_turn_gives(alice, assistant):
+    assert asked(alice, assistant, max_tokens=10**9).max_tokens == assistant.conversation.reply_tokens

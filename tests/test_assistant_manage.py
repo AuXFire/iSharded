@@ -525,3 +525,22 @@ def test_nothing_here_needs_a_person_to_trust_a_request_for_their_name():
     source = (Path(manage_http.__file__)).read_text(encoding="utf-8")
     assert "body.by" not in source and "by: str" not in source
 
+
+
+# What one key can do to everyone
+
+
+def test_one_clients_limit_cannot_take_a_model_from_everyone(assistant, alice, bob):
+    """A refusal backs a provider off for every user, so a client's number must not cause one."""
+
+    class Picky(FakeProvider):
+        def complete(self, request, model):
+            if request.max_tokens > assistant.conversation.reply_tokens:
+                raise ValueError("max_tokens is more than this model can do")
+            return super().complete(request, model)
+
+    assistant.providers.register(Picky("picky"))
+    body = {"messages": [{"role": "user", "content": "Hi"}]}
+    assert alice.post("/v1/chat/completions", json={**body, "max_tokens": 10**9}).status_code == 200
+    assert assistant.store.one("SELECT count(*) AS total FROM model_health")["total"] == 0
+    assert bob.post("/v1/chat/completions", json=body).json()["choices"][0]["message"]["content"] == "ok"
