@@ -165,6 +165,14 @@ def test_a_draft_of_an_unknown_family_still_loads(monkeypatch):
     assert draft_cache_bytes(SimpleNamespace(config={})) == 0
 
 
+def test_a_draft_whose_header_cannot_size_its_cache_still_loads(monkeypatch):
+    def unreadable(layer, itemsize):
+        raise TypeError("head counts given per layer")
+
+    monkeypatch.setattr(orchestrator_module, "create_adapter", lambda config: SimpleNamespace(num_layers=1, kv_bytes_per_token=unreadable))
+    assert draft_cache_bytes(SimpleNamespace(config={})) == 0
+
+
 def test_a_load_with_room_takes_what_the_route_wants(pool):
     wanted = target()
     choose(pool, wanted)
@@ -280,6 +288,18 @@ def test_the_same_load_again_keeps_the_running_stages(pool):
     assert again.slots == chosen
 
 
+def test_the_same_load_on_a_pool_too_small_for_its_slots_chooses_again(pool):
+    pool.active = target()
+    choose(pool, pool.active)
+    chosen = pool.active.slots
+    assert chosen > 1
+    pool.offered = [worker("a", 700 * MIB, 100 * MIB), worker("b", 700 * MIB, 100 * MIB)]
+    again = target()
+    choose(pool, again)
+    assert again.slots < chosen
+    assert pool.plan(again)
+
+
 def test_another_load_chooses_for_itself(pool):
     pool.active = target()
     choose(pool, pool.active)
@@ -300,6 +320,18 @@ def test_a_pool_that_shrank_past_the_choice_chooses_again(pool):
     choose(pool, wanted)
     assert wanted.slots < chosen
     assert pool.plan(wanted)
+
+
+def test_a_pool_that_holds_nothing_for_now_leaves_the_running_choice_alone(pool):
+    wanted = target()
+    choose(pool, wanted)
+    chosen, sizes = wanted.parallel, wanted.profile.kv_bytes_per_token
+    assert wanted.slots > 1
+    pool.offered = [worker("a", 10 * MIB, 10 * MIB)]
+    choose(pool, wanted)
+    assert wanted.parallel == chosen
+    assert wanted.slots == chosen["slots"]
+    assert wanted.profile.kv_bytes_per_token == sizes
 
 
 def test_status_shows_the_choice_and_why(pool, monkeypatch):
@@ -323,6 +355,13 @@ def test_the_preview_shows_what_a_load_would_choose(pool, monkeypatch):
     response = TestClient(orchestrator_module.app).post("/admin/plan", json={"model_id": "m.gguf"})
     assert response.status_code == 200, response.text
     assert response.json()["parallel"] == wanted.slots > 1
+    assert not [event for event in pool.events if "at once" in event["title"]], "a preview chose nothing"
+
+
+def test_a_load_says_what_it_chose(pool):
+    wanted = target()
+    choose(pool, wanted)
+    assert [event["detail"] for event in pool.events if event["title"] == f"{wanted.slots} at once"] == [wanted.parallel["reason"]]
 
 
 def test_a_follower_takes_the_choice_with_the_route(pool, monkeypatch):

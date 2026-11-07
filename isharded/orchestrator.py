@@ -487,9 +487,9 @@ def draft_cache_bytes(draft: Manifest) -> int:
     """A draft of a family nobody planned for still guesses, and its cache just goes uncounted."""
     try:
         adapter = create_adapter(draft.config)
-    except UnsupportedModel:
+        return sum(adapter.kv_bytes_per_token(layer, 2) for layer in range(adapter.num_layers))
+    except (UnsupportedModel, KeyError, TypeError, ValueError, ZeroDivisionError):
         return 0
-    return sum(adapter.kv_bytes_per_token(layer, 2) for layer in range(adapter.num_layers))
 
 
 def resolve_projector(
@@ -555,8 +555,8 @@ def wanted_slots(route: list[StageAssignment], devices: list[str], links: dict[t
 
     While one reply goes round, that device can serve round trip / row time others, and only
     whole rows count. Replies that share a route without sharing passes cost each other: measured
-    with a CPU and a GPU stage, a trip of 1.8 rows gave two replies 58 tokens/s on two slots and 70
-    on one. Stages on one device take turns on it, so their rows add up, and a route on a single
+    with a CPU and a GPU stage, a trip of 1.8 rows gave two replies 58 tokens/s on two slots and 65
+    to 112 on one. Stages on one device take turns on it, so their rows add up, and a route on a single
     device has nothing to overlap: two stages on one GPU went from 128 to 70 at two slots.
     """
     names = [stage.worker_id for stage in route]
@@ -1518,7 +1518,7 @@ class Orchestrator:
         except PlacementError:
             return None
 
-    async def choose_slots(self, target: ModelTarget) -> None:
+    async def choose_slots(self, target: ModelTarget, *, preview: bool = False) -> None:
         """Settle how many replies a load runs at once, if the operator left that open.
 
         Slots are in every stage's signature, so changing them restarts stages. This
@@ -1526,20 +1526,27 @@ class Orchestrator:
         would hold the model.
         """
         if target.parallel.get("auto") and target.slots > 1 and self._route_or_none(target) is None:
+            slots = target.slots
+            with_slots(target, 1)
+            if self._route_or_none(target) is None:
+                with_slots(target, slots)  # nothing holds it for now, and its stages may yet return
+                return
             target.parallel = {}
         if target.parallel:
             return
         held = self.active
         if held is not None and held is not target and held.parallel.get("auto") and same_load(held, target):
             with_slots(target, held.slots)  # the same load again leaves its stages running
-            target.parallel = held.parallel
-            return
+            if self._route_or_none(target) is not None:
+                target.parallel = held.parallel
+                return
         with_slots(target, 1)
         route = self._route_or_none(target)
         if route is None:
             return  # the plan that follows says why
         target.parallel = await self._fit_slots(target, route)
-        self.add_event("model", f"{target.slots} at once", target.parallel["reason"])
+        if not preview:
+            self.add_event("model", f"{target.slots} at once", target.parallel["reason"])
 
     async def _fit_slots(self, target: ModelTarget, route: list[StageAssignment]) -> dict[str, Any]:
         """As many slots as the route wants and can hold, on the same workers, with no more spilled."""
@@ -3216,7 +3223,7 @@ async def preview_plan(body: LoadModelRequest, authorization: str | None = Heade
     await runtime.refresh_worker_metrics()
     await runtime.refresh_holdings(target)
     await runtime.measure_links(row_bytes(target))
-    await runtime.choose_slots(target)
+    await runtime.choose_slots(target, preview=True)
     route = runtime.plan_or_refuse(target, honor_pins_strictly=True)
     return {**describe_plan(target, route), "memory": runtime.plan_memory(target, route)}
 
