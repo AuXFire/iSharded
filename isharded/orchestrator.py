@@ -2645,7 +2645,6 @@ async def believe_forward(request: Request) -> str | None:
     return None
 
 
-@app.middleware("http")
 async def forward_to_coordinator(request: Request, call_next: Any) -> Any:
     """Serve the API from any node.
 
@@ -2726,7 +2725,6 @@ def page(name: str) -> HTMLResponse:
     return HTMLResponse(content, headers={"Cache-Control": "no-store"})
 
 
-@app.middleware("http")
 async def allow_mesh_pages(request: Request, call_next: Any) -> Any:
     """A chat page may fail over to another node, and only to another node.
 
@@ -2750,17 +2748,21 @@ async def allow_mesh_pages(request: Request, call_next: Any) -> Any:
 
 @app.middleware("http")
 async def audit_requests(request: Request, call_next: Any) -> Any:
-    """Record who changed things and who asked for replies. Prompts stay out of it."""
-    response = await call_next(request)
+    """Record who changed things and who asked for replies. Prompts stay out of it.
+
+    This is the only http middleware, and it runs the other two itself: each one
+    would add a hop between tasks for every chunk of every reply.
+    """
+    peer = PEER.get()  # forwarding clears this, and the record still names who passed it on
+    response = await allow_mesh_pages(request, lambda inner: forward_to_coordinator(inner, call_next))
     path = request.url.path
     if request.method != "GET" and path.startswith(FORWARDED_PATHS):
         # Every node that handles a request records it: anyone can send the forward mark.
         marked = FORWARD_MARK in request.headers
-        peer = None if marked else PEER.get()
-        caller = runtime.access.identify(request.headers.get("authorization"), peer)
+        caller = runtime.access.identify(request.headers.get("authorization"), None if marked else peer)
         vouched = getattr(request.state, "vouched", None)  # what was proven, and never what was claimed
         client = request.client.host if request.client else None
-        actor = f"{vouched} via {PEER.get()}" if vouched else caller.name if caller else "unknown"
+        actor = f"{vouched} via {peer}" if vouched else caller.name if caller else "unknown"
         runtime.audit.record(actor, request.method, path, response.status_code, client)
     return response
 
