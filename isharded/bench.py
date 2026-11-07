@@ -32,7 +32,8 @@ from .up import local_url, mesh_client, read_settings, sign_in_key, up_home
 LOCAL_NODE = "http://127.0.0.1:8000"
 LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 READ_SECONDS = 900.0  # a long prompt behind seven others can stay silent for minutes
-SIZING_TRIES = 4
+SIZING_TRIES = 5
+SIZING_FIRST_TOKENS_PER_UNIT = 64  # above any text here, so the first try cannot overrun a size that fits
 CACHED_REPLY_TOKENS = 8  # only the first token is being timed
 LONGEST_ERROR = 200
 
@@ -80,6 +81,9 @@ NOT_FOR_POSTING = (
     re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b"),
     re.compile(r"\[[0-9A-Fa-f:]*:[0-9A-Fa-f:]*\](?::\d+)?"),
     re.compile(r"(?<![\w.])/(?:[\w.-]+/)+[\w.-]*"),
+    re.compile(r"(?:\\\\)?[\w.-]+(?:\\[\w.-]+)+"),  # also what is left of a path with a space in it
+    re.compile(r"\b[\w-]+(?:\.[\w-]+)*:\d{2,5}\b"),
+    re.compile(r"(?<![\w:])[0-9A-Fa-f]*:[0-9A-Fa-f]*:[0-9A-Fa-f:]*"),
 )
 
 
@@ -87,8 +91,20 @@ class BenchError(RuntimeError):
     """Why there is nothing to measure."""
 
 
-def clean(text: str) -> str:
+def machine_names(status: dict[str, Any]) -> re.Pattern[str] | None:
+    """The mesh's own names. Its errors say which worker failed, and an id is often a machine's name."""
+    workers = status.get("workers") or {}
+    mesh = status.get("mesh") or {}
+    names = {*workers, *(mesh.get("members") or {}), mesh.get("node"), mesh.get("leader")}
+    names |= {((worker or {}).get("hardware") or {}).get("host_id") for worker in workers.values()}
+    found = sorted(filter(None, names), key=len, reverse=True)
+    return re.compile(r"(?<![\w-])(?:" + "|".join(map(re.escape, found)) + r")(?![\w-])", re.IGNORECASE) if found else None
+
+
+def clean(text: str, names: re.Pattern[str] | None = None) -> str:
     """A server's words, safe to post. Errors are the one free text in a report."""
+    if names:
+        text = names.sub("[hidden]", text)
     for pattern in NOT_FOR_POSTING:
         text = pattern.sub("[hidden]", text)
     return text[:LONGEST_ERROR]
@@ -273,6 +289,7 @@ class Bench:
     def __init__(self, client: httpx.Client, url: str, headers: dict[str, str], options: argparse.Namespace, clock: Callable[[], float] = time.perf_counter) -> None:
         self.client, self.url, self.headers, self.options, self.clock = client, url, headers, options, clock
         self.rng = random.Random(options.seed)
+        self.names: re.Pattern[str] | None = None
 
     def status(self) -> dict[str, Any]:
         try:
@@ -283,7 +300,13 @@ class Bench:
             raise BenchError("the node wants a key; give one with --key")
         if answer.status_code >= 400:
             raise BenchError(f"the node refused: HTTP {answer.status_code}")
-        return answer.json()
+        try:
+            status = answer.json()
+        except ValueError:
+            status = None
+        if not isinstance(status, dict):
+            raise BenchError("that address did not answer like an iSharded node")
+        return status
 
     def ask(self, prompt: str, tokens: int) -> Reply:
         """One streamed reply, timed here, where a person would feel it."""
@@ -301,14 +324,14 @@ class Bench:
         try:
             with self.client.stream("POST", self.url + "/v1/chat/completions", json=body, headers=self.headers) as answer:
                 if answer.status_code >= 400:
-                    reply.error = refusal(answer.status_code, answer.read())
+                    reply.error = refusal(answer.status_code, answer.read(), self.names)
                     return reply
                 for line in answer.iter_lines():
                     if not line.startswith("data: {"):
                         continue
                     data = json.loads(line[6:])
                     if "error" in data:
-                        reply.error = clean(str(data["error"].get("message")))
+                        reply.error = clean(str(data["error"].get("message")), self.names)
                         break
                     choice = (data.get("choices") or [{}])[0]
                     piece = (choice.get("delta") or {}).get("content")
@@ -320,8 +343,8 @@ class Bench:
                     if data.get("usage"):
                         reply.prompt_tokens = data["usage"]["prompt_tokens"]
                         reply.tokens = data["usage"]["completion_tokens"]
-        except (httpx.HTTPError, ValueError, KeyError) as exc:
-            reply.error = clean(str(exc)) or type(exc).__name__
+        except (httpx.HTTPError, ValueError, KeyError, AttributeError, TypeError) as exc:
+            reply.error = clean(str(exc), self.names) or type(exc).__name__
         reply.text = "".join(pieces)
         if not reply.error and not reply.prompt_tokens:
             reply.error = "the reply ended without its usage line"
@@ -333,7 +356,7 @@ class Bench:
         Only the node can say, and it has no route for counting, so this asks for
         one token at a time and reads what the prompt came to.
         """
-        units = max(wanted // 16, 1)
+        units = max(wanted // SIZING_FIRST_TOKENS_PER_UNIT, 1)
         best, best_gap = None, None
         for _ in range(SIZING_TRIES):
             reply = self.ask(build_prompt(self.options.text, units, self.rng), 1)
@@ -389,6 +412,8 @@ class Bench:
         problem = first.error or second.error
         if problem:
             return {"identical": None, "error": problem}
+        if not first.text:
+            return {"identical": None, "error": "the reply was empty"}
         return {"identical": first.text == second.text, "reply_tokens": first.tokens}
 
     def run(self) -> dict[str, Any]:
@@ -396,23 +421,31 @@ class Bench:
         before = self.status()
         if before.get("status") != "ready":
             raise BenchError(f"no model is ready here; the node says {clean(str(before.get('status')))}")
+        self.names = machine_names(before)
         results = [self.measure(wanted) for wanted in options.prompt_tokens]
-        after = self.status()
+        lost = None
+        try:
+            after = self.status()
+        except BenchError as exc:  # what was measured is still true, and a run can take an hour
+            after, lost = before, str(exc)
         measured = [result for result in results if "levels" in result]
         repeat = self.repeat_check(measured[0]["units"]) if measured else None
         for result in measured:
             del result["units"]  # only meaningful inside this run
-        return build_report(options, before, after, results, repeat)
+        report = build_report(options, before, after, results, repeat)
+        if lost:
+            report["notes"].append(f"The node's status could not be read after the run, so the native engine and decoding lines mean nothing here: {lost}")
+        return report
 
 
-def refusal(status_code: int, body: bytes) -> str:
+def refusal(status_code: int, body: bytes, names: re.Pattern[str] | None = None) -> str:
     if status_code == 429:
         return "the node's rate limit refused this reply"  # its words name the key
     try:
         detail = json.loads(body).get("detail")
     except (ValueError, AttributeError):
         detail = None
-    return f"HTTP {status_code}: {clean(str(detail))}" if detail else f"HTTP {status_code}"
+    return f"HTTP {status_code}: {clean(str(detail), names)}" if detail else f"HTTP {status_code}"
 
 
 def build_report(options: argparse.Namespace, before: dict[str, Any], after: dict[str, Any], results: list[dict[str, Any]], repeat: dict[str, Any] | None) -> dict[str, Any]:
@@ -438,6 +471,10 @@ def build_report(options: argparse.Namespace, before: dict[str, Any], after: dic
                 notes.append(f"{level['failed']} replies failed at {result['wanted_prompt_tokens']} tokens, {level['parallel']} at once: {error}")
             if level["short_replies"]:
                 notes.append(f"{level['short_replies']} replies at {result['wanted_prompt_tokens']} tokens, {level['parallel']} at once, ended before --tokens.")
+        if result.get("cached_failed"):
+            notes.append(f"{result['cached_failed']} cached replies failed at {result['wanted_prompt_tokens']} tokens.")
+    if repeat and repeat.get("error"):
+        notes.append(f"The repeat of a seeded reply could not be checked: {repeat['error']}")
     return {
         "format": 1,
         "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -505,7 +542,7 @@ def facts(report: dict[str, Any]) -> list[tuple[str, str]]:
         stages.append(f"{stage['stage']}: layers {stage['start_layer']}-{stage['end_layer'] - 1}, {stage['gpu']}, {where}{link}")
     way = f"pipeline {decoding['pipeline_tokens']} tokens, {decoding['pipeline_misses']} misses, depth {decoding['pipeline_depth']}"
     if decoding["draft_passes"]:
-        way += f"; draft {decoding['draft_passes']} passes, {decoding['draft_tokens_per_pass']} tokens per pass"
+        way += f"; draft {decoding['draft_passes']} passes, {decoding['draft_tokens_per_pass']} tokens per pass since the stage started"
     options = report["options"]
     same = "not checked" if repeat is None else "failed to run" if repeat["identical"] is None else "yes" if repeat["identical"] else "NO"
     rows = [
@@ -548,23 +585,35 @@ def connect(args: argparse.Namespace) -> tuple[str, dict[str, str], httpx.Client
     settings = read_settings(home)
     url = (args.url or (local_url(settings) if settings else LOCAL_NODE)).rstrip("/")
     key = args.key
-    if not key and httpx.URL(url).host in LOOPBACK:
+    try:
+        own_node = httpx.URL(url).host in LOOPBACK
+    except httpx.InvalidURL as exc:
+        raise BenchError(f"that is not an address: {clean(str(exc))}") from exc
+    if not key and own_node:
         key = sign_in_key(home) or load_token()
-    verify = str(home / "ca.pem") if settings and settings.get("tls") and url.startswith("https:") else client_verify()
+    verify = str(home / "ca.pem") if own_node and settings and settings.get("tls") and url.startswith("https:") else client_verify()
     return url, bearer_headers(key), mesh_client(verify, READ_SECONDS)
 
 
+def went_wrong(report: dict[str, Any]) -> bool:
+    """Whether a reply failed, or nothing was measured. A size with no room is the load's limit, not a failure."""
+    results = report["results"]
+    levels = [level for item in results for level in item.get("levels", [])]
+    failed_sizes = [item for item in results if "skipped" in item and not item["skipped"].startswith("HTTP 400")]
+    repeat = report["repeat_check"] or {}
+    return not levels or any(level["failed"] for level in levels) or bool(failed_sizes) or any(item.get("cached_failed") for item in results) or "error" in repeat
+
+
 def run_bench(args: argparse.Namespace) -> int:
-    url, headers, client = connect(args)
     try:
+        url, headers, client = connect(args)
         with client:
             result = Bench(client, url, headers, args).run()
     except BenchError as exc:
         print(f"Cannot run the bench: {exc}", file=sys.stderr)
         return 1
     print(as_text(result))
-    levels = [level for item in result["results"] for level in item.get("levels", [])]
-    code = 0 if levels and not any(level["failed"] for level in levels) else 1
+    code = 1 if went_wrong(result) else 0
     for name, text in ((args.json_file, json.dumps(result, indent=2) + "\n"), (args.markdown_file, as_markdown(result))):
         try:
             if name:

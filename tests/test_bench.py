@@ -86,6 +86,7 @@ class FakeNode:
         self.statuses = [status(100), status(350, reused=0)]
         self.status_code = 200
         self.context = 100_000
+        self.tokens_per_word = 1
         self.reply_tokens: int | None = None
         self.text_of = lambda body, count: ["word "] * count
         self.fail: dict[str, str] = {}
@@ -102,13 +103,20 @@ class FakeNode:
         if request.url.path == "/admin/status":
             if self.status_code != 200:
                 return httpx.Response(self.status_code, json={"detail": "no"})
-            return httpx.Response(200, json=self.statuses[0] if len(self.statuses) == 1 else self.statuses.pop(0))
+            answer = self.statuses[0] if len(self.statuses) == 1 else self.statuses.pop(0)
+            return answer if isinstance(answer, httpx.Response) else httpx.Response(200, json=answer)
         body = json.loads(request.content)
         self.bodies.append(body)
         prompt = body["messages"][0]["content"]
-        prompt_tokens = len(prompt.split()) + OPENING_TOKENS
+        prompt_tokens = len(prompt.split()) * self.tokens_per_word + OPENING_TOKENS
         if prompt_tokens > self.context:
             return httpx.Response(400, json={"detail": f"the prompt is {prompt_tokens} tokens, and this model was loaded with room for {self.context}"})
+        if "big" in self.fail and prompt_tokens > 1000:
+            return httpx.Response(503, json={"detail": self.fail["big"]})
+        if "cached" in self.fail and body["max_tokens"] == bench.CACHED_REPLY_TOKENS:
+            return httpx.Response(503, json={"detail": self.fail["cached"]})
+        if "repeat" in self.fail and body["max_tokens"] > 1 and prompt in self.seen:
+            return httpx.Response(503, json={"detail": self.fail["repeat"]})
         if body["max_tokens"] > 1:
             if "http" in self.fail:
                 return httpx.Response(503, json={"detail": self.fail["http"]})
@@ -137,6 +145,9 @@ class FakeNode:
                 self.clock.advance(TOKEN_SECONDS)
             if "stream" in self.fail and body["max_tokens"] > 1:
                 yield f'data: {json.dumps({"error": {"message": self.fail["stream"], "code": 503}})}\n\n'.encode()
+                return
+            if "plain" in self.fail and body["max_tokens"] > 1:
+                yield f'data: {json.dumps({"error": self.fail["plain"]})}\n\n'.encode()
                 return
             if "cut" in self.fail and body["max_tokens"] > 1:
                 return
@@ -302,6 +313,13 @@ def test_sizing_ends_even_when_it_cannot_hit_the_size(wanted):
     assert run(node, "--prompt-tokens", str(wanted), "--text", "counting")["results"][0]["levels"]
 
 
+def test_a_first_guess_too_big_does_not_cost_a_size_that_fits():
+    node = FakeNode()
+    node.context, node.tokens_per_word = 4096, 3  # code runs to about 30 tokens a line
+    level = run(node, "--prompt-tokens", "3400", "--text", "code")["results"][0]["levels"][0]
+    assert abs(level["prompt_tokens"] - 3400) <= 68
+
+
 def test_a_size_the_model_has_no_room_for_is_skipped_and_said():
     node = FakeNode()
     node.context = 1000
@@ -398,6 +416,25 @@ def test_nothing_private_reaches_a_clean_report_either():
         assert private not in written
 
 
+@pytest.mark.parametrize("failure", ["http", "stream"])
+def test_a_machine_named_in_a_failure_stays_out_of_a_report(failure):
+    node = FakeNode()
+    node.fail[failure] = f"the entry worker could not answer: {{'failed_worker': '{MACHINE}-1', 'message': 'lost'}} on {MACHINE}"
+    written = everything_written(run(node))
+    assert "could not answer" in written and MACHINE not in written
+
+
+@pytest.mark.parametrize(
+    "private",
+    [r"C:\Users\John Smith\logs\w1.log", r"\\fileserver\share\w1.log", "db-node.example.org:8301", "2001:db8::1"],
+)
+def test_addresses_and_paths_without_a_clean_edge_are_hidden(private):
+    shown = bench.clean(f"lost {private} just now")
+    assert shown.startswith("lost ") and shown.endswith(" just now")
+    for part in ("Smith", "w1.log", "fileserver", "example.org", "db8"):
+        assert part not in shown
+
+
 def test_a_rate_limit_does_not_name_the_key():
     assert bench.refusal(429, b'{"detail": "rate limit reached for somebody"}') == "the node's rate limit refused this reply"
 
@@ -467,6 +504,63 @@ def test_a_node_that_cannot_be_measured_says_why(monkeypatch, capsys, code, read
     assert not node.bodies
 
 
+def test_a_size_that_failed_is_a_failure_though_one_with_no_room_is_not(monkeypatch, capsys):
+    node = FakeNode()
+    node.fail["big"] = "stage lost"
+    assert run_command(monkeypatch, node, "--prompt-tokens", "200,3400") == 1
+    node = FakeNode()
+    node.context = 1000
+    assert run_command(monkeypatch, node, "--prompt-tokens", "200,3400") == 0
+
+
+def test_a_failed_cached_reply_fails_the_command_and_is_noted(monkeypatch, capsys):
+    node = FakeNode()
+    node.fail["cached"] = "busy"
+    assert run_command(monkeypatch, node, "--cached") == 1
+    assert "cached replies failed" in capsys.readouterr().out
+
+
+def test_a_repeat_check_that_could_not_run_fails_the_command_and_says_why(monkeypatch, capsys):
+    node = FakeNode()
+    node.fail["repeat"] = "stage lost"
+    assert run_command(monkeypatch, node) == 1
+    assert "stage lost" in capsys.readouterr().out
+
+
+def test_empty_replies_prove_nothing_about_repeating(monkeypatch, capsys):
+    node = FakeNode()
+    node.text_of = lambda body, count: []
+    assert run_command(monkeypatch, node) == 1
+    assert "identical: failed to run" in capsys.readouterr().out
+
+
+def test_a_plain_error_in_the_stream_is_a_failed_reply():
+    node = FakeNode()
+    node.fail["plain"] = "busy"
+    assert run(node)["results"][0]["levels"][0]["failed"] == 2
+
+
+def test_losing_the_node_at_the_end_keeps_what_was_measured(monkeypatch, capsys):
+    node = FakeNode()
+    node.statuses = [status(100), httpx.Response(500, json={"detail": "no"})]
+    run_command(monkeypatch, node)
+    shown = capsys.readouterr().out
+    assert "Tokens/s per reply" in shown and "could not be read after the run" in shown
+
+
+def test_something_that_is_not_a_node_says_so(monkeypatch, capsys):
+    node = FakeNode()
+    node.statuses = [httpx.Response(200, text="<html>hello</html>")]
+    assert run_command(monkeypatch, node) == 1
+    assert "did not answer like" in capsys.readouterr().err
+
+
+def test_a_bad_address_says_so(up_folder, capsys):
+    arguments = cli.build_parser().parse_args(["bench", "--url", "http://:abc"])
+    assert bench.run_bench(arguments) == 1
+    assert "Cannot run the bench" in capsys.readouterr().err
+
+
 def test_a_node_that_does_not_answer_says_so(monkeypatch, capsys):
     def refuse(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError(f"cannot reach {ADDRESS}")
@@ -529,6 +623,14 @@ def test_a_tls_node_is_checked_against_the_meshs_authority(up_folder, monkeypatc
     monkeypatch.setattr(bench, "mesh_client", lambda verify, timeout: seen.update(verify=verify, timeout=timeout) or httpx.Client())
     assert connect()[0] == "https://127.0.0.1:8209"
     assert seen == {"verify": str(up_folder / "ca.pem"), "timeout": bench.READ_SECONDS}
+
+
+def test_this_meshs_authority_is_not_forced_on_a_node_elsewhere(up_folder, monkeypatch):
+    (up_folder / "settings.json").write_text(json.dumps({"port": 8209, "tls": True}), encoding="utf-8")
+    seen = {}
+    monkeypatch.setattr(bench, "mesh_client", lambda verify, timeout: seen.update(verify=verify) or httpx.Client())
+    connect("--url", "https://somebody-elses-mesh:8209")
+    assert seen == {"verify": True}
 
 
 def test_the_guide_covers_the_command():

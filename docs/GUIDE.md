@@ -827,9 +827,9 @@ isharded bench --prompt-tokens 128 --parallel 1,2 --repeat 5 --text code --json 
 | `--url` | This machine's node | Any node's address |
 | `--key` | This machine's own | An API key. A user key is enough. See below |
 
-With no `--url` it reads the `up` folder, so `isharded bench` on a node just works. The saved key, or the pool token, goes only to this machine's own node. For any other `--url`, give `--key`, so that benching someone else's mesh cannot hand them your key.
+With no `--url` it reads the `up` folder, so `isharded bench` on a node just works. The saved key, or the pool token, goes only to this machine's own node. For any other `--url`, give `--key`, so that benching someone else's mesh cannot hand them your key. In the same way this mesh's certificate authority is used only for this machine's own node. For a node elsewhere whose certificate comes from a mesh's own authority, name that authority's file in `ISHARDED_CA_FILE`.
 
-Each prompt size starts with a few one-token requests that find how much text comes to that size on the model's own tokenizer, because a node has no route for counting. Prompts are fixed text in the module behind a prefix that is new every time, so nothing comes from the prompt cache, not even from an earlier run with the same seed. The table shows the size the prompts came to, which lands within 16 tokens or 2% of the size asked for. A size the model was not loaded with room for is skipped and noted. The defaults need a load with `--context-tokens` of 4096 or more.
+Each prompt size starts with a few one-token requests that find how much text comes to that size on the model's own tokenizer, because a node has no route for counting. Prompts are fixed text in the module behind a prefix that is new every time, so nothing comes from the prompt cache, not even from an earlier run with the same seed. The table shows the size the prompts came to, which usually lands within 16 tokens or 2% of the size asked for. A size the model was not loaded with room for is skipped and noted. The defaults need a load with `--context-tokens` of 4096 or more.
 
 What it reports:
 
@@ -841,9 +841,9 @@ What it reports:
 | Total tokens/s | All the tokens of a round, divided by the whole round, reading prompts included. This is what the mesh delivers |
 | Repeat of a seeded reply identical | The same seeded request, sent twice. `NO` deserves a look, as one route should repeat itself. It does not fail the run |
 
-Each number is the median of the measurements, with the lowest and highest in brackets. The report also says what explains them: the model and its quantization (read from the name), each stage's layers, GPU and country, link times where the status has them, the pipeline's tokens, misses and depth, any draft's tokens per pass, whether the native engine was on, the iSharded version nodes report, and the commit of the copy running the bench, if it is a git checkout. It leaves out addresses, keys, machine names and paths, so it is safe to post. Countries appear only where a node's operator shows one.
+Each number is the median of the measurements, with the lowest and highest in brackets. The report also says what explains them: the model and its quantization (read from the name), each stage's layers, GPU and country, link times where the status has them, the pipeline's tokens, misses and depth, any draft's passes in this run and its tokens per pass since the stage started, whether the native engine was on, the iSharded version nodes report, and the commit of the copy running the bench, if it is a git checkout. It leaves out addresses, keys, machine names and paths, so it is safe to post. Countries appear only where a node's operator shows one.
 
-Notes under the table say when something bent the numbers: a route that moved, cache use nobody asked for, `--cached` with no cache behind it, replies that ended before `--tokens`, sizes skipped. A node keeps prompt states only with room for them, in `--state-ram-gb` or `--state-disk-gb`. It exits with 1 if any reply failed, or if nothing could be measured. A repeat that differs does not fail it.
+Notes under the table say when something bent the numbers: a route that moved, cache use nobody asked for, `--cached` with no cache behind it, replies that ended before `--tokens`, sizes skipped. A node keeps prompt states only with room for them, in `--state-ram-gb` or `--state-disk-gb`. It exits with 1 if any reply failed, or if nothing could be measured. A repeat that differs does not fail it, and neither does a size the model has no room for.
 
 Read the numbers fairly. Two results compare only with the same model, the same quantization, and the same prompt size and reply length. After that:
 
