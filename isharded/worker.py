@@ -719,7 +719,9 @@ class WorkerRuntime:
                 await asyncio.to_thread(self.gguf.respawn)
             except (LlamaError, OSError, AssertionError) as exc:
                 self.last_error = f"stage would not restart: {exc}"
-                return HTTPException(status_code=500, detail=self.last_error)
+                # Not a 500, which reads as a request the stage refused: that ends the reply
+                # and blames nobody. This node has lost its stage, so it goes and the reply goes on.
+                return HTTPException(status_code=502, detail={"failed_worker": self.worker_id, "message": self.last_error})
             self.stage_restarts += 1
         if self.draft_request is not None and not draft_apart():
             await self.replace_draft(lost, draft)  # it lived in that process
