@@ -548,6 +548,7 @@ fn a_lost_closing_link_comes_back_at_both_ends() {
     let (mut ring, relay) = ring_through(0, 3, true, Duration::ZERO, 2000);
     ring.client.send(&pass(1, 5, 9).encode()).unwrap();
     answer(&mut ring);
+    wait_for_acknowledgements(&ring); // or the first answer is still held, and goes again
     relay.cut();
     wait_until("the closing link's loss", || relay.attempts() == 2);
     wait_until("the closing link's return", || ring.nodes[2].stats().closing_up && ring.nodes[0].stats().closing_up);

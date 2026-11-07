@@ -882,6 +882,11 @@ fn watch_peer(inner: &Arc<Inner>, ring: &Arc<Ring>, peer: &Arc<Peer>) {
             let _ = peer.link.beat(&wire::beat(Kind::Ping, stamp));
         }
     }
+    // A write that ran out of time closes the link from the writer's thread. On Windows that
+    // wakes no read of the socket, so the reader may never say so, and this is all that will.
+    if !peer.lost.load(Ordering::Acquire) && peer.link.write_failed() && !ring.is_shut() {
+        peer_lost(inner, ring, peer, "a write did not finish in time", true);
+    }
 }
 
 /// `silent` says the far end may be alive. A link that closed is usually a stage that died,
