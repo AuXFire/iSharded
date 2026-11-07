@@ -1491,11 +1491,7 @@ class WorkerRuntime:
         self._forget_hop(hop)
 
     async def _watch_hop(self, hop: NextHop) -> None:
-        """A link that goes silent raises nothing, and a pass on it would wait out its deadline.
-
-        An echo is given as long as the link gets to answer at all. One cut off sooner would
-        close the connection under it, and the next prompt would have to open a new one.
-        """
+        """A link that goes silent raises nothing, and a pass on it would wait out its deadline."""
         heard = time.monotonic()
         try:
             while not hop.lost.is_set():
@@ -2787,12 +2783,17 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
         pieces = prompt_parts(plan.cuts, len(prompt) - start) if PROMPT_PARTS and rows is None and len(runtime.route) > 1 else []
         restoring = runtime.gguf is not None and whole.restore_length is not None and len(runtime.route) > 1
         ahead = asyncio.ensure_future(runtime.restore_ahead(whole)) if restoring else None
+        failed = True
         try:
             result = await (runtime.run_in_parts(whole, pieces, reply_step) if len(pieces) > 1 else reply_step(whole, part))
+            failed = False
         finally:
             if ahead is not None:
                 # One still on its way could land after the slot has gone to another reply.
-                await asyncio.gather(ahead, return_exceptions=True)
+                # A failed pass may mean a silent stage, whose restore would hold the reply
+                # for its whole timeout, so then it gets only as long as a silent hop.
+                with suppress(Exception):
+                    await asyncio.wait_for(asyncio.shield(ahead), HOP_SILENCE_SECONDS if failed else None)
         for save in plan.saves:
             if save.replaces:
                 runtime.prefix.drop(save.replaces)

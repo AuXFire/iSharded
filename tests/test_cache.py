@@ -1028,6 +1028,24 @@ def test_a_reply_has_every_later_stage_restore_at_once_and_waits_for_them(monkey
     assert runtime.passes[1].reset and runtime.passes[1].checkpoint_key is None
 
 
+def test_a_failed_first_pass_waits_for_a_silent_stage_restore_only_as_long_as_a_silent_hop(monkeypatch):
+    prompt = chat(200, 100, 10)
+    key = prefix_key(prompt[:300])
+    runtime = fake_entry(monkeypatch, [missing(key), {"token_id": 5}])
+    runtime.route = [SimpleNamespace(worker_id=name) for name in ("w1", "w2", "w3")]
+    runtime.prefix.add(key, 300, HISTORY)
+
+    async def restore_ahead(request):
+        await asyncio.sleep(30)  # a suspended stage answers nothing until its timeout
+
+    runtime.restore_ahead = restore_ahead
+    monkeypatch.setattr(worker, "PROMPT_PARTS", False)
+    monkeypatch.setattr(worker, "HOP_SILENCE_SECONDS", 0.05)
+    began = time.monotonic()
+    assert generate(prompt) == [{"token_id": 5}]
+    assert time.monotonic() - began < 5
+
+
 def test_restore_ahead_goes_to_every_stage_but_this_one():
     seen = []
 
