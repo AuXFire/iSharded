@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <title>iSharded dashboard</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%2308738a' d='M6 3h14l-2.4 5H3.6zM8 10h14l-2.4 5H5.6zM4 17h14l-2.4 5H1.6z'/%3E%3C/svg%3E">
+  <title>iSharded</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%235d737b' d='M6 3h14l-2.4 5H3.6zM8 10h14l-2.4 5H5.6zM4 17h14l-2.4 5H1.6z'/%3E%3C/svg%3E">
   <script>try { const theme = localStorage.getItem('isharded-theme'); if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme; } catch {}</script>
   <style>/* isharded:ui.css */</style>
 </head>
@@ -15,89 +15,94 @@
     <a class="brand" href="/dashboard"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 3h14l-2.4 5H3.6zM8 10h14l-2.4 5H5.6zM4 17h14l-2.4 5H1.6z"/></svg><span>iSharded</span></a>
     <nav class="tabs" aria-label="Pages"><a href="/chat">Chat</a><a href="/dashboard" aria-current="page">Dashboard</a></nav>
     <div class="top-gap"></div>
-    <div class="pill tone-idle" id="pill" role="status"><i class="glyph work" id="pillGlyph"></i><span id="pillText">Connecting</span></div>
+    <div class="state-word" id="pill" role="status"><i class="glyph work" id="pillGlyph"></i><span id="pillText">Connecting</span></div>
     <button class="icon-btn" id="themeButton" type="button"></button>
     <button class="btn quiet" id="signOut" type="button" hidden>Sign out</button>
   </header>
 
-  <main id="main">
+  <main id="main" class="wrap console">
+    <div class="notices" id="notices"></div>
     <section class="console-head" aria-labelledby="headline">
-      <div class="wrap head-inner">
-        <div class="notices" id="notices"></div>
-        <div class="head-row">
-          <div class="head-copy">
-            <h1 class="headline" id="headline">Connecting to this node</h1>
-            <p class="subline" id="subline"></p>
-          </div>
-          <div class="actions" id="actions" hidden>
-            <button class="btn" id="addMachine" type="button">Add a machine</button>
-            <button class="btn" id="loadButton" type="button">Load a model</button>
-            <button class="btn" id="rebalanceButton" type="button">Rebalance</button>
-          </div>
-        </div>
-        <div class="instrument" id="instrument"><div class="ribbon skeleton" aria-hidden="true"></div></div>
-        <dl class="figures" id="figures" hidden></dl>
-        <div class="meta" id="meta" hidden></div>
+      <div class="head-copy">
+        <h1 class="headline" id="headline">Connecting to this node</h1>
+        <p class="subline" id="subline"></p>
+      </div>
+      <div class="actions" id="actions" hidden>
+        <span class="action-note" id="actionNote" hidden>A load is running.</span>
+        <button class="btn" id="addMachine" type="button">Add a machine</button>
+        <button class="btn" id="loadButton" type="button">Load a model</button>
+        <button class="btn" id="rebalanceButton" type="button">Rebalance</button>
       </div>
     </section>
 
-    <div class="wrap body-grid" id="bodyGrid" hidden>
-      <div class="main-col">
-        <section class="plate" id="routeSection" aria-labelledby="routeTitle" hidden>
-          <div class="section-head"><div><h2 id="routeTitle">Stages</h2><p class="section-note" id="routeNote"></p></div></div>
-          <div id="routeTable"></div>
-        </section>
+    <div id="needsTop"></div>
 
-        <section class="plate" id="lanesSection" aria-labelledby="lanesTitle" hidden>
-          <div class="section-head"><div><h2 id="lanesTitle">Also running</h2><p class="section-note">Models in their own lanes, beside the main one</p></div></div>
-          <div id="lanes"></div>
-        </section>
+    <section class="board" id="board" aria-labelledby="boardName" hidden>
+      <div class="board-title"><h2 id="boardName"></h2><span class="sample-word" id="sampleWord" hidden>Sample data</span><p id="boardAbout"></p></div>
+      <div id="routeDraw"></div>
+      <div id="loadStrip"></div>
+      <div class="lanes" id="lanes"></div>
+    </section>
+    <div class="hint" id="boardHint" hidden><span>The top line is the model's layers. The bottom line is one pass in time. The widest band is the slowest stage.</span><button class="btn small" type="button" id="hintDone">Got it</button></div>
+    <div id="startPanel"></div>
 
-        <section class="plate" id="machinesSection" aria-labelledby="machinesTitle">
-          <div class="section-head">
-            <div><h2 id="machinesTitle">Workers</h2><p class="section-note" id="machinesNote"></p></div>
-            <div class="head-tools">
-              <label class="field inline-field sort-field">Sort by
-                <select class="select" id="sortBy">
-                  <option value="state">State</option>
-                  <option value="name">Name</option>
-                  <option value="memory">Memory in use</option>
-                  <option value="compute">Compute</option>
-                  <option value="rtt">Control RTT</option>
-                </select>
-              </label>
-              <label class="field inline-field">Group by
-                <select class="select" id="groupBy">
-                  <option value="state">State</option>
-                  <option value="machine">Machine</option>
-                  <option value="accelerator">Accelerator</option>
-                  <option value="none">Nothing</option>
-                </select>
-              </label>
-            </div>
-          </div>
-          <div id="census"></div>
-          <div class="toolbar">
-            <label class="search"><span class="sr-only">Search workers</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.8-3.8"/></svg><input class="input" id="nodeSearch" type="search" placeholder="Search workers" autocomplete="off" spellcheck="false"></label>
-            <div class="chips" id="stateChips" role="group" aria-label="Filter workers by state"></div>
-          </div>
-          <div id="nodeTable"></div>
+    <div id="consoleBody" hidden>
+      <div class="bays">
+        <div class="bay bay-needs" id="needsBay"></div>
+        <section class="bay" aria-labelledby="machinesBayTitle"><h2 id="machinesBayTitle">Machines</h2><div id="machinesBay"></div></section>
+        <section class="bay" aria-labelledby="memoryTitle"><h2 id="memoryTitle">Memory</h2><div id="memoryBay"></div></section>
+        <section class="bay" aria-labelledby="activityTitle">
+          <div class="section-head"><h2 id="activityTitle">Activity</h2><div class="chips" id="feedChips" role="group" aria-label="Filter activity"></div></div>
+          <div class="feed" id="eventList" tabindex="0" role="group" aria-label="Recent events"></div>
         </section>
       </div>
 
-      <aside class="side-col" aria-label="What needs you and recent activity">
-        <section class="plate" id="attention" aria-labelledby="attentionTitle">
-          <div class="section-head"><h2 id="attentionTitle" tabindex="-1">Needs you</h2></div>
-          <div id="attentionList"></div>
-        </section>
-        <section class="plate activity" aria-labelledby="activityTitle">
-          <div class="section-head">
-            <div><h2 id="activityTitle">Activity</h2><p class="section-note">Recent changes in this mesh</p></div>
-            <div class="chips" id="feedChips" role="group" aria-label="Filter activity"></div>
+      <section class="section" id="routeSection" aria-labelledby="routeTitle" hidden>
+        <div class="section-head"><h2 id="routeTitle">Stages</h2></div>
+        <div id="routeTable"></div>
+      </section>
+
+      <section class="section" id="readingsSection" aria-labelledby="readingsTitle" hidden>
+        <div class="section-head"><h2 id="readingsTitle">Readings</h2></div>
+        <div id="readings"></div>
+        <p class="facts-note">Trends are kept by this tab since it opened, because the pool stores no history.</p>
+      </section>
+
+      <section class="section" id="machinesSection" aria-labelledby="machinesTitle">
+        <div class="section-head">
+          <div><h2 id="machinesTitle">Every machine</h2><p class="section-note" id="machinesNote"></p></div>
+          <div class="head-tools">
+            <label class="field inline-field">Sort by
+              <select class="select" id="sortBy">
+                <option value="state">State</option>
+                <option value="name">Name</option>
+                <option value="memory">Memory in use</option>
+                <option value="compute">Compute</option>
+                <option value="rtt">Round trip</option>
+              </select>
+            </label>
+            <label class="field inline-field">Group by
+              <select class="select" id="groupBy">
+                <option value="state">State</option>
+                <option value="machine">Machine</option>
+                <option value="accelerator">Accelerator</option>
+                <option value="none">Nothing</option>
+              </select>
+            </label>
           </div>
-          <div class="feed" id="eventList" tabindex="0" role="group" aria-label="Recent events"></div>
-        </section>
-      </aside>
+        </div>
+        <div class="toolbar">
+          <label class="search"><span class="sr-only">Search machines</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.8-3.8"/></svg><input class="input" id="nodeSearch" type="search" placeholder="Search machines" autocomplete="off" spellcheck="false"></label>
+          <div class="chips" id="stateChips" role="group" aria-label="Filter machines by state"></div>
+        </div>
+        <div id="nodeTable"></div>
+      </section>
+
+      <section class="section" aria-labelledby="factsTitle">
+        <div class="section-head"><h2 id="factsTitle">Facts</h2><button class="icon-btn" type="button" id="refreshButton" aria-label="Refresh now" data-tip="Refresh now"></button></div>
+        <dl class="facts" id="facts"></dl>
+        <p class="facts-note" id="factsNote" hidden></p>
+      </section>
     </div>
   </main>
 
@@ -106,7 +111,7 @@
   <dialog class="sheet" id="picker" aria-labelledby="pickerTitle">
     <form class="sheet-body" id="pickerForm" method="dialog">
       <h2 id="pickerTitle">Load a model</h2>
-      <label class="search" style="max-width:none"><span class="sr-only">Search models</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.8-3.8"/></svg><input class="input" id="catalogSearch" type="search" placeholder="Search the model list" autocomplete="off" spellcheck="false"></label>
+      <label class="search wide"><span class="sr-only">Search models</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.8-3.8"/></svg><input class="input" id="catalogSearch" type="search" placeholder="Search the model list" autocomplete="off" spellcheck="false"></label>
       <div class="scroll-list" id="catalog"></div>
       <label class="field">Or any Hugging Face model or GGUF file, or a folder on this node
         <input class="input" id="customModel" placeholder="Qwen/Qwen3-4B or owner/repo:file.gguf" autocomplete="off" spellcheck="false">
@@ -124,10 +129,10 @@
         </label>
       </div>
       <div class="fields">
-        <label class="field">Entry node, which sees your prompt
+        <label class="field">Entry worker, which sees your prompt
           <select class="select" id="entryWorker"></select>
         </label>
-        <label class="field">Exit node, which sees the reply
+        <label class="field">Exit worker, which sees the reply
           <select class="select" id="exitWorker"></select>
         </label>
       </div>
@@ -153,7 +158,7 @@
   <dialog class="sheet narrow" id="auth" aria-labelledby="authTitle">
     <form class="sheet-body" id="authForm">
       <h2 id="authTitle">Sign in</h2>
-      <p>This mesh is protected. Your key stays in this browser.</p>
+      <p>Enter this pool's key to see it. Your key stays in this browser.</p>
       <label class="field">Key
         <input class="input" id="tokenInput" type="password" autocomplete="current-password">
       </label>
@@ -162,11 +167,25 @@
     </form>
   </dialog>
 
+  <dialog class="sheet narrow" id="confirm" aria-labelledby="confirmTitle">
+    <div class="sheet-body">
+      <h2 id="confirmTitle"></h2>
+      <p id="confirmText"></p>
+      <p class="error" id="confirmError" role="alert" hidden></p>
+      <div class="sheet-actions">
+        <button class="btn" type="button" id="confirmNo"></button>
+        <button class="btn primary" type="button" id="confirmYes"></button>
+      </div>
+    </div>
+  </dialog>
+
   <div class="tip" id="tip" hidden></div>
   <div class="toast" id="toast" role="status"></div>
   <!-- isharded:flags.svg -->
 
   <script>
+    /* isharded:ui.js */
+    const { routeModel, drawBoard, drawRouteList, drawRail, focusStage, keyStages, sparkline, glyphHtml, tierOf, median, num, bytes, ms, duration, relative, clock, count, whole, span, modelName, jobRunning, TIER_ORDER } = UI;
     const $ = id => document.getElementById(id);
     const store = {
       get: key => { try { return localStorage.getItem(key); } catch { return null; } },
@@ -174,22 +193,22 @@
       drop: key => { try { localStorage.removeItem(key); } catch {} },
     };
     const state = {
-      token: store.get('isharded-token') || '', data: null, inventory: {}, inventoryGone: false, inventoryAt: 0, catalog: null, catalogFailed: false,
-      latency: [], polling: false, timer: null, failures: 0, signedOut: false, problem: '', updatedAt: null, lastMembers: {},
-      text: '', chip: 'all', group: store.get('isharded-group') || 'state', sortKey: 'state', sortDir: 1, groupsOpen: new Map(),
-      allStages: false, feed: 'all', openWorker: null, selected: '', previewTimer: null, previewId: 0,
+      token: store.get('isharded-token') || '', data: null, model: null, tab: {}, inventory: {}, inventoryGone: false, inventoryAt: 0, catalog: null, catalogFailed: false,
+      samples: [], polling: false, timer: null, failures: 0, signedOut: false, problem: '', updatedAt: null, lastMembers: {},
+      text: '', chip: 'all', group: store.get('isharded-group') || 'state', sortKey: 'state', sortDir: 1, groupsOpen: new Map(), limit: 50,
+      allStages: false, allRoute: false, openStage: null, allNeeds: false, feed: 'all', openWorker: null, selected: '', previewTimer: null, previewId: 0, markKey: '', confirmRun: null,
       joins: [], joinsHidden: false, joinsAt: 0, joinBusy: new Set(), joinErrors: new Map(),
     };
+    const phone = matchMedia('(max-width: 760px)');
 
-    const TIERS = { vram: ['VRAM', '--tier-vram'], unified: ['Unified', '--tier-unified'], ram: ['RAM', '--tier-ram'], disk: ['Disk', '--tier-disk'] };
-    const TIER_ORDER = ['vram', 'unified', 'ram', 'disk'];
+    const TIERS = { vram: ['VRAM'], unified: ['Unified'], ram: ['RAM'], disk: ['Disk'] };
     const STATES = {
-      quarantined: { label: 'Quarantined', rank: 0, glyph: 'warn', tone: 'warn' },
-      offline: { label: 'Offline', rank: 1, glyph: 'bad', tone: 'bad' },
-      active: { label: 'In route', rank: 2, glyph: 'ok', tone: 'idle' },
-      fetching: { label: 'Downloading', rank: 2, glyph: 'idle', tone: 'idle' },
-      service: { label: 'Cache service', rank: 3, glyph: 'idle', tone: 'idle' },
-      standby: { label: 'Idle', rank: 4, glyph: 'idle', tone: 'idle' },
+      offline: { label: 'Offline', rank: 0, mark: 'offline', tone: 'bad' },
+      quarantined: { label: 'Quarantined', rank: 1, mark: 'quarantined', tone: 'warn' },
+      active: { label: 'On the route', rank: 2, mark: 'active', tone: 'idle' },
+      fetching: { label: 'Fetching', rank: 2, mark: 'fetching', tone: 'work' },
+      service: { label: 'Cache service', rank: 3, mark: 'service', tone: 'idle' },
+      standby: { label: 'Idle', rank: 4, mark: 'standby', tone: 'idle' },
     };
     // The route decides whether a worker is in it, so its label can never disagree with its row.
     function workerState(id, worker, route) {
@@ -201,7 +220,7 @@
       const job = state.data?.load_job, mine = job?.workers?.[id];
       return jobRunning(job) && mine?.phase === 'fetching' ? mine : null;
     }
-    const PHASES = [['resolving', 'Read the tensor list'], ['fetching', 'Download each worker\'s shards'], ['loading', 'Move weights into memory']];
+    const PHASES = [['resolving', 'Read the tensor list'], ['fetching', 'Fetch each worker\'s shards'], ['loading', 'Move weights into memory']];
     const WORKER_KINDS = ['gpu', 'cpu', 'memory'];
     const ICONS = {
       system: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor" stroke="none"/></svg>',
@@ -219,20 +238,10 @@
     const countryName = code => flagged(code) ? regions?.of(code) || code : '';
     // With room set, a worker with no country keeps the column, so names still line up.
     const flagMark = (code, room) => flagged(code) ? `<svg class="flag" role="img" aria-label="${esc(countryName(code))}" data-tip="${esc(countryName(code))}"><use href="#flag-${code}"/></svg>` : room ? '<span class="flag-gap"></span>' : '';
-    const num = (value, digits = 1) => value == null || Number.isNaN(Number(value)) ? '—' : Number(value).toFixed(digits).replace(/\.0+$/, '');
-    const bytes = value => { if (!value) return '0 B'; const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']; const i = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1); return `${num(value / 1024 ** i, i > 2 ? 2 : 1)} ${units[i]}`; };
-    const duration = seconds => { if (seconds == null) return '—'; const d = Math.floor(seconds / 86400), h = Math.floor(seconds % 86400 / 3600), m = Math.floor(seconds % 3600 / 60); return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`; };
-    const relative = stamp => { const s = Math.max(0, Math.floor(Date.now() / 1000 - stamp)); return s < 5 ? 'just now' : s < 60 ? `${s}s ago` : s < 3600 ? `${Math.floor(s / 60)}m ago` : s < 86400 ? `${Math.floor(s / 3600)}h ago` : `${Math.floor(s / 86400)}d ago`; };
-    const clock = stamp => new Date(stamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    const count = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
-    const ms = value => value == null ? '—' : `${num(value)} ms`;
-    const whole = value => Number(value ?? 0).toLocaleString();
     const headers = () => state.token ? { Authorization: `Bearer ${state.token}` } : {};
-    // GGUF ids carry a repository and a file; the file names the model and its quantization.
-    const modelName = id => { const text = String(id || ''); if (/\.gguf$/i.test(text)) return text.split(/[:\\/]/).pop().replace(/\.gguf$/i, ''); if (/^([A-Za-z]:[\\/]|[\\/.~])/.test(text)) return text.split(/[\\/]/).filter(Boolean).pop() || text; return text; };
     const nodeOf = id => { const at = id.lastIndexOf('-'); return at > 0 && WORKER_KINDS.includes(id.slice(at + 1)) ? id.slice(0, at) : id; };
-    const jobRunning = job => Boolean(job) && !['ready', 'failed', 'cancelled'].includes(job.phase);
     const byName = (a, b) => String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' });
+    const rate = value => value == null ? '—' : Number(value).toFixed(1);
 
     // Repainting a region must not cost the operator their place in it.
     const painted = new WeakMap();
@@ -278,51 +287,14 @@
 
     function toast(message) { $('toast').textContent = message; $('toast').classList.add('show'); clearTimeout(toast.timer); toast.timer = setTimeout(() => $('toast').classList.remove('show'), 3200); }
 
-    function tierOf(data, workerId, poolId) {
-      const pools = data.workers?.[workerId]?.hardware?.memory_pools || [];
-      const kind = pools.find(pool => pool.pool_id === poolId)?.kind;
-      return TIERS[kind] ? kind : 'disk';
-    }
     function tierTotals(route, data) {
       const totals = {};
       for (const stage of route) for (const item of stage.placements || []) { const kind = tierOf(data, stage.worker_id, item.pool_id); totals[kind] = (totals[kind] || 0) + item.bytes; }
       return totals;
     }
-    const legend = totals => `<div class="legend">${TIER_ORDER.filter(kind => totals[kind]).map(kind => `<span class="tier-${kind}"><i></i>${TIERS[kind][0]} <b>${bytes(totals[kind])}</b></span>`).join('')}</div>`;
-    const stageRole = (index, total) => total === 1 ? 'Entry and exit' : index === 0 ? 'Entry' : index === total - 1 ? 'Exit' : `Stage ${index + 1}`;
-    const span = (start, end) => Number(end) - 1 > Number(start) ? `${Number(start)}–${Number(end) - 1}` : `${Number(start)}`;
-    const stageRange = stage => span(stage.start_layer, stage.end_layer);
-    const stageLayers = stage => `${Number(stage.end_layer) - Number(stage.start_layer) > 1 ? 'layers' : 'layer'} ${stageRange(stage)}`;
+    const stageLayers = stage => `${Number(stage.end_layer) - Number(stage.start_layer) > 1 ? 'layers' : 'layer'} ${span(stage.start_layer, stage.end_layer)}`;
     const stageMemory = (stage, data) => { const totals = tierTotals([stage], data); return TIER_ORDER.filter(kind => totals[kind]).map(kind => `${TIERS[kind][0]} ${bytes(totals[kind])}`).join(', '); };
-
-    function ribbon(route, data, { progress = null, stale = false, open = true } = {}) {
-      const unit = (layer, part) => `layer-${String(layer).padStart(5, '0')}.${part}`;
-      const parts = route.map((stage, index) => {
-        const start = Number(stage.start_layer), layers = Number(stage.end_layer) - start;
-        const placed = Object.fromEntries((stage.placements || []).map(item => [item.unit, item]));
-        const fallback = stage.placements?.length ? 'disk' : 'none';
-        const kind = item => item ? tierOf(data, stage.worker_id, item.pool_id) : fallback;
-        const worker = data.workers?.[stage.worker_id];
-        const tone = !worker || !worker.live ? ' bad' : worker.quarantined ? ' warn' : '';
-        const job = progress?.[stage.worker_id];
-        const share = job ? (job.bytes_total ? job.bytes_done / job.bytes_total : 1) : 0;
-        let cells = '';
-        for (let offset = 0; offset < layers; offset += 1) {
-          const dense = placed[unit(start + offset, 'dense')], experts = placed[unit(start + offset, 'experts')];
-          cells += `<span class="cell${progress && (offset + 1) / layers <= share ? ' done' : ''}"><i class="tier-${kind(dense)}"></i>${experts ? `<i class="experts tier-${kind(experts)}"></i>` : ''}</span>`;
-        }
-        const compute = worker?.runtime?.telemetry?.compute_ms_ema;
-        const tip = [`${stage.worker_id}, ${stageRole(index, route.length).toLowerCase()}`, stageLayers(stage), stageMemory(stage, data), job ? `${bytes(job.bytes_done)} of ${bytes(job.bytes_total)} fetched` : compute != null ? `${num(compute)} ms compute` : ''].filter(Boolean).join('\n');
-        return `<div class="seg${tone}${progress ? ' fetching' : ''}" style="--layers:${layers}" data-tip="${esc(tip)}"${open ? ` data-worker="${esc(stage.worker_id)}"` : ''}>${cells}</div>`;
-      }).join('');
-      return `<div class="ribbon${stale ? ' stale' : ''}" role="img" aria-label="${esc(`${route.length} stages. The stage list has the same details.`)}">${parts}</div>`;
-    }
-    function ribbonNotes(route) {
-      const first = route[0], last = route[route.length - 1], many = route.length > 2;
-      const ends = fit => `<div class="ribbon-ends${fit}"><span><b>${esc(first.worker_id)}</b> entry, layer ${Number(first.start_layer)}</span><span><b>${esc(last.worker_id)}</b> exit, layer ${Number(last.end_layer) - 1}</span></div>`;
-      if (route.length > 6) return ends('');
-      return `${many ? ends(' narrow-only') : ''}<div class="ribbon-notes${many ? ' wide-only' : ''}">${route.map((stage, index) => `<div style="--layers:${Number(stage.end_layer) - Number(stage.start_layer)}"><b>${esc(stage.worker_id)}</b><span>${stageRole(index, route.length)}, ${stageLayers(stage)}</span></div>`).join('')}</div>`;
-    }
+    const machineCount = (route, data) => new Set(route.map(stage => data.workers?.[stage.worker_id]?.hardware?.host_id ?? stage.worker_id)).size;
 
     function memoryOf(data) {
       const byKind = data.virtual_hardware?.memory_by_kind || {};
@@ -331,194 +303,173 @@
       return { byKind, budget: budget || data.virtual_hardware?.ram_total_bytes || 0, used };
     }
 
-    /* What the operator most needs to know, worked out from what the mesh reports. */
+    /* What the operator most needs to know, worked out from what the pool reports. */
     function assess(data) {
       const workers = Object.entries(data.workers || {}).map(([id, worker]) => ({ id, ...worker }));
-      const route = data.route || [], job = data.load_job, running = jobRunning(job), lanes = data.lanes || [];
+      const route = data.route || [], job = data.load_job, running = jobRunning(job), lanes = data.lanes || [], model = state.model;
       const name = modelName(data.model), issues = [];
       const lost = route.filter(stage => { const worker = data.workers?.[stage.worker_id]; return !worker || !worker.live; });
       const lostIds = new Set(lost.map(stage => stage.worker_id));
       const quarantined = workers.filter(worker => worker.state === 'quarantined');
       const offline = workers.filter(worker => worker.state === 'offline' && !lostIds.has(worker.id));
-      if (lost.length) issues.push({ tone: 'bad', title: `${count(lost.length, 'stage')} of the route stopped answering`, detail: lost.map(stage => stage.worker_id).join(', '), worker: lost[0].worker_id });
-      if (job?.phase === 'failed') issues.push({ tone: route.length ? 'warn' : 'bad', title: `${modelName(job.model)} did not load`, detail: job.error });
+      const stageOf = id => model?.stages.find(stage => stage.workerId === id);
+      if (lost.length === 1) issues.push({ tone: 'bad', title: `${lost[0].worker_id} stopped answering`, detail: `It holds stage ${stageOf(lost[0].worker_id)?.n}. Check the machine and its network.`, worker: lost[0].worker_id, stage: stageOf(lost[0].worker_id)?.n });
+      else if (lost.length) issues.push({ tone: 'bad', n: lost.length, title: `${count(lost.length, 'stage')} of the route stopped answering`, detail: lost.slice(0, 4).map(stage => stage.worker_id).join(', ') + (lost.length > 4 ? ` and ${lost.length - 4} more` : ''), filter: 'attention' });
+      if (job?.phase === 'failed') issues.push({ tone: route.length ? 'warn' : 'bad', title: `${modelName(job.model)} did not load`, detail: job.error, retry: job.model });
       for (const lane of lanes) if (lane.error) issues.push({ tone: 'warn', title: `Lane ${lane.name} failed`, detail: lane.error });
-      const group = (list, tone, word, reason) => {
-        if (list.length > 3) issues.push({ tone, title: `${count(list.length, 'worker')} ${word}`, detail: list.slice(0, 4).map(worker => worker.id).join(', ') + (list.length > 4 ? ` and ${list.length - 4} more` : ''), filter: 'attention' });
-        else for (const worker of list) issues.push({ tone, title: `${worker.id} ${word}`, detail: reason(worker), worker: worker.id });
+      if (data.last_audit && data.last_audit.verdict !== 'agree') issues.push({ tone: 'bad', title: 'Routes disagree', detail: (data.last_audit.suspects || []).length ? `The route to check: ${data.last_audit.suspects.join(', ')}.` : 'Two routes gave different replies. Load a third route to see which one is wrong.' });
+      for (const stage of model?.stages || []) if (stage.spillSlow) issues.push({ tone: 'warn', title: `Stage ${stage.n} runs partly from ${TIERS[stage.tier]?.[0] || 'slower memory'}`, detail: `${stage.workerId} holds ${bytes(stage.spilledBytes)} below its best memory, and each layer takes ${num(stage.ratioToOthers)} times as long as on the other stages.`, stage: stage.n });
+      const group = (list, tone, word, reason, one) => {
+        if (list.length > 3) issues.push({ tone, n: list.length, title: `${count(list.length, 'machine')} ${word}`, detail: list.slice(0, 4).map(worker => worker.id).join(', ') + (list.length > 4 ? ` and ${list.length - 4} more` : ''), filter: 'attention' });
+        else for (const worker of list) issues.push({ tone, title: `${worker.id} is ${word}`, detail: reason(worker), worker: worker.id, stage: stageOf(worker.id)?.n, ...one(worker) });
       };
-      group(quarantined, 'warn', 'quarantined', worker => worker.quarantine_reason || 'It is being checked before it can rejoin.');
-      group(offline, 'bad', 'offline', () => 'It stopped checking in.');
+      group(quarantined, 'warn', 'quarantined', worker => {
+        const stage = stageOf(worker.id), why = worker.quarantine_reason ? 'It failed: ' + worker.quarantine_reason + '.' : 'It is being checked before it can rejoin.';
+        return stage?.moving ? `${why} Stage ${stage.n} is moving to ${stage.moving.to}, so the route needs nothing from you. Fix the machine and it rejoins after a run of healthy checks.` : `${why} Fix the machine and it rejoins after a run of healthy checks.`;
+      }, worker => ({ cordon: nodeOf(worker.id) }));
+      group(offline, 'bad', 'offline', () => 'It stopped checking in. Check the machine and its network.', () => ({}));
+      for (const item of state.joins) issues.push({ tone: 'warn', join: item, title: `${item.name} wants to join` });
       if (data.mesh && !data.mesh.leader) issues.push({ tone: 'warn', title: 'No coordinator', detail: 'Replies keep running, but nothing can be repaired or loaded until a node takes over.' });
+      const entry = model?.stages[0]?.worker?.runtime?.telemetry;
+      if (data.status === 'ready' && route.length > 1 && entry?.ring && entry.ring_live === false) issues.push({ tone: 'info', title: 'Direct links are down', detail: 'Tokens are using the slower HTTP path.' });
       const battery = Object.entries(state.inventory).filter(([, item]) => item.battery && item.battery.on_mains === false).map(([node]) => node);
       if (battery.length) issues.push({ tone: 'info', title: `${count(battery.length, 'machine')} on battery`, detail: battery.slice(0, 4).join(', ') + (battery.length > 4 ? ` and ${battery.length - 4} more` : '') });
+      for (const item of [].concat(data.proposals ?? [])) issues.push({ tone: 'info', title: item.title ?? String(item), detail: item.detail ?? '' });
 
       issues.sort((a, b) => ['bad', 'warn', 'info'].indexOf(a.tone) - ['bad', 'warn', 'info'].indexOf(b.tone));
       const alerts = issues.filter(issue => issue.tone !== 'info');
-      const summary = () => {
-        const parts = [];
-        if (quarantined.length) parts.push(`${count(quarantined.length, 'worker')} quarantined`);
-        if (offline.length) parts.push(`${offline.length} offline`);
-        const rest = alerts.length - (quarantined.length > 3 ? 1 : quarantined.length) - (offline.length > 3 ? 1 : offline.length);
-        if (rest > 0) parts.push(count(rest, 'other problem'));
-        return parts.join(', ');
-      };
-      const machines = data.virtual_hardware?.hosts ?? 0, memory = memoryOf(data);
-      const asking = state.joins.length ? `${count(state.joins.length, 'machine')} asking to join.` : 'Nothing needs you.';
-      const healthy = `${count(route.length, 'stage')} on ${count(new Set(route.map(stage => data.workers?.[stage.worker_id]?.hardware?.host_id ?? stage.worker_id)).size, 'machine')}. ${asking}`;
+      const needed = alerts.reduce((n, issue) => n + (issue.n || 1), 0);
+      const look = (tone, glyph, word, title, detail, extra) => ({ tone, glyph, word, title, detail, issues, ...extra });
+      const machines = data.virtual_hardware?.hosts ?? 0, speed = data.metrics?.tokens_per_second_ema;
+      const left = job?.bytes_per_second ? Math.ceil(Math.max((job.bytes_total || 0) - (job.bytes_done || 0), 0) / job.bytes_per_second) : null;
       if (data.status === 'ready') {
-        if (lost.length) return { tone: 'bad', glyph: 'bad', label: 'Failed', title: `${name} lost part of its route`, detail: 'Replies may stall until the mesh repairs the route.', issues };
-        if (alerts.length) return { tone: 'warn', glyph: 'warn', label: 'Degraded', title: `Serving ${name}`, detail: `${summary()}. Replies are still being served.`, issues };
-        if (running) return { tone: 'work', glyph: 'work', label: 'Working', title: `Serving ${name}`, detail: `${job.model === data.model ? 'A new layout' : modelName(job.model)} is being prepared. Replies stay on the current layout until every shard is in place.`, issues };
-        return { tone: 'ok', glyph: 'ok', label: 'Healthy', title: `Serving ${name}`, detail: healthy, issues };
+        if (lost.length) return look('bad', 'bad', 'Route lost', `${name} lost part of its route`, 'Replies may stall until the pool repairs the route.');
+        if (alerts.length) return look('warn', 'warn', `${needed} need${needed === 1 ? 's' : ''} you`, needed === 1 ? alerts[0].title : `${needed} machines need you`, `Replies are still being served. ${count(route.length, 'stage')} at ${rate(speed)} tokens/s.`);
+        if (running) return look('work', 'work', 'Loading', job.model === data.model ? 'Preparing a new layout' : `Loading ${modelName(job.model)} beside this route`, 'Replies stay on the current route until every shard is in place.');
+        const where = `${count(route.length, 'stage')} on ${count(machineCount(route, data), 'machine')}`;
+        return look('idle', '', 'Healthy', 'Serving, and nothing needs you', speed ? `${where}, ${rate(speed)} tokens/s.` : `${where}. No replies yet.`);
       }
-      if (running) return { tone: 'work', glyph: 'work', label: 'Loading', title: `Loading ${modelName(job.model)}`, detail: 'Chat opens when every shard is in place.', issues };
-      if (data.status === 'recovering') return { tone: 'work', glyph: 'work', label: 'Recovering', title: `Recovering ${name || 'the last model'}`, detail: 'Waiting for its workers to come back.', issues };
-      if (data.status === 'repairing') return { tone: 'work', glyph: 'work', label: 'Repairing', title: `Repairing ${name}`, detail: 'A stage lost its layers. Replies wait for the repair.', issues };
-      if (job?.phase === 'failed') return { tone: 'bad', glyph: 'bad', label: 'Failed', title: `${modelName(job.model)} did not load`, detail: job.error, issues, empty: workers.some(worker => worker.live) ? 'model' : 'machines' };
-      if (!workers.some(worker => worker.live)) return { tone: 'idle', glyph: 'idle', label: 'No machines', title: 'No machines connected', detail: 'This node is running, but no worker has joined it yet.', issues, empty: 'machines' };
-      return { tone: alerts.length ? 'warn' : 'idle', glyph: alerts.length ? 'warn' : 'idle', label: alerts.length ? 'Degraded' : 'No model', title: 'No model loaded', detail: `${count(machines, 'machine')} ready. Choose a model to start.`, issues, empty: 'model' };
+      if (running && route.length && job.model === data.model && model) {
+        const moving = model.stages.filter(stage => stage.moving);
+        const wait = `New replies wait until the route is whole again${left != null ? `, about ${left} s at this rate` : ''}.`;
+        if (moving.length === 1) return look('work', 'work', 'Repairing', `Moving stage ${moving[0].n} off ${moving[0].workerId}`, wait);
+        if (moving.length) return look('work', 'work', 'Repairing', `Moving ${moving.length} stages`, wait);
+      }
+      if (running) return look('work', 'work', 'Loading', `Loading ${modelName(job.model)}`, 'Chat opens when every shard is in place.');
+      if (data.status === 'recovering') return look('work', 'work', 'Recovering', `Recovering ${name || 'the last model'}`, 'Waiting for its workers to come back.');
+      if (data.status === 'repairing') return look('work', 'work', 'Repairing', `Repairing ${name}`, 'A stage lost its layers. Replies wait for the repair.');
+      if (job?.phase === 'failed') return look('bad', 'bad', 'Load failed', `${modelName(job.model)} did not load`, String(job.error ?? 'The load stopped.') + ' Check the name and try again, or pick another model.', { empty: workers.some(worker => worker.live) ? 'model' : 'machines' });
+      if (!workers.some(worker => worker.live)) return look('idle', 'idle', 'No machines', 'No machines connected', 'This node is running, and no machine has joined it yet.', { empty: 'machines' });
+      return look(alerts.length ? 'warn' : 'idle', alerts.length ? 'warn' : 'idle', alerts.length ? `${needed} need${needed === 1 ? 's' : ''} you` : 'No model', 'No model loaded', `${count(machines, 'machine')} ready. Choose a model to start.`, { empty: 'model' });
     }
 
-    function setPill(tone, glyph, label) {
-      $('pill').className = `pill tone-${tone}`;
+    function setWord(tone, glyph, word) {
+      $('pill').className = `state-word tone-${tone}`;
       $('pillGlyph').className = `glyph ${glyph}`;
-      $('pillText').textContent = label;
+      $('pillGlyph').hidden = !glyph;
+      $('pillText').textContent = word;
+    }
+    const tabTitle = word => { document.title = word ? `${word}: iSharded` : 'iSharded'; };
+
+    /* The board */
+
+    function boardSentence(model) {
+      const parts = [`${count(model.layers, 'layer')} on ${count(model.stages.length, 'stage')}.`];
+      if (model.passMs != null) parts.push(`${model.serving ? 'One pass takes' : 'The last pass took'} about ${num(model.passMs, 0)} ms: ${num(model.computeMs, 0)} ms of compute and ${num(model.linksMs, 0)} ms on links.`);
+      if (model.ratePerSecond != null) parts.push(`${model.serving ? '' : 'Last rate '}${rate(model.ratePerSecond)} tokens/s${model.draftModel && model.tokensPerPass != null ? `, ${num(model.tokensPerPass)} tokens a pass with draft ${model.draftModel}` : ''}.`);
+      else if (model.draftModel) parts.push(`Draft ${model.draftModel}.`);
+      if (model.epoch != null) parts.push(`Epoch ${model.epoch}.`);
+      return parts.join(' ');
+    }
+    function openStage(stage) {
+      state.openStage = stage.workerId;
+      if (state.model && !keyStages(state.model).has(stage.n)) state.allStages = true;
+      renderStages(state.data);
+      const row = $('routeTable').querySelector(`[data-key="s:${CSS.escape(stage.workerId)}"]`);
+      row?.scrollIntoView({ block: 'center' });
+      row?.focus();
+    }
+    function renderBoard(data) {
+      const model = state.model, job = data.load_job, running = jobRunning(job);
+      $('board').hidden = !model && !running;
+      $('boardHint').hidden = !model || phone.matches || Boolean(store.get('isharded-board-hint')) || model.stages.every(stage => stage.computeMs == null);
+      $('sampleWord').hidden = !data.simulated;
+      $('boardName').textContent = model?.name || modelName(job?.model);
+      $('boardAbout').textContent = model ? boardSentence(model) : '';
+      if (!model) $('routeDraw').textContent = '';
+      else if (phone.matches) { if ($('routeDraw').board) $('routeDraw').board.signature = null; drawRouteList($('routeDraw'), model, { all: state.allRoute }); }
+      else drawBoard($('routeDraw'), model, { last: !model.serving || model.stages.some(stage => stage.failed), onOpen: openStage });
+      paint($('loadStrip'), running ? loadStrip(job, data) : '');
+      renderLanes(data);
+    }
+    function renderLanes(data) {
+      const lanes = data.lanes || [];
+      paint($('lanes'), lanes.map(lane => {
+        const route = lane.route || [], running = jobRunning(lane.load_job);
+        const look = lane.error ? ['bad', `Failed: ${esc(lane.error)}`] : lane.ready ? ['', `Ready on ${count(route.length, 'stage')}`] : ['work', running ? `Loading, ${esc(lane.load_job.phase)}` : 'Starting'];
+        return `<div class="lane-line"><div class="lane-name">Lane ${esc(lane.name)}<span>${esc(modelName(lane.model) || 'No model yet')}</span></div><div>${route.length ? `<div data-lane="${esc(lane.name)}"></div>` : ''}<span class="quiet-text">${route.length ? 'This lane does not report stage times here.' : count(lane.workers || 0, 'worker')}</span></div><div class="lane-tools"><span class="tag ${look[0]}">${look[0] ? glyphHtml(look[0]) : ''}${look[1]}</span><button class="btn small" type="button" data-lane-remove="${esc(lane.name)}" data-key="l:${esc(lane.name)}">Remove lane</button></div></div>`;
+      }).join(''));
+      for (const lane of lanes) {
+        const target = $('lanes').querySelector(`[data-lane="${CSS.escape(lane.name)}"]`);
+        if (target) drawRail(target, routeModel({ route: lane.route, workers: data.workers }).stages);
+      }
     }
 
-    function loadPanel(job) {
-      const ratio = job.bytes_total ? job.bytes_done / job.bytes_total : 0, percent = Math.floor(ratio * 100);
+    function loadStrip(job, data) {
       const at = PHASES.findIndex(([phase]) => phase === job.phase);
       const steps = PHASES.map(([, label], index) => `<li class="${index < at ? 'done' : index === at ? 'now' : ''}"${index === at ? ' aria-current="step"' : ''}>${esc(label)}</li>`).join('');
+      // bytes_reused is what was already there. bytes_done is what has arrived, from other machines or the source.
+      const here = job.bytes_reused || 0, done = Math.min(job.bytes_done || 0, job.bytes_total || 0), peers = Math.min(job.bytes_from_peers || 0, done), source = done - peers, rest = Math.max((job.bytes_total || 0) - done, 0);
+      const whole_ = here + done + rest || 1, part = (cls, value) => value ? `<i class="${cls}" style="width:${(value / whole_ * 100).toFixed(2)}%"></i>` : '';
+      const percent = Math.floor((here + done) / whole_ * 100);
+      const key = [['tier-vram', 'On these workers', here], ['tier-ram', 'From other machines', peers], ['from-source', 'From the source', source], ['to-fetch', 'Still to fetch', rest]].filter(([, , value]) => value).map(([cls, label, value]) => `<span><i class="${cls}"></i>${label} ${bytes(value)}</span>`).join('');
       const workers = Object.values(job.workers || {}), finished = workers.filter(worker => worker.phase === 'ready').length;
-      const parts = [];
-      if (job.bytes_total) parts.push(`${bytes(job.bytes_done)} of ${bytes(job.bytes_total)}`);
-      if (job.bytes_per_second) parts.push(`${bytes(job.bytes_per_second)}/s`);
-      if (job.bytes_from_peers) parts.push(`${bytes(job.bytes_from_peers)} from other nodes`);
-      if (job.bytes_reused) parts.push(`${bytes(job.bytes_reused)} already here`);
-      if (workers.length) parts.push(`${finished} of ${count(workers.length, 'worker')} ready`);
+      const left = job.bytes_per_second ? Math.ceil(rest / job.bytes_per_second) : null;
+      const pace = [job.bytes_per_second ? `Fetching at ${bytes(job.bytes_per_second)}/s${left != null ? `, about ${left} s left` : ''}` : (job.bytes_total ? '' : 'Working out where each layer goes'), workers.length ? `${finished} of ${count(workers.length, 'worker')} ready` : ''].filter(Boolean).join('. ');
       const cancel = job.phase !== 'loading' ? '<button class="btn small" type="button" data-action="cancel" data-key="cancel">Cancel load</button>' : '';
-      return `<div class="load"><ol class="steps">${steps}</ol><div class="progress" role="progressbar" aria-label="Load progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><i style="width:${(ratio * 100).toFixed(1)}%"></i></div><div class="load-foot"><span>${esc(parts.join(', ') || 'Working out where each layer goes')}</span>${cancel}</div></div>`;
+      return `<div class="load"><div class="load-head"><h3>Loading ${esc(modelName(job.model))}</h3><ol class="steps">${steps}</ol></div><div class="stack-bar" role="progressbar" aria-label="Load progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}">${part('tier-vram', here)}${part('tier-ram', peers)}${part('from-source', source)}</div><div class="legend">${key}</div><div class="load-foot"><span>${esc(pace)}</span>${cancel}</div></div>`;
     }
 
     const sizeBytes = text => { const match = /([\d.]+)\s*(MB|GB|TB)/i.exec(text || ''); return match ? Number(match[1]) * { MB: 1e6, GB: 1e9, TB: 1e12 }[match[2].toUpperCase()] : 0; };
     function modelRows(models, budget) {
-      return models.map(model => { const big = budget && sizeBytes(model.size) > budget; return `<li><button class="model-row${big ? ' too-big' : ''}" type="button" data-model="${esc(model.id)}" data-key="m:${esc(model.id)}" aria-pressed="${model.id === state.selected}"><span class="id">${esc(modelName(model.id))}</span><span class="meta">${esc(big ? 'Larger than this mesh' : model.kind)}</span><span class="meta">${esc(model.size)}</span></button></li>`; }).join('');
+      return models.map(model => { const big = budget && sizeBytes(model.size) > budget; return `<li><button class="model-row${big ? ' too-big' : ''}" type="button" data-model="${esc(model.id)}" data-key="m:${esc(model.id)}" aria-pressed="${model.id === state.selected}"><span class="id">${esc(modelName(model.id))}</span><span class="meta">${esc(big ? 'Larger than this pool' : model.kind)}</span><span class="meta">${esc(model.size)}</span></button></li>`; }).join('');
     }
+    const memoryMeter = (kind, used, budget) => `<div class="mem-row"><div><span>${esc(TIERS[kind]?.[0] || kind)}</span><span>${bytes(used)} of ${bytes(budget)}</span></div><div class="meter" role="img" aria-label="${budget ? Math.round(used / budget * 100) : 0} percent in use">${used ? `<i class="tier-${TIERS[kind] ? kind : 'disk'}" style="width:${(used / budget * 100).toFixed(1)}%"></i>` : ''}</div></div>`;
     function firstRun(data) {
-      const { byKind, budget } = memoryOf(data);
-      const kinds = TIER_ORDER.filter(kind => byKind[kind]?.budget_bytes);
-      const capacity = kinds.length ? `<div class="ribbon" aria-hidden="true">${kinds.map(kind => `<div class="seg" style="--layers:${byKind[kind].budget_bytes}"><span class="cell"><i class="tier-${kind}"></i></span></div>`).join('')}</div>${legend(Object.fromEntries(kinds.map(kind => [kind, byKind[kind].budget_bytes])))}` : '';
+      const { budget } = memoryOf(data);
       const fit = (state.catalog || []).filter(model => !budget || sizeBytes(model.size) <= budget).sort((a, b) => sizeBytes(b.size) - sizeBytes(a.size)).slice(0, 6);
       const list = state.catalogFailed ? '<p class="list-note">The model list could not be read. You can still load a model by name.</p>' : state.catalog ? (fit.length ? `<ul class="model-list">${modelRows(fit, budget)}</ul>` : '<p class="list-note">No listed model fits this memory. Add a machine, or load a smaller model by name.</p>') : '<p class="list-note">Reading the model list</p>';
-      return `<div class="first-run"><div><h2>${esc(bytes(budget))} of memory for weights</h2>${capacity}<p class="capacity-note">Each machine holds only its share, so a model can be larger than any one of them.</p></div><div><h2>Models that fit</h2><div class="scroll-list" style="max-height:none">${list}</div><p style="margin-top:8px"><button class="link" type="button" data-action="load" data-key="all-models">See every model</button></p></div></div>`;
+      return `<div class="first-run"><div><p>Nothing is loaded. Pick a model to see where it would run before anything downloads.</p><p class="capacity-note">Each machine holds only its share, so a model can be larger than any one of them.</p></div><div><h2>Models that fit</h2><div class="scroll-list">${list}</div><p class="capacity-note"><button class="link" type="button" data-action="load" data-key="all-models">See every model</button></p></div></div>`;
+    }
+    function renderStart(data, view) {
+      if (view.empty === 'model') { paint($('startPanel'), firstRun(data)); if (!state.catalog && !state.catalogFailed) readCatalog(); }
+      else if (view.empty === 'machines') paint($('startPanel'), '<div class="empty"><b>No machines yet</b><span>Create an invite, and run its command on the machine you want to add.</span><button class="btn primary" type="button" data-action="invite" data-key="a:invite">Add a machine</button></div>');
+      else paint($('startPanel'), '');
     }
 
-    function renderInstrument(data, view) {
-      const route = data.route || [], job = data.load_job, running = jobRunning(job), stale = state.failures > 0, parts = [];
-      if (route.length) {
-        const layers = route.reduce((n, stage) => n + Number(stage.end_layer) - Number(stage.start_layer), 0);
-        parts.push(`<div class="instrument-head"><h2>${count(layers, 'layer')} across ${count(route.length, 'stage')}</h2>${legend(tierTotals(route, data))}</div><div>${ribbon(route, data, { stale })}${ribbonNotes(route)}</div>`);
-      }
-      if (running) {
-        const target = job.route || [];
-        if (target.length && !route.length) parts.push(`<div>${ribbon(target, data, { progress: job.workers || {}, open: false })}${ribbonNotes(target)}</div>`);
-        parts.push(loadPanel(job));
-      }
-      if (!route.length && !running) {
-        if (view.empty === 'model') { parts.push(firstRun(data)); if (!state.catalog && !state.catalogFailed) readCatalog(); }
-        else if (view.empty === 'machines') parts.push('<div class="empty" style="padding-left:0"><b>Add the first machine</b><span>Workers appear here as they join. Start one with <code>python -m isharded node</code>, or create an invite.</span></div>');
-      }
-      paint($('instrument'), parts.join(''));
-    }
+    /* Needs you */
 
-    function renderFigures(data) {
-      const workers = Object.values(data.workers || {}), live = workers.filter(worker => worker.live).length, metrics = data.metrics || {}, memory = memoryOf(data), machines = data.virtual_hardware?.hosts ?? 0;
-      const spark = (() => {
-        const values = state.latency; if (values.length < 2) return '';
-        const min = Math.min(...values), max = Math.max(...values), range = max - min || 1;
-        const line = values.map((value, index) => `${(index / (values.length - 1) * 84).toFixed(1)},${(25 - (value - min) / range * 22).toFixed(1)}`).join(' L');
-        return `<svg class="spark" viewBox="0 0 84 28" preserveAspectRatio="none" aria-hidden="true"><path d="M${line}"/></svg>`;
-      })();
-      const figure = (label, value, unit, note = '', extra = '') => `<div class="figure"><dt>${esc(label)}</dt><dd><div class="figure-row"><span class="figure-value">${esc(value)}${unit && value !== '—' ? `<span class="figure-unit">${esc(unit)}</span>` : ''}</span>${extra}</div><div class="figure-note">${esc(note) || '&nbsp;'}</div></dd></div>`;
-      const memoryText = bytes(memory.budget).split(' ');
-      paint($('figures'), [
-        figure('Throughput', num(metrics.tokens_per_second_ema, 1), 'tokens/s'),
-        figure('Token latency', num(metrics.token_latency_ms_ema), 'ms', '', spark),
-        figure('Workers online', `${live} of ${workers.length}`, '', count(machines, 'machine')),
-        figure('Memory for weights', memoryText[0], memoryText[1], `${bytes(memory.used)} in use`),
-        figure('Recoveries', whole(metrics.recoveries_total), 'total'),
-        figure('Requests', whole(metrics.requests_total), 'total', `${whole(metrics.tokens_generated)} tokens generated`),
-      ].join(''));
+    function issueLine(issue) {
+      if (issue.join) return joinLine(issue.join);
+      const mark = issue.tone === 'bad' ? 'bad' : issue.tone === 'warn' ? 'warn' : 'idle', key = esc(issue.title), buttons = [];
+      if (issue.worker) buttons.push(`<button class="btn small" type="button" data-worker="${esc(issue.worker)}" data-key="i:w:${key}">Open machine</button>`);
+      if (issue.cordon && !state.data?.cordoned_nodes?.includes(issue.cordon)) buttons.push(`<button class="btn small" type="button" data-cordon="${esc(issue.cordon)}" data-key="i:c:${key}">Cordon this machine</button>`);
+      if (issue.stage) buttons.push(`<button class="btn small" type="button" data-show-stage="${issue.stage}" data-key="i:s:${key}">Show on the route</button>`);
+      if (issue.filter) buttons.push(`<button class="btn small" type="button" data-action="show-attention" data-key="i:f:${key}">Show them</button>`);
+      if (issue.retry) buttons.push(`<button class="btn small" type="button" data-model="${esc(issue.retry)}" data-key="i:r:${key}">Try again</button>`);
+      return `<div class="issue">${glyphHtml(mark)}<div class="issue-body"><b>${esc(issue.title)}</b><p>${esc(issue.detail)}</p>${buttons.length ? `<div class="issue-actions">${buttons.slice(0, 2).join('')}</div>` : ''}</div></div>`;
     }
-    function renderMeta(data) {
-      const parts = [];
-      if (data.mesh) {
-        parts.push(`<span>Coordinator <b>${esc(data.mesh.leader || 'none')}</b>, term ${esc(data.mesh.term)}</span>`);
-        parts.push(`<span>This node <b>${esc(data.mesh.node)}</b></span>`);
-        parts.push(`<span>${count(Object.keys(data.mesh.members || {}).length, 'control plane')} reachable</span>`);
-      }
-      parts.push(`<span>Epoch <b>${esc(data.epoch)}</b></span>`, `<span>Up <b>${esc(duration(data.uptime_seconds))}</b></span>`);
-      if (data.ownerless) parts.push(`<span>Ownerless network, joining ${esc(data.ownerless.joining)}</span>`);
-      if ((data.cordoned_nodes || []).length) parts.push(`<span>${count(data.cordoned_nodes.length, 'node')} cordoned</span>`);
-      if (data.model_profile === 'protocol-test') parts.push('<span><b>Test model.</b> It checks sharding, not language quality.</span>');
-      parts.push(`<span>Updated ${esc(clock(state.updatedAt))}</span>`, `<button class="icon-btn" type="button" data-action="refresh" data-key="refresh" aria-label="Refresh now" data-tip="Refresh now">${ICONS.refresh}</button>`);
-      paint($('meta'), parts.join(''));
-    }
-
-    function renderRoute(data) {
-      const route = data.route || [];
-      $('routeSection').hidden = !route.length;
-      if (!route.length) return;
-      const layers = route.reduce((n, stage) => n + Number(stage.end_layer) - Number(stage.start_layer), 0), plan = data.active_plan || {};
-      const rows = route.map((stage, index) => {
-        const worker = data.workers?.[stage.worker_id] || {};
-        return { stage, index, worker, compute: worker.runtime?.telemetry?.compute_ms_ema, state: workerState(stage.worker_id, worker, route) };
-      });
-      const timed = rows.filter(row => row.compute != null), slowest = timed.length > 2 ? timed.reduce((a, b) => b.compute > a.compute ? b : a) : null;
-      const notes = [`${count(route.length, 'stage')}, ${count(layers, 'layer')}, epoch ${esc(data.epoch)}`];
-      if (plan.estimated_tokens_per_second) notes.push(`planned for about ${esc(plan.estimated_tokens_per_second)} tokens/s`);
-      if (plan.draft_model) notes.push(`draft model ${esc(modelName(plan.draft_model))}`);
-      if (data.cache_url) notes.push('RAM KV protected');
-      if (slowest) notes.push(`slowest stage ${esc(slowest.stage.worker_id)} at ${num(slowest.compute)} ms`);
-      paint($('routeNote'), notes.join(', '));
-      const keep = row => row.index === 0 || row.index === route.length - 1 || row === slowest || row.state !== 'active';
-      const shown = state.allStages || route.length <= 8 ? rows : rows.filter(keep);
-      const room = rows.some(row => flagged(row.worker.country));
-      const line = row => {
-        const look = STATES[row.state] || STATES.offline, hw = row.worker.hardware || {};
-        const problem = row.state === 'active' ? '' : ` problem ${look.tone}`;
-        return `<tr class="row${problem}" data-worker="${esc(row.stage.worker_id)}"><td class="num">${row.index + 1}</td><td class="name-cell"><div class="name-line">${flagMark(row.worker.country, room)}<button class="name-link" type="button" data-worker="${esc(row.stage.worker_id)}" data-key="s:${esc(row.stage.worker_id)}">${esc(row.stage.worker_id)}</button></div><span class="sub">${esc([stageRole(row.index, route.length).replace(/^Stage \d+$/, ''), (hw.backend || '').toUpperCase()].filter(Boolean).join(', '))}</span></td><td>${stageRange(row.stage)}</td><td>${esc(stageMemory(row.stage, data)) || '—'}</td><td class="right">${ms(row.compute)}${row === slowest ? ' <span class="tag">Slowest</span>' : ''}</td><td><span class="state-cell tone-${look.tone}"><i class="glyph ${look.glyph}"></i><span>${esc(look.label)}</span></span></td></tr>`;
-      };
-      const more = shown.length < rows.length || state.allStages && route.length > 8;
-      const foot = more ? `<div class="table-foot"><span>Showing ${shown.length} of ${count(rows.length, 'stage')}</span><button class="link" type="button" data-action="stages" data-key="stages">${state.allStages ? 'Show key stages' : 'Show every stage'}</button></div>` : '';
-      paint($('routeTable'), `<table class="grid stages"><thead><tr><th scope="col">Stage</th><th scope="col">Worker</th><th scope="col">Layers</th><th scope="col">Memory</th><th scope="col" class="right">Compute</th><th scope="col">State</th></tr></thead><tbody>${shown.map(line).join('')}</tbody></table>${foot}`);
-    }
-
-    function renderLanes(data) {
-      const lanes = data.lanes || [];
-      $('lanesSection').hidden = !lanes.length;
-      paint($('lanes'), lanes.map(lane => {
-        const route = lane.route || [], running = jobRunning(lane.load_job);
-        const look = lane.error ? ['bad', 'bad', 'Failed: ' + lane.error] : lane.ready ? ['ok', 'idle', `Ready on ${count(route.length, 'stage')}`] : ['work', 'work', running ? `Loading, ${lane.load_job.phase}` : 'Starting'];
-        const strip = route.length ? ribbon(route, data, { open: false }) : '';
-        return `<div class="lane"><div class="lane-name">${esc(lane.name)}<span class="sub">${esc(modelName(lane.model) || 'No model yet')}</span></div><div class="lane-state tone-${look[1]}"><i class="glyph ${look[0]}"></i><span style="color:var(--ink)">${esc(look[2])}</span></div><div>${strip}<span class="sub">${count(lane.workers || 0, 'worker')}${route.length ? ', memory not reported here' : ''}</span></div></div>`;
-      }).join(''));
-    }
-
-    function renderAttention(view) {
-      if (state.failures) { paint($('attentionList'), '<div class="all-clear tone-idle"><i class="glyph idle"></i><span>Not known until this node answers</span></div>'); return; }
-      const list = view.issues;
-      const line = issue => {
-        const look = issue.tone === 'bad' ? ['bad', 'bad'] : issue.tone === 'warn' ? ['warn', 'warn'] : ['idle', 'idle'];
-        const action = issue.worker ? `<button class="btn small" type="button" data-worker="${esc(issue.worker)}" data-key="i:${esc(issue.worker)}">View</button>` : issue.filter ? `<button class="btn small" type="button" data-action="show-attention" data-key="i:filter">Show</button>` : '';
-        return `<li><i class="glyph ${look[0]} tone-${look[1]}"></i><div class="issue-body"><b>${esc(issue.title)}</b><p>${esc(issue.detail)}</p></div>${action}</li>`;
-      };
-      const joins = state.joins.length ? `<div class="joins"><p class="join-note">Check that each fingerprint matches what the new machine shows before you approve it.</p><ul class="issues">${state.joins.map(joinLine).join('')}</ul></div>` : '';
-      let html = joins + (list.length ? `<ul class="issues">${list.map(line).join('')}</ul>` : '');
-      if (view.empty === 'machines') html += '<div class="empty compact"><b>This mesh has no workers yet</b><button class="btn primary" type="button" data-action="invite" data-key="a:invite">Add a machine</button></div>';
-      else if (!joins && !list.some(issue => issue.tone !== 'info')) html = `<div class="all-clear tone-ok"><i class="glyph ok"></i><span>Nothing right now</span></div>${html}`;
-      paint($('attentionList'), html);
+    function renderNeeds(view) {
+      const slot = phone.matches ? $('needsTop') : $('needsBay'), other = phone.matches ? $('needsBay') : $('needsTop');
+      paint(other, '');
+      const head = '<h2 id="attentionTitle" tabindex="-1">Needs you</h2>';
+      if (state.failures) { paint(slot, `<div class="needs calm">${head}<p>Not known until this node answers.</p></div>`); return; }
+      const list = view.issues, alerts = list.filter(issue => issue.tone !== 'info');
+      if (!list.length) { paint(slot, phone.matches ? '' : `<div class="needs calm">${head}<p>Nothing right now.</p></div>`); return; }
+      const shown = state.allNeeds ? list : list.slice(0, 3), more = list.length - shown.length;
+      const worst = alerts.some(issue => issue.tone === 'bad') ? 'bad' : alerts.length ? 'warn' : '';
+      const note = state.joins.length ? '<p class="quiet-text">Check that each fingerprint matches what the new machine shows before you approve it.</p>' : '';
+      paint(slot, `<div class="needs ${worst}">${head}${note}${shown.map(issueLine).join('')}${more > 0 ? `<p class="issue-more"><button class="link" type="button" data-action="all-needs" data-key="i:more">and ${more} more</button></p>` : ''}</div>`);
     }
 
     /* Machines asking to join. Anyone may ask, so all of this is someone else's text. */
@@ -526,13 +477,13 @@
     function joinLine(item) {
       const name = String(item.name ?? ''), busy = state.joinBusy.has(name) ? ' disabled' : '', failure = state.joinErrors.get(name);
       const addresses = [].concat(item.addresses ?? []).join(', ') || 'None given';
-      return `<li><i class="glyph ok tone-work"></i><div class="issue-body"><b>${esc(name)} wants to join</b><dl class="join-facts"><dt>Addresses</dt><dd>${esc(addresses)}</dd><dt>Key fingerprint</dt><dd><code>${esc(item.fingerprint ?? 'Unknown')}</code></dd></dl>${failure ? `<p class="error" role="alert">${esc(failure)}</p>` : ''}<div class="join-actions"><button class="btn small primary" type="button" data-join="approve" data-name="${esc(name)}" data-key="j:a:${esc(name)}"${busy}>Approve</button><button class="btn small" type="button" data-join="deny" data-name="${esc(name)}" data-key="j:d:${esc(name)}"${busy}>Deny</button></div></div></li>`;
+      return `<div class="issue">${glyphHtml('warn')}<div class="issue-body"><b>${esc(name)} wants to join</b><dl class="join-facts"><dt>Addresses</dt><dd>${esc(addresses)}</dd><dt>Key fingerprint</dt><dd><code>${esc(item.fingerprint ?? 'Unknown')}</code></dd></dl>${failure ? `<p class="error" role="alert">${esc(failure)}</p>` : ''}<div class="issue-actions"><button class="btn small" type="button" data-join="approve" data-name="${esc(name)}" data-key="j:a:${esc(name)}"${busy}>Approve</button><button class="btn small" type="button" data-join="deny" data-name="${esc(name)}" data-key="j:d:${esc(name)}"${busy}>Deny</button></div></div></div>`;
     }
     function joinsChanged() {
       if (!state.data) return;
       const view = assess(state.data);
-      if (!state.failures) $('subline').textContent = view.detail;
-      renderAttention(view);
+      if (!state.failures) { $('subline').textContent = view.detail; $('headline').textContent = view.title; setWord(view.tone, view.glyph, view.word); }
+      renderNeeds(view);
     }
     async function readJoins(force = false) {
       if (state.joinsHidden || state.signedOut || document.hidden || readJoins.busy) return;
@@ -559,7 +510,7 @@
         else await api(`/admin/join/${encodeURIComponent(name)}/deny`, { method: 'POST', admin: true });
         state.joins = state.joins.filter(item => item.name !== name);
         toast(`${decision === 'approve' ? 'Approved' : 'Denied'} ${name}`);
-        $('attentionTitle').focus();
+        $('attentionTitle')?.focus();
       } catch (error) { state.joinErrors.set(name, joinError(error)); }
       finally { state.joinBusy.delete(name); joinsChanged(); readJoins(true); }
     }
@@ -579,7 +530,7 @@
       }
       const kinds = {};
       for (const entry of Object.values(groups)) { const kind = kinds[entry.kind] || (kinds[entry.kind] = { budget: 0, used: 0 }); kind.budget += entry.budget; kind.used += entry.used; }
-      return `<span class="legend">${Object.entries(kinds).sort(([a], [b]) => TIER_ORDER.indexOf(a) - TIER_ORDER.indexOf(b)).map(([kind, value]) => `<span class="tier-${TIERS[kind] ? kind : 'disk'}"><i></i>${esc(TIERS[kind]?.[0]||kind)} ${bytes(value.used)} of ${bytes(value.budget)}</span>`).join('')}</span>`;
+      return `<span class="legend">${Object.entries(kinds).sort(([a], [b]) => TIER_ORDER.indexOf(a) - TIER_ORDER.indexOf(b)).map(([kind, value]) => `<span><i class="tier-${TIERS[kind] ? kind : 'disk'}"></i>${esc(TIERS[kind]?.[0]||kind)} ${bytes(value.used)} of ${bytes(value.budget)}</span>`).join('')}</span>`;
     }
     function describe(id, worker, data) {
       const hw = worker.hardware || {}, contribution = hw.contribution || {}, runtime = worker.runtime || {}, telemetry = runtime.telemetry || {}, cache = runtime.memory_store || {}, assignment = runtime.assignment;
@@ -592,16 +543,23 @@
       const gpus = (inventory.gpus || []).filter(gpu => gpu.temperature_c != null || gpu.load_percent != null);
       const hottest = gpus.length ? gpus.reduce((a, b) => (b.temperature_c ?? -1) > (a.temperature_c ?? -1) ? b : a) : null;
       const accelerator = hw.accelerator_name || (hw.backend || '').toUpperCase() || 'Unknown';
+      const now = workerState(id, worker, route), cordoned = (data.cordoned_nodes || []).includes(node);
       return {
-        id, worker, state: workerState(id, worker, route), host: hw.host_id || 'Unknown machine', accelerator, backend: hw.backend || '', pools, budget, used, layers, position, isService,
-        roles: (contribution.roles || []).join(', '), compute: telemetry.compute_ms_ema, rtt: worker.control_latency_ms, cordoned: (data.cordoned_nodes || []).includes(node), gpu: hottest,
-        search: [id, hw.host_id, hw.accelerator_name, hw.backend, countryName(worker.country), STATES[workerState(id, worker, route)].label, (contribution.roles || []).join(' ')].join(' ').toLowerCase(),
+        id, worker, state: now, host: hw.host_id || 'Unknown machine', accelerator, backend: hw.backend || '', pools, budget, used, layers, position, isService,
+        roles: (contribution.roles || []).join(', '), compute: telemetry.compute_ms_ema, rtt: worker.control_latency_ms, cordoned, gpu: hottest,
+        mark: cordoned && now === 'standby' ? 'cordoned' : STATES[now].mark, word: doing(now, id, position, cordoned),
+        search: [id, hw.host_id, hw.accelerator_name, hw.backend, countryName(worker.country), STATES[now].label, (contribution.roles || []).join(' ')].join(' ').toLowerCase(),
       };
     }
-    const CHIPS = { all: 'All', attention: 'Needs attention', active: 'In route', fetching: 'Downloading', standby: 'Idle', service: 'Cache service' };
+    function doing(now, id, position, cordoned) {
+      if (now === 'fetching') { const stage = state.model?.stages.find(item => item.moving?.to === id); return stage ? `Taking stage ${stage.n}` : 'Fetching'; }
+      if (now === 'active') return `Stage ${position + 1}`;
+      return cordoned && now === 'standby' ? 'Cordoned' : STATES[now].label;
+    }
+    const CHIPS = { all: 'All', attention: 'Needs you', active: 'On the route', fetching: 'Fetching', standby: 'Idle', service: 'Cache service' };
     const inChip = (row, chip) => chip === 'all' || (chip === 'attention' ? row.state === 'quarantined' || row.state === 'offline' : row.state === chip);
-    const groupKey = row => state.group === 'machine' ? row.host : state.group === 'accelerator' ? row.accelerator : state.group === 'none' ? '' : row.state === 'quarantined' || row.state === 'offline' ? 'Needs attention' : STATES[row.state].label;
-    const STATE_GROUPS = ['Needs attention', 'In route', 'Downloading', 'Cache service', 'Idle'];
+    const groupKey = row => state.group === 'machine' ? row.host : state.group === 'accelerator' ? row.accelerator : state.group === 'none' ? '' : row.state === 'quarantined' || row.state === 'offline' ? 'Needs you' : STATES[row.state].label;
+    const STATE_GROUPS = ['Needs you', 'On the route', 'Fetching', 'Cache service', 'Idle'];
     const groupOrder = (a, b) => state.group === 'state' ? STATE_GROUPS.indexOf(a) - STATE_GROUPS.indexOf(b) : byName(a, b);
     const SORTS = {
       name: (a, b) => byName(a.id, b.id),
@@ -611,49 +569,70 @@
       rtt: (a, b) => (a.rtt ?? -1) - (b.rtt ?? -1),
       gpu: (a, b) => (a.gpu?.temperature_c ?? -1) - (b.gpu?.temperature_c ?? -1),
     };
-    function workerLine(row, showGpu, room) {
-      const look = STATES[row.state];
-      const problem = look.tone === 'idle' ? '' : ` problem ${look.tone}`;
-      const route = state.data?.route || [];
-      const fetched = row.state === 'fetching' ? downloading(row.id) : null;
-      const doing = fetched ? `downloading ${bytes(fetched.bytes_done)} of ${bytes(fetched.bytes_total)}` : [row.position >= 0 ? stageRole(row.position, route.length) : '', row.layers].filter(Boolean).join(', ') || 'Not on the route';
-      const work = row.isService ? 'KV cache' : esc(doing[0].toUpperCase() + doing.slice(1));
+    // Every tray shares one scale, so a 48 GiB card is drawn six times an 8 GiB laptop.
+    function tray(row, largest) {
       const fills = row.isService ? `<i class="tier-ram" style="width:${row.budget ? (row.used / row.budget * 100).toFixed(1) : 0}%"></i>` : row.pools.filter(pool => pool.used_bytes).map(pool => `<i class="tier-${TIERS[pool.kind] ? pool.kind : 'disk'}" style="width:${(pool.used_bytes / row.budget * 100).toFixed(1)}%"></i>`).join('');
-      const memory = row.budget ? `<div class="meter" aria-hidden="true">${fills}</div>${bytes(row.used)} of ${bytes(row.budget)}` : '—';
+      return `<div class="tray" aria-hidden="true" style="width:${(row.budget / largest * 100).toFixed(1)}%">${fills}</div>`;
+    }
+    function workerLine(row, showGpu, room, largest) {
+      const look = STATES[row.state], fetched = row.state === 'fetching' ? downloading(row.id) : null;
+      const memory = row.budget ? `${tray(row, largest)}${bytes(row.used)} of ${bytes(row.budget)}` : '—';
       const gpu = showGpu ? `<td class="right" data-label="GPU">${row.gpu ? esc([row.gpu.temperature_c != null ? `${Math.round(row.gpu.temperature_c)}°C` : '', row.gpu.load_percent != null ? `${Math.round(row.gpu.load_percent)}%` : ''].filter(Boolean).join(', ')) : '—'}</td>` : '';
       const place = row.host !== row.id && row.host !== nodeOf(row.id) ? `${row.host}, ${row.accelerator}` : row.accelerator;
-      return `<tr class="row${problem}" data-worker="${esc(row.id)}"><td class="name-cell"><div class="name-line">${flagMark(row.worker.country, room)}<button class="name-link" type="button" data-worker="${esc(row.id)}" data-key="w:${esc(row.id)}">${esc(row.id)}</button></div><span class="sub">${esc(place)}</span></td><td class="state-td"><span class="state-cell tone-${look.tone}"><i class="glyph ${look.glyph}"></i><span>${esc(look.label)}</span></span>${row.cordoned ? ' <span class="tag">Cordoned</span>' : ''}</td><td class="work-td">${work}</td><td class="memory-cell">${memory}</td>${gpu}<td class="right" data-label="Compute">${row.isService ? '—' : ms(row.compute)}</td><td class="right" data-label="RTT">${ms(row.rtt)}</td></tr>`;
+      const sub = fetched ? `, ${bytes(fetched.bytes_done)} of ${bytes(fetched.bytes_total)}` : row.layers && row.position >= 0 ? `, ${row.layers}` : '';
+      return `<tr class="row ${look.tone === 'warn' || look.tone === 'bad' ? look.tone : ''}" data-worker="${esc(row.id)}"><td class="name-cell"><div class="name-line">${glyphHtml(row.mark)}${flagMark(row.worker.country, room)}<button class="name-link" type="button" data-worker="${esc(row.id)}" data-key="w:${esc(row.id)}">${esc(row.id)}</button></div><span class="sub">${esc(place)}</span></td><td class="whole">${esc(row.word)}${esc(sub)}${row.cordoned && row.mark !== 'cordoned' ? ', cordoned' : ''}</td><td class="memory-cell whole">${memory}</td>${gpu}<td class="right" data-label="Compute">${row.isService ? '—' : ms(row.compute)}</td><td class="right" data-label="Round trip">${ms(row.rtt)}</td></tr>`;
     }
-    function renderMachines(data) {
-      const all = Object.entries(data.workers || {}).map(([id, worker]) => describe(id, worker, data));
-      const online = all.filter(row => row.worker.live), live = online.length, hosts = new Set(online.map(row => row.host)).size;
-      paint($('machinesNote'), `${live} of ${count(all.length, 'worker')} online, on ${count(hosts, 'machine')}`);
-      const ranked = [...all].sort(SORTS.state);
-      const tally = {}; for (const row of all) tally[row.state] = (tally[row.state] || 0) + 1;
-      paint($('census'), all.length >= 8 ? `<div class="census" role="img" aria-label="${esc(Object.entries(tally).map(([key, value]) => `${value} ${STATES[key].label.toLowerCase()}`).join(', '))}">${ranked.map(row => `<i class="tile ${row.state}" data-worker="${esc(row.id)}" data-tip="${esc(`${row.id}\n${STATES[row.state].label}`)}"></i>`).join('')}</div>` : '');
-      const tile = key => key === 'all' || key === 'attention' ? '' : `<i class="tile ${key}" aria-hidden="true"></i>`;
-      paint($('stateChips'), Object.keys(CHIPS).map(key => { const n = all.filter(row => inChip(row, key)).length; return (key === 'all' || n || state.chip === key) ? `<button class="chip" type="button" data-chip="${key}" data-key="c:${key}" aria-pressed="${state.chip === key}">${tile(key)}${esc(CHIPS[key])} <b>${n}</b></button>` : ''; }).join(''));
+    function allRows(data) { return Object.entries(data.workers || {}).map(([id, worker]) => describe(id, worker, data)); }
+    function renderMachines(data, rowsAll) {
+      const all = rowsAll || allRows(data);
+      const online = all.filter(row => row.worker.live), hosts = new Set(online.map(row => row.host)).size;
+      paint($('machinesNote'), `${online.length} of ${count(all.length, 'worker')} online, on ${count(hosts, 'machine')}`);
+      paint($('stateChips'), Object.keys(CHIPS).map(key => { const n = all.filter(row => inChip(row, key)).length; return (key === 'all' || n || state.chip === key) ? `<button class="chip" type="button" data-chip="${key}" data-key="c:${key}" aria-pressed="${state.chip === key}">${esc(CHIPS[key])} <b>${n}</b></button>` : ''; }).join(''));
       const words = state.text.trim().toLowerCase().split(/\s+/).filter(Boolean);
       const rows = all.filter(row => inChip(row, state.chip) && words.every(word => row.search.includes(word)));
-      if (!all.length) { paint($('nodeTable'), '<div class="empty"><b>No workers registered</b><span>Add a machine, and it will appear here.</span></div>'); return; }
-      if (!rows.length) { paint($('nodeTable'), '<div class="empty"><b>No workers match</b><button class="link" type="button" data-action="clear" data-key="clear">Clear the search and filter</button></div>'); return; }
+      if (!all.length) { paint($('nodeTable'), '<div class="empty"><span>No machines yet. Add one, and it appears here.</span></div>'); return; }
+      if (!rows.length) { paint($('nodeTable'), '<div class="empty"><b>No machines match</b><button class="link" type="button" data-action="clear" data-key="clear">Clear the search and filter</button></div>'); return; }
       const sorted = [...rows].sort((a, b) => SORTS[state.sortKey](a, b) * state.sortDir || byName(a.id, b.id));
-      const showGpu = all.some(row => row.gpu), room = all.some(row => flagged(row.worker.country));
-      const groups = new Map();
-      for (const row of sorted) { const key = groupKey(row); if (!groups.has(key)) groups.set(key, []); groups.get(key).push(row); }
+      const paged = sorted.slice(0, state.limit);
+      const showGpu = all.some(row => row.gpu), room = all.some(row => flagged(row.worker.country)), largest = Math.max(...all.map(row => row.budget), 1);
+      const grouped = all.length >= 5, groups = new Map();
+      for (const row of paged) { const key = grouped ? groupKey(row) : ''; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(row); }
       const sortHead = (key, label, right) => `<th scope="col"${right ? ' class="right"' : ''}${state.sortKey === key ? ` aria-sort="${state.sortDir > 0 ? 'ascending' : 'descending'}"` : ''}><button type="button" data-sort="${key}" data-key="h:${key}">${label}</button></th>`;
-      const head = `<thead><tr>${sortHead('name', 'Worker')}${sortHead('state', 'State')}<th scope="col">Work</th>${sortHead('memory', 'Memory')}${showGpu ? sortHead('gpu', 'GPU', true) : ''}${sortHead('compute', 'Compute', true)}${sortHead('rtt', 'Control RTT', true)}</tr></thead>`;
-      const columns = showGpu ? 7 : 6;
+      const head = `<thead><tr>${sortHead('name', 'Worker')}${sortHead('state', 'Doing')}${sortHead('memory', 'Memory')}${showGpu ? sortHead('gpu', 'GPU', true) : ''}${sortHead('compute', 'Compute', true)}${sortHead('rtt', 'Round trip', true)}</tr></thead>`;
+      const columns = showGpu ? 6 : 5;
       const body = [...groups.keys()].sort(groupOrder).map(key => {
-        const members = groups.get(key), lines = members.map(row => workerLine(row, showGpu, room)).join('');
+        const members = groups.get(key), lines = members.map(row => workerLine(row, showGpu, room, largest)).join('');
         if (!key) return `<tbody>${lines}</tbody>`;
         const open = state.groupsOpen.has(key) ? state.groupsOpen.get(key) : !(state.group === 'state' && key === 'Idle' && all.length > 24);
         const label = state.group === 'machine' ? `${count(members.length, 'worker')} on this machine` : count(members.length, 'worker');
         return `<tbody><tr class="group-row"><th colspan="${columns}" scope="colgroup"><button type="button" data-group="${esc(key)}" data-key="g:${esc(key)}" aria-expanded="${open}">${ICONS.chevron}${esc(key)} <span class="group-count">${esc(label)}</span><span class="group-memory">${hostMemory(members.map(row => row.worker))}</span></button></th></tr>${open ? lines : ''}</tbody>`;
       }).join('');
-      const filtered = rows.length < all.length;
-      const foot = filtered ? `<div class="table-foot"><span>Showing ${rows.length} of ${count(all.length, 'worker')}</span><button class="link" type="button" data-action="clear" data-key="clear">Clear the search and filter</button></div>` : '';
-      paint($('nodeTable'), `<table class="grid nodes${showGpu ? ' with-gpu' : ''}">${head}${body}</table>${foot}`);
+      const filtered = rows.length < all.length, more = sorted.length - paged.length;
+      const foot = filtered || more > 0 ? `<div class="table-foot"><span>Showing ${paged.length} of ${count(all.length, 'worker')}</span>${more > 0 ? `<button class="link" type="button" data-action="more-rows" data-key="more-rows">Show ${Math.min(more, 50)} more</button>` : ''}${filtered ? '<button class="link" type="button" data-action="clear" data-key="clear">Clear the search and filter</button>' : ''}</div>` : '';
+      paint($('nodeTable'), `<table class="grid nodes stack">${head}${body}</table>${foot}`);
+    }
+    function renderMachinesBay(data, rows) {
+      const tally = {}; for (const row of rows) tally[row.state] = (tally[row.state] || 0) + 1;
+      const words = { offline: 'offline', quarantined: 'quarantined', active: 'on the route', fetching: 'fetching', service: 'cache service', standby: 'idle' };
+      const ranked = [...rows].sort(SORTS.state);
+      const sentence = Object.keys(words).filter(key => tally[key]).map(key => `${tally[key]} ${words[key]}`).join(', ');
+      if (!rows.length) { paint($('machinesBay'), '<p class="bay-note">No machines yet.</p>'); return; }
+      if (rows.length > 24) {
+        const marks = ranked.map((row, index) => `<button type="button" data-worker="${esc(row.id)}" data-key="k:${esc(row.id)}" data-word="${esc(`${row.id}, ${row.word}`)}" aria-label="${esc(`${row.id}, ${row.word}`)}" tabindex="${(state.markKey ? state.markKey === row.id : index === 0) ? 0 : -1}">${glyphHtml(row.mark)}</button>`).join('');
+        paint($('machinesBay'), `<p class="counts">${esc(sentence)}.</p><div class="marks" id="marks" role="group" aria-label="Every machine, trouble first">${marks}</div><p class="mark-word" id="markWord" aria-live="polite">${esc(`${ranked[0].id}, ${ranked[0].word}`)}</p><button class="btn small" type="button" data-action="find" data-key="find">Find a machine</button>`);
+      } else {
+        paint($('machinesBay'), `<p class="counts">${esc(sentence)}.</p><table class="mini"><thead><tr><th scope="col" class="mini-name">Worker</th><th scope="col">Doing</th><th scope="col" class="mini-rtt">Round trip</th></tr></thead><tbody>${ranked.map(row => { const tone = STATES[row.state].tone; return `<tr class="${tone === 'warn' || tone === 'bad' ? tone : ''}"><td>${glyphHtml(row.mark)}<button class="name-link" type="button" data-worker="${esc(row.id)}" data-key="b:${esc(row.id)}">${esc(row.id)}</button></td><td>${esc(row.word)}</td><td>${ms(row.rtt)}</td></tr>`; }).join('')}</tbody></table>`);
+      }
+    }
+    function renderMemory(data, rows) {
+      const { byKind } = memoryOf(data), model = state.model, plan = data.active_plan?.memory;
+      const meters = TIER_ORDER.filter(kind => byKind[kind]?.budget_bytes).map(kind => memoryMeter(kind, byKind[kind].used_bytes || 0, byKind[kind].budget_bytes)).join('');
+      const low = model?.stages.filter(stage => stage.spilledBytes) || [];
+      const note = !model ? '' : low.length ? `${bytes(low.reduce((n, stage) => n + stage.spilledBytes, 0))} of this model sits in ${esc(TIERS[low[0].tier]?.[0] || 'slower memory')}, on ${low.length === 1 ? `stage ${low[0].n}` : count(low.length, 'stage')}.` : 'All of this model sits in the fastest memory each machine offers.';
+      const idle = rows.filter(row => row.state === 'standby' && row.worker.live && row.budget).sort((a, b) => (b.budget - b.used) - (a.budget - a.used)), top = idle.slice(0, 3), largest = Math.max(...top.map(row => row.budget), 1);
+      const room = top.length ? `<h3>Room for layers</h3>${top.map(row => `<div class="room"><div><button class="name-link" type="button" data-worker="${esc(row.id)}" data-key="r:${esc(row.id)}">${esc(row.id)}</button><span>${bytes(row.budget - row.used)} free</span></div>${tray(row, largest)}</div>`).join('')}${idle.length > 3 ? `<p class="bay-note">and ${idle.length - 3} more idle.</p>` : ''}` : '';
+      const free = plan?.unused_bytes ? `<p class="bay-note">${bytes(plan.unused_bytes)} free across the pool.</p>` : '';
+      paint($('memoryBay'), `${meters || '<p class="bay-note">No memory reported yet.</p>'}${note ? `<p class="bay-note">${note}</p>` : ''}${room}${free}`);
     }
 
     /* Activity: a burst of the same thing reads as one line. */
@@ -661,21 +640,98 @@
       const chipFor = key => ({ all: 'All', problems: 'Problems', changes: 'Changes' })[key];
       paint($('feedChips'), ['all', 'problems', 'changes'].map(key => `<button class="chip" type="button" data-feed="${key}" data-key="f:${key}" aria-pressed="${state.feed === key}">${chipFor(key)}</button>`).join(''));
       const events = (data.events || []).filter(event => state.feed === 'all' || (state.feed === 'problems') === (event.kind === 'failure'));
-      if (!events.length) { paint($('eventList'), `<div class="empty compact"><span>${state.feed === 'all' ? 'No events yet' : 'Nothing here'}</span></div>`); return; }
+      if (!events.length) { paint($('eventList'), `<div class="empty compact"><span>${state.feed === 'all' ? 'Nothing has happened yet.' : 'Nothing here.'}</span></div>`); return; }
       const names = Object.keys(data.workers || {}).sort((a, b) => b.length - a.length);
       const shape = event => { const title = String(event.title || ''), name = names.find(item => title.includes(item)); return name ? title.replace(name, '{}') : title; };
+      // A model's id can be a path on a machine, and only its name means anything here.
+      const plain = text => data.model ? String(text ?? '').replaceAll(data.model, modelName(data.model)) : String(text ?? '');
+      const linked = (text, key) => { const value = plain(text), name = names.find(item => value.includes(item)); if (!name) return esc(value); const at = value.indexOf(name); return `${esc(value.slice(0, at))}<button class="name-link" type="button" data-worker="${esc(name)}" data-key="${esc(key)}">${esc(name)}</button>${esc(value.slice(at + name.length))}`; };
       const runs = [];
       for (const event of events) {
         const key = `${event.kind}|${shape(event)}`, last = runs[runs.length - 1];
         if (last && last.key === key) last.items.push(event); else runs.push({ key, shape: shape(event), items: [event] });
       }
-      const look = kind => kind === 'failure' ? ['bad', 'bad'] : ['recovery', 'join', 'model'].includes(kind) ? ['ok', 'idle'] : ['idle', 'idle'];
       paint($('eventList'), runs.map(run => {
-        const first = run.items[0], [glyph, tone] = look(first.kind);
-        if (run.items.length === 1) return `<div class="event"><i class="glyph ${glyph} tone-${tone}"></i><div class="event-title">${esc(first.title)}</div><div class="event-time">${esc(relative(first.at))}</div><div class="event-detail">${esc(first.detail)}</div></div>`;
+        const first = run.items[0], tone = first.kind === 'failure' ? ' failure' : '';
+        if (run.items.length === 1) return `<div class="event${tone}"><div class="event-title">${linked(first.title, `e:t:${first.id}`)}</div><div class="event-time">${esc(relative(first.at))}</div><div class="event-detail">${linked(first.detail, `e:d:${first.id}`)}</div></div>`;
         const title = run.shape.includes('{}') ? run.shape.replace('{}', `${run.items.length} workers`) : `${run.shape}, ${run.items.length} times`;
-        return `<details class="event-group"><summary class="event" data-key="e:${esc(run.key)}"><i class="glyph ${glyph} tone-${tone}"></i><div class="event-title">${esc(title)}</div><div class="event-time">${esc(relative(first.at))}</div></summary><ul class="event-members">${run.items.map(item => `<li><span>${esc(item.title)}${item.detail ? `: ${esc(item.detail)}` : ''}</span><span>${esc(relative(item.at))}</span></li>`).join('')}</ul></details>`;
+        return `<details class="event-group"><summary class="event${tone}" data-key="e:${esc(run.key)}"><div class="event-title">${esc(title)}</div><div class="event-time">${esc(relative(first.at))}</div></summary><ul class="event-members">${run.items.map(item => `<li><span>${esc(plain(item.title))}${item.detail ? `: ${esc(plain(item.detail))}` : ''}</span><span>${esc(relative(item.at))}</span></li>`).join('')}</ul></details>`;
       }).join(''));
+    }
+
+    /* Stages */
+
+    function renderStages(data) {
+      const model = state.model, route = data.route || [];
+      $('routeSection').hidden = !model || !route.length;
+      if (!model || !route.length) return;
+      const keep = keyStages(model), short = model.stages.length > 12 && !state.allStages;
+      const shown = short ? model.stages.filter(stage => keep.has(stage.n)) : model.stages;
+      const room = model.stages.some(stage => flagged(stage.worker?.country));
+      const line = stage => {
+        const id = esc(stage.workerId), open = state.openStage === stage.workerId, route_ = route[stage.n - 1], tone = stage.trouble || '';
+        const flag = value => stage.spillSlow ? `<span class="flagged-value">${value}</span>` : value;
+        const hw = stage.worker?.hardware || {}, round = stage.worker?.runtime?.telemetry?.ring?.link_rtt_us;
+        const pools = (stage.worker?.runtime?.memory_pools || hw.memory_pools || []).map(pool => `${TIERS[pool.kind]?.[0] || pool.kind} ${bytes(pool.used_bytes || 0)} of ${bytes(pool.budget_bytes)}`).join(', ');
+        const facts = [['Machine', hw.host_id || '—'], ['GPU', hw.accelerator_name || 'None'], ['Memory by pool', pools || '—'], ['Direct link round trip', round ? `${num(round / 1000)} ms` : 'No reading'], ['Control round trip', ms(stage.worker?.control_latency_ms)]];
+        const detail = open ? `<tr class="stage-detail"><td colspan="7"><dl>${facts.map(([key, value]) => `<div><dt>${esc(key)}</dt><dd>${esc(value)}</dd></div>`).join('')}</dl><button class="btn small" type="button" data-worker="${id}" data-key="so:${id}">Open machine</button></td></tr>` : '';
+        const place = stage.n === 1 ? (model.stages.length === 1 ? ', entry and exit' : ', entry') : stage.n === model.stages.length ? ', exit' : '';
+        return `<tr class="row ${tone}${open ? ' open' : ''}" data-stagerow="${id}"><td>${stage.n}${place}</td><td class="name-cell"><div class="name-line">${stage.trouble ? glyphHtml(stage.trouble) : ''}${flagMark(stage.worker?.country, room)}<button class="name-link" type="button" data-stagerow="${id}" data-key="s:${id}" aria-expanded="${open}">${id}</button></div></td><td data-label="Layers">${span(stage.start, stage.end)}</td><td data-label="Memory">${esc(stageMemory(route_, data)) || '—'}</td><td class="right" data-label="Compute">${flag(ms(stage.computeMs))}</td><td class="right" data-label="Per layer">${flag(stage.perLayerMs == null ? '—' : `${num(stage.perLayerMs, 2)} ms`)}</td><td class="right" data-label="Link to next">${stage.n === model.stages.length ? (stage.linkMs == null ? '—' : `${num(stage.linkMs)} ms back`) : ms(stage.linkMs)}</td></tr>${detail}`;
+      };
+      const foot = model.stages.length > 12 ? `<div class="table-foot"><span>Showing ${shown.length} of ${count(model.stages.length, 'stage')}</span><button class="link" type="button" data-action="stages" data-key="stages">${state.allStages ? 'Show key stages' : 'Show every stage'}</button></div>` : '';
+      paint($('routeTable'), `<table class="grid stages stack"><thead><tr><th scope="col">Stage</th><th scope="col">Worker</th><th scope="col">Layers</th><th scope="col">Memory</th><th scope="col" class="right">Compute</th><th scope="col" class="right">Per layer</th><th scope="col" class="right">Link to next</th></tr></thead><tbody>${shown.map(line).join('')}</tbody></table>${foot}`);
+    }
+
+    /* Readings: the pool keeps no history, so these trends are this tab's. */
+
+    const WINDOW_SECONDS = 900, COLLECT_SECONDS = 120;
+    function takeSample(data) {
+      const model = state.model, now = Date.now() / 1000, { used } = memoryOf(data);
+      state.samples.push({ at: now, rate: data.metrics?.tokens_per_second_ema ?? null, pass: model?.passMs ?? null, draft: model?.tokensPerPass ?? null, memory: used, recoveries: data.metrics?.recoveries_total ?? 0 });
+      while (state.samples.length && state.samples[0].at < now - WINDOW_SECONDS) state.samples.shift();
+    }
+    function trend(key) {
+      const list = state.samples.filter(sample => sample[key] != null);
+      if (!list.length || list[list.length - 1].at - list[0].at < COLLECT_SECONDS) return { spark: '', change: 'Collecting' };
+      const step = Math.ceil(list.length / 48), values = list.filter((_, index) => index % step === 0).map(sample => sample[key]);
+      const first = median(list.slice(0, 5).map(sample => sample[key])), last = median(list.slice(-5).map(sample => sample[key]));
+      const moved = first ? (last - first) / first * 100 : last ? 100 : 0;
+      return { spark: sparkline(values), change: Math.abs(moved) < 3 ? 'Steady' : `${moved > 0 ? 'Up' : 'Down'} ${Math.round(Math.abs(moved))}%` };
+    }
+    function renderReadings(data) {
+      const model = state.model, metrics = data.metrics || {}, { used, budget } = memoryOf(data);
+      $('readingsSection').hidden = !model;
+      if (!model) return;
+      const line = (name, now, key, meaning) => { const { spark, change } = trend(key); return `<tr class="row"><td class="reading-name whole">${name}</td><td class="reading-now right" data-label="Now">${esc(now)}</td><td class="whole">${spark}</td><td data-label="Change">${esc(change)}</td><td class="whole">${esc(meaning)}</td></tr>`; };
+      const share = model.passMs ? Math.round(model.computeMs / model.passMs * 100) : null;
+      const rows = [
+        line('Reply speed', metrics.tokens_per_second_ema == null ? '—' : `${rate(metrics.tokens_per_second_ema)} tokens/s`, 'rate', metrics.token_latency_ms_ema ? `Each token takes ${num(metrics.token_latency_ms_ema)} ms on average.` : 'No replies yet.'),
+        line('One pass', model.passMs == null ? '—' : `about ${num(model.passMs, 0)} ms`, 'pass', share == null ? 'Stages report their times after the first reply.' : `${share}% is compute and ${100 - share}% is links, so ${share >= 50 ? 'compute' : 'links'} set${share >= 50 ? 's' : ''} the pace of this route.`),
+      ];
+      if (model.draftModel && model.tokensPerPass != null) rows.push(line('Draft yield', `${num(model.tokensPerPass)} tokens a pass`, 'draft', `Each pass lands ${num(model.tokensPerPass)} tokens with ${model.draftModel}.`));
+      rows.push(line('Weights in memory', bytes(used), 'memory', `${bytes(budget)} is offered for weights across the pool.`));
+      rows.push(line('Recoveries', whole(metrics.recoveries_total), 'recoveries', metrics.recoveries_total ? 'Each one is a stage the pool put back without you.' : 'No stage has needed putting back since this coordinator started.'));
+      paint($('readings'), `<table class="grid readings stack"><thead><tr><th scope="col">Reading</th><th scope="col" class="right">Now</th><th scope="col">Last 15 min</th><th scope="col">Change</th><th scope="col">What it means</th></tr></thead><tbody>${rows.join('')}</tbody></table>`);
+    }
+
+    /* Facts */
+
+    function renderFacts(data) {
+      const fact = (key, value) => `<div><dt>${esc(key)}</dt><dd>${esc(value)}</dd></div>`, metrics = data.metrics || {}, parts = [];
+      // The answer comes from the coordinator, whichever node took the request.
+      if (data.mesh) parts.push(fact('Coordinator', `${data.mesh.leader || 'none'}, term ${data.mesh.term}`), fact('Control planes reachable', Object.keys(data.mesh.members || {}).length));
+      const slots = data.active_plan?.slots ?? data.slots;
+      parts.push(fact('Epoch', data.epoch), fact('Machines', data.virtual_hardware?.hosts ?? 0), fact('Requests', whole(metrics.requests_total)), fact('Tokens', whole(metrics.tokens_generated)), fact('Recoveries', whole(metrics.recoveries_total)), fact('Up', duration(data.uptime_seconds)));
+      if (slots != null) parts.push(fact('Reply slots', slots));
+      if ((data.cordoned_nodes || []).length) parts.push(fact('Cordoned', data.cordoned_nodes.join(', ')));
+      if (data.cache_url) parts.push(fact('KV cache', 'Protected in RAM'));
+      parts.push(fact('Updated', clock(state.updatedAt)));
+      paint($('facts'), parts.join(''));
+      const notes = [];
+      if (data.ownerless) notes.push(`Nobody owns this network, joining ${data.ownerless.joining}.`);
+      if (data.model_profile === 'protocol-test') notes.push('Test model. It checks sharding, not language quality.');
+      $('factsNote').hidden = !notes.length;
+      $('factsNote').textContent = notes.join(' ');
     }
 
     /* Worker detail */
@@ -707,18 +763,20 @@
     function renderWorker() {
       const id = state.openWorker, w = state.data?.workers?.[id];
       if (!id) return;
-      if (!w) { paint($('workerContent'), `<div class="drawer-head"><h2 id="workerTitle">${esc(id)}</h2><button class="icon-btn" type="button" data-action="close-worker" data-key="close" aria-label="Close details">${ICONS.close}</button></div><div class="drawer-body"><p class="quiet-text">This worker has left the mesh.</p></div>`); return; }
+      const close = `<button class="icon-btn" type="button" data-action="close-worker" data-key="close" aria-label="Close details">${ICONS.close}</button>`;
+      if (!w) { paint($('workerContent'), `<div class="drawer-head"><h2 id="workerTitle">${esc(id)}</h2>${close}</div><div class="drawer-body"><p class="quiet-text">This worker has left the pool.</p></div>`); return; }
       const hw = w.hardware || {}, contribution = hw.contribution || {}, rt = w.runtime || {}, tel = rt.telemetry || {}, cache = rt.memory_store || {}, a = rt.assignment;
-      const look = STATES[workerState(id, w, state.data.route || [])];
+      const now = describe(id, w, state.data), node = nodeOf(id), look = STATES[now.state];
       const alert = w.quarantined && w.quarantine_reason ? `<div class="notice warn"><i class="glyph warn"></i><div class="notice-body"><b>Quarantined</b><p>${esc(w.quarantine_reason)}</p></div></div>` : '';
       const failure = tel.last_error ? `<div class="notice"><i class="glyph idle"></i><div class="notice-body"><b>Last error</b><p>${esc(tel.last_error)}</p></div></div>` : '';
-      paint($('workerContent'), `<div class="drawer-head"><div><h2 id="workerTitle">${esc(id)}</h2><div class="drawer-state tone-${look.tone}"><i class="glyph ${look.glyph}"></i><span>${esc(look.label)}</span></div></div><button class="icon-btn" type="button" data-action="close-worker" data-key="close" aria-label="Close details">${ICONS.close}</button></div><div class="drawer-body">${alert}${failure}
+      const action = now.cordoned ? `<button class="btn small" type="button" data-uncordon="${esc(node)}" data-key="uncordon">Uncordon this machine</button>` : `<button class="btn small" type="button" data-cordon="${esc(node)}" data-key="cordon">Cordon this machine</button>`;
+      paint($('workerContent'), `<div class="drawer-head"><div><h2 id="workerTitle">${esc(id)}</h2><div class="drawer-state tag ${look.tone === 'idle' ? '' : look.tone}">${glyphHtml(now.mark)}<span>${esc(now.word)}</span></div></div>${close}</div><div class="drawer-body">${alert}${failure}<div class="drawer-actions">${action}</div>
         <section class="detail"><h3>Live readings</h3>${readings(id)}</section>
-        <section class="detail"><h3>Contribution</h3>${row('Roles', (contribution.roles || []).join(', ') || '—')}${row('CPU threads', contribution.cpu_threads ?? 0)}${row('RAM budget', bytes(contribution.ram_budget_bytes))}${row('Accelerator budget', bytes(contribution.accelerator_memory_budget_bytes))}${row('Standby', contribution.standby ? 'Yes' : 'No')}</section>
-        <section class="detail"><h3>Memory for weights</h3>${(rt.memory_pools || hw.memory_pools || []).map(pool => row(`${TIERS[pool.kind]?.[0] || pool.kind} (${pool.pool_id})`, `${bytes(pool.used_bytes || 0)} of ${bytes(pool.budget_bytes)}, ${pool.dtype}, ${pool.bandwidth_gbps} GB/s`)).join('') || row('Pools', 'None')}</section>
         <section class="detail"><h3>Placement</h3>${row('Layer range', a ? span(a.start_layer, a.end_layer) : 'Not on the active route')}${row('Pipeline epoch', rt.epoch ?? '—')}${row('Address', w.advertised_url)}${flagged(w.country) ? row('Country', countryName(w.country)) : ''}</section>
+        <section class="detail"><h3>Memory for weights</h3>${(rt.memory_pools || hw.memory_pools || []).map(pool => row(`${TIERS[pool.kind]?.[0] || pool.kind} (${pool.pool_id})`, `${bytes(pool.used_bytes || 0)} of ${bytes(pool.budget_bytes)}, ${pool.dtype}, ${pool.bandwidth_gbps} GB/s`)).join('') || row('Pools', 'None')}</section>
         <section class="detail"><h3>Hardware</h3>${row('Machine', hw.host_id || '—')}${row('Backend', (hw.backend || '—').toUpperCase())}${row('Runtime', hw.runtime_version || '—')}${row('Accelerator', hw.accelerator_name || 'None')}${row('Accelerator memory', bytes(hw.accelerator_memory_bytes))}${row('System memory', bytes(hw.ram_total_bytes))}${row('CPU cores', hw.cpu_cores ?? '—')}</section>
-        <section class="detail"><h3>Telemetry</h3>${row('Control RTT', `${num(w.control_latency_ms)} ms`)}${row('Local compute', `${num(tel.compute_ms_ema)} ms`)}${row('Downstream', `${num(tel.downstream_ms_ema)} ms`)}${row('Tokens processed', tel.tokens_processed ?? 0)}${row('Activations sent', bytes(tel.activation_bytes_sent))}${row('KV snapshots sent', tel.kv_snapshots_sent ?? 0)}${row('KV restores', tel.kv_restores ?? 0)}${row('RAM cache used', bytes(cache.used_bytes))}${row('RAM cache budget', bytes(cache.budget_bytes))}</section>
+        <section class="detail"><h3>Contribution</h3>${row('Roles', (contribution.roles || []).join(', ') || '—')}${row('CPU threads', contribution.cpu_threads ?? 0)}${row('RAM budget', bytes(contribution.ram_budget_bytes))}${row('Accelerator budget', bytes(contribution.accelerator_memory_budget_bytes))}${row('Standby', contribution.standby ? 'Yes' : 'No')}</section>
+        <section class="detail"><h3>Telemetry</h3>${row('Round trip', `${num(w.control_latency_ms)} ms`)}${row('Local compute', `${num(tel.compute_ms_ema)} ms`)}${row('Downstream', `${num(tel.downstream_ms_ema)} ms`)}${row('Tokens processed', tel.tokens_processed ?? 0)}${row('Activations sent', bytes(tel.activation_bytes_sent))}${row('KV snapshots sent', tel.kv_snapshots_sent ?? 0)}${row('KV restores', tel.kv_restores ?? 0)}${row('RAM cache used', bytes(cache.used_bytes))}${row('RAM cache budget', bytes(cache.budget_bytes))}</section>
       </div>`);
     }
     function openWorker(id) {
@@ -738,7 +796,7 @@
       try {
         const answer = await api('/admin/inventory', { timeout: 15000 });
         state.inventory = answer.nodes || {};
-        if (state.data) { renderMachines(state.data); renderAttention(assess(state.data)); }
+        if (state.data) { renderMachines(state.data); renderNeeds(assess(state.data)); }
         if (state.openWorker) renderWorker();
       } catch (error) { if (error.status === 404) { state.inventoryGone = true; if (state.openWorker) renderWorker(); } }
       finally { readInventory.busy = false; }
@@ -749,7 +807,7 @@
       try { state.catalog = (await api('/admin/catalog', { timeout: 10000 })).models || []; state.catalogFailed = false; }
       catch { state.catalogFailed = true; }
       finally { readCatalog.busy = false; }
-      if (state.data) renderInstrument(state.data, assess(state.data));
+      if (state.data) renderStart(state.data, assess(state.data));
       if ($('picker').open) renderCatalog();
     }
 
@@ -797,7 +855,8 @@
         const speed = plan.estimated_tokens_per_second ? `, about ${esc(plan.estimated_tokens_per_second)} tokens/s` : '';
         const download = (plan.download_bytes ? `Needs ${bytes(plan.download_bytes)} of new shards.` : 'Every shard is already in place.') + (plan.draft_model ? ` A draft model (${modelName(plan.draft_model)}) will speed up replies.` : '');
         const busy = jobRunning(state.data?.load_job) ? ` ${modelName(state.data.load_job.model)} is still loading, so cancel it first to load this one.` : '';
-        $('preview').innerHTML = `<b>Fits: ${bytes(plan.model_bytes)} across ${count(plan.route.length, 'worker')}${speed}</b>${ribbon(plan.route, data, { open: false })}<ul>${lines}</ul>${esc(download + busy)}`;
+        $('preview').innerHTML = `<b>Fits: ${bytes(plan.model_bytes)} across ${count(plan.route.length, 'worker')}${speed}</b><div id="previewRail"></div><ul>${lines}</ul>${esc(download + busy)}`;
+        drawRail($('previewRail'), routeModel({ route: plan.route, workers: data.workers }).stages);
         $('loadModel').disabled = Boolean(busy);
       } catch (error) {
         if (ticket !== state.previewId) return;
@@ -829,7 +888,7 @@
       if (error.offline) return 'This node did not answer, so no invite was created. Try again in a moment.';
       if (error.status === 404) return 'This node cannot create invites yet. It needs a newer version of iSharded.';
       if (error.status === 403) return 'Creating an invite needs an admin key.';
-      if (error.status === 409) return error.detail || 'This mesh cannot create invites right now.';
+      if (error.status === 409) return error.detail || 'This pool cannot create invites right now.';
       return error.detail || error.message;
     }
     function expiry(value) {
@@ -866,59 +925,111 @@
       $('copyNote').textContent = done ? 'Copied' : 'Selected. Press Ctrl+C to copy.';
     }
 
+    /* Asking first */
+
+    function confirmSheet({ title, text, yes, no = 'Cancel', run }) {
+      $('confirmTitle').textContent = title;
+      $('confirmText').textContent = text;
+      $('confirmError').hidden = true;
+      $('confirmNo').textContent = no;
+      $('confirmYes').textContent = yes;
+      $('confirmYes').hidden = !run;
+      state.confirmRun = run;
+      if (!$('confirm').open) $('confirm').showModal();
+    }
+    async function rebalance() {
+      const button = $('rebalanceButton');
+      button.disabled = true;
+      try { await api('/admin/rebalance', { method: 'POST' }); toast('Rebalanced'); await refresh(); }
+      finally { button.disabled = false; }
+    }
+    function askRebalance() {
+      const held = Object.values(state.data?.workers || {}).filter(worker => worker.quarantined).length;
+      if (held) confirmSheet({ title: 'Rebalance', text: `Rebalance gives ${count(held, 'quarantined machine')} another chance. ${held === 1 ? 'It' : 'They'} may fail again.`, yes: 'Rebalance', no: 'Keep them out', run: rebalance });
+      else rebalance().catch(error => toast(error.message));
+    }
+    // Cordon can refuse in a sentence. Only the kind that names a cost can be pushed through.
+    async function cordon(node, force) {
+      const name = encodeURIComponent(node), forced = `/admin/nodes/${name}/cordon?force=true`;
+      try {
+        if (force) await api(forced, { method: 'POST' });
+        else await api(`/admin/nodes/${name}/cordon`, { method: 'POST' });
+        toast(`Cordoned ${node}`); refresh();
+      } catch (error) {
+        if (error.status !== 409) throw error;
+        const costly = /use force/.test(error.message);
+        confirmSheet({ title: `Cordon ${node}`, text: error.message, yes: 'Cordon anyway', no: 'Keep it in', run: costly ? () => cordon(node, true) : null });
+        return false;
+      }
+    }
+    function askCordon(node) {
+      confirmSheet({ title: `Cordon ${node}`, text: 'Its share of the model moves to other machines, and no reply is dropped.', yes: 'Cordon this machine', run: () => cordon(node) });
+    }
+    async function uncordon(node) {
+      try { await api(`/admin/nodes/${encodeURIComponent(node)}/uncordon`, { method: 'POST' }); toast(`Uncordoned ${node}`); refresh(); }
+      catch (error) { toast(error.message); }
+    }
+    function askRemoveLane(name) {
+      confirmSheet({ title: `Remove lane ${name}`, text: 'Replies on this lane stop, and its memory is freed. The main route is not touched.', yes: 'Remove lane', run: async () => { await api(`/admin/lanes/${encodeURIComponent(name)}`, { method: 'DELETE' }); toast(`Removed lane ${name}`); refresh(); } });
+    }
+
     /* Whole-page states */
 
     function showConsole(visible) {
-      $('bodyGrid').hidden = !visible; $('figures').hidden = !visible; $('meta').hidden = !visible; $('actions').hidden = !visible;
-      if (!visible) { paint($('instrument'), ''); }
+      $('consoleBody').hidden = !visible; $('actions').hidden = !visible;
+      if (!visible) { $('board').hidden = true; $('boardHint').hidden = true; paint($('startPanel'), ''); paint($('needsTop'), ''); }
     }
     function renderSignedOut() {
-      state.data = null; state.inventory = {};
+      state.data = null; state.model = null; state.inventory = {};
       showConsole(false);
-      setPill('idle', 'idle', 'Signed out');
+      setWord('idle', 'idle', 'Signed out');
       $('headline').textContent = 'Signed out';
-      $('subline').textContent = 'Sign in with a key to see this mesh.';
+      $('subline').textContent = 'Enter this pool\'s key to see it.';
       paint($('notices'), '');
-      paint($('instrument'), '<div><button class="btn primary" type="button" data-action="sign-in" data-key="sign-in">Sign in</button></div>');
-      document.title = 'Signed out, iSharded';
+      paint($('startPanel'), '<div class="empty"><button class="btn primary" type="button" data-action="sign-in" data-key="sign-in">Sign in</button></div>');
+      tabTitle('Signed out');
     }
     function otherNodes() {
       return Object.entries(state.lastMembers).filter(([, url]) => /^https?:/.test(url) && url.replace(/\/$/, '') !== location.origin);
     }
     function renderOffline() {
-      const links = state.failures >= 3 && otherNodes().length ? `<div class="notice-links">${otherNodes().slice(0, 6).map(([name, url]) => `<a href="${esc(url)}/dashboard" rel="noreferrer">Open ${esc(name)}</a>`).join('')}</div>` : '';
-      const when = state.updatedAt ? `Last update at ${esc(clock(state.updatedAt))}. These figures may be out of date.` : 'Nothing has been read from it yet.';
-      setPill('warn', 'work', 'Reconnecting');
-      paint($('notices'), `<div class="notice warn"><i class="glyph warn"></i><div class="notice-body"><b>Reconnecting to this node</b><p>${when} Any other node can show this mesh.</p>${links}</div><button class="btn small" type="button" data-action="refresh" data-key="retry">Retry now</button></div>`);
+      const links = state.failures >= 3 && otherNodes().length ? `<p>These nodes were in the pool:</p><div class="notice-links">${otherNodes().slice(0, 6).map(([name, url]) => `<a href="${esc(url)}/dashboard" rel="noreferrer">Open ${esc(name)}</a>`).join('')}</div>` : '';
+      const silent = state.updatedAt ? Math.round((Date.now() - state.updatedAt) / 1000) : null;
+      setWord('bad', 'bad', silent == null ? 'Not answering' : `Last heard ${silent} s ago`);
+      paint($('notices'), `<div class="notice bad"><i class="glyph bad"></i><div class="notice-body"><b>This node stopped answering</b><p>The page keeps trying. Any other node can show this pool.</p>${links}</div><button class="btn small" type="button" data-action="refresh" data-key="retry">Try again</button></div>`);
       if (!state.data) {
         $('headline').textContent = 'This node is not answering';
         $('subline').textContent = 'The page keeps trying.';
-        paint($('instrument'), '');
       } else {
         // What was last read may be wrong now, so it must not be offered as an all-clear.
-        $('subline').textContent = `Last known state, from ${clock(state.updatedAt)}. This node is not answering.`;
-        renderInstrument(state.data, assess(state.data));
-        renderAttention(assess(state.data));
+        $('subline').textContent = `This node stopped answering ${silent} s ago. These figures are from then.`;
+        renderNeeds(assess(state.data));
       }
-      document.title = 'Reconnecting, iSharded';
+      tabTitle('Out of date');
     }
 
     function render(data) {
       state.data = data;
       if (data.mesh?.members) state.lastMembers = data.mesh.members;
-      const view = assess(data);
-      setPill(view.tone, view.glyph, view.label);
+      state.model = routeModel(data, state.tab);
+      const view = assess(data), running = jobRunning(data.load_job), rows = allRows(data);
+      setWord(view.tone, view.glyph, view.word);
       $('headline').textContent = view.title;
       $('subline').textContent = view.detail;
-      document.title = `${view.label}, iSharded dashboard`;
-      paint($('notices'), state.problem ? `<div class="notice bad"><i class="glyph bad"></i><div class="notice-body"><b>The last update failed</b><p>${esc(state.problem)}</p></div></div>` : '');
+      tabTitle(view.word === 'Healthy' ? '' : view.word);
+      const notices = [];
+      if (data.simulated) notices.push('<div class="notice"><i class="glyph idle"></i><div class="notice-body">Simulated pool. Every name and figure is a sample.</div></div>');
+      if (state.problem) notices.push(`<div class="notice bad"><i class="glyph bad"></i><div class="notice-body"><b>The last update failed</b><p>${esc(state.problem)}</p></div><button class="btn small" type="button" data-action="refresh" data-key="retry">Try again</button></div>`);
+      paint($('notices'), notices.join(''));
       showConsole(true);
       $('rebalanceButton').hidden = !(data.route || []).length;
       $('loadButton').hidden = view.empty === 'machines';
       $('loadButton').classList.toggle('primary', view.empty === 'model');
       $('addMachine').classList.toggle('primary', view.empty === 'machines');
-      if (data.metrics?.token_latency_ms_ema) { state.latency.push(data.metrics.token_latency_ms_ema); if (state.latency.length > 28) state.latency.shift(); }
-      renderInstrument(data, view); renderFigures(data); renderMeta(data); renderRoute(data); renderLanes(data); renderAttention(view); renderMachines(data); renderEvents(data);
+      $('actionNote').hidden = !running;
+      $('rebalanceButton').disabled = running; $('loadButton').disabled = running;
+      takeSample(data);
+      renderBoard(data); renderStart(data, view); renderNeeds(view); renderMachinesBay(data, rows); renderMemory(data, rows); renderEvents(data); renderStages(data); renderReadings(data); renderMachines(data, rows); renderFacts(data);
       if (state.openWorker) renderWorker();
     }
 
@@ -942,7 +1053,7 @@
       } catch (error) {
         if (error.status === 401) renderSignedOut();
         else if (error.offline) { state.failures += 1; renderOffline(); }
-        else { state.problem = error.message; if (state.data) render(state.data); else { $('headline').textContent = 'This node refused the request'; $('subline').textContent = error.message; } }
+        else { state.problem = error.message; if (state.data) render(state.data); else { $('headline').textContent = 'This node refused the request'; $('subline').textContent = error.message; paint($('startPanel'), '<div class="empty"><button class="btn" type="button" data-action="refresh" data-key="retry">Try again</button></div>'); } }
         if (manual === true && error.status !== 401) toast(error.message);
       } finally { state.polling = false; schedule(); }
     }
@@ -954,7 +1065,7 @@
     }
     function signOut() {
       store.drop('isharded-token');
-      state.token = ''; state.data = null; state.inventory = {}; state.latency = []; state.joins = []; state.joinsHidden = false;
+      state.token = ''; state.data = null; state.model = null; state.tab = {}; state.inventory = {}; state.samples = []; state.joins = []; state.joinsHidden = false;
       if ($('worker').open) $('worker').close();
       refresh();
     }
@@ -974,36 +1085,61 @@
 
     /* Wiring */
 
+    function showAttention() { state.chip = 'attention'; state.text = ''; $('nodeSearch').value = ''; renderMachines(state.data); $('machinesSection').scrollIntoView({ block: 'start' }); }
     function onAction(action) {
       if (action === 'refresh') refresh(true);
       else if (action === 'load') openPicker();
       else if (action === 'invite') openInvite();
       else if (action === 'sign-in') askForKey(false);
-      else if (action === 'stages') { state.allStages = !state.allStages; renderRoute(state.data); }
+      else if (action === 'stages') { state.allStages = !state.allStages; renderStages(state.data); }
+      else if (action === 'route-all') { state.allRoute = !state.allRoute; renderBoard(state.data); }
+      else if (action === 'all-needs') { state.allNeeds = true; renderNeeds(assess(state.data)); }
+      else if (action === 'more-rows') { state.limit += 50; renderMachines(state.data); }
+      else if (action === 'find') { $('nodeSearch').focus(); $('nodeSearch').scrollIntoView({ block: 'center' }); }
       else if (action === 'close-worker') $('worker').close();
-      else if (action === 'show-attention') { state.chip = 'attention'; state.text = ''; $('nodeSearch').value = ''; renderMachines(state.data); $('machinesSection').scrollIntoView({ block: 'start' }); }
+      else if (action === 'show-attention') showAttention();
       else if (action === 'clear') { state.chip = 'all'; state.text = ''; $('nodeSearch').value = ''; renderMachines(state.data); $('nodeSearch').focus(); }
       else if (action === 'cancel') api('/admin/load/cancel', { method: 'POST' }).then(() => { toast('Load cancelled'); refresh(); }).catch(error => toast(error.message));
     }
     document.addEventListener('click', event => {
-      const target = event.target.closest?.('[data-action],[data-join],[data-chip],[data-feed],[data-sort],[data-group],[data-model],[data-worker]');
+      const target = event.target.closest?.('[data-action],[data-join],[data-chip],[data-feed],[data-sort],[data-group],[data-model],[data-worker],[data-stagerow],[data-show-stage],[data-cordon],[data-uncordon],[data-lane-remove]');
       if (!target) return;
-      if (target.dataset.action) onAction(target.dataset.action);
-      else if (target.dataset.join) answerJoin(target.dataset.name, target.dataset.join);
-      else if (target.dataset.chip) { state.chip = target.dataset.chip; renderMachines(state.data); }
-      else if (target.dataset.feed) { state.feed = target.dataset.feed; renderEvents(state.data); }
-      else if (target.dataset.sort) {
-        const key = target.dataset.sort;
+      const set = target.dataset;
+      if (set.action) onAction(set.action);
+      else if (set.join) answerJoin(set.name, set.join);
+      else if (set.chip) { state.chip = set.chip; state.limit = 50; renderMachines(state.data); }
+      else if (set.feed) { state.feed = set.feed; renderEvents(state.data); }
+      else if (set.sort) {
+        const key = set.sort;
         if (state.sortKey === key) state.sortDir *= -1; else { state.sortKey = key; state.sortDir = key === 'name' || key === 'state' ? 1 : -1; }
         $('sortBy').value = SORTS[key] && [...$('sortBy').options].some(option => option.value === key) ? key : $('sortBy').value;
         renderMachines(state.data);
-      } else if (target.dataset.group) {
-        const key = target.dataset.group, open = target.getAttribute('aria-expanded') === 'true';
-        state.groupsOpen.set(key, !open); renderMachines(state.data);
-      } else if (target.dataset.model) { if ($('picker').open) { $('customModel').value = ''; selectModel(target.dataset.model); } else openPicker(target.dataset.model); }
-      else if (target.dataset.worker) openWorker(target.dataset.worker);
+      } else if (set.group) {
+        const open = target.getAttribute('aria-expanded') === 'true';
+        state.groupsOpen.set(set.group, !open); renderMachines(state.data);
+      } else if (set.model) { if ($('picker').open) { $('customModel').value = ''; selectModel(set.model); } else openPicker(set.model); }
+      else if (set.stagerow) { state.openStage = state.openStage === set.stagerow ? null : set.stagerow; renderStages(state.data); }
+      else if (set.showStage) { if (phone.matches) openStage(state.model.stages[Number(set.showStage) - 1]); else { $('board').scrollIntoView({ block: 'nearest' }); focusStage($('routeDraw'), Number(set.showStage) - 1); } }
+      else if (set.cordon) askCordon(set.cordon);
+      else if (set.uncordon) uncordon(set.uncordon);
+      else if (set.laneRemove) askRemoveLane(set.laneRemove);
+      else if (set.worker) openWorker(set.worker);
     });
-    for (const dialog of [$('worker'), $('picker'), $('invite')]) dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
+    // The mark field is one tab stop. Arrows walk it, and the name shows under it.
+    const markButton = target => target.closest?.('#marks button');
+    function showMark(button) { if (button && $('markWord')) $('markWord').textContent = button.dataset.word; }
+    document.addEventListener('pointerover', event => showMark(markButton(event.target)));
+    document.addEventListener('focusin', event => showMark(markButton(event.target)));
+    document.addEventListener('keydown', event => {
+      const button = markButton(event.target);
+      if (!button || !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      const marks = [...$('marks').children], at = marks.indexOf(button);
+      const next = marks[{ ArrowLeft: Math.max(at - 1, 0), ArrowRight: Math.min(at + 1, marks.length - 1), Home: 0, End: marks.length - 1 }[event.key]];
+      button.tabIndex = -1; next.tabIndex = 0; next.focus();
+      state.markKey = next.dataset.worker;
+    });
+    for (const dialog of [$('worker'), $('picker'), $('invite'), $('confirm')]) dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
     $('worker').addEventListener('close', () => { state.openWorker = null; });
     $('auth').addEventListener('close', () => { if (state.signedOut) renderSignedOut(); });
 
@@ -1016,7 +1152,7 @@
       tip.style.top = `${box.top - height - 8 < 8 ? box.bottom + 8 : box.top - height - 8}px`;
     });
 
-    $('nodeSearch').addEventListener('input', event => { state.text = event.target.value; if (state.data) renderMachines(state.data); });
+    $('nodeSearch').addEventListener('input', event => { state.text = event.target.value; state.limit = 50; if (state.data) renderMachines(state.data); });
     $('sortBy').addEventListener('change', event => { state.sortKey = event.target.value; state.sortDir = ['name', 'state'].includes(state.sortKey) ? 1 : -1; renderMachines(state.data); });
     $('groupBy').value = state.group;
     $('groupBy').addEventListener('change', event => { state.group = event.target.value; store.set('isharded-group', state.group); renderMachines(state.data); });
@@ -1034,11 +1170,16 @@
     $('addMachine').onclick = openInvite;
     $('closeInvite').onclick = () => $('invite').close();
     $('createInvite').onclick = createInvite;
-    $('rebalanceButton').onclick = async () => {
-      const button = $('rebalanceButton');
+    $('rebalanceButton').onclick = askRebalance;
+    $('hintDone').onclick = () => { store.set('isharded-board-hint', '1'); $('boardHint').hidden = true; };
+    $('refreshButton').innerHTML = ICONS.refresh;
+    $('refreshButton').onclick = () => refresh(true);
+    $('confirmNo').onclick = () => $('confirm').close();
+    $('confirmYes').onclick = async () => {
+      const run = state.confirmRun, button = $('confirmYes');
       button.disabled = true;
-      try { const result = await api('/admin/rebalance', { method: 'POST' }); toast(`Pipeline advanced to epoch ${result.epoch}`); await refresh(); }
-      catch (error) { toast(error.message); }
+      try { if (await run() !== false) $('confirm').close(); }
+      catch (error) { if (error.status !== 401) { $('confirmError').textContent = error.message; $('confirmError').hidden = false; } }
       finally { button.disabled = false; }
     };
     $('authForm').onsubmit = event => {
@@ -1052,6 +1193,9 @@
     $('themeButton').onclick = () => applyTheme(THEMES[(THEMES.indexOf($('themeButton').dataset.choice) + 1) % THEMES.length]);
     addEventListener('hashchange', () => { if (takeKeyFromLink()) { state.signedOut = false; state.joinsHidden = false; state.joins = []; if ($('auth').open) $('auth').close(); refresh(); } });
     document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+    let resized = null;
+    addEventListener('resize', () => { clearTimeout(resized); resized = setTimeout(() => { if (state.data) renderBoard(state.data); }, 120); });
+    phone.addEventListener('change', () => { if (state.data) render(state.data); });
 
     takeKeyFromLink();
     applyTheme(document.documentElement.dataset.theme || 'system');
