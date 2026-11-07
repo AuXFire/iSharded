@@ -139,6 +139,9 @@ class ModelProfile:
     attention_interval: int = 0
     # What the entry stage must also hold, such as a draft model and its cache.
     entry_extra_bytes: int = 0
+    # What the draft reads for each guess, counted on the entry stage's memory. Zero
+    # leaves it out: no GPU run has yet shown that a guess takes its time from that stage.
+    draft_bytes: int = 0
     # Per layer, the RAM a stage keeps for rewinding a recurrent model. Empty if it keeps none.
     snapshot_bytes: list[int] = field(default_factory=list)
     # Tokens a plan has to earn back its download over. Zero ignores downloads.
@@ -344,6 +347,8 @@ def _pack(
                     UnitPlacement(unit=item.unit.name, pool_id=pool.pool_id, bytes=size, compact=compact)
                 )
                 milliseconds += _read_ms(size, item.active, pool, compact)
+                if item.entry_bytes:  # the draft sits beside the entry's first layer, on its device
+                    milliseconds += _read_ms(profile.draft_bytes, 1.0, pool, False)
                 break
         else:
             return None
@@ -1216,9 +1221,9 @@ def with_links(group: list[Candidate], links: dict[tuple[str, str], float] | Non
     return [replace(item, links=by_source.get(item.worker_id, {})) for item in group]
 
 
-def _fast_room(candidate: Candidate, workspace: int) -> int:
-    """What a worker's VRAM can give to weights and context."""
-    return sum(_group_rooms((pool for pool in candidate.pools if pool.kind in FAST_MEMORY), workspace).values())
+def _fast_room(candidate: Candidate, workspace: int, kinds: Iterable[str] = FAST_MEMORY) -> int:
+    """What a worker's VRAM can give to weights and context, or memory of these kinds."""
+    return sum(_group_rooms((pool for pool in candidate.pools if pool.kind in kinds), workspace).values())
 
 
 def _loop_lengths(hops: list[list[float]], ring: bool) -> list[float]:
@@ -1319,7 +1324,7 @@ def _untangled(loop: list[int], hops: list[list[float]]) -> list[int]:
 
 
 def _closest_subsets(
-    group: list[Candidate], profile: ModelProfile, required: set[str], slack: int
+    group: list[Candidate], profile: ModelProfile, required: set[str], slack: int, kinds: Iterable[str] = FAST_MEMORY
 ) -> list[list[Candidate]]:
     """The subsets that could hold a model in VRAM, by estimated time per token.
 
@@ -1328,7 +1333,7 @@ def _closest_subsets(
     is what makes few, close workers win. These are only estimates, so the best few
     get planned in full, and ``slack`` asks for that many spare steps of room, for
     when one that only just fits turns out not to. Empty if nothing here can hold the
-    whole model in VRAM.
+    whole model in VRAM, or in the memory of ``kinds``.
     """
     workspace = profile.stage_workspace_bytes
     sizes = profile.layer_sizes()
@@ -1340,10 +1345,10 @@ def _closest_subsets(
     step = max(layers // steps_needed, 1)
     steps_needed += slack
     fastest_first = sorted(group, key=lambda item: -_best_speed(item))
-    workers = [item for item in fastest_first if _fast_room(item, workspace) >= step or item.worker_id in required]
+    workers = [item for item in fastest_first if _fast_room(item, workspace, kinds) >= step or item.worker_id in required]
     if not workers:
         return []
-    rooms = [_fast_room(item, workspace) for item in workers]
+    rooms = [_fast_room(item, workspace, kinds) for item in workers]
     steps = [room // step for room in rooms]
     speeds = [_best_speed(item) for item in workers]
     hops = [

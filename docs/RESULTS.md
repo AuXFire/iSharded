@@ -240,6 +240,10 @@ Linux `tc netem` in WSL2 on the desktop, or a delay relay on Windows. These meas
 | Planning a 397B | Planner, Qwen3.5-397B-A17B on cards of 44, 44, 29, 29, 21 and 21 GiB | Was refused with 188 GiB offered for 166.5 GiB; now plans with 2.57 GiB in one node's RAM, down from 5.14 GiB across two | Estimated (planner output) | 2026-11-06 | 7d0886d |
 | Planning at 200 workers | Loop planner, 200 simulated workers | Retries 2.0 and 3.0 s against 0.6 and 0.9 s with the fix; 200 workers plan in under 2 s even when a model needs 63 | Measured on synthetic pools | 2026-11-06 | 44f6acf, 717abcb |
 | A GGUF stage's reserve | 8192 tokens, 2 slots, on an A40 | 1.375 GiB planned with context, against 1.4 GiB measured | Measured | 2026-11-06 | 3468170 |
+| The seven-node loop: today's order against the tour | Planner on the WAN lab's seven-node table: chain round trips from measured hop costs, 110 ms for every other pair (a guess) | Summed round trips 765 ms today, 679 ms for the tour s1 > s2 > s3 > s4 > s6 > s5 > s7, which is the shortest of all 720 orders and skips the 195 ms link. With 1 ms a hop and 64 ms of compute: 453.5 against 410.5 ms a token. Real per-site round trips, which this table does not have, would decide more | Estimated (planner output) | 2026-11-07 | Round 6 place lane |
+| The same two orders on the emulator | That table over netem in WSL2 on the laptop, stand-in ring stages with the measured per-stage compute, 8.3 KB a token, 30 tokens; 3 rounds, today and tour interleaved | token_ms p50 today 451.7, 452.0, 452.1; tour 408.8, 408.9, 409.0 (p99 at most 454.8 and 415.1). 9.6% less a token, 2.21 to 2.45 tokens/s. Both are 1.6 ms under the law, so a hop cost 0.77 ms here | Simulated, emulated delay | 2026-11-07 | Round 6 place lane |
+| A shorter loop applied by the coordinator | Real coordinator and CPU workers of Qwen3-0.6B Q8_0 in WSL2 network namespaces on the laptop, 1 ms between three near nodes, 80 ms round trip to a far one; each worker offered 0.34 GB, so three were needed. The route loaded while one near node was away, so the far node held a stage; then that node joined, with `ISHARDED_APPLY_LOOP=1`. 64-token greedy replies, 3 before and 3 after, 3 rounds each from a fresh pool. Other lanes used the laptop meanwhile | Tokens/s before 9.13, 9.18, 9.15 / 9.07, 8.83, 8.76 / 7.73, 8.61, 7.18; after 31.36, 34.31, 30.62 / 22.59, 20.67, 20.77 / 17.23, 17.24, 18.57. The coordinator applied the loop 55 to 89 s after the node joined, left the far node out and brought the new one in. 10, 17 and 18 replies ran during the three applies, and none was dropped. Its estimate was 8.5 to 10.2 ms a token saved, paid back in 311 to 319 tokens: far under the 70 to 80 ms that went, because probes over HTTP priced the near links, as the next row shows | Measured, emulated 80 ms | 2026-11-07 | Round 6 place lane |
+| Ring times against HTTP probes | The same runs, links as `/admin/status` priced them after each apply | The ring priced the 80 ms link at 78.35 to 79.54 ms, a one way of 40.2 to 40.8 ms. HTTP probes priced links of the same 80 ms at 123.05 to 131.25 ms. Near links of 1 ms: ring 0.0, which means under the 1 ms a hop the planner adds; probes 3.45 to 23.05 ms. The closing link and links off the route stay on probes | Measured, emulated 80 ms | 2026-11-07 | Round 6 place lane |
 
 ## Failures during a reply
 
@@ -271,6 +275,7 @@ Each row gives the longest pause and whether the text matched an unbroken run. [
 | Weights moved after restarts | Planner, 7 workers, Qwen3-235B, 180 GiB | Speeds that moved 2% moved 74 to 116 GiB of 180; the held order is now always tried, which moved 0 GiB in 32 re-measured restarts | Measured | 2026-11-06 | 3468170 |
 | A drained worker leaving the route | Live pool | Replies queued behind its drain waited up to 180 s (fixed) | Measured | 2026-11-05 | 392c767 |
 | Connections from a home link | Seven-machine mesh | About 1 in 10 new connections from a home link failed, and one dropped attempt ended a whole load (fixed with retries) | Measured | 2026-11-06 | bb1d272 |
+| A node killed while it fetches for a shorter loop | The live apply lab of Routes and the planner: the joining near node's worker and its children killed as soon as the apply's fetch began, with replies running one after another | The fetch failed (stopped reporting download progress) and the old route, far node included, kept serving: 18 replies during, none dropped, and 3 more after, all whole. No weights moved on the route | Measured, emulated 80 ms | 2026-11-07 | Round 6 place lane |
 
 ### Freezes
 
@@ -286,6 +291,7 @@ Each row gives the longest pause and whether the text matched an unbroken run. [
 | A hung engine looks healthy (pre-fix) | Real engine at 08fd071, compute stuck, stand-in model | Acks and pings continued: nothing heard in 6x the limit, next link marked up. The entry would wait 186 s, then hold the slot up to 186 s more (read from code). Hop silence did work: a refusal at 0.74-1.0x the limit | Measured, waits read from code | 2026-11-06 | Round 1 stress lane |
 | The status page with stalled or dead workers | Real orchestrator, three CPU workers, three timed GETs each | Before: 0.01 s all up, 3.01 to 3.03 s one worker suspended, 9.66 to 9.71 s one killed, 9.70 to 9.74 s both. After: 0.01, 3.00 to 3.02, 3.01 to 3.03, 3.02 to 3.03 s. Verifier, new: 0.01, 3.01-3.02, 3.01-3.02, 3.01-3.03; old (c117641): 0.01, 3.01-3.03, 9.65-9.69, 9.63-9.66 s. A refused connect on Windows takes 2.03 s on a raw socket, 2.05 s with httpx | Measured | 2026-11-07 | Round 5 fixes lane |
 | Watchdog on macOS runners | GitHub macOS runners | Runners slept 100 ms ticks for more than twice that, so the watchdog saw a hung pass run less than half as long | Measured | 2026-11-07 | c117641 |
+| A node stalled while it fetches for a shorter loop | The same lab, the joining node's worker and its children suspended with psutil as the fetch began | The fetch failed after its missed polls, and the old route kept serving: 42 replies during, none dropped, and 3 more after, all whole | Measured, emulated 80 ms | 2026-11-07 | Round 6 place lane |
 
 ### Silent and lost links
 
@@ -352,6 +358,7 @@ Every comparison count on record, newest work last within each group.
 | Nearby seeds | Tool-call measurement, consecutive seeds | One draw put the same rare token into 11 of 72 replies (fixed) | Measured | 2026-11-06 | 2f9c5fe |
 | Silent relays and kills on the ring | See [Silent and lost links](#silent-and-lost-links) | Same text on every run listed there | Measured | 2026-11-07 | Round 4 ring lane |
 | Replies when passes merge | The round-five slots runs, temperature 0, from 4 replies at once | Not identical. Once passes merged, the same prompt gave different text from round to round, in every sweep and in the verifier's rerun; never with nothing merged. A merged pass rounds differently from single passes | Measured | 2026-11-07 | Round 5 slots lane and its verifier, [guide](GUIDE.md#several-conversations-at-once) |
+| Replies after a shorter loop is applied | The live apply lab of Routes and the planner, every node the same CPU build of llama.cpp; a greedy count, a greedy story, and a reply at temperature 0.8 with seed 1234, 64 tokens each, before and after the apply | Where the apply kept the layer split and only swapped a node (2 runs): 6 of 6 identical to the loaded layout. Where it moved boundaries (1 run): the story matched, the count and the seeded reply did not. A fresh load landed on another split than the apply each time it was tried (2 runs), so no fresh load of the exact applied layout was compared; against those other splits the story matched twice, the count once, the seeded reply never | Measured, emulated 80 ms | 2026-11-07 | Round 6 place lane |
 
 ## Security probes
 
@@ -500,6 +507,7 @@ Scale and hardware:
 - The chat page has been used only in Chrome.
 - `isharded bench` has no GPU numbers and no full default run (prompts of 128 and 3400, `--parallel 1,4,8`, 200 tokens).
 - One load failure at `--parallel 2` on the test pool was transient, and its cause was never found.
+- Whether a draft takes its time from the entry stage's GPU. `ISHARDED_DRAFT_SHARES_DEVICE` counts it that way, and stays off until a GPU run shows it. A shorter loop applied on real GPUs or across a real mesh, and the ring's link prices on a real WAN, have not run either: only the emulator above
 
 Failures:
 
