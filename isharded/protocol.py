@@ -295,7 +295,8 @@ class LoadModelRequest(BaseModel):
     # A small GGUF that guesses tokens for the big one to check in one pass.
     # "auto" picks one for the model's family, and "none" turns this off.
     draft_model: str = "auto"
-    draft_tokens: int = Field(default=6, ge=1, le=16)  # the most guesses out at once
+    # The most guesses out at once. Unset, it follows the route. See orchestrator.build_target.
+    draft_tokens: int | None = Field(default=None, ge=1, le=16)
     # Replies the pipeline runs at once. Each costs its own context memory.
     parallel: int = Field(default=1, ge=1, le=32)
     merge_passes: bool = True

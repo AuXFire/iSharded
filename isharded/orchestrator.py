@@ -99,6 +99,9 @@ AUTO_DRAFTS = {
     "qwen35": "lmstudio-community/Qwen3.5-0.8B-GGUF:Qwen3.5-0.8B-Q8_0.gguf",
     "qwen35moe": "lmstudio-community/Qwen3.5-0.8B-GGUF:Qwen3.5-0.8B-Q8_0.gguf",
 }
+# The most guesses out at once, unless a load says otherwise.
+GUESSES_REWINDING = 16
+GUESSES_SNAPSHOTTED = 6
 # llama.cpp's compute buffers on a GPU, on top of weights and context.
 GGUF_STAGE_WORKSPACE_BYTES = 768 * 1024**2
 DRAFT_WORKSPACE_BYTES = 512 * 1024**2
@@ -303,6 +306,15 @@ class LoadJob:
         }
 
 
+def guess_limit(request: LoadModelRequest, rewinds: bool) -> int:
+    """The most guesses out at once on this route.
+
+    A guess out on a route that rewinds by itself costs nothing to hold. Elsewhere every stage
+    keeps a copy of its recurrent state for each one, so the limit stays where it was.
+    """
+    return request.draft_tokens or (GUESSES_REWINDING if rewinds else GUESSES_SNAPSHOTTED)
+
+
 def build_target(
     request: LoadModelRequest,
     reuse_cached: bool = True,
@@ -324,7 +336,8 @@ def build_target(
     check_pooling(request, adapter)
     draft = resolve_draft(request, manifest, adapter, sources, token)
     projector, image_marker = resolve_projector(request, adapter, sources, token)
-    speculate_tokens = request.draft_tokens if draft else 0
+    rewinds = not any(adapter.recurrent_state_bytes(index) for index in range(adapter.num_layers))
+    speculate_tokens = guess_limit(request, rewinds) if draft else 0
     slots = request.parallel if isinstance(adapter, GgufAdapter) and not request.embedding else 1
     kv_share = KV_TYPES[request.kv_type if isinstance(adapter, GgufAdapter) else "f16"][1]
     units = adapter.partition(manifest.tensors)
@@ -367,7 +380,7 @@ def build_target(
         peer_fetch=peer_fetch,
         draft=draft,
         speculate_tokens=speculate_tokens,
-        rewinds=not any(adapter.recurrent_state_bytes(index) for index in range(adapter.num_layers)),
+        rewinds=rewinds,
         request=request,
         file_sources=holders,
         slots=slots,

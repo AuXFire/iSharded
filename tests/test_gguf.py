@@ -1445,3 +1445,29 @@ def test_an_unseeded_gguf_pass_samples_as_it_always_did(monkeypatch):
     monkeypatch.setattr(runtime, "gguf_logits", torch.tensor([0.0, 50.0, 0.0]))
     request = InferRequest(session_id="s", epoch=1, input_ids=[1], temperature=0.8)
     assert runtime._sample(None, request) == 1
+
+
+def load_settings(**fields):
+    from isharded.protocol import LoadModelRequest
+
+    return LoadModelRequest(model_id="m", **fields)
+
+
+def test_a_route_that_rewinds_gets_more_guesses_than_one_that_keeps_snapshots():
+    from isharded.orchestrator import guess_limit
+
+    assert guess_limit(load_settings(), rewinds=True) == 16
+    assert guess_limit(load_settings(), rewinds=False) == 6
+
+
+def test_a_load_that_names_a_guess_limit_keeps_it():
+    from isharded.orchestrator import guess_limit
+
+    assert guess_limit(load_settings(draft_tokens=3), rewinds=True) == 3
+    assert guess_limit(load_settings(draft_tokens=16), rewinds=False) == 16
+
+
+@pytest.mark.parametrize("value", [0, 17])
+def test_no_load_goes_past_the_guess_cap(value):
+    with pytest.raises(ValueError):
+        load_settings(draft_tokens=value)

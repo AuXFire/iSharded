@@ -1279,7 +1279,7 @@ On two nodes on one machine, the same loop ran through the coordinator, a follow
 | `parallel` | 1 | 1 to 32 |
 | `entry_worker`, `exit_worker` | None | Pin the ends of the route |
 | `draft_model` | `auto` | A GGUF id, `auto`, or `none` |
-| `draft_tokens` | 6 | Most guesses out at once, 1 to 16 |
+| `draft_tokens` | 16 on a route that rewinds by itself, 6 on one with recurrent layers | Most guesses out at once, 1 to 16 |
 | `merge_passes` | `true` | Let conversations share a pass |
 | `prompt_cache` | `true` | Reuse saved prompt states |
 | `kv_type` | `f16` | How a GGUF model keeps attention KV: `f16` or `q8_0` |
@@ -1513,7 +1513,7 @@ A token has to cross every stage in turn, so a reply on its own would leave all 
 
 So a guess can only save time. Each pass is one row at its own position, which is what plain decoding runs, so every token is the one plain decoding gives, seed and all. It needs the [native engine](#the-native-engine) and at least two stages.
 
-The entry keeps just enough passes out to fill the route, up to `draft_tokens`, and fewer when guesses are landing badly. Other replies want the route too, so each reply keeps out only its share. N replies with D passes out, each out for a round trip R, ask for N × D / R rows a second, and a route passes 1 / T, where T is the time one row takes. So D stops at R / (N × T), and never goes below one. T is the shortest gap lately between any two answers on the route, so it does not change with the number of replies. A reply on its own is limited by filling the route, as above.
+The entry keeps just enough passes out to fill the route, up to `draft_tokens`, and fewer when guesses are landing badly. Left unset, `draft_tokens` is 16 on a route that rewinds by itself and 6 on a model with recurrent layers, where each one costs every stage a snapshot. Other replies want the route too, so each reply keeps out only its share. N replies with D passes out, each out for a round trip R, ask for N × D / R rows a second, and a route passes 1 / T, where T is the time one row takes. So D stops at R / (N × T), and never goes below one. T is the shortest gap lately between any two answers on the route, so it does not change with the number of replies. A reply on its own is limited by filling the route, as above.
 
 A model with recurrent layers cannot rewind past a finished pass by itself, so its passes also ask each stage to keep a snapshot. After such a pass a stage saves that slot's recurrent state, and a rewind restores the snapshot of the right position and then cuts attention back as usual. A stage holds `draft_tokens` + 2 snapshots for each slot, in RAM, and a slot's snapshots go when it is cleared. If a rewind finds none, the reply replays over HTTP, and the route stays off its direct links until they reopen. Attention models keep no snapshots and pay nothing.
 
