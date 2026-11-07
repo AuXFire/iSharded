@@ -21,7 +21,7 @@ from isharded import up
 from isharded import worker as worker_module
 from isharded.addresses import NodeProof, claim, host_port, prove, reach_options, reach_urls
 from isharded.node import _worker_command
-from isharded.orchestrator import Orchestrator, WorkerRecord
+from isharded.orchestrator import LINK_TTL_SECONDS, Orchestrator, WorkerRecord
 from isharded.pool import add_node, init_pool
 from isharded.protocol import PROTOCOL_VERSION, HardwareInfo, StageAssignment, WorkerRegistration
 from isharded.tickets import AUDIENCE, NodeTickets, TicketMaker
@@ -430,6 +430,18 @@ def test_a_ring_that_cannot_dial_a_proven_address_opens_on_the_advertised_ones()
     asyncio.run(run())
     assert dialled(pool, "a")[-1]["next"]["address"] == "b:7"
     assert pool.plane.ring_epoch == 4
+    assert pool.plane.ring_fell_back_at is not None
+
+
+def test_a_ring_that_fell_back_tries_its_proven_address_again_after_a_while() -> None:
+    pool = Pool("a", "b", addresses={})
+    plane = pool.plane
+    plane.ring_epoch, plane.ring_tried, plane.ring_fell_back_at = 4, 4, time.monotonic()
+    plane._redial_moved_ring()
+    assert plane.ring_epoch == 4
+    plane.ring_fell_back_at -= LINK_TTL_SECONDS
+    plane._redial_moved_ring()
+    assert plane.ring_epoch is None
 
 
 def test_a_better_address_waits_for_a_quiet_moment_to_move_the_ring() -> None:

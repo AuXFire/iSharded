@@ -556,6 +556,7 @@ class Orchestrator:
         self.hops_checked_at = float("-inf")
         self.hop_lock = asyncio.Lock()
         self.ring_moved = False
+        self.ring_fell_back_at: float | None = None
         self.link_row_bytes = 0
         self.model_id: str | None = None
         self.planning_model: str | None = None
@@ -1289,7 +1290,9 @@ class Orchestrator:
 
     def _redial_moved_ring(self) -> None:
         """A better address waits for a quiet moment, as a redial sends running replies to a replay."""
-        if self.ring_moved and self.ring_epoch is not None and not self.replies_in_flight:
+        # A proven address the ring could not dial may work later, but each try stops the ring.
+        again = self.ring_fell_back_at is not None and time.monotonic() - self.ring_fell_back_at >= LINK_TTL_SECONDS
+        if (self.ring_moved or again) and self.ring_epoch is not None and not self.replies_in_flight:
             self.ring_moved = False
             self.ring_epoch = self.ring_tried = None
 
@@ -1373,7 +1376,9 @@ class Orchestrator:
         self.ring_moved = False
         # An address that passed over HTTP can still fail here, as a door has its own port.
         hops = dict(self.hops)
+        self.ring_fell_back_at = None
         if not await self._open_ring(route, epoch, hops) and hops:
+            self.ring_fell_back_at = time.monotonic()
             await self._open_ring(route, epoch, {})
 
     async def _open_ring(self, route: list[StageAssignment], epoch: int, hops: dict[tuple[str, str], str]) -> bool:
