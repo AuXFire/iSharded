@@ -1756,6 +1756,8 @@ Exactness costs speed where merging helped. On one stage, four conversations wen
 | Qwen3.5-0.8B Q8_0 on CPU | 3 | true |
 | Qwen3.5-0.8B Q8_0 on the RTX 3060 | 3 | true |
 
+Measured on that route at `--parallel 8`, with 8 replies seeded at temperature 0.8: with `--exact`, 16 of 16 replies over two bursts matched the same replies run one at a time on the same route, and still 16 of 16 when the CPU stage was suspended for 10 seconds in the middle. Without it, 2 of 16 matched. The reference must be the same route: a `--parallel 1` load had room for 5 more layers on the GPU, and a different split rounds differently where the stages meet, whatever is merged.
+
 The probe is only as good as the rows it tried. A model whose rounding depends on the data, as a mixture of experts can, may differ where the probe saw none.
 
 Each stage reports what it found in the `exact` block of its `/health` telemetry: `setting`, `exact_merge_limit`, `verify_exact`, `probe_error` if the probe could not run, `merge_most`, the most replies a pass may hold there, and `guesses_in_one_pass`. A stage with no native engine probes nothing, so with `--exact` it merges nothing. `exact` in `/admin/status` says whether the running route's replies are exact: `exact`, `setting`, and `reasons`, one for each stage that merges more than its probe allowed, checks guesses several rows to a pass, or has not reported yet.
