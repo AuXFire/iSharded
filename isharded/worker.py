@@ -1102,9 +1102,6 @@ class WorkerRuntime:
         self.ring_stop()
         self.draft_choice = DraftChoice()  # a new route can change which way is faster
         self.row_clock = RowClock()
-        if request.model_id != self.model_id:
-            # The planner trusts these counts to say how this model's guesses go.
-            self.pipeline_tokens = self.pipeline_misses = 0
         adapter = create_adapter(request.architecture)
         if not isinstance(adapter, GgufAdapter) and not has_torch():
             raise ValueError(NO_TORCH)
@@ -1116,6 +1113,9 @@ class WorkerRuntime:
             self._release_weights()
             raise
         self.adapter = adapter
+        if request.model_id != self.model_id:
+            # The planner trusts these counts to say how this model's guesses go.
+            self.pipeline_tokens = self.pipeline_misses = 0
         self.model_id = request.model_id
         self.epoch = request.epoch
         self.assignment = request.assignment

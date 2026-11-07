@@ -1035,11 +1035,15 @@ def test_a_load_of_another_model_starts_its_pipeline_counts_again(monkeypatch) -
     """A stage that restarts reloads the same model, and its counts still describe it."""
     from isharded.protocol import ConfigureRequest
 
-    def stop(_):
+    def stop(*_):
         raise ValueError("stop here")
 
-    monkeypatch.setattr(worker_module, "create_adapter", stop)
+    monkeypatch.setattr(worker_module, "create_adapter", lambda _: SimpleNamespace(num_layers=2))
+    monkeypatch.setattr(worker_module, "has_torch", lambda: True)
     item = runtime(pipeline_tokens=900, pipeline_misses=40, term=5, roles={"inference"}, host_models=[], worker_id="w", ring_client=None, model_id="m")
+    item._materialize = lambda *_: None
+    item.caches, item.prefix, item.gguf = {}, SimpleNamespace(clear=lambda: None), None
+    item.copies = SimpleNamespace(aim=stop)  # the load stops here, once the model is in place
     stage = StageAssignment(worker_id="w", url="http://w", start_layer=0, end_layer=1)
 
     def load(model_id):
