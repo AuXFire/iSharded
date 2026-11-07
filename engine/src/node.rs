@@ -788,7 +788,10 @@ fn start_peer(inner: &Arc<Inner>, ring: &Arc<Ring>, peer: &Arc<Peer>) {
             spawn("isharded-peer", move || {
                 let (inner, ring, peer) = reading;
                 read_peer(&inner, &ring, &peer);
-                peer_lost(&inner, &ring, &peer, "the link closed", peer.link.write_failed());
+                // A link that had already gone quiet was ended by the far end's read limit,
+                // and a stage that died was still answering heartbeats.
+                let quiet = peer.heard.lock().elapsed() > ring.silence_timeout / 2;
+                peer_lost(&inner, &ring, &peer, "the link closed", quiet || peer.link.write_failed());
             })
         })
         .and_then(|_| {

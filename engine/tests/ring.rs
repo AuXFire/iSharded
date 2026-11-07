@@ -135,6 +135,13 @@ impl Relay {
         }
     }
 
+    /// The same, for what goes towards the far end only.
+    fn hold_forth(&self) {
+        for item in self.state.carried.lock().unwrap().iter() {
+            item.forth.store(true, Ordering::SeqCst);
+        }
+    }
+
     /// New connections are closed as soon as they arrive.
     fn refuse(&self, refusing: bool) {
         self.state.refusing.store(refusing, Ordering::SeqCst);
@@ -591,6 +598,29 @@ fn a_silent_hop_is_redialled_and_what_it_held_goes_again_in_order() {
         assert!(ring.nodes[door - 1].stats().next_up);
         assert_eq!(ring.nodes[door - 1].stats().refusals, 0);
     }
+}
+
+#[test]
+fn a_hop_silent_one_way_is_redialled_even_when_the_far_end_gives_up_on_it_first() {
+    // The far end's read limit ends the link, and that close still gets through. It is not a
+    // stage dying, so the reply should not pay for a replay. Which side's limit fires first
+    // depends on the system, so the close is made here, just inside the near end's own limit.
+    let (mut ring, relay) = ring_through(1, 3, true, Duration::ZERO, 600);
+    patient_client(&ring);
+    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+    answer(&mut ring);
+    let_links_prove_themselves(&ring, 2);
+    relay.hold_forth();
+    for id in 2..=5 {
+        ring.client.send(&pass(id, 5, id as u32).encode()).unwrap();
+    }
+    thread::sleep(Duration::from_millis(450));
+    relay.cut();
+    for id in 2..=5 {
+        assert_eq!(answer(&mut ring).id, id);
+    }
+    assert_eq!(relay.attempts(), 2);
+    assert_eq!(ring.nodes[0].stats().refusals, 0);
 }
 
 #[test]
