@@ -515,13 +515,18 @@ def ms_per_token(loop_ms: float, pace_ms: float, tokens_per_miss: float = 1.0, r
     return (loop_ms + rewind_ms + (tokens_per_miss - 1) * pace_ms) / tokens_per_miss
 
 
-def route_times(route: list[StageAssignment], links: dict[tuple[str, str], float], ring: bool) -> tuple[float, float]:
-    """A planned route's time around the loop, and its slowest stage, in ms.
+def stage_ms(stage: StageAssignment) -> float:
+    """A row's time on a stage, from its memory's measured speed.
 
     Bandwidth alone flatters small active sets, such as a MoE's: every layer still costs
-    its kernel launches, and every stage boundary costs a network hop.
+    its kernel launches.
     """
-    stages = [max(stage.estimated_ms_per_token, (stage.end_layer - stage.start_layer) * LAYER_FLOOR_MS) for stage in route]
+    return max(stage.estimated_ms_per_token, (stage.end_layer - stage.start_layer) * LAYER_FLOOR_MS)
+
+
+def route_times(route: list[StageAssignment], links: dict[tuple[str, str], float], ring: bool) -> tuple[float, float]:
+    """A planned route's time around the loop, and its slowest stage, in ms. Every stage boundary costs a hop."""
+    stages = [stage_ms(stage) for stage in route]
     return sum(stages) + route_network_ms(route, links, ring), max(stages, default=0.0)
 
 

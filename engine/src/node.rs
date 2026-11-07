@@ -14,7 +14,7 @@
 //! the same errors the HTTP path raises, so every failure lands on recovery that is already
 //! proven: a reply replays, and a lost worker is replaced.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -976,18 +976,25 @@ fn next_batch(inner: &Inner) -> Option<Vec<Job>> {
     }
 }
 
-/// A job, and whatever waiting behind it can share its trip. There is no window to wait
-/// out: passes gather while the stage is busy, so a lone reply goes straight through.
+/// A job, and whatever waiting anywhere behind it can share its trip. There is no window to
+/// wait out: passes gather while the stage is busy, so a lone reply goes straight through.
 fn take_batch(first: Job, jobs: &mut VecDeque<Job>) -> Vec<Job> {
     let mut batch = vec![first];
     if !can_merge(&batch[0].pass) {
         return batch;
     }
-    let fits = |batch: &[Job], job: &Job| {
-        can_merge(&job.pass) && job.pass.epoch == batch[0].pass.epoch && batch.iter().all(|item| item.pass.slot != job.pass.slot)
-    };
-    while batch.len() < MAX_MERGED && jobs.front().is_some_and(|job| fits(&batch, job)) {
-        batch.extend(jobs.pop_front());
+    let epoch = batch[0].pass.epoch;
+    // A slot's passes run in the order they came, so a slot is done with once one of its
+    // passes has been looked at, whether that pass went or stayed.
+    let mut seen = HashSet::from([batch[0].pass.slot]);
+    let mut index = 0;
+    while index < jobs.len() && batch.len() < MAX_MERGED {
+        let pass = &jobs[index].pass;
+        if seen.insert(pass.slot) && can_merge(pass) && pass.epoch == epoch {
+            batch.extend(jobs.remove(index));
+        } else {
+            index += 1;
+        }
     }
     batch
 }
@@ -1125,6 +1132,61 @@ mod tests {
         let done = work();
         SPAWNS_LEFT.set(u32::MAX);
         done
+    }
+
+    fn job(slot: u32, epoch: u64, rows: u32, flags: u8) -> Job {
+        let pass = Pass {
+            id: u64::from(slot),
+            generation: 1,
+            epoch,
+            slot,
+            position: 0,
+            rollback_to: None,
+            flags,
+            sampling: wire::Sampling::GREEDY,
+            guesses: vec![],
+            tokens: vec![],
+            rows,
+            width: 1,
+            data: vec![0; rows as usize * 4],
+        };
+        Job { pass, arrived: Instant::now() }
+    }
+
+    fn batch_of(jobs: Vec<Job>) -> (Vec<u32>, Vec<u32>) {
+        let mut queue: VecDeque<Job> = jobs.into();
+        let first = queue.pop_front().unwrap();
+        let slots = |jobs: &mut dyn Iterator<Item = &Job>| jobs.map(|job| job.pass.slot).collect();
+        (slots(&mut take_batch(first, &mut queue).iter()), slots(&mut queue.iter()))
+    }
+
+    #[test]
+    fn a_merge_reaches_past_what_cannot_go_with_it() {
+        let verify = job(1, 1, 3, wire::FLAG_VERIFY);
+        let queue = vec![job(4, 1, 1, 0), verify, job(9, 1, 1, 0), job(4, 1, 1, 0), job(2, 2, 1, 0), job(0, 1, 1, 0)];
+        assert_eq!(batch_of(queue), (vec![4, 9, 0], vec![1, 4, 2]));
+    }
+
+    #[test]
+    fn a_pass_never_overtakes_one_of_its_own_slot() {
+        let verify = job(1, 1, 3, wire::FLAG_VERIFY);
+        assert_eq!(batch_of(vec![job(0, 1, 1, 0), verify, job(1, 1, 1, 0)]), (vec![0], vec![1, 1]));
+        let other_route = job(1, 2, 1, 0);
+        assert_eq!(batch_of(vec![job(0, 1, 1, 0), other_route, job(1, 1, 1, 0)]), (vec![0], vec![1, 1]));
+    }
+
+    #[test]
+    fn a_pass_that_cannot_merge_runs_alone() {
+        let verify = job(1, 1, 3, wire::FLAG_VERIFY);
+        assert_eq!(batch_of(vec![verify, job(2, 1, 1, 0)]), (vec![1], vec![2]));
+    }
+
+    #[test]
+    fn a_merge_stops_at_the_most_one_trip_holds() {
+        let queue = (0..MAX_MERGED as u32 + 2).map(|slot| job(slot, 1, 1, 0)).collect();
+        let (taken, left) = batch_of(queue);
+        assert_eq!(taken.len(), MAX_MERGED);
+        assert_eq!(left, vec![MAX_MERGED as u32, MAX_MERGED as u32 + 1]);
     }
 
     #[test]

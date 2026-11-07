@@ -725,6 +725,29 @@ fn passes_that_wait_share_a_trip_and_each_still_gets_its_own_answer() {
 }
 
 #[test]
+fn a_merge_reaches_past_a_slots_second_pass_and_refuses_only_its_own_row() {
+    let mut ring = ring(2, true, Duration::from_millis(30), 2000);
+    // The first holds the stage while the rest queue up, slot 1's two passes side by side.
+    let queued = [(1, 9, 1), (2, 1, 7), (3, 1, 8), (4, 2, 9), (5, 3, 666), (6, 4, 10)];
+    for (id, slot, position) in queued {
+        ring.client.send(&Pass { slot, ..pass(id, 3, position) }.encode()).unwrap();
+    }
+    let (mut answered, mut refused) = (vec![], vec![]);
+    for _ in queued {
+        let (kind, body) = ring.frames.next().unwrap();
+        match kind {
+            Kind::Result => answered.push(Answer::decode(&body).unwrap().id),
+            Kind::Nack => refused.push(Nack::decode(&body).unwrap().id),
+            other => panic!("{other:?}"),
+        }
+    }
+    answered.sort_unstable();
+    assert_eq!(answered, vec![1, 2, 3, 4, 6]);
+    assert_eq!(refused, vec![5]);
+    assert!(ring.nodes[0].stats().merged_rows >= 4, "{:?}", ring.nodes[0].stats());
+}
+
+#[test]
 fn passes_on_one_sequence_never_share_a_trip() {
     let mut ring = ring(2, true, Duration::from_millis(5), 2000);
     for id in 1..=20 {

@@ -22,12 +22,14 @@ from .deadlines import PASS_SECONDS, PASS_SECONDS_PER_TOKEN, pass_seconds  # noq
 META_HEADER = "x-isharded-meta"
 # Raised whenever workers and the orchestrator stop being able to talk safely.
 # A node on another version is refused at the door, not found out mid-request.
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 7
 # PyTorch's own bit pattern for a NaN in BF16.
 BFLOAT16_NAN = np.uint16(0xFFFF)
 # What a pass can hold, by the names the safetensors format gives them, in the order that
 # format's writer lays them out. BF16 is read as bits.
 ROW_DTYPES = {"I64": np.int64, "F64": np.float64, "F32": np.float32, "I32": np.int32, "BF16": np.uint16, "F16": np.float16}
+# The most replies a route runs at once.
+MAX_PARALLEL = 64
 
 
 class ResourceContribution(BaseModel):
@@ -235,6 +237,8 @@ class DraftModel(BaseModel):
     file_size: int
     revision: PlainName
     file_sources: list[str] = Field(default_factory=list)
+    # What it keeps per token of context, which every slot adds to the entry stage.
+    kv_bytes_per_token: int = 0
 
 
 class ConfigureRequest(BaseModel):
@@ -319,7 +323,8 @@ class LoadModelRequest(BaseModel):
     # Guess from the prompt and the reply so far. It needs no model, and two stages or more.
     prompt_lookup: bool = True
     # Replies the pipeline runs at once. Each costs its own context memory.
-    parallel: int = Field(default=1, ge=1, le=32)
+    # None leaves it to the load, which keeps the route busy with what fits.
+    parallel: int | None = Field(default=None, ge=1, le=MAX_PARALLEL)
     merge_passes: bool = True
     # Reuse saved prompt states. Replies are the same either way at temperature 0.
     prompt_cache: bool = True

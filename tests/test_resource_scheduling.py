@@ -99,6 +99,7 @@ def test_a_lost_pinned_worker_is_dropped_so_recovery_can_continue() -> None:
             orchestrator.register(record)
         target = ModelTarget.__new__(ModelTarget)
         target.embedding = False
+        target.parallel = {"slots": 1, "reason": "set by the operator"}
         unit = WeightUnit(
             name="x",
             kind="embed",
@@ -150,6 +151,7 @@ def test_a_plan_preview_says_what_goes_unused_on_every_node(monkeypatch) -> None
             orchestrator.register(record)
         target = ModelTarget.__new__(ModelTarget)
         target.embedding = False
+        target.parallel = {"slots": 1, "reason": "set by the operator"}
         unit = WeightUnit(
             name="x",
             kind="embed",

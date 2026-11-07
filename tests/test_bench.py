@@ -499,7 +499,7 @@ def test_status_gives_what_a_report_needs(monkeypatch):
     adapter.header = {"general.file_type": 15}
     adapter.config, adapter.num_layers = {"model_type": "qwen3"}, 2
     target = SimpleNamespace(
-        model_id="m", adapter=adapter, slots=4, draft=None, embedding=False, projector=None, units={}, held={},
+        model_id="m", adapter=adapter, slots=4, parallel={}, draft=None, embedding=False, projector=None, units={}, held={},
         profile=SimpleNamespace(total_bytes=1, ring=False, context_tokens=8192),
     )  # fmt: skip
     route = [StageAssignment(worker_id="w", url="http://worker", start_layer=0, end_layer=2)]

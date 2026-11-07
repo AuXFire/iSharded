@@ -1698,7 +1698,7 @@ def test_a_plan_shows_its_loop_and_pace(monkeypatch) -> None:
     route = plan_placement(mesh_cards(), [], model, links=LINKS)
     adapter = SimpleNamespace(config={}, num_layers=model.num_layers)
     units = {item.name: item for item in model.units}
-    target = SimpleNamespace(model_id="m", adapter=adapter, profile=model, units=units, held={}, draft=None, embedding=False, projector=None)
+    target = SimpleNamespace(model_id="m", adapter=adapter, profile=model, units=units, held={}, draft=None, embedding=False, projector=None, slots=1, parallel={})
     runtime.active = target
     plan = orchestrator_module.describe_plan(target, route)
     loop, pace = planner.route_times(route, LINKS, model.ring)
@@ -1896,13 +1896,13 @@ def running_pool(monkeypatch):
     active = SimpleNamespace(model_id="m", profile=model, draft=None, projector=None, entry_worker=None, exit_worker=None, held={}, serving=set(), reuse_cached=True)
     runtime.active, runtime.route, runtime.links, runtime.epoch = active, route, dict(LINKS), 7
 
-    async def nothing(*args):
+    async def nothing(*args, **kwargs):
         return {}
 
     def refuse(*args, **kwargs):
         raise AssertionError("a plan must not touch a route")
 
-    runtime.gguf_sources = runtime.refresh_worker_metrics = runtime.refresh_holdings = runtime.measure_links = nothing
+    runtime.gguf_sources = runtime.refresh_worker_metrics = runtime.refresh_holdings = runtime.measure_links = runtime.choose_slots = nothing
     runtime.candidate_groups = lambda: (workers, [])
     runtime._with_holdings = lambda group, target: group
     runtime.plan_or_refuse = lambda target, **options: route
