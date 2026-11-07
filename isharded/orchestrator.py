@@ -2064,7 +2064,7 @@ class Orchestrator:
                                 event = json.loads(line)
                                 if "token_id" not in event:
                                     failure = event.get("error")
-                                    self.add_event("failure", "Generation stream stopped", str(failure)[:200])
+                                    self.add_event("failure", "Generation stream stopped", (f"{failure.get('failed_worker')}: {failure.get('message')}" if isinstance(failure, dict) else str(failure))[:200])
                                     break
                                 now = time.perf_counter()
                                 if produced:

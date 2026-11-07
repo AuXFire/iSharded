@@ -287,3 +287,68 @@ def test_a_fixture_is_labelled_and_names_nobody(path):
 def test_every_fixture_the_plan_names_exists():
     names = {path.stem for path in FIXTURES}
     assert names >= {"calm-7", "repair-7", "spill-7", "lost-7", "load-lane-7", "two", "forty", "two-hundred", "fresh-no-times", "no-model", "no-machines"}
+
+
+def open_dashboard(playwright, fixture, status_change=None):
+    """The real page in real Chrome, with a fixture in place of the pool."""
+    try:
+        chrome = playwright.chromium.launch(channel="chrome")
+    except Exception as error:  # no Chrome on this machine
+        pytest.skip(f"Chrome is not available: {error}")
+    data = json.loads((ROOT / "tests" / "fixtures" / "status" / f"{fixture}.json").read_text(encoding="utf-8"))
+    if status_change:
+        status_change(data)
+    page = chrome.new_context(viewport={"width": 1440, "height": 900}).new_page()
+    page.route("**/*", lambda route: route.fulfill(status=404, body="{}", content_type="application/json"))
+    page.route("**/dashboard", lambda route: route.fulfill(body=served("dashboard.html"), content_type="text/html"))
+    page.route("**/admin/status", lambda route: route.fulfill(body=json.dumps(data), content_type="application/json"))
+    page.goto("http://pool.invalid/dashboard")
+    page.wait_for_selector("#consoleBody:not([hidden])")
+    return chrome, page
+
+
+def test_many_machines_keep_true_counts_and_search_reaches_a_closed_group():
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    with playwright_api.sync_playwright() as playwright:
+        chrome, page = open_dashboard(playwright, "two-hundred")
+        idle = page.locator("[data-group=Idle]")
+        assert idle.get_attribute("aria-expanded") == "false"
+        idle_total = sum(worker["state"] == "standby" for worker in page.evaluate("Object.values(state.data.workers)"))
+        assert idle.inner_text().split("workers")[0].split()[-1] == str(idle_total)
+        page.fill("#nodeSearch", "sample-1")
+        assert page.locator("#nodeTable tr.row").count() == 50  # the first page of them, in spite of the closed group
+        page.click("[data-action=more-rows]")
+        assert page.locator("#nodeTable tr.row").count() > 50
+        chrome.close()
+
+
+def test_a_failure_in_activity_reads_as_a_line():
+    def add_failure(data):
+        name = next(iter(data["workers"]))
+        data["events"].insert(0, {"id": "sample", "at": data["events"][0]["at"], "kind": "failure", "title": f"{name} quarantined", "detail": "reply failed: the link closed"})
+
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    with playwright_api.sync_playwright() as playwright:
+        chrome, page = open_dashboard(playwright, "calm-7", add_failure)
+        assert page.locator("#eventList .event").first.bounding_box()["height"] < 80
+        chrome.close()
+
+
+def test_a_node_that_stops_answering_takes_its_all_clear_with_it():
+    text = source("dashboard.html")
+    offline = text[text.index("function renderOffline"):text.index("function render(data)")]
+    assert "$('headline').textContent = 'This node stopped answering'" in offline
+    assert "setWord('work', 'work', 'Checking')" in text and "setWord('work', 'work', 'Checking')" in source("chat.html")
+
+
+def test_a_group_choice_works_on_a_small_pool():
+    assert "Boolean(store.get('isharded-group'))" in source("dashboard.html")
+
+
+def test_a_reply_that_ends_late_leaves_the_open_conversation_alone():
+    assert "if (chat === state.chat) touchChat();" in source("chat.html")
+
+
+def test_the_chat_word_counts_machines_asking_to_join():
+    text = source("chat.html")
+    assert "+ state.joins" in text and "/join/requests" in text
