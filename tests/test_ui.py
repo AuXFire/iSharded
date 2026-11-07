@@ -375,7 +375,8 @@ def test_a_proposal_is_information_under_needs_you_and_nothing_applies_it():
         chrome, page = open_dashboard(playwright, "calm-7", with_proposal)
         needs = page.inner_text("#needsBay")
         assert "Another order would save 4.1 ms a token" in needs
-        assert "61.5 ms a loop now, 48 ms then" in needs and "3 GiB" in needs and "854 tokens" in needs
+        assert "61.5 ms a loop now and 48 ms in the new order" in needs and "fetch 3 GiB" in needs and "after 854 tokens" in needs
+        assert page.locator("#needsBay .needs.calm").count() == 1  # information alone draws no alarm
         assert "isharded plan --url http://pool.invalid --token YOUR_ADMIN_KEY" in needs
         assert page.locator("#needsBay .issue button").count() == 0
         assert page.inner_text("#pillText") == "Healthy"  # information, so it needs nobody
@@ -429,7 +430,7 @@ def test_a_pool_with_no_pytorch_says_so_and_marks_what_needs_it():
     playwright_api = pytest.importorskip("playwright.sync_api")
     with playwright_api.sync_playwright() as playwright:
         chrome, page = open_dashboard(playwright, "calm-7", light, {"**/admin/catalog": answer_json(CATALOG)})
-        assert "No worker can run them, only GGUF" in page.inner_text("#facts")
+        assert "No worker, so GGUF only" in page.inner_text("#facts")
         page.click("#loadButton")
         page.wait_for_selector("#catalog .model-row")
         assert "Needs PyTorch, which no worker here has" in page.inner_text("[data-model='Qwen/Qwen3-0.6B']")
@@ -445,7 +446,7 @@ def test_a_pool_that_has_pytorch_counts_who_can_run_it():
     with playwright_api.sync_playwright() as playwright:
         chrome, page = open_dashboard(playwright, "calm-7", answers={"**/admin/catalog": answer_json(CATALOG)})
         live = page.evaluate("Object.values(state.data.workers).filter(worker => worker.live).length")
-        assert f"{live} of {live} workers can run them" in page.inner_text("#facts")
+        assert f"Run PyTorch models\n{live} of {live} workers" in page.inner_text("#facts")
         page.click("#loadButton")
         page.wait_for_selector("#catalog .model-row")
         assert "PyTorch" not in page.inner_text("#catalog")

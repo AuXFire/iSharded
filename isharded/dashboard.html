@@ -370,7 +370,7 @@
       const proposal = data.proposal;
       if (proposal) issues.push({
         tone: 'info', title: `Another order would save ${num(proposal.saved_ms_per_token)} ms a token`,
-        detail: `The same machines in a shorter loop: ${num(proposal.current.loop_ms)} ms a loop now, ${num(proposal.proposed.loop_ms)} ms then. Moving there fetches ${bytes(proposal.moved_bytes)} and pays for itself after ${whole(proposal.break_even_tokens)} tokens. Nothing has moved, and nothing here applies it. To look closer:`,
+        detail: `The same machines, ${num(proposal.current.loop_ms)} ms a loop now and ${num(proposal.proposed.loop_ms)} ms in the new order. It would fetch ${bytes(proposal.moved_bytes)}, paid back after ${whole(proposal.break_even_tokens)} tokens. Nothing applies it here. To look closer:`,
         command: `isharded plan --url ${location.origin} --token YOUR_ADMIN_KEY`,
       });
 
@@ -520,7 +520,7 @@
       const list = view.issues, alerts = list.filter(issue => issue.tone !== 'info');
       if (!list.length) { paint(slot, phone.matches ? '' : `<div class="needs calm">${head}<p>Nothing right now.</p></div>`); return; }
       const shown = state.allNeeds ? list : list.slice(0, 3), more = list.length - shown.length;
-      const worst = alerts.some(issue => issue.tone === 'bad') ? 'bad' : alerts.length ? 'warn' : '';
+      const worst = alerts.some(issue => issue.tone === 'bad') ? 'bad' : alerts.length ? 'warn' : 'calm';  // information alone asks for nothing
       const note = state.joins.length ? '<p class="quiet-text">Check that each fingerprint matches what the new machine shows before you approve it.</p>' : '';
       paint(slot, `<div class="needs ${worst}">${head}${note}${shown.map(issueLine).join('')}${more > 0 ? `<p class="issue-more"><button class="link" type="button" data-action="all-needs" data-key="i:more">and ${more} more</button></p>` : ''}</div>`);
     }
@@ -781,7 +781,7 @@
       parts.push(fact('Epoch', data.epoch), fact('Machines', data.virtual_hardware?.hosts ?? 0), fact('Requests', whole(metrics.requests_total)), fact('Tokens', whole(metrics.tokens_generated)), fact('Recoveries', whole(metrics.recoveries_total)), fact('Up', duration(data.uptime_seconds)));
       if (slots != null) parts.push(fact('Reply slots', slots));
       const live = Object.values(data.workers || {}).filter(worker => worker.live), torch = live.filter(runsTorch).length;
-      if (live.length) parts.push(fact('PyTorch models', torch ? `${torch} of ${count(live.length, 'worker')} can run them` : 'No worker can run them, only GGUF'));
+      if (live.length) parts.push(fact('Run PyTorch models', torch ? `${torch} of ${count(live.length, 'worker')}` : 'No worker, so GGUF only'));
       if ((data.cordoned_nodes || []).length) parts.push(fact('Cordoned', data.cordoned_nodes.join(', ')));
       if (data.cache_url) parts.push(fact('KV cache', 'Protected in RAM'));
       parts.push(fact('Updated', clock(state.updatedAt)));
@@ -1016,6 +1016,7 @@
       $('keysError').hidden = true; paint($('keyShown'), '');
       renderKeys();
       if (!$('keys').open) $('keys').showModal();
+      $('keyName').focus();  // not a Revoke button, which is first in the sheet
       readKeys();
     }
     async function createKey() {
