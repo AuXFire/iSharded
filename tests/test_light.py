@@ -6,6 +6,8 @@ either way, and hide PyTorch with ``no_torch`` where it is installed.
 import asyncio
 import subprocess
 import sys
+import threading
+import time
 from types import SimpleNamespace
 
 from fastapi import HTTPException
@@ -241,6 +243,18 @@ def test_a_refusal_says_nothing_of_pytorch_when_it_is_not_the_reason():
     assert Orchestrator._left_out(pool) == ""
 
 
+def test_kv_snapshots_only_go_where_they_can_be_read():
+    def offer(pytorch, budget):
+        contribution = SimpleNamespace(roles=["kv-cache"], ram_budget_bytes=budget)
+        hardware = SimpleNamespace(pytorch=pytorch, contribution=contribution)
+        return SimpleNamespace(live=True, quarantined=False, registration=SimpleNamespace(hardware=hardware, advertised_url=f"http://{budget}"))
+
+    pool = SimpleNamespace(workers={"light": offer(False, 9), "full": offer(True, 1)})
+    assert Orchestrator.choose_cache_url(pool, []).startswith("http://1")
+    pool.workers.pop("full")
+    assert Orchestrator.choose_cache_url(pool, []) is None
+
+
 def test_the_refusal_reaches_whoever_asked():
     pool = pool_with(("light", True, False))
     pool._left_out = lambda: Orchestrator._left_out(pool)
@@ -266,7 +280,8 @@ def smi(stdout, returncode=0):
     return lambda *_, **__: SimpleNamespace(returncode=returncode, stdout=stdout)
 
 
-def test_an_nvidia_gpu_is_read_from_its_driver_tool():
+def test_an_nvidia_gpu_is_read_from_its_driver_tool(monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     found = read_nvidia_devices(smi("0, NVIDIA GeForce RTX 3060, 6144, 5000, 581.08\n1, Tesla T4, 15360, 15000, 581.08\n"))
     assert [(item.device, item.backend, item.kind) for item in found] == [("cuda:0", "cuda", "vram"), ("cuda:1", "cuda", "vram")]
     assert found[0].name == "NVIDIA GeForce RTX 3060" and found[0].total_bytes == 6144 * 1024**2 and found[0].free_bytes == 5000 * 1024**2
@@ -279,6 +294,23 @@ def test_a_missing_or_broken_driver_tool_means_no_nvidia_gpu_and_no_crash():
     assert read_nvidia_devices(missing) == []
     assert read_nvidia_devices(smi("", 9)) == []
     assert read_nvidia_devices(smi("0, Card, [N/A], [N/A], 1\n")) == []
+
+
+TWO_CARDS = "0, Small, 6144, 5000, 581.08\n1, Large, 15360, 15000, 581.08\n"
+
+
+@pytest.mark.parametrize(
+    "visible, expected",
+    [("", []), ("-1", []), ("1", [("cuda:0", "Large")]), ("1,0", [("cuda:0", "Large"), ("cuda:1", "Small")]), ("0,-1,1", [("cuda:0", "Small")]), ("7", [])],
+)
+def test_a_card_hidden_from_cuda_is_hidden_from_the_pool(monkeypatch, visible, expected):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible)
+    assert [(item.device, item.name) for item in read_nvidia_devices(smi(TWO_CARDS))] == expected
+
+
+def test_cards_named_by_uuid_are_left_as_the_tool_said(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-1234")
+    assert len(read_nvidia_devices(smi(TWO_CARDS))) == 2
 
 
 def card(device):
@@ -325,26 +357,43 @@ def nvidia_pool():
     return MemoryPool(pool_id="cuda:0", kind="vram", device="cuda:0", capacity_group="g", total_bytes=8, budget_bytes=8, free_bytes=5, bandwidth_gbps=1.0, dtype="bfloat16")
 
 
+def forget_vram_readings(monkeypatch):
+    memory._read_nvidia_free.cache_clear()
+    monkeypatch.setattr(memory, "NVIDIA_FREE", {})
+
+
 def test_free_vram_is_read_from_the_driver_and_not_every_time(no_torch, monkeypatch, tmp_path):
-    asked = []
+    asked = threading.Event()
+    times = []
 
     def read():
-        asked.append(1)
-        return [card("cuda:0")]
+        times.append(1)
+        memory.NVIDIA_FREE["cuda:0"] = 7 * 1024**3
+        asked.set()
+        return []
 
-    memory._nvidia_free_bytes.cache_clear()
+    forget_vram_readings(monkeypatch)
     monkeypatch.setattr(memory, "read_nvidia_devices", read)
+    memory.live_free_bytes(nvidia_pool(), tmp_path)
+    assert asked.wait(5)
     assert memory.live_free_bytes(nvidia_pool(), tmp_path) == 7 * 1024**3
-    assert memory.live_free_bytes(nvidia_pool(), tmp_path) == 7 * 1024**3
-    assert len(asked) == 1
-    memory._nvidia_free_bytes.cache_clear()
+    assert len(times) == 1
+
+
+def test_a_slow_driver_tool_never_holds_up_a_health_check(no_torch, monkeypatch, tmp_path):
+    release = threading.Event()
+    forget_vram_readings(monkeypatch)
+    monkeypatch.setattr(memory, "read_nvidia_devices", lambda: release.wait(5) and [])
+    started = time.perf_counter()
+    assert memory.live_free_bytes(nvidia_pool(), tmp_path) == 5  # what discovery saw
+    assert time.perf_counter() - started < 1
+    release.set()
 
 
 def test_free_vram_falls_back_to_what_was_last_known(no_torch, monkeypatch, tmp_path):
-    memory._nvidia_free_bytes.cache_clear()
+    forget_vram_readings(monkeypatch)
     monkeypatch.setattr(memory, "read_nvidia_devices", lambda: [])
     assert memory.live_free_bytes(nvidia_pool(), tmp_path) == 5
-    memory._nvidia_free_bytes.cache_clear()
 
 
 def test_an_explicit_vram_budget_does_nothing_with_no_pytorch_to_hold_it(no_torch):

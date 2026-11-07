@@ -23,8 +23,9 @@ import platform
 import shutil
 import subprocess
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,8 @@ NVIDIA_PROBE_SECONDS = 10
 NVIDIA_QUERY = ["nvidia-smi", "--query-gpu=index,name,memory.total,memory.free,driver_version", "--format=csv,noheader,nounits"]
 # Status asks for free memory every few seconds, and starting nvidia-smi is not free.
 NVIDIA_FREE_SECONDS = 30.0
+# The tool's last reading of each card's free memory.
+NVIDIA_FREE: dict[str, int] = {}
 
 
 @dataclass(slots=True)
@@ -155,16 +158,36 @@ def vulkan_accelerators() -> tuple[Accelerator, ...]:
         return ()  # no way to fetch the build, as on a closed network
 
 
+def _visible_to_cuda(found: list[Accelerator]) -> list[Accelerator]:
+    """What CUDA will show llama.cpp, because nvidia-smi ignores CUDA_VISIBLE_DEVICES.
+
+    A list of numbers picks cards, which then count from zero, and stops at the first
+    that is not there. Anything else in the list is a UUID, so this leaves the cards be.
+    """
+    chosen = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if chosen is None:
+        return found
+    picked: list[Accelerator] = []
+    for part in (item.strip() for item in chosen.split(",")):
+        if part and not part.lstrip("-").isdigit():
+            return found
+        match = next((item for item in found if item.device == f"cuda:{part}"), None)
+        if match is None:
+            break
+        picked.append(replace(match, device=f"cuda:{len(picked)}"))
+    return picked
+
+
 def read_nvidia_devices(run: Any = subprocess.run) -> list[Accelerator]:
     """What the driver's own tool sees, for a node with no PyTorch to ask."""
     try:
         done = run(NVIDIA_QUERY, capture_output=True, text=True, timeout=NVIDIA_PROBE_SECONDS)
         lines = done.stdout.splitlines() if done.returncode == 0 else []
         rows = [[part.strip() for part in line.split(",")] for line in lines if line.strip()]
-        return [
+        return _visible_to_cuda([
             Accelerator(f"cuda:{int(index)}", "vram", "cuda", name, int(total) * 1024**2, int(free) * 1024**2, driver)
             for index, name, total, free, driver in rows
-        ]
+        ])
     except (OSError, ValueError, subprocess.SubprocessError):
         return []  # no driver, or a card that reports [N/A]
 
@@ -273,9 +296,18 @@ def _measure_ram_bandwidth(size_mib: int, rounds: int) -> float:
         return 20.0
 
 
-@functools.lru_cache(maxsize=8)
-def _nvidia_free_bytes(device: str, _: int) -> int | None:
-    return next((item.free_bytes for item in read_nvidia_devices() if item.device == device), None)
+@functools.lru_cache(maxsize=1)
+def _read_nvidia_free(_: int) -> None:
+    """One reading per period, beside the caller.
+
+    /health comes through here on the event loop, and a busy card can hold nvidia-smi
+    for longer than a health check waits, so a healthy node would look lost.
+    """
+
+    def read() -> None:
+        NVIDIA_FREE.update({item.device: item.free_bytes for item in read_nvidia_devices()})
+
+    threading.Thread(target=read, name="nvidia-free", daemon=True).start()
 
 
 def live_free_bytes(pool: MemoryPool, cache_dir: Path) -> int:
@@ -285,8 +317,8 @@ def live_free_bytes(pool: MemoryPool, cache_dir: Path) -> int:
     if pool.kind == "ram" or pool.device == "mps":
         return ram().available
     if pool.device.startswith("cuda:") and not has_torch():
-        free = _nvidia_free_bytes(pool.device, int(time.monotonic() / NVIDIA_FREE_SECONDS))
-        return pool.free_bytes if free is None else free
+        _read_nvidia_free(int(time.monotonic() / NVIDIA_FREE_SECONDS))
+        return NVIDIA_FREE.get(pool.device, pool.free_bytes)
     if pool.device.startswith("cuda:"):
         return torch.cuda.mem_get_info(int(pool.device.split(":", 1)[1]))[0]
     return pool.free_bytes

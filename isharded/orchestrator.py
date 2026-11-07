@@ -1147,6 +1147,7 @@ class Orchestrator:
             and not record.quarantined
             and "kv-cache" in record.registration.hardware.contribution.roles
             and record.registration.hardware.contribution.ram_budget_bytes > 0
+            and record.registration.hardware.pytorch  # these snapshots are PyTorch tensors
         ]
         if not candidates:
             return None
