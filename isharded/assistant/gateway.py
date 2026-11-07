@@ -28,19 +28,23 @@ import time
 from typing import Any
 import uuid
 
-from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from isharded.pool import LOOPBACK
 from isharded.serving import BodyLimit, keep_listening, NoDelayHTTPProtocol
 
-from .broker import PEER_PREFIX
+from .broker import PEER_PREFIX, redacted
+from .coder import CoderError
 from .context import TurnNotFound
 from .contracts import Provenance, Reach, Trust
 from .conversation import TurnResult, decide_approval
+from .federation import FederationError
+from .manage_http import me, owner_only, person, routes as manage_routes, whose
 from .memory import KINDS, MemoryNotFound, MemoryRefused
 from .mind import LOCAL_USER, actor, emit, table
+from .skills import SkillError
 
 KEY_PREFIX = "sma-"
 USER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -247,7 +251,7 @@ def server_sent(payload: dict[str, Any] | str) -> str:
     return f"data: {payload if isinstance(payload, str) else json.dumps(payload)}\n\n"
 
 
-def turn_in_background(assistant: Any, user: str, text: str, conversation_id: str) -> queue.Queue[Any]:
+def turn_in_background(assistant: Any, user: str, text: str, conversation_id: str, **sampling: Any) -> queue.Queue[Any]:
     """Run a turn on its own thread, handing text over as it comes.
 
     The turn belongs to the assistant and not to the connection. If a client goes
@@ -257,7 +261,7 @@ def turn_in_background(assistant: Any, user: str, text: str, conversation_id: st
 
     def work() -> None:
         try:
-            for item in assistant.conversation.stream(user, text, conversation_id, learn="background"):
+            for item in assistant.conversation.stream(user, text, conversation_id, learn="background", **sampling):
                 items.put(item)
         except Exception as error:
             items.put(error)
@@ -287,6 +291,29 @@ class ChatRequest(BaseModel):
     model: str | None = None
     stream: bool = False
     conversation_id: str | None = Field(default=None, max_length=128)
+    max_tokens: int | None = Field(default=None, ge=1)
+    max_completion_tokens: int | None = Field(default=None, ge=1)  # the newer name for the same limit
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    tools: Any = None
+    tool_choice: Any = None
+    functions: Any = None  # what tools was called before
+    function_call: Any = None
+
+    def sampling(self) -> dict[str, Any]:
+        """Only what the client asked for, so a turn keeps its own defaults for the rest."""
+        limit = self.max_completion_tokens if self.max_tokens is None else self.max_tokens
+        return {name: value for name, value in (("max_tokens", limit), ("temperature", self.temperature)) if value is not None}
+
+    def tools_refused(self) -> str | None:
+        """Why this request cannot be honoured. The assistant's tools are its own, behind its
+        broker, and a client's are never called, so saying nothing would only look like a
+        model that chose to ignore them."""
+        choice = self.function_call if self.tool_choice is None else self.tool_choice
+        if choice == "none":
+            return None
+        if self.tools or self.functions or choice not in (None, "auto"):
+            return "This endpoint cannot call a client's tools. The assistant uses its own, behind its broker. Leave out tools and tool_choice, or set tool_choice to none."
+        return None
 
 
 class SayRequest(BaseModel):
@@ -316,6 +343,10 @@ class TaskRequest(BaseModel):
     plan: dict[str, Any]
 
 
+class ReflectRequest(BaseModel):
+    draft: bool = True
+
+
 @asynccontextmanager
 async def running_tasks(app: FastAPI) -> AsyncIterator[None]:
     """Nothing runs a task unless its host says so, and this server is the host."""
@@ -333,13 +364,6 @@ def create_app(assistant: Any) -> FastAPI:
     app.state.assistant = assistant
     app.state.users = users
 
-    def me(request: Request) -> str:
-        return request.state.user
-
-    def owner_only(request: Request) -> None:
-        if request.state.role != "owner":
-            raise HTTPException(403, "Only the owner can do this")
-
     def persona() -> str:
         return re.sub(r"[^a-z0-9._-]+", "-", assistant.identity.name.lower()).strip("-") or "assistant"
 
@@ -353,6 +377,9 @@ def create_app(assistant: Any) -> FastAPI:
     async def chat_completions(body: ChatRequest, request: Request) -> Any:
         # Only the newest message is new. A client's history and system prompt are
         # not trusted: the assistant keeps its own record and its own identity.
+        refused = body.tools_refused()
+        if refused:
+            raise HTTPException(400, refused)
         user = me(request)
         newest = next((message for message in reversed(body.messages) if message.role == "user"), None)
         text = text_of(newest.content).strip() if newest else ""
@@ -362,9 +389,9 @@ def create_app(assistant: Any) -> FastAPI:
         identifier = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
         if body.stream:
-            items = turn_in_background(assistant, user, text, conversation_id)
+            items = turn_in_background(assistant, user, text, conversation_id, **body.sampling())
             return StreamingResponse(events(items, identifier, created), media_type="text/event-stream")
-        result = await asyncio.to_thread(assistant.conversation.say, user, text, conversation_id, learn="background")
+        result = await asyncio.to_thread(assistant.conversation.say, user, text, conversation_id, learn="background", **body.sampling())
         return {
             "id": identifier,
             "object": "chat.completion",
@@ -420,6 +447,10 @@ def create_app(assistant: Any) -> FastAPI:
         rows = assistant.memory.recent(me(request), conversation_id, 200)
         keys = ("id", "role", "content", "model", "provider", "tool", "tainted", "created_at", "turn_id")
         return {"messages": [{key: row[key] for key in keys} for row in rows]}
+
+    @api.get("/conversations/{conversation_id}/tasks")
+    def conversation_tasks(conversation_id: str, request: Request) -> dict[str, Any]:
+        return {"tasks": assistant.conversation.handed_tasks(me(request), conversation_id)}
 
     @api.get("/memory")
     def memories(request: Request, q: str = "", limit: int = 100, history: bool = False) -> dict[str, Any]:
@@ -502,8 +533,12 @@ def create_app(assistant: Any) -> FastAPI:
         return held + extra
 
     @api.get("/approvals")
-    def approvals(request: Request) -> dict[str, Any]:
-        return {"approvals": approvals_of(me(request), request.state.role)}
+    def approvals(request: Request, decided: bool = False, user: str | None = None) -> dict[str, Any]:
+        if not decided and user is None:
+            return {"approvals": approvals_of(me(request), request.state.role)}
+        broker = getattr(assistant, "broker", None)
+        rows = broker.approvals(whose(request, user), None if decided else "pending") if broker else []
+        return {"approvals": [{**row, "approval_id": row["id"], "arguments": redacted(row["arguments"])} for row in rows]}
 
     @api.post("/approvals/{approval_id}")
     def decide(approval_id: str, body: DecisionRequest, request: Request) -> dict[str, Any]:
@@ -557,6 +592,15 @@ def create_app(assistant: Any) -> FastAPI:
         assistant.tasks.cancel(task_id, me(request))
         return {"cancelled": True}
 
+    @api.post("/tasks/{task_id}/reflect", dependencies=[Depends(person)])
+    def task_reflect(task_id: str, request: Request, body: ReflectRequest = ReflectRequest(), user: str | None = None) -> dict[str, Any]:
+        # Reflecting takes any id, so whose task this is has to be asked here.
+        owned_task(whose(request, user), task_id)
+        skills = getattr(assistant, "skills", None)
+        if skills is None:
+            raise HTTPException(404, "Skills are not installed")
+        return skills.reflect(task_id, propose=body.draft)
+
     @api.get("/audit")
     def audit(request: Request, since: int = 0, limit: int = 200, newest: bool = False) -> dict[str, Any]:
         # The trail covers everyone, so only the owner reads all of it. It holds
@@ -579,6 +623,7 @@ def create_app(assistant: Any) -> FastAPI:
         return {"stats": assistant.router.stats(), "routes": assistant.router.routes()}
 
     add_routes(app, api)
+    add_routes(app, manage_routes(assistant))
     include_parts(app, assistant)
     add_error_handlers(app)
 
@@ -606,7 +651,8 @@ def add_error_handlers(app: FastAPI) -> None:
 
         return handle
 
-    for kind, status in ((MemoryNotFound, 404), (TurnNotFound, 404), (MemoryRefused, 409), (ValueError, 400)):
+    # A part refusing in its own words means this cannot happen now, and a route that means "no such thing" says so itself.
+    for kind, status in ((MemoryNotFound, 404), (TurnNotFound, 404), (MemoryRefused, 409), (CoderError, 409), (FederationError, 409), (SkillError, 409), (ValueError, 400)):
         app.add_exception_handler(kind, plain_error(status))
 
     @app.exception_handler(sqlite3.OperationalError)

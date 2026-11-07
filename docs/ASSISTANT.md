@@ -124,7 +124,7 @@ Every part attaches to one `Assistant`, which owns one folder. Commands take `--
 | `coder` | `assistant.coder` | Supervised coding on a branch in an isolated copy |
 | `federation` | `assistant.federation` | Narrow, signed, revocable work between independent installs |
 | `voice` | `assistant.voice` | Speech in and out, local and optional |
-| `gateway` | | The HTTP server and web page, holding every part's routes |
+| `gateway` | | The HTTP server and web page, holding every part's routes. `manage_http.py` holds the routes for what a person manages |
 
 ## What keeps it safe
 
@@ -224,7 +224,7 @@ A pool with its own authority is verified against `ISHARDED_CA_FILE`, as nodes a
 | `route show` | Shows each role's candidates |
 | `models` | Shows how each model has really done. `--role` for one role |
 
-The roles are `conversation`, `planning`, `coding`, `worker`, `decision`, `vision`, `embedding`, and `verification`. A role with no route uses `conversation`, then every provider. `embedding` has no fallback.
+The roles are `conversation`, `planning`, `coding`, `worker`, `decision`, `vision`, `embedding`, and `verification`. A role with no route uses `conversation`, then every provider. `embedding` has no fallback, and a provider with no call for embeddings is passed over for it, with a reason that says so.
 
 A request first loses every candidate it may not use: reach, then back-off, then budget, and a refusal says why for each. What is left is tried best first by the Wilson lower bound on its success rate, then speed, then listed order. Given the same numbers it picks the same model.
 
@@ -232,7 +232,9 @@ A candidate counts as untested until it has 3 runs. Strictly zero would let one 
 
 A failure backs off for 15 s, doubling to at most 5 minutes, and that survives a restart. A budget reserves the most a call could cost, so it is not overrun. A stream can move to another model only before any text has gone out.
 
-`assistant.router.record_outcome(reply, role, success)` feeds back what checking the work found. A reply counts as a success when it arrives, and a failed check takes that back, so the rate means work that held up. It also takes the model name with `provider=`.
+`assistant.router.record_outcome(reply, role, success)` feeds back what checking the work found. A reply counts as a success when it arrives, and a failed check takes that back, so the rate means work that held up. It also takes the model name with `provider=`. A reply that names itself differently from the candidate that gave it, as a peer's does, is counted under that candidate while this process runs.
+
+Two things call it, and both are mechanical. In a task, a `check` step reports on each `model` step it read, and an `expect` on a `model` step reports on that reply. In the coder, applying a change and running its tests report on the `coding` model of that round. A reply loses its success once, however many checks it fails. A tool step never counts, since its data is its own. A reviewing model's opinion is not a check, so it counts for nothing here.
 
 ## Context
 
@@ -469,6 +471,8 @@ Model and check steps can always run again. Only one process runs tasks at a tim
 |---|---|
 | `steps` | Required. A list of steps |
 | `title` | A name for lists |
+| `goal` | What a person asked for, in their words. The planner writes it, and it defaults to the title |
+| `task_type` | A short lowercase word for the kind of work, which `skill gaps` counts by. Default is the first part of the capability the plan's tools use most, such as `files`, or `general` with no tools. The planner never takes this from a model |
 | `priority` | A whole number, higher first. Default 0 |
 | `reach` | How far this plan's text may travel: `machine`, `pool`, `peer`, or `cloud`. Default `pool` |
 | `inputs` | Values that steps read as `{{inputs.name}}` |
@@ -584,7 +588,7 @@ Runs tasks and schedules here until stopped. `--once` stops when nothing can mov
 
 `assistant.planner.plan(user, goal)` asks the `planning` role for JSON only. Software then validates it: acyclic, known capabilities and roles, references that resolve, at most 50 steps. On rejection it re-asks at most twice with the errors, then raises `PlanRejected`. Only `title` and `steps` are read from a model, at every level, so a model cannot schedule a plan, widen its reach, or clear its taint.
 
-A mechanical check is added after any consequential step that lacks one, and what followed that step waits for the check. The result lists `checks_added` and `missing_grants`, each with the command that would allow it. `assistant.planner.allow_missing(user, plan, by)` is one yes from a person: exact scopes, 24 hours, and only as many uses as the plan has tries, retries included. A step run again after a crash needs a use of its own, so a person may have to allow that one. A scope known only at run time, and anything physical, is left for a person.
+A mechanical check is added after any consequential step that lacks one, and what followed that step waits for the check. The result lists `checks_added` and `missing_grants`, each with the command that would allow it. `assistant.planner.allow_missing(user, plan, by)` is one yes from a person: exact scopes, 24 hours, and only as many uses as the plan has tries, retries included. It works out what is missing again from the steps, because a plan comes from a file or a request, so its own `missing_grants` is only a claim. It refuses a plan that could not run. A step run again after a crash needs a use of its own, so a person may have to allow that one. A scope known only at run time, a scope with `*`, `?`, or `[` in it, and anything physical, is left for a person.
 
 `triage(goal)` is deterministic and uses no model. Something short, in one sentence, with no words suggesting stages, is small enough to run directly.
 
@@ -596,6 +600,15 @@ Asks for a plan and checks it. It runs nothing.
 |---|---|
 | `--user` | Who this is for, which decides what counts as missing. Default `owner` |
 | `--out` | Write the plan here for `task run`. Default prints it |
+
+### `plan-allow PLAN`
+
+One yes for a plan saved with `plan --out`, using `allow_missing`. It prints how many grants it made, and what it left for a person.
+
+| Option | Meaning |
+|---|---|
+| `--user` | Who the plan runs for. Default `owner` |
+| `--by` | The person allowing it, for the record. Default `owner` |
 
 ## Plugins
 
@@ -793,7 +806,7 @@ HTTP status mirrors the result (200, 202 for pending, 403 for refused), but only
 
 ### Routes
 
-`routes(assistant)` gives these, on `peer serve` and on the gateway alike. They need no key, because every message proves itself, and the part lists them in `PUBLIC_ROUTES` so a gateway leaves exactly these open. There is deliberately no route for listing peers or offers.
+`routes(assistant)` gives these, on `peer serve` and on the gateway alike. They need no key, because every message proves itself, and the part lists them in `PUBLIC_ROUTES` so a gateway leaves exactly these open. None of them lists peers or offers. The owner reads those through the gateway, with a key, under [Routes](#routes-2).
 
 | Route | Does |
 |---|---|
@@ -809,6 +822,8 @@ Bodies over 1 MiB are refused before anything is parsed. Strangers get at most 3
 ### Using a peer's models
 
 `PeerProvider` is a full provider, named `peer:NAME`, so `provider list` and `route set` treat it like any other. It refuses a request whose reach is below `PEER` even if the router sent it. Its replies never carry tool calls, the reply's `provider` is `peer:<fingerprint>`, and a peer answers whole, so a stream arrives as one piece. Treat its text as `EXTERNAL`.
+
+A peer makes no embeddings. The protocol offers `models.complete` and nothing like it for embeddings, so the router passes over a peer on the `embedding` role, and says why. That counts as no failure against the peer, and `can_embed` is false if nothing else is on that route.
 
 A provider is registered for each paired peer known to offer `models.complete`. `peer offers NAME` finds that out, and it is remembered across restarts. Three things must line up before a turn reaches a peer's model: `peer offers NAME` has been run, this install holds a `peer.send` grant for that peer, and the person's reach allows it (`context --reach peer`), since a person's words stay on the pool otherwise.
 
@@ -855,7 +870,7 @@ There are no regular expressions, because a model writes these tests and a bad p
 
 From a success it can draft a candidate. The `worker` role writes it, and the `verification` role reviews it, or `planning` if that is down. A review can turn a draft down, but cannot approve anything. The capabilities come from what the task actually used, whatever the draft says.
 
-It reads `status`, `user`, `title`, `tainted`, `reach`, and `steps` from `tasks.status(task_id)`, each step with `id`, `status`, `capability`, `error`, `tainted`, and `approval_id`. A task that read a file or a page is tainted, as nearly all do, so a candidate from one can be promoted only by a person. No skill is drafted from a task whose text may not leave this machine, because a skill's text is shown to models on the pool. Nothing reflects by itself: run `skill reflect`.
+It reads `status`, `user`, `title`, `goal`, `task_type`, `tainted`, `reach`, and `steps` from `tasks.status(task_id)`, each step with `id`, `status`, `capability`, `error`, `tainted`, and `approval_id`. The record and `skill gaps` use the task's type. A draft that sets no rules of its own applies to that type and to `general`, because every turn is `general`, and a skill typed only by its task would never reach one. A task that read a file or a page is tainted, as nearly all do, so a candidate from one can be promoted only by a person. No skill is drafted from a task whose text may not leave this machine, because a skill's text is shown to models on the pool. Nothing reflects by itself: run `skill reflect`.
 
 ### How a candidate proves itself
 
@@ -1086,12 +1101,15 @@ Every path needs a key except `GET /`, `GET /assistant`, `GET /assistant/`, `GET
 | Route | Does |
 |---|---|
 | `GET /v1/models` | The assistant, under its own name |
-| `POST /v1/chat/completions` | Any OpenAI client. `stream` works, and `conversation_id` or an `X-Conversation-Id` header names a conversation |
+| `POST /v1/chat/completions` | Any OpenAI client. `stream` works, and `conversation_id` or an `X-Conversation-Id` header names a conversation. `max_tokens`, or `max_completion_tokens`, limits the whole reply, and `temperature` is from 0 to 2. Tools it cannot honour are a 400 |
 | `GET /assistant/whoami` | Who this key is |
 | `GET /assistant/identity` | The persona, as it applies to this person |
+| `GET /assistant/identity/history` | How the name, style, and voice changed, newest first. `limit` |
+| `GET /assistant/identity/relationship` | This person's relationship notes, newest first. `limit`, `user` |
 | `POST /assistant/say` | One turn in the assistant's own shape |
 | `GET /assistant/conversations` | This person's conversations |
 | `GET /assistant/conversations/{conversation_id}` | One conversation's messages |
+| `GET /assistant/conversations/{conversation_id}/tasks` | The tasks this conversation handed off, each with `task_id`, `turn_id`, `created_at`, and its `title` and `status` now, or null if the task is gone |
 | `GET /assistant/memory` | Memories with provenance. `q` searches, `limit`, and `history=true` includes superseded rows |
 | `POST /assistant/memory` | Keeps a fact. It is always the caller's own words, and a request cannot claim more trust |
 | `GET /assistant/memory/export` | Everything held for this person |
@@ -1103,12 +1121,42 @@ Every path needs a key except `GET /`, `GET /assistant`, `GET /assistant/`, `GET
 | `DELETE /assistant/library/{root}` | Removes a folder |
 | `POST /assistant/library/index` | Brings the index up to date |
 | `GET /assistant/library/search` | Searches with citations. `q`, `limit` |
-| `GET /assistant/approvals` | What is waiting on this person, from turns, tasks, and the coder. The owner also sees what peers are asking, since a peer has no key |
+| `GET /assistant/approvals` | What is waiting on this person, from turns, tasks, and the coder. The owner also sees what peers are asking, since a peer has no key. `decided=true` adds what was already decided, and `user` names someone else. Either one reads the broker's own record, with secret arguments as `***` |
 | `POST /assistant/approvals/{approval_id}` | Decides one with `approve`, and carries a waiting turn on. A task carries on by itself. Something no longer waiting is a 409 |
 | `GET /assistant/tasks` | This person's tasks, newest first, and whether the engine is installed. `limit` |
 | `POST /assistant/tasks` | Submits a plan |
 | `GET /assistant/tasks/{task_id}` | One task |
 | `POST /assistant/tasks/{task_id}/cancel` | Cancels one |
+| `POST /assistant/tasks/{task_id}/reflect` | Records what a finished task showed, as `skill reflect` does. Owner. `draft=false` in the body skips drafting a skill, and `user` names whose task it is |
+| `POST /assistant/plan` | Asks for a plan from `goal`, for the caller, and checks it. It runs nothing, and the goal goes no further than the caller's words may |
+| `POST /assistant/plan/allow` | One yes for what `plan` needs, as `plan-allow` does. Owner. `for_user` says who it runs for |
+| `GET /assistant/capabilities` | What a grant can name, with effects and scope field |
+| `GET /assistant/grants` | The caller's live grants, and everyone's for the owner. `user`, and `ended=true` adds ended ones |
+| `POST /assistant/grants` | Grants `capability` within `scope`. Owner. `for_user`, `expires_in` in seconds, `uses` |
+| `POST /assistant/grants/{grant_id}/revoke` | Ends a grant at once. Owner. The record stays |
+| `GET /assistant/providers` | Each provider, never its key. Owner. `check=true` also asks each if it is up |
+| `POST /assistant/providers` | Adds one, as `provider add` does: `name`, `url`, `mesh`, `key_env` or `key_file`, `reach`, `tools`, `daily_tokens`, `read_seconds`, `model`. Owner |
+| `DELETE /assistant/providers/{name}` | Removes one. Owner. One that a part registered, such as a peer's, is a 409 |
+| `POST /assistant/providers/{name}/test` | Asks it whether it is up: `up`, `models`, `error`, and `seconds`. Owner |
+| `GET /assistant/routes` | Each role's candidates |
+| `PUT /assistant/routes/{role}` | Sets a role's `candidates`, at least one. Owner |
+| `GET /assistant/skills` | This person's skill versions, with state and trust. `user` |
+| `GET /assistant/skills/{reference}` | One version, as `name@number` or its id, with its success rate and last evaluation. `user` |
+| `POST /assistant/skills/{reference}/evaluate` | Runs a candidate against what is active, which promoting needs first. Owner. `user` |
+| `POST /assistant/skills/{reference}/promote` | Puts an eligible candidate into use. Owner. `user` |
+| `POST /assistant/skills/{reference}/reject` | Turns a version down, with an optional `reason`. On an active version with a predecessor, this is a rollback. Owner. `user` |
+| `GET /assistant/plugins` | Installed plugins. Owner |
+| `POST /assistant/plugins` | Installs from `manifest`, a path on this machine. `effects`, `tool_effects`, and `env`. Owner, since its programs run as this process |
+| `DELETE /assistant/plugins/{name}` | Removes one and ends every grant for it. Owner |
+| `GET /assistant/code/runs` | This person's runs. `user` |
+| `GET /assistant/code/runs/{run_id}` | One run, with its diff, tests, and models. `output=true` adds test output. `user` |
+| `POST /assistant/code/runs/{run_id}/approve` | Commits this exact diff through `git.commit`, with an optional `message`. Owner. `user`. If the broker asks, the run comes back still `ready` with its `approval_id`: approve that, then call this again |
+| `POST /assistant/code/runs/{run_id}/reject` | Discards the work, with an optional `reason`. Owner. `user` |
+| `GET /assistant/peers` | This install's fingerprint, then each peer's name, state, fingerprint, address, and offers. Owner |
+| `POST /assistant/peers/invite` | Makes a one-time code, as `peer invite` does: `name`, `address`, `minutes`. Owner |
+| `POST /assistant/peers/accept` | Agrees to pair using `code`, as `peer accept` does: `name`, `address`. Owner |
+| `POST /assistant/peers/{name}/approve` | Agrees to pair after comparing fingerprints, as `peer approve` does. `fingerprint` refuses if it does not match. Owner |
+| `POST /assistant/peers/{name}/revoke` | Ends a pairing at once, as `peer revoke` does. Owner |
 | `GET /assistant/audit` | The owner sees everything and a member sees their own actions. It holds ids and decisions, never what anyone said. `since`, `limit`, and `newest=true` for the last rows rather than the first |
 | `GET /assistant/why/{turn}` | What a model saw on a turn |
 | `GET /assistant/turns` | Recent turns. `limit` |
@@ -1117,6 +1165,10 @@ Every path needs a key except `GET /`, `GET /assistant`, `GET /assistant/`, `GET
 | `GET /federation/identity`, `POST /federation/pair`, `POST /federation/request`, `POST /federation/notice` | The peer protocol, under [Federation](#federation) |
 | `POST /assistant/voice/transcribe`, `POST /assistant/voice/speak` | Speech, under [Voice](#voice) |
 | `GET /`, `GET /assistant`, `GET /assistant/` | The page |
+
+Three rules decide who may do what. A key reads its own data, and `user` names someone else's only for the owner, otherwise a 403. Where a row says Owner, a member gets a 403, because that route reaches this machine, spends what everyone shares, or gives a permission. Anything that decides is done in the key holder's own name, which never comes from a request, and a key whose name the broker would not take for a person, or that starts as a machine's does, decides nothing. A route that ends something and keeps its record says `revoke` or `reject`, and one that removes it is a `DELETE`. Where something does not exist the answer is 404, and a part refusing something in its current state is 409. For skills and runs the owner gives `user` to act on someone else's, so an id alone does not reach across people.
+
+A chat request's `tools` and `functions` are a 400, as is any `tool_choice` or `function_call` other than `auto` or `none`, because the assistant uses its own tools, behind its broker, and never calls a client's. `tool_choice: none` is honoured with or without `tools`, as is an empty list. `max_tokens` covers a whole turn, so what a round of tools spent comes out of it. A turn that waits for a person keeps these. `finish_reason` is always `stop`, even when the limit cut a reply short.
 
 Only the newest user message in a chat request is new. A client's earlier messages and system prompt are not believed, since the assistant keeps its own record and its own identity. The OpenAI `user` field changes nothing. The real model is in the `assistant` object on the reply, or in the last event of a stream.
 
@@ -1159,6 +1211,7 @@ A part is a module in `isharded/assistant/` with `attach(assistant)`, and option
 | `assistant.tasks` | `contracts.TaskEngine`: `submit`, `status`, `cancel`, `start`, `stop`, `list_tasks`. It also offers `pause`, `resume`, `retry`, `events`, `attempts`, `tick`, `runner`, `run_until_idle`, and `run_until_settled`. `status(task_id, user)` is scoped to a user in the query |
 | `assistant.providers` | `register(provider)`, for a part to add a `contracts.Provider` while running, such as a peer's. `add`, `remove`, `get`, and `all` |
 | `assistant.router` | `complete(request)`, `stream(request)`, and `record_outcome(reply, role, success)` |
+| `assistant.conversation` | `say`, `stream`, `resume`, `pending`, and `handed_tasks(user, conversation_id)`. `say` and `stream` also take `max_tokens` and `temperature` |
 | `assistant.planner` | `plan(user, goal, reach=..., tainted=...)`, `missing_grants`, `allow_missing`, `triage` |
 | `assistant.skills` | `relevant(user, text, task_type, limit)`, `propose`, `evaluate`, `promote`, `reject`, `rollback`, `execute`, `reflect`, `record_run`, `gaps` |
 | `assistant.memory` | `search`, `remember`, `forget`, `record_message`, `recent`, `conversations` |
@@ -1179,7 +1232,9 @@ A tool that stores or sends text reads `CallContext.reach`, which says how far t
 - **Home or robot control.** `physical` is an effect the broker enforces: such a capability can have no grant, and every action needs a person. No such capability exists. No plugin for one has been written, and no hardware has ever been moved by this.
 - **Running a skill by itself.** A skill's instructions reach the model on every turn it applies to, but `execute` is called by no command and no part.
 - **Reflecting by itself.** `skill reflect` is a person's command. Nothing watches for finished tasks.
-- **Most of the assistant over HTTP.** Grants, providers, routes, skills, plugins, the coder, and peers have commands and no routes or page. A member of an install cannot manage any of these, and the owner uses a terminal.
+- **A page for managing the assistant.** Grants, providers, routes, skills, plugins, the coder, and peers have [routes](#routes-2) and no page, so the owner uses a terminal or calls those routes. A member cannot manage any of these.
+- **Every command as a route.** `code start`, `code resume`, and `code push`, `skill rollback` and `skill gaps`, `peer offer`, `peer ask`, `peer collect`, and `peer offers`, and everything under `task` except what the routes table lists, are commands only. So is `identity set`.
+- **`provider test` as a command.** Its route has no command beside it. `provider list` checks every provider instead.
 
 ### How a small model does
 

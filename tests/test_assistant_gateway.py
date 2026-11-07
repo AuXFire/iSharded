@@ -1126,3 +1126,76 @@ def test_nothing_named_after_the_concept(tmp_path):
     pattern = re.compile("fre" + "ya", re.IGNORECASE)
     assert [path.name for path in root.glob("*") if path.is_file() and path.suffix in (".py", ".html") and pattern.search(path.read_text(encoding="utf-8"))] == []
     shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+# What a client asks of a chat
+
+
+def asked(connection, assistant, **extra):
+    router = assistant.router = ScriptedRouter("Fine.", skip_workers=True)
+    chat(connection, "Hello", **extra)
+    return router.requests[0]
+
+
+def test_a_chat_honours_max_tokens_and_temperature(alice, assistant):
+    request = asked(alice, assistant, max_tokens=5, temperature=0.9)
+    assert (request.max_tokens, request.temperature) == (5, 0.9)
+
+
+def test_a_temperature_of_zero_is_a_real_answer(alice, assistant):
+    assert asked(alice, assistant, temperature=0).temperature == 0.0
+
+
+def test_the_newer_name_for_the_limit_works_and_the_older_one_wins(alice, assistant):
+    assert asked(alice, assistant, max_completion_tokens=6).max_tokens == 6
+    assert asked(alice, assistant, max_tokens=4, max_completion_tokens=6).max_tokens == 4
+
+
+def test_a_chat_that_asks_for_nothing_keeps_the_defaults(alice, assistant):
+    request = asked(alice, assistant)
+    assert (request.max_tokens, request.temperature) == (assistant.conversation.reply_tokens, 0.2)
+
+
+def test_a_stream_honours_them_too(alice, assistant):
+    router = assistant.router = ScriptedRouter("Fine.", skip_workers=True)
+    with alice.stream("POST", "/v1/chat/completions", json={"messages": [{"role": "user", "content": "Hi"}], "stream": True, "max_tokens": 5, "temperature": 0.9}) as response:
+        assert events_of(response)[-1] == "[DONE]"
+    assert (router.requests[0].max_tokens, router.requests[0].temperature) == (5, 0.9)
+
+
+@pytest.mark.parametrize("extra", [{"max_tokens": 0}, {"max_tokens": -1}, {"temperature": -0.1}, {"temperature": 2.1}, {"max_completion_tokens": 0}])
+def test_a_limit_that_means_nothing_is_refused(alice, extra):
+    response = alice.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "Hi"}], **extra})
+    assert response.status_code == 422
+
+
+TOOL = {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object", "properties": {}}}}
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"tools": [TOOL]},
+        {"tools": [TOOL], "tool_choice": "auto"},
+        {"tools": [TOOL], "tool_choice": "required"},
+        {"tool_choice": "required"},
+        {"tool_choice": {"type": "function", "function": {"name": "lookup"}}},
+        {"functions": [TOOL["function"]]},
+        {"function_call": {"name": "lookup"}},
+        {"tools": {"not": "a list"}},
+    ],
+)
+@pytest.mark.parametrize("stream", [False, True])
+def test_tools_this_endpoint_cannot_call_are_refused_and_nothing_happens(alice, assistant, extra, stream):
+    router = assistant.router = ScriptedRouter("Fine.", skip_workers=True)
+    response = alice.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "Hi"}], "stream": stream, **extra})
+    assert response.status_code == 400
+    assert "cannot call a client's tools" in response.json()["detail"]
+    assert router.requests == []
+    assert alice.get("/assistant/conversations").json()["conversations"] == []  # nothing was said, so nothing is kept
+
+
+@pytest.mark.parametrize("extra", [{"tools": []}, {"tool_choice": "none"}, {"tool_choice": "auto"}, {"tools": [TOOL], "tool_choice": "none"}, {"function_call": "none"}, {"functions": []}])
+def test_a_request_that_asks_for_no_tools_is_honoured(alice, assistant, extra):
+    assistant.router = ScriptedRouter("Fine.", skip_workers=True)
+    assert chat(alice, "Hi", **extra)["choices"][0]["message"]["content"] == "Fine."

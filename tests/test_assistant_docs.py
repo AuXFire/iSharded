@@ -109,7 +109,7 @@ def test_every_route_is_documented(tmp_path):
 
 def test_every_documented_route_exists(tmp_path):
     real = set(real_routes(tmp_path))
-    named = {route for route in re.findall(r"`((?:GET|POST|DELETE) /[^`]*)`", DOCS)}
+    named = {route for route in re.findall(r"`((?:GET|POST|PUT|DELETE) /[^`]*)`", DOCS)}
     assert sorted(named - real) == []
 
 
