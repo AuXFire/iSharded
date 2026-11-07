@@ -166,6 +166,44 @@ LOG_CALLBACK = C.CFUNCTYPE(None, C.c_int, C.c_char_p, C.c_void_p)
 TO_FLOAT = C.CFUNCTYPE(None, C.c_void_p, C.c_void_p, C.c_int64)
 GGML_LOG_ERROR = 4
 
+# Native functions by name, each with its return type and then its arguments.
+GGML_FUNCTIONS = {
+    "ggml_backend_load_all_from_path": (None, C.c_char_p),
+    "ggml_backend_dev_by_type": (C.c_void_p, C.c_int),
+}
+GGML_BASE_FUNCTIONS = {
+    "ggml_get_name": (C.c_char_p, C.c_void_p),
+    "ggml_nbytes": (C.c_size_t, C.c_void_p),
+    "ggml_backend_tensor_get": (None, C.c_void_p, C.c_void_p, C.c_size_t, C.c_size_t),
+    "ggml_get_type_traits": (C.POINTER(TypeTraits), C.c_int),
+    "ggml_backend_dev_buffer_type": (C.c_void_p, C.c_void_p),
+}
+LLAMA_FUNCTIONS = {
+    "llama_log_set": (None, LOG_CALLBACK, C.c_void_p),
+    "llama_backend_init": (None,),
+    "llama_model_default_params": (ModelParams,),
+    "llama_context_default_params": (ContextParams,),
+    "llama_model_load_from_file": (C.c_void_p, C.c_char_p, ModelParams),
+    "llama_init_from_model": (C.c_void_p, C.c_void_p, ContextParams),
+    "llama_model_free": (None, C.c_void_p),
+    "llama_free": (None, C.c_void_p),
+    "llama_decode": (C.c_int32, C.c_void_p, Batch),
+    "llama_get_logits_ith": (C.POINTER(C.c_float), C.c_void_p, C.c_int32),
+    "llama_get_memory": (C.c_void_p, C.c_void_p),
+    "llama_memory_clear": (None, C.c_void_p, C.c_bool),
+    "llama_memory_seq_rm": (C.c_bool, C.c_void_p, C.c_int32, C.c_int32, C.c_int32),
+    "llama_memory_seq_cp": (None, C.c_void_p, C.c_int32, C.c_int32, C.c_int32, C.c_int32),
+    "llama_state_seq_get_size": (C.c_size_t, C.c_void_p, C.c_int32),
+    "llama_state_seq_get_data": (C.c_size_t, C.c_void_p, C.c_void_p, C.c_size_t, C.c_int32),
+    "llama_state_seq_set_data": (C.c_size_t, C.c_void_p, C.c_void_p, C.c_size_t, C.c_int32),
+    "llama_get_embeddings_seq": (C.POINTER(C.c_float), C.c_void_p, C.c_int32),
+    "llama_model_n_embd": (C.c_int32, C.c_void_p),
+    "llama_model_n_embd_out": (C.c_int32, C.c_void_p),
+    "llama_model_n_layer": (C.c_int32, C.c_void_p),
+    "llama_model_get_vocab": (C.c_void_p, C.c_void_p),
+    "llama_vocab_n_tokens": (C.c_int32, C.c_void_p),
+}
+
 
 # Nucleus sampling keeps the head of the distribution, so a full sort of a
 # quarter-million logits per row would be wasted work.
@@ -184,15 +222,25 @@ class StageLost(LlamaError):
         self.host = host  # which process, since a reply can report one already replaced
 
 
+def bind(library: C.CDLL, functions: dict[str, tuple[Any, ...]]) -> None:
+    """Declare native functions. See LLAMA_FUNCTIONS for the shape of the table."""
+    for name, (result, *arguments) in functions.items():
+        function = getattr(library, name)
+        function.restype = result
+        function.argtypes = arguments
+
+
 def sequence_pointers(owners: list[int]) -> tuple[Any, Any]:
     """llama_batch wants a pointer per token. Keep both results alive through the pass."""
     count = len(owners)
     held = (C.c_int32 * count)(*owners)
-    width = C.sizeof(C.c_int32)
-    pointers = (C.POINTER(C.c_int32) * count)(
-        *[C.cast(C.addressof(held) + width * index, C.POINTER(C.c_int32)) for index in range(count)]
-    )
-    return held, pointers
+    first = C.addressof(held)
+    return held, (C.c_void_p * count)(*range(first, first + C.sizeof(held), C.sizeof(C.c_int32)))
+
+
+def all_sections(steps: np.ndarray) -> np.ndarray:
+    """Positions for embedding input, which reads every position section itself."""
+    return np.concatenate([steps, steps, steps, np.zeros(len(steps), dtype=np.int32)])
 
 
 def step_random(seed: int | None, position: int) -> np.random.Generator:
@@ -398,7 +446,9 @@ class LlamaLibrary:
         self.ggml_base = load_native(Path(self.folder) / library_file("ggml-base"))
         self.ggml = load_native(Path(self.folder) / library_file("ggml"))
         self.llama = load_native(Path(self.folder) / library_file("llama"))
-        self._bind()
+        bind(self.ggml, GGML_FUNCTIONS)
+        bind(self.ggml_base, GGML_BASE_FUNCTIONS)
+        bind(self.llama, LLAMA_FUNCTIONS)
         self._check_binding()
         self._log = LOG_CALLBACK(self._on_log)
         self.llama.llama_log_set(self._log, None)
@@ -442,68 +492,6 @@ class LlamaLibrary:
     def _on_log(level: int, text: bytes | None, _: Any) -> None:
         if level == GGML_LOG_ERROR and text:
             print("llama.cpp:", text.decode("utf-8", "replace").rstrip(), flush=True)
-
-    def _bind(self) -> None:
-        lib, base = self.llama, self.ggml_base
-        self.ggml.ggml_backend_load_all_from_path.argtypes = [C.c_char_p]
-        self.ggml.ggml_backend_load_all_from_path.restype = None
-        lib.llama_log_set.argtypes = [LOG_CALLBACK, C.c_void_p]
-        lib.llama_log_set.restype = None
-        lib.llama_backend_init.restype = None
-        lib.llama_model_default_params.restype = ModelParams
-        lib.llama_context_default_params.restype = ContextParams
-        lib.llama_model_load_from_file.argtypes = [C.c_char_p, ModelParams]
-        lib.llama_model_load_from_file.restype = C.c_void_p
-        lib.llama_init_from_model.argtypes = [C.c_void_p, ContextParams]
-        lib.llama_init_from_model.restype = C.c_void_p
-        lib.llama_model_free.argtypes = [C.c_void_p]
-        lib.llama_model_free.restype = None
-        lib.llama_free.argtypes = [C.c_void_p]
-        lib.llama_free.restype = None
-        lib.llama_decode.argtypes = [C.c_void_p, Batch]
-        lib.llama_decode.restype = C.c_int32
-        lib.llama_get_logits_ith.argtypes = [C.c_void_p, C.c_int32]
-        lib.llama_get_logits_ith.restype = C.POINTER(C.c_float)
-        lib.llama_get_memory.argtypes = [C.c_void_p]
-        lib.llama_get_memory.restype = C.c_void_p
-        lib.llama_memory_clear.argtypes = [C.c_void_p, C.c_bool]
-        lib.llama_memory_clear.restype = None
-        lib.llama_memory_seq_rm.argtypes = [C.c_void_p, C.c_int32, C.c_int32, C.c_int32]
-        lib.llama_memory_seq_rm.restype = C.c_bool
-        lib.llama_memory_seq_cp.argtypes = [C.c_void_p, C.c_int32, C.c_int32, C.c_int32, C.c_int32]
-        lib.llama_memory_seq_cp.restype = None
-        lib.llama_state_seq_get_size.argtypes = [C.c_void_p, C.c_int32]
-        lib.llama_state_seq_get_size.restype = C.c_size_t
-        lib.llama_state_seq_get_data.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t, C.c_int32]
-        lib.llama_state_seq_get_data.restype = C.c_size_t
-        lib.llama_state_seq_set_data.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t, C.c_int32]
-        lib.llama_state_seq_set_data.restype = C.c_size_t
-        lib.llama_get_embeddings_seq.argtypes = [C.c_void_p, C.c_int32]
-        lib.llama_get_embeddings_seq.restype = C.POINTER(C.c_float)
-        lib.llama_model_n_embd.argtypes = [C.c_void_p]
-        lib.llama_model_n_embd.restype = C.c_int32
-        lib.llama_model_n_embd_out.argtypes = [C.c_void_p]
-        lib.llama_model_n_embd_out.restype = C.c_int32
-        lib.llama_model_n_layer.argtypes = [C.c_void_p]
-        lib.llama_model_n_layer.restype = C.c_int32
-        lib.llama_model_get_vocab.argtypes = [C.c_void_p]
-        lib.llama_model_get_vocab.restype = C.c_void_p
-        lib.llama_vocab_n_tokens.argtypes = [C.c_void_p]
-        lib.llama_vocab_n_tokens.restype = C.c_int32
-        lib.llama_synchronize.argtypes = [C.c_void_p]
-        lib.llama_synchronize.restype = None
-        base.ggml_get_name.argtypes = [C.c_void_p]
-        base.ggml_get_name.restype = C.c_char_p
-        base.ggml_nbytes.argtypes = [C.c_void_p]
-        base.ggml_nbytes.restype = C.c_size_t
-        base.ggml_backend_tensor_get.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t, C.c_size_t]
-        base.ggml_backend_tensor_get.restype = None
-        base.ggml_get_type_traits.argtypes = [C.c_int]
-        base.ggml_get_type_traits.restype = C.POINTER(TypeTraits)
-        self.ggml.ggml_backend_dev_by_type.argtypes = [C.c_int]
-        self.ggml.ggml_backend_dev_by_type.restype = C.c_void_p
-        base.ggml_backend_dev_buffer_type.argtypes = [C.c_void_p]
-        base.ggml_backend_dev_buffer_type.restype = C.c_void_p
 
     def cpu_buffer_type(self) -> int:
         device = self.ggml.ggml_backend_dev_by_type(0)  # GGML_BACKEND_DEVICE_TYPE_CPU
@@ -562,10 +550,9 @@ class LlamaStage:
         if not self.model:
             raise LlamaError(f"llama.cpp could not load {path}")
         self.hidden_size = lib.llama_model_n_embd(self.model)
-        self.layers = lib.llama_model_n_layer(self.model)
         self.vocab_size = lib.llama_vocab_n_tokens(lib.llama_model_get_vocab(self.model))
         self.batch_tokens = batch_tokens
-        self._target = f"l_out-{self.layers - 1}".encode()
+        self._target = f"l_out-{lib.llama_model_n_layer(self.model) - 1}".encode()
         self._captured: np.ndarray | None = None
         # llama.cpp can split a pass into several, and this sees each of them.
         self._parts: list[np.ndarray] = []
@@ -660,35 +647,44 @@ class LlamaStage:
         sequence_id: int = 0,
         places: np.ndarray | None = None,
     ) -> None:
-        steps = np.arange(position, position + count, dtype=np.int32)
         if places is not None:
             positions = np.ascontiguousarray(places, dtype=np.int32).reshape(-1)
-        elif tokens is None:
-            # Embedding input reads every position section itself.
-            positions = np.concatenate([steps, steps, steps, np.zeros(count, dtype=np.int32)])
         else:
-            positions = steps
-        sequence_counts = np.ones(count, dtype=np.int32)
+            positions = np.arange(position, position + count, dtype=np.int32)
+            if tokens is None:
+                positions = all_sections(positions)
         sequence = C.c_int32(sequence_id)
-        sequence_ids = (C.POINTER(C.c_int32) * count)(*([C.pointer(sequence)] * count))
-        outputs = np.ones(count, dtype=np.int8) if want_all else np.zeros(count, dtype=np.int8)
+        sequence_ids = (C.c_void_p * count)(*([C.addressof(sequence)] * count))
+        outputs = np.full(count, want_all, dtype=np.int8)
         outputs[-1] = 1
+        if self.engine is not None:
+            self.engine.capture_begin()
+        self._run_batch(count, positions, sequence_ids, outputs, hidden, tokens)
+        if self.engine is not None and not self.last:
+            self._captured = self.engine.capture_read(count * self.hidden_size)
+
+    def _run_batch(
+        self,
+        count: int,
+        positions: np.ndarray,
+        sequence_ids: Any,
+        outputs: np.ndarray,
+        hidden: np.ndarray | None = None,
+        tokens: np.ndarray | None = None,
+    ) -> None:
+        sequence_counts = np.ones(count, dtype=np.int32)
         batch = Batch(
             n_tokens=count,
             token=None if tokens is None else tokens.ctypes.data,
             embd=None if hidden is None else hidden.ctypes.data,
             pos=positions.ctypes.data,
             n_seq_id=sequence_counts.ctypes.data,
-            seq_id=C.cast(sequence_ids, C.c_void_p).value,
+            seq_id=C.addressof(sequence_ids),
             logits=outputs.ctypes.data,
         )
-        if self.engine is not None:
-            self.engine.capture_begin()
         status = self.library.llama.llama_decode(self.context, batch)
         if status != 0:
             raise LlamaError(f"llama_decode failed with status {status}")
-        if self.engine is not None and not self.last:
-            self._captured = self.engine.capture_read(count * self.hidden_size)
 
     def logits_at(self, index: int) -> np.ndarray:
         pointer = self.library.llama.llama_get_logits_ith(self.context, index)
@@ -696,12 +692,15 @@ class LlamaStage:
             raise LlamaError(f"no logits for output {index}")
         return np.ctypeslib.as_array(pointer, shape=(self.vocab_size,))
 
-    def decode_tokens(self, tokens: list[int], position: int, *, want_all: bool = False, sequence_id: int = 0) -> None:
+    def best_token(self) -> int:
+        return int(np.argmax(self.logits_at(-1)))
+
+    def decode_tokens(self, tokens: list[int], position: int, *, sequence_id: int = 0) -> None:
         """Run token ids through a whole model, in chunks the batch can hold."""
         ids = np.array(tokens, dtype=np.int32)
         for start in range(0, len(ids), self.batch_tokens):
-            chunk = np.ascontiguousarray(ids[start : start + self.batch_tokens])
-            self._decode(len(chunk), position + start, want_all, tokens=chunk, sequence_id=sequence_id)
+            chunk = ids[start : start + self.batch_tokens]
+            self._decode(len(chunk), position + start, False, tokens=chunk, sequence_id=sequence_id)
 
     def verify(
         self,
@@ -727,16 +726,13 @@ class LlamaStage:
         """
         lib = self.library.llama
         self.decode_tokens(commit, position, sequence_id=slot)
-        guess = int(np.argmax(self.logits_at(-1)))
-        guesses = [guess]
+        guesses = [self.best_token()]
         if count > 1:
             lib.llama_memory_seq_cp(self.memory, slot, scratch, -1, -1)
             cursor = position + len(commit)
-            for _ in range(count - 1):
-                self.decode_tokens([guess], cursor, sequence_id=scratch)
-                guess = int(np.argmax(self.logits_at(-1)))
-                guesses.append(guess)
-                cursor += 1
+            for offset in range(count - 1):
+                self.decode_tokens(guesses[-1:], cursor + offset, sequence_id=scratch)
+                guesses.append(self.best_token())
             lib.llama_memory_seq_rm(self.memory, scratch, -1, -1)
         return guesses
 
@@ -784,30 +780,16 @@ class LlamaStage:
         """
         count = hidden.shape[0]
         hidden = np.ascontiguousarray(hidden, dtype=np.float32)
-        steps = np.array(positions, dtype=np.int32)
-        places = np.concatenate([steps, steps, steps, np.zeros(count, dtype=np.int32)])
-        sequence_counts = np.ones(count, dtype=np.int32)
-        owners, sequence_ids = sequence_pointers(slots)
-        outputs = np.ones(count, dtype=np.int8)
-        batch = Batch(
-            n_tokens=count,
-            token=None,
-            embd=hidden.ctypes.data,
-            pos=places.ctypes.data,
-            n_seq_id=sequence_counts.ctypes.data,
-            seq_id=C.cast(sequence_ids, C.c_void_p).value,
-            logits=outputs.ctypes.data,
-        )
+        places = all_sections(np.array(positions, dtype=np.int32))
+        held, sequence_ids = sequence_pointers(slots)
         self._parts = []
         self._collecting = True
         if self.engine is not None:
             self.engine.capture_begin()
         try:
-            status = self.library.llama.llama_decode(self.context, batch)
+            self._run_batch(count, places, sequence_ids, np.ones(count, dtype=np.int8), hidden)
         finally:
             self._collecting = False
-        if status != 0:
-            raise LlamaError(f"llama_decode failed with status {status}")
         if self.last:
             return np.stack([self.logits_at(index).copy() for index in range(count)])
         if self.engine is not None:
@@ -826,24 +808,10 @@ class LlamaStage:
         lib = self.library.llama
         count = hidden.shape[0]
         hidden = np.ascontiguousarray(hidden, dtype=np.float32)
-        steps = np.concatenate([np.arange(length, dtype=np.int32) for length in lengths])
-        places = np.concatenate([steps, steps, steps, np.zeros(count, dtype=np.int32)])
-        sequence_counts = np.ones(count, dtype=np.int32)
-        owners, sequence_ids = sequence_pointers(np.repeat(np.arange(len(lengths)), lengths).tolist())
-        outputs = np.ones(count, dtype=np.int8)
-        batch = Batch(
-            n_tokens=count,
-            token=None,
-            embd=hidden.ctypes.data,
-            pos=places.ctypes.data,
-            n_seq_id=sequence_counts.ctypes.data,
-            seq_id=C.cast(sequence_ids, C.c_void_p).value,
-            logits=outputs.ctypes.data,
-        )
+        places = all_sections(np.concatenate([np.arange(length, dtype=np.int32) for length in lengths]))
+        held, sequence_ids = sequence_pointers(np.repeat(np.arange(len(lengths)), lengths).tolist())
         lib.llama_memory_clear(self.memory, True)
-        status = lib.llama_decode(self.context, batch)
-        if status != 0:
-            raise LlamaError(f"llama_decode failed with status {status}")
+        self._run_batch(count, places, sequence_ids, np.ones(count, dtype=np.int8), hidden)
         pooled = np.empty((len(lengths), self.output_width), dtype=np.float32)
         for sequence in range(len(lengths)):
             pointer = lib.llama_get_embeddings_seq(self.context, sequence)
@@ -851,15 +819,6 @@ class LlamaStage:
                 raise LlamaError("llama.cpp produced no pooled output; this model may declare no pooling")
             pooled[sequence] = np.ctypeslib.as_array(pointer, shape=(self.output_width,))
         return pooled
-
-    def close(self) -> None:
-        lib = self.library.llama
-        if getattr(self, "context", None):
-            lib.llama_free(self.context)
-            self.context = None
-        if getattr(self, "model", None):
-            lib.llama_model_free(self.model)
-            self.model = None
 
 
 class TokenEmbedding:
@@ -874,6 +833,7 @@ class TokenEmbedding:
 
     def rows(self, tokens: list[int]) -> np.ndarray:
         result = np.empty((len(tokens), self.width), dtype=np.float32)
+        target = result.ctypes.data
         for index, token in enumerate(tokens):
             start = token * self.row_bytes
             row = bytes(self.data[start : start + self.row_bytes])
@@ -882,5 +842,5 @@ class TokenEmbedding:
             if self.to_float is None:
                 result[index] = np.frombuffer(row, dtype=np.float32)
             else:
-                self.to_float(C.cast(C.c_char_p(row), C.c_void_p), result[index].ctypes.data, self.width)
+                self.to_float(row, target + index * result.strides[0], self.width)
         return result
