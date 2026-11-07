@@ -91,6 +91,13 @@ def bearer(key):
     return {"Authorization": f"Bearer {key}"}
 
 
+def test_a_user_key_can_read_measured_links(secured):
+    client, alice, _, _ = secured
+    reading = {"median_ms": 10.0, "max_ms": 12.0, "cost_ms": 14.0, "checked_at": 1}
+    orchestrator_module.runtime.link_readings["one", "two"] = reading
+    assert client.get("/admin/status", headers=bearer(alice)).json()["links"] == [{"source": "one", "target": "two", **reading}]
+
+
 def test_users_can_read_but_not_manage(secured):
     client, alice, _, _ = secured
     assert client.get("/admin/status").status_code == 401

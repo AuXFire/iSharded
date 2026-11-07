@@ -1136,6 +1136,98 @@ def test_links_are_measured_from_each_end_and_a_dead_one_stays_on_record() -> No
     done(orchestrator)
 
 
+def measure(orchestrator, handler, *rows):
+    async def run():
+        orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        for row in rows:
+            await orchestrator.measure_links(row)
+
+    asyncio.run(run())
+
+
+def test_a_link_is_charged_what_a_row_adds_and_never_less_than_its_base_cost() -> None:
+    orchestrator = pool(one=record("one"), two=record("two"))
+    asked = []
+
+    def handler(request):
+        asked.append((json.loads(request.content)["sizes"], request.extensions["timeout"]["read"]))
+        row = {"median_ms": 14.0 if request.url.host == "one" else 9.0, "max_ms": 99.0}
+        return httpx.Response(200, json={"100": {"median_ms": 10.0, "max_ms": 12.0}, "16384": row})
+
+    measure(orchestrator, handler, 16384)
+    assert orchestrator.links == {("one", "two"): 15.0, ("two", "one"): 11.0}
+    assert asked == [([100, 16384], 20.0)] * 2  # twice the work must not make a slow link look dead
+    done(orchestrator)
+
+
+def test_a_row_no_bigger_than_the_probe_is_not_probed() -> None:
+    orchestrator = pool(one=record("one"), two=record("two"))
+    asked = []
+
+    def handler(request):
+        asked.append(json.loads(request.content)["sizes"])
+        return httpx.Response(200, json={"100": {"median_ms": 10.0}})
+
+    measure(orchestrator, handler, 64)
+    assert asked == [[100], [100]]
+    assert orchestrator.links == {("one", "two"): 10.0, ("two", "one"): 10.0}
+    done(orchestrator)
+
+
+def test_a_model_with_rows_of_another_size_measures_links_again() -> None:
+    orchestrator = pool(one=record("one"), two=record("two"))
+    asked = []
+
+    def handler(request):
+        sizes = json.loads(request.content)["sizes"]
+        asked.append(sizes[-1])
+        return httpx.Response(200, json={str(size): {"median_ms": size / 1000} for size in sizes})
+
+    measure(orchestrator, handler, 4096, 4096, 8192)
+    assert asked == [4096, 4096, 8192, 8192]
+    assert orchestrator.links[("one", "two")] == 8.19
+    done(orchestrator)
+
+
+def test_status_publishes_measured_links_by_worker_id_alone() -> None:
+    orchestrator = pool(one=record("one"), two=record("two"))
+
+    def handler(request):
+        if request.url.host == "two":
+            return httpx.Response(500)
+        return httpx.Response(200, json={"100": {"median_ms": 10.0, "max_ms": 12.0}, "4096": {"median_ms": 13.0}})
+
+    before = int(time.time())
+    measure(orchestrator, handler, 4096)
+    links = orchestrator.status()["links"]
+    assert before <= links[0]["checked_at"] <= time.time()
+    for link in links:
+        del link["checked_at"]
+    assert links == [
+        {"source": "one", "target": "two", "median_ms": 10.0, "max_ms": 12.0, "cost_ms": 14.0},
+        {"source": "two", "target": "one", "median_ms": None, "max_ms": None, "cost_ms": orchestrator_module.UNREACHABLE_LINK_MS},
+    ]
+    assert "http" not in json.dumps(links) and ":1" not in json.dumps(links)
+    done(orchestrator)
+
+
+def test_a_failed_link_drops_its_old_reading() -> None:
+    orchestrator = pool(one=record("one"), two=record("two"))
+    measure(orchestrator, lambda request: httpx.Response(200, json={"100": {"median_ms": 10.0}}), 0)
+    orchestrator.links_checked.clear()
+    measure(orchestrator, lambda request: httpx.Response(500), 0)
+    assert [link["median_ms"] for link in orchestrator.status()["links"]] == [None, None]
+    done(orchestrator)
+
+
+def test_a_row_is_a_float32_per_hidden_unit_in_every_model_family() -> None:
+    from types import SimpleNamespace
+
+    assert orchestrator_module.row_bytes(SimpleNamespace(adapter=SimpleNamespace(hidden_size=1024))) == 4096
+    assert orchestrator_module.row_bytes(SimpleNamespace(adapter=SimpleNamespace(header=SimpleNamespace(hidden_size=5120)))) == 20480
+    assert orchestrator_module.row_bytes(SimpleNamespace()) == 0
+
+
 def stage_answering(status, body):
     """A middle stage whose next stage gives this answer."""
     import torch

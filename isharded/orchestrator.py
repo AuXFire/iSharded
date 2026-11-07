@@ -117,6 +117,7 @@ RING_RETRY_SECONDS = 30.0
 RING_CALL_SECONDS = 30.0
 LINK_TTL_SECONDS = 600.0
 LINK_PROBE_ROUNDS = 5
+LINK_PROBE_BYTES = 100
 LINK_PROBE_SECONDS = 30.0
 # Replanning around a worker that is alive but failed may move this much at most.
 REPLAN_MOVE_LIMIT_BYTES = 2 * 1024**3
@@ -511,6 +512,22 @@ def link_cost(measured: dict[str, float]) -> float:
     return median + (float(measured.get("max_ms", median)) - median) / 2
 
 
+def link_reading(measured: dict[str, Any], sizes: list[int]) -> dict[str, float]:
+    """A probed link. The probe goes over HTTP, so a row's own time is only what it
+    took beyond the small probe, added to what that probe alone costs."""
+    small, row = measured[str(sizes[0])], measured[str(sizes[-1])]
+    median = float(small["median_ms"])
+    transfer = max(float(row["median_ms"]) - median, 0.0)
+    return {"median_ms": median, "max_ms": float(small.get("max_ms", median)), "cost_ms": round(link_cost(small) + transfer, 2)}
+
+
+def row_bytes(target: ModelTarget) -> int:
+    """What one token's row of float32 weighs on a link. With no width to go by it is
+    0, which leaves links measured by the small probe alone."""
+    adapter = getattr(target, "adapter", None)
+    return int(getattr(getattr(adapter, "header", adapter), "hidden_size", 0)) * 4
+
+
 class Orchestrator:
     def __init__(self) -> None:
         self.pool_token = load_token()
@@ -522,6 +539,8 @@ class Orchestrator:
         self.ring_tried_at = 0.0
         self.links: dict[tuple[str, str], float] = {}  # round trip in ms, from one worker to another
         self.links_checked: dict[tuple[str, str], float] = {}
+        self.link_readings: dict[tuple[str, str], dict[str, Any]] = {}  # what /admin/status publishes
+        self.link_row_bytes = 0
         self.model_id: str | None = None
         self.planning_model: str | None = None
         self.active: ModelTarget | None = None
@@ -1279,12 +1298,13 @@ class Orchestrator:
             self.ring_epoch = epoch
             self.add_event("mesh", "Direct links up", f"Tokens now cross {len(route)} stages on the native path")
 
-    async def measure_links(self) -> None:
+    async def measure_links(self, row: int = 0) -> None:
         """Time the links between workers, which the planner routes by.
 
         Every token crosses each link on its route and comes back, so on a mesh that
         spans cities these round trips set the speed. Each is measured from the end
         that would send, and a link that fails stays on record so that no route needs it.
+        A slow link also feels how big a token's row is, so ``row`` is probed as well.
         """
         urls = {
             worker_id: worker_url(record)
@@ -1292,19 +1312,27 @@ class Orchestrator:
             if record.live and not record.quarantined
         }
         now = time.monotonic()
+        sizes = [LINK_PROBE_BYTES, row] if row > LINK_PROBE_BYTES else [LINK_PROBE_BYTES]
+        if row != self.link_row_bytes:
+            self.link_row_bytes = row
+            self.links_checked.clear()  # those costs were for another model's rows
 
         async def probe(source: str, target: str) -> None:
+            reading: dict[str, Any] = {"median_ms": None, "max_ms": None, "cost_ms": UNREACHABLE_LINK_MS}
             try:
+                # The time allowed grows with the work, or a slow link would pass for a dead one.
                 response = await self.client.post(
                     urls[source] + "/internal/diag/probe",
-                    json={"url": urls[target], "sizes": [100], "rounds": LINK_PROBE_ROUNDS},
+                    json={"url": urls[target], "sizes": sizes, "rounds": LINK_PROBE_ROUNDS},
                     headers=auth_headers(self.pool_token),
-                    timeout=10.0,
+                    timeout=10.0 * len(sizes),
                 )
                 response.raise_for_status()
-                self.links[source, target] = link_cost(response.json()["100"])
+                reading = link_reading(response.json(), sizes)
             except (httpx.HTTPError, KeyError, TypeError, ValueError):
-                self.links[source, target] = UNREACHABLE_LINK_MS
+                pass
+            self.links[source, target] = reading["cost_ms"]
+            self.link_readings[source, target] = {**reading, "checked_at": int(time.time())}
             self.links_checked[source, target] = now
 
         async def from_one(source: str) -> None:
@@ -1312,10 +1340,11 @@ class Orchestrator:
                 if target != source and now - self.links_checked.get((source, target), -LINK_TTL_SECONDS) >= LINK_TTL_SECONDS:
                     await probe(source, target)
 
+        allowed = LINK_PROBE_SECONDS * len(sizes)
         try:
-            await asyncio.wait_for(asyncio.gather(*map(from_one, urls)), LINK_PROBE_SECONDS)
+            await asyncio.wait_for(asyncio.gather(*map(from_one, urls)), allowed)
         except asyncio.TimeoutError:
-            self.add_event("mesh", "Link measuring cut short", f"Planning with what {LINK_PROBE_SECONDS:.0f} s could measure")
+            self.add_event("mesh", "Link measuring cut short", f"Planning with what {allowed:.0f} s could measure")
 
     def plan_memory(self, target: ModelTarget, route: list[StageAssignment]) -> dict[str, Any]:
         """A route's use of the memory on offer, with what each stage spills.
@@ -1598,7 +1627,7 @@ class Orchestrator:
         for _ in range(MAX_DEPLOY_ATTEMPTS):
             await self.refresh_worker_metrics()
             await self.refresh_holdings(target)
-            await self.measure_links()
+            await self.measure_links(row_bytes(target))
             route = self.plan_or_refuse(target)
             job.route = route
             job.workers = {}
@@ -2497,6 +2526,7 @@ class Orchestrator:
             "epoch": self.epoch,
             "uptime_seconds": int(time.time() - self.started_at),
             "route": [stage.model_dump() for stage in self.route],
+            "links": [{"source": source, "target": target, **reading} for (source, target), reading in sorted(self.link_readings.items())],
             "cache_url": self.active_cache_url,
             "metrics": {
                 "requests_total": self.requests_total,
@@ -2942,7 +2972,7 @@ async def preview_plan(body: LoadModelRequest, authorization: str | None = Heade
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     await runtime.refresh_worker_metrics()
     await runtime.refresh_holdings(target)
-    await runtime.measure_links()
+    await runtime.measure_links(row_bytes(target))
     route = runtime.plan_or_refuse(target, honor_pins_strictly=True)
     return {**describe_plan(target, route), "memory": runtime.plan_memory(target, route)}
 
