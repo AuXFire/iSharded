@@ -4,6 +4,7 @@
 //! So there is one copy of the library in the process, and this code needs no linking to a
 //! particular build.
 
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::Arc;
 
@@ -29,10 +30,17 @@ pub struct Batch {
 pub type Decode = unsafe extern "C" fn(*mut c_void, Batch) -> i32;
 pub type LogitsIth = unsafe extern "C" fn(*mut c_void, i32) -> *mut f32;
 pub type SeqRm = unsafe extern "C" fn(*mut c_void, i32, i32, i32) -> bool;
+pub type StateSize = unsafe extern "C" fn(*mut c_void, i32, u32) -> usize;
+pub type StateGet = unsafe extern "C" fn(*mut c_void, *mut u8, usize, i32, u32) -> usize;
+pub type StateSet = unsafe extern "C" fn(*mut c_void, *const u8, usize, i32, u32) -> usize;
 pub type TensorName = unsafe extern "C" fn(*const c_void) -> *const c_char;
 pub type TensorBytes = unsafe extern "C" fn(*const c_void) -> usize;
 pub type TensorGet = unsafe extern "C" fn(*const c_void, *mut c_void, usize, usize);
 pub type ToFloat = unsafe extern "C" fn(*const c_void, *mut f32, i64);
+
+/// `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`. Attention can rewind by itself, so a snapshot leaves
+/// it out, which keeps its size the same however long the reply gets.
+const PARTIAL_ONLY: u32 = 1;
 
 /// What the output capture needs. Set before the model's context exists.
 #[repr(C)]
@@ -50,6 +58,9 @@ pub struct StageApi {
     pub decode: Decode,
     pub logits_ith: LogitsIth,
     pub seq_rm: SeqRm,
+    pub state_size: StateSize,
+    pub state_get: StateGet,
+    pub state_set: StateSet,
     pub context: *mut c_void,
     pub memory: *mut c_void,
     pub width: i32,
@@ -61,6 +72,8 @@ pub struct StageApi {
     pub table_rows: i64,
     pub row_bytes: i64,
     pub to_float: Option<ToFloat>,
+    /// How many snapshots each slot holds, which must cover every pass a miss can undo.
+    pub keep_limit: u32,
 }
 
 /// Holds what the stage's last layer produced. llama.cpp calls `on_eval` for every node of
@@ -104,9 +117,64 @@ impl Capture {
     }
 }
 
+/// A slot's state just after a pass, named by the position the next pass runs at.
+struct Snapshot {
+    end: u32,
+    bytes: Vec<u8>,
+}
+
+/// One slot's snapshots, oldest first.
+#[derive(Default)]
+struct SlotStates {
+    saved: VecDeque<Snapshot>,
+    spare: Vec<Vec<u8>>,
+}
+
+impl SlotStates {
+    fn drop_past(&mut self, end: u32) {
+        while self.saved.back().is_some_and(|item| item.end > end) {
+            self.spare.extend(self.saved.pop_back().map(|item| item.bytes));
+        }
+    }
+
+    /// A buffer for the next snapshot. A state can be many megabytes, so they are reused.
+    fn buffer(&mut self, limit: usize) -> Vec<u8> {
+        if self.saved.len() >= limit {
+            if let Some(oldest) = self.saved.pop_front() {
+                return oldest.bytes;
+            }
+        }
+        self.spare.pop().unwrap_or_default()
+    }
+}
+
+/// What recurrent state can go back to. A rewind cannot undo a finished pass by itself, so a
+/// reply that may need one asks each stage to hold on to where it has been.
+///
+/// Python changes slots too, and nothing here would notice: a snapshot from an earlier reply
+/// restores without complaint and gives wrong answers. So it is shared, as `Capture` is, and
+/// Python says when a slot's history stops being the one these came from.
+#[derive(Default)]
+pub struct Snapshots {
+    slots: Mutex<HashMap<i32, SlotStates>>,
+}
+
+impl Snapshots {
+    /// A negative slot means all of them.
+    pub fn forget(&self, slot: i32) {
+        let mut slots = self.slots.lock();
+        if slot < 0 {
+            slots.clear();
+        } else {
+            slots.remove(&slot);
+        }
+    }
+}
+
 pub struct LlamaCompute {
     api: StageApi,
     capture: Arc<Capture>,
+    snapshots: Arc<Snapshots>,
     /// The rows of the coming batch.
     hidden: Vec<f32>,
     positions: Vec<i32>,
@@ -144,10 +212,11 @@ fn to_wire(rows: &[f32], bf16: bool) -> Vec<u8> {
 }
 
 impl LlamaCompute {
-    pub fn new(api: StageApi, capture: Arc<Capture>) -> LlamaCompute {
+    pub fn new(api: StageApi, capture: Arc<Capture>, snapshots: Arc<Snapshots>) -> LlamaCompute {
         LlamaCompute {
             api,
             capture,
+            snapshots,
             hidden: Vec::new(),
             positions: Vec::new(),
             slots: Vec::new(),
@@ -193,13 +262,59 @@ impl LlamaCompute {
         Ok(())
     }
 
+    /// Forgets positions from `keep` on, going through a snapshot if the model refuses.
+    fn rewind(&self, slot: i32, keep: u32) -> Result<(), Failure> {
+        let refused = || Failure { refusal: Refusal::Retry, message: "this model cannot rewind; replay instead".into() };
+        // Safety: only the gate's holder touches the memory.
+        let cut = || unsafe { (self.api.seq_rm)(self.api.memory, slot, keep as i32, -1) };
+        let mut slots = self.snapshots.slots.lock();
+        if !cut() {
+            let found = slots.get(&slot).and_then(|states| states.saved.iter().find(|item| item.end == keep));
+            let state = found.ok_or_else(refused)?;
+            // Safety: the bytes came from `state_get`, for this slot of this context.
+            let read = unsafe { (self.api.state_set)(self.api.context, state.bytes.as_ptr(), state.bytes.len(), slot, PARTIAL_ONLY) };
+            if read == 0 || !cut() {
+                // llama.cpp empties a slot whose restore fails, so nothing here fits it now.
+                slots.remove(&slot);
+                return Err(refused());
+            }
+        }
+        if let Some(states) = slots.get_mut(&slot) {
+            states.drop_past(keep);
+        }
+        Ok(())
+    }
+
+    /// Saves where a pass left its slot, if the pass asked. Failing to is no failure of the
+    /// pass: a rewind that needs the snapshot refuses, and the reply replays.
+    fn keep_state(&self, pass: &Pass) {
+        if !pass.keeps_state() {
+            return;
+        }
+        let slot = pass.slot as i32;
+        let end = pass.position + pass.row_count() as u32;
+        let mut slots = self.snapshots.slots.lock();
+        let states = slots.entry(slot).or_default();
+        states.drop_past(end - 1);
+        let mut bytes = states.buffer(self.api.keep_limit as usize);
+        // Safety: the buffer is resized to what llama.cpp asks for, and the gate is held.
+        let wrote = unsafe {
+            let size = (self.api.state_size)(self.api.context, slot, PARTIAL_ONLY);
+            bytes.resize(size, 0);
+            (self.api.state_get)(self.api.context, bytes.as_mut_ptr(), size, slot, PARTIAL_ONLY)
+        };
+        if wrote == 0 {
+            states.spare.push(bytes);
+            return;
+        }
+        bytes.truncate(wrote);
+        states.saved.push_back(Snapshot { end, bytes });
+    }
+
     /// Does a pass's rewind, and adds its rows to the coming batch.
     fn load(&mut self, pass: &Pass) -> Result<(), Failure> {
         if let Some(keep) = pass.rollback_to {
-            // Safety: only the gate's holder touches the memory.
-            if !unsafe { (self.api.seq_rm)(self.api.memory, pass.slot as i32, keep as i32, -1) } {
-                return Err(Failure { refusal: Refusal::Retry, message: "this model cannot rewind; replay instead".into() });
-            }
+            self.rewind(pass.slot as i32, keep)?;
         }
         if pass.carries_tokens() {
             self.embed(&pass.tokens)
@@ -265,6 +380,7 @@ impl LlamaCompute {
         }
         let count = passes.len();
         self.decode(order.iter().map(|index| (passes[*index].position as i32, passes[*index].slot as i32)), true)?;
+        passes.iter().for_each(|pass| self.keep_state(pass));
         let mut results: Vec<Option<Result<Output, Failure>>> = (0..count).map(|_| None).collect();
         if self.api.last {
             for (row, index) in order.iter().enumerate() {
@@ -303,6 +419,7 @@ impl Compute for LlamaCompute {
         let verify = self.api.last && pass.verifying();
         let rows = (0..count as i32).map(|step| (pass.position as i32 + step, pass.slot as i32));
         self.decode(rows, !self.api.last || verify)?;
+        self.keep_state(pass);
         if !self.api.last {
             let rows = self.capture.rows.lock();
             let width = self.api.width as usize;
@@ -326,7 +443,7 @@ impl Compute for LlamaCompute {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{Sampling, FLAG_TOKENS};
+    use crate::wire::{Sampling, FLAG_KEEP, FLAG_TOKENS};
 
     const WIDTH: usize = 2;
 
@@ -337,6 +454,14 @@ mod tests {
         rewinds: Vec<(i32, i32)>,
         batches: Vec<Seen>,
         logits: Vec<f32>,
+        /// Refuses a rewind across finished passes, as recurrent memory does.
+        recurrent: bool,
+        /// Each slot's state: the position that comes next, and every position it has run.
+        slots: HashMap<i32, (i32, Vec<i32>)>,
+        restores: Vec<(i32, i32)>,
+        saves: usize,
+        refuse_saves: bool,
+        refuse_restores: bool,
     }
 
     #[derive(Debug, PartialEq)]
@@ -358,6 +483,11 @@ mod tests {
             hidden: hidden.clone(),
         });
         assert!(std::slice::from_raw_parts(batch.n_seq_id, count).iter().all(|item| *item == 1));
+        for row in 0..count {
+            let state = fake.slots.entry(**batch.seq_id.add(row)).or_default();
+            state.0 = *batch.pos.add(row) + 1;
+            state.1.push(*batch.pos.add(row));
+        }
         let doubled = hidden.iter().map(|value| value * 2.0);
         fake.capture.as_ref().unwrap().rows.lock().extend(doubled);
         0
@@ -368,8 +498,46 @@ mod tests {
     }
 
     unsafe extern "C" fn fake_rewind(memory: *mut c_void, slot: i32, keep: i32, _end: i32) -> bool {
-        (*memory.cast::<Fake>()).rewinds.push((slot, keep));
-        true
+        let fake = &mut *memory.cast::<Fake>();
+        fake.rewinds.push((slot, keep));
+        !fake.recurrent || keep >= fake.slots.get(&slot).map_or(0, |state| state.0)
+    }
+
+    fn state_bytes(state: &(i32, Vec<i32>)) -> Vec<u8> {
+        std::iter::once(state.0).chain(state.1.iter().copied()).flat_map(i32::to_le_bytes).collect()
+    }
+
+    unsafe extern "C" fn fake_state_size(context: *mut c_void, slot: i32, flags: u32) -> usize {
+        assert_eq!(flags, PARTIAL_ONLY);
+        state_bytes(&(&*context.cast::<Fake>()).slots[&slot]).len()
+    }
+
+    unsafe extern "C" fn fake_state_get(context: *mut c_void, out: *mut u8, size: usize, slot: i32, flags: u32) -> usize {
+        assert_eq!(flags, PARTIAL_ONLY);
+        let fake = &mut *context.cast::<Fake>();
+        if fake.refuse_saves {
+            return 0;
+        }
+        fake.saves += 1;
+        let bytes = state_bytes(&fake.slots[&slot]);
+        assert_eq!(size, bytes.len());
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, size);
+        size
+    }
+
+    unsafe extern "C" fn fake_state_set(context: *mut c_void, data: *const u8, size: usize, slot: i32, flags: u32) -> usize {
+        assert_eq!(flags, PARTIAL_ONLY);
+        let fake = &mut *context.cast::<Fake>();
+        if fake.refuse_restores {
+            fake.slots.remove(&slot);
+            return 0;
+        }
+        let bytes = std::slice::from_raw_parts(data, size);
+        let mut items = bytes.chunks_exact(4).map(|item| i32::from_le_bytes([item[0], item[1], item[2], item[3]]));
+        let next = items.next().unwrap();
+        fake.restores.push((slot, next));
+        fake.slots.insert(slot, (next, items.collect()));
+        size
     }
 
     unsafe extern "C" fn no_name(_tensor: *const c_void) -> *const c_char {
@@ -392,6 +560,9 @@ mod tests {
             decode: fake_decode,
             logits_ith: fake_logits,
             seq_rm: fake_rewind,
+            state_size: fake_state_size,
+            state_get: fake_state_get,
+            state_set: fake_state_set,
             context: pointer,
             memory: pointer,
             width: WIDTH as i32,
@@ -402,8 +573,9 @@ mod tests {
             table_rows: (table.len() / WIDTH) as i64,
             row_bytes: (WIDTH * 4) as i64,
             to_float: None,
+            keep_limit: 3,
         };
-        LlamaCompute::new(api, capture)
+        LlamaCompute::new(api, capture, Arc::default())
     }
 
     fn rows_pass(slot: u32, position: u32, values: &[f32]) -> Pass {
@@ -485,6 +657,188 @@ mod tests {
         let got = compute.run_merged(&[rows_pass(5, 20, &[1.0, 2.0]), wrong]);
         assert!(got.iter().all(|item| matches!(item, Err(failure) if failure.message == "rows are 1 wide and this stage takes 2")));
         assert!(fake.batches.is_empty());
+    }
+
+    fn plain(slot: u32, position: u32) -> Pass {
+        rows_pass(slot, position, &[1.0, 2.0])
+    }
+
+    fn kept(slot: u32, position: u32) -> Pass {
+        Pass { flags: FLAG_KEEP, ..plain(slot, position) }
+    }
+
+    fn rewound(slot: u32, position: u32) -> Pass {
+        Pass { rollback_to: Some(position), ..kept(slot, position) }
+    }
+
+    fn recurrent(fake: &mut Fake, start: i32) -> LlamaCompute {
+        fake.recurrent = true;
+        fake.slots.insert(0, (start, vec![]));
+        fake.slots.insert(1, (start, vec![]));
+        stage(fake, false, &[])
+    }
+
+    fn runs(compute: &mut LlamaCompute, slot: u32, positions: std::ops::Range<u32>) {
+        for position in positions {
+            assert!(compute.run(&kept(slot, position)).is_ok());
+        }
+    }
+
+    fn refused(output: Result<Output, Failure>) -> bool {
+        matches!(output, Err(failure) if failure.refusal == Refusal::Retry && failure.message == "this model cannot rewind; replay instead")
+    }
+
+    #[test]
+    fn a_rewind_the_model_refuses_goes_through_the_snapshot_of_that_position() {
+        let mut fake = Fake::default();
+        let mut compute = recurrent(&mut fake, 10);
+        runs(&mut compute, 0, 10..13);
+        assert!(compute.run(&rewound(0, 11)).is_ok());
+        assert_eq!(fake.restores, vec![(0, 11)]);
+        // Refused, restored, and then the same cut goes through.
+        assert_eq!(fake.rewinds, vec![(0, 11), (0, 11)]);
+        // The wrong passes are gone from the state, and the new one follows the right one.
+        assert_eq!(fake.slots[&0], (12, vec![10, 11]));
+    }
+
+    #[test]
+    fn a_rewind_with_nothing_to_remove_needs_no_snapshot() {
+        let mut fake = Fake::default();
+        let mut compute = recurrent(&mut fake, 10);
+        runs(&mut compute, 0, 10..12);
+        assert!(compute.run(&rewound(0, 12)).is_ok());
+        assert!(fake.restores.is_empty());
+    }
+
+    #[test]
+    fn a_pass_that_did_not_ask_keeps_nothing() {
+        let mut fake = Fake::default();
+        let mut compute = recurrent(&mut fake, 10);
+        assert!(compute.run(&plain(0, 10)).is_ok());
+        assert!(compute.run(&plain(0, 11)).is_ok());
+        assert_eq!(fake.saves, 0);
+        assert!(refused(compute.run(&rewound(0, 11))));
+    }
+
+    #[test]
+    fn a_rewind_past_every_snapshot_refuses_and_the_ring_stays_within_its_limit() {
+        let mut fake = Fake::default();
+        let mut compute = recurrent(&mut fake, 10);
+        runs(&mut compute, 0, 10..16); // the limit is 3, so 14, 15, and 16 are left
+        assert!(refused(compute.run(&rewound(0, 13))));
+        assert!(fake.restores.is_empty());
+        assert!(compute.run(&rewound(0, 14)).is_ok());
+        assert_eq!(fake.restores, vec![(0, 14)]);
+    }
+
+    #[test]
+    fn a_snapshot_from_an_abandoned_path_never_answers_for_the_new_one() {
+        let mut fake = Fake::default();
+        let mut compute = recurrent(&mut fake, 10);
+        runs(&mut compute, 0, 10..13);
+        assert!(compute.run(&rewound(0, 11)).is_ok());
+        assert!(compute.run(&plain(0, 12)).is_ok());
+        assert!(compute.run(&plain(0, 13)).is_ok());
+        // 13 was saved on the wrong path, and the right path has not saved one.
+        assert!(refused(compute.run(&rewound(0, 13))));
+        assert_eq!(fake.restores, vec![(0, 11)]);
+    }
+
+    #[test]
+    fn a_rewind_the_model_allows_still_drops_what_it_went_past() {
+        let mut fake = Fake::default();
+        let mut compute = recurrent(&mut fake, 10);
+        runs(&mut compute, 0, 10..13);
+        fake.recurrent = false; // inside the last pass, llama.cpp can rewind by itself
+        assert!(compute.run(&rewound(0, 11)).is_ok());
+        fake.recurrent = true;
+        assert!(compute.run(&plain(0, 12)).is_ok());
+        assert!(compute.run(&plain(0, 13)).is_ok());
+        assert!(refused(compute.run(&rewound(0, 13))));
+        assert!(fake.restores.is_empty());
+    }
+
+    #[test]
+    fn a_slot_only_ever_goes_back_to_its_own_snapshots() {
+        let mut fake = Fake::default();
+        let mut compute = recurrent(&mut fake, 10);
+        runs(&mut compute, 0, 10..13);
+        runs(&mut compute, 1, 12..14);
+        assert!(refused(compute.run(&rewound(1, 12)))); // slot 0 holds a 12, and slot 1 does not
+        assert!(compute.run(&rewound(0, 12)).is_ok());
+        assert_eq!(fake.restores, vec![(0, 12)]);
+    }
+
+    #[test]
+    fn forgetting_a_slot_leaves_the_others_and_a_negative_slot_forgets_them_all() {
+        let mut fake = Fake::default();
+        let mut compute = recurrent(&mut fake, 10);
+        let snapshots = compute.snapshots.clone();
+        runs(&mut compute, 0, 10..13);
+        runs(&mut compute, 1, 10..13);
+        snapshots.forget(0);
+        assert!(refused(compute.run(&rewound(0, 12))));
+        assert!(compute.run(&rewound(1, 12)).is_ok());
+        assert_eq!(fake.restores, vec![(1, 12)]);
+        snapshots.forget(-1);
+        assert!(refused(compute.run(&rewound(1, 11))));
+    }
+
+    #[test]
+    fn merged_passes_rewind_and_keep_each_slot_for_itself() {
+        let mut fake = Fake::default();
+        let mut compute = recurrent(&mut fake, 10);
+        assert!(compute.run_merged(&[kept(1, 10), kept(0, 10)]).iter().all(Result::is_ok));
+        assert!(compute.run_merged(&[kept(1, 11), kept(0, 11)]).iter().all(Result::is_ok));
+        assert_eq!(fake.saves, 4);
+        assert!(compute.run_merged(&[rewound(1, 11), kept(0, 12)]).iter().all(Result::is_ok));
+        assert_eq!(fake.restores, vec![(1, 11)]);
+        assert_eq!(fake.slots[&1], (12, vec![10, 11]));
+        assert_eq!(fake.slots[&0], (13, vec![10, 11, 12]));
+    }
+
+    #[test]
+    fn a_merge_with_a_rewind_nothing_reaches_refuses_every_pass_in_it() {
+        let mut fake = Fake::default();
+        let mut compute = recurrent(&mut fake, 10);
+        runs(&mut compute, 1, 10..12);
+        let got = compute.run_merged(&[kept(0, 10), rewound(1, 10)]);
+        assert!(got.into_iter().all(refused));
+    }
+
+    #[test]
+    fn a_snapshot_that_could_not_be_saved_only_costs_the_rewind_that_needed_it() {
+        let mut fake = Fake::default();
+        let mut compute = recurrent(&mut fake, 10);
+        fake.refuse_saves = true;
+        runs(&mut compute, 0, 10..12);
+        assert!(refused(compute.run(&rewound(0, 11))));
+    }
+
+    #[test]
+    fn a_restore_that_fails_leaves_nothing_to_go_back_to() {
+        let mut fake = Fake::default();
+        let mut compute = recurrent(&mut fake, 10);
+        runs(&mut compute, 0, 10..13);
+        fake.refuse_restores = true;
+        assert!(refused(compute.run(&rewound(0, 12))));
+        assert!(compute.snapshots.slots.lock().get(&0).is_none());
+    }
+
+    #[test]
+    fn a_ring_reuses_its_buffers_once_it_is_full() {
+        let mut states = SlotStates::default();
+        for end in 1..=3 {
+            let mut bytes = states.buffer(3);
+            assert!(bytes.is_empty());
+            bytes.resize(8, 0);
+            states.saved.push_back(Snapshot { end, bytes });
+        }
+        assert_eq!(states.buffer(3).capacity(), 8);
+        assert_eq!(states.saved.front().map(|item| item.end), Some(2));
+        states.drop_past(2);
+        assert_eq!(states.spare.len(), 1);
+        assert_eq!(states.buffer(3).capacity(), 8);
     }
 
     #[test]

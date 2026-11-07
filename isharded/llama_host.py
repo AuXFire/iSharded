@@ -39,6 +39,8 @@ ENCODED_IMAGE_BYTES = 128 * 1024 * 1024
 DRAFT_STATE_BYTES = 256 * 1024 * 1024
 # Operations that touch only the engine's links, and so need not wait for a running pass.
 UNGATED = {"load", "ring_open", "ring_connect", "ring_close", "ring_stats"}
+# These put a sequence on another history, which the engine's snapshots cannot follow.
+NEW_HISTORY = {"clear", "restore", "truncate"}
 
 
 class _Host:
@@ -86,6 +88,7 @@ class _Host:
                 len(self.table_view) // found.row_bytes if found else 0,
                 found.row_bytes if found else 0,
                 C.cast(found.to_float, C.c_void_p).value if found and found.to_float else None,
+                meta.get("rollback_tokens", 0) + 2,
             )
         return {"hidden_size": self.stage.hidden_size, "vocab_size": self.stage.vocab_size, "engine": self.stage.engine is not None}, b""
 
@@ -266,6 +269,8 @@ def run(address: Any, key: bytes) -> None:
             if engine is not None:
                 engine.lock()
             try:
+                if engine is not None and operation in NEW_HISTORY:
+                    engine.forget(meta.get("slot"))
                 answer, data = getattr(host, operation)(meta, payload)
             finally:
                 if engine is not None:

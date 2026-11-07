@@ -25,7 +25,7 @@ from typing import Any
 
 import numpy as np
 
-ABI_VERSION = 1
+ABI_VERSION = 2
 MAGIC = 0x5369
 WIRE_VERSION = 1
 HEADER = struct.Struct("<HBBI")
@@ -33,7 +33,7 @@ RESULT_HEAD = struct.Struct("<QQI")
 NACK_HEAD = struct.Struct("<QQBHI")
 KIND_HELLO, KIND_HELLO_OK, KIND_AUTH, KIND_PASS, KIND_ACK, KIND_RESULT, KIND_NACK, KIND_PING, KIND_PONG = range(1, 10)
 ROLE_LOCAL = 3
-FLAG_VERIFY, FLAG_TOKENS = 1, 2
+FLAG_VERIFY, FLAG_TOKENS, FLAG_KEEP = 1, 2, 8
 NO_ROLLBACK = 0xFFFFFFFF
 SERVER_LABEL = b"isharded link accept"
 CLIENT_LABEL = b"isharded link dial"
@@ -51,6 +51,9 @@ class StageApi(C.Structure):
         ("decode", C.c_void_p),
         ("logits_ith", C.c_void_p),
         ("seq_rm", C.c_void_p),
+        ("state_size", C.c_void_p),
+        ("state_get", C.c_void_p),
+        ("state_set", C.c_void_p),
         ("context", C.c_void_p),
         ("memory", C.c_void_p),
         ("width", C.c_int32),
@@ -61,6 +64,7 @@ class StageApi(C.Structure):
         ("table_rows", C.c_int64),
         ("row_bytes", C.c_int64),
         ("to_float", C.c_void_p),
+        ("keep_limit", C.c_uint32),
     ]
 
 
@@ -71,6 +75,7 @@ SIGNATURES: dict[str, tuple[list[Any], Any]] = {
     "lock": ([C.c_void_p], None),
     "unlock": ([C.c_void_p], None),
     "close_ring": ([C.c_void_p], None),
+    "forget": ([C.c_void_p, C.c_int32], None),
     "capture_read": ([C.c_void_p, C.c_void_p, C.c_size_t], C.c_size_t),
     "attach": ([C.c_void_p, C.POINTER(StageApi)], None),
     "listen": ([C.c_void_p, C.c_char_p, C.c_uint16, C.c_char_p, C.c_size_t], C.c_int32),
@@ -134,13 +139,18 @@ class Engine:
             print(f"the native engine is not available: {exc}", flush=True)
             return None
 
-    def attach(self, stage: Any, wire_bf16: bool, table: Any = None, table_rows: int = 0, row_bytes: int = 0, to_float: int | None = None) -> None:
+    def attach(
+        self, stage: Any, wire_bf16: bool, table: Any = None, table_rows: int = 0, row_bytes: int = 0, to_float: int | None = None, keep_limit: int = 2
+    ) -> None:
         llama = self.library.llama
         self.table_anchor = None if table is None else np.frombuffer(table, dtype=np.uint8)
         self.api = StageApi(
             decode=_address(llama.llama_decode),
             logits_ith=_address(llama.llama_get_logits_ith),
             seq_rm=_address(llama.llama_memory_seq_rm),
+            state_size=_address(llama.llama_state_seq_get_size_ext),
+            state_get=_address(llama.llama_state_seq_get_data_ext),
+            state_set=_address(llama.llama_state_seq_set_data_ext),
             context=stage.context,
             memory=stage.memory,
             width=stage.hidden_size,
@@ -151,8 +161,13 @@ class Engine:
             table_rows=table_rows,
             row_bytes=row_bytes,
             to_float=to_float,
+            keep_limit=keep_limit,
         )
         self.lib.isharded_engine_attach(self.handle, C.byref(self.api))
+
+    def forget(self, slot: int | None) -> None:
+        """A slot's history changed, so what its rewinds could go back to is wrong. None means every slot."""
+        self.lib.isharded_engine_forget(self.handle, -1 if slot is None else slot)
 
     def capture_begin(self) -> None:
         self.lib.isharded_engine_capture_begin(self.handle)
@@ -229,8 +244,9 @@ def pass_frame(
     top_p: float,
     top_k: int,
     seed: int | None,
+    keep: bool = False,
 ) -> bytes:
-    flags = FLAG_TOKENS | (FLAG_VERIFY if verify else 0)
+    flags = FLAG_TOKENS | (FLAG_VERIFY if verify else 0) | (FLAG_KEEP if keep else 0)
     rollback = NO_ROLLBACK if rollback_to is None else rollback_to
     body = struct.pack(
         f"<QQIIIBffIBQI{len(guesses)}II{len(tokens)}III",
