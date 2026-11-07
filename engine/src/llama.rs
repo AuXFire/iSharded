@@ -363,7 +363,167 @@ impl Compute for LlamaCompute {
 
 #[cfg(test)]
 mod tests {
-    use super::to_bf16;
+    use super::*;
+    use crate::wire::{Sampling, FLAG_TOKENS};
+
+    const WIDTH: usize = 2;
+
+    /// Stands in for llama.cpp: writes down each batch, and gives each row back doubled.
+    #[derive(Default)]
+    struct Fake {
+        capture: Option<Arc<Capture>>,
+        rewinds: Vec<(i32, i32)>,
+        batches: Vec<Seen>,
+        logits: Vec<f32>,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Seen {
+        hidden: Vec<f32>,
+        positions: Vec<i32>,
+        slots: Vec<i32>,
+        outputs: Vec<i8>,
+    }
+
+    unsafe extern "C" fn fake_decode(context: *mut c_void, batch: Batch) -> i32 {
+        let fake = &mut *context.cast::<Fake>();
+        let count = batch.n_tokens as usize;
+        let hidden = std::slice::from_raw_parts(batch.embd, count * WIDTH).to_vec();
+        fake.batches.push(Seen {
+            positions: std::slice::from_raw_parts(batch.pos, count * 4).to_vec(),
+            slots: (0..count).map(|row| **batch.seq_id.add(row)).collect(),
+            outputs: std::slice::from_raw_parts(batch.logits, count).to_vec(),
+            hidden: hidden.clone(),
+        });
+        assert!(std::slice::from_raw_parts(batch.n_seq_id, count).iter().all(|item| *item == 1));
+        let doubled = hidden.iter().map(|value| value * 2.0);
+        fake.capture.as_ref().unwrap().rows.lock().extend(doubled);
+        0
+    }
+
+    unsafe extern "C" fn fake_logits(context: *mut c_void, _row: i32) -> *mut f32 {
+        (*context.cast::<Fake>()).logits.as_mut_ptr()
+    }
+
+    unsafe extern "C" fn fake_rewind(memory: *mut c_void, slot: i32, keep: i32, _end: i32) -> bool {
+        (*memory.cast::<Fake>()).rewinds.push((slot, keep));
+        true
+    }
+
+    unsafe extern "C" fn no_name(_tensor: *const c_void) -> *const c_char {
+        std::ptr::null()
+    }
+
+    unsafe extern "C" fn no_bytes(_tensor: *const c_void) -> usize {
+        0
+    }
+
+    unsafe extern "C" fn no_get(_tensor: *const c_void, _out: *mut c_void, _offset: usize, _size: usize) {}
+
+    fn stage(fake: &mut Fake, last: bool, table: &[f32]) -> LlamaCompute {
+        let tensors = TensorApi { name: no_name, bytes: no_bytes, get: no_get };
+        let capture = Arc::new(Capture::new(CString::default(), tensors));
+        fake.capture = Some(capture.clone());
+        fake.logits = vec![0.0, 5.0, 1.0];
+        let pointer = std::ptr::from_mut(fake).cast();
+        let api = StageApi {
+            decode: fake_decode,
+            logits_ith: fake_logits,
+            seq_rm: fake_rewind,
+            context: pointer,
+            memory: pointer,
+            width: WIDTH as i32,
+            vocab: 3,
+            last,
+            wire_bf16: true,
+            table: table.as_ptr().cast(),
+            table_rows: (table.len() / WIDTH) as i64,
+            row_bytes: (WIDTH * 4) as i64,
+            to_float: None,
+        };
+        LlamaCompute::new(api, capture)
+    }
+
+    fn rows_pass(slot: u32, position: u32, values: &[f32]) -> Pass {
+        Pass {
+            id: u64::from(slot),
+            epoch: 1,
+            slot,
+            position,
+            rollback_to: None,
+            flags: 0,
+            sampling: Sampling::GREEDY,
+            guesses: vec![],
+            tokens: vec![],
+            rows: (values.len() / WIDTH) as u32,
+            width: WIDTH as u32,
+            data: values.iter().flat_map(|value| value.to_le_bytes()).collect(),
+        }
+    }
+
+    fn floats(output: Result<Output, Failure>) -> (u32, bool, Vec<u8>) {
+        match output {
+            Ok(Output::Rows { rows, bf16, data, .. }) => (rows, bf16, data),
+            _ => panic!("expected rows"),
+        }
+    }
+
+    fn bytes(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|value| value.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn one_pass_runs_its_rows_in_place_and_several_rows_cross_as_bf16() {
+        let mut fake = Fake::default();
+        let mut compute = stage(&mut fake, false, &[]);
+        let got = floats(compute.run(&rows_pass(3, 10, &[1.0, 2.0, 3.0, 4.0])));
+        let data: Vec<u8> = [2.0f32, 4.0, 6.0, 8.0].iter().flat_map(|value| to_bf16(*value).to_le_bytes()).collect();
+        assert_eq!(got, (2, true, data));
+        let got = floats(compute.run(&rows_pass(3, 12, &[1.0, 2.0])));
+        assert_eq!(got, (1, false, bytes(&[2.0, 4.0])));
+        assert_eq!(
+            fake.batches[0],
+            Seen { hidden: vec![1.0, 2.0, 3.0, 4.0], positions: vec![10, 11, 10, 11, 10, 11, 0, 0], slots: vec![3, 3], outputs: vec![1, 1] }
+        );
+    }
+
+    #[test]
+    fn a_token_pass_is_embedded_and_the_last_stage_only_asks_for_its_last_row() {
+        let table = [1.0, 1.5, 2.0, 2.5, 3.0, 3.5];
+        let mut fake = Fake::default();
+        let mut compute = stage(&mut fake, true, &table);
+        let pass = Pass { flags: FLAG_TOKENS, tokens: vec![2, 0], rows: 0, width: 0, data: vec![], rollback_to: Some(4), ..rows_pass(1, 4, &[]) };
+        assert!(matches!(compute.run(&pass), Ok(Output::Tokens(tokens)) if tokens == vec![1]));
+        assert_eq!(fake.rewinds, vec![(1, 4)]);
+        assert_eq!(fake.batches[0].hidden, vec![3.0, 3.5, 1.0, 1.5]);
+        assert_eq!(fake.batches[0].outputs, vec![0, 1]);
+        let outside = Pass { tokens: vec![3], ..pass };
+        assert!(matches!(compute.run(&outside), Err(failure) if failure.message == "token 3 is outside the embedding table"));
+    }
+
+    #[test]
+    fn merged_passes_run_in_slot_order_and_answer_in_their_own_order() {
+        let mut fake = Fake::default();
+        let mut compute = stage(&mut fake, false, &[]);
+        let passes = [rows_pass(5, 20, &[1.0, 2.0]), Pass { rollback_to: Some(7), ..rows_pass(2, 7, &[3.0, 4.0]) }];
+        let got: Vec<_> = compute.run_merged(&passes).into_iter().map(floats).collect();
+        assert_eq!(got, vec![(1, false, bytes(&[2.0, 4.0])), (1, false, bytes(&[6.0, 8.0]))]);
+        assert_eq!(fake.rewinds, vec![(2, 7)]);
+        assert_eq!(
+            fake.batches[0],
+            Seen { hidden: vec![3.0, 4.0, 1.0, 2.0], positions: vec![7, 20, 7, 20, 7, 20, 0, 0], slots: vec![2, 5], outputs: vec![1, 1] }
+        );
+    }
+
+    #[test]
+    fn a_refused_merge_refuses_every_pass_in_it() {
+        let mut fake = Fake::default();
+        let mut compute = stage(&mut fake, false, &[]);
+        let wrong = Pass { width: 1, rows: 2, ..rows_pass(2, 7, &[3.0, 4.0]) };
+        let got = compute.run_merged(&[rows_pass(5, 20, &[1.0, 2.0]), wrong]);
+        assert!(got.iter().all(|item| matches!(item, Err(failure) if failure.message == "rows are 1 wide and this stage takes 2")));
+        assert!(fake.batches.is_empty());
+    }
 
     #[test]
     fn bf16_rounds_to_nearest_even() {
