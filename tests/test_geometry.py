@@ -110,3 +110,31 @@ def test_a_reorder_leaves_nothing_out() -> None:
     proposal = geometry.propose(route, workers, fixtures.LINKS, model, shed=True)
     assert proposal["left_out"] == []
     assert sorted(proposal["proposed"]["order"]) == sorted(fixtures.ZIGZAG)
+
+
+# A near node joined after a repair put a far one on the route.
+FOUR = {**NEAR_FAR, ("a", "d"): 2.0, ("b", "d"): 2.0, ("c", "d"): 40.0}
+FOUR |= {(right, left): milliseconds for (left, right), milliseconds in FOUR.items()}
+
+
+def four_cards() -> list[Candidate]:
+    return [*three_cards(), fixtures.worker("d", fixtures.pool("d-gpu", "vram", GIB, 300, "d:vram"))]
+
+
+def test_a_spare_that_joined_can_take_the_far_node_s_place() -> None:
+    model = ring_profile(250 * MIB)
+    route, workers = fixtures.zigzag(model, ["a", "b", "c"], four_cards(), FOUR)
+    found = geometry.propose_route(route, workers, FOUR, model, shed=True, spares=["d"])
+    assert found is not None
+    new_route, proposal = found
+    assert proposal["left_out"] == ["c"] and proposal["joined"] == ["d"]
+    assert sorted(stage.worker_id for stage in new_route) == ["a", "b", "d"]
+    assert proposal["moved_bytes"] > 0  # the newcomer has nothing yet
+
+
+def test_a_spare_is_weighed_only_when_shedding_and_only_on_measured_links() -> None:
+    model = ring_profile(250 * MIB)
+    route, workers = fixtures.zigzag(model, ["a", "b", "c"], four_cards(), FOUR)
+    assert geometry.propose(route, workers, FOUR, model, spares=["d"]) is None
+    unmeasured = {link: milliseconds for link, milliseconds in FOUR.items() if "d" not in link or "c" in link}
+    assert geometry.propose(route, workers, unmeasured, model, shed=True, spares=["d"]) is None

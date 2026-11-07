@@ -9,6 +9,7 @@ when its operator allowed that and the saving pays for the move.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import replace
 from itertools import combinations
 from math import ceil
@@ -135,35 +136,41 @@ def propose_route(
     entry_bytes: int = 0,
     tokens_per_miss: float = 1.0,
     shed: bool = False,
+    spares: Sequence[str] = (),
 ) -> tuple[list[StageAssignment], dict[str, Any]] | None:
-    """A better order of the nodes in ``route``, or of fewer of them, with what it costs.
-    None if nothing is worth it.
+    """A better order of the nodes in ``route``, with what it costs, or None if nothing is worth it.
 
     ``entry`` and ``exit_`` are pins, which a proposal keeps. ``entry_bytes`` is what would
     follow a new entry, such as a draft model. ``shed`` also weighs leaving out nodes the
-    model does not need, which only a route planned for the fewest nodes should do: one
-    that was spread has the nodes its operator asked for. A proposal never needs more
-    links that failed, or more weights outside VRAM, than the route it would replace.
+    model does not need, and letting ``spares`` take a place, which only a route planned for
+    the fewest nodes should do: one that was spread has the nodes its operator asked for.
+    A proposal never needs more links that failed, or more weights outside VRAM, than the
+    route it would replace.
     """
     profile = replace(profile, tokens_per_miss=tokens_per_miss)
     workers = {item.worker_id: item for item in with_links(candidates, links)}
     names = [stage.worker_id for stage in route]
-    # A link nobody measured counts as a guess, which is no reason to move weights.
-    measured = all((left, right) in links or (right, left) in links for left, right in combinations(names, 2))
-    if len(route) < 2 or not measured or any(name not in workers for name in names):
+
+    def measured(group: list[str]) -> bool:
+        # A link nobody measured counts as a guess, which is no reason to move weights.
+        return all((left, right) in links or (right, left) in links for left, right in combinations(group, 2))
+
+    if len(route) < 2 or not measured(names) or any(name not in workers for name in names):
         return None
     members = [workers[name] for name in names]
+    everyone = members + [workers[name] for name in spares if name in workers and name not in names]
     groups = [members]
     if shed:
-        # A node can join a running route without need, by a repair or by joining it.
-        # The subsets that hold the model in VRAM are ranked by loop and reads.
+        # A node can be on a running route without need: a repair put it there, or a closer
+        # one joined since. These sets hold the model in VRAM, ranked by loop and reads.
         required = {name for name in (entry, exit_) if name in names}
-        groups += [group for group in _closest_subsets(members, profile, required, 0) if len(group) < len(members)]
-    now = route_faults(route, members)
+        subsets = _closest_subsets(everyone, profile, required, 0)
+        groups += [group for group in subsets if {item.worker_id for item in group} != set(names) and measured([item.worker_id for item in group])]
+    now = route_faults(route, everyone)
     best: tuple[float, list[StageAssignment]] | None = None
     for group in groups:
         found = plan_through(_orders(group, links, profile, entry, exit_), group, profile)
-        if found is None or any(then > before for then, before in zip(route_faults(found, members), now)):
+        if found is None or any(then > before for then, before in zip(route_faults(found, everyone), now)):
             continue
         cost = _times(found, links, profile, tokens_per_miss)["ms_per_token"]
         if best is None or cost < best[0]:
@@ -175,7 +182,7 @@ def propose_route(
     saved = current["ms_per_token"] - proposed["ms_per_token"]
     if saved < current["ms_per_token"] * MIN_SAVED_SHARE:
         return None
-    moved, seconds = moved_weights(found, members, profile, entry_bytes if found[0].worker_id != names[0] else 0)
+    moved, seconds = moved_weights(found, everyone, profile, entry_bytes if found[0].worker_id != names[0] else 0)
     kept = {(stage.worker_id, stage.start_layer, stage.end_layer) for stage in route}
     left_out = set(names) - {stage.worker_id for stage in found}
     return found, {
@@ -186,6 +193,7 @@ def propose_route(
             "stages": [{"worker_id": stage.worker_id, "start_layer": stage.start_layer, "end_layer": stage.end_layer} for stage in found],
         },
         "left_out": [name for name in names if name in left_out],
+        "joined": [stage.worker_id for stage in found if stage.worker_id not in names],
         "saved_ms_per_token": round(saved, 2),
         "moved_bytes": moved,
         "move_seconds": round(seconds, 1),

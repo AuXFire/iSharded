@@ -1973,9 +1973,9 @@ A plan, and `active_plan` in `/admin/status`, shows these. All are estimates fro
 
 ### A shorter loop
 
-A route keeps the order it loaded with, even when a better one exists, because weights must not move or reload unless they must. So by default iSharded only proposes. `POST /admin/plan` for the model that is running has a `proposal` field, and [isharded plan](#isharded-plan) prints it. It is `null` if the model is not running, if any link between the route's nodes has not been measured, if a node on the route has left, or if no order of the same nodes, or of fewer of them, saves at least 1% of a token's time.
+A route keeps the order it loaded with, even when a better one exists, because weights must not move or reload unless they must. So by default iSharded only proposes. `POST /admin/plan` for the model that is running has a `proposal` field, and [isharded plan](#isharded-plan) prints it. It is `null` if the model is not running, if any link between the route's nodes has not been measured, if a node on the route has left, or if nothing saves at least 1% of a token's time.
 
-A route loaded with `--placement auto`, the default, takes the fewest nodes that hold the model in VRAM. A node can still end up on it without need, by a repair or by joining while it ran. So for such a route the proposal also weighs leaving nodes out: the subsets of the route's nodes that hold the model in VRAM, ranked as a load ranks them, by loop and reads. A node left out stays a spare. A spread route keeps every node, because that is what its operator asked for, and a pinned entry or exit is never left out.
+A route loaded with `--placement auto`, the default, takes the fewest, closest nodes that hold the model in VRAM. It can still end up with a node it does not need: a repair puts a spare in a lost node's place, and a closer node may join the pool later. So for such a route the proposal also weighs other sets of nodes: the route's own, fewer of them, and spares that joined, which hold the model in VRAM, ranked as a load ranks them, by loop and reads. Only sets whose links have all been measured count. A node left out stays a spare. A spread route keeps its nodes, because that is what its operator asked for, and a pinned entry or exit is never left out.
 
 To find one, nodes with a link of 15 ms or less are grouped as a site, and the route's nodes are toured with the closing link counted. A dozen nodes or fewer get the exact shortest tour. More go site by site, and then uncross. Any node of a loop can be the entry for the same network time, so the entry goes where what it carries fits: a draft needs that much VRAM. The current entry stands if nothing is gained. Pins on the entry and exit stay. A proposal never needs more failed links, or more weights outside VRAM, than the route it would replace.
 
@@ -1988,6 +1988,7 @@ To find one, nodes with a link of 15 ms or less are grouped as a site, and the r
 | `moved_bytes` | Bytes nodes would have to fetch, counting a draft or projector if the entry changes, even if the new entry holds one already |
 | `move_seconds` | How long that takes with nodes fetching side by side, at each node's measured rate. A node with no measured rate counts as 40 MB/s, and a copy from a peer as at least 100 MB/s |
 | `left_out` | Nodes the proposal leaves out. Empty for an order of the same nodes |
+| `joined` | Spares the proposal brings in. They fetch their layers, which `moved_bytes` counts |
 | `stages_changed` | Stages that would restart with other layers. Their reload is not in `move_seconds` |
 | `break_even_tokens` | Tokens until the saving has paid for the move |
 

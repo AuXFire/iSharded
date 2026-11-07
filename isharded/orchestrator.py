@@ -1880,9 +1880,11 @@ class Orchestrator:
         workers = self._with_holdings(preferred + standby, active)
         extra = sum(item.file_size for item in (active.draft, active.projector) if item)
         pins = {"entry": active.entry_worker, "exit_": active.exit_worker, "entry_bytes": extra, "tokens_per_miss": self.tokens_per_miss(active)}
-        # Only a route planned for the fewest nodes may lose one. A spread route keeps what was asked.
+        # Only a route planned for the fewest, closest nodes may change its nodes. A spread route keeps what was asked.
         shed = active.spread is None
-        return await asyncio.to_thread(propose_route, list(self.route), workers, dict(self.links), active.profile, **pins, shed=shed)
+        on_route = {stage.worker_id for stage in self.route}
+        spares = [item.worker_id for item in preferred if item.worker_id not in on_route] if shed else []
+        return await asyncio.to_thread(propose_route, list(self.route), workers, dict(self.links), active.profile, **pins, shed=shed, spares=spares)
 
     async def apply_proposal(self) -> bool:
         """Move the route to its shorter loop, if the operator allowed it and the move pays soon.

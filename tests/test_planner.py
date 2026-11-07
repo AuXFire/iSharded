@@ -2488,13 +2488,14 @@ def test_only_a_route_planned_for_the_fewest_nodes_may_lose_one(monkeypatch) -> 
     asked = []
 
     def found(*args, **options):
-        asked.append(options["shed"])
+        asked.append((options["shed"], options["spares"]))
 
     monkeypatch.setattr(orchestrator_module, "propose_route", found)
     asyncio.run(runtime.propose_order(runtime.active))
     runtime.active.spread = None
     asyncio.run(runtime.propose_order(runtime.active))
-    assert asked == [False, True]
+    # Every mesh card is on the route, so none is spare.
+    assert asked == [(False, []), (True, [])]
 
 
 # The draft, counted on its device only when the operator says so.
