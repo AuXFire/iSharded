@@ -551,7 +551,7 @@ def stage_devices(route: list[StageAssignment], candidates: list[Candidate]) -> 
 
 
 def wanted_slots(route: list[StageAssignment], devices: list[str], links: dict[tuple[str, str], float], ring: bool) -> dict[str, Any] | None:
-    """How many replies keep a route's busiest device working, or None if a link on it is unmeasured.
+    """How many replies keep a route's busiest device working, or None if a link on it has no reading.
 
     While one reply goes round, that device can serve round trip / row time others, and only
     whole rows count. Replies that share a route without sharing passes cost each other: measured
@@ -561,8 +561,9 @@ def wanted_slots(route: list[StageAssignment], devices: list[str], links: dict[t
     """
     names = [stage.worker_id for stage in route]
     hops = list(pairwise(names)) + ([(names[-1], names[0])] if ring and len(names) > 1 else [])
-    if any(hop not in links and hop[::-1] not in links for hop in hops):
-        return None
+    readings = [links.get(hop, links.get(hop[::-1])) for hop in hops]
+    if any(reading is None or reading >= UNREACHABLE_LINK_MS for reading in readings):
+        return None  # a probe that failed reads as 10 s, and that says nothing about the trip
     busy: Counter[str] = Counter()
     for stage, device in zip(route, devices):
         busy[device] += stage_ms(stage)

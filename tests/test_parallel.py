@@ -124,6 +124,13 @@ def test_an_unmeasured_link_says_nothing():
     assert wanted_slots(route, ["a", "b"], {("b", "a"): 1.0}, False) is not None
 
 
+def test_a_link_whose_probe_failed_says_nothing_either():
+    route = [stage("a", 0, 4, 10.0), stage("b", 4, 8, 20.0)]
+    failed = orchestrator_module.UNREACHABLE_LINK_MS
+    assert wanted_slots(route, ["a", "b"], {("a", "b"): failed, ("b", "a"): failed}, True) is None
+    assert wanted_slots(route, ["a", "b"], {("a", "b"): failed, ("b", "a"): 1.0}, True) is None
+
+
 def test_a_stage_runs_where_most_of_it_is_held():
     held = stage("a", 0, 4, 1.0).model_copy(update={"placements": [UnitPlacement(unit="u", pool_id="a-ram", bytes=1), UnitPlacement(unit="v", pool_id="a-gpu", bytes=5)]})
     assert stage_devices([held, stage("gone", 4, 8, 1.0)], [worker("a")]) == ["a:gpu", "gone"]
