@@ -2057,3 +2057,25 @@ def test_tasks_run_with_a_router_that_cannot_be_told(assistant, engine):
     assistant.router = Plain()
     task = run(engine, {"title": "t", "steps": [model_step(), check_of("c")]})
     assert status(engine, task) == "done"
+
+
+def test_checks_side_by_side_take_a_reply_success_back_once(assistant, engine, monkeypatch):
+    """Both read the reply before either marks it, which a plan with two checks can do."""
+    import threading
+
+    assistant.router = Answers("no")
+    task = run(engine, {"title": "t", "steps": [model_step()]})
+    together, read = threading.Barrier(2), engine._step
+
+    def read_together(*arguments):
+        row = read(*arguments)
+        together.wait(10)
+        return row
+
+    monkeypatch.setattr(engine, "_step", read_together)
+    checks = [threading.Thread(target=engine._tell_router_about, args=(task, {"answer"}, False)) for _ in range(2)]
+    for check in checks:
+        check.start()
+    for check in checks:
+        check.join(20)
+    assert assistant.router.outcomes == [("m", "worker", False, "p")]

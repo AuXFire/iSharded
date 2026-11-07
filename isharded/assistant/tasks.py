@@ -1702,11 +1702,17 @@ class DurableTasks:
             data = json.loads(row["data"]) if row["data"] else {}
             if row["kind"] != "model" or data.get("failed_a_check"):
                 continue
-            self._tell_router(data, passed)
-            if not passed:
-                self.store.execute(
-                    "UPDATE task_steps SET data = ? WHERE task_id = ? AND step_id = ?", (json.dumps({**data, "failed_a_check": True}), task_id, name)
-                )
+            if passed or self._first_to_fail(task_id, name, row["data"], data):
+                self._tell_router(data, passed)
+
+    def _first_to_fail(self, task_id: str, step_id: str, stored: str, data: Mapping[str, Any]) -> bool:
+        """Checks can run side by side, so the mark is claimed in one statement and only one wins it."""
+        with self.store.transaction():
+            updated = self.store.connection.execute(
+                "UPDATE task_steps SET data = ? WHERE task_id = ? AND step_id = ? AND data = ?",
+                (json.dumps({**data, "failed_a_check": True}), task_id, step_id, stored),
+            )
+        return updated.rowcount == 1
 
     def _settle(self, task_id: str, step_id: str, attempt: int, outcome: Outcome) -> None:
         """Write the result. One transaction, so a crash leaves all of it or none."""
