@@ -2162,9 +2162,11 @@ class Orchestrator:
     def metrics_text(self) -> str:
         """This node's numbers in Prometheus format. Every node reports for itself."""
         lines: list[str] = []
+        described: set[str] = set()
 
         def add(name: str, value: float | None, help_text: str, kind: str = "gauge", **labels: str) -> None:
-            if f"# HELP isharded_{name} " not in "\n".join(lines):
+            if name not in described:
+                described.add(name)
                 lines.append(f"# HELP isharded_{name} {help_text}")
                 lines.append(f"# TYPE isharded_{name} {kind}")
             tags = ",".join(f'{key}="{text}"' for key, text in labels.items())
@@ -2404,37 +2406,56 @@ class Orchestrator:
             kind["used_bytes"] += int(group["used"])
         return summary
 
-    def status(self) -> dict[str, Any]:
-        loading = self.job is not None and self.job.finished_at is None
-        live_records = [record for record in self.workers.values() if record.live]
+    def virtual_hardware(self) -> dict[str, Any]:
+        """The pool as one machine, counting each physical resource once."""
+        live = [record.registration.hardware for record in self.workers.values() if record.live]
         hosts: dict[str, Any] = {}
         accelerators: dict[tuple[str, str, str | None], Any] = {}
-        for record in live_records:
-            hardware = record.registration.hardware
+        budgets: dict[tuple[str, str, str | None], int] = {}
+        for hardware in live:
             hosts.setdefault(hardware.host_id, hardware)
+            key = (hardware.host_id, hardware.device, hardware.accelerator_name)
+            budgets[key] = max(budgets.get(key, 0), hardware.contribution.accelerator_memory_budget_bytes)
             if hardware.accelerator_memory_bytes:
-                key = (hardware.host_id, hardware.device, hardware.accelerator_name)
                 accelerators.setdefault(key, hardware)
-        ram = sum(hardware.ram_total_bytes for hardware in hosts.values())
-        accelerator_memory = sum(hardware.accelerator_memory_bytes for hardware in accelerators.values())
-        contributed_ram = sum(
-            record.registration.hardware.contribution.ram_budget_bytes for record in live_records
-        )
-        contributed_cpu_threads = sum(
-            record.registration.hardware.contribution.cpu_threads for record in live_records
-        )
-        contributed_accelerator_memory = sum(
-            max(
-                record.registration.hardware.contribution.accelerator_memory_budget_bytes
-                for record in live_records
-                if (
-                    record.registration.hardware.host_id,
-                    record.registration.hardware.device,
-                    record.registration.hardware.accelerator_name,
-                ) == key
-            )
-            for key in accelerators
-        )
+        return {
+            "workers": len(live),
+            "hosts": len(hosts),
+            "accelerators": len(accelerators),
+            "ram_total_bytes": sum(hardware.ram_total_bytes for hardware in hosts.values()),
+            "accelerator_memory_bytes": sum(hardware.accelerator_memory_bytes for hardware in accelerators.values()),
+            "cpu_cores": sum(hardware.cpu_cores for hardware in hosts.values()),
+            "contributed_ram_bytes": sum(hardware.contribution.ram_budget_bytes for hardware in live),
+            "contributed_cpu_threads": sum(hardware.contribution.cpu_threads for hardware in live),
+            "contributed_accelerator_memory_bytes": sum(budgets[key] for key in accelerators),
+            "memory_by_kind": self.memory_summary(),
+            "note": "capacities are physically distributed, not uniform shared memory",
+        }
+
+    @staticmethod
+    def _worker_view(record: WorkerRecord, active: bool) -> dict[str, Any]:
+        if not record.live:
+            state = "offline"
+        elif record.quarantined:
+            state = "quarantined"
+        elif active:
+            state = "active"
+        else:
+            state = "standby" if "inference" in record.registration.hardware.contribution.roles else "service"
+        return {
+            **record.registration.model_dump(mode="json"),
+            "live": record.live,
+            "quarantined": record.quarantined,
+            "quarantine_reason": record.quarantine_reason,
+            "active": active,
+            "state": state,
+            "control_latency_ms": record.control_latency_ms,
+            "runtime": record.health,
+        }
+
+    def status(self) -> dict[str, Any]:
+        loading = self.job is not None and self.job.finished_at is None
+        on_route = {stage.worker_id for stage in self.route}
         return {
             "status": "ready" if self.route and self.tokenizer else "loading" if loading else "recovering" if self.saved_state else "waiting",
             "mesh": (
@@ -2475,42 +2496,8 @@ class Orchestrator:
                 ),
                 "cache": self.cache_summary(),
             },
-            "virtual_hardware": {
-                "workers": sum(record.live for record in self.workers.values()),
-                "hosts": len(hosts),
-                "accelerators": len(accelerators),
-                "ram_total_bytes": ram,
-                "accelerator_memory_bytes": accelerator_memory,
-                "cpu_cores": sum(hardware.cpu_cores for hardware in hosts.values()),
-                "contributed_ram_bytes": contributed_ram,
-                "contributed_cpu_threads": contributed_cpu_threads,
-                "contributed_accelerator_memory_bytes": contributed_accelerator_memory,
-                "memory_by_kind": self.memory_summary(),
-                "note": "capacities are physically distributed, not uniform shared memory",
-            },
-            "workers": {
-                worker_id: {
-                    **record.registration.model_dump(mode="json"),
-                    "live": record.live,
-                    "quarantined": record.quarantined,
-                    "quarantine_reason": record.quarantine_reason,
-                    "active": any(stage.worker_id == worker_id for stage in self.route),
-                    "state": (
-                        "offline"
-                        if not record.live
-                        else "quarantined"
-                        if record.quarantined
-                        else "active"
-                        if any(stage.worker_id == worker_id for stage in self.route)
-                        else "service"
-                        if "inference" not in record.registration.hardware.contribution.roles
-                        else "standby"
-                    ),
-                    "control_latency_ms": record.control_latency_ms,
-                    "runtime": record.health,
-                }
-                for worker_id, record in self.workers.items()
-            },
+            "virtual_hardware": self.virtual_hardware(),
+            "workers": {worker_id: self._worker_view(record, worker_id in on_route) for worker_id, record in self.workers.items()},
             "events": list(self.events),
         }
 
