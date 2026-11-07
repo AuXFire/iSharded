@@ -14,25 +14,44 @@ from .contracts import Trust
 from .voice import MAX_AUDIO_BYTES, MAX_TEXT, SPEAK, TRANSCRIBE, VoiceError, VoiceRefused, VoiceUnavailable, _user
 
 
+NEEDS_USER = "This needs a signed-in user."
+SEND_JSON = 'Send JSON: {"text": "...", "voice": "optional name"}.'
+
+
 async def _bounded_body(request: Request, limit: int) -> bytes | None:
     if int(request.headers.get("content-length") or 0) > limit:
         return None
-    body = b""
+    body = bytearray()  # adding to bytes copies everything so far, for each chunk of up to 64 MiB of audio
     async for chunk in request.stream():
         body += chunk
         if len(body) > limit:
             return None
-    return body
+    return bytes(body)
 
 
 def _media_type(request: Request) -> str:
     return request.headers.get("content-type", "").split(";")[0].strip().lower()
 
 
+def _error(message: str, status: int) -> JSONResponse:
+    return JSONResponse({"error": message}, status_code=status)
+
+
 def _failure(error: VoiceError) -> JSONResponse:
     if isinstance(error, VoiceRefused):
         return JSONResponse({"refused": str(error), "approval_id": error.approval_id}, status_code=403)
-    return JSONResponse({"error": str(error)}, status_code=503 if isinstance(error, VoiceUnavailable) else 400)
+    return _error(str(error), 503 if isinstance(error, VoiceUnavailable) else 400)
+
+
+def _speech_arguments(body: bytes | None) -> dict[str, str] | None:
+    """What a speak request asks for, or None if it is not a proper request."""
+    try:
+        fields = json.loads(body) if body is not None else None
+    except (RecursionError, ValueError):
+        return None
+    if not isinstance(fields, dict) or not isinstance(fields.get("text"), str):
+        return None
+    return {"text": fields["text"], **({"voice": fields["voice"]} if isinstance(fields.get("voice"), str) else {})}
 
 
 def routes(assistant: Any) -> APIRouter:
@@ -44,14 +63,14 @@ def routes(assistant: Any) -> APIRouter:
     async def transcribe(request: Request) -> Response:
         user = _user(request, voice)
         if user is None:
-            return JSONResponse({"error": "This needs a signed-in user."}, status_code=401)
+            return _error(NEEDS_USER, 401)
         # A web page cannot send these types without asking first, so it cannot call this behind the owner's back.
         kind = _media_type(request)
         if not kind.startswith("audio/") and kind != "application/octet-stream":
-            return JSONResponse({"error": "Send the audio as the body, with an audio Content-Type."}, status_code=415)
+            return _error("Send the audio as the body, with an audio Content-Type.", 415)
         body = await _bounded_body(request, MAX_AUDIO_BYTES)
         if body is None:
-            return JSONResponse({"error": f"Audio may be at most {MAX_AUDIO_BYTES >> 20} MiB."}, status_code=413)
+            return _error(f"Audio may be at most {MAX_AUDIO_BYTES >> 20} MiB.", 413)
         incoming = voice.folder / "incoming"
         incoming.mkdir(parents=True, exist_ok=True)
         path = incoming / f"{secrets.token_hex(8)}.audio"
@@ -68,17 +87,12 @@ def routes(assistant: Any) -> APIRouter:
     async def speak(request: Request) -> Response:
         user = _user(request, voice)
         if user is None:
-            return JSONResponse({"error": "This needs a signed-in user."}, status_code=401)
+            return _error(NEEDS_USER, 401)
         if _media_type(request) != "application/json":
-            return JSONResponse({"error": 'Send JSON: {"text": "...", "voice": "optional name"}.'}, status_code=415)
-        body = await _bounded_body(request, MAX_TEXT * 8)
-        try:
-            fields = json.loads(body) if body is not None else None
-        except (RecursionError, ValueError):
-            fields = None
-        if not isinstance(fields, dict) or not isinstance(fields.get("text"), str):
-            return JSONResponse({"error": 'Send JSON: {"text": "...", "voice": "optional name"}.'}, status_code=400)
-        arguments = {"text": fields["text"], **({"voice": fields["voice"]} if isinstance(fields.get("voice"), str) else {})}
+            return _error(SEND_JSON, 415)
+        arguments = _speech_arguments(await _bounded_body(request, MAX_TEXT * 8))
+        if arguments is None:
+            return _error(SEND_JSON, 400)
         try:
             result = await run_in_threadpool(voice.call, SPEAK, arguments, user)
         except VoiceError as error:

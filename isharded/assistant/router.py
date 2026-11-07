@@ -65,27 +65,27 @@ SCHEMA = [
 ]
 
 
-class Refused(Exception):
-    """Nothing may take this request, with the reason for each candidate.
+class Unserved(Exception):
+    """A request found no answer, with the reason for each candidate."""
+
+    def __init__(self, message: str, reasons: Sequence[str] = ()) -> None:
+        super().__init__(message)
+        self.reasons = list(reasons)
+
+
+class Refused(Unserved):
+    """Nothing may take this request.
 
     ``refusal`` marks a decision, as opposed to something going wrong.
     """
 
     refusal = True
 
-    def __init__(self, message: str, reasons: Sequence[str] = ()) -> None:
-        super().__init__(message)
-        self.reasons = list(reasons)
 
-
-class AllFailed(Exception):
+class AllFailed(Unserved):
     """Candidates were allowed, and each one failed."""
 
     refusal = False
-
-    def __init__(self, message: str, reasons: Sequence[str] = ()) -> None:
-        super().__init__(message)
-        self.reasons = list(reasons)
 
 
 def all_failed(failures: Sequence[str]) -> AllFailed:
@@ -119,6 +119,10 @@ def wilson_lower_bound(successes: int, runs: int, z: float = Z_95) -> float:
     centre = rate + spread / 2
     margin = z * math.sqrt(rate * (1 - rate) / runs + z * z / (4 * runs * runs))
     return max((centre - margin) / (1 + spread), 0.0)
+
+
+def tokens_per_second(row: Any) -> float:
+    return row["tokens"] / row["seconds"] if row["seconds"] else 0.0
 
 
 def parse_candidate(text: str) -> Candidate:
@@ -224,7 +228,7 @@ class ModelRouter:
         )
         if row is None:
             return 0, 0, 0.0
-        return row["runs"], row["successes"], (row["tokens"] / row["seconds"] if row["seconds"] else 0.0)
+        return row["runs"], row["successes"], tokens_per_second(row)
 
     def _ranked(self, usable: list[Candidate], role: str) -> list[Candidate]:
         """Untested first, since a number can only come from runs. Then the measured best."""
@@ -247,24 +251,28 @@ class ModelRouter:
                 reasons.append(f"{listed}: this provider has been removed")
                 continue
             # Reach and back-off come first: neither should cost a call to the provider.
-            blocked = self._blocked(listed, provider, request)
-            resolved, problem = (None, blocked) if blocked else self._resolve(listed, provider)
-            blocked = problem or (self._blocked(resolved, provider, request) if resolved != listed else None)
+            resolved, blocked = None, self._blocked(listed, provider, request)
+            if not blocked:
+                resolved, blocked = self._resolve(listed, provider)
+            if not blocked and resolved != listed:
+                blocked = self._blocked(resolved, provider, request)
             if blocked:
                 reasons.append(blocked)
             else:
                 usable.append(resolved)
         return self._ranked(usable, request.role), reasons
 
-    def _refuse(self, request: ModelRequest, reasons: list[str]) -> Refused:
-        if not reasons:
-            message = f"No model is set up for {request.role}. Add one with `provider add`."
-        else:
-            message = f"No model may take this {request.role} request: " + "; ".join(reasons) + "."
+    def _ordered(self, request: ModelRequest) -> list[Candidate]:
+        """The candidates to try in turn, or a refusal that says why there are none."""
+        ordered, reasons = self.plan(request)
+        if ordered:
+            return ordered
         self.assistant.audit.record(
             "router", "router.refused", request.role, {"reach": request.reach.name.lower(), "reasons": len(reasons)}
         )
-        return Refused(message, reasons)
+        if not reasons:
+            raise Refused(f"No model is set up for {request.role}. Add one with `provider add`.")
+        raise Refused(f"No model may take this {request.role} request: " + "; ".join(reasons) + ".", reasons)
 
     # Running
 
@@ -285,8 +293,9 @@ class ModelRouter:
                 )
 
     def _succeeded(self, candidate: Candidate, role: str, reply: ModelReply) -> None:
-        self._record(candidate, role, True, reply.prompt_tokens + reply.completion_tokens, reply.seconds)
-        self.store.execute("DELETE FROM model_health WHERE provider = ? AND model = ?", (candidate.provider, candidate.model))
+        with self.store.transaction():
+            self._record(candidate, role, True, reply.prompt_tokens + reply.completion_tokens, reply.seconds)
+            self.store.execute("DELETE FROM model_health WHERE provider = ? AND model = ?", (candidate.provider, candidate.model))
 
     def _back_off(self, candidate: Candidate, error: BaseException) -> int:
         row = self.store.one("SELECT failures FROM model_health WHERE provider = ? AND model = ?", (candidate.provider, candidate.model))
@@ -305,11 +314,8 @@ class ModelRouter:
         self.assistant.audit.record("router", "router.failed", str(candidate), {"role": role, "failures": failures})
 
     def complete(self, request: ModelRequest) -> ModelReply:
-        ordered, reasons = self.plan(request)
-        if not ordered:
-            raise self._refuse(request, reasons)
         failures = []
-        for candidate in ordered:
+        for candidate in self._ordered(request):
             started = time.perf_counter()
             provider = self._provider(candidate.provider)
             try:
@@ -326,11 +332,8 @@ class ModelRouter:
 
     def stream(self, request: ModelRequest) -> Iterator[str | ModelReply]:
         """Text as it comes, then the ModelReply. Moves on only before any text went out."""
-        ordered, reasons = self.plan(request)
-        if not ordered:
-            raise self._refuse(request, reasons)
         failures = []
-        for candidate in ordered:
+        for candidate in self._ordered(request):
             started = time.perf_counter()
             provider = self._provider(candidate.provider)
             visible = VisibleText(request.tools)
@@ -361,11 +364,8 @@ class ModelRouter:
     def embed(self, texts: Sequence[str], reach: Reach = Reach.POOL) -> tuple[list[list[float]], str]:
         """Vectors from the best allowed embedding model, and that model's name."""
         request = ModelRequest(role="embedding", messages=[{"role": "user", "content": text} for text in texts], reach=reach, max_tokens=1)
-        ordered, reasons = self.plan(request)
-        if not ordered:
-            raise self._refuse(request, reasons)
         failures = []
-        for candidate in ordered:
+        for candidate in self._ordered(request):
             started = time.perf_counter()
             try:
                 vectors = self._provider(candidate.provider).embed(candidate.model, texts)
@@ -415,13 +415,7 @@ class ModelRouter:
     def stats(self, role: str | None = None) -> list[dict[str, Any]]:
         clause, parameters = ("WHERE role = ?", [role]) if role else ("", [])
         rows = self.store.query(f"SELECT * FROM model_stats {clause} ORDER BY role, provider, model", parameters)
-        result = []
-        for row in rows:
-            item = dict(row)
-            item["wilson"] = wilson_lower_bound(row["successes"], row["runs"])
-            item["tokens_per_second"] = row["tokens"] / row["seconds"] if row["seconds"] else 0.0
-            result.append(item)
-        return result
+        return [{**dict(row), "wilson": wilson_lower_bound(row["successes"], row["runs"]), "tokens_per_second": tokens_per_second(row)} for row in rows]
 
 
 def attach(assistant: Any) -> None:

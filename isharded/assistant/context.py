@@ -23,6 +23,7 @@ import uuid
 from .contracts import ContextItem, Provenance, Reach, Trust, is_tainted, lowest_reach
 from .memory import MemoryNotFound
 from .mind import actor, add_user_option, emit, LOCAL_USER, plainly, reach_named
+from .providers import estimate_tokens
 
 DEFAULT_BUDGET_TOKENS = 6144
 HISTORY_MESSAGES = 40
@@ -35,6 +36,10 @@ ITEM_OVERHEAD_TOKENS = 12  # role markers and a note's label
 DATA_OVERHEAD_TOKENS = 64  # both fence lines, with a label at its longest
 MAX_LABEL = 120
 SAFE_LABEL = re.compile(r"[^\w .:/\\#@+=,()-]+", re.UNICODE)
+INSERT_ITEM = (
+    "INSERT INTO context_items (user, turn_id, included, source, source_id, author, trust, reach, score, tokens, captured_at) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
 
 SCHEMA = [
     """
@@ -79,10 +84,6 @@ class ContextTooSmall(ValueError):
 
 class TurnNotFound(LookupError):
     """Also what another user's turn looks like, so its existence is not revealed."""
-
-
-def estimate_tokens(text: str) -> int:
-    return len(text) // 3 + 1
 
 
 @dataclass
@@ -179,19 +180,14 @@ class Context:
     def _normalized(items: list[ContextItem], weight: float = 1.0) -> list[ContextItem]:
         """Bring one source's scores to the range the others use, keeping their order."""
         top = max((item.score for item in items), default=0.0)
-        if top <= 0:
-            return [ContextItem(item.text, item.provenance, weight / 2) for item in items]
-        return [ContextItem(item.text, item.provenance, weight * item.score / top) for item in items]
+        return [ContextItem(item.text, item.provenance, weight * item.score / top if top > 0 else weight / 2) for item in items]
 
     def _skills(self, user: str, query: str) -> list[ContextItem]:
         skills = getattr(self.assistant, "skills", None)
         if skills is None:
             return []
-        lookup = next((getattr(skills, name) for name in ("relevant", "search", "match") if hasattr(skills, name)), None)
-        if lookup is None:
-            return []
         try:
-            found = lookup(user, query, limit=SKILL_RESULTS)
+            found = skills.relevant(user, query, limit=SKILL_RESULTS)
         except Exception as error:
             self.assistant.audit.record("context", "context.skills_failed", f"user:{user}", {"error": type(error).__name__})
             return []
@@ -282,7 +278,8 @@ class Context:
                 orphans.append(item)
             elif role is not None:
                 break
-        return [item for item in kept if not any(item is orphan for orphan in orphans)], [*dropped, *orphans]
+        gone = {id(item) for item in orphans}
+        return [item for item in kept if id(item) not in gone], [*dropped, *orphans]
 
     @staticmethod
     def _label(item: ContextItem) -> str:
@@ -310,34 +307,25 @@ class Context:
     # The record
 
     def _record(self, built: BuiltContext, now: float) -> None:
-        with self.store.transaction():
+        with self.store.transaction() as connection:
             self.store.execute(
                 "INSERT INTO context_turns (turn_id, user, conversation_id, role, tainted, reach, tokens, budget, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(turn_id) DO UPDATE SET tainted = max(tainted, excluded.tainted), reach = min(reach, excluded.reach), tokens = excluded.tokens",
                 (built.turn_id, built.user, built.conversation_id, built.role, int(built.tainted), int(built.reach), built.tokens, built.budget, now),
             )
             self.store.execute("DELETE FROM context_items WHERE user = ? AND turn_id = ? AND source != 'tool'", (built.user, built.turn_id))
-            for item in built.items:
-                self._record_item(built.user, built.turn_id, item, True)
-            for item in built.dropped:
-                self._record_item(built.user, built.turn_id, item, False)
-
-    def _record_item(self, user: str, turn_id: str, item: ContextItem, included: bool) -> None:
-        # No text is stored: a forgotten memory must not survive in a log of when it was used.
-        origin = item.provenance
-        self.store.execute(
-            "INSERT INTO context_items (user, turn_id, included, source, source_id, author, trust, reach, score, tokens, captured_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                user, turn_id, int(included), origin.source, origin.source_id, origin.author, origin.trust.value,
-                int(origin.reach), item.score, estimate_tokens(item.text), origin.captured_at,
-            ),
-        )
+            connection.executemany(
+                INSERT_ITEM,
+                [
+                    *(_item_row(built.user, built.turn_id, item, True) for item in built.items),
+                    *(_item_row(built.user, built.turn_id, item, False) for item in built.dropped),
+                ],
+            )
 
     def note_tool(self, user: str, turn_id: str, item: ContextItem) -> None:
         """A tool's output joined the turn after it was built."""
         with self.store.transaction():
-            self._record_item(user, turn_id, item, True)
+            self.store.execute(INSERT_ITEM, _item_row(user, turn_id, item, True))
             self.store.execute(
                 "UPDATE context_turns SET tainted = 1, reach = min(reach, ?) WHERE turn_id = ? AND user = ?",
                 (int(item.provenance.reach), turn_id, user),
@@ -397,6 +385,15 @@ class Context:
         return [dict(row) for row in rows]
 
 
+def _item_row(user: str, turn_id: str, item: ContextItem, included: bool) -> tuple[Any, ...]:
+    # No text is stored: a forgotten memory must not survive in a log of when it was used.
+    origin = item.provenance
+    return (
+        user, turn_id, int(included), origin.source, origin.source_id, origin.author, origin.trust.value,
+        int(origin.reach), item.score, estimate_tokens(item.text), origin.captured_at,
+    )
+
+
 def _standing(trust: Trust) -> str:
     return {Trust.VERIFIED: "checked", Trust.OWNER: "they told you", Trust.MODEL: "your own inference, unconfirmed"}.get(trust, "unverified")
 
@@ -405,7 +402,7 @@ def merged(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for message in messages:
         if result and result[-1]["role"] == message["role"]:
-            result[-1] = {**result[-1], "content": f"{result[-1]['content']}\n\n{message['content']}"}
+            result[-1]["content"] = f"{result[-1]['content']}\n\n{message['content']}"
         else:
             result.append(dict(message))
     return result

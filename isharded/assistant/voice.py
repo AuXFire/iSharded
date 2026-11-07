@@ -7,7 +7,8 @@ run. A persona's voice picks how speech sounds and changes nothing else.
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import re
@@ -175,7 +176,7 @@ class Voice:
         try:
             segments, _ = model.transcribe(str(path))
             return " ".join(segment.text.strip() for segment in segments).strip()
-        except Exception as error:  # noqa: BLE001 - the library raises many kinds on bad audio
+        except Exception as error:  # the library raises many kinds on bad audio
             raise VoiceError(f"That audio could not be read: {error}") from error
 
     def _whisper_model(self, module: Any) -> Any:
@@ -185,7 +186,7 @@ class Voice:
             if self._whisper is None or self._whisper[0] != name:
                 try:
                     self._whisper = (name, module.WhisperModel(name, device="cpu", compute_type="int8", local_files_only=True))
-                except Exception as error:  # noqa: BLE001 - which error depends on the version and on what is missing
+                except Exception as error:  # which error depends on the version and on what is missing
                     raise VoiceUnavailable(
                         f"faster-whisper has no {name} model on this machine, and nothing is downloaded by itself. "
                         f"Set {WHISPER_MODEL_SETTING} to a folder holding a converted model."
@@ -217,16 +218,17 @@ class Voice:
         chosen = voice if isinstance(voice, str) and VOICE_NAME.fullmatch(voice) else self.persona_voice()
         out = Path(out_path).resolve() if out_path else self._new_speech_path()
         out.parent.mkdir(parents=True, exist_ok=True)
-        engine = self._speech_engine()
-        engine[1](text, out, chosen)
-        return {"path": str(out), "engine": engine[0], "voice": chosen}
+        engine, write = self._speech_engine()
+        write(text, out, chosen)
+        return {"path": str(out), "engine": engine, "voice": chosen}
 
     def _new_speech_path(self) -> Path:
         speech = self.folder / "speech"
         speech.mkdir(parents=True, exist_ok=True)
+        cutoff = time.time() - OLD_SPEECH_SECONDS
         for old in speech.glob("*.wav"):  # the caller keeps what it needs, and nobody tidies up for it
             try:
-                if time.time() - old.stat().st_mtime > OLD_SPEECH_SECONDS:
+                if old.stat().st_mtime < cutoff:
                     old.unlink()
             except OSError:
                 continue
@@ -253,34 +255,28 @@ class Voice:
         chosen = str(sibling) if sibling and sibling.is_file() else model
         _run([binary, "--model", chosen, "--output_file", str(out)], stdin=text.encode())
 
-    def _with_text_file(self, text: str, use: Callable[[Path], None]) -> None:
+    @contextmanager
+    def _text_file(self, text: str) -> Iterator[Path]:
         self.folder.mkdir(parents=True, exist_ok=True)
         path = self.folder / f"{secrets.token_hex(8)}.txt"
         path.write_text(text, encoding="utf-8")
         try:
-            use(path)
+            yield path
         finally:
             path.unlink(missing_ok=True)
 
     def _with_sapi(self, text: str, out: Path, voice: str | None) -> None:
-        def use(path: Path) -> None:
+        with self._text_file(text) as path:
             environment = {"ISHARDED_VOICE_OUT": str(out), "ISHARDED_VOICE_TEXT": str(path), "ISHARDED_VOICE_NAME": voice or ""}
             _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", SAPI_SCRIPT], environment=environment)
 
-        self._with_text_file(text, use)
-
     def _with_say(self, text: str, out: Path, voice: str | None) -> None:
-        def use(path: Path) -> None:
-            command = ["say", "-f", str(path), "-o", str(out), "--data-format=LEI16@22050"]
-            _run(command + (["-v", voice] if voice else []))
-
-        self._with_text_file(text, use)
+        with self._text_file(text) as path:
+            _run(["say", "-f", str(path), "-o", str(out), "--data-format=LEI16@22050"] + (["-v", voice] if voice else []))
 
     def _with_espeak(self, binary: str, text: str, out: Path, voice: str | None) -> None:
-        def use(path: Path) -> None:
+        with self._text_file(text) as path:
             _run([binary, "-f", str(path), "-w", str(out)] + (["-v", voice] if voice else []))
-
-        self._with_text_file(text, use)
 
     def status(self) -> dict[str, Any]:
         """What works here, and what to install for what does not."""
