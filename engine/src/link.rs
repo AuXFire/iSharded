@@ -263,11 +263,12 @@ impl Link {
         self.room.notify_all();
     }
 
-    /// Whether a write stalled or failed, as opposed to the far end closing the link.
+    /// The average from a real frame being queued to its last byte reaching the socket.
     pub fn write_us(&self) -> u64 {
         self.write_us.load(Ordering::Relaxed)
     }
 
+    /// Whether a write stalled or failed, as opposed to the far end closing the link.
     pub fn write_failed(&self) -> bool {
         self.failure.lock().is_some()
     }
