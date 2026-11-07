@@ -1693,6 +1693,7 @@ def test_loading_on_a_host_starts_watching_it():
         def call(self, operation, **_):
             if self.failure:
                 raise self.failure
+            return {"rewinds": True}, b""
 
         def watch(self):
             self.watched += 1
@@ -1701,7 +1702,7 @@ def test_loading_on_a_host_starts_watching_it():
             self.closed += 1
 
     loaded = Host()
-    load_on(loaded, "load", {})
+    assert load_on(loaded, "load", {}) == {"rewinds": True}, "the host's answer comes back"
     assert (loaded.watched, loaded.closed) == (1, 0)
     refused = Host(LlamaError("no"))
     with pytest.raises(LlamaError):
