@@ -198,6 +198,8 @@ CONTROL_LINK_FAILURES = 60
 CHECK_IN_SECONDS = 5.0
 # How long a link may go without an acknowledgement, and how long a stage keeps dialling.
 RING_ACK_MS = 5000
+# How often a wait for a slot's passes looks up to see whether the ring is still there.
+SETTLE_LOOK_SECONDS = 0.25
 RING_DIAL_MS = 10_000
 # Off is for checking results against a prompt that went out whole.
 PROMPT_PARTS = os.getenv("ISHARDED_PROMPT_PARTS", "1") != "0"
@@ -709,6 +711,7 @@ class WorkerRuntime:
             if self.gguf is not None and lost.host is not None and lost.host is not self.gguf.host:
                 return retry
             self.last_error = str(lost)
+            self.ring_live = False  # every pass on it went through that process
             self.caches.clear()
             draft = self.draft
             try:
@@ -1198,10 +1201,20 @@ class WorkerRuntime:
             raise self._ring_silent() from exc
 
     async def ring_settle(self, slot: int) -> None:
-        """Waits for a slot's passes, so none reaches a stage after the next reply has begun."""
+        """Waits for a slot's passes, so none reaches a stage after the next reply has begun.
+
+        A ring known to be lost is not waited on. Replays leave it, so nothing of this slot's
+        can reach them, and this runs before the slot is free for the replay to take.
+        """
         client = self.ring_client
-        if client is not None and not await client.settled(slot, pass_seconds(1, len(self.route))):
-            self.ring_live = False
+        if client is None:
+            return
+        left = pass_seconds(1, len(self.route))
+        while self.ring_live and left > 0:
+            if await client.settled(slot, min(left, SETTLE_LOOK_SECONDS)):
+                return
+            left -= SETTLE_LOOK_SECONDS
+        self.ring_live = False
 
     def ring_refused(self, refused: EngineRefusal) -> HTTPException:
         """The error the HTTP path would have raised, so recovery is the same."""

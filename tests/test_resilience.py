@@ -2254,3 +2254,17 @@ def test_a_replay_on_the_slow_way_still_waits_for_the_repair():
 
     asyncio.run(scenario())
     assert asked == [3]
+
+
+def test_a_lost_stage_takes_its_ring_with_it(monkeypatch):
+    from types import SimpleNamespace
+
+    from isharded.llamacpp import StageLost
+    from isharded.worker import WorkerRuntime
+
+    async def scenario():
+        worker = SimpleNamespace(replacing=asyncio.Lock(), gguf=RestartingStage(), last_error=None, caches={}, stage_restarts=0, draft=None, draft_request=None, ring_live=True)
+        await WorkerRuntime.replace_stage(worker, StageLost("gone", worker.gguf.host))
+        return worker
+
+    assert asyncio.run(scenario()).ring_live is False

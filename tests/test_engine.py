@@ -687,3 +687,49 @@ def test_a_real_stage_never_goes_back_to_a_snapshot_from_before_a_clear() -> Non
         asyncio.run(run(host))
     finally:
         host.close()
+
+
+def waiting_ring(client, **fields):
+    """A worker whose ring has a pass out that will never come back."""
+    client.send(**FIELDS)
+    return runtime(ring_client=client, **fields)
+
+
+def test_settling_does_not_wait_on_a_ring_known_to_be_lost() -> None:
+    async def use(client):
+        await asyncio.wait_for(waiting_ring(client, ring_live=False).ring_settle(0), 1)
+        return True
+
+    assert asyncio.run(with_door(lambda identity: b"", use))
+
+
+def test_settling_stops_when_the_ring_is_lost_during_the_wait() -> None:
+    """Another reply can find the stage lost while this one waits on the same ring."""
+
+    async def use(client):
+        item = waiting_ring(client)
+        asyncio.get_running_loop().call_later(0.05, lambda: setattr(item, "ring_live", False))
+        await asyncio.wait_for(item.ring_settle(0), 2)
+        return True
+
+    assert asyncio.run(with_door(lambda identity: b"", use))
+
+
+def test_a_pass_that_never_settles_still_turns_the_ring_off(monkeypatch) -> None:
+    monkeypatch.setattr(worker_module, "pass_seconds", lambda tokens, hops=1: 0.05)
+
+    async def use(client):
+        item = waiting_ring(client)
+        await item.ring_settle(0)
+        return item.ring_live
+
+    assert asyncio.run(with_door(lambda identity: b"", use)) is False
+
+
+def test_a_slot_that_settles_leaves_the_ring_up() -> None:
+    async def use(client):
+        item = waiting_ring(client)
+        await item.ring_settle(0)
+        return item.ring_live
+
+    assert asyncio.run(with_door(lambda identity: answer(identity, [identity]), use)) is True
