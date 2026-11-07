@@ -1671,8 +1671,8 @@ class Orchestrator:
     async def _warm_route(self, epoch: int) -> None:
         """Run a one-token reply, so that a new route's first real reply does not pay for first use.
 
-        On two local GPU stages of a 0.6B model this took a first reply from 659 to 169 ms, against
-        308 to 280 on CPU. A restarted stage showed no such gain: the reply that found it dead has
+        On two local GPU stages of a 0.6B model this took a first reply from 175 to 92 ms on a quiet
+        machine and 659 to 169 on a busy one, against 308 to 280 on CPU. A restarted stage showed no such gain: the reply that found it dead has
         already paid. Nobody waits for this one, so a failure only means the next reply pays.
         """
         active = self.active
