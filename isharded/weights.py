@@ -52,7 +52,6 @@ logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", message="The given buffer is not writable")
 
 INDEX_FILE = "model.safetensors.index.json"
-SINGLE_FILE = "model.safetensors"
 # Ranges closer than this are fetched together: re-reading a small gap is
 # cheaper than another round trip.
 COALESCE_GAP_BYTES = 256 * 1024
@@ -398,8 +397,6 @@ def build_gguf_manifest(
         else:
             prints = [file_fingerprint(reader, part, header.file_size) for part, header in parts.items()]
             pinned = prints[0] if len(prints) == 1 else "gguf-" + hashlib.sha1("".join(prints).encode()).hexdigest()[:16]
-    except GgufError as exc:
-        raise WeightSourceError(f"{name}: {exc}") from exc
     finally:
         reader.close()
     tensors = {
@@ -555,11 +552,9 @@ def fetch_unit(reader: Reader, unit: WeightUnit, destination: Path, on_bytes: Ca
 
 def unit_tensor_span(path: Path, name: str) -> tuple[int, int]:
     """Where one tensor's bytes sit inside a unit file, as (offset, length)."""
-    header = _read_unit_header(path)
-    with path.open("rb") as handle:
-        (prefix,) = struct.unpack("<Q", handle.read(8))
+    header, base = _unit_header(path)
     start, end = header[name]["data_offsets"]
-    return 8 + prefix + start, end - start
+    return base + start, end - start
 
 
 def iter_unit_tensor(path: Path, name: str) -> Iterator[bytes]:
@@ -602,12 +597,17 @@ class LoadedUnit:
             self.mapping = None
 
 
-def _read_unit_header(path: Path) -> dict[str, Any]:
+def _unit_header(path: Path) -> tuple[dict[str, Any], int]:
+    """A unit file's tensors, and where its data starts."""
     with path.open("rb") as handle:
         (length,) = struct.unpack("<Q", handle.read(8))
         header = json.loads(handle.read(length))
     header.pop("__metadata__", None)
-    return header
+    return header, 8 + length
+
+
+def _read_unit_header(path: Path) -> dict[str, Any]:
+    return _unit_header(path)[0]
 
 
 def _resident_form(
@@ -634,18 +634,14 @@ def _carve_slab(layout: dict[str, tuple[torch.dtype, list[int]]], device: torch.
     For MoE experts of a few MiB each, that wastes over 20% of the memory, and
     an exact plan then runs out of a hard budget. One allocation wastes nothing.
     """
-    offsets: dict[str, int] = {}
+    spans: dict[str, tuple[int, int]] = {}
     cursor = 0
     for name, (dtype, shape) in layout.items():
-        cursor = -(-cursor // SLAB_ALIGNMENT) * SLAB_ALIGNMENT
-        offsets[name] = cursor
-        cursor += math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+        start = -(-cursor // SLAB_ALIGNMENT) * SLAB_ALIGNMENT
+        cursor = start + math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+        spans[name] = start, cursor
     slab = torch.empty(max(cursor, 1), dtype=torch.uint8, device=device)
-    views: dict[str, torch.Tensor] = {}
-    for name, (dtype, shape) in layout.items():
-        size = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
-        views[name] = slab[offsets[name] : offsets[name] + size].view(dtype).view(shape)
-    return views
+    return {name: slab[slice(*spans[name])].view(dtype).view(shape) for name, (dtype, shape) in layout.items()}
 
 
 def load_unit(
@@ -818,15 +814,12 @@ def fetch_from_peer(
             if response.status_code != 200:
                 return False
             with partial.open("wb") as handle:
-                checked = False
                 head = b""
                 for chunk in response.iter_bytes(CHUNK_BYTES):
-                    if not checked:
+                    if len(head) < len(prefix):
                         head += chunk[: len(prefix) - len(head)]
-                        if len(head) == len(prefix):
-                            if head != prefix:
-                                return False
-                            checked = True
+                        if not prefix.startswith(head):
+                            return False
                     if received + len(chunk) > expected:
                         return False  # a peer must not be able to fill the disk
                     handle.write(chunk)
@@ -933,9 +926,6 @@ class UnitCache:
         """Everything the cache budget covers: units, and stage files built from them."""
         return [*self.root.rglob("*.safetensors"), *self.root.rglob("stage-*.gguf")]
 
-    def used_bytes(self) -> int:
-        return sum(path.stat().st_size for path in self._files())
-
     def _clear_leftovers(self) -> None:
         """A process that dies mid-transfer leaves its partial files, and nothing else would remove them."""
         stale = time.time() - STALE_PART_SECONDS
@@ -948,11 +938,9 @@ class UnitCache:
 
     def make_room(self, needed: int, protected: set[Path]) -> None:
         """Evict least recently used units until ``needed`` bytes fit."""
-        files = sorted(
-            (path for path in self._files() if path not in protected),
-            key=lambda path: path.stat().st_atime,
-        )
-        used = self.used_bytes()
+        held = self._files()
+        files = sorted((path for path in held if path not in protected), key=lambda path: path.stat().st_atime)
+        used = sum(path.stat().st_size for path in held)
 
         def short() -> bool:
             free = shutil.disk_usage(self.root).free - DISK_RESERVE_BYTES
@@ -1002,6 +990,7 @@ class UnitCache:
         protected = {self.path(model_id, revision, unit.name) for unit in units}
         self.make_room(progress.bytes_total, protected)
         lock = threading.Lock()
+        peers = peers or {}
 
         def add_bytes(count: int) -> None:
             if progress.cancelled:
@@ -1026,11 +1015,11 @@ class UnitCache:
 
         def sources_for(unit: WeightUnit) -> list[str]:
             """Everywhere this unit can come from, the host first so that it wins a tie."""
-            nodes = dict.fromkeys([*(peers or {}).get(unit.name, []), *holders])
+            nodes = dict.fromkeys([*peers.get(unit.name, []), *holders])
             return [MODEL_HOST, *nodes] if host or not nodes else list(nodes)
 
         def deliver(origin: str, unit: WeightUnit, destination: Path, on_bytes: Callable[[int], None]) -> bool:
-            if origin in (peers or {}).get(unit.name, []):
+            if origin in peers.get(unit.name, []):
                 return fetch_from_peer(origin, token, model_id, revision, unit, destination, on_bytes)
             reader = open_reader(source, source_revision) if origin == MODEL_HOST else PeerReader([origin], token)
             try:
@@ -1063,7 +1052,7 @@ class UnitCache:
                         with lock:
                             if origin != MODEL_HOST:
                                 progress.bytes_from_peers += unit.nbytes
-                            if origin in (peers or {}).get(unit.name, []):
+                            if origin in peers.get(unit.name, []):
                                 # A unit file is its tensors plus a small header.
                                 progress.bytes_done += unit.nbytes - destination.stat().st_size
                             progress.units_done += 1
