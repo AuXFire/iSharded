@@ -28,6 +28,7 @@ import httpx
 import numpy as np
 
 from .embedding import PASS_SEQUENCES
+from .optional import has_torch
 from .engine import Engine
 from .statestore import PASS_ROWS
 
@@ -362,12 +363,16 @@ def speculative_choice(
 
 def pick_build(requested_device: str = "auto") -> str:
     """Choose the release build for this machine's accelerator."""
-    import torch
-
     if str(requested_device).startswith("cpu"):
         return "cpu"
     if str(requested_device).startswith("vulkan"):
         return "vulkan"
+    if not has_torch():
+        from .memory import nvidia_accelerators
+
+        return "cuda" if nvidia_accelerators() else "cpu"
+    import torch
+
     if torch.version.hip:
         return "rocm"
     if torch.cuda.is_available():

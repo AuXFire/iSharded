@@ -332,7 +332,7 @@ def test_gpu_slab_keeps_mixed_dtypes_and_conversions_correct(tmp_path: Path) -> 
 def test_gpu_slab_holds_fp8_in_either_form(tmp_path: Path) -> None:
     directory = tmp_path / "model"
     directory.mkdir()
-    weight = torch.randn(256, 256).to(weights.FP8)
+    weight = torch.randn(256, 256).to(torch.float8_e4m3fn)
     scale = torch.tensor([[1.0, 2.0], [4.0, 8.0]], dtype=torch.bfloat16)
     save_file({"w.weight": weight, "w.weight_scale_inv": scale}, directory / "model.safetensors")
     unit = unit_of(directory, "w.weight", "w.weight_scale_inv")
@@ -343,6 +343,6 @@ def test_gpu_slab_holds_fp8_in_either_form(tmp_path: Path) -> None:
     compact = load_unit(destination, "cuda:0", torch.bfloat16, lambda name: False, compact=True).tensors
 
     assert set(expanded) == {"w.weight"} and expanded["w.weight"].dtype == torch.bfloat16
-    assert compact["w.weight"].dtype == weights.FP8 and "w.weight_scale_inv" in compact
+    assert compact["w.weight"].dtype == torch.float8_e4m3fn and "w.weight_scale_inv" in compact
     rebuilt = weights.dequantize_fp8(compact["w.weight"], compact["w.weight_scale_inv"], torch.bfloat16)
     assert torch.equal(rebuilt, expanded["w.weight"])

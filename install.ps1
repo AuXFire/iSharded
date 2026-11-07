@@ -3,6 +3,7 @@
 #   irm https://raw.githubusercontent.com/AuXFire/iSharded/main/install.ps1 | iex
 #   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/AuXFire/iSharded/main/install.ps1))) --no-start
 #   ... --service     also start at login
+#   ... --full        also add PyTorch, for safetensors models
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"  # the progress bar makes large downloads many times slower
@@ -96,11 +97,13 @@ function Add-ToPath([string]$Scripts) {
 function Install-ISharded([string[]]$Options) {
     $start = $true
     $service = $false
+    $full = $false
     foreach ($option in $Options) {
         switch ($option) {
             "--no-start" { $start = $false }
             "--service" { $service = $true }
-            default { throw "Unknown option $option. This takes --no-start or --service." }
+            "--full" { $full = $true }
+            default { throw "Unknown option $option. This takes --no-start, --service, or --full." }
         }
     }
     if ($service -and -not $start) { throw "--no-start and --service do not go together: a service starts the node." }
@@ -129,8 +132,10 @@ function Install-ISharded([string[]]$Options) {
             # --seed keeps pip in the environment, for anyone adding packages by hand.
             Invoke-Native $uv venv --quiet --seed --clear --managed-python --python $PythonVersion $folder
         }
-        $index = if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) { "cu124" } else { "cpu" }
-        Invoke-Native $uv pip install --python $python torch --default-index "https://download.pytorch.org/whl/$index"
+        if ($full) {
+            $index = if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) { "cu124" } else { "cpu" }
+            Invoke-Native $uv pip install --python $python torch --default-index "https://download.pytorch.org/whl/$index"
+        }
         $package = Get-Package $work
         Invoke-Native $uv pip install --python $python --reinstall-package isharded --refresh-package isharded $package
     } finally {

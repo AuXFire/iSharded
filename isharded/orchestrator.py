@@ -41,9 +41,11 @@ from .mcp_server import INVALID_REQUEST, PAID_AT_THE_API, McpHandler, MeshTools,
 from .mesh import GOSSIP_SECONDS, ControlMesh
 from .models import Adapter, GgufAdapter, SUPPORTED_TYPES, UnsupportedModel, create_adapter
 from .geometry import propose
+from .optional import ADD_TORCH
 from .planner import AMORTIZE_TOKENS, UNREACHABLE_LINK_MS, Candidate, ModelProfile, PlacementError, keep_layers, memory_report, ms_per_token, plan_placement, route_times, with_links
 from .protocol import (
     hosts_model,
+    needs_pytorch,
     pass_seconds,
     CacheRestoreRequest,
     ChatCompletionRequest,
@@ -1148,9 +1150,15 @@ class Orchestrator:
         return not model or hosts_model(contribution.host_models, model)
 
     def _runs_on(self, hardware: Any) -> bool:
-        """A GPU reached through Vulkan runs llama.cpp, so it can only take GGUF models."""
+        """A GPU reached through Vulkan, or a node with no PyTorch, can only take GGUF models."""
         model = self.planning_model or self.model_id
-        return hardware.backend != "vulkan" or not model or ".gguf" in model.lower()
+        return not model or not needs_pytorch(model) or (hardware.backend != "vulkan" and hardware.pytorch)
+
+    def _left_out(self) -> str:
+        """Who a PyTorch model cannot use, so that a refusal says what would change it."""
+        model = self.planning_model or self.model_id
+        names = sorted(name for name, record in self.workers.items() if record.live and not record.registration.hardware.pytorch)
+        return f" {', '.join(names)} left out for having no PyTorch. {ADD_TORCH}." if model and needs_pytorch(model) and names else ""
 
     def candidates(self) -> list[Candidate]:
         preferred, standby = self.candidate_groups()
@@ -1165,6 +1173,7 @@ class Orchestrator:
             and not record.quarantined
             and "kv-cache" in record.registration.hardware.contribution.roles
             and record.registration.hardware.contribution.ram_budget_bytes > 0
+            and record.registration.hardware.pytorch  # these snapshots are PyTorch tensors
         ]
         if not candidates:
             return None
@@ -1577,7 +1586,8 @@ class Orchestrator:
         try:
             return self.plan(target, **options)
         except PlacementError as exc:
-            raise HTTPException(status_code=507, detail=str(exc)) from exc
+            note = self._left_out()
+            raise HTTPException(status_code=507, detail=f"{str(exc).rstrip('.')}.{note}" if note else str(exc)) from exc
 
     def _keep_stages(
         self, target: ModelTarget, preferred: list[Candidate], standby: list[Candidate], available: set[str], pins: dict[str, str | None]

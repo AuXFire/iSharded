@@ -37,10 +37,10 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-import torch
 from safetensors import safe_open
 
 from .gguf import GgufError, GgufHeader, join_parts, parse_header, parse_source, split_parts
+from .optional import torch
 from .protocol import auth_headers, TensorRef, WeightUnit
 from .tickets import client_auth
 from .tls import client_verify, stay_on_this_machine
@@ -62,18 +62,19 @@ STALE_PART_SECONDS = 600.0  # a live transfer writes far more often than this
 # Disk space a fetch must leave behind, so a download cannot fill the volume.
 DISK_RESERVE_BYTES = 2 * 1024**3
 
-TORCH_DTYPES: dict[str, torch.dtype] = {
-    "F64": torch.float64,
-    "F32": torch.float32,
-    "F16": torch.float16,
-    "BF16": torch.bfloat16,
-    "F8_E4M3": torch.float8_e4m3fn,
-    "I64": torch.int64,
-    "I32": torch.int32,
-    "I16": torch.int16,
-    "I8": torch.int8,
-    "U8": torch.uint8,
-    "BOOL": torch.bool,
+# Each stored dtype's PyTorch name and width. Planning reads widths on nodes with no PyTorch.
+STORED_DTYPES: dict[str, tuple[str, int]] = {
+    "F64": ("float64", 8),
+    "F32": ("float32", 4),
+    "F16": ("float16", 2),
+    "BF16": ("bfloat16", 2),
+    "F8_E4M3": ("float8_e4m3fn", 1),
+    "I64": ("int64", 8),
+    "I32": ("int32", 4),
+    "I16": ("int16", 2),
+    "I8": ("int8", 1),
+    "U8": ("uint8", 1),
+    "BOOL": ("bool", 1),
 }
 
 
@@ -83,7 +84,6 @@ LOCAL_SCAN_SECONDS = 60.0
 RANGE_ATTEMPTS = 4
 RANGE_RETRY_SECONDS = 3.0
 SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
-FP8 = torch.float8_e4m3fn
 FP8_SCALE_SUFFIX = "_scale_inv"
 FP8_BLOCK = 128
 # Tensor start alignment inside a slab, matching what GPU allocators give.
@@ -469,9 +469,13 @@ def _slug(model_id: str) -> str:
     return f"{tail[:48]}-{hashlib.sha1(model_id.encode()).hexdigest()[:10]}"
 
 
+def _torch_dtype(stored: str) -> torch.dtype:
+    return getattr(torch, STORED_DTYPES[stored][0])
+
+
 def _itemsize(dtype: str) -> int:
     try:
-        return torch.empty((), dtype=TORCH_DTYPES[dtype]).element_size()
+        return STORED_DTYPES[dtype][1]
     except KeyError as exc:
         raise WeightSourceError(f"unsupported tensor dtype {dtype}") from exc
 
@@ -620,8 +624,8 @@ def _resident_form(
     """Dtype a tensor takes in its pool, or None if it does not stay resident."""
     if name.endswith(FP8_SCALE_SUFFIX):
         return stored if compact else None
-    if stored == FP8:
-        return FP8 if compact else dtype or torch.bfloat16
+    if stored == torch.float8_e4m3fn:
+        return stored if compact else dtype or torch.bfloat16
     if dtype is not None and stored.is_floating_point and not keep_float32(name):
         return dtype
     return stored
@@ -660,7 +664,7 @@ def load_unit(
     target = torch.device(device)
     layout: dict[str, tuple[torch.dtype, list[int]]] = {}
     for name, info in _read_unit_header(path).items():
-        form = _resident_form(name, TORCH_DTYPES[info["dtype"]], dtype, keep_float32, compact)
+        form = _resident_form(name, _torch_dtype(info["dtype"]), dtype, keep_float32, compact)
         if form is not None:
             layout[name] = (form, info["shape"])
     slab = _carve_slab(layout, target) if target.type != "cpu" else None
@@ -669,7 +673,7 @@ def load_unit(
     with safe_open(str(path), framework="pt", device="cpu") as handle:
         for name, (form, _) in layout.items():
             tensor = handle.get_tensor(name)
-            if tensor.dtype == FP8 and form != FP8:
+            if tensor.dtype == torch.float8_e4m3fn and form != torch.float8_e4m3fn:
                 scale = handle.get_tensor(name + FP8_SCALE_SUFFIX).to(target)
                 tensor = dequantize_fp8(tensor.to(target), scale, form)
             if slab is None:
@@ -697,7 +701,7 @@ def map_unit(path: Path) -> LoadedUnit:
     for name, info in header.items():
         if name == "__metadata__":
             continue
-        dtype = TORCH_DTYPES[info["dtype"]]
+        dtype = _torch_dtype(info["dtype"])
         begin, end = info["data_offsets"]
         if end == begin:
             tensors[name] = torch.empty(info["shape"], dtype=dtype)

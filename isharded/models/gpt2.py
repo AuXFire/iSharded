@@ -5,8 +5,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
-import torch
-import torch.nn.functional as F
+from ..optional import functional as F
+from ..optional import torch
 
 from ..protocol import TensorRef
 from .base import Adapter, LayerState, UnsupportedModel, Weights, attend

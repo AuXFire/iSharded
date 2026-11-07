@@ -45,8 +45,8 @@ Name: "{group}\Uninstall iSharded"; Filename: "{uninstallexe}"
 
 [Run]
 ; A window stays open for these, because a question about joining a mesh needs a console.
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\setup.ps1"""; StatusMsg: "Installing iSharded. PyTorch is large, so this takes a few minutes."; Tasks: not service
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\setup.ps1"" -Service"; StatusMsg: "Installing iSharded. PyTorch is large, so this takes a few minutes."; Tasks: service
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\setup.ps1"""; StatusMsg: "Installing iSharded. This takes a minute or two."; Tasks: not service
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\setup.ps1"" -Service"; StatusMsg: "Installing iSharded. This takes a minute or two."; Tasks: service
 ; {localappdata} is named here because an elevated copy may run as a different account.
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\firewall.ps1"" -Python ""{localappdata}\iSharded\venv\Scripts\python.exe"""; Verb: runas; Flags: shellexec waituntilterminated; Tasks: firewall
 

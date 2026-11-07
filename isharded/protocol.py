@@ -10,10 +10,11 @@ import re
 from typing import Annotated, Any, Literal
 import uuid
 
-import torch
+import numpy as np
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, HttpUrl
-from safetensors.torch import load as load_safetensors
-from safetensors.torch import save as save_safetensors
+from safetensors import deserialize
+
+from .optional import torch_safetensors
 
 from .deadlines import PASS_SECONDS, PASS_SECONDS_PER_TOKEN, pass_seconds  # noqa: F401
 
@@ -22,6 +23,11 @@ META_HEADER = "x-isharded-meta"
 # Raised whenever workers and the orchestrator stop being able to talk safely.
 # A node on another version is refused at the door, not found out mid-request.
 PROTOCOL_VERSION = 6
+# PyTorch's own bit pattern for a NaN in BF16.
+BFLOAT16_NAN = np.uint16(0xFFFF)
+# What a pass can hold, by the names the safetensors format gives them, in the order that
+# format's writer lays them out. BF16 is read as bits.
+ROW_DTYPES = {"I64": np.int64, "F64": np.float64, "F32": np.float32, "I32": np.int32, "BF16": np.uint16, "F16": np.float16}
 
 
 class ResourceContribution(BaseModel):
@@ -32,6 +38,14 @@ class ResourceContribution(BaseModel):
     standby: bool = False
     # Patterns naming the only models this node will host. Empty means any.
     host_models: list[str] = Field(default_factory=list)
+
+
+PLACE_DTYPES = {"int64": "I64", "int32": "I32"}
+
+
+def needs_pytorch(model: str) -> bool:
+    """Only a GGUF file runs on llama.cpp. Every other model runs on PyTorch."""
+    return ".gguf" not in model.lower()
 
 
 def host_model_patterns() -> list[str]:
@@ -77,6 +91,8 @@ class HardwareInfo(BaseModel):
     ram_total_bytes: int
     accelerator_name: str | None = None
     accelerator_memory_bytes: int = 0
+    # A node from before PyTorch was optional always has it.
+    pytorch: bool = True
     contribution: ResourceContribution = Field(default_factory=ResourceContribution)
     memory_pools: list[MemoryPool] = Field(default_factory=list)
 
@@ -474,7 +490,7 @@ def encode_activation(tensor: torch.Tensor, places: torch.Tensor | None = None) 
     tensors = {"hidden": tensor.detach().contiguous().cpu()}
     if places is not None:
         tensors["places"] = places.contiguous()
-    return save_safetensors(tensors)
+    return torch_safetensors.save(tensors)
 
 
 def decode_pass(payload: bytes) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -483,20 +499,79 @@ def decode_pass(payload: bytes) -> tuple[torch.Tensor, torch.Tensor | None]:
     Every stage applies M-RoPE in its own attention layers, so positions have to
     travel with the rows. In the body, because a header could not hold many images.
     """
-    tensors = load_safetensors(payload)
+    tensors = torch_safetensors.load(payload)
     if not {"hidden"} <= set(tensors) <= {"hidden", "places"}:
         raise ValueError("activation payload must hold a 'hidden' tensor and at most 'places' besides")
     return tensors["hidden"], tensors.get("places")
 
 
 def encode_tensors(tensors: dict[str, torch.Tensor]) -> bytes:
-    return save_safetensors(
+    return torch_safetensors.save(
         {name: tensor.detach().contiguous().cpu() for name, tensor in tensors.items()}
     )
 
 
 def decode_tensors(payload: bytes) -> dict[str, torch.Tensor]:
-    return load_safetensors(payload)
+    return torch_safetensors.load(payload)
+
+
+def to_bfloat16(rows: np.ndarray) -> np.ndarray:
+    """FP32 rows as BF16 bit patterns, rounded to nearest even, as PyTorch rounds them."""
+    bits = np.ascontiguousarray(rows, dtype=np.float32).view(np.uint32)
+    # In place, since a whole prompt's rows pass through here.
+    rounded = bits >> 16
+    rounded &= 1
+    rounded += 0x7FFF
+    rounded += bits
+    rounded >>= 16
+    narrowed = rounded.astype(np.uint16)
+    narrowed[np.isnan(rows)] = BFLOAT16_NAN
+    return narrowed
+
+
+def from_bfloat16(bits: np.ndarray) -> np.ndarray:
+    """BF16 is the top half of an FP32, so this is exact."""
+    wide = bits.astype(np.uint32)
+    wide <<= 16
+    return wide.view(np.float32)
+
+
+def _safetensors_file(tensors: dict[str, tuple[str, np.ndarray]]) -> bytes:
+    """The bytes safetensors would write. Its own writer changes its arguments between versions."""
+    header: dict[str, Any] = {}
+    parts: list[memoryview] = []
+    offset = 0
+    for name, (dtype, array) in sorted(tensors.items(), key=lambda item: (list(ROW_DTYPES).index(item[1][0]), item[0])):
+        header[name] = {"dtype": dtype, "shape": list(array.shape), "data_offsets": [offset, offset + array.nbytes]}
+        parts.append(array.data)
+        offset += array.nbytes
+    text = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    text += b" " * (-len(text) % 8)
+    return b"".join([len(text).to_bytes(8, "little"), text, *parts])
+
+
+def encode_rows(rows: np.ndarray, places: np.ndarray | None = None, bfloat16: bool = False) -> bytes:
+    """What encode_activation sends, byte for byte, from a GGUF stage's numpy rows."""
+    rows = np.ascontiguousarray(rows, dtype=np.float32)
+    tensors = {"hidden": ("BF16", to_bfloat16(rows)) if bfloat16 else ("F32", rows)}
+    if places is not None:
+        tensors["places"] = (PLACE_DTYPES[places.dtype.name], np.ascontiguousarray(places))
+    return _safetensors_file(tensors)
+
+
+def _array(view: dict[str, Any]) -> np.ndarray:
+    if view["dtype"] not in ROW_DTYPES:
+        raise ValueError(f"a GGUF stage cannot read {view['dtype']} tensors")
+    array = np.frombuffer(view["data"], dtype=ROW_DTYPES[view["dtype"]]).reshape(view["shape"])
+    return from_bfloat16(array) if view["dtype"] == "BF16" else array
+
+
+def decode_rows(payload: bytes) -> tuple[np.ndarray, np.ndarray | None]:
+    """decode_pass for a GGUF stage: FP32 rows in numpy, however they crossed."""
+    tensors = {name: _array(view) for name, view in deserialize(payload)}
+    if not {"hidden"} <= set(tensors) <= {"hidden", "places"}:
+        raise ValueError("activation payload must hold a 'hidden' tensor and at most 'places' besides")
+    return tensors["hidden"].astype(np.float32, copy=False), tensors.get("places")
 
 
 @dataclass(slots=True)

@@ -4,6 +4,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/AuXFire/iSharded/main/install.sh | sh
 #   ... | sh -s -- --no-start     only the files
 #   ... | sh -s -- --service      also start at login
+#   ... | sh -s -- --full         also add PyTorch, for safetensors models
 set -eu
 
 UV_VERSION=0.13.6
@@ -108,10 +109,13 @@ make_venv() {
 }
 
 install_torch() {
+  if [ "$full" != yes ]; then return 0; fi
   # PyTorch's default Linux build carries GPU libraries. Without a GPU the CPU build is far smaller.
   if [ "$(uname -s)" = Linux ] && ! command -v nvidia-smi >/dev/null 2>&1 && ! command -v rocminfo >/dev/null 2>&1; then
     say "No GPU tools found, so this takes PyTorch's smaller CPU build."
     "$uv" pip install --python "$python" torch --default-index https://download.pytorch.org/whl/cpu
+  else
+    "$uv" pip install --python "$python" torch
   fi
 }
 
@@ -191,11 +195,13 @@ start_node() {
 main() {
   start=yes
   service=no
+  full=no
   for option in "$@"; do
     case "$option" in
       --no-start) start=no ;;
       --service) service=yes ;;
-      *) die "Unknown option $option. This takes --no-start or --service." ;;
+      --full) full=yes ;;
+      *) die "Unknown option $option. This takes --no-start, --service, or --full." ;;
     esac
   done
   [ "$start$service" != noyes ] || die "--no-start and --service do not go together: a service starts the node."

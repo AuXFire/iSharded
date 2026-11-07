@@ -15,6 +15,7 @@ from typing import Any
 
 from .geo import country_code
 from .lanes import lane_port, lane_url, read_lanes
+from .optional import has_torch
 from .tls import OWN_ADDRESS
 from .pool import check_exposure, load_token
 
@@ -324,9 +325,11 @@ def _has_accelerator() -> bool:
     # Import the accelerator runtime only when discovery was requested.
     # CPU/RAM-only contributors should not depend on CUDA/ROCm driver
     # initialization merely to join the pool.
-    import torch
+    from .memory import _all_accelerators, vulkan_accelerators
 
-    from .memory import vulkan_accelerators
+    if not has_torch():
+        return bool(_all_accelerators())
+    import torch
 
     has_mps = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
     has_xpu = hasattr(torch, "xpu") and torch.xpu.is_available()

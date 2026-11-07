@@ -1006,6 +1006,7 @@ def test_forward_can_return_a_speculative_answer(monkeypatch):
     class Runtime:
         lock = __import__("asyncio").Lock()
         last_error = None
+        gguf = None
 
         def _record(self, *args):
             pass
