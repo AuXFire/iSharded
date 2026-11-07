@@ -32,7 +32,7 @@ from pathlib import Path
 import secrets
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, TextIO
 
 from .pool import read_membership_request
 
@@ -65,6 +65,10 @@ def node_of(worker_id: str) -> str:
 
 def digest(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()
+
+
+def fingerprint(document: dict[str, Any]) -> str:
+    return digest(json.dumps(document, sort_keys=True))
 
 
 def new_key() -> str:
@@ -360,7 +364,7 @@ class AccessControl:
         # own keys, blocks, and cordons.
         if not self.ownerless:
             self._take_join_requests(document)
-            if self._rank(document) > self._rank(mine):
+            if self._outranks(document, mine):
                 cordoned = set(document.get("cordoned_nodes", []))
                 changed = changed or cordoned != self.cordoned
                 self.cordoned = cordoned
@@ -380,9 +384,12 @@ class AccessControl:
             if hashed not in self.keys and hashed not in self.removed and name not in self.removed_names and role in {ROLE_USER, ROLE_ADMIN}:
                 self.keys[hashed] = Caller(name, role, int(item.get("requests_per_minute", 0)), verifier=str(item.get("verifier", "")))
 
-    def _rank(self, document: dict[str, Any]) -> tuple[int, str]:
+    def _outranks(self, document: dict[str, Any], mine: dict[str, Any]) -> bool:
+        theirs, ours = int(document.get("version", 0)), int(mine.get("version", 0))
+        if theirs != ours:
+            return theirs > ours
         # Two sides of a split can reach one version. Any fixed rule settles it.
-        return int(document.get("version", 0)), hashlib.sha256(json.dumps(document, sort_keys=True).encode()).hexdigest()
+        return document != mine and fingerprint(document) > fingerprint(mine)
 
     def merge(self, document: dict[str, Any] | None) -> bool:
         """Combine a peer's document with this one. True if anything changed.
@@ -395,7 +402,7 @@ class AccessControl:
         if self.authority is not None:
             return self._merge_with_authority(document)
         mine = self.document()
-        newest = document if self._rank(document) > self._rank(mine) else mine
+        newest = document if self._outranks(document, mine) else mine
         removed = self.removed | set(document.get("removed_keys", []))
         keys = {item["sha256"]: item for item in [*document.get("keys", []), *mine["keys"]]}
         merged = {
@@ -561,9 +568,19 @@ class AuditLog:
             "status": status,
             "client": client,
         }
+        line = json.dumps(entry) + "\n"
         with self.lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            if self.path.is_file() and self.path.stat().st_size > AUDIT_ROTATE_BYTES:
+            handle = self._open()
+            if handle.tell() > AUDIT_ROTATE_BYTES:  # an open file knows its size, so nothing else need look
+                handle.close()
                 self.path.replace(self.path.with_suffix(self.path.suffix + ".1"))
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(entry) + "\n")
+                handle = self._open()
+            with handle:
+                handle.write(line)
+
+    def _open(self) -> TextIO:
+        try:
+            return open(self.path, "a", encoding="utf-8")
+        except FileNotFoundError:  # the first record, or someone cleared the folder
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            return open(self.path, "a", encoding="utf-8")

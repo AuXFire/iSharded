@@ -11,6 +11,7 @@ import httpx
 import pytest
 import uvicorn
 
+from isharded import access as access_module
 from isharded import orchestrator as orchestrator_module
 from isharded.access import ROLE_ADMIN, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, create_key, digest
 from isharded.orchestrator import Orchestrator
@@ -73,6 +74,63 @@ def test_the_audit_log_rotates(tmp_path, monkeypatch):
     log.record("a", "POST", "/admin/load", 200, "1.2.3.4")
     assert (tmp_path / "audit.jsonl.1").is_file()
     assert json.loads(path.read_text(encoding="utf-8"))["actor"] == "a"
+
+
+def test_the_audit_log_rotates_only_past_the_limit(tmp_path, monkeypatch):
+    path = tmp_path / "audit.jsonl"
+    log = AuditLog(str(path), "n")
+    log.record("a", "GET", "/", 200, None)
+    monkeypatch.setattr("isharded.access.AUDIT_ROTATE_BYTES", path.stat().st_size)
+    log.record("a", "GET", "/", 200, None)  # exactly at the limit, so this one still goes in
+    assert len(path.read_bytes().splitlines()) == 2 and not (tmp_path / "audit.jsonl.1").exists()
+    log.record("a", "GET", "/", 200, None)
+    assert len(path.read_bytes().splitlines()) == 1 and len((tmp_path / "audit.jsonl.1").read_bytes().splitlines()) == 2
+
+
+def test_the_audit_log_makes_its_folder_once_and_again_if_it_goes(tmp_path, monkeypatch):
+    path = tmp_path / "logs" / "deep" / "audit.jsonl"
+    log = AuditLog(str(path), "n")
+    log.record("a", "GET", "/", 200, None)
+    assert path.is_file()
+
+    def no_more(*_args, **_options):
+        raise AssertionError("the folder is there already")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Path, "mkdir", no_more)
+        patched.setattr(Path, "stat", no_more)
+        patched.setattr(Path, "is_file", no_more)
+        log.record("a", "GET", "/", 200, None)
+    assert len(path.read_bytes().splitlines()) == 2
+    shutil.rmtree(tmp_path / "logs")
+    log.record("a", "GET", "/", 200, None)
+    assert len(path.read_bytes().splitlines()) == 1
+
+
+def test_gossip_hashes_a_document_only_when_two_of_one_version_differ(tmp_path, monkeypatch):
+    access = AccessControl(str(tmp_path / "keys.json"))
+    access.add_key("alice", ROLE_USER)
+    same = json.loads(json.dumps(access.document()))
+    hashed: list[dict] = []
+    real = access_module.fingerprint
+    monkeypatch.setattr(access_module, "fingerprint", lambda document: hashed.append(document) or real(document))
+    assert not access.merge(same)
+    assert not access.merge({**same, "version": same["version"] - 1})
+    assert access.merge({**same, "version": same["version"] + 1, "cordoned_nodes": ["n"]})
+    assert hashed == []
+    assert access.cordoned == {"n"}
+    tied = {**access.document(), "cordoned_nodes": ["m"]}
+    access.merge(tied)
+    assert len(hashed) == 2
+
+
+def test_gossip_still_tidies_a_key_marked_removed_when_the_documents_match(tmp_path):
+    access = AccessControl(str(tmp_path / "keys.json"))
+    access.add_key("alice", ROLE_USER)
+    held = next(iter(access.keys))
+    access.removed.add(held)
+    assert access.merge(json.loads(json.dumps(access.document())))
+    assert held not in access.keys
 
 
 @pytest.fixture
