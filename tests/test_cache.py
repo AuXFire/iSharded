@@ -917,3 +917,133 @@ def test_a_busy_stage_is_not_waited_for():
     with host.lock:
         stage.refresh_states()
     assert stage.states == {"states": 1}
+
+
+class Slots:
+    """A stage's llama.cpp sequences, as far as restoring goes."""
+
+    def __init__(self, held=("k",)):
+        self.held, self.calls = set(held), []
+
+    def restore(self, key, slot):
+        self.calls.append(("restore", key, slot))
+        if key not in self.held:
+            raise LlamaError(f"no saved state {key} here")
+        return "ram"
+
+    def clear(self, slot):
+        self.calls.append(("clear", slot))
+
+
+def later_stage(slots=None):
+    runtime = worker.WorkerRuntime.__new__(worker.WorkerRuntime)
+    runtime.gguf, runtime.caches, runtime.tokens_reused, runtime.fetched = slots or Slots(), {}, {}, set()
+    runtime.epoch, runtime.lock = 1, asyncio.Lock()
+    return runtime
+
+
+def first_pass(session="s", key="k", length=10, slot=0):
+    return InferRequest(session_id=session, epoch=1, input_ids=[1], restore_length=length, reused_rows=length, checkpoint_key=key, slot=slot)
+
+
+def test_a_state_restored_ahead_is_what_the_first_pass_runs_on():
+    runtime = later_stage()
+    assert asyncio.run(runtime.take_restore("s", 1, 0, "k", 10))
+    assert runtime._session(first_pass()).length == 10
+    assert runtime.gguf.calls == [("restore", "k", 0)], "restored once, before the pass"
+    assert runtime.tokens_reused == {"history_ram": 10}
+    assert runtime.caches["s"].ahead is None, "only that one pass runs on it"
+
+
+def test_a_restore_that_comes_after_its_pass_does_nothing():
+    runtime = later_stage()
+    entry = runtime._session(first_pass())
+    entry.length = 40  # the pass ran on from the restored state
+    assert not asyncio.run(runtime.take_restore("s", 1, 0, "k", 10))
+    assert runtime.gguf.calls == [("restore", "k", 0)]
+    assert runtime._session(first_pass().model_copy(update={"restore_length": None, "checkpoint_key": None})) is entry
+
+
+def test_a_restore_for_another_reply_leaves_nothing_to_go_on_from():
+    runtime = later_stage(Slots(held=("k", "other")))
+    runtime._session(first_pass())
+    # Something old, held up somewhere, lands on the slot after this reply's first pass.
+    assert asyncio.run(runtime.take_restore("t", 1, 0, "other", 20))
+    with pytest.raises(HTTPException) as caught:
+        runtime._session(first_pass().model_copy(update={"restore_length": None, "checkpoint_key": None}))
+    assert caught.value.detail["retry"], "replayed, never run on a state that is not its own"
+    # And a first pass that is not the one it was for restores its own state.
+    assert runtime._session(first_pass()).length == 10
+    assert runtime.gguf.calls[-1] == ("restore", "k", 0)
+
+
+def test_an_older_restore_of_the_same_conversation_is_not_gone_on_from():
+    runtime = later_stage(Slots(held=("k", "older")))
+    runtime._session(first_pass())
+    assert asyncio.run(runtime.take_restore("s", 1, 0, "older", 5))
+    with pytest.raises(HTTPException) as caught:
+        runtime._session(first_pass().model_copy(update={"restore_length": None, "checkpoint_key": None}))
+    assert caught.value.detail["retry"]
+
+
+def test_a_state_a_stage_cannot_restore_ahead_still_comes_back_as_missing():
+    runtime = later_stage(Slots(held=()))
+    assert not asyncio.run(runtime.take_restore("s", 1, 0, "k", 10))
+    with pytest.raises(HTTPException) as caught:
+        runtime._session(first_pass())
+    assert caught.value.detail["missing"] == "k"
+
+
+def test_a_restore_for_another_route_or_a_lost_stage_is_refused():
+    runtime = later_stage()
+    assert not asyncio.run(runtime.take_restore("s", 2, 0, "k", 10))
+    assert runtime.gguf.calls == []
+
+    class Lost(Slots):
+        def restore(self, key, slot):
+            raise StageLost("the stage process is gone")
+
+    runtime = later_stage(Lost())
+    with pytest.raises(StageLost):
+        asyncio.run(runtime.take_restore("s", 1, 0, "k", 10))
+
+
+def test_a_reply_has_every_later_stage_restore_at_once_and_waits_for_them(monkeypatch):
+    prompt = chat(200, 100, 10)
+    key = prefix_key(prompt[:300])
+    runtime = fake_entry(monkeypatch, [missing(key), {"token_id": 5}])
+    runtime.route = [SimpleNamespace(worker_id=name) for name in ("w1", "w2", "w3")]
+    runtime.prefix.add(key, 300, HISTORY)
+    done = []
+
+    async def restore_ahead(request):
+        await asyncio.sleep(0.01)
+        done.append((request.checkpoint_key, request.restore_length, len(runtime.passes)))
+
+    runtime.restore_ahead = restore_ahead
+    monkeypatch.setattr(worker, "PROMPT_PARTS", False)  # the replay reads it whole, here in one pass
+    assert generate(prompt) == [{"token_id": 5}]
+    # It went out with the first pass, and the reply waited for it even though that failed.
+    assert done == [(key, 300, 1)]
+    assert runtime.passes[1].reset and runtime.passes[1].checkpoint_key is None
+
+
+def test_restore_ahead_goes_to_every_stage_but_this_one():
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.host, json.loads(request.content)))
+        return httpx.Response(200, json={"restored": True})
+
+    runtime = worker.WorkerRuntime.__new__(worker.WorkerRuntime)
+    runtime.worker_id, runtime.pool_token = "w1", "secret"
+    runtime.route = [SimpleNamespace(worker_id=name, url=f"http://{name}:1/") for name in ("w1", "w2", "w3")]
+
+    async def run():
+        runtime.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await runtime.restore_ahead(first_pass(length=300))
+        await runtime.client.aclose()
+
+    asyncio.run(run())
+    assert sorted(host for host, _ in seen) == ["w2", "w3"]
+    assert seen[0][1] == {"session_id": "s", "epoch": 1, "slot": 0, "key": "k", "length": 300}
