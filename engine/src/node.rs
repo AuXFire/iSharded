@@ -329,6 +329,19 @@ impl Node {
         }
     }
 
+    /// Tells the route that nothing here will finish. Id zero covers every pass at once, so
+    /// this needs no word from the compute thread, which may be the thing that hung.
+    pub fn refuser(&self) -> impl FnOnce(String) + Send + 'static {
+        let inner = self.inner.clone();
+        move |message| {
+            if let Some(ring) = inner.ring.read().clone() {
+                let nack = Nack { id: 0, epoch: ring.epoch, refusal: Refusal::FailedStage, stage: ring.index, message };
+                inner.counters.refusals.fetch_add(1, Ordering::Relaxed);
+                send_back(&inner, &ring, &nack.encode());
+            }
+        }
+    }
+
     pub fn close_ring(&self) {
         if let Some(old) = self.inner.ring.write().take() {
             old.shut();

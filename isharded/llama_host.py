@@ -29,7 +29,7 @@ from typing import Any
 import numpy as np
 import psutil
 
-from .deadlines import pass_seconds
+from .deadlines import PASS_SECONDS, PASS_SECONDS_PER_TOKEN, pass_seconds
 from .llamacpp import LlamaError, LlamaLibrary, LlamaStage, StageLost, TokenEmbedding
 from .statestore import HISTORY, PARTIAL, StateStore
 
@@ -59,6 +59,7 @@ LOADS = {"load", "load_draft", "load_projector"}
 # slow disk, and an image a long encode on a CPU. They get the time of a long prompt.
 SLOW = {"save", "restore", "state_adopt", "state_list", "measure_image", "encode_image"}
 SLOW_ROWS = 600
+PASS_MS, ROW_MS = round(PASS_SECONDS * 1000), round(PASS_SECONDS_PER_TOKEN * 1000)
 
 
 def seconds_for(operation: str, rows: int) -> float | None:
@@ -262,7 +263,9 @@ class _Host:
         if self.engine is None:
             return {"engine": False}, b""
         door = self.engine.listen(meta["host"], meta["port"])
-        self.engine.open(meta["epoch"], meta["index"], meta["count"], bytes.fromhex(meta["key"]), meta["ack_timeout_ms"], meta["silence_timeout_ms"])
+        # The engine's watchdog holds a pass to what this process holds a call to.
+        limits = (meta.get("pass_ms", PASS_MS), meta.get("row_ms", ROW_MS))
+        self.engine.open(meta["epoch"], meta["index"], meta["count"], bytes.fromhex(meta["key"]), meta["ack_timeout_ms"], meta["silence_timeout_ms"], *limits)
         return {"engine": True, **door}, b""
 
     def ring_connect(self, meta: dict[str, Any], _: bytes) -> Reply:
