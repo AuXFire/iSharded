@@ -46,6 +46,7 @@ THINKING_ROLES = frozenset({"planning", "coding", "verification"})
 TOOL_MODES = ("auto", "native", "prompt")
 TOOL_FENCE_TAGS = frozenset({"", "tool", "tools", "tool_call", "tool_calls", "toolcall", "json", "json5", "javascript", "js"})
 LOOPBACK_NAMES = frozenset({"localhost"})
+NO_TOOLS_STATUSES = (400, 404, 422, 501)
 
 SCHEMA = [
     """
@@ -74,6 +75,10 @@ class ProviderRefused(ValueError):
     pass
 
 
+class ToolsNotSupported(Exception):
+    pass
+
+
 def estimate_tokens(text: str) -> int:
     """A rough count, used only when a server does not report one."""
     return len(text) // 3 + 1
@@ -87,6 +92,17 @@ def is_loopback(url: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def api_root(url: str) -> str:
+    """A server's address, with /v1 added if it was given as a bare host."""
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ProviderRefused(f"{url!r} is not an http or https address")
+    if parts.username or parts.password or parts.query:
+        raise ProviderRefused("Put the key in an environment variable or a file, not in the address")
+    root = url.rstrip("/")
+    return root if parts.path.strip("/") else f"{root}/v1"
 
 
 def read_key(reference: str | None) -> str | None:
@@ -143,18 +159,18 @@ def strip_thinking(text: str) -> str:
 
 def balanced_span(text: str, start: int) -> int | None:
     """Where the JSON value opening at ``start`` closes, respecting strings."""
-    depth, quote, escaped = 0, None, False
+    depth, in_string, escaped = 0, False, False
     for index in range(start, len(text)):
         character = text[index]
-        if quote:
+        if in_string:
             if escaped:
                 escaped = False
             elif character == "\\":
                 escaped = True
-            elif character == quote:
-                quote = None
+            elif character == '"':
+                in_string = False
         elif character == '"':
-            quote = character
+            in_string = True
         elif character in "{[":
             depth += 1
         elif character in "}]":
@@ -218,7 +234,7 @@ def as_calls(value: Any, offered: frozenset[str]) -> list[ToolCall]:
     arguments = next((value[key] for key in ("arguments", "args", "parameters", "input") if key in value), {})
     if isinstance(arguments, str):
         arguments = loose_json(arguments) if arguments.strip() else {}
-    if arguments is None or not isinstance(arguments, dict):
+    if not isinstance(arguments, dict):
         return []
     return [ToolCall(name, arguments, str(value.get("id") or ""))]
 
@@ -298,14 +314,18 @@ class VisibleText:
         self.markers = ("<think>", "<tool_call>", "```", "{") if self.names else ("<think>",)
         self.held = ""
         self.state = "text"  # or think, tool, fence, code, bare
+        self.steps = {"text": self._text, "think": self._think, "tool": self._tool, "fence": self._fence, "code": self._code, "bare": self._bare}
 
     def feed(self, text: str) -> str:
         self.held += text
         released: list[str] = []
-        step = {"text": self._text, "think": self._think, "tool": self._tool, "fence": self._fence, "code": self._code, "bare": self._bare}
-        while self.held and step[self.state](released):
+        while self.held and self.steps[self.state](released):
             pass
         return "".join(released)
+
+    def _release(self, released: list[str], size: int) -> None:
+        released.append(self.held[:size])
+        self.held = self.held[size:]
 
     def _skip_past(self, marker: str) -> bool:
         end = self.held.find(marker)
@@ -325,13 +345,10 @@ class VisibleText:
     def _code(self, released: list[str]) -> bool:
         end = self.held.find("```")
         if end >= 0:
-            released.append(self.held[: end + 3])
-            self.held = self.held[end + 3 :]
+            self._release(released, end + 3)
             self.state = "text"
             return True
-        keep = self._partial("```")
-        released.append(self.held[: len(self.held) - keep])
-        self.held = self.held[len(self.held) - keep :]
+        self._release(released, len(self.held) - self._partial("```"))
         return False
 
     def _fence(self, released: list[str]) -> bool:
@@ -339,8 +356,7 @@ class VisibleText:
         if first_line < 0:
             return False
         if self.held[3:first_line].strip().lower() not in TOOL_FENCE_TAGS:
-            released.append(self.held[:first_line])
-            self.held = self.held[first_line:]
+            self._release(released, first_line)
             self.state = "code"
             return True
         end = self.held.find("```", first_line)
@@ -356,8 +372,7 @@ class VisibleText:
     def _bare(self, released: list[str]) -> bool:
         if self._may_be_calls():
             return False
-        released.append(self.held[0])  # only the brace, as a call can still start after it
-        self.held = self.held[1:]
+        self._release(released, 1)  # only the brace, as a call can still start after it
         self.state = "text"
         return True
 
@@ -386,20 +401,18 @@ class VisibleText:
         return 0
 
     def _text(self, released: list[str]) -> bool:
-        hits = [(self.held.find(marker), marker) for marker in self.markers if marker in self.held]
-        if hits:
-            start, marker = min(hits)
-            released.append(self.held[:start])
-            if marker in ("```", "{"):
-                self.held, self.state = self.held[start:], "fence" if marker == "```" else "bare"
-            else:
-                self.held = self.held[start + len(marker) :]
-                self.state = "think" if marker == "<think>" else "tool"
-            return True
-        keep = max(self._partial(marker) for marker in self.markers)
-        released.append(self.held[: len(self.held) - keep])
-        self.held = self.held[len(self.held) - keep :]
-        return False
+        hits = [(start, marker) for marker in self.markers if (start := self.held.find(marker)) >= 0]
+        if not hits:
+            self._release(released, len(self.held) - max(self._partial(marker) for marker in self.markers))
+            return False
+        start, marker = min(hits)
+        self._release(released, start)
+        if marker in ("```", "{"):
+            self.state = "fence" if marker == "```" else "bare"
+        else:
+            self.held = self.held[len(marker) :]
+            self.state = "think" if marker == "<think>" else "tool"
+        return True
 
     def flush(self) -> str:
         held, state = self.held, self.state
@@ -461,6 +474,15 @@ def plain_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, str]]:
     ]
 
 
+def gather_call(streamed: dict[int, dict[str, str]], call: dict[str, Any]) -> None:
+    """Add one streamed piece of a native tool call to the call it belongs to."""
+    held = streamed.setdefault(int(call.get("index") or 0), {"id": "", "name": "", "arguments": ""})
+    function = call.get("function") or {}
+    held["id"] = call.get("id") or held["id"]
+    held["name"] = function.get("name") or held["name"]
+    held["arguments"] += function.get("arguments") or ""
+
+
 class OpenAICompatible:
     """Any server with the OpenAI chat API."""
 
@@ -520,6 +542,15 @@ class OpenAICompatible:
 
     def _failed(self, response: httpx.Response) -> ProviderError:
         return ProviderError(f"{self.name} answered HTTP {response.status_code}: {self._clean(response.text)}")
+
+    def _post(self, path: str, body: dict[str, Any], read: float, doing: str) -> httpx.Response:
+        with self._client(read) as client:
+            try:
+                return client.post(f"{self.base_url}/{path}", json=body, headers=self._headers())
+            except httpx.TimeoutException:
+                raise ProviderError(f"{self.name} went silent while {doing}") from None
+            except httpx.HTTPError as error:
+                raise self._unreachable(error) from None
 
     def models(self) -> list[str]:
         cached = self._models
@@ -595,13 +626,7 @@ class OpenAICompatible:
     def _once(self, request: ModelRequest, model: str, native: bool) -> ModelReply:
         started = time.perf_counter()
         body = self._body(request, model, False, native)
-        with self._client(max(self.read_seconds, WHOLE_REPLY_SECONDS)) as client:
-            try:
-                response = client.post(f"{self.base_url}/chat/completions", json=body, headers=self._headers())
-            except httpx.TimeoutException:
-                raise ProviderError(f"{self.name} went silent while answering") from None
-            except httpx.HTTPError as error:
-                raise self._unreachable(error) from None
+        response = self._post("chat/completions", body, max(self.read_seconds, WHOLE_REPLY_SECONDS), "answering")
         if native and self.tool_mode == "auto" and response.status_code in NO_TOOLS_STATUSES:
             raise ToolsNotSupported
         if response.status_code != 200:
@@ -612,23 +637,23 @@ class OpenAICompatible:
         except (ValueError, KeyError, IndexError, TypeError):
             raise ProviderError(f"{self.name} sent a reply that could not be read") from None
         raw = str(message.get("content") or "")
+        answered_by = payload.get("model") or model
+        return self._reply(raw, message.get("tool_calls") or [], request, body, payload.get("usage") or {}, answered_by, started)
+
+    def _reply(
+        self, raw: str, native_calls: list[Any], request: ModelRequest, body: dict[str, Any], usage: dict[str, Any], model: Any, started: float
+    ) -> ModelReply:
         text, calls = parse_tool_calls(raw, request.tools)
-        native_calls = self._native_calls(message, request.tools)
-        usage = payload.get("usage") or {}
+        found = as_calls(native_calls, frozenset(tool.name for tool in request.tools))
         return ModelReply(
             text=text,
-            tool_calls=tuple(native_calls) or calls,
-            model=str(payload.get("model") or model),
+            tool_calls=tuple(found) or calls,
+            model=str(model),
             provider=self.name,
-            prompt_tokens=int(usage.get("prompt_tokens") or sum(estimate_tokens(str(item.get("content") or "")) for item in body["messages"])),
+            prompt_tokens=int(usage.get("prompt_tokens") or sum(estimate_tokens(item["content"]) for item in body["messages"])),
             completion_tokens=int(usage.get("completion_tokens") or estimate_tokens(raw)),
             seconds=time.perf_counter() - started,
         )
-
-    @staticmethod
-    def _native_calls(message: dict[str, Any], tools: Sequence[Capability]) -> list[ToolCall]:
-        names = frozenset(tool.name for tool in tools)
-        return as_calls(message.get("tool_calls") or [], names)
 
     def stream(self, request: ModelRequest, model: str) -> Iterator[str | ModelReply]:
         """Text as it comes, then the finished ModelReply last."""
@@ -668,11 +693,7 @@ class OpenAICompatible:
                                 parts.append(piece)
                                 yield piece
                             for call in delta.get("tool_calls") or []:
-                                held = streamed.setdefault(int(call.get("index") or 0), {"id": "", "name": "", "arguments": ""})
-                                function = call.get("function") or {}
-                                held["id"] = call.get("id") or held["id"]
-                                held["name"] = function.get("name") or held["name"]
-                                held["arguments"] += function.get("arguments") or ""
+                                gather_call(streamed, call)
                             finished = finished or bool(choice.get("finish_reason"))
             except httpx.TimeoutException:
                 raise ProviderError(f"{self.name} went silent for {self.read_seconds:.0f} s") from None
@@ -684,18 +705,7 @@ class OpenAICompatible:
             return
         if not finished:
             raise ProviderError(f"{self.name} stopped before finishing its reply")
-        raw = "".join(parts)
-        text, calls = parse_tool_calls(raw, request.tools)
-        native_calls = as_calls([streamed[index] for index in sorted(streamed)], frozenset(tool.name for tool in request.tools))
-        yield ModelReply(
-            text=text,
-            tool_calls=tuple(native_calls) or calls,
-            model=str(answered_by),
-            provider=self.name,
-            prompt_tokens=int(usage.get("prompt_tokens") or sum(estimate_tokens(item["content"]) for item in body["messages"])),
-            completion_tokens=int(usage.get("completion_tokens") or estimate_tokens(raw)),
-            seconds=time.perf_counter() - started,
-        )
+        yield self._reply("".join(parts), [streamed[index] for index in sorted(streamed)], request, body, usage, answered_by, started)
 
     def _events(self, response: httpx.Response) -> Iterator[dict[str, Any] | None]:
         for line in response.iter_lines():
@@ -709,22 +719,17 @@ class OpenAICompatible:
                 event = json.loads(data)
             except ValueError:
                 continue  # a keep-alive or a comment
-            if isinstance(event, dict) and event.get("error"):
+            if not isinstance(event, dict):
+                continue
+            if event.get("error"):
                 # Headers are long gone by now, so failures travel in the stream.
                 error = event["error"]
                 detail = error.get("message") if isinstance(error, dict) else error
                 raise ProviderError(f"{self.name} failed partway: {self._clean(str(detail))}")
-            if isinstance(event, dict):
-                yield event
+            yield event
 
     def embed(self, model: str, texts: Sequence[str]) -> list[list[float]]:
-        with self._client(self.read_seconds) as client:
-            try:
-                response = client.post(f"{self.base_url}/embeddings", json={"model": model, "input": list(texts)}, headers=self._headers())
-            except httpx.TimeoutException:
-                raise ProviderError(f"{self.name} went silent while embedding") from None
-            except httpx.HTTPError as error:
-                raise self._unreachable(error) from None
+        response = self._post("embeddings", {"model": model, "input": list(texts)}, self.read_seconds, "embedding")
         if response.status_code != 200:
             raise self._failed(response)
         try:
@@ -732,13 +737,6 @@ class OpenAICompatible:
             return [[float(value) for value in row["embedding"]] for row in rows]
         except (ValueError, KeyError, TypeError):
             raise ProviderError(f"{self.name} sent embeddings that could not be read") from None
-
-
-NO_TOOLS_STATUSES = (400, 404, 422, 501)
-
-
-class ToolsNotSupported(Exception):
-    pass
 
 
 class MeshProvider(OpenAICompatible):
@@ -753,7 +751,6 @@ class MeshProvider(OpenAICompatible):
     streams_tool_calls = True
 
     def __init__(self, name: str, base_url: str, key_env_or_file: str | None = None, reach: Reach = Reach.POOL, **options: Any) -> None:
-        options.setdefault("tool_mode", "auto")
         super().__init__(name, base_url, key_env_or_file, reach, **options)
 
     def _body(self, request: ModelRequest, model: str, stream: bool, native: bool) -> dict[str, Any]:
@@ -766,17 +763,6 @@ class MeshProvider(OpenAICompatible):
             if isinstance(item, ModelReply):
                 return item
         raise ProviderError(f"{self.name} stopped before finishing its reply")
-
-
-def api_root(url: str) -> str:
-    """A server's address, with /v1 added if it was given as a bare host."""
-    parts = urlsplit(url)
-    if parts.scheme not in ("http", "https") or not parts.hostname:
-        raise ProviderRefused(f"{url!r} is not an http or https address")
-    if parts.username or parts.password or parts.query:
-        raise ProviderRefused("Put the key in an environment variable or a file, not in the address")
-    root = url.rstrip("/")
-    return root if parts.path.strip("/") else f"{root}/v1"
 
 
 class Providers:
