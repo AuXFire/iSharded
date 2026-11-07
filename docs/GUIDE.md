@@ -637,7 +637,7 @@ With real processes, as three nodes on one machine started with `isharded node`,
 | `--location` | Set it on Tailscale, on a LAN, behind a relay, or in a cloud | The address cannot show the right country there |
 | `--gguf-dir` | Point it at LM Studio's or your own model folder | Files there are read locally, not downloaded |
 
-The entry node also carries the draft model. The planner reserves its file, 512 MiB of working space, and its cache: one context for each slot, plus one more for guesses. That comes out of the entry's VRAM before any weights, so the entry's weights spill first. If you want it on a particular machine, pin that machine with `--entry`.
+The entry node also carries the draft model. The planner reserves its file, 512 MiB of working space, and its cache: one context for each slot, plus one more for guesses. That comes out of the entry's VRAM before any weights, so the entry's weights spill first. If the pool has no room for all of that, a draft chosen automatically is left out, and a draft you named refuses the load. If you want it on a particular machine, pin that machine with `--entry`.
 
 ### Load settings
 

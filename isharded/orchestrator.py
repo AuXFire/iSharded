@@ -146,6 +146,8 @@ RESTART_WAIT_SECONDS = 30.0
 MAX_ROUTE_MOVES = 8
 # New streams a reply may open while recovering, before going one token at a time.
 STREAM_ATTEMPTS = 6
+# How a kept connection fails when the far side closed it, or a router forgot it.
+BROKEN_CONNECTION = (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError)
 DRAIN_WAIT_SECONDS = 45.0
 # Long enough for a planned move to finish, for a reply that arrives during one.
 MOVE_WAIT_SECONDS = 90.0
@@ -403,6 +405,16 @@ def draft_cache_bytes(draft: DraftModel, context_tokens: int, slots: int) -> int
     """
     cells = context_tokens * (slots + 1)
     return draft.kv_bytes_per_token * cells + draft.state_bytes * 2 * slots
+
+
+def drop_draft(target: ModelTarget) -> None:
+    """Take a draft and all it reserves out of a plan. The stages then keep no guesses."""
+    assert target.draft is not None
+    profile = target.profile
+    profile.entry_extra_bytes -= target.draft.file_size + DRAFT_WORKSPACE_BYTES + draft_cache_bytes(target.draft, profile.context_tokens, target.slots)
+    profile.state_bytes = [target.adapter.recurrent_state_bytes(layer) * target.slots for layer in range(profile.num_layers)]
+    profile.snapshot_bytes = []
+    target.draft, target.speculate_tokens = None, 0
 
 
 def holders_of(sources: dict[str, list[str]], model: str) -> list[str]:
@@ -1451,6 +1463,11 @@ class Orchestrator:
         try:
             return self.plan(target, **options)
         except PlacementError as exc:
+            if target.draft is not None and target.request is not None and target.request.draft_model == "auto":
+                # A draft nobody asked for must never cost a model its load.
+                self.add_event("rebalance", "Planning without a draft", f"{target.model_id} has no room for {target.draft.file} and its cache")
+                drop_draft(target)
+                return self.plan_or_refuse(target, **options)
             raise HTTPException(status_code=507, detail=str(exc)) from exc
 
     def _keep_stages(
@@ -2264,7 +2281,7 @@ class Orchestrator:
                     timeout=httpx.Timeout(seconds, connect=10.0),
                 )
             except httpx.HTTPError as exc:
-                problem = {"failed_worker": entry.worker_id, "message": str(exc)}
+                problem = {"lost" if isinstance(exc, BROKEN_CONNECTION) else "failed_worker": entry.worker_id, "message": str(exc)}
             else:
                 if response.is_success:
                     return response.json()

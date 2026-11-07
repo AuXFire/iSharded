@@ -2565,3 +2565,26 @@ def test_there_is_nothing_to_warm_on_some_routes(epoch, embedding, replying) -> 
 
     asyncio.run(run())
     assert not seen
+
+
+def test_an_answer_lost_to_a_broken_connection_asks_before_it_blames() -> None:
+    """A kept connection can break under a healthy entry. Its model should not move for that."""
+    orchestrator = pool(one=record("one"))
+    orchestrator.route, orchestrator.epoch = [stage("one", 0, 1)], 3
+    posts = []
+
+    def handler(request):
+        if request.url.path == "/health":
+            return httpx.Response(200, json={})
+        posts.append(request)
+        if len(posts) == 1:
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        return httpx.Response(200, json={"done": True})
+
+    async def run():
+        orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        return await orchestrator.ask_entry("/v1/embed", {}, 5.0)
+
+    assert asyncio.run(run()) == {"done": True}
+    assert len(posts) == 2 and not orchestrator.workers["one"].quarantined
+    done(orchestrator)

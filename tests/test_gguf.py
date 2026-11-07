@@ -1484,3 +1484,41 @@ def test_a_recurrent_model_counts_its_snapshots_while_guessing(local_model, tmp_
     assert target.profile.snapshot_bytes == [state * (5 + 2) * 3 for state in held]
     plain = orchestrator.build_target(LoadModelRequest(model_id=str(local_model), draft_model="none", parallel=3))
     assert not any(plain.profile.snapshot_bytes)
+
+
+def draft_that_leaves_no_room(local_model, tmp_path, monkeypatch, choice):
+    """A draft whose cache is far larger than anything on offer, on a model that fits without it."""
+    from isharded import orchestrator
+    from isharded.models import GgufAdapter
+    from isharded.protocol import LoadModelRequest
+
+    monkeypatch.setattr(GgufAdapter, "recurrent_state_bytes", lambda self, layer: 1000)
+    draft = tmp_path / "draft.gguf"
+    draft.write_bytes(build_file())
+    request = LoadModelRequest(model_id=str(local_model), draft_model=str(draft), context_tokens=262144, parallel=4)
+    target = orchestrator.build_target(request)
+    target.request = request.model_copy(update={"draft_model": choice})
+    ram = MemoryPool(pool_id="ram", kind="ram", device="cpu", capacity_group="ram", budget_bytes=2**40, free_bytes=2**40, bandwidth_gbps=30, dtype="bfloat16")
+    ram.budget_bytes = ram.free_bytes = target.profile.total_bytes + sum(target.profile.context_bytes(layer) for layer in range(target.profile.num_layers)) + 200 * 2**20
+    assert target.profile.entry_extra_bytes > ram.budget_bytes
+    node = orchestrator.Orchestrator()
+    node.plan = lambda target, **options: plan_placement([Candidate(worker_id="w", url="http://w", pools=[ram])], [], target.profile)
+    return node, target
+
+
+def test_an_automatic_draft_that_leaves_the_model_no_room_goes_without(local_model, tmp_path, monkeypatch):
+    node, target = draft_that_leaves_no_room(local_model, tmp_path, monkeypatch, "auto")
+    state = target.adapter.recurrent_state_bytes(0) * target.slots
+    assert node.plan_or_refuse(target)
+    assert target.draft is None and target.speculate_tokens == 0
+    assert target.profile.entry_extra_bytes == 0 and not any(target.profile.snapshot_bytes)
+    assert set(target.profile.state_bytes) == {state}
+
+
+def test_a_named_draft_that_leaves_the_model_no_room_is_refused(local_model, tmp_path, monkeypatch):
+    from fastapi import HTTPException
+
+    node, target = draft_that_leaves_no_room(local_model, tmp_path, monkeypatch, "named")
+    with pytest.raises(HTTPException) as refused:
+        node.plan_or_refuse(target)
+    assert refused.value.status_code == 507 and target.draft is not None
