@@ -386,6 +386,9 @@ fn connect(inner: &Arc<Inner>, links: &Links) -> Result<bool, String> {
         let peer = Peer::new(link, ring.index + 1, false);
         *ring.next.lock() = Some(peer.clone());
         start_peer(inner, &ring, &peer);
+        if peer.lost.load(Ordering::Acquire) {
+            return Err("the link to the next stage could not start".to_string());
+        }
     }
     let mut closing = false;
     if let Some(entry) = &links.entry {
@@ -393,7 +396,7 @@ fn connect(inner: &Arc<Inner>, links: &Links) -> Result<bool, String> {
             let peer = Peer::new(link, 0, true);
             *ring.closing.lock() = Some(peer.clone());
             start_peer(inner, &ring, &peer);
-            closing = true;
+            closing = !peer.lost.load(Ordering::Acquire);
         }
     }
     Ok(closing)
@@ -559,23 +562,27 @@ fn send_back(inner: &Inner, ring: &Ring, frame: &[u8]) {
 fn start_peer(inner: &Arc<Inner>, ring: &Arc<Ring>, peer: &Arc<Peer>) {
     // A ping leaves at most a third of the limit after the peer was last heard, so a write
     // stuck on it still fails inside the limit, and the watcher is back on watch.
-    if let Err(error) = peer.link.limit_writes(ring.silence_timeout * 2 / 3) {
-        peer_lost(inner, ring, peer, &error.to_string());
-        return;
-    }
+    let limited = peer.link.limit_writes(ring.silence_timeout * 2 / 3);
     let reading = (inner.clone(), ring.clone(), peer.clone());
-    let spawned = thread::Builder::new().name("isharded-peer".into()).spawn(move || {
-        let (inner, ring, peer) = reading;
-        read_peer(&inner, &ring, &peer);
-        peer_lost(&inner, &ring, &peer, "the link closed");
-    });
-    drop(spawned);
     let watching = (inner.clone(), ring.clone(), peer.clone());
-    let spawned = thread::Builder::new().name("isharded-watch".into()).spawn(move || {
-        let (inner, ring, peer) = watching;
-        watch_peer(&inner, &ring, &peer);
-    });
-    drop(spawned);
+    let started = limited
+        .and_then(|()| {
+            spawn("isharded-peer", move || {
+                let (inner, ring, peer) = reading;
+                read_peer(&inner, &ring, &peer);
+                peer_lost(&inner, &ring, &peer, "the link closed");
+            })
+        })
+        .and_then(|_| {
+            spawn("isharded-watch", move || {
+                let (inner, ring, peer) = watching;
+                watch_peer(&inner, &ring, &peer);
+            })
+        });
+    // A peer nobody reads or watches would fail in silence.
+    if let Err(error) = started {
+        peer_lost(inner, ring, peer, &error.to_string());
+    }
 }
 
 fn read_peer(inner: &Inner, ring: &Ring, peer: &Peer) {
@@ -812,5 +819,49 @@ mod tests {
         let (socket, _) = listener.accept().unwrap();
         with_spawns(0, || admit(&node.inner, socket, false));
         assert_eq!(node.inner.strangers.load(Ordering::Acquire), 0);
+    }
+
+    fn stage(index: u16) -> (Node, Address) {
+        let node = Node::new().unwrap();
+        node.listen("127.0.0.1", 0).unwrap();
+        node.open(Plan { epoch: 1, index, count: 2, key: vec![7], ack_timeout_ms: 60_000, silence_timeout_ms: 60_000 });
+        let listening = node.inner.listening.lock();
+        let door = listening.as_ref().unwrap();
+        let address = Address { address: format!("127.0.0.1:{}", door.port), fingerprint: door.fingerprint.clone() };
+        drop(listening);
+        (node, address)
+    }
+
+    #[test]
+    fn a_next_stage_with_no_reader_or_no_watcher_is_lost() {
+        for spawns in [0, 1] {
+            let (near, _) = stage(0);
+            let (_far, door) = stage(1);
+            let links = Links { next: Some(door), entry: None, timeout_ms: 3000 };
+            assert!(with_spawns(spawns, || near.connect(links)).is_err());
+            let stats = near.stats();
+            assert!(!stats.next_up);
+            assert_eq!(stats.refusals, 1);
+        }
+    }
+
+    #[test]
+    fn a_next_stage_with_both_threads_is_up() {
+        let (near, _) = stage(0);
+        let (_far, door) = stage(1);
+        let links = Links { next: Some(door), entry: None, timeout_ms: 3000 };
+        assert_eq!(with_spawns(2, || near.connect(links)), Ok(false));
+        assert!(near.stats().next_up);
+    }
+
+    #[test]
+    fn a_closing_link_with_no_thread_costs_nothing_but_speed() {
+        let (last, _) = stage(1);
+        let (_entry, door) = stage(0);
+        let links = Links { next: None, entry: Some(door), timeout_ms: 3000 };
+        assert_eq!(with_spawns(1, || last.connect(links)), Ok(false));
+        let stats = last.stats();
+        assert!(!stats.closing_up);
+        assert_eq!(stats.refusals, 0);
     }
 }
