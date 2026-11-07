@@ -139,6 +139,9 @@ class ModelProfile:
     attention_interval: int = 0
     # What the entry stage must also hold, such as a draft model and its cache.
     entry_extra_bytes: int = 0
+    # What the draft reads for each guess, counted on the entry stage's memory. Zero
+    # leaves it out: no GPU run has yet shown that a guess takes its time from that stage.
+    draft_bytes: int = 0
     # Per layer, the RAM a stage keeps for rewinding a recurrent model. Empty if it keeps none.
     snapshot_bytes: list[int] = field(default_factory=list)
     # Tokens a plan has to earn back its download over. Zero ignores downloads.
@@ -344,6 +347,8 @@ def _pack(
                     UnitPlacement(unit=item.unit.name, pool_id=pool.pool_id, bytes=size, compact=compact)
                 )
                 milliseconds += _read_ms(size, item.active, pool, compact)
+                if item.entry_bytes:  # the draft sits beside the entry's first layer, on its device
+                    milliseconds += _read_ms(profile.draft_bytes, 1.0, pool, False)
                 break
         else:
             return None
