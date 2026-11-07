@@ -4,6 +4,9 @@ PyTorch and llama.cpp each load their own OpenMP runtime, and the two abort when
 they meet in a process. Keeping them apart also means a native crash cannot take
 the worker with it, and that unloading is a process exit that frees everything.
 
+A draft model shares its stage's process, on a connection and a thread of its own. Two
+processes on one GPU take turns on it, and this way both run in one CUDA context.
+
 This module must not import torch, directly or through other iSharded modules.
 """
 
@@ -178,19 +181,22 @@ class _Host:
         return {"tokens": self.stage.verify(hidden, meta["position"], **sampling)}, b""
 
     def load_draft(self, meta: dict[str, Any], _: bytes) -> Reply:
+        slots = meta.get("slots", 1)
         self.library = LlamaLibrary.load(meta["folder"], tuple(meta["extra_paths"]))
         self.stage = LlamaStage(
             self.library,
             meta["path"],
             last=True,
-            context_tokens=meta["context_tokens"],
+            # Every slot has a scratch sequence, but a copy shares its cells, so scratch
+            # needs only room for guesses and the shared cache stays the size it was.
+            context_tokens=meta["context_tokens"] * (slots + 1) // (2 * slots),
             gpu_layers=meta["gpu_layers"],
             threads=meta["threads"],
-            sequences=meta.get("slots", 1) + 1,
+            sequences=2 * slots,
             unified_cache=True,
             map_file=False,
         )
-        self.scratch = meta.get("slots", 1)
+        self.scratch = slots
         self.states = StateStore(None, DRAFT_STATE_BYTES, 0)
         return {}, b""
 
@@ -217,7 +223,10 @@ class _Host:
 
     def guess(self, meta: dict[str, Any], _: bytes) -> Reply:
         assert self.stage is not None
-        tokens = self.stage.guess(meta["commit"], meta["position"], meta["count"], meta.get("slot", 0), self.scratch)
+        slot = meta.get("slot", 0)
+        tokens = self.stage.guess(
+            meta["commit"], meta["position"], meta["count"], slot, self.scratch + slot, meta.get("fresh", ()), meta.get("restart", True)
+        )
         return {"tokens": tokens}, b""
 
     @property
@@ -244,10 +253,33 @@ class _Host:
     def ring_stats(self, _: dict[str, Any], __: bytes) -> Reply:
         return ({} if self.engine is None else self.engine.stats()), b""
 
+    def shut(self) -> None:
+        self.states.close()
+
+
+class _Beside(_Host):
+    """A second model in a stage's process. That process outlives it, so it frees what it holds."""
+
+    def shut(self) -> None:
+        super().shut()
+        if self.stage is not None:
+            self.stage.close()
+            self.stage = None
+
+
+def beside(address: Any, key: bytes) -> None:
+    host = _Beside()
+    try:
+        serve(Client(address, authkey=key), host, address, key)
+    finally:
+        host.shut()
+
 
 def run(address: Any, key: bytes) -> None:
-    connection = Client(address, authkey=key)
-    host = _Host()
+    serve(Client(address, authkey=key), _Host(), address, key)
+
+
+def serve(connection: Connection, host: _Host, address: Any, key: bytes) -> None:
     while True:
         try:
             meta = json.loads(connection.recv_bytes())
@@ -256,10 +288,16 @@ def run(address: Any, key: bytes) -> None:
             return  # the worker went away, so this stage has no purpose left
         operation = meta.pop("op")
         if operation == "close":
-            host.states.close()
+            host.shut()
             connection.send_bytes(b'{"ok":true}')
             connection.send_bytes(b"")
             return
+        if operation == "channel":
+            # It connects from a thread, because the worker only accepts once it has this answer.
+            threading.Thread(target=beside, args=(address, key), daemon=True).start()
+            connection.send_bytes(b'{"ok":true}')
+            connection.send_bytes(b"")
+            continue
         try:
             # The engine runs passes on its own threads, and llama.cpp allows one at a time.
             engine = None if operation in UNGATED else host.engine
@@ -277,32 +315,13 @@ def run(address: Any, key: bytes) -> None:
             connection.send_bytes(b"")
 
 
-class StageHost:
-    """The worker's handle on a stage process."""
+class Channel:
+    """One connection to a stage process, which runs one exchange at a time."""
 
-    def __init__(self) -> None:
-        key = secrets.token_bytes(32)
-        self.listener = Listener(authkey=key)
-        environment = {**os.environ, KEY_VARIABLE: key.hex()}
-        package_root = str(Path(__file__).resolve().parents[1])
-        environment["PYTHONPATH"] = os.pathsep.join(filter(None, [package_root, environment.get("PYTHONPATH")]))
-        self.process = subprocess.Popen(
-            [sys.executable, "-m", "isharded.llama_host", json.dumps(self.listener.address)],
-            env=environment,
-            stdin=subprocess.DEVNULL,
-        )
-        self.connection = self._accept()
+    def __init__(self, process: subprocess.Popen[bytes], connection: Connection) -> None:
+        self.process = process
+        self.connection = connection
         self.lock = threading.Lock()
-
-    def _accept(self) -> Connection:
-        accepted: list[Connection] = []
-        thread = threading.Thread(target=lambda: accepted.append(self.listener.accept()), daemon=True)
-        thread.start()
-        thread.join(CONNECT_SECONDS)
-        if not accepted:
-            self.process.kill()
-            raise LlamaError(f"the stage process did not start (exit code {self.process.poll()})")
-        return accepted[0]
 
     def _exchange(self, operation: str, payload: bytes, meta: dict[str, Any]) -> Reply:
         try:
@@ -328,6 +347,54 @@ class StageHost:
             return self._exchange(operation, b"", meta)[0]
         finally:
             self.lock.release()
+
+    def close(self) -> None:
+        try:
+            self.call("close")
+        except LlamaError:
+            pass
+        self.connection.close()
+
+
+class StageHost(Channel):
+    """The worker's handle on a stage process."""
+
+    def __init__(self) -> None:
+        key = secrets.token_bytes(32)
+        self.listener = Listener(authkey=key)
+        environment = {**os.environ, KEY_VARIABLE: key.hex()}
+        package_root = str(Path(__file__).resolve().parents[1])
+        environment["PYTHONPATH"] = os.pathsep.join(filter(None, [package_root, environment.get("PYTHONPATH")]))
+        self.process = subprocess.Popen(
+            [sys.executable, "-m", "isharded.llama_host", json.dumps(self.listener.address)],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+        )
+        try:
+            super().__init__(self.process, self._accept())
+        except LlamaError:
+            self.process.kill()
+            raise
+
+    def channel(self) -> Channel:
+        """Another connection to this process, with a thread and a handler of its own.
+
+        A pass runs on the engine's thread and ctypes lets go of the GIL, so a model on a
+        channel works beside the stage. The stage's gate does not cover it and need not:
+        they are separate models and contexts. A crash in either still takes both.
+        """
+        with self.lock:
+            self._exchange("channel", b"", {})
+            return Channel(self.process, self._accept())
+
+    def _accept(self) -> Connection:
+        accepted: list[Connection] = []
+        thread = threading.Thread(target=lambda: accepted.append(self.listener.accept()), daemon=True)
+        thread.start()
+        thread.join(CONNECT_SECONDS)
+        if not accepted:
+            raise LlamaError(f"the stage process did not start (exit code {self.process.poll()})")
+        return accepted[0]
 
     def close(self) -> None:
         try:

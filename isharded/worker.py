@@ -85,6 +85,7 @@ from .gguf_stage import (
     GgufStage,
     ImageEncoder,
     PromptPlan,
+    draft_apart,
     next_guess_count,
     plan_prompt,
 )
@@ -659,12 +660,14 @@ class WorkerRuntime:
     def _load_draft(self, request: ConfigureRequest, folder: str, threads: int) -> None:
         """Speculation only speeds things up, so a draft that fails must not stop the load."""
         self.speculate_tokens = request.speculate_tokens
+        self.draft_request = None  # a stage restart must not bring back the last model's draft
         if request.draft is None or request.assignment.start_layer != 0:
             return
         self.draft_request = (request, folder, threads)
         try:
             path = self._draft_file(request.draft)
-            self.draft = DraftModel(folder, rocm_library_paths(), path, request.context_tokens, threads, request.slots)
+            beside = None if self.gguf is None or draft_apart() else self.gguf.host
+            self.draft = DraftModel(folder, rocm_library_paths(), path, request.context_tokens, threads, request.slots, beside)
         except (LlamaError, WeightSourceError, httpx.HTTPError, OSError, ValueError) as exc:
             self.last_error = f"draft model unavailable, running without it: {exc}"
 
@@ -704,6 +707,7 @@ class WorkerRuntime:
                 return retry
             self.last_error = str(lost)
             self.caches.clear()
+            draft = self.draft
             try:
                 assert self.gguf is not None
                 await asyncio.to_thread(self.gguf.respawn)
@@ -711,17 +715,38 @@ class WorkerRuntime:
                 self.last_error = f"stage would not restart: {exc}"
                 return HTTPException(status_code=500, detail=self.last_error)
             self.stage_restarts += 1
+        if self.draft_request is not None and not draft_apart():
+            await self.replace_draft(lost, draft)  # it lived in that process
         return retry
 
-    async def replace_draft(self, reason: Exception) -> RuntimeError:
-        """A draft is only an accelerator: lose it, try for another, and replay without it."""
-        self.last_error = f"draft model lost: {reason}"
-        draft, self.draft = self.draft, None
-        if draft is not None:
-            await asyncio.to_thread(draft.close)
-        if self.draft_request is not None:
-            await asyncio.to_thread(self._load_draft, *self.draft_request)
-        return RuntimeError("the draft model was lost; replaying without it")
+    async def replace_draft(self, reason: Exception, failed: DraftModel | None = None) -> RuntimeError:
+        """A draft is only an accelerator: lose it, try for another, and replay without it.
+
+        Every reply on a dead draft ends up here, and only the first should load a new one.
+        A draft that shares a stage's process holds memory there until it is closed.
+        """
+        lost = RuntimeError("the draft model was lost; replaying without it")
+        async with self.replacing:
+            if failed is not None and failed is not self.draft:
+                return lost
+            self.last_error = f"draft model lost: {reason}"
+            draft, self.draft = self.draft, None
+            if draft is not None:
+                await asyncio.to_thread(draft.close)
+            if self.draft_request is not None:
+                await asyncio.to_thread(self._load_draft, *self.draft_request)
+        return lost
+
+    async def draft_failed(self, reason: LlamaError, draft: DraftModel) -> Exception:
+        """What a reply raises for a draft that failed.
+
+        A draft in the stage's process often hears first when that process dies. That is a
+        lost stage, which asks for a replay, and not a lost draft, which ends the stream.
+        """
+        shared = self.gguf is not None and draft.host.process is self.gguf.host.process
+        if isinstance(reason, StageLost) and shared and draft is self.draft:
+            return StageLost(str(reason), self.gguf.host)
+        return await self.replace_draft(reason, draft)
 
     @staticmethod
     def _stage_signature(request: ConfigureRequest) -> tuple[Any, ...]:
@@ -2345,29 +2370,26 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
         try:
             await prepared
         except LlamaError as exc:
-            raise await runtime.replace_draft(exc) from exc
+            raise await runtime.draft_failed(exc, draft) from exc
         history = [*body.input_ids, token]
         produced = 1
         ahead = min(INITIAL_GUESSES, runtime.speculate_tokens)
         following = request.model_copy(update=GOING_ON)
 
-        async def draft_guesses(text: list[int], count: int) -> list[int]:
+        async def draft_guesses(fresh: list[int], count: int) -> list[int]:
             started = time.perf_counter()
             try:
-                guesses = await asyncio.to_thread(draft.guess, text, count, request.slot)
+                guesses = await asyncio.to_thread(draft.guess, fresh, count, request.slot)
             except LlamaError as exc:
-                raise await runtime.replace_draft(exc) from exc
+                raise await runtime.draft_failed(exc, draft) from exc
             runtime._record("draft", started)
             return guesses
 
-        async def next_guess(text: list[int]) -> int:
-            return (await draft_guesses(text, 1))[0]
+        async def next_guess(fresh: list[int]) -> int:
+            return (await draft_guesses(fresh, 1))[0]
 
         async def rewind_draft(keep: int) -> None:
-            try:
-                await asyncio.to_thread(draft.rewind, keep, request.slot)
-            except LlamaError as exc:
-                raise await runtime.replace_draft(exc) from exc
+            draft.rewind(keep, request.slot)
 
         pipe: Pipeline | None = None
         while produced < body.max_tokens and token not in stops:
@@ -2390,6 +2412,7 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
                         guess=next_guess,
                         rewind=rewind_draft,
                         sharing=lambda: runtime.gate.size - len(runtime.gate.free),
+                        told=draft.seen(request.slot),
                     )
                     runtime.pipes[request.slot] = pipe
                 made, misses = pipe.tokens_made, pipe.misses
@@ -2406,7 +2429,7 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
                 pipe = None
                 del runtime.pipes[request.slot]
             drafting = way == GUESSED
-            guesses = await draft_guesses(history, min(ahead, room)) if drafting else []
+            guesses = await draft_guesses(history[draft.seen(request.slot) :], min(ahead, room)) if drafting else []
             result = await reply_step(
                 following.model_copy(update={"input_ids": [token, *guesses], "verify": drafting, "rollback_to": len(history) - 1})
             )
@@ -2422,6 +2445,8 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
                 if token in stops:
                     return
             history.extend(accepted)
+            if drafting:
+                draft.rewind(len(history) - 1, request.slot)  # the newest token is the model's own
 
     async def tokens() -> AsyncIterator[bytes]:
         request = InferRequest(**body.model_dump(exclude={"max_tokens", "stop_token_ids", "checkpoint_at", "cut_token", "images"}))

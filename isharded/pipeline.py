@@ -49,7 +49,11 @@ class Flight:
 
 
 class Pipeline:
-    """One reply's passes on a route. ``history`` is the reply so far, and grows here."""
+    """One reply's passes on a route. ``history`` is the reply so far, and grows here.
+
+    ``guess`` hears only the tokens the draft has not seen, and ``told`` is how much it had
+    seen at the start, so a guess costs the same however long the reply is.
+    """
 
     def __init__(
         self,
@@ -63,6 +67,7 @@ class Pipeline:
         guess: Callable[[list[int]], Awaitable[int]],
         rewind: Callable[[int], Awaitable[None]],
         sharing: Callable[[], int] = lambda: 1,
+        told: int = 0,
     ) -> None:
         self.history = history
         self.room = room
@@ -74,6 +79,7 @@ class Pipeline:
         self.guess = guess
         self.rewind = rewind
         self.sharing = sharing
+        self.told = told
         self.flights: deque[Flight] = deque()
         self.right = FIRST_RIGHT
         self.trip: float | None = None
@@ -108,22 +114,25 @@ class Pipeline:
         answer = self.send(token, position, rollback_to)
         self.flights.append(Flight(token, position, answer, time.perf_counter(), not self.flights))
 
-    def _text(self) -> list[int]:
-        """The reply as it stands if every guess out there lands."""
+    def _fresh(self) -> list[int]:
+        """What the draft has not seen of the reply as it stands if every guess out there lands."""
+        if self.wrong_from is not None:
+            self.told = min(self.told, self.wrong_from)
+        told, self.told = self.told, self.flights[-1].position + 1
         known = len(self.history)
-        return self.history + [flight.token for flight in self.flights if flight.position >= known]
+        return self.history[told:] + [flight.token for flight in self.flights if flight.position >= max(known, told)]
 
-    async def _next_guess(self, text: list[int]) -> int:
+    async def _next_guess(self, fresh: list[int]) -> int:
         if self.wrong_from is not None:
             keep, self.wrong_from = self.wrong_from, None
             await self.rewind(keep)
-        return await self.guess(text)
+        return await self.guess(fresh)
 
     def _guess_on(self) -> None:
         """Starts the next guess, if the route has room for one."""
         if self.guessing is None and not self.ending and len(self.flights) < min(self.depth(), self.room):
             self.guessing_for = (self.misses, self.flights[-1].position)
-            self.guessing = asyncio.ensure_future(self._next_guess(self._text()))
+            self.guessing = asyncio.ensure_future(self._next_guess(self._fresh()))
 
     def _take_guess(self) -> None:
         assert self.guessing is not None

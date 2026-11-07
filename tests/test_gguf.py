@@ -715,6 +715,255 @@ def test_draft_guesses_extend_from_committed_text():
         host.close()
 
 
+class RecordingHost:
+    """Stands in for a draft's stage process, and remembers what it was asked."""
+
+    def __init__(self):
+        self.calls = []
+        self.next = 100
+
+    def call(self, operation, payload=b"", **meta):
+        self.calls.append((operation, meta))
+        tokens = list(range(self.next, self.next + meta.get("count", 0)))
+        self.next += len(tokens)
+        return {"tokens": tokens}, b""
+
+
+def recording_draft(slots=1):
+    from isharded.gguf_stage import DraftModel, PromptPlan
+
+    draft = DraftModel.__new__(DraftModel)
+    draft.slots, draft.text, draft.host = slots, {}, RecordingHost()
+    for slot in range(slots):
+        draft.prepare([1, 2, 3], PromptPlan(), slot)
+    draft.host.calls.clear()
+    return draft
+
+
+def test_a_landed_guess_costs_one_trip_and_reads_one_token():
+    draft = recording_draft()
+    first = draft.guess([4], 1)
+    second = draft.guess(first, 1)
+    third = draft.guess(second, 1)
+    assert [meta["restart"] for operation, meta in draft.host.calls[1:]] == [False, False]
+    assert [(meta["position"], meta["fresh"]) for _, meta in draft.host.calls[1:]] == [(4, first), (5, second)]
+    assert [operation for operation, _ in draft.host.calls] == ["guess"] * 3
+    assert third and draft.seen() == 6
+
+
+def test_a_miss_commits_what_landed_in_one_batch_and_starts_scratch_again():
+    draft = recording_draft()
+    first = draft.guess([4], 1)
+    second = draft.guess(first, 1)
+    draft.guess(second, 1)
+    draft.host.calls.clear()
+    # The model agreed with the first guess, and said 50 where the second one went.
+    draft.rewind(5)
+    assert not draft.host.calls  # the next guess does the work, in the same trip
+    assert draft.seen() == 5
+    draft.guess([50], 1)
+    [(operation, meta)] = draft.host.calls
+    assert (operation, meta["commit"], meta["position"], meta["fresh"]) == ("guess", [first[0], 50], 4, [])
+    assert meta.get("restart", True)
+    assert draft.text[0].committed == 6
+
+
+def test_a_rewind_past_what_the_draft_read_changes_nothing():
+    draft = recording_draft()
+    guess = draft.guess([4], 1)
+    draft.rewind(7)
+    draft.guess(guess, 1)
+    assert draft.host.calls[-1][1]["restart"] is False
+
+
+def test_several_guesses_stay_on_scratch_for_the_next_pass():
+    draft = recording_draft()
+    guesses = draft.guess([4], 3)
+    assert draft.seen() == 4 + 2  # the newest guess has not run
+    # All three landed, and the model added one of its own.
+    draft.rewind(7)
+    draft.guess([guesses[-1], 70], 3)
+    meta = draft.host.calls[-1][1]
+    assert (meta["position"], meta["fresh"], meta["restart"]) == (6, [guesses[-1], 70], False)
+
+
+def test_each_slot_has_its_own_scratch_sequence():
+    from isharded.gguf_stage import PromptPlan
+
+    draft = recording_draft(3)
+    draft.prepare([1, 2], PromptPlan(), 1)
+    assert draft.host.calls[0] == ("clear", {"slot": 4})
+    assert draft.text[1].committed == 2 and draft.text[2].committed == 3
+
+
+def test_draft_settings_keep_the_cache_the_size_it_was(monkeypatch):
+    from isharded import llama_host
+
+    made = {}
+    monkeypatch.setattr(llama_host.LlamaLibrary, "load", lambda *_: None)
+    monkeypatch.setattr(llama_host, "LlamaStage", lambda _, __, **settings: made.update(settings))
+    host = llama_host._Host()
+    meta = {"folder": "", "extra_paths": [], "path": "", "context_tokens": 4096, "gpu_layers": 0, "threads": 1}
+    host.load_draft({**meta, "slots": 1}, b"")
+    assert (made["sequences"], made["context_tokens"], host.scratch) == (2, 4096, 1)
+    host.load_draft({**meta, "slots": 4}, b"")
+    assert (made["sequences"], host.scratch) == (8, 4)
+    assert made["context_tokens"] * made["sequences"] == 4096 * 5
+
+
+@pytest.mark.parametrize(("apart", "stage", "shared"), [(None, True, True), ("1", True, False), (None, False, False)])
+def test_a_draft_joins_the_entry_stage_unless_it_cannot(monkeypatch, tmp_path, apart, stage, shared):
+    from types import SimpleNamespace
+
+    from isharded import worker
+
+    if apart is None:
+        monkeypatch.delenv("ISHARDED_DRAFT_APART", raising=False)
+    else:
+        monkeypatch.setenv("ISHARDED_DRAFT_APART", apart)
+    seen = []
+    monkeypatch.setattr(worker, "DraftModel", lambda *args: seen.append(args[-1]))
+    host = object()
+    request = SimpleNamespace(speculate_tokens=4, draft=object(), assignment=SimpleNamespace(start_layer=0), context_tokens=64, slots=1)
+    runtime = SimpleNamespace(gguf=SimpleNamespace(host=host) if stage else None, _draft_file=lambda _: tmp_path, last_error=None)
+    worker.WorkerRuntime._load_draft(runtime, request, "folder", 2)
+    assert seen == [host if shared else None]
+
+
+def real_stage(host):
+    """Loads the whole model as one stage."""
+    from isharded.gguf import read_file_header
+
+    header = read_file_header(MODEL)
+    table = header.tensors["token_embd.weight"]
+    embed = {"path": MODEL, "offset": header.data_start + table.offset, "length": table.nbytes, "ggml_type": table.ggml_type}
+    host.call("load", path=MODEL, last=True, table=embed, folder=BUILD, extra_paths=[], context_tokens=256, gpu_layers=-1, threads=2, cpu_tensors=[])
+
+
+def real_draft(slots=1, beside=None):
+    from isharded.gguf_stage import DraftModel
+
+    return DraftModel(BUILD, (), Path(MODEL), 256, 2, slots, beside)
+
+
+# Plain English in this model family's tokens, so the next token is rarely a near tie.
+REAL_PROMPT = [785, 6722, 315, 9625, 374, 12095, 13, 576, 6722, 315, 15344, 374, 21718, 13, 576, 6722, 315, 17689, 374]
+
+
+@needs_real_model
+def test_guesses_after_a_rewind_match_a_fresh_run():
+    """On a hybrid model this is the point: recurrent state cannot go back, and need not."""
+    from isharded.gguf_stage import PromptPlan
+
+    reference = real_draft()
+
+    def fresh(text, count):
+        reference.prepare(text[:-1], PromptPlan())
+        return reference.guess(text[-1:], count)
+
+    draft = real_draft(2)
+    try:
+        other = [3838, 374, 279, 7192, 315, 220, 18, 323, 220, 19, 30]
+        draft.prepare(REAL_PROMPT[:-1], PromptPlan(), 0)
+        draft.prepare(other[:-1], PromptPlan(), 1)
+        text, fed, other_fed = list(REAL_PROMPT), REAL_PROMPT[-1:], other[-1:]
+        for round_number in range(4):
+            # Guesses that land, with the other slot working in between, as a second reply would.
+            for _ in range(3):
+                [guess] = draft.guess(fed, 1)
+                assert guess == fresh(text, 1)[0]
+                other_fed = draft.guess(other_fed, 1, 1)
+                text.append(guess)
+                fed = [guess]
+            # The model disagrees with the last two. The newest of them has not even run.
+            keep = len(text) - 2
+            draft.rewind(keep)
+            text = [*text[:keep], (text[keep] + 1 + round_number) % 5000 + 200]
+            fed = text[-1:]
+            # Several guesses at once, of which one lands, as a checked pass does.
+            guesses = draft.guess(fed, 3)
+            assert guesses == fresh(text, 3)
+            text += [guesses[0], (guesses[1] + 7) % 5000 + 200]
+            draft.rewind(len(text) - 1)
+            fed = text[-1:]
+    finally:
+        draft.close()
+        reference.close()
+
+
+@needs_real_model
+def test_a_draft_beside_a_stage_works_while_the_stage_does():
+    from concurrent.futures import ThreadPoolExecutor
+
+    import psutil
+
+    from isharded.gguf_stage import PromptPlan
+    from isharded.llama_host import StageHost
+
+    def guesses(draft):
+        draft.prepare(REAL_PROMPT[:-1], PromptPlan())
+        made, fed = [], REAL_PROMPT[-1:]
+        for _ in range(24):
+            fed = draft.guess(fed, 1)
+            made += fed
+        return made
+
+    def passes(rows):
+        answers = []
+        for _ in range(6):
+            host.call("clear", slot=0)
+            answers.append(host.call("forward", rows, position=0)[1])
+        return answers
+
+    apart = real_draft()
+    alone = guesses(apart)
+    apart.close()
+    host = StageHost()
+    try:
+        real_stage(host)
+        rows = host.call("embed", tokens=REAL_PROMPT)[1]
+        expected = passes(rows)[0]
+        draft = real_draft(beside=host)
+        assert draft.host.process is host.process
+        with ThreadPoolExecutor(2) as pool:
+            guessed, stage_passes = pool.submit(guesses, draft), pool.submit(passes, rows)
+            assert guessed.result() == alone
+            assert all(answer == expected for answer in stage_passes.result())
+        # A draft replaced in a live process must leave nothing behind, and the stage goes on.
+        draft.close()
+        memory = psutil.Process(host.process.pid)
+        settled = memory.memory_info().rss
+        for _ in range(3):
+            draft = real_draft(beside=host)
+            assert guesses(draft) == alone
+            draft.close()
+        assert memory.memory_info().rss - settled < Path(MODEL).stat().st_size
+        assert passes(rows)[0] == expected
+    finally:
+        host.close()
+
+
+@needs_real_model
+def test_a_stage_that_dies_takes_its_draft_and_says_so():
+    from isharded.gguf_stage import PromptPlan
+    from isharded.llama_host import StageHost
+    from isharded.llamacpp import StageLost
+
+    host = StageHost()
+    try:
+        real_stage(host)
+        draft = real_draft(beside=host)
+        draft.prepare(REAL_PROMPT[:-1], PromptPlan())
+        draft.guess(REAL_PROMPT[-1:], 1)
+        host.process.kill()
+        host.process.wait()
+        with pytest.raises(StageLost):
+            draft.guess([5], 1)
+        draft.close()  # a replacement closes the old one first, and that must not fail
+    finally:
+        host.close()
+
+
 def test_a_draft_needs_a_matching_vocabulary(local_model, tmp_path, monkeypatch):
     from isharded import orchestrator
     from isharded.protocol import LoadModelRequest
