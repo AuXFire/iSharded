@@ -358,6 +358,7 @@ Every comparison count on record, newest work last within each group.
 | Nearby seeds | Tool-call measurement, consecutive seeds | One draw put the same rare token into 11 of 72 replies (fixed) | Measured | 2026-11-06 | 2f9c5fe |
 | Silent relays and kills on the ring | See [Silent and lost links](#silent-and-lost-links) | Same text on every run listed there | Measured | 2026-11-07 | Round 4 ring lane |
 | Replies when passes merge | The round-five slots runs, temperature 0, from 4 replies at once | Not identical. Once passes merged, the same prompt gave different text from round to round, in every sweep and in the verifier's rerun; never with nothing merged. A merged pass rounds differently from single passes | Measured | 2026-11-07 | Round 5 slots lane and its verifier, [guide](GUIDE.md#several-conversations-at-once) |
+| Replies after a shorter loop is applied | The live apply lab of Routes and the planner, every node the same CPU build of llama.cpp; a greedy count, a greedy story, and a reply at temperature 0.8 with seed 1234, 64 tokens each, before and after the apply | Where the apply kept the layer split and only swapped a node (2 runs): 6 of 6 identical to the loaded layout. Where it moved boundaries (1 run): the story matched, the count and the seeded reply did not. A fresh load landed on another split than the apply each time it was tried (2 runs), so no fresh load of the exact applied layout was compared; against those other splits the story matched twice, the count once, the seeded reply never | Measured, emulated 80 ms | 2026-11-07 | Round 6 place lane |
 
 ## Security probes
 
@@ -506,6 +507,7 @@ Scale and hardware:
 - The chat page has been used only in Chrome.
 - `isharded bench` has no GPU numbers and no full default run (prompts of 128 and 3400, `--parallel 1,4,8`, 200 tokens).
 - One load failure at `--parallel 2` on the test pool was transient, and its cause was never found.
+- Whether a draft takes its time from the entry stage's GPU. `ISHARDED_DRAFT_SHARES_DEVICE` counts it that way, and stays off until a GPU run shows it. A shorter loop applied on real GPUs or across a real mesh, and the ring's link prices on a real WAN, have not run either: only the emulator above
 
 Failures:
 
