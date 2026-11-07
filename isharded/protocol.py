@@ -254,6 +254,8 @@ class ConfigureRequest(BaseModel):
     speculate_tokens: int = 0
     # Whether stages can rewind past a pass that has finished. Recurrent state cannot.
     rewinds: bool = False
+    # Guess from the text as well, on a route that can pipeline.
+    prompt_lookup: bool = False
     draft: DraftModel | None = None
     # Leadership generation. Workers refuse orders older than the newest they saw.
     term: int = 0
@@ -312,7 +314,10 @@ class LoadModelRequest(BaseModel):
     # A small GGUF that guesses tokens for the big one to check in one pass.
     # "auto" picks one for the model's family, and "none" turns this off.
     draft_model: str = "auto"
-    draft_tokens: int = Field(default=6, ge=1, le=16)  # the most guesses out at once
+    # The most guesses out at once. Unset, it follows the route. See orchestrator.build_target.
+    draft_tokens: int | None = Field(default=None, ge=1, le=16)
+    # Guess from the prompt and the reply so far. It needs no model, and two stages or more.
+    prompt_lookup: bool = True
     # Replies the pipeline runs at once. Each costs its own context memory.
     parallel: int = Field(default=1, ge=1, le=32)
     merge_passes: bool = True

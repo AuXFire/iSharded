@@ -92,7 +92,7 @@ from .gguf_stage import (
     next_guess_count,
     plan_prompt,
 )
-from .pipeline import Pipeline
+from .pipeline import Pipeline, RowClock
 from . import __version__
 from .llamacpp import PINNED_BUILD, LlamaError, StageLost, ensure_build, pick_build, rocm_library_paths, speculative_choice, step_draws, step_random
 from .pool import check_exposure, load_token
@@ -387,6 +387,7 @@ class WorkerRuntime:
         self.draft_choice = DraftChoice()
         # The stage that would not restart, for as long as it is still this worker's stage.
         self.stage_down: Any = None
+        self.row_clock = RowClock()
         self.ring_live = False
         self.ring_epoch: int | None = None
         self.ring_door: dict[str, Any] | None = None
@@ -431,6 +432,7 @@ class WorkerRuntime:
         self.draft: DraftModel | None = None
         self.encoder: ImageEncoder | None = None
         self.speculate_tokens = 0
+        self.prompt_lookup = False
         self.rewinds = False
         self.draft_passes = 0
         self.draft_accepted = 0
@@ -440,6 +442,7 @@ class WorkerRuntime:
         self.part_ran = asyncio.Condition()
         self.pipeline_tokens = 0
         self.pipeline_misses = 0
+        self.pipeline_lookups = 0
         self.pipeline_depth = 0
         self.stage_restarts = 0
         self.draft_request: tuple[ConfigureRequest, str, int] | None = None
@@ -1095,6 +1098,7 @@ class WorkerRuntime:
         self.term = request.term
         self.ring_stop()
         self.draft_choice = DraftChoice()  # a new route can change which way is faster
+        self.row_clock = RowClock()
         adapter = create_adapter(request.architecture)
         if not isinstance(adapter, GgufAdapter) and not has_torch():
             raise ValueError(NO_TORCH)
@@ -1111,6 +1115,7 @@ class WorkerRuntime:
         self.assignment = request.assignment
         self.route = request.route
         self.rewinds = request.rewinds  # here, because a kept stage loads nothing
+        self.prompt_lookup = request.prompt_lookup
         self.cache_url = request.cache_url.rstrip("/") if request.cache_url else None
         self.caches.clear()
         self.prefix.clear()  # the stages behind this one may have changed
@@ -2081,7 +2086,7 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
             "stages_kept": runtime.stages_kept,
             "draft_passes": runtime.draft_passes,
             "draft_tokens_per_pass": round(runtime.draft_accepted / runtime.draft_passes, 2) if runtime.draft_passes else None,
-            "pipeline": {"tokens": runtime.pipeline_tokens, "misses": runtime.pipeline_misses, "depth": runtime.pipeline_depth},
+            "pipeline": {"tokens": runtime.pipeline_tokens, "misses": runtime.pipeline_misses, "depth": runtime.pipeline_depth, "lookups": runtime.pipeline_lookups},
             "draft_ways": {way: round(runtime.draft_choice.rate(way), 2) for way in runtime.draft_choice.seconds},
             "checkpoints_dropped": runtime.checkpoints_dropped,
             "cache": runtime.cache_report(),
@@ -2639,18 +2644,19 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
         yet, and every stage forgets anything at or past it before the next pass.
         """
         draft = runtime.draft
-        assert draft is not None
         # The draft reads the prompt while the real model does.
-        prepared = asyncio.create_task(asyncio.to_thread(draft.prepare, body.input_ids, plan, request.slot))
+        prepared = asyncio.create_task(asyncio.to_thread(draft.prepare, body.input_ids, plan, request.slot)) if draft else None
         try:
             token = await next_new_token(request, plan)
         except Exception:
             # A reply may plan again now, and two of these on one sequence would tangle it.
-            await asyncio.gather(prepared, return_exceptions=True)
+            if prepared:
+                await asyncio.gather(prepared, return_exceptions=True)
             raise
         yield token
         try:
-            await prepared
+            if prepared:
+                await prepared
         except LlamaError as exc:
             raise await runtime.draft_failed(exc, draft) from exc
         history = [*body.input_ids, *body.written, token]
@@ -2679,7 +2685,8 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             began = time.perf_counter()
             # Checking guesses in one pass runs several rows at once, which rounds a little
             # differently. A pipeline and plain decoding run one row, so they agree exactly.
-            ways = [PIPELINED, PLAIN] if runtime.ring_pipelines(following) else [GUESSED, PLAIN]
+            # So a guess from the text only ever goes out on a pipeline.
+            ways = [PIPELINED, PLAIN] if runtime.ring_pipelines(following) else [GUESSED, PLAIN] if draft else [PLAIN]
             way = runtime.draft_choice.pick(ways)
             if way == PIPELINED:
                 if pipe is None:
@@ -2691,21 +2698,25 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
                         runtime.speculate_tokens,
                         send=lambda item, place, rollback: runtime.ring_send(following, item, place, rollback),
                         wait=runtime.ring_answer,
-                        guess=next_guess,
-                        rewind=rewind_draft,
+                        guess=next_guess if draft else None,
+                        rewind=rewind_draft if draft else None,
                         sharing=lambda: runtime.gate.size - len(runtime.gate.free),
-                        told=draft.seen(request.slot),
+                        told=draft.seen(request.slot) if draft else 0,
+                        lookup=runtime.prompt_lookup,
+                        clock=runtime.row_clock,
                     )
                     runtime.pipes[request.slot] = pipe
-                made, misses = pipe.tokens_made, pipe.misses
+                made, misses, lookups = pipe.tokens_made, pipe.misses, pipe.lookups
                 async for token in pipe.tokens(PIPELINE_STRETCH):
                     produced += 1
                     yield token
                 runtime.pipeline_tokens += pipe.tokens_made - made
                 runtime.pipeline_misses += pipe.misses - misses
+                runtime.pipeline_lookups += pipe.lookups - lookups
                 runtime.pipeline_depth = pipe.depth()
                 runtime.draft_choice.note(way, pipe.tokens_made - made, time.perf_counter() - began)
                 continue
+            landing = pipe is not None
             if pipe is not None:
                 await pipe.land()
                 pipe = None
@@ -2720,7 +2731,10 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
                 runtime.draft_passes += 1
                 runtime.draft_accepted += len(accepted)
                 ahead = next_guess_count(ahead, len(accepted) - 1, runtime.speculate_tokens)
-            runtime.draft_choice.note(way, len(accepted), time.perf_counter() - began)
+            # The first pass off a pipeline waits behind what was out, which says nothing about
+            # this way, and a trial is too short to carry that. The next pass is the trial.
+            if not landing:
+                runtime.draft_choice.note(way, len(accepted), time.perf_counter() - began)
             for token in accepted[:room]:
                 yield token
                 produced += 1
@@ -2738,8 +2752,8 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             if body.epoch != runtime.epoch:
                 yield error_line(epoch_error(runtime.epoch).detail)
                 return
-            # A draft reads text, so it cannot follow a prompt with images in it.
-            use_draft = runtime.draft is not None and runtime.speculate_tokens and not body.images
+            # Guesses come from text, so they cannot follow a prompt with images in it.
+            use_guesses = runtime.speculate_tokens and not body.images and (runtime.draft is not None or (runtime.prompt_lookup and len(runtime.route) > 1))
             caching = runtime.gguf is not None and runtime.prompt_cache
             if caching:
                 try:
@@ -2757,7 +2771,7 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
                 try:
                     if body.images and rows is None:
                         rows = await runtime.prompt_rows(body.input_ids, body.images)
-                    source = speculative(request, plan) if use_draft else plain(request, plan, rows)
+                    source = speculative(request, plan) if use_guesses else plain(request, plan, rows)
                     async for token in source:
                         answered = True
                         yield token_line(token)

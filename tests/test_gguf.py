@@ -1802,3 +1802,39 @@ def test_a_close_does_not_wait_behind_a_call_that_is_stuck(monkeypatch):
         began = time.monotonic()
         host.close()
     assert time.monotonic() - began < 2
+
+
+def load_settings(**fields):
+    from isharded.protocol import LoadModelRequest
+
+    return LoadModelRequest(model_id="m", **fields)
+
+
+def test_a_route_that_rewinds_gets_more_guesses_than_one_that_keeps_snapshots():
+    from isharded.orchestrator import guess_limit
+
+    assert guess_limit(load_settings(), rewinds=True) == 16
+    assert guess_limit(load_settings(), rewinds=False) == 6
+
+
+def test_a_load_that_names_a_guess_limit_keeps_it():
+    from isharded.orchestrator import guess_limit
+
+    assert guess_limit(load_settings(draft_tokens=3), rewinds=True) == 3
+    assert guess_limit(load_settings(draft_tokens=16), rewinds=False) == 16
+
+
+@pytest.mark.parametrize("value", [0, 17])
+def test_no_load_goes_past_the_guess_cap(value):
+    with pytest.raises(ValueError):
+        load_settings(draft_tokens=value)
+
+
+def test_lookup_is_on_unless_a_load_or_the_command_line_says_not(monkeypatch):
+    from isharded import cli
+
+    assert load_settings().prompt_lookup
+    parser = cli.build_parser()
+    assert "prompt_lookup" not in cli.load_body(parser.parse_args(["load", "m"]))
+    assert cli.load_body(parser.parse_args(["load", "m", "--no-lookup"]))["prompt_lookup"] is False
+    assert cli.load_body(parser.parse_args(["load", "m", "--no-draft"]))["draft_model"] == "none"

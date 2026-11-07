@@ -148,6 +148,8 @@ def load_body(args: argparse.Namespace) -> dict[str, object]:
         body["reuse_cached"] = False
     if args.no_peer_fetch:
         body["peer_fetch"] = False
+    if args.no_lookup:
+        body["prompt_lookup"] = False
     if args.no_draft:
         body["draft_model"] = "none"
     elif args.draft:
@@ -528,7 +530,8 @@ def add_load_command(subparsers: Any, token: str | None) -> None:
     load.add_argument("--exit", help="worker to hold the exit stage")
     load.add_argument("--no-reuse-cached", action="store_true", help="plan as if no worker held any shards")
     load.add_argument("--draft", help="small GGUF for speculative decoding; chosen automatically if not set")
-    load.add_argument("--no-draft", action="store_true", help="turn speculative decoding off")
+    load.add_argument("--no-draft", action="store_true", help="load no draft model; prompt lookup still guesses")
+    load.add_argument("--no-lookup", action="store_true", help="make no guesses from the prompt and the reply so far")
     load.add_argument("--parallel", type=int, help="replies to run at once; each costs its own context memory")
     load.add_argument("--no-peer-fetch", action="store_true", help="download every shard from the model host")
     add_token(load, token, "an admin key; defaults to this machine's pool token")

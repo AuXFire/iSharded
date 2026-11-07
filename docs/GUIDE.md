@@ -696,7 +696,7 @@ The entry node also carries the draft model, about 1.7 GiB of VRAM for the defau
 |---|---|---|
 | `--context-tokens` | The smallest that fits your use. 8192 is a good chat default | Each reply's context costs memory on every stage |
 | `--parallel` | Your expected concurrent conversations, up to about 4 | Each one costs its own context memory |
-| Draft model | Keep it. On a model with recurrent layers, keep it for one or two users and use `--no-draft` for three or more | A busy route stops guessing by itself, unless a recurrent model is checking guesses in one pass, as it does on one stage or with no native engine. See the table below |
+| Draft model | Keep it. On a model with recurrent layers, keep it for one or two users and use `--no-draft` for three or more | A busy route guesses less by itself, unless a recurrent model is checking guesses in one pass, as it does on one stage or with no native engine. See the table below |
 | `--placement` | Leave at `auto` | `auto` takes the fastest, steadiest route through the fewest close workers that hold the model in VRAM. `spread` forces every worker in, however far away |
 | `--hashes` | Use it when any node or mirror is less than fully trusted | Every node then checks every unit |
 
@@ -892,7 +892,8 @@ Loads a model on a running pool and shows progress. `model` is any [model id](#l
 | `--placement` | `auto` | `auto` picks the fastest route, `spread` uses every worker, `compact` the fewest that fit |
 | `--entry`, `--exit` | Chosen for speed | Worker to hold the entry or exit stage |
 | `--draft` | Chosen automatically | Small GGUF for speculative decoding |
-| `--no-draft` | Off | Turn speculative decoding off |
+| `--no-draft` | Off | Load no draft model. Prompt lookup still guesses |
+| `--no-lookup` | Off | Make no guesses from the prompt and the reply so far |
 | `--no-merge-passes` | Off | Make conversations take turns on each stage |
 | `--no-prompt-cache` | Off | Read every prompt in full instead of reusing saved states. See [Conversation reuse](#conversation-reuse) |
 | `--kv-type` | `f16` | How a GGUF model keeps attention KV. `q8_0` takes about half the memory. See [Conversation reuse](#conversation-reuse) |
@@ -1356,7 +1357,8 @@ On two nodes on one machine, the same loop ran through the coordinator, a follow
 | `parallel` | 1 | 1 to 32 |
 | `entry_worker`, `exit_worker` | None | Pin the ends of the route |
 | `draft_model` | `auto` | A GGUF id, `auto`, or `none` |
-| `draft_tokens` | 6 | Most guesses out at once, 1 to 16 |
+| `draft_tokens` | 16 on a route that rewinds by itself, 6 on one with recurrent layers | Most guesses out at once, 1 to 16 |
+| `prompt_lookup` | `true` | Guess from the prompt and the reply so far. Needs two stages or more |
 | `merge_passes` | `true` | Let conversations share a pass |
 | `prompt_cache` | `true` | Reuse saved prompt states |
 | `kv_type` | `f16` | How a GGUF model keeps attention KV: `f16` or `q8_0` |
@@ -1597,7 +1599,7 @@ A token has to cross every stage in turn, so a reply on its own would leave all 
 
 So a guess can only save time. Each pass is one row at its own position, which is what plain decoding runs, so every token is the one plain decoding gives, seed and all. It needs the [native engine](#the-native-engine) and at least two stages.
 
-The entry keeps just enough passes out to fill the route, up to `draft_tokens`, and fewer when guesses are landing badly. Other replies fill a route too, so a busy route gets no guesses at all.
+The entry keeps just enough passes out to fill the route, up to `draft_tokens`, and fewer when guesses are landing badly. Left unset, `draft_tokens` is 16 on a route that rewinds by itself and 6 on a model with recurrent layers, where each one costs every stage a snapshot. Other replies want the route too, so each reply keeps out only its share. N replies with D passes out, each out for a round trip R, ask for N × D / R rows a second, and a route passes 1 / T, where T is the time one row takes. So D stops at R / (N × T), and never goes below one. T is the shortest gap lately between any two answers on the route, so it does not change with the number of replies. Answers less than 2 ms apart came out of one merged pass and say nothing about a row, so they do not count. A reply on its own is limited by filling the route, as above.
 
 A model with recurrent layers cannot rewind past a finished pass by itself, so its passes also ask each stage to keep a snapshot. After such a pass a stage saves that slot's recurrent state, and a rewind restores the snapshot of the right position and then cuts attention back as usual. A stage holds `draft_tokens` + 2 snapshots for each slot, in RAM, and a slot's snapshots go when it is cleared. If a rewind finds none, the reply replays over HTTP, and the route stays off its direct links until they reopen. Attention models keep no snapshots and pay nothing.
 
@@ -1610,6 +1612,35 @@ Identical here means on the same route. With the stages split at a different lay
 On one stage, or with no native engine, a recurrent model checks guesses another way: several guesses go out as rows of one pass, and the real model checks them together. The number of guesses adapts as a reply goes, up to `draft_tokens`. Sampling keeps the model's distribution exactly: a guess `g` is accepted with probability `q(g)`, and a rejection draws from `q` with `g` removed. At temperature 0, batched arithmetic rounds slightly differently from single-token arithmetic, so output can differ from a run without a draft where two tokens are nearly tied.
 
 Guessing does not always pay, so the entry measures. It keeps whichever way has been fastest lately, by total tokens over total time, and gives the others a short trial now and then, because a route or a reply can change which one wins.
+
+#### Prompt lookup
+
+Text often repeats what came before, as code and quoted documents do, and finding that costs no model at all. So the entry also guesses by looking the last few tokens up in the prompt and the reply so far, and reading on from the match. It needs three matching tokens to guess at all. On a route with a draft it needs five, and then it takes over from the draft for as long as the match holds, without waiting for a guess the draft is still making. What the draft misses reaches it in one go the next time it is asked. On a route with no draft, lookup is what lets a pipeline run at all.
+
+These guesses go out only on a pipeline, one row at a time, so a reply is the same as plain decoding token for token. They are never checked as rows of one pass, so a route that cannot pipeline does not use them. That also means they need no room at the end of the context, and a model on one stage asks for no guess memory because of them.
+
+A lookup searches the newest 65,536 tokens of a reply. It holds 0.5 MiB for each reply on a pipeline, and a search reads the window once, and only when no match is being followed. Measured under load, a search took 69 microseconds on a full window and 16 on 2,000 tokens, and following a match about 1. A reply that matches nothing sends no guesses, runs one pass at a time, and pays for those searches and, on a recurrent model, a snapshot per pass. The measuring above then decides between that and plain decoding like anything else.
+
+This was measured on two CPU stages of Qwen3-0.6B on one laptop, with a copy of the model as the draft, which makes the draft as slow as the model and right almost every time. Text that repeats asked for a Python file back with one change and for a passage copied out; text that does not asked for a story, an explanation and a meal plan. Each figure is tokens per second over 12 replies of 96 tokens, greedy and seeded.
+
+| Route | No guesses | Draft | Lookup | Both |
+|---|---|---|---|---|
+| Local, repeating text | 31.5 | 33.2 | 32.8 | 32.5 |
+| Local, fresh text | 32.6 | 32.3 | 32.3 | 31.8 |
+| 50 ms added to each link, repeating text | 7.6 | 30.0 | 21.0 | 28.0 |
+| 50 ms added to each link, fresh text | 7.7 | 19.4 | 7.9 | 19.3 |
+
+Every load above split the layers 1 and 27, except no guesses with 50 ms added, which split them 19 and 9. Locally the first stage then has almost nothing to overlap, and lookup on that very load with its guesses turned off made 31.6 and 32.3. One local lookup load that split the layers 19 and 9 made 42.2 on repeating text, so locally the split matters more than lookup does.
+
+Lookup alone nearly tripled repeating text on the far route and cost nothing on fresh text. With a draft this good it added nothing, and over several runs on a busy machine both was sometimes ahead of the draft alone and sometimes behind. A real draft is smaller than its model and wrong more often, which this could not measure. On Qwen3.5-0.8B, with recurrent layers, lookup took repeating text from 6.5 to 17.0 tokens per second on the far route, and fresh text from 6.1 to 6.4.
+
+Replies with guesses matched replies with none on every run, 12 of 12, as long as the load split the layers the same way. A load with free memory to spare can split them differently, and those replies differ with no guess involved, as above. On the recurrent model, plain decoding and lookup on the very same load matched in 24 of 24.
+
+Sixteen guesses pay only on a far route and a long run of matches. With 200 ms on each link and replies of 192 tokens, repeating text went from 7.3 tokens per second at 6 guesses to 8.6 and 9.1 at 16, and depth reached 16. On replies of 96 tokens they made no difference.
+
+Eight replies at once with lookup, at 64 tokens each: with 50 ms on each link each reply went from 3.15 to 3.42 tokens per second on repeating text and 3.14 to 3.32 on fresh text, against dividing depth by the replies. With 200 ms on each link repeating text went from 1.75 to 2.30, and fresh text from 1.73 to 1.63. Several replies at once on the native path share passes, and a shared pass rounds differently, so these replies can differ from run to run with or without guesses.
+
+`prompt_lookup` is on by default. Turn it off with `--no-lookup`. On a model with recurrent layers and no draft it costs what a draft would: every stage holds `draft_tokens` copies of its recurrent state for each slot. Images turn it off for that reply, as they do a draft.
 
 For `qwen3`, `qwen3moe`, `qwen35`, and `qwen35moe` models the draft is chosen automatically (`Qwen3-0.6B` or `Qwen3.5-0.8B`, which share their vocabulary). Name another with `--draft`, or turn this off with `--no-draft`. A named draft must have the same vocabulary as the model, and a draft that cannot load leaves the model running without one.
 
@@ -2071,6 +2102,7 @@ A node started with `isharded up` keeps its route state, keys, and audit log in 
 | `worker_draft_tokens_per_pass` | Tokens per speculative pass. Near 1 means the draft is not helping |
 | `worker_pipeline_tokens` | Tokens made with passes overlapping on the route |
 | `worker_pipeline_misses` | Guesses that sent a pipeline back |
+| `worker_pipeline_lookups` | Guesses a pipeline took from the text |
 | `prompt_tokens_computed_total`, `prompt_tokens_reused_total` | Prompt tokens the route computed, and restored instead. This is the saving: the second over the sum of both. `metrics.cache` in `/admin/status` gives it as `saved_percent` |
 | `worker_prompt_tokens_computed_total` | Prompt tokens a stage computed |
 | `worker_tokens_reused_total` | Prompt tokens a stage restored instead of computing. `source` is `prefix` for a shared prefix or `history` for a conversation, then the tier it came from |
