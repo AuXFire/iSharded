@@ -4,7 +4,8 @@
 //! the neighbours its fingerprint over the control plane, which is already authenticated.
 //! So a link needs no certificate authority, works in every pool mode, and is encrypted
 //! even on a network where the control plane is not. Once TLS is up, both ends prove they
-//! hold the route's key, so a stranger who reaches the port gets nothing.
+//! hold that link's key, so a stranger who reaches the port gets nothing, and a stage of the
+//! route gets no further than the links the coordinator gave it keys for.
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -26,8 +27,9 @@ use rustls::{ClientConfig, ClientConnection, Connection, DigitallySignedStruct, 
 
 use crate::wire::{self, Hello, Kind, Role, HEADER_BYTES, MAC_BYTES, NONCE_BYTES};
 
-/// How long a handshake may take. A peer that goes quiet in the middle holds nothing for long.
-const HANDSHAKE_SECONDS: u64 = 10;
+/// The most a whole handshake may take. A limit on each read is not enough: a peer that
+/// sends a byte now and then would hold its place for ever.
+pub const HANDSHAKE: Duration = Duration::from_secs(10);
 /// A frame's write must finish in this long, or the link is treated as dead.
 const WRITE_SECONDS: u64 = 15;
 /// How much may wait for a link's writer. A frame longer than the whole limit still goes,
@@ -388,7 +390,40 @@ impl Link {
     }
 
     pub fn reader(self: &Arc<Self>, limit: usize) -> Frames {
-        Frames { link: self.clone(), plain: Vec::with_capacity(1 << 16), last: 0, start: 0, raw: vec![0; 1 << 16].into_boxed_slice(), limit }
+        Frames { link: self.clone(), plain: Vec::with_capacity(1 << 16), last: 0, start: 0, raw: vec![0; 1 << 16].into_boxed_slice(), limit, until: None }
+    }
+}
+
+/// How long is left before a deadline, or a refusal once it has passed.
+fn time_left(until: Instant) -> io::Result<Duration> {
+    let left = until.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(io::Error::new(io::ErrorKind::TimedOut, "the handshake took too long"));
+    }
+    Ok(left)
+}
+
+/// A socket whose reads all share one deadline, for the TLS handshake.
+struct Hurried<'a> {
+    socket: &'a TcpStream,
+    until: Instant,
+}
+
+impl Read for Hurried<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.socket.set_read_timeout(Some(time_left(self.until)?))?;
+        (&mut &*self.socket).read(buffer)
+    }
+}
+
+impl Write for Hurried<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        time_left(self.until)?;
+        (&mut &*self.socket).write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -409,6 +444,8 @@ pub struct Frames {
     start: usize,
     raw: Box<[u8]>,
     limit: usize,
+    /// While the link is being proven, when that must be done by.
+    until: Option<Instant>,
 }
 
 impl Frames {
@@ -474,6 +511,9 @@ impl Frames {
             if self.pull_held()? {
                 continue;
             }
+            if let Some(until) = self.until {
+                self.link.socket.set_read_timeout(Some(time_left(until)?))?;
+            }
             let count = (&self.link.socket).read(&mut self.raw)?;
             if count == 0 {
                 return Err(LinkError::Closed);
@@ -525,35 +565,36 @@ fn same(left: &[u8], right: &[u8]) -> bool {
 fn prepare(socket: &TcpStream) -> Result<(), LinkError> {
     socket.set_nodelay(true)?;
     socket.set_write_timeout(Some(Duration::from_secs(WRITE_SECONDS)))?;
-    socket.set_read_timeout(Some(Duration::from_secs(HANDSHAKE_SECONDS)))?;
     Ok(())
 }
 
-fn shake_hands(socket: &mut TcpStream, connection: impl Into<Connection>) -> Result<Connection, LinkError> {
+fn shake_hands(socket: &TcpStream, until: Instant, connection: impl Into<Connection>) -> Result<Connection, LinkError> {
     let mut connection: Connection = connection.into();
+    let mut hurried = Hurried { socket, until };
     while connection.is_handshaking() {
-        connection.complete_io(socket)?;
+        connection.complete_io(&mut hurried)?;
     }
     Ok(connection)
 }
 
 /// Opens a link to another node, proving this end holds `key`.
 pub fn dial(address: &str, fingerprint: Option<&str>, key: &[u8], role: Role, epoch: u64, timeout: Duration) -> Result<Arc<Link>, LinkError> {
+    let until = Instant::now() + timeout.min(HANDSHAKE);
     let target = address.to_socket_addrs()?.next().ok_or(LinkError::Refused("the address resolved to nothing"))?;
-    let mut socket = TcpStream::connect_timeout(&target, timeout)?;
+    let socket = TcpStream::connect_timeout(&target, timeout)?;
     prepare(&socket)?;
-    socket.set_read_timeout(Some(timeout.min(Duration::from_secs(HANDSHAKE_SECONDS))))?;
     let tls = match fingerprint {
         None => None,
         Some(fingerprint) => {
             let name = ServerName::try_from("isharded").map_err(|_| LinkError::Refused("bad server name"))?;
-            Some(shake_hands(&mut socket, ClientConnection::new(client_config(fingerprint)?, name)?)?)
+            Some(shake_hands(&socket, until, ClientConnection::new(client_config(fingerprint)?, name)?)?)
         }
     };
     let link = Link::new(socket, tls);
     let hello = Hello { role, epoch, nonce: random_bytes() };
     link.greet(&hello.encode())?;
     let mut frames = link.reader(STRANGER_BYTES);
+    frames.until = Some(until);
     let (kind, body) = frames.next()?;
     if kind != Kind::HelloOk {
         return Err(LinkError::Refused("the other node did not greet this one"));
@@ -561,7 +602,7 @@ pub fn dial(address: &str, fingerprint: Option<&str>, key: &[u8], role: Role, ep
     let (nonce, mac) = wire::read_hello_ok(body)?;
     let pin = fingerprint.unwrap_or("");
     if !same(&mac, &proof(key, SERVER_LABEL, &hello, &nonce, pin)) {
-        return Err(LinkError::Refused("the other node does not hold this route's key"));
+        return Err(LinkError::Refused("the other node does not hold this link's key"));
     }
     link.greet(&wire::auth(&proof(key, CLIENT_LABEL, &hello, &nonce, pin)))?;
     link.socket.set_read_timeout(None)?;
@@ -569,19 +610,23 @@ pub fn dial(address: &str, fingerprint: Option<&str>, key: &[u8], role: Role, ep
     Ok(link)
 }
 
-/// Takes a connection someone made to this node. `key_for` says which key a role and epoch need.
+/// Takes a connection someone made to this node, if it proves itself within `patience`.
+/// `key_for` says which key a role and epoch need.
 pub fn accept(
-    mut socket: TcpStream,
+    socket: TcpStream,
     identity: Option<&Identity>,
+    patience: Duration,
     key_for: impl Fn(Role, u64) -> Option<Vec<u8>>,
 ) -> Result<(Arc<Link>, Frames, Hello), LinkError> {
+    let until = Instant::now() + patience;
     prepare(&socket)?;
     let tls = match identity {
         None => None,
-        Some(identity) => Some(shake_hands(&mut socket, ServerConnection::new(identity.server.clone())?)?),
+        Some(identity) => Some(shake_hands(&socket, until, ServerConnection::new(identity.server.clone())?)?),
     };
     let link = Link::new(socket, tls);
     let mut frames = link.reader(STRANGER_BYTES);
+    frames.until = Some(until);
     let (kind, body) = frames.next()?;
     if kind != Kind::Hello {
         return Err(LinkError::Refused("a link must open with a greeting"));
@@ -593,11 +638,12 @@ pub fn accept(
     link.greet(&wire::hello_ok(&nonce, &proof(&key, SERVER_LABEL, &hello, &nonce, pin)))?;
     let (kind, body) = frames.next()?;
     if kind != Kind::Auth || !same(body, &proof(&key, CLIENT_LABEL, &hello, &nonce, pin)) {
-        return Err(LinkError::Refused("the other node does not hold this route's key"));
+        return Err(LinkError::Refused("the other node does not hold this link's key"));
     }
     link.socket.set_read_timeout(None)?;
     link.start_writer()?;
     frames.set_limit(wire::MAX_BODY_BYTES);
+    frames.until = None;
     Ok((link, frames, hello))
 }
 
@@ -615,7 +661,7 @@ mod tests {
         let address = listener.local_addr().unwrap().to_string();
         let handle = thread::spawn(move || {
             let (socket, _) = listener.accept().unwrap();
-            let (link, mut frames, hello) = accept(socket, Some(&identity), |_, _| Some(key.to_vec()))?;
+            let (link, mut frames, hello) = accept(socket, Some(&identity), HANDSHAKE, |_, _| Some(key.to_vec()))?;
             let (kind, body) = frames.next()?;
             assert_eq!(kind, Kind::Ack);
             link.send(&Ack { id: 2 }.encode())?;
@@ -662,7 +708,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let handle = thread::spawn(move || {
             let (socket, _) = listener.accept().unwrap();
-            accept(socket, None, |_, _| Some(KEY.to_vec())).map(|_| ())
+            accept(socket, None, HANDSHAKE, |_, _| Some(KEY.to_vec())).map(|_| ())
         });
         let mut frame = Hello { role: Role::Hop, epoch: 1, nonce: [0; NONCE_BYTES] }.encode();
         frame[2] = wire::VERSION - 1;
@@ -676,7 +722,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let handle = thread::spawn(move || {
             let (socket, _) = listener.accept().unwrap();
-            accept(socket, None, |_, _| Some(KEY.to_vec())).map(|_| ())
+            accept(socket, None, HANDSHAKE, |_, _| Some(KEY.to_vec())).map(|_| ())
         });
         let mut stranger = TcpStream::connect(address).unwrap();
         let frame = crate::wire::Pass {
@@ -696,6 +742,38 @@ mod tests {
         };
         stranger.write_all(&frame.encode()).unwrap();
         assert!(matches!(handle.join().unwrap(), Err(LinkError::Refused(_))));
+    }
+
+    /// A peer that sends one byte at a time, never quite slow enough for a limit on each read.
+    fn trickle(encrypted: bool, opening: Vec<u8>) {
+        let patience = Duration::from_millis(600);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let identity = Identity::generate().unwrap();
+        let handle = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let began = Instant::now();
+            let accepted = accept(socket, encrypted.then_some(&identity), patience, |_, _| Some(KEY.to_vec())).map(|_| ());
+            (accepted, began.elapsed())
+        });
+        let mut stranger = TcpStream::connect(address).unwrap();
+        for byte in opening.iter().cycle().take(40) {
+            if stranger.write_all(&[*byte]).is_err() || handle.is_finished() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let (accepted, took) = handle.join().unwrap();
+        assert!(accepted.is_err());
+        assert!(took < patience + Duration::from_millis(400), "took {took:?}");
+    }
+
+    #[test]
+    fn a_stranger_who_trickles_bytes_is_refused_when_the_whole_handshake_runs_out() {
+        // A TLS record header that promises a long record, and then the slow rest of it.
+        trickle(true, vec![22, 3, 1, 0x40, 0]);
+        // A greeting's header, where the far end waits for a body that comes a byte at a time.
+        trickle(false, Hello { role: Role::Hop, epoch: 1, nonce: [0; NONCE_BYTES] }.encode());
     }
 
     #[test]
@@ -762,7 +840,7 @@ mod tests {
         let (finish, finished) = mpsc::channel::<()>();
         let far = thread::spawn(move || {
             let (socket, _) = listener.accept().unwrap();
-            let _held = accept(socket, Some(&identity), |_, _| Some(KEY.to_vec())).unwrap();
+            let _held = accept(socket, Some(&identity), HANDSHAKE, |_, _| Some(KEY.to_vec())).unwrap();
             let _ = finished.recv();
         });
         let link = dial(&address, Some(&pin), KEY, Role::Hop, 1, Duration::from_secs(5)).unwrap();
@@ -812,7 +890,7 @@ mod tests {
         let address = listener.local_addr().unwrap().to_string();
         let server = thread::spawn(move || {
             let (socket, _) = listener.accept().unwrap();
-            let (_link, mut frames, _) = accept(socket, Some(&identity), |_, _| Some(KEY.to_vec())).unwrap();
+            let (_link, mut frames, _) = accept(socket, Some(&identity), HANDSHAKE, |_, _| Some(KEY.to_vec())).unwrap();
             let mut seen = vec![];
             for _ in 0..4000 {
                 let (_, body) = frames.next().unwrap();

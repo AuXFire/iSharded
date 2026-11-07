@@ -311,12 +311,95 @@ def test_a_ring_opens_every_stage_before_any_dials_and_the_last_dials_the_entry(
     opens = [call for call in calls if call[1].endswith("/open")]
     connects = {call[0]: call[2] for call in calls if call[1].endswith("/connect")}
     assert [call[0] for call in calls[:3]] == ["a", "b", "c"]
-    assert len({call[2]["key"] for call in opens}) == 1 and len(opens[0][2]["key"]) == 64
+    keys = [call[2]["keys"] for call in opens]
+    # Each link has its own key, and each stage holds only the keys of its own links.
+    assert keys[0]["back"] is None and keys[0]["next"] == keys[1]["back"] and keys[1]["next"] == keys[2]["back"] and keys[2]["next"] is None
+    assert keys[0]["closing"] == keys[2]["closing"] and keys[1]["closing"] is None
+    assert len({keys[0]["next"], keys[1]["next"], keys[0]["closing"]}) == 3 and all(len(key) == 64 for key in (keys[0]["next"], keys[0]["closing"]))
+    assert all(call[2]["term"] == 0 for call in calls)
     assert [call[2]["index"] for call in opens] == [0, 1, 2]
     assert connects["a"]["next"]["address"] == "b:9" and connects["a"]["entry"] is None
     assert connects["c"]["next"] is None and connects["c"]["entry"]["address"] == "a:9"
     assert calls[-1][:2] == ("a", "/internal/ring/go")
     assert orchestrator.ring_epoch == 4
+
+
+def ring_worker(**fields):
+    """A worker with a stage process that records what it is asked."""
+    asked = []
+
+    def ring_call(operation, **meta):
+        asked.append(operation)
+        return {"engine": False}
+
+    closed = []
+    item = runtime(term=5, ring_term=5, ring_door={}, revoked_nodes=set(), gguf=SimpleNamespace(ring_call=ring_call), **fields)
+    item.ring_client = SimpleNamespace(alive=True, close=lambda: closed.append(True))
+    return item, asked, closed
+
+
+RING_KEYS = {"back": None, "next": "01" * 32, "closing": "02" * 32}
+
+
+def test_a_replaced_coordinator_cannot_open_dial_or_start_a_ring() -> None:
+    item, asked, _ = ring_worker()
+    opening = {"epoch": 3, "index": 0, "count": 2, "keys": RING_KEYS}
+
+    def refused(call) -> int:
+        with pytest.raises(HTTPException) as caught:
+            asyncio.run(call) if asyncio.iscoroutine(call) else call()
+        return caught.value.status_code
+
+    for term in (4, None, "5"):
+        assert refused(item.ring_open({**opening, "term": term})) == 409
+        assert refused(item.ring_connect({"epoch": 3, "term": term})) == 409
+        assert refused(lambda: item.ring_go({"epoch": 3, "term": term})) == 409
+    # Only the term that opened a ring may dial it or start it, so a newer one is refused too.
+    assert refused(item.ring_connect({"epoch": 3, "term": 6})) == 409
+    assert asked == []
+    item.ring_go({"epoch": 3, "term": 5})
+    asyncio.run(item.ring_open({**opening, "term": 6}))
+    assert (item.term, item.ring_term, asked) == (6, 6, ["ring_open"])
+    assert refused(item.ring_open({**opening, "term": 5})) == 409
+
+
+def test_a_ring_needs_keys_for_its_own_links_only() -> None:
+    item, asked, _ = ring_worker()
+    for keys in (None, "00", {"route": "00"}, {"next": 7}):
+        with pytest.raises(HTTPException) as caught:
+            asyncio.run(item.ring_open({"epoch": 3, "term": 5, "index": 0, "count": 2, "keys": keys}))
+        assert caught.value.status_code == 400
+    assert asked == []
+
+
+def test_a_revoked_node_gets_no_ring_and_its_revocation_closes_one_at_once() -> None:
+    item, asked, closed = ring_worker(worker_id="a", pool_token=None, authority=None, last_error=None)
+    item.client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"revoked_nodes": ["b"]})))
+    link = worker_module.ControlLink()
+    link.registered = True
+    asyncio.run(item._check_in("http://control", link))
+    assert closed and asked == ["ring_close"] and not item.ring_live
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(item.ring_open({"epoch": 3, "term": 5, "index": 0, "count": 2, "keys": RING_KEYS}))
+    assert caught.value.status_code == 409 and asked == ["ring_close"]
+    asyncio.run(item._check_in("http://control", link))  # nothing new, so nothing more to close
+    assert asked == ["ring_close"]
+
+
+def test_revoking_a_node_on_the_route_closes_the_ring_at_once_and_keeps_it_shut() -> None:
+    calls = []
+    orchestrator = pool(lambda item: calls.append((item.url.host, item.url.path)) or httpx.Response(200, json={}))
+    orchestrator.ring_epoch = 4
+
+    async def scenario() -> None:
+        orchestrator.access.revoked.add("b")
+        orchestrator.apply_revocations()
+        assert orchestrator.ring_epoch is None
+        await asyncio.gather(*orchestrator.background)
+        await orchestrator._start_ring()
+
+    asyncio.run(scenario())
+    assert sorted(calls) == [("a", "/internal/ring/close"), ("c", "/internal/ring/close")]
 
 
 def test_a_stage_with_no_engine_leaves_every_reply_on_http() -> None:
@@ -811,7 +894,8 @@ def real_stage():
 
 
 async def real_ring(host, **limits) -> EngineClient:
-    door = host.call("ring_open", host="127.0.0.1", port=0, epoch=1, index=0, count=1, key=bytes(32).hex(), ack_timeout_ms=30000, silence_timeout_ms=30000, **limits)[0]
+    keys = {"back": None, "next": None, "closing": None}  # one stage has no links
+    door = host.call("ring_open", host="127.0.0.1", port=0, epoch=1, index=0, count=1, keys=keys, ack_timeout_ms=30000, silence_timeout_ms=30000, **limits)[0]
     host.call("ring_connect", links={"next": None, "entry": None, "timeout_ms": 5000})
     while (state := host.call("ring_stats")[0].get("connect")) == "dialling":
         await asyncio.sleep(0.02)
@@ -978,9 +1062,12 @@ def test_a_passs_deadline_reaches_the_engine_in_the_plan_it_already_reads() -> N
     host = llama_host._Host()
     host.stage = SimpleNamespace(engine=engine)
     engine.listen = lambda *_: {}
-    host.ring_open({"host": "h", "port": 0, "epoch": 1, "index": 0, "count": 2, "key": "00", "ack_timeout_ms": 5, "silence_timeout_ms": 5}, b"")
+    keys = {"back": None, "next": "01" * 32, "closing": "02" * 32}
+    host.ring_open({"host": "h", "port": 0, "epoch": 1, "index": 0, "count": 2, "keys": keys, "ack_timeout_ms": 5, "silence_timeout_ms": 5}, b"")
     assert plans[0]["pass_ms"] + plans[0]["row_ms"] == pass_seconds(1, 1) * 1000
     assert plans[0]["pass_ms"] + 9 * plans[0]["row_ms"] == pass_seconds(9, 1) * 1000
+    # Each link's key reaches the engine as it was given, and a link the stage is not on has none.
+    assert plans[0]["keys"] == {"next": [1] * 32, "closing": [2] * 32}
 
 
 def test_a_load_that_merges_nothing_tells_the_engine_in_its_plan() -> None:
@@ -995,14 +1082,14 @@ def test_a_load_that_merges_nothing_tells_the_engine_in_its_plan() -> None:
     engine.listen = lambda *_: {}
     host = llama_host._Host()
     host.stage = SimpleNamespace(engine=engine)
-    meta = {"host": "h", "port": 0, "epoch": 1, "index": 0, "count": 2, "key": "00", "ack_timeout_ms": 5, "silence_timeout_ms": 5}
+    meta = {"host": "h", "port": 0, "epoch": 1, "index": 0, "count": 2, "keys": RING_KEYS, "ack_timeout_ms": 5, "silence_timeout_ms": 5}
     host.ring_open({**meta, "merge_passes": False}, b"")
     host.ring_open(meta, b"")  # a worker from before the plan carried it
     assert [plan["merge_passes"] for plan in plans] == [False, True]
 
-    item = runtime(ring_client=None, merge_passes=False, advertised_url="http://w:1")
+    item = runtime(ring_client=None, merge_passes=False, advertised_url="http://w:1", term=5, ring_term=5, revoked_nodes=set())
     item.gguf = SimpleNamespace(ring_call=lambda kind, **fields: calls.append(fields) or {"engine": False})
-    asyncio.run(item.ring_open({"epoch": 3, "index": 0, "count": 2, "key": "00"}))
+    asyncio.run(item.ring_open({"epoch": 3, "term": 5, "index": 0, "count": 2, "keys": RING_KEYS}))
     assert calls[0]["merge_passes"] is False
 
 

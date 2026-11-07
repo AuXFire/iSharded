@@ -100,7 +100,7 @@ from .serving import MAX_STAGE_BYTES, MAX_STATE_BYTES, BodyLimit, serve, where_e
 from .slots import SlotGate
 from .statecopy import CopySender, fetch_file
 from .statestore import HISTORY, PARTIAL, PrefixIndex, StateStore, clear_other_stores, prompt_parts, stage_namespace
-from .access import load_authority
+from .access import load_authority, node_of
 from .addresses import ECHO_PATH, NodeProof, claim, direct_client, host_port, prove, reach_options, reach_urls
 from .tickets import TicketIdentity, client_auth
 from .tls import client_verify, node_proven, node_transport, PEER, stay_on_this_machine_async
@@ -209,6 +209,9 @@ RING_ANSWER_FLOOR_SECONDS = 2 * RING_ACK_MS / 1000
 # How often a wait on the ring looks up to see whether it, or the stage under it, is still there.
 SETTLE_LOOK_SECONDS = 0.25
 RING_DIAL_MS = 10_000
+# Which of a ring's links a stage holds keys for: the hop behind, the hop ahead, and at the
+# two ends the closing link. Each link has its own key.
+RING_KEYS = frozenset({"back", "next", "closing"})
 # A silent link answers nothing, so a shorter address is checked while it is in use. It
 # gets as long without an answer as a ring link gets without an acknowledgement.
 HOP_WATCH_SECONDS = 1.0
@@ -393,6 +396,7 @@ class WorkerRuntime:
         self.row_clock = RowClock()
         self.ring_live = False
         self.ring_epoch: int | None = None
+        self.ring_term = 0  # of the coordinator that opened the ring
         self.ring_door: dict[str, Any] | None = None
         self.ring_client: EngineClient | None = None
         self.ring_guard: asyncio.Task[None] | None = None
@@ -598,7 +602,12 @@ class WorkerRuntime:
                 link.registered = True
                 link.failures = 0
                 answer = response.json()
+                held = len(self.revoked_nodes)
                 self._take_revocations(answer)
+                # A revoked node keeps no link into this stage, not even until the route moves.
+                if len(self.revoked_nodes) > held and self._ring_reaches_revoked():
+                    with suppress(LlamaError):  # a stage process that is gone holds no links
+                        await self.ring_close()
                 for other in answer.get("controls", []):
                     self.control_urls.setdefault(str(other).rstrip("/"), ControlLink())
         except (httpx.HTTPError, OSError, ValueError):
@@ -1144,9 +1153,34 @@ class WorkerRuntime:
             self.ring_client.close()
             self.ring_client = None
 
+    def _ring_order(self, body: dict[str, Any], opening: bool = False) -> None:
+        """Refuses a ring order from a coordinator that has been replaced.
+
+        Opening takes the newest term it has seen. Dialling and going live must come from the
+        term that opened this ring, so an old coordinator cannot finish what a new one started.
+        """
+        term = body.get("term")
+        if not isinstance(term, int) or term < self.term or not (opening or term == self.ring_term):
+            raise HTTPException(status_code=409, detail=f"a ring order from term {term}, but this worker follows term {self.term}")
+
+    def _ring_reaches_revoked(self) -> bool:
+        return any(node_of(stage.worker_id) in self.revoked_nodes for stage in self.route)
+
+    async def ring_close(self) -> None:
+        self.ring_stop()
+        if self.gguf is not None:
+            await asyncio.to_thread(self.gguf.ring_call, "ring_close")
+
     async def ring_open(self, body: dict[str, Any]) -> dict[str, Any]:
+        self._ring_order(body, opening=True)
         if self.gguf is None or body["epoch"] != self.epoch:
             raise HTTPException(status_code=409, detail="this worker is not on that route")
+        if self._ring_reaches_revoked():
+            raise HTTPException(status_code=409, detail="that route has a revoked node on it")
+        keys = body.get("keys")
+        if not isinstance(keys, dict) or not keys.keys() <= RING_KEYS or not all(value is None or isinstance(value, str) for value in keys.values()):
+            raise HTTPException(status_code=400, detail="a ring needs a key for each of this stage's links")
+        self.term = self.ring_term = body["term"]
         self.ring_stop()
         answer = await asyncio.to_thread(
             self.gguf.ring_call,
@@ -1156,7 +1190,7 @@ class WorkerRuntime:
             epoch=body["epoch"],
             index=body["index"],
             count=body["count"],
-            key=body["key"],
+            keys=keys,
             ack_timeout_ms=body.get("ack_timeout_ms", RING_ACK_MS),
             silence_timeout_ms=body.get("silence_timeout_ms", RING_ACK_MS),
             merge_passes=self.merge_passes,
@@ -1169,6 +1203,7 @@ class WorkerRuntime:
         return {"engine": True, "address": host_port(host, answer["port"]), "port": answer["port"], "fingerprint": answer["fingerprint"]}
 
     async def ring_connect(self, body: dict[str, Any]) -> dict[str, Any]:
+        self._ring_order(body)
         if self.gguf is None or self.ring_door is None or body["epoch"] != self.ring_epoch:
             raise HTTPException(status_code=409, detail="this worker has not opened that ring")
         links = {"next": body.get("next"), "entry": body.get("entry"), "timeout_ms": RING_DIAL_MS}
@@ -1193,6 +1228,7 @@ class WorkerRuntime:
         client.close()
 
     def ring_go(self, body: dict[str, Any]) -> None:
+        self._ring_order(body)
         if body["epoch"] != self.ring_epoch or self.ring_client is None:
             raise HTTPException(status_code=409, detail="this worker has not joined that ring")
         self.ring_live = True
@@ -2880,9 +2916,7 @@ async def ring_connect(body: dict[str, Any], authorization: str | None = Header(
 @app.post("/internal/ring/close")
 async def ring_close(authorization: str | None = Header(default=None)) -> dict[str, str]:
     verify_token(authorization)
-    runtime.ring_stop()
-    if runtime.gguf is not None:
-        await asyncio.to_thread(runtime.gguf.ring_call, "ring_close")
+    await runtime.ring_close()
     return {"status": "closed"}
 
 

@@ -6,9 +6,12 @@
 
 use std::fmt;
 
+use ring::hmac;
+
 pub const MAGIC: u16 = 0x5369;
-/// Two added a generation to passes, answers and refusals. Nodes that differ refuse each other.
-pub const VERSION: u8 = 2;
+/// Two added a generation to passes, answers and refusals. Three added the seal on answers.
+/// Nodes that differ refuse each other.
+pub const VERSION: u8 = 3;
 pub const HEADER_BYTES: usize = 8;
 /// The most a body may hold. Enough for a 512 row pass at a width of 32,768 in FP32.
 pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -324,16 +327,42 @@ pub struct Answer {
     pub epoch: u64,
     pub slot: u32,
     pub tokens: Vec<u32>,
+    /// Made by the last stage under a key only it and the entry hold, so a stage in between
+    /// cannot make an answer up. Zero where the entry is the last stage too.
+    pub seal: [u8; MAC_BYTES],
 }
 
+const SEAL_LABEL: &[u8] = b"isharded answer";
+
 impl Answer {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut frame = start_frame(Kind::Result, 32 + 4 * self.tokens.len());
+    fn put_fields(&self, frame: &mut Vec<u8>) {
         frame.extend_from_slice(&self.id.to_le_bytes());
         frame.extend_from_slice(&self.generation.to_le_bytes());
         frame.extend_from_slice(&self.epoch.to_le_bytes());
         frame.extend_from_slice(&self.slot.to_le_bytes());
-        put_tokens(&mut frame, &self.tokens);
+        put_tokens(frame, &self.tokens);
+    }
+
+    fn sealed_fields(&self) -> Vec<u8> {
+        let mut message = SEAL_LABEL.to_vec();
+        self.put_fields(&mut message);
+        message
+    }
+
+    pub fn sealed(mut self, key: &[u8]) -> Answer {
+        let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), &self.sealed_fields());
+        self.seal.copy_from_slice(tag.as_ref());
+        self
+    }
+
+    pub fn is_sealed_by(&self, key: &[u8]) -> bool {
+        hmac::verify(&hmac::Key::new(hmac::HMAC_SHA256, key), &self.sealed_fields(), &self.seal).is_ok()
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut frame = start_frame(Kind::Result, 32 + 4 * self.tokens.len() + MAC_BYTES);
+        self.put_fields(&mut frame);
+        frame.extend_from_slice(&self.seal);
         finish_frame(frame)
     }
 
@@ -344,8 +373,9 @@ impl Answer {
         let epoch = cursor.long()?;
         let slot = cursor.int()?;
         let tokens = cursor.tokens()?;
+        let seal = cursor.array()?;
         cursor.finished()?;
-        Ok(Answer { id, generation, epoch, slot, tokens })
+        Ok(Answer { id, generation, epoch, slot, tokens, seal })
     }
 }
 
@@ -611,7 +641,7 @@ mod tests {
 
     #[test]
     fn answers_refusals_and_beats_survive_the_wire() {
-        let answer = Answer { id: 4, generation: 9, epoch: 2, slot: 5, tokens: vec![1, 2, 3] };
+        let answer = Answer { id: 4, generation: 9, epoch: 2, slot: 5, tokens: vec![1, 2, 3], seal: [0; MAC_BYTES] }.sealed(b"key");
         assert_eq!(Answer::decode(body(&answer.encode())).unwrap(), answer);
         let nack = Nack { id: 4, generation: 9, epoch: 2, refusal: Refusal::FailedStage, stage: 3, message: "gone".into() };
         assert_eq!(Nack::decode(body(&nack.encode())).unwrap(), nack);
@@ -619,6 +649,26 @@ mod tests {
         assert_eq!(Ack::decode(body(&Ack { id: 8 }.encode())).unwrap().id, 8);
         let hello = Hello { role: Role::Closing, epoch: 9, nonce: [3; NONCE_BYTES] };
         assert_eq!(Hello::decode(body(&hello.encode())).unwrap(), hello);
+    }
+
+    #[test]
+    fn a_seal_covers_every_field_and_only_its_key_makes_it() {
+        let answer = Answer { id: 4, generation: 9, epoch: 2, slot: 5, tokens: vec![1, 2, 3], seal: [0; MAC_BYTES] };
+        assert!(!answer.is_sealed_by(b"key"));
+        let sealed = answer.clone().sealed(b"key");
+        assert!(sealed.is_sealed_by(b"key") && !sealed.is_sealed_by(b"another key"));
+        let changed = [
+            Answer { id: 5, ..sealed.clone() },
+            Answer { generation: 8, ..sealed.clone() },
+            Answer { epoch: 3, ..sealed.clone() },
+            Answer { slot: 6, ..sealed.clone() },
+            Answer { tokens: vec![1, 2, 4], ..sealed.clone() },
+        ];
+        assert!(changed.iter().all(|item| !item.is_sealed_by(b"key")));
+        let decoded = Answer::decode(body(&sealed.encode())).unwrap();
+        assert!(decoded.is_sealed_by(b"key"));
+        let frame = sealed.encode();
+        assert!(Answer::decode(&body(&frame)[..body(&frame).len() - 1]).is_err());
     }
 
     #[test]

@@ -225,6 +225,23 @@ A saved prompt state is what a stage worked out from someone's conversation. Tre
 
 `--state-disk-gb 0` keeps states in RAM only, `--state-copy-mb 0` keeps them on their own node, and `--no-prompt-cache` on a load saves none at all.
 
+## Direct links
+
+The [native engine](GUIDE.md#the-native-engine) links stages with TLS 1.3. Each node makes a fresh certificate when it starts, and the coordinator pins its fingerprint for the neighbours over the control plane. Inside TLS, both ends prove they hold the link's key.
+
+- The coordinator makes new keys for each ring: one for each hop, and one for the closing link from the last stage to the entry. A stage gets only the keys of its own links. So it cannot dial past its neighbour, take the closing link in the last stage's place, or join a link it is not on.
+- The last stage seals each answer under the closing key, which only it and the entry hold. The entry drops an answer without that seal, even one that walked back through the other stages, and counts it in `forged`. A stage in between cannot make an answer up.
+- A handshake must finish within 10 seconds in all, however its bytes are spaced. At most 64 connections may be mid-handshake on a node, and at most 4 from one address, so one machine cannot take every place. On three local stages, 16 slow connections from one address had 12 turned away at once and 4 closed at 10 seconds, and an honest dial from another address took 6 to 25 ms meanwhile.
+- Ring orders carry the coordinator's term. A worker refuses to open a ring for a term older than one it has seen, and to dial or start a ring for any term but the one that opened it. Closing a ring needs no term: it only moves replies to HTTP.
+- When a node is revoked, the coordinator tells every other stage on its route to close its ring links at once, and a worker that hears of the revocation at check-in closes its own. Replies carry on over HTTP, or replay. No ring opens on a route with a revoked node.
+
+What this leaves open:
+
+- A stage computes its share, so it can change the rows it passes on, and the last stage can seal a wrong answer. [Checking answers](GUIDE.md#checking-answers) is what catches that.
+- A stage can drop passes, make up refusals, or acknowledge an answer walking back that it never passed on. Each costs a replay, not wrong text.
+- Keys travel over the control plane, so they are as private as it is. The coordinator makes every key, so a dishonest coordinator can forge anything on its rings.
+- A worker takes the term an order names, as it does for every order. A member that claims a higher term can open rings, as it can already reorder a route.
+
 ## Audit log
 
 Each node records who loaded models, changed the pool, and asked for replies: time, node, caller, path, status, and client address. It never records prompts or replies. Every node that handles a request records it, so a forwarded request appears twice, and you need the files from every node for the full picture. A forwarded request shows the caller the node proved, such as `admin:alice via node-b`, and `unknown` if it proved nothing.

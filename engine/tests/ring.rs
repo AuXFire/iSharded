@@ -7,13 +7,33 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use isharded_engine::link::{self, Frames, Link};
+use isharded_engine::link::{self, Frames, Identity, Link};
 use isharded_engine::watchdog::{Limits, Watchdog};
-use isharded_engine::node::{Address, Compute, Failure, Links, Node, Output, Plan};
-use isharded_engine::wire::{Answer, Kind, Nack, Pass, Refusal, Role, Sampling, FLAG_TOKENS};
+use isharded_engine::node::{Address, Compute, Failure, Keys, Links, Node, Output, Plan};
+use isharded_engine::wire::{Ack, Answer, Kind, Nack, Pass, Refusal, Role, Sampling, FLAG_TOKENS, MAC_BYTES};
 
-const KEY: &[u8] = b"a route key for testing";
+const CLOSING: &[u8] = &[9; 32];
 const WIDTH: u32 = 4;
+
+/// The key of the link from stage `edge` to the next.
+fn hop_key(edge: u16) -> Vec<u8> {
+    vec![edge as u8 + 1; 32]
+}
+
+/// The keys a coordinator gives a place in a route: those of its own links and no others.
+fn keys_for(index: u16, count: u16) -> Keys {
+    let ends = count > 1 && (index == 0 || index + 1 == count);
+    Keys {
+        back: (index > 0).then(|| hop_key(index - 1)),
+        next: (index + 1 < count).then(|| hop_key(index)),
+        closing: ends.then(|| CLOSING.to_vec()),
+    }
+}
+
+/// An answer as the last stage makes it.
+fn sealed(id: u64, tokens: Vec<u32>) -> Answer {
+    Answer { id, generation: 1, epoch: 7, slot: 0, tokens, seal: [0; MAC_BYTES] }.sealed(CLOSING)
+}
 
 /// Adds its stage number to every value, so an answer shows each stage ran, in order.
 struct Adder {
@@ -227,7 +247,7 @@ fn build_ring(count: u16, closing: bool, delay: Duration, (ack_timeout_ms, silen
         seen.push(counter);
     }
     for (index, node) in nodes.iter().enumerate() {
-        node.open(Plan { epoch: 7, index: index as u16, count, key: KEY.to_vec(), ack_timeout_ms, silence_timeout_ms, merge_passes: true });
+        node.open(Plan { epoch: 7, index: index as u16, count, keys: keys_for(index as u16, count), ack_timeout_ms, silence_timeout_ms, merge_passes: true }).unwrap();
     }
     let relay = relayed.map(|door| Relay::to(doors[door].port));
     let address = |at: usize| {
@@ -302,7 +322,7 @@ fn a_pass_runs_every_stage_in_order_and_the_answer_reaches_the_entry() {
     ring.client.send(&pass(1, 5, 9).encode()).unwrap();
     let got = answer(&mut ring);
     // ((5 * 10 + 1) * 10 + 2) * 10 + 3
-    assert_eq!(got, Answer { id: 1, generation: 1, epoch: 7, slot: 0, tokens: vec![5123, 9] });
+    assert_eq!(got, sealed(1, vec![5123, 9]));
     assert!(ring.nodes[2].stats().closing_up);
 }
 
@@ -463,7 +483,7 @@ fn losing_the_closing_link_costs_nothing_but_speed() {
     wait_until("the closing link's loss", || !ring.nodes[2].stats().closing_up);
     ring.client.send(&pass(2, 5, 9).encode()).unwrap();
     let got = answer(&mut ring);
-    assert_eq!(got, Answer { id: 2, generation: 1, epoch: 7, slot: 0, tokens: vec![5123, 9] });
+    assert_eq!(got, sealed(2, vec![5123, 9]));
     assert_eq!(ring.nodes[2].stats().refusals, 0);
 }
 
@@ -851,7 +871,7 @@ fn the_entry_drops_a_late_result_from_an_older_generation() {
 /// Says what the last stage says, from outside it, as a stage that lost track could.
 fn closing_voice(ring: &Ring) -> Arc<Link> {
     let door = &ring.doors[0];
-    link::dial(&format!("127.0.0.1:{}", door.port), Some(&door.fingerprint), KEY, Role::Closing, 7, Duration::from_secs(3)).unwrap()
+    link::dial(&format!("127.0.0.1:{}", door.port), Some(&door.fingerprint), CLOSING, Role::Closing, 7, Duration::from_secs(3)).unwrap()
 }
 
 #[test]
@@ -861,9 +881,9 @@ fn the_entry_passes_on_an_answer_it_has_already_seen_only_once() {
     let first = answer(&mut ring);
     let voice = closing_voice(&ring);
     voice.send(&first.encode()).unwrap();
-    voice.send(&Answer { id: 2, ..first.clone() }.encode()).unwrap();
-    voice.send(&Answer { id: 2, ..first.clone() }.encode()).unwrap();
-    voice.send(&Answer { id: 3, ..first }.encode()).unwrap();
+    voice.send(&Answer { id: 2, ..first.clone() }.sealed(CLOSING).encode()).unwrap();
+    voice.send(&Answer { id: 2, ..first.clone() }.sealed(CLOSING).encode()).unwrap();
+    voice.send(&Answer { id: 3, ..first }.sealed(CLOSING).encode()).unwrap();
     assert_eq!(answer(&mut ring).id, 2);
     assert_eq!(answer(&mut ring).id, 3);
     wait_until("both repeats dropped", || ring.nodes[0].stats().dropped == 2);
@@ -876,12 +896,80 @@ fn an_answer_from_no_reply_this_entry_knows_is_dropped() {
     ring.client.send(&pass(1, 5, 9).encode()).unwrap();
     let first = answer(&mut ring);
     let voice = closing_voice(&ring);
-    voice.send(&Answer { id: 2, generation: 99, ..first.clone() }.encode()).unwrap();
-    voice.send(&Answer { id: 3, slot: 4, ..first.clone() }.encode()).unwrap();
-    voice.send(&Answer { id: 4, ..first }.encode()).unwrap();
+    voice.send(&Answer { id: 2, generation: 99, ..first.clone() }.sealed(CLOSING).encode()).unwrap();
+    voice.send(&Answer { id: 3, slot: 4, ..first.clone() }.sealed(CLOSING).encode()).unwrap();
+    voice.send(&Answer { id: 4, ..first }.sealed(CLOSING).encode()).unwrap();
     assert_eq!(answer(&mut ring).id, 4);
     assert_eq!(ring.nodes[0].stats().dropped, 2);
     voice.close();
+}
+
+#[test]
+fn a_stage_can_speak_only_on_the_links_it_is_part_of() {
+    let mut ring = ring(3, true, Duration::ZERO, 2000);
+    {
+        let dial = |at: usize, key: &[u8], role: Role| {
+            let door = &ring.doors[at];
+            link::dial(&format!("127.0.0.1:{}", door.port), Some(&door.fingerprint), key, role, 7, Duration::from_secs(3))
+        };
+        // Stage one holds the keys of the hops on either side of it, and nothing else.
+        for key in [hop_key(0), hop_key(1)] {
+            assert!(dial(0, &key, Role::Closing).is_err(), "it closed the ring as if it were the last stage");
+        }
+        assert!(dial(2, &hop_key(0), Role::Hop).is_err(), "it dialled past its neighbour");
+        assert!(dial(1, &hop_key(1), Role::Hop).is_err(), "a key went the wrong way along its link");
+        assert!(dial(1, CLOSING, Role::Closing).is_err(), "a stage in the middle took a closing link");
+        assert!(dial(0, &hop_key(0), Role::Hop).is_err(), "the entry took a hop");
+    }
+    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+    assert_eq!(answer(&mut ring), sealed(1, vec![5123, 9]));
+    let (entry, middle, last) = (ring.nodes[0].stats(), ring.nodes[1].stats(), ring.nodes[2].stats());
+    assert!(entry.next_up && entry.closing_up && middle.next_up && last.closing_up);
+    assert_eq!(ring.nodes[2].stats().resent, 0);
+}
+
+#[test]
+fn an_answer_a_middle_stage_makes_up_is_dropped_and_its_link_stays_up() {
+    // The test stands in for stage one of three, holding only what stage one would hold.
+    let entry = Node::new().unwrap();
+    entry.set_compute(Box::new(Adder { stage: 1, last: false, delay: Duration::ZERO, seen: Arc::default() }));
+    let door = listening(&entry);
+    entry.open(Plan { epoch: 7, index: 0, count: 3, keys: keys_for(0, 3), ack_timeout_ms: 5000, silence_timeout_ms: 5000 }).unwrap();
+    let identity = Identity::generate().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = Address { address: listener.local_addr().unwrap().to_string(), fingerprint: identity.fingerprint.clone() };
+    let middle = thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        let (link, frames, _) = link::accept(socket, Some(&identity), link::HANDSHAKE, |role, _| (role == Role::Hop).then(|| hop_key(0))).unwrap();
+        (link, frames)
+    });
+    entry.connect(Links { next: Some(address), entry: None, timeout_ms: 3000 }).unwrap();
+    let (link, mut frames) = middle.join().unwrap();
+    let client = link::dial(&format!("127.0.0.1:{}", door.local_port), None, &door.local_key, Role::Local, 0, Duration::from_secs(3)).unwrap();
+    let mut answers = client.reader(1 << 20);
+    client.send(&pass(1, 5, 9).encode()).unwrap();
+    let id = loop {
+        let (kind, body) = frames.next().unwrap();
+        if kind == Kind::Pass {
+            break Pass::decode(body).unwrap().id;
+        }
+    };
+    link.beat(&Ack { id }.encode()).unwrap();
+    let made_up = Answer { id, generation: 1, epoch: 7, slot: 0, tokens: vec![42, 9], seal: [0; MAC_BYTES] };
+    link.send(&made_up.encode()).unwrap();
+    for key in [hop_key(0), hop_key(1)] {
+        link.send(&made_up.clone().sealed(&key).encode()).unwrap();
+    }
+    // What the last stage really sealed, walking back through this stage, still lands.
+    link.send(&sealed(id, vec![5123, 9]).encode()).unwrap();
+    let (kind, body) = answers.next().unwrap();
+    assert_eq!(kind, Kind::Result);
+    assert_eq!(Answer::decode(body).unwrap().tokens, vec![5123, 9]);
+    let stats = entry.stats();
+    assert_eq!((stats.forged, stats.answers), (3, 1));
+    assert!(stats.next_up && !link.is_closed());
+    link.close();
+    client.close();
 }
 
 #[test]
@@ -930,9 +1018,11 @@ fn the_local_role_is_refused_on_the_public_door() {
 fn a_route_cannot_be_joined_with_the_wrong_key_or_epoch() {
     let node = Node::new().unwrap();
     let door = listening(&node);
-    node.open(Plan { epoch: 7, index: 1, count: 2, key: KEY.to_vec(), ack_timeout_ms: 1000, silence_timeout_ms: 1000, merge_passes: true });
+    node.open(Plan { epoch: 7, index: 1, count: 2, keys: keys_for(1, 2), ack_timeout_ms: 1000, silence_timeout_ms: 1000, merge_passes: true }).unwrap();
     let address = format!("127.0.0.1:{}", door.port);
+    let key = hop_key(0);
     assert!(link::dial(&address, Some(&door.fingerprint), b"wrong", Role::Hop, 7, Duration::from_secs(3)).is_err());
-    assert!(link::dial(&address, Some(&door.fingerprint), KEY, Role::Hop, 8, Duration::from_secs(3)).is_err());
-    assert!(link::dial(&address, Some(&door.fingerprint), KEY, Role::Hop, 7, Duration::from_secs(3)).is_ok());
+    assert!(link::dial(&address, Some(&door.fingerprint), CLOSING, Role::Hop, 7, Duration::from_secs(3)).is_err());
+    assert!(link::dial(&address, Some(&door.fingerprint), &key, Role::Hop, 8, Duration::from_secs(3)).is_err());
+    assert!(link::dial(&address, Some(&door.fingerprint), &key, Role::Hop, 7, Duration::from_secs(3)).is_ok());
 }

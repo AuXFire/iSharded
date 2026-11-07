@@ -275,7 +275,8 @@ class _Host:
         door = self.engine.listen(meta["host"], meta["port"])
         # The engine's watchdog holds a pass to what this process holds a call to.
         limits = (meta.get("pass_ms", PASS_MS), meta.get("row_ms", ROW_MS))
-        self.engine.open(meta["epoch"], meta["index"], meta["count"], bytes.fromhex(meta["key"]), meta["ack_timeout_ms"], meta["silence_timeout_ms"], *limits, merge_passes=meta.get("merge_passes", True))
+        keys = {name: bytes.fromhex(key) for name, key in meta["keys"].items() if key is not None}
+        self.engine.open(meta["epoch"], meta["index"], meta["count"], keys, meta["ack_timeout_ms"], meta["silence_timeout_ms"], *limits, merge_passes=meta.get("merge_passes", True))
         return {"engine": True, **door}, b""
 
     def ring_connect(self, meta: dict[str, Any], _: bytes) -> Reply:

@@ -905,6 +905,19 @@ class Orchestrator:
         for worker_id, record in self.workers.items():
             if node_of(worker_id) in self.access.revoked and not record.quarantined:
                 self._quarantine(worker_id, "its node was revoked")
+        if self.ring_epoch is not None and self._route_reaches_revoked():
+            # Its links close now, not when the route moves. Replies carry on over HTTP.
+            self.ring_epoch = None
+            self.spawn(self._close_ring(list(self.route)))
+
+    def _route_reaches_revoked(self) -> bool:
+        return any(node_of(stage.worker_id) in self.access.revoked for stage in self.route)
+
+    async def _close_ring(self, route: list[StageAssignment]) -> None:
+        """Every stage still trusted lets go of its links, so a revoked one keeps none."""
+        stages = [stage for stage in route if node_of(stage.worker_id) not in self.access.revoked]
+        # One that misses this sees its neighbours' links close all the same.
+        await asyncio.gather(*(self._tell(stage.url.rstrip("/") + "/internal/ring/close", timeout=RING_CALL_SECONDS) for stage in stages))
 
     def _step_down(self) -> None:
         """Another node outranks this one, so it stops coordinating at once.
@@ -1549,6 +1562,8 @@ class Orchestrator:
         """
         if os.getenv("ISHARDED_RING", "1") == "0" or not self.coordinating or not self.route or self.ring_epoch == self.epoch:
             return
+        if self._route_reaches_revoked():
+            return  # no links for a revoked node, while the route still holds it
         route, epoch = list(self.route), self.epoch
         if self.ring_tried == epoch and time.monotonic() - self.ring_tried_at < RING_RETRY_SECONDS:
             return
@@ -1571,10 +1586,25 @@ class Orchestrator:
             response.raise_for_status()
             return response.json()
 
-        key = secrets.token_hex(32)
+        last = len(route) - 1
+        term = self.mesh.term if self.mesh else 0
+        hop_keys = [secrets.token_hex(32) for _ in range(last)]
+        closing_key = secrets.token_hex(32) if last > 0 else None
+
+        def keys(index: int) -> dict[str, str | None]:
+            """Only the keys of a stage's own links, so it can speak nowhere else on the route."""
+            return {
+                "back": hop_keys[index - 1] if index > 0 else None,
+                "next": hop_keys[index] if index < last else None,
+                "closing": closing_key if index in (0, last) else None,
+            }
+
         try:
             doors = await asyncio.gather(
-                *(ask(stage, "/internal/ring/open", {"epoch": epoch, "index": index, "count": len(route), "key": key}) for index, stage in enumerate(route))
+                *(
+                    ask(stage, "/internal/ring/open", {"epoch": epoch, "term": term, "index": index, "count": len(route), "keys": keys(index)})
+                    for index, stage in enumerate(route)
+                )
             )
             if not all(door.get("engine") for door in doors):
                 without = [stage.worker_id for stage, door in zip(route, doors) if not door.get("engine")]
@@ -1582,7 +1612,6 @@ class Orchestrator:
                     self.no_engine_told = epoch
                     self.add_event("mesh", "Native path off", f"No native engine on {', '.join(without)}, so replies stay on HTTP")
                 return True
-            last = len(route) - 1
 
             def link(source: int, target: int) -> dict[str, Any]:
                 """What one stage dials. The pinned fingerprint stops a stranger at a reused address."""
@@ -1592,10 +1621,10 @@ class Orchestrator:
 
             def connect(index: int) -> dict[str, Any]:
                 entry = link(index, 0) if index == last and last > 0 else None
-                return {"epoch": epoch, "next": link(index, index + 1) if index < last else None, "entry": entry}
+                return {"epoch": epoch, "term": term, "next": link(index, index + 1) if index < last else None, "entry": entry}
 
             await asyncio.gather(*(ask(stage, "/internal/ring/connect", connect(index)) for index, stage in enumerate(route)))
-            await ask(route[0], "/internal/ring/go", {"epoch": epoch})
+            await ask(route[0], "/internal/ring/go", {"epoch": epoch, "term": term})
         except httpx.HTTPStatusError as exc:
             # A worker a step behind or ahead of this epoch is a route moving, not a fault.
             if exc.response.status_code != 409:
