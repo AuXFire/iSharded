@@ -1000,8 +1000,13 @@
       try { state.keys = (await api('/admin/keys', { timeout: 10000, admin: true })).keys || []; $('keysButton').hidden = false; }
       catch (error) { $('keysButton').hidden = true; if (![401, 403, 404].includes(error.status)) state.keysChecked = false; }  // a node that did not answer is asked again
     }
+    // A page that reads the pool with no key is on an open pool, and its first key would close
+    // the pool to every worker and page that sends none.
+    const openPool = () => !state.token && !(state.keys || []).length;
     function renderKeys() {
       const keys = state.keys || [];
+      $('createKey').disabled = openPool();
+      if (openPool()) { paint($('keysList'), '<p class="list-note">This pool takes requests with no key. A first key would close it to every worker and page that sends none, so give the pool credentials with <code>isharded pool init</code> before adding keys.</p>'); return; }
       paint($('keysList'), keys.length ? `<table class="grid keys"><thead><tr><th scope="col">Name</th><th scope="col">Role</th><th scope="col" class="right">Requests a minute</th><th scope="col"><span class="sr-only">Revoke</span></th></tr></thead><tbody>${keys.map(key => `<tr><td>${esc(key.name)}</td><td>${esc(key.role)}</td><td class="right">${key.requests_per_minute ? esc(key.requests_per_minute) : 'No limit'}</td><td class="right"><button class="btn small" type="button" data-revoke-key="${esc(key.name)}" data-key="key:${esc(key.name)}">Revoke</button></td></tr>`).join('')}</tbody></table>` : '<p class="list-note">No keys yet.</p>');
     }
     async function readKeys() {
@@ -1021,7 +1026,7 @@
     }
     async function createKey() {
       const name = $('keyName').value.trim();
-      if (!name) return;
+      if (!name || openPool()) return;
       $('keysError').hidden = true; $('createKey').disabled = true;
       try {
         const made = await api('/admin/keys', { method: 'POST', admin: true, body: JSON.stringify({ name, role: $('keyRole').value, requests_per_minute: Number($('keyRate').value) || 0 }) });
@@ -1031,7 +1036,7 @@
         $('keyName').value = '';
         await readKeys();
       } catch (error) { if (error.status !== 401) keysError(error); }
-      finally { $('createKey').disabled = false; }
+      finally { $('createKey').disabled = openPool(); }
     }
     function askRevokeKey(name) {
       confirmSheet({ title: `Revoke ${name}`, text: 'Whatever uses this key stops working at once. It cannot be brought back, only replaced with a new key.', yes: 'Revoke key', run: async () => {

@@ -540,7 +540,7 @@ Every node serves both, so any node's address works.
 
 Load a model asks for a lane name on a node's mesh. Empty, the model replaces the main one, and that waits while another load runs, because the pool takes one at a time. With a name, it loads beside the main model as a [lane](#several-models-at-once), which the pool allows during a load, so Load stays open then. A model that needs PyTorch is marked in the list when no worker has it, and Facts and each worker's details say which can run PyTorch models. During a repair the route is gone for its last seconds, while every stage takes its layers, and the dashboard says the repair is finishing.
 
-API keys shows each key's name, role and rate limit, never the key. A new key is shown once, with a button to copy it. Revoking asks first. The button shows only for a key that may list keys, and a pool with an authority refuses changes here in its own words, as [isharded key](#isharded-key) explains.
+API keys shows each key's name, role and rate limit, never the key. A new key is shown once, with a button to copy it. Revoking asks first. The button shows only for a key that may list keys, and a pool with an authority refuses changes here in its own words, as [isharded key](#isharded-key) explains. On a pool with no credentials it creates nothing, because a first key would close that pool to every worker that sends no token.
 
 Conversations are kept in your browser, the latest 50, because the pool stores none. Signing out forgets them, and a browser that runs out of room keeps the words and drops the images.
 

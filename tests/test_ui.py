@@ -519,6 +519,23 @@ def test_keys_are_listed_created_once_and_revoked_after_asking():
         chrome.close()
 
 
+def test_an_open_pool_is_not_closed_by_a_first_key_from_the_page():
+    asked = []
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    with playwright_api.sync_playwright() as playwright:
+        # The page holds no key and the pool lists none, which is an open pool.
+        chrome, page = open_dashboard(playwright, "calm-7", answers=keys_answers([], asked))
+        page.wait_for_selector("#keysButton:not([hidden])")
+        page.click("#keysButton")
+        page.wait_for_selector("#keysList:has-text('isharded pool init')")
+        assert page.locator("#createKey").is_disabled()
+        page.fill("#keyName", "sample-writer")
+        page.press("#keyName", "Enter")
+        page.wait_for_timeout(300)
+        assert not any(method == "POST" for method, _ in asked)
+        chrome.close()
+
+
 def test_a_key_that_cannot_list_keys_sees_no_entry():
     playwright_api = pytest.importorskip("playwright.sync_api")
     with playwright_api.sync_playwright() as playwright:
