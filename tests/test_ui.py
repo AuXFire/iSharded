@@ -1,5 +1,6 @@
 """The pages are static files with no build step, so these read them as text."""
 
+import json
 from pathlib import Path
 import re
 
@@ -182,3 +183,61 @@ def test_text_colours_pass_wcag_aa(theme, text, ground):
 def test_marks_stand_out_from_the_plate(theme, mark):
     tokens = theme_tokens()[theme]
     assert contrast(tokens[mark], tokens["plate"]) >= 3
+
+
+SCRIPT_MARKER = "/* isharded:ui.js */"
+SCRIPT = (PACKAGE / "ui.js").read_text(encoding="utf-8")
+FIXTURES = sorted((ROOT / "tests" / "fixtures" / "status").glob("*.json"))
+
+
+def test_the_dashboard_inlines_the_shared_drawing_once():
+    assert source("dashboard.html").count(SCRIPT_MARKER) == 1
+    page = served("dashboard.html")
+    assert SCRIPT_MARKER not in page and SCRIPT in page
+    assert '"ui.js"' in (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+
+def test_the_shared_drawing_works_under_the_assistants_policy():
+    assert 'style="' not in SCRIPT  # the policy refuses a style attribute, even one set through innerHTML
+    assert "fetch(" not in SCRIPT
+
+
+@pytest.mark.parametrize("theme", [0, 1], ids=["light", "dark"])
+def test_the_board_has_its_own_colours_in_both_themes(theme):
+    assert {"band", "band-slow", "on-track"} <= set(theme_tokens()[theme])
+
+
+def test_a_status_answer_is_not_presented_as_coming_from_this_node():
+    text = source("dashboard.html")
+    assert "data.mesh.node" not in text  # /admin/status is forwarded, so this names the coordinator
+    assert "This node <b>" not in text
+
+
+@pytest.mark.parametrize("name", PAGES + ["ui.js"])
+def test_colour_lives_only_in_the_styles(name):
+    assert not re.search(r"#[0-9a-fA-F]{6}", source(name))
+
+
+def test_the_healthy_state_spends_no_colour():
+    assert re.search(r"look\('idle', '', 'Healthy'", source("dashboard.html"))
+
+
+def test_rebalance_asks_first_when_it_would_free_a_quarantine():
+    text = source("dashboard.html")
+    assert "Keep them out" in text and "another chance" in text
+
+
+@pytest.mark.parametrize("path", FIXTURES, ids=lambda path: path.stem)
+def test_a_fixture_is_labelled_and_names_nobody(path):
+    text = path.read_text(encoding="utf-8")
+    data = json.loads(text)
+    assert data["simulated"] is True  # the page says so on its face
+    for name, worker in data["workers"].items():
+        assert name.startswith("sample-") and worker["country"] is None
+        assert ".invalid" in worker["advertised_url"]
+    assert not re.search(r"\d{1,3}(?:\.\d{1,3}){3}", text.replace("3.10.5", ""))
+
+
+def test_every_fixture_the_plan_names_exists():
+    names = {path.stem for path in FIXTURES}
+    assert names >= {"calm-7", "repair-7", "spill-7", "lost-7", "load-lane-7", "two", "forty", "two-hundred", "fresh-no-times", "no-model", "no-machines"}
