@@ -864,7 +864,7 @@
     function saveTools() {
       let tools;
       const refuse = text => { $('toolsError').textContent = text; $('toolsError').hidden = false; };
-      try { tools = JSON.parse($('toolsText').value.trim() || '[]'); } catch (error) { refuse(`That is not valid JSON: ${error.message}`); return; }
+      try { tools = JSON.parse($('toolsText').value.trim() || '[]'); } catch (error) { refuse('That is not valid JSON: ' + error.message); return; }
       if (!Array.isArray(tools)) tools = [tools];
       if (tools.some(tool => !tool?.function?.name)) { refuse('Each tool needs a function with a name. Check the shape and try again.'); return; }
       setTools(tools.map(tool => ({ type: 'function', ...tool })));

@@ -684,8 +684,9 @@ dialog::backdrop { background: var(--overlay); }
 .reasoning summary { cursor: pointer; }
 .reasoning div { margin-top: 6px; padding-left: var(--s-3); white-space: pre-wrap; overflow-wrap: anywhere; }
 .receipt { margin-top: var(--s-2); color: var(--ink-2); font: 400 var(--t-xs)/16px var(--font-ui); }
-.failure { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-1) var(--s-2); margin-top: var(--s-2); color: var(--bad); font: 400 var(--t-md)/20px var(--font-ui); overflow-wrap: anywhere; }
-.failure > span { flex: 0 1 auto; min-width: 0; }
+.failure { display: grid; grid-template-columns: 13px minmax(0, 1fr); gap: var(--s-1) var(--s-2); margin-top: var(--s-2); color: var(--bad); font: 400 var(--t-md)/20px var(--font-ui); overflow-wrap: anywhere; }
+.failure > .glyph { margin-top: 3px; }
+.failure > .btn { grid-column: 2; justify-self: start; }
 .greeting .failure { display: block; }
 /* The join in a reply the pool carried across a repair: the board's dotted link, laid across the text. */
 .seam { display: flex; align-items: center; gap: var(--s-3); margin: var(--s-3) 0; color: var(--ink-2); font: 400 var(--t-sm)/18px var(--font-narrow); }
@@ -761,6 +762,8 @@ dialog::backdrop { background: var(--overlay); }
   .top .model-button:not(.plain) { flex: 1; }
   .model-control .select { flex: 1; max-width: none; }
   .top #newChat { order: 6; margin-bottom: var(--s-1); padding: 0 var(--s-2); }
+  .pool-chat .top #themeButton { order: 7; margin-bottom: var(--s-1); }
+  .pool-chat .top .model-control { flex-basis: calc(100% - 140px); }
   .tabs { margin-left: 0; }
   .tabs a { min-height: 36px; padding: 0 var(--s-2); }
   .headline { font-size: 24px; line-height: 30px; }
