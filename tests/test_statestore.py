@@ -288,17 +288,6 @@ def test_a_state_being_sent_can_still_be_evicted(tmp_path):
     store.close()
 
 
-def test_wiping_empties_both_tiers(tmp_path):
-    store = filled(tmp_path)
-    store.put("a", blob(10), 1)
-    store.put("b", blob(10), 1)
-    store.flush()
-    store.wipe()
-    assert store.listing() == []
-    assert not list((tmp_path / "store").iterdir())
-    store.close()
-
-
 def test_saving_the_same_state_again_writes_nothing(tmp_path):
     store = filled(tmp_path)
     store.put("a", blob(10), 1)

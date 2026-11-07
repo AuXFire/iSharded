@@ -351,16 +351,21 @@ class StateStore:
                 self._shed_ram()
         return data, "disk"
 
+    def _read_file(self, path: Path) -> tuple[dict[str, Any], np.ndarray]:
+        """A state file's header and data, once they prove to match."""
+        with path.open("rb") as handle:
+            header = self._read_header(handle)
+            data = np.fromfile(handle, dtype=np.uint8)
+        if data.size != int(header["size"]) or zlib.crc32(data) != header.get("crc"):
+            raise ValueError("a saved state that does not match its checksum")
+        return header, data
+
     def _read(self, key: str, entry: Entry) -> np.ndarray | None:
         try:
-            with self._file(key).open("rb") as handle:
-                header = self._read_header(handle)
-                data = np.fromfile(handle, dtype=np.uint8)
-        except (OSError, ValueError, KeyError):
+            data = self._read_file(self._file(key))[1]
+        except (OSError, ValueError, KeyError, TypeError):
             return None
-        if data.size != entry.size or zlib.crc32(data) != header.get("crc"):
-            return None
-        return data
+        return data if data.size == entry.size else None
 
     def adopt(self, key: str, path: Path) -> bool:
         """Take over a state file that arrived from another node. False if it is no good."""
@@ -368,12 +373,8 @@ class StateStore:
             self._remove(path)
             return False
         try:
-            with path.open("rb") as handle:
-                header = self._read_header(handle)
-                data = np.fromfile(handle, dtype=np.uint8)
+            header = self._read_file(path)[0]
             entry = Entry(int(header["length"]), int(header["size"]), str(header["kind"]), on_disk=True)
-            if data.size != entry.size or zlib.crc32(data) != header.get("crc"):
-                raise ValueError("a saved state that does not match its checksum")
             with self.lock:
                 path.replace(self._file(key))
                 self.entries[key] = entry
@@ -400,12 +401,6 @@ class StateStore:
             entry = self.entries.pop(key, None)
             if entry is not None and entry.on_disk:
                 self._remove(self._file(key))
-
-    def wipe(self) -> None:
-        """Forget everything, which is what a change of model calls for."""
-        with self.lock:
-            for key in list(self.entries):
-                self.drop(key)
 
     def listing(self) -> list[dict[str, Any]]:
         with self.lock:
