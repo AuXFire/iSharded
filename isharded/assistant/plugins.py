@@ -30,9 +30,8 @@ from typing import Any
 
 from isharded.mcp_client import START_SECONDS, LineRpc, content_parts
 
-from .broker import DEFAULT_USER
 from .contracts import CallContext, Capability, Effect, Provenance, ToolResult, Trust
-from .mind import is_person
+from .mind import is_person, LOCAL_USER
 from .sandbox import CappedReader, ProcessTree, run_tree, scrubbed_env
 from .store import canonical
 
@@ -166,7 +165,7 @@ class Plugins:
     def add(
         self,
         path: str | Path,
-        by: str = DEFAULT_USER,
+        by: str = LOCAL_USER,
         effects: Sequence[str] | None = None,
         tool_effects: dict[str, Sequence[str]] | None = None,
         env: Sequence[str] = (),
@@ -330,7 +329,7 @@ class Plugins:
             broker.unregister(entry["name"])
             broker.revoke_capability(entry["name"], by)
 
-    def remove(self, name: str, by: str = DEFAULT_USER) -> bool:
+    def remove(self, name: str, by: str = LOCAL_USER) -> bool:
         require_person(by, "remove")
         row = self.store.one("SELECT spec FROM plugins WHERE name = ?", (name,))
         if row is None:
@@ -490,13 +489,13 @@ def add_commands(commands: Any) -> None:
     add.add_argument("--effects", default=None, help="what every tool in it can do, comma separated, overriding the manifest")
     add.add_argument("--tool-effects", action="append", default=[], metavar="TOOL=EFFECTS", help="what one tool can do; can repeat")
     add.add_argument("--env", action="append", default=[], metavar="NAME", help="an environment variable to pass through, by name; can repeat")
-    add.add_argument("--by", default=DEFAULT_USER, help="the person installing it, for the record")
+    add.add_argument("--by", default=LOCAL_USER, help="the person installing it, for the record")
     add.set_defaults(run=run_plugin_add)
     listing = actions.add_parser("list", help="show installed plugins")
     listing.set_defaults(run=run_plugin_list)
     remove = actions.add_parser("remove", help="remove a plugin and end every grant for it")
     remove.add_argument("name", help="the plugin")
-    remove.add_argument("--by", default=DEFAULT_USER, help="the person removing it, for the record")
+    remove.add_argument("--by", default=LOCAL_USER, help="the person removing it, for the record")
     remove.set_defaults(run=run_plugin_remove)
 
 

@@ -170,6 +170,12 @@ def test_a_reply_in_python_words_still_parses():
     assert loose_json("{'a': True, 'b': None, 'c': [1, 2]}") == {"a": True, "b": None, "c": [1, 2]}
 
 
+def test_a_token_is_counted_one_way(monkeypatch):
+    assert conversation.CHARS_PER_TOKEN is providers.CHARS_PER_TOKEN
+    monkeypatch.setattr(providers, "CHARS_PER_TOKEN", 10)
+    assert estimate_tokens("x" * 100) == 11
+
+
 def test_loose_json_refuses_something_absurdly_long():
     assert loose_json('{"a": "' + "x" * 300_000 + '"}') is None
 

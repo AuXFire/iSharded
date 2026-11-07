@@ -519,6 +519,11 @@ def test_every_part_asks_the_same_question_about_who_is_a_person():
     assert mind.is_person("ann") and mind.is_person("user:ann") and mind.is_person(mind.LOCAL_USER)
 
 
+def test_a_shared_constant_has_one_home():
+    assert not hasattr(broker_part, "DEFAULT_USER") and not hasattr(tasks_part, "DEFAULT_USER") and not hasattr(plugins, "DEFAULT_USER")
+    assert memory.SECONDS_PER_DAY is mind.SECONDS_PER_DAY and router.SECONDS_PER_DAY is mind.SECONDS_PER_DAY
+
+
 def test_a_decision_can_be_limited_to_the_users_own_approvals(broker):
     make(broker, "demo.act", effects=(Effect.EXECUTE,))
     broker.add_grant("ann", "demo.act", None, "ann")

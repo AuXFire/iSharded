@@ -18,13 +18,12 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import ContextItem, Provenance, Reach, Trust
-from .mind import actor, add_reach_option, add_user_option, emit, plainly, reach_named, search_terms
+from .mind import actor, add_reach_option, add_user_option, emit, plainly, reach_named, search_terms, SECONDS_PER_DAY
 
 KINDS = ("episodic", "semantic", "procedural", "user", "system")
 RANK = {Trust.EXTERNAL: 0, Trust.MODEL: 1, Trust.OWNER: 2, Trust.VERIFIED: 3}
 TRUST_WEIGHT = {Trust.VERIFIED: 1.3, Trust.OWNER: 1.2, Trust.MODEL: 0.8, Trust.EXTERNAL: 0.5}
 RECENCY_HALF_LIFE_DAYS = 30.0
-SECONDS_PER_DAY = 86_400.0
 # bm25 cannot see trust or age, so ask it for more than will be returned.
 SEARCH_POOL = 4
 # A memory and everything it replaced. Takes the id, then the user twice.

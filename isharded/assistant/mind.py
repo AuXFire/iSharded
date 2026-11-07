@@ -18,6 +18,7 @@ from .contracts import Reach
 
 # Who the command line acts for. Over HTTP a person's key says who they are.
 LOCAL_USER = "owner"
+SECONDS_PER_DAY = 86_400
 
 WORD = re.compile(r"\w+", re.UNICODE)
 # Dropped from searches, or every memory with the word "my" answers every question.
@@ -44,7 +45,7 @@ def is_person(name: str) -> bool:
 
 def owner_of(assistant: Any) -> str:
     identity = getattr(assistant, "identity", None)
-    return getattr(identity, "owner", None) or os.environ.get("ISHARDED_ASSISTANT_USER") or "owner"
+    return getattr(identity, "owner", None) or os.environ.get("ISHARDED_ASSISTANT_USER") or LOCAL_USER
 
 
 def emit(text: str = "", end: str = "\n", stream: TextIO | None = None) -> None:

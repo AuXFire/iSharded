@@ -18,8 +18,8 @@ from pathlib import Path
 import re
 from typing import Any
 
-from .broker import DEFAULT_USER
 from .contracts import Capability, Effect, ModelRequest, Reach
+from .mind import LOCAL_USER
 from .providers import loose_json
 from .router import AllFailed, Refused
 from .tasks import count_steps, plan_errors, references_in, step_inputs, steps_referenced
@@ -325,7 +325,7 @@ def attach(assistant: Any) -> None:
 def add_commands(commands: Any) -> None:
     plan = commands.add_parser("plan", help="ask the planning model for a plan, and check it; runs nothing")
     plan.add_argument("goal", help="what you want done")
-    plan.add_argument("--user", default=DEFAULT_USER, help="who this is for; decides which grants count as missing")
+    plan.add_argument("--user", default=LOCAL_USER, help="who this is for; decides which grants count as missing")
     plan.add_argument("--out", default=None, help="write the plan here, for task run; default prints it")
     plan.set_defaults(run=run_plan)
 
