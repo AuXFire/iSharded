@@ -45,7 +45,6 @@ DEFAULT_MEMORY_MB = 2048
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_STDERR_BYTES = 64 * 1024
 MAX_SUMMARY = 200
-MCP_PROTOCOL = "2025-06-18"
 
 SCHEMA = [
     """
@@ -109,6 +108,7 @@ class McpSession(LineRpc):
     failure = PluginFailure
     refusal = ToolError
     ensure_ascii = True
+    client_info = {"name": "isharded-assistant", "version": "1"}
 
     def __init__(self, command: Sequence[str], cwd: str | None, env: dict[str, str], memory_mb: int) -> None:
         try:
@@ -122,10 +122,17 @@ class McpSession(LineRpc):
         return f"{method} took longer than {timeout:g} seconds"
 
     def start(self) -> None:
-        identity = {"name": "isharded-assistant", "version": "1"}
-        # We offer no sampling and no roots: a server cannot call back into a model.
-        self.request("initialize", {"protocolVersion": MCP_PROTOCOL, "capabilities": {}, "clientInfo": identity}, START_SECONDS)
-        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        """The older handshake goes first here, and the probe only after a refusal.
+
+        A server that stays silent about the probe would cost its whole wait at
+        every start, and most servers a person has installed are of that era.
+        """
+        try:
+            self._initialize()
+        except ToolError:
+            self.modern_version = self._probe()
+            if not self.modern_version:
+                raise
 
     def close(self) -> None:
         self.tree.close()

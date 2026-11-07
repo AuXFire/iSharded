@@ -398,7 +398,13 @@ SERVER = """
         if "strict" in FLAGS and method == "tools/call" and not ready:
             send({{"jsonrpc": "2.0", "id": ident, "error": {{"code": -32002, "message": "called before the handshake"}}}})
             continue
-        if method == "initialize":
+        if method == "server/discover" and "modern_only" in FLAGS:
+            send({{"jsonrpc": "2.0", "id": ident, "result": {{"supportedVersions": ["2026-07-28"], "capabilities": {{"tools": {{}}}}, "resultType": "complete"}}}})
+        elif method == "initialize" and "modern_only" in FLAGS:
+            send({{"jsonrpc": "2.0", "id": ident, "error": {{"code": -32601, "message": "there is no initialize here"}}}})
+        elif method == "initialize" and "newest_only" in FLAGS and message["params"]["protocolVersion"] != "2025-11-25":
+            send({{"jsonrpc": "2.0", "id": ident, "error": {{"code": -32602, "message": "unsupported protocol version"}}}})
+        elif method == "initialize":
             if "strict" in FLAGS:
                 import time
                 time.sleep(0.4)  # long enough for an impatient caller to get in first
@@ -659,6 +665,29 @@ def test_a_new_tool_after_install_is_not_offered(assistant, mcp):
     mcp.manifest([SEARCH, tool_named("exfiltrate")])
     assert invoke(assistant, name, q="x").ok
     assert assistant.broker.capability("mcp.srv.exfiltrate") is None
+
+
+def test_a_server_that_only_speaks_the_newest_era_can_be_installed(assistant, mcp):
+    (name,) = assistant.plugins.add(mcp.manifest(flags=["modern_only"]))
+    grant(assistant, name)
+    assert invoke(assistant, name, q="tea").ok
+    call = next(message for message in mcp.seen() if message.get("method") == "tools/call")
+    assert call["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
+    assert call["params"]["_meta"]["io.modelcontextprotocol/clientInfo"]["name"] == "isharded-assistant"
+
+
+def test_a_server_that_only_speaks_a_newer_older_version_can_be_installed(assistant, mcp):
+    (name,) = assistant.plugins.add(mcp.manifest(flags=["newest_only"]))
+    grant(assistant, name)
+    assert invoke(assistant, name, q="tea").ok
+
+
+def test_a_legacy_server_never_sees_the_probe(assistant, mcp):
+    """A silent one would cost the whole wait at every start."""
+    (name,) = assistant.plugins.add(mcp.manifest())
+    grant(assistant, name)
+    invoke(assistant, name, q="tea")
+    assert "server/discover" not in [message.get("method") for message in mcp.seen()]
 
 
 def test_a_server_that_will_not_start_is_refused_at_install(assistant, tmp_path):

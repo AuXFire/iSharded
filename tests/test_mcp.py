@@ -31,6 +31,9 @@ from isharded import cli, mcp_client, orchestrator
 from isharded.access import AccessControl, create_key
 from isharded.mcp_client import (
     SAFE_ENVIRONMENT,
+    CutOff,
+    HttpServer,
+    McpConnection,
     ServerError,
     StdioServer,
     Toolbox,
@@ -62,6 +65,7 @@ from isharded.mcp_server import (
     McpHandler,
     MeshTools,
     accepts_both,
+    as_header,
     header_value,
     serve_stdio,
 )
@@ -1369,5 +1373,239 @@ def test_stdio_survives_an_id_it_cannot_use(stdio):
     assert pipes.wait_for(2)["result"] == {}
     pipes.incoming.put(b"")
     thread.join(5)
+
+
+# --- mcp run over HTTP
+
+
+class FarServer:
+    """A Streamable HTTP server, written out by hand, that keeps what it was sent."""
+
+    def __init__(self, era: str = "legacy") -> None:
+        self.era = era
+        self.seen: list[tuple[str, httpx.Headers, dict | None]] = []
+
+    def reply(self, identifier, result: dict, **headers) -> httpx.Response:
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": identifier, "result": result}, headers=headers)
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        message = json.loads(request.content) if request.content else None
+        self.seen.append((request.method, request.headers, message))
+        if request.method == "DELETE" or message is None or "id" not in message or "method" not in message:
+            return httpx.Response(202)
+        identifier, method = message["id"], message["method"]
+        if method == "server/discover":
+            if self.era == "legacy":
+                return httpx.Response(400, text="Bad Request: no session")
+            return self.reply(identifier, {"supportedVersions": [MODERN], "capabilities": {"tools": {}}, "_meta": {SERVER_KEY: {"name": "far"}}, "resultType": "complete"})
+        if method == "initialize":
+            return self.reply(identifier, {"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {"name": "far"}}, **{"Mcp-Session-Id": "session-1"})
+        if method == "tools/list":
+            return self.reply(identifier, {"tools": [{"name": "search", "annotations": {"readOnlyHint": True}}, {"name": "hello wörld"}]})
+        events = [
+            {"jsonrpc": "2.0", "method": "notifications/progress", "params": {}},
+            {"jsonrpc": "2.0", "id": 99, "method": "sampling/createMessage", "params": {}},
+            {"jsonrpc": "2.0", "id": identifier, "result": {"content": [{"type": "text", "text": "found"}]}},
+        ]
+        body = "".join(f"event: message\ndata: {json.dumps(event)}\n\n" for event in events).encode()
+        return httpx.Response(200, content=b": a comment\r\n\r\nnot json\n\ndata: [1]\n\n" + body, headers={"Content-Type": "text/event-stream"})
+
+    def calls(self, method: str) -> list:
+        return [(headers, message) for _, headers, message in self.seen if message and message.get("method") == method]
+
+
+def far_server(era: str = "legacy") -> tuple[FarServer, HttpServer]:
+    far = FarServer(era)
+    server = HttpServer("http://far.example/mcp", transport=httpx.MockTransport(far))
+    server.start()
+    return far, server
+
+
+def test_an_http_server_of_the_older_era_gets_a_handshake_and_a_session():
+    far, server = far_server("legacy")
+    assert server.modern_version is None and server.name == "far"
+    assert "mcp-protocol-version" not in far.calls("initialize")[0][0]
+    notified = far.calls("notifications/initialized")[0][0]
+    assert notified["mcp-session-id"] == "session-1" and notified["mcp-protocol-version"] == "2025-06-18"
+    toolbox = Toolbox([server])
+    assert toolbox.call("search", {}, 5) == "found"
+    headers, message = far.calls("tools/call")[0]
+    assert headers["mcp-session-id"] == "session-1" and headers["accept"] == "application/json, text/event-stream"
+    assert "_meta" not in message["params"]
+    server.close()
+    assert far.seen[-1][0] == "DELETE" and far.seen[-1][1]["mcp-session-id"] == "session-1"
+
+
+def test_an_http_server_of_the_current_era_gets_every_mirrored_header():
+    far, server = far_server("modern")
+    assert server.modern_version == MODERN and server.name == "far"
+    assert not far.calls("initialize")
+    Toolbox([server]).call("hello wörld", {}, 5)
+    headers, message = far.calls("tools/call")[0]
+    assert headers["mcp-protocol-version"] == MODERN and headers["mcp-method"] == "tools/call"
+    assert header_value(headers["mcp-name"]) == "hello wörld"
+    assert message["params"]["_meta"][VERSION_KEY] == MODERN
+    server.close()
+    assert far.seen[-1][0] != "DELETE", "a modern server has no session to end"
+
+
+def test_a_question_on_a_stream_is_answered_with_a_no():
+    far, server = far_server()
+    server.request("tools/call", {"name": "search", "arguments": {}}, 5)
+    answer = next(message for _, _, message in far.seen if message and message.get("id") == 99 and "error" in message)
+    assert answer["error"]["code"] == -32601
+
+
+def test_a_name_a_header_cannot_carry_goes_as_base64_and_a_plain_one_does_not():
+    assert as_header("chat") == "chat"
+    for awkward in ("héllo", " spaced", "line\nbreak"):
+        assert as_header(awkward).startswith("=?base64?") and header_value(as_header(awkward)) == awkward
+
+
+def test_an_http_server_that_refuses_a_tool_says_why():
+    def refuses(request):
+        message = json.loads(request.content)
+        return httpx.Response(400, json={"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32602, "message": "no such tool"}})
+
+    server = HttpServer("http://far.example/mcp", transport=httpx.MockTransport(refuses))
+    with pytest.raises(mcp_client.ToolRefused, match="no such tool"):
+        server.request("tools/call", {"name": "x"}, 5)
+
+
+@pytest.mark.parametrize("answer, words", [(httpx.Response(401, text="who are you"), "401"), (httpx.Response(202), "202"), (httpx.Response(307, headers={"Location": "http://elsewhere"}), "307")])
+def test_an_http_server_that_gives_no_reply_is_named(answer, words):
+    server = HttpServer("http://far.example/mcp", transport=httpx.MockTransport(lambda request: answer))
+    with pytest.raises(ServerError, match=words):
+        server.start()
+
+
+def test_a_stream_that_ends_without_a_reply_is_a_failure():
+    empty = httpx.Response(200, content=b"data: {}\n\n", headers={"Content-Type": "text/event-stream"})
+    server = HttpServer("http://far.example/mcp", transport=httpx.MockTransport(lambda request: empty))
+    with pytest.raises(ServerError, match="without answering"):
+        server.request("tools/list", {}, 5)
+
+
+def test_one_enormous_event_is_refused(monkeypatch):
+    monkeypatch.setattr(mcp_client, "MAX_LINE_BYTES", 100)
+    big = httpx.Response(200, content=b"data: " + b"x" * 500, headers={"Content-Type": "text/event-stream"})
+    server = HttpServer("http://far.example/mcp", transport=httpx.MockTransport(lambda request: big))
+    with pytest.raises(ServerError, match="larger than"):
+        server.request("tools/list", {}, 5)
+
+
+@pytest.mark.parametrize("url, words", [("http://[nonsense", "is not a URL"), ("http://host:port/mcp", "could not reach")])
+def test_a_url_that_makes_no_sense_is_said_plainly(url, words, capsys):
+    assert run_agent(agent_arguments(url)) == 1
+    assert words in capsys.readouterr().err
+
+
+def test_a_server_that_cannot_be_reached_is_named():
+    def down(request):
+        raise httpx.ConnectError("refused")
+
+    server = HttpServer("http://far.example/mcp", transport=httpx.MockTransport(down))
+    with pytest.raises(ServerError, match="could not reach"):
+        server.start()
+
+
+@pytest.fixture
+def bad_socket():
+    """A real listener that takes requests and behaves badly, as ``behave(connection)`` says."""
+    listener = socket.create_server(("127.0.0.1", 0))
+    listener.settimeout(0.1)
+    stop = threading.Event()
+
+    def serve(behave) -> None:
+        while not stop.is_set():
+            try:
+                connection, _ = listener.accept()
+            except OSError:
+                continue
+            threading.Thread(target=behave, args=(connection,), daemon=True).start()
+
+    def start(behave) -> str:
+        threading.Thread(target=serve, args=(behave,), daemon=True).start()
+        return f"http://127.0.0.1:{listener.getsockname()[1]}/mcp"
+
+    yield start
+    stop.set()
+    listener.close()
+
+
+def test_a_silent_server_on_a_real_socket_runs_out_of_time(bad_socket):
+    def silent(connection):
+        connection.recv(65536)
+        time.sleep(10)
+
+    server = HttpServer(bad_socket(silent))
+    began = time.monotonic()
+    with pytest.raises(ServerError, match="longer than 0.5"):
+        server.request("tools/list", {}, 0.5)
+    assert time.monotonic() - began < 5
+
+
+def test_a_server_that_only_drips_bytes_runs_out_of_time_too(bad_socket):
+    def drip(connection):
+        connection.recv(65536)
+        connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+        try:
+            for _ in range(200):
+                connection.sendall(b"3\r\n: x\r\n")
+                time.sleep(0.05)
+        except OSError:
+            pass
+
+    server = HttpServer(bad_socket(drip))
+    began = time.monotonic()
+    with pytest.raises(ServerError, match="longer than 0.5"):
+        server.request("tools/list", {}, 0.5)
+    assert time.monotonic() - began < 5
+
+
+class LegacyHttp(HttpServer):
+    def _probe(self):
+        return None
+
+
+@pytest.mark.parametrize("kind, version", [(HttpServer, MODERN), (LegacyHttp, None)])
+def test_our_http_client_reaches_a_real_mesh_in_both_eras(real_socket, kind, version):
+    server = kind(real_socket + "/mcp")
+    try:
+        server.start()
+        assert server.modern_version == version and server.name == "isharded"
+        toolbox = Toolbox([server])
+        assert set(toolbox.tools) == {tool["name"] for tool in TOOLS}
+        assert json.loads(toolbox.call("list_models", {}, 20)) == {"models": []}
+    finally:
+        server.close()
+
+
+def test_the_command_takes_a_url_as_a_server(real_socket, monkeypatch, capsys):
+    real = httpx.Client
+    client, asked = scripted_model([("list_models", {})], "None are loaded.")
+    monkeypatch.setattr(mcp_client.httpx, "Client", lambda **options: client if "base_url" in options else real(**options))
+    assert run_agent(agent_arguments(real_socket + "/mcp")) == 0
+    assert capsys.readouterr().out == "None are loaded.\n"
+    assert tool_results(asked) == ['{"models": []}']
+
+
+def test_a_mesh_server_and_a_stdio_server_can_work_side_by_side(real_socket, monkeypatch, capsys):
+    real = httpx.Client
+    client, asked = scripted_model([("add", {"a": 1, "b": 2}), ("list_models", {})], "Done.")
+    monkeypatch.setattr(mcp_client.httpx, "Client", lambda **options: client if "base_url" in options else real(**options))
+    assert run_agent(agent_arguments(server_command(), real_socket + "/mcp")) == 0
+    assert tool_results(asked) == ["3", '{"models": []}']
+
+
+def test_a_stdio_server_still_negotiates_down_to_a_strict_older_version(started):
+    server = started("--only-version", "2025-06-18")
+    assert server.modern_version is None and server.legacy_version == "2025-06-18"
+    assert Toolbox([server]).call("add", {"a": 1, "b": 1}, 5) == "2"
+
+
+def test_a_server_that_refuses_every_version_is_refused(started, tmp_path):
+    with pytest.raises(mcp_client.ToolRefused, match="unsupported"):
+        started("--only-version", "1999-01-01")
 
 

@@ -444,6 +444,13 @@ def header_value(value: str) -> str:
     return value
 
 
+def as_header(value: str) -> str:
+    """What ``header_value`` reads back."""
+    if value.isascii() and value.isprintable() and value == value.strip():
+        return value
+    return "=?base64?" + base64.b64encode(value.encode("utf-8")).decode("ascii") + "?="
+
+
 def check_modern_headers(headers: Mapping[str, str], message: dict[str, Any], version: str) -> None:
     """Modern headers mirror the body, so whatever routes on one cannot be told another story."""
     params = as_object(message.get("params"))
