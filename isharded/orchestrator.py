@@ -2301,7 +2301,7 @@ class Orchestrator:
         markers = [marker for marker in ([stop] if isinstance(stop, str) else (stop or [])) if marker]
         holdback = max((len(marker) for marker in markers), default=1) - 1
         generated: list[int] = []
-        sent = ""
+        sent = 0  # characters of the reply yielded so far
         finish_reason = "length"
         started = time.perf_counter()
         first_token_at: float | None = None
@@ -2319,6 +2319,8 @@ class Orchestrator:
                         break
                     generated.append(token)
                     session.tokens.append(token)
+                    # Only the end of the reply is in hand. A stop string finishing now
+                    # starts inside it, as one in the settled text would have ended the reply.
                     text = decoder.add(token)
                     hits = [text.index(marker) for marker in markers if marker in text]
                     if hits:
@@ -2327,11 +2329,13 @@ class Orchestrator:
                     ready = text if hits else text[: len(text) - holdback]
                     if ready.endswith("�") and not hits:
                         continue
-                    if len(ready) > len(sent):
-                        delta, sent = ready[len(sent) :], ready
+                    if decoder.start + len(ready) > sent:
+                        delta = ready[sent - decoder.start :]
+                        sent = decoder.start + len(ready)
                         yield {"text": delta}
                     if hits:
                         break
+                    decoder.forget(holdback)  # all but the holdback is sent by now
         finally:
             self.replies_in_flight -= 1
             # This generator may be closing because the client left, and
@@ -2342,8 +2346,8 @@ class Orchestrator:
         hits = [text.index(marker) for marker in markers if marker in text]
         if hits:
             text = text[: min(hits)]
-        if len(text) > len(sent):
-            yield {"text": text[len(sent) :]}
+        if len(text) > sent:
+            yield {"text": text[sent:]}
         finished = time.perf_counter()
         decode_seconds = finished - (first_token_at or finished)
         yield {

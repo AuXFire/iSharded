@@ -1,6 +1,9 @@
 import asyncio
 import json
 from pathlib import Path
+import random
+import re
+from typing import Any
 
 from fastapi import HTTPException
 import httpx
@@ -10,6 +13,7 @@ from tokenizers import Tokenizer
 from tokenizers.models import BPE, WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 
+from isharded import orchestrator as orchestrator_module
 from isharded.models import GgufAdapter
 from isharded.orchestrator import Orchestrator
 from isharded.protocol import StageAssignment
@@ -33,10 +37,10 @@ class ScriptedTokenizer:
         return "".join(self.pieces[token] for token in ids)
 
 
-def generate(pieces: dict[int, str], tokens: list[int], stop=None, max_tokens: int = 20) -> tuple[list[dict], list[str]]:
+def generate(pieces: Any, tokens: list[int], stop=None, max_tokens: int = 20) -> tuple[list[dict], list[str]]:
     async def scenario() -> tuple[list[dict], list[str]]:
         orchestrator = Orchestrator()
-        orchestrator.tokenizer = ScriptedTokenizer(pieces)
+        orchestrator.tokenizer = ScriptedTokenizer(pieces) if isinstance(pieces, dict) else pieces
         orchestrator.model_id = "scripted"
         remaining = iter(tokens)
         cleared: list[str] = []
@@ -89,6 +93,188 @@ def test_text_that_only_looked_like_a_stop_string_still_arrives() -> None:
 def test_a_character_split_across_tokens_is_held_until_complete() -> None:
     events, _ = generate({1: "a", 2: "�", 3: "b"}, [1, 2, STOP_TOKEN])
     assert all("�" not in piece for piece in text_of(events)[:-1])
+
+
+@pytest.mark.parametrize(
+    ("pieces", "tokens", "stop", "shown"),
+    [
+        # A stop string at each place a token can cut it.
+        ({1: "abc", 2: "END"}, [1, 2], "END", "abc"),
+        ({1: "abcE", 2: "ND"}, [1, 2], "END", "abc"),
+        ({1: "abcEN", 2: "D"}, [1, 2], "END", "abc"),
+        ({1: "ab", 2: "cE", 3: "N", 4: "Dzz"}, [1, 2, 3, 4], "END", "abc"),
+        # Far enough in that the start of the reply has been let go of.
+        ({1: "words " * 50, 2: "E", 3: "N", 4: "D"}, [1, 1, 2, 3, 4, 1], "END", "words " * 100),
+        ({1: "words " * 50, 2: "END words"}, [1, 2], "END", "words " * 50),
+        # Whichever comes first wins, however long it is.
+        ({1: "xx long-stop short"}, [1], ["short", "long-stop"], "xx "),
+        ({1: "xx lo", 2: "ng-stop short"}, [1, 2], ["long-stop", "short"], "xx "),
+        # Overlapping, and a false start that runs into the real one.
+        ({1: "ENE", 2: "ND"}, [1, 2], "END", "EN"),
+        ({1: "aaa", 2: "ab"}, [1, 2], "aab", "aa"),
+    ],
+)
+def test_a_stop_string_ends_the_text_at_every_boundary(pieces, tokens, stop, shown) -> None:
+    events, _ = generate(pieces, tokens, stop=stop)
+    assert "".join(text_of(events)) == shown
+    assert events[-1]["finish_reason"] == "stop"
+
+
+class ByteTokenizer:
+    """One token per byte, so any character can be cut, as a byte-level vocabulary cuts it."""
+
+    stop_token_ids = {STOP_TOKEN + 1000}
+
+    def __init__(self, mark_each_byte: bool) -> None:
+        self.mark_each_byte = mark_each_byte  # some decoders give one mark per bad byte, so text can shrink
+
+    def encode(self, text: str) -> list[int]:
+        return [1, 2]
+
+    def decode(self, ids: list[int]) -> str:
+        if self.mark_each_byte:
+            return re.sub("[\udc80-\udcff]", "�", bytes(ids).decode("utf-8", "surrogateescape"))
+        return bytes(ids).decode("utf-8", "replace")
+
+
+@pytest.mark.parametrize("mark_each_byte", [False, True])
+@pytest.mark.parametrize(("reply", "stop", "shown"), [("ok é! more", "é!", "ok "), ("ok €uro", "€", "ok "), ("🙂🙂 end", "🙂 e", "🙂")])
+def test_a_stop_string_can_hold_a_character_split_across_tokens(mark_each_byte, reply, stop, shown) -> None:
+    tokens = list(reply.encode())
+    events, _ = generate(ByteTokenizer(mark_each_byte), tokens, stop=stop, max_tokens=len(tokens))
+    assert "".join(text_of(events)) == shown
+    assert events[-1]["finish_reason"] == "stop"
+
+
+def whole_text_stream(tokenizer, tokens: list[int], stop: str | list[str] | None) -> tuple[list[str], str]:
+    """What stream_tokens gave when it read the whole text on every token."""
+    markers = [marker for marker in ([stop] if isinstance(stop, str) else (stop or [])) if marker]
+    holdback = max((len(marker) for marker in markers), default=1) - 1
+    settled, pending, sent, generated, deltas, reason = "", [], "", [], [], "length"
+    for token in tokens:
+        if token in tokenizer.stop_token_ids:
+            reason = "stop"
+            break
+        generated.append(token)
+        pending.append(token)
+        tail = tokenizer.decode(pending)
+        if tail.endswith("�"):
+            text = settled + tail
+        else:
+            settled, pending = settled + tail, []
+            text = settled
+        hits = [text.index(marker) for marker in markers if marker in text]
+        if hits:
+            text = text[: min(hits)]
+            reason = "stop"
+        ready = text if hits else text[: len(text) - holdback]
+        if ready.endswith("�") and not hits:
+            continue
+        if len(ready) > len(sent):
+            deltas.append(ready[len(sent) :])
+            sent = ready
+        if hits:
+            break
+    text = tokenizer.decode(generated)
+    hits = [text.index(marker) for marker in markers if marker in text]
+    if hits:
+        text = text[: min(hits)]
+    if len(text) > len(sent):
+        deltas.append(text[len(sent) :])
+    return deltas, reason
+
+
+def random_reply(rng: random.Random) -> tuple[Any, list[int], str | list[str] | None]:
+    words = ["a", "b", "ab", "é", "€", "🙂", " ", "\n", "END", "EN", "�"]
+    text = "".join(rng.choice(words) for _ in range(rng.randrange(0, 40)))
+    kind = rng.randrange(3)
+    if kind == 2:
+        pieces = {index + 1: rng.choice(words) * rng.randrange(1, 4) for index in range(10)}
+        tokenizer: Any = ScriptedTokenizer(pieces)
+        tokens = [rng.randrange(1, 11) for _ in range(rng.randrange(1, 40))]
+    else:
+        tokenizer = ByteTokenizer(mark_each_byte=kind == 1)
+        tokens = list(text.encode()) or [97]
+        if rng.random() < 0.3:  # bytes no character can be made from
+            tokens.insert(rng.randrange(len(tokens)), rng.choice([0x80, 0xC3, 0xE2, 0xF0, 0xFF]))
+    if rng.random() < 0.3:
+        tokens.insert(rng.randrange(len(tokens)), next(iter(tokenizer.stop_token_ids)))
+    full = tokenizer.decode(tokens[: tokens.index(next(iter(tokenizer.stop_token_ids)))] if next(iter(tokenizer.stop_token_ids)) in tokens else tokens)
+
+    def marker() -> str:
+        if full and rng.random() < 0.7:
+            start = rng.randrange(len(full))
+            return full[start : start + rng.randrange(1, 9)]
+        return "".join(rng.choice(words) for _ in range(rng.randrange(0, 5)))  # some never come, and some outrun the reply
+
+    return tokenizer, tokens, rng.choice([None, marker(), [marker() for _ in range(rng.randrange(0, 4))]])
+
+
+def replies_match_whole_text_reading(seed: int, rounds: int) -> None:
+    async def scenario() -> None:
+        rng = random.Random(seed)
+        orchestrator = Orchestrator()
+        orchestrator.model_id = "scripted"
+
+        async def clear_session(session_id: str) -> None:
+            return None
+
+        orchestrator.clear_session = clear_session
+        for _ in range(rounds):
+            tokenizer, tokens, stop = random_reply(rng)
+            remaining = iter(tokens)
+
+            async def next_token(*args) -> int:
+                return next(remaining)
+
+            orchestrator.tokenizer = tokenizer
+            orchestrator.next_token = next_token
+            events = [item async for item in orchestrator.stream_tokens("prompt", len(tokens), 0.0, 1.0, 0, None, stop)]
+            assert (text_of(events), events[-1]["finish_reason"]) == whole_text_stream(tokenizer, tokens, stop), (tokens, stop)
+        await asyncio.gather(*orchestrator.background)
+        await orchestrator.close()
+
+    asyncio.run(scenario())
+
+
+def test_reading_only_the_tail_gives_what_reading_the_whole_text_gave() -> None:
+    replies_match_whole_text_reading(seed=2026, rounds=1500)
+
+
+def test_a_long_reply_does_not_keep_its_whole_text_in_hand() -> None:
+    held: list[int] = []
+
+    class Watched(IncrementalText):
+        def add(self, token: int) -> str:
+            text = super().add(token)
+            held.append(len(text))
+            return text
+
+    original = orchestrator_module.IncrementalText
+    orchestrator_module.IncrementalText = Watched
+    try:
+        events, _ = generate({1: "some words "}, [1] * 2000, stop=["</never-comes>", "NOT HERE"], max_tokens=2000)
+    finally:
+        orchestrator_module.IncrementalText = original
+    assert len("".join(text_of(events))) == 2000 * 11
+    assert max(held) < 64
+
+
+def test_incremental_text_lets_go_of_what_was_read_but_never_of_what_is_unsettled() -> None:
+    class Bytes:
+        def decode(self, ids):
+            return bytes(ids).decode("utf-8", "replace")
+
+    decoder = IncrementalText(Bytes())
+    for token in b"abcdef":
+        decoder.add(token)
+    decoder.forget(2)
+    assert (decoder.start, decoder.settled) == (4, "ef")
+    decoder.forget(3)  # only two are there, so nothing goes
+    assert (decoder.start, decoder.settled) == (4, "ef")
+    assert decoder.add(0xC3) == "ef�"
+    decoder.forget(0)
+    assert decoder.add(0xA9) == "é" and decoder.start == 6
 
 
 def test_a_client_leaving_mid_stream_still_clears_worker_state() -> None:
