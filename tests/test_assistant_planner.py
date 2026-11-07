@@ -417,3 +417,102 @@ def test_the_plan_command_prints_a_plan_and_says_when_it_cannot(tmp_path, capsys
     monkeypatch.setattr(planner_part, "attach", attach_with_router)
     assert command(home, "plan", "Build a new feature") == 0
     assert "Needs a plan" in capsys.readouterr().out
+
+
+# One yes, and only for what the steps do
+
+
+def test_one_yes_is_worked_out_from_the_steps_and_not_from_the_plans_own_list(assistant, tmp_path):
+    script(assistant, {"steps": [read_step(path=str(tmp_path / "x"))]})
+    plan = assistant.planner.plan("ann", "Read it")
+    plan["missing_grants"] = [{"capability": "shell.run", "scope": "*", "uses": 1000, "steps": ["a"]}]
+    outcome = assistant.planner.allow_missing("ann", plan, "ann")
+    assert len(outcome["granted"]) == 1
+    assert [(row["capability"], row["uses_left"]) for row in assistant.broker.grants("ann")] == [("files.read", 1)]
+
+
+def test_what_is_already_allowed_gets_no_second_grant(assistant, tmp_path):
+    assistant.broker.add_grant("ann", "files.read", str(tmp_path), "ann")
+    script(assistant, {"steps": [read_step(path=str(tmp_path / "x"))]})
+    plan = assistant.planner.plan("ann", "Read it")
+    assert assistant.planner.allow_missing("ann", plan, "ann") == {"granted": [], "left_for_a_person": []}
+
+
+def glob_scoped(assistant):
+    capability = Capability("notes.tag", "x", frozenset({Effect.WRITE_LOCAL}), scope_field="tag", input_schema={"type": "object", "properties": {"tag": {"type": "string"}}})
+    assistant.broker.register(capability, lambda arguments, context: "tagged")
+
+
+@pytest.mark.parametrize("scope", ["*", "work*", "wor?", "[a-z]"])
+def test_a_scope_a_model_wrote_as_a_pattern_is_left_for_a_person(assistant, scope):
+    """One yes is for exact scopes, so a plan must not turn it into everything."""
+    glob_scoped(assistant)
+    script(assistant, {"steps": [{"id": "a", "kind": "tool", "capability": "notes.tag", "arguments": {"tag": scope}}]})
+    plan = assistant.planner.plan("ann", "Tag it")
+    assert assistant.planner.allow_missing("ann", plan, "ann") == {"granted": [], "left_for_a_person": ["notes.tag"]}
+    assert assistant.broker.grants("ann") == []
+
+
+def test_an_exact_scope_of_that_kind_is_granted(assistant):
+    glob_scoped(assistant)
+    script(assistant, {"steps": [{"id": "a", "kind": "tool", "capability": "notes.tag", "arguments": {"tag": "work"}}]})
+    plan = assistant.planner.plan("ann", "Tag it")
+    assert len(assistant.planner.allow_missing("ann", plan, "ann")["granted"]) == 1
+    assert assistant.broker.grants("ann")[0]["scope"] == "work"
+
+
+def test_a_plan_that_could_not_run_gets_no_grants(assistant):
+    plan = {"steps": [{"id": "a", "kind": "tool", "capability": "nothing.here", "arguments": {}}]}
+    with pytest.raises(PlanRejected, match="not a capability"):
+        assistant.planner.allow_missing("ann", plan, "ann")
+
+
+@pytest.mark.parametrize("by", ["skill:planner", "task:t1", "peer:ann", "model:x", "plugin:y", "conversation"])
+def test_no_machine_can_give_that_yes_even_when_nothing_is_missing(assistant, by):
+    with pytest.raises(ValueError, match="not a person"):
+        assistant.planner.allow_missing("ann", {"steps": []}, by)
+
+
+def plan_command(home, *words):
+    parser = argparse.ArgumentParser()
+    cli.add_arguments(parser)
+    return cli.run(parser.parse_args(["--home", str(home), "plan-allow", *words]))
+
+
+def test_the_command_gives_one_yes_for_a_saved_plan(tmp_path, capsys):
+    home, file = tmp_path / "home", tmp_path / "plan.json"
+    with Assistant(home) as assistant:
+        script(assistant, {"steps": [read_step(path=str(tmp_path / "x"), retries=2)]})
+        file.write_text(json.dumps(assistant.planner.plan("ann", "Read it")), encoding="utf-8")
+    assert plan_command(home, str(file), "--user", "ann", "--by", "ann") == 0
+    assert "Granted 1" in capsys.readouterr().out
+    with Assistant(home) as assistant:
+        grant = assistant.broker.grants("ann")[0]
+    assert (grant["capability"], grant["uses_left"], grant["granted_by"]) == ("files.read", 3, "ann")
+
+
+def test_the_command_says_what_it_left_for_a_person(tmp_path, capsys):
+    home, file = tmp_path / "home", tmp_path / "plan.json"
+    steps = [{"id": "a", "kind": "wait", "seconds": 1}, {"id": "b", "kind": "tool", "capability": "files.read", "arguments": {"path": "{{steps.a.output}}"}}]
+    file.write_text(json.dumps({"steps": steps}), encoding="utf-8")
+    assert plan_command(home, str(file)) == 0
+    assert "Left for a person: files.read" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("content", "words"),
+    [(None, "Could not read"), ("not json", "Expecting value"), ('{"steps": [{"id": "a", "kind": "tool", "capability": "nothing.here", "arguments": {}}]}', "not a capability")],
+)
+def test_the_command_refuses_in_words(tmp_path, capsys, content, words):
+    file = tmp_path / "plan.json"
+    if content is not None:
+        file.write_text(content, encoding="utf-8")
+    assert plan_command(tmp_path / "home", str(file)) == 1
+    assert words in capsys.readouterr().out
+
+
+def test_the_command_refuses_a_machine_as_the_person(tmp_path, capsys):
+    file = tmp_path / "plan.json"
+    file.write_text('{"steps": []}', encoding="utf-8")
+    assert plan_command(tmp_path / "home", str(file), "--by", "skill:x") == 1
+    assert "not a person" in capsys.readouterr().out

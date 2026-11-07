@@ -18,8 +18,9 @@ from pathlib import Path
 import re
 from typing import Any
 
-from .broker import DEFAULT_USER
+from .broker import DEFAULT_USER, is_person
 from .contracts import Capability, Effect, ModelRequest, Reach
+from .mind import printing
 from .providers import loose_json
 from .router import AllFailed, Refused
 from .tasks import count_steps, plan_errors, references_in, step_inputs, steps_referenced
@@ -31,6 +32,7 @@ ROLES = {"conversation", "planning", "coding", "worker", "decision", "vision", "
 EXIT_CODE_TOOLS = {"shell.run", "git.branch", "git.commit", "git.push"}
 GRANT_SECONDS = 24 * 3600.0
 SMALL_GOAL_WORDS = 24
+WIDE_SCOPE = re.compile(r"[*?\[]")  # a model chose these words, and one yes must not become everything
 SEQUENCE_WORDS = re.compile(
     r"\b(then|after|afterwards|before|finally|first|second|next|once|until|while|each|every|all|daily|weekly|hourly|"
     r"schedule|repeat|refactor|implement|migrate|deploy|develop|design|investigate|plan|project|feature)\b",
@@ -304,17 +306,27 @@ class Planner:
         }
 
     def allow_missing(self, user: str, plan: Mapping[str, Any], by: str, seconds: float = GRANT_SECONDS) -> dict[str, list[str]]:
-        """One yes from a person for what a plan needs: exact scopes, a limited time, limited uses."""
+        """One yes from a person for what a plan needs: exact scopes, a limited time, limited uses.
+
+        Worked out again from the steps. A plan comes from a file or a request, so its own
+        list of what it is missing is a claim, and the yes is for what it would really do.
+        """
+        if not is_person(by):
+            raise ValueError(f"{by or 'Nobody'} is not a person, and only a person can allow a plan.")
         broker = self.assistant.broker
         now = self.assistant.clock()
         known = self._known()
+        problems = plan_problems(plan, known, self._capacity())
+        if problems:
+            raise PlanRejected("This plan cannot run. " + " ".join(problems), problems)
         granted, left = [], []
-        for entry in plan.get("missing_grants", []):
-            capability = known.get(entry["capability"])
-            if capability is None or Effect.PHYSICAL in capability.effects or (capability.scope_field and entry["scope"] is None):
-                left.append(entry["capability"])
+        for entry in self.missing_grants(user, plan):
+            capability, scope = known[entry["capability"]], entry["scope"]
+            exact = isinstance(scope, str) and not WIDE_SCOPE.search(scope)
+            if Effect.PHYSICAL in capability.effects or (capability.scope_field and not exact):
+                left.append(capability.name)
                 continue
-            granted.append(broker.add_grant(user, entry["capability"], entry["scope"], by, now + seconds, entry["uses"]))
+            granted.append(broker.add_grant(user, capability.name, scope, by, now + seconds, entry["uses"]))
         return {"granted": granted, "left_for_a_person": left}
 
 
@@ -328,6 +340,23 @@ def add_commands(commands: Any) -> None:
     plan.add_argument("--user", default=DEFAULT_USER, help="who this is for; decides which grants count as missing")
     plan.add_argument("--out", default=None, help="write the plan here, for task run; default prints it")
     plan.set_defaults(run=run_plan)
+    allow = commands.add_parser("plan-allow", help="one yes for what a saved plan needs: exact scopes, 24 hours, only the uses it has")
+    allow.add_argument("plan", help="the plan file, from plan --out")
+    allow.add_argument("--user", default=DEFAULT_USER, help="who the plan runs for")
+    allow.add_argument("--by", default=DEFAULT_USER, help="the person allowing it, for the record")
+    allow.set_defaults(run=printing(ValueError)(run_plan_allow))
+
+
+def run_plan_allow(assistant: Any, args: Any) -> int:
+    try:
+        plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
+    except OSError as error:
+        raise ValueError(f"Could not read {args.plan}: {error}") from None
+    outcome = assistant.planner.allow_missing(args.user, plan, args.by)
+    print(f"Granted {len(outcome['granted'])}, for 24 hours and only the uses the plan has.")
+    for name in outcome["left_for_a_person"]:
+        print(f"Left for a person: {name}")
+    return 0
 
 
 def run_plan(assistant: Any, args: Any) -> int:
