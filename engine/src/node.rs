@@ -441,7 +441,7 @@ impl Node {
         let inner = self.inner.clone();
         move |message| {
             if let Some(ring) = inner.ring.read().clone() {
-                let nack = Nack { id: 0, epoch: ring.epoch, refusal: Refusal::FailedStage, stage: ring.index, message };
+                let nack = Nack { id: 0, generation: 0, epoch: ring.epoch, refusal: Refusal::FailedStage, stage: ring.index, message };
                 inner.counters.refusals.fetch_add(1, Ordering::Relaxed);
                 send_back(&inner, &ring, &nack.encode());
             }

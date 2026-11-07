@@ -335,7 +335,6 @@
       if (data.status === 'ready' && route.length > 1 && entry?.ring && entry.ring_live === false) issues.push({ tone: 'info', title: 'Direct links are down', detail: 'Tokens are using the slower HTTP path.' });
       const battery = Object.entries(state.inventory).filter(([, item]) => item.battery && item.battery.on_mains === false).map(([node]) => node);
       if (battery.length) issues.push({ tone: 'info', title: `${count(battery.length, 'machine')} on battery`, detail: battery.slice(0, 4).join(', ') + (battery.length > 4 ? ` and ${battery.length - 4} more` : '') });
-      for (const item of [].concat(data.proposals ?? [])) issues.push({ tone: 'info', title: item.title ?? String(item), detail: item.detail ?? '' });
 
       issues.sort((a, b) => ['bad', 'warn', 'info'].indexOf(a.tone) - ['bad', 'warn', 'info'].indexOf(b.tone));
       const alerts = issues.filter(issue => issue.tone !== 'info');
@@ -726,7 +725,7 @@
       const fact = (key, value) => `<div><dt>${esc(key)}</dt><dd>${esc(value)}</dd></div>`, metrics = data.metrics || {}, parts = [];
       // The answer comes from the coordinator, whichever node took the request.
       if (data.mesh) parts.push(fact('Coordinator', `${data.mesh.leader || 'none'}, term ${data.mesh.term}`), fact('Control planes reachable', Object.keys(data.mesh.members || {}).length));
-      const slots = data.active_plan?.slots ?? data.slots;
+      const slots = data.active_plan?.slots;
       parts.push(fact('Epoch', data.epoch), fact('Machines', data.virtual_hardware?.hosts ?? 0), fact('Requests', whole(metrics.requests_total)), fact('Tokens', whole(metrics.tokens_generated)), fact('Recoveries', whole(metrics.recoveries_total)), fact('Up', duration(data.uptime_seconds)));
       if (slots != null) parts.push(fact('Reply slots', slots));
       if ((data.cordoned_nodes || []).length) parts.push(fact('Cordoned', data.cordoned_nodes.join(', ')));
