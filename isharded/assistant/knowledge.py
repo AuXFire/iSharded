@@ -583,14 +583,13 @@ class Library:
         paged = "#page=" in source_id
         base, _, tail = source_id.rpartition("#page=" if paged else ":")
         column = "c.page" if paged else "c.line"
-        number = int(tail) if tail.isdigit() else -1
         for row in self.store.query("SELECT id, path FROM library_roots WHERE user = ?", (user,)):
             if not source_id.startswith(row["path"]):
                 continue
             relative = os.path.relpath(base, row["path"]).replace(os.sep, "/")
             match = self.store.one(
                 f"SELECT c.text FROM library_chunks c JOIN library_files f ON f.id = c.file_id WHERE f.root_id = ? AND f.path = ? AND {column} = ?",
-                (row["id"], relative, number),
+                (row["id"], relative, int(tail) if tail.isdigit() else -1),
             )
             if match:
                 return match["text"]

@@ -411,6 +411,7 @@ def test_one_users_folder_is_invisible_to_another(assistant, folder):
     assert assistant.library.search("bob", "walrus") == []
     assert assistant.library.roots("bob") == []
     assert assistant.library.chunk_text("bob", f"{folder / 'a.txt'}:1") is None
+    assert assistant.library.chunk_text("bob", "no root holds this:²") is None  # isdigit is true, and int() refuses it
     assert assistant.library.index("bob").added == 0
     for attempt in (
         lambda: assistant.library.remove("bob", root),
