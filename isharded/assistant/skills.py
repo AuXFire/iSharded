@@ -252,6 +252,13 @@ def _clean_rules(rules: dict[str, Any] | None, task_type: str) -> dict[str, Any]
     return rules or {"task_types": [task_type]}
 
 
+def _drafted_rules(rules: Any, task_type: str) -> dict[str, Any]:
+    """Every turn is of type general, so a skill typed only by its task would never reach one."""
+    cleaned = _clean_rules(rules if isinstance(rules, dict) else None, task_type)
+    types = cleaned.get("task_types")
+    return {**cleaned, "task_types": sorted({*map(str, types if isinstance(types, list) else [types]), "general"})} if types else cleaned
+
+
 def _field(mapping: dict[str, Any], *names: str) -> Any:
     for name in names:
         if mapping.get(name) not in (None, ""):
@@ -800,8 +807,7 @@ class Skills:
                 str(draft.get("name") or f"{record['task_type']}-procedure").lower(),
                 str(draft.get("instructions") or ""),
                 _capabilities_used(status),
-                # Every turn is of type general, so a skill drafted from a task must still reach them.
-                draft["applicability"] if isinstance(draft.get("applicability"), dict) else {"task_types": sorted({record["task_type"], "general"})},
+                _drafted_rules(draft.get("applicability"), record["task_type"]),
                 draft.get("stop_conditions") if isinstance(draft.get("stop_conditions"), dict) else None,
                 draft.get("tests") if isinstance(draft.get("tests"), list) else (),
                 user=record["user"],

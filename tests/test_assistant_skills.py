@@ -959,3 +959,23 @@ def test_a_draft_that_sets_no_rules_still_reaches_a_turn(real, tmp_path):
     assert version.task_type == "files"
     assert applies(version.applicability, "anything", "general") and applies(version.applicability, "anything", "files")
     assert not applies(version.applicability, "anything", "deploy")
+
+
+def draft_with(real: Any, tmp_path: Any, rules: Any) -> Any:
+    router = real.router = ScriptedRouter()
+    router.on("role:worker", json.dumps({**json.loads(REAL_DRAFT), "applicability": rules}))
+    router.on("role:verification", json.dumps({"verdict": "accept", "notes": ""}))
+    return real.skills.version(real.skills.reflect(finished(real, tmp_path))["candidate"])
+
+
+@pytest.mark.parametrize("rules", [{"task_types": ["files"]}, {"task_types": "files"}, {"task_types": []}, {}, {"unknown": 1}])
+def test_a_draft_that_names_its_own_type_still_reaches_a_turn(real, tmp_path, rules):
+    """The worker is told the type and asked for task_types, so naming it is the usual case."""
+    version = draft_with(real, tmp_path, rules)
+    assert applies(version.applicability, "anything", "general") and applies(version.applicability, "anything", "files")
+    assert not applies(version.applicability, "anything", "deploy")
+
+
+def test_a_drafts_other_rules_are_kept_as_it_wrote_them(real, tmp_path):
+    version = draft_with(real, tmp_path, {"any_of": ["notes"]})
+    assert version.applicability == {"any_of": ["notes"]}
