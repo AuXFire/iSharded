@@ -16,6 +16,7 @@ from math import ceil
 from typing import Any
 
 from .planner import (
+    FAST_MEMORY,
     MAX_LINKED_WORKERS,
     Candidate,
     ModelProfile,
@@ -164,7 +165,9 @@ def propose_route(
         # A node can be on a running route without need: a repair put it there, or a closer
         # one joined since. These sets hold the model in VRAM, ranked by loop and reads.
         required = {name for name in (entry, exit_) if name in names}
-        subsets = _closest_subsets(everyone, profile, required, 0)
+        # Where no set holds it in VRAM, sets that hold it in RAM count, as at a load. A set
+        # never wins with more outside VRAM than the route has, as below.
+        subsets = _closest_subsets(everyone, profile, required, 0) or _closest_subsets(everyone, profile, required, 0, (*FAST_MEMORY, "ram"))
         groups += [group for group in subsets if {item.worker_id for item in group} != set(names) and measured([item.worker_id for item in group])]
     now = route_faults(route, everyone)
     best: tuple[float, list[StageAssignment]] | None = None

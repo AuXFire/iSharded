@@ -138,3 +138,15 @@ def test_a_spare_is_weighed_only_when_shedding_and_only_on_measured_links() -> N
     assert geometry.propose(route, workers, FOUR, model, spares=["d"]) is None
     unmeasured = {link: milliseconds for link, milliseconds in FOUR.items() if "d" not in link or "c" in link}
     assert geometry.propose(route, workers, unmeasured, model, shed=True, spares=["d"]) is None
+
+
+def ram_worker(name: str) -> Candidate:
+    return fixtures.worker(name, fixtures.pool(f"{name}-ram", "ram", GIB, 30, f"{name}:ram"))
+
+
+def test_on_workers_with_no_vram_a_spare_can_still_take_the_far_node_s_place() -> None:
+    model = ring_profile(250 * MIB)
+    workers = [ram_worker(name) for name in "abcd"]
+    route, workers = fixtures.zigzag(model, ["a", "b", "c"], workers, FOUR)
+    proposal = geometry.propose(route, workers, FOUR, model, shed=True, spares=["d"])
+    assert proposal is not None and proposal["left_out"] == ["c"] and proposal["joined"] == ["d"]
