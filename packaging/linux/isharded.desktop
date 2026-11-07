@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=iSharded
+Comment=Open iSharded, starting it if it is not running
+Exec=isharded up --background
+Terminal=true
+Categories=Network;
+Actions=Stop;
+
+[Desktop Action Stop]
+Name=Stop iSharded
+Exec=isharded stop
