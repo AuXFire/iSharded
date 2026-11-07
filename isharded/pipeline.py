@@ -42,6 +42,8 @@ FIRST_RIGHT = 0.6
 STEP_WEIGHT = 0.2
 # The fastest trip is forgotten slowly, because a route can get slower.
 TRIP_DRIFT = 1.02
+# Answers closer than this left the route in one merged pass, so the gap says nothing about a row.
+SAME_PASS_SECONDS = 0.002
 # How much text a lookup searches. It holds up to twice this, at 4 bytes a token, and one search
 # reads it once, so this sets both its memory and the most a token can cost.
 LOOKUP_WINDOW = 1 << 16
@@ -126,10 +128,10 @@ class RowClock:
         self.answered: float | None = None
 
     def tick(self, now: float) -> None:
-        if self.answered is not None:
-            gap = now - self.answered
-            self.row = gap if self.row is None else min(gap, self.row * TRIP_DRIFT)
+        gap = None if self.answered is None else now - self.answered
         self.answered = now
+        if gap is not None and gap >= SAME_PASS_SECONDS:
+            self.row = gap if self.row is None else min(gap, self.row * TRIP_DRIFT)
 
 
 @dataclass(slots=True)

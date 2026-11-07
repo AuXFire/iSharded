@@ -260,6 +260,14 @@ def test_the_row_clock_keeps_the_shortest_gap_and_forgets_it_slowly() -> None:
     assert clock.row > 0.1, "but a route can get slower"
 
 
+def test_answers_from_one_merged_pass_do_not_look_like_a_fast_route() -> None:
+    clock = RowClock()
+    for batch in range(5):
+        for row in range(8):
+            clock.tick(batch * 0.05 + row * 0.0002)
+    assert clock.row == pytest.approx(0.05 - 7 * 0.0002)
+
+
 def test_replies_on_one_route_share_a_row_clock_so_many_replies_do_not_look_like_a_slow_route(monkeypatch) -> None:
     # Eight replies take turns on a route passing one row every 10 ms, so each hears its own
     # answers 80 ms apart, while the route is as fast as ever.
