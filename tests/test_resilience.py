@@ -343,6 +343,23 @@ def test_a_failed_load_leaves_the_running_routes_link_costs_as_they_were(monkeyp
     assert orchestrator.links_checked == {("w1", "w2"): 1.0}
 
 
+def test_a_probe_that_outlasts_its_time_shows_the_worker_unreachable(monkeypatch):
+    """The client tries a refused connection again, so its own timeout does not bound a probe."""
+    orchestrator = pool(w1=record("w1", health={"status": "ok"}))
+    monkeypatch.setattr(orchestrator_module, "PROBE_SECONDS", 0.1)
+
+    async def retrying(*args, **kwargs):
+        await asyncio.sleep(5)
+
+    orchestrator.client = SimpleNamespace(get=retrying)
+    began = time.monotonic()
+    asyncio.run(orchestrator.refresh_worker_metrics())
+    assert time.monotonic() - began < 2
+    view = orchestrator.status()["workers"]["w1"]
+    assert view["state"] == "unreachable" and view["live"]
+    assert view["runtime"] == {"status": "unreachable", "error": "no answer in 0 s"}
+
+
 def test_a_small_replan_around_a_failing_node_goes_ahead(monkeypatch):
     failure = {"w1": "out of memory"}
     orchestrator, attempts = deploy_pool(monkeypatch, [failure, failure, failure, {}], 1024)

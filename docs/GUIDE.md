@@ -1208,7 +1208,7 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `POST` | `/api/pull`, `/api/push`, `/api/create`, `/api/copy`, `/api/blobs/{digest}` | User key | Refused with a 400 that says to load models through iSharded |
 | `DELETE` | `/api/delete` | User key | The same |
 | `POST` | `/mcp` | User key | [MCP](#mcp) over Streamable HTTP. `GET` and `DELETE` answer 405, since there is no stream or session |
-| `GET` | `/admin/status` | User key | Workers and their `country`, memory pools, route, measured [`links`](#what-a-route-costs), epoch, mesh, lanes, load progress, the last answer check, and how many [replies run at once](#several-conversations-at-once) and why |
+| `GET` | `/admin/status` | User key | Workers and their `country`, memory pools, route, measured [`links`](#what-a-route-costs), epoch, mesh, lanes, load progress, the last answer check, and how many [replies run at once](#several-conversations-at-once) and why. It asks every worker for its health and waits up to 3 s for each, so it answers within about that. A worker that still checks in but did not answer shows `state` `unreachable` |
 | `GET` | `/admin/catalog` | User key | Suggested models and supported architectures |
 | `POST` | `/admin/plan` | Admin key | Show where a model would run, and any [shorter loop](#a-shorter-loop) for the route already running, without moving anything |
 | `POST` | `/admin/load` | Admin key | Load a model |
