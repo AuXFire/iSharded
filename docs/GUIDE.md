@@ -36,7 +36,7 @@ How to install, run, configure, and understand iSharded. [The README](../README.
 - [Development](#development)
 - [Current limits](#current-limits)
 
-More detail lives in [Operating iSharded](OPERATIONS.md), [iSharded security](SECURITY.md), and [the assistant's guide](ASSISTANT.md).
+More detail lives in [Operating iSharded](OPERATIONS.md), [iSharded security](SECURITY.md), and [the assistant's guide](ASSISTANT.md). [Test results](RESULTS.md) is the full record of what has been measured, on what setup, and what has not.
 
 ## What it does
 
@@ -597,7 +597,7 @@ for part in stream:
 
 If the connection to a node drops, retry against another node. Replies survive almost every other failure, but nothing can save a connection to a node that died. `/ready` answers 200 when every stage of the route is held by a live worker, which suits load balancers. A node can know a route before its workers hold their layers, as a new coordinator does after a restart. Until they do, `/ready` answers 503 and `/admin/status` says `repairing`, or `loading` during a load. The same goes while a cordoned node's share moves. A reply that arrives then waits for the repair and goes ahead, for up to 90 seconds, or 10 minutes during a load. A worker that died a moment ago still counts until 15 seconds after its last heartbeat.
 
-### Loading a model
+### Loading a model on a running pool
 
 `isharded load` starts a load, prints progress, and returns when the model is ready. The old model keeps serving until then.
 
@@ -907,7 +907,7 @@ A node contributes whatever you give it. With a GPU and weight memory, one worke
 
 ### isharded load
 
-Loads a model on a running pool and shows progress. `model` is any [model id](#loading-a-model).
+Loads a model on a running pool and shows progress. `model` is any [model id](#loading-a-model-on-a-running-pool).
 
 | Option | Default | What it does |
 |---|---|---|
@@ -1371,7 +1371,7 @@ On two nodes on one machine, the same loop ran through the coordinator, a follow
 
 | Field | Default | What it does |
 |---|---|---|
-| `model_id` | `distilbert/distilgpt2` | Any [model id](#loading-a-model) |
+| `model_id` | `distilbert/distilgpt2` | Any [model id](#loading-a-model-on-a-running-pool) |
 | `lane` | None | Load beside the main model, in a lane of this name |
 | `lane_gpu_gb`, `lane_ram_gb` | What is spare | Most VRAM and RAM per node for a new lane |
 | `lane_apart` | `false` | Keep a new lane off every node another route uses |

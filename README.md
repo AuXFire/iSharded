@@ -32,7 +32,7 @@ Qwen3-235B-A22B Instruct at Q5_K_M, 155 GiB and 94 layers, ran on four rented A4
 | A stage's engine killed mid-reply | Paused 7.5 s and finished with the same text |
 | A worker process killed mid-reply | Paused 41 s and finished with the same text |
 
-After a failure, the last words of a reply can differ from an unbroken run where two tokens are nearly tied. [Measured across data centers](docs/GUIDE.md#measured-across-data-centers) has the full table and its limits.
+After a failure, the last words of a reply can differ from an unbroken run where two tokens are nearly tied. [Measured across data centers](docs/GUIDE.md#measured-across-data-centers) has the full table and its limits. [Test results](docs/RESULTS.md) holds every speed, failure and security result measured so far, each with its setup, and what has not been measured yet.
 
 ## What it does
 
@@ -111,6 +111,7 @@ On Tailscale the mesh adds no TLS, so use `http` in both commands and leave out 
 - [The assistant's guide](docs/ASSISTANT.md): the personal assistant that uses a mesh as its model.
 - [Operating iSharded](docs/OPERATIONS.md): running a pool day to day, with failure details and recovery.
 - [iSharded security](docs/SECURITY.md): what the security model covers, and what it leaves open.
+- [Test results](docs/RESULTS.md): every speed, failure, exactness and security result on record, with its setup, and what is not measured yet.
 
 ## License
 
