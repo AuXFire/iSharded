@@ -477,10 +477,12 @@ def test_calls_to_a_provider_share_a_connection_and_no_cookies():
         provider = OpenAICompatible("other", server.url)
         for _ in range(4):
             assert provider._post("chat/completions", {}, 5.0, "answering").status_code == 200
+        provider.models()
+        assert server.connections == 1
         assert provider.health()["up"]
         provider.close()
-        assert server.connections == 1
-        assert server.cookies == [None] * 5
+        assert server.connections == 2, "a health check has to show a new connection works"
+        assert server.cookies == [None] * 6
 
 
 def test_each_call_keeps_its_own_timeout_on_the_shared_client():

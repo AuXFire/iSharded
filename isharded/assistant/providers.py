@@ -629,13 +629,13 @@ class OpenAICompatible:
         except httpx.HTTPError as error:
             raise self._unreachable(error) from None
 
-    def models(self) -> list[str]:
+    def models(self, client: httpx.Client | None = None) -> list[str]:
         cached = self._models
         now = time.monotonic()
         if cached and now - cached[0] < MODELS_FRESH_SECONDS:
             return cached[1]
         try:
-            response = self._client().get(f"{self.base_url}/models", headers=self._headers(), timeout=seconds_to_wait(HEALTH_SECONDS))
+            response = (client or self._client()).get(f"{self.base_url}/models", headers=self._headers(), timeout=seconds_to_wait(HEALTH_SECONDS))
         except httpx.HTTPError as error:
             raise self._unreachable(error) from None
         if response.status_code != 200:
@@ -657,7 +657,9 @@ class OpenAICompatible:
         started = time.perf_counter()
         try:
             self._models = None
-            names = self.models()
+            # A held connection can outlive the server's listener, and new calls would find that out.
+            with httpx.Client(**self._client_options()) as fresh:
+                names = self.models(fresh)
         except ProviderError as error:
             return {"up": False, "models": [], "error": str(error), "seconds": time.perf_counter() - started}
         return {"up": True, "models": names, "error": None, "seconds": time.perf_counter() - started}

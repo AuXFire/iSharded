@@ -91,7 +91,7 @@ def test_every_new_route_needs_a_key(assistant, app):
         assert anonymous.request(method, path, json={}).status_code == 401, path
 
 
-@pytest.mark.parametrize("name", ["model-one", "conversation-two"])
+@pytest.mark.parametrize("name", ["model", "conversation-two"])
 def test_an_owners_key_with_a_machines_name_decides_nothing(assistant, app, name):
     """Such a user can be made, and the broker would not take them for a person."""
     key = Users(assistant).add(name, "owner")
