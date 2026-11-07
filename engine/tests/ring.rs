@@ -336,13 +336,16 @@ fn a_frame_too_big_for_one_tls_buffer_crosses_a_link() {
 
 #[test]
 fn losing_the_closing_link_costs_nothing_but_speed() {
-    let mut ring = ring(3, true, Duration::ZERO, 2000);
+    let (mut ring, relay) = ring_through(0, 3, true, Duration::ZERO, 2000);
     ring.client.send(&pass(1, 5, 9).encode()).unwrap();
     answer(&mut ring);
-    // Dropping the entry's end of the closing link makes the last stage fall back.
-    ring.nodes[0].stats();
+    assert!(ring.nodes[2].stats().closing_up);
+    relay.cut();
+    wait_until("the closing link's loss", || !ring.nodes[2].stats().closing_up);
     ring.client.send(&pass(2, 5, 9).encode()).unwrap();
-    assert_eq!(answer(&mut ring).id, 2);
+    let got = answer(&mut ring);
+    assert_eq!(got, Answer { id: 2, epoch: 7, tokens: vec![5123, 9] });
+    assert_eq!(ring.nodes[2].stats().refusals, 0);
 }
 
 #[test]
