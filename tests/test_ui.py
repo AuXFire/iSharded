@@ -383,6 +383,24 @@ def test_a_proposal_is_information_under_needs_you_and_nothing_applies_it():
         chrome.close()
 
 
+def test_a_worker_that_checks_in_but_does_not_answer_reads_as_not_answering_and_not_offline():
+    def stall_one(data):
+        on_route = {stage["worker_id"] for stage in data["route"]}
+        name = next(worker for worker in data["workers"] if worker not in on_route)
+        data["workers"][name]["state"] = "unreachable"
+        return name
+
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    with playwright_api.sync_playwright() as playwright:
+        chrome, page = open_dashboard(playwright, "calm-7", stall_one)
+        name = page.evaluate("Object.entries(state.data.workers).find(([, worker]) => worker.state === 'unreachable')[0]")
+        needs = page.inner_text("#needsBay")
+        assert f"{name} is not answering" in needs and "did not answer its last health check" in needs
+        assert "offline" not in needs.lower()
+        assert "1 not answering" in page.inner_text("body")
+        chrome.close()
+
+
 def test_load_stays_open_for_a_lane_while_a_job_runs():
     playwright_api = pytest.importorskip("playwright.sync_api")
     with playwright_api.sync_playwright() as playwright:

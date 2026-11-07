@@ -693,7 +693,7 @@
     function poolWord(status, model) {
       const workers = Object.entries(status.workers || {}), route = status.route || [], job = status.load_job;
       const lost = route.filter(stage => !status.workers?.[stage.worker_id]?.live), lostIds = new Set(lost.map(stage => stage.worker_id));
-      const alerts = workers.filter(([id, worker]) => worker.state === 'quarantined' || (worker.state === 'offline' && !lostIds.has(id))).length + lost.length + (job?.phase === 'failed' ? 1 : 0) + (status.lanes || []).filter(lane => lane.error).length + (status.last_audit && status.last_audit.verdict !== 'agree' ? 1 : 0) + (model?.stages || []).filter(stage => stage.spillSlow).length + (status.mesh && !status.mesh.leader ? 1 : 0) + state.joins;
+      const alerts = workers.filter(([id, worker]) => worker.state === 'quarantined' || ((worker.state === 'offline' || worker.state === 'unreachable') && !lostIds.has(id))).length + lost.length + (job?.phase === 'failed' ? 1 : 0) + (status.lanes || []).filter(lane => lane.error).length + (status.last_audit && status.last_audit.verdict !== 'agree' ? 1 : 0) + (model?.stages || []).filter(stage => stage.spillSlow).length + (status.mesh && !status.mesh.leader ? 1 : 0) + state.joins;
       const need = [alerts ? 'warn' : 'idle', alerts ? 'warn' : 'idle', `${alerts} need${alerts === 1 ? 's' : ''} you`];
       if (status.status === 'ready') return lost.length ? ['bad', 'bad', 'Route lost'] : alerts ? need : jobRunning(status) ? ['work', 'work', 'Loading'] : ['idle', '', 'Healthy'];
       // A repair's last seconds have no route. Remembering the repair keeps them from reading as a first load.

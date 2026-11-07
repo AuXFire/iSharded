@@ -236,6 +236,7 @@
     const STATES = {
       offline: { label: 'Offline', rank: 0, mark: 'offline', tone: 'bad' },
       quarantined: { label: 'Quarantined', rank: 1, mark: 'quarantined', tone: 'warn' },
+      unreachable: { label: 'Not answering', rank: 1, mark: 'quarantined', tone: 'warn' },
       active: { label: 'On the route', rank: 2, mark: 'active', tone: 'idle' },
       fetching: { label: 'Fetching', rank: 2, mark: 'fetching', tone: 'work' },
       service: { label: 'Cache service', rank: 3, mark: 'service', tone: 'idle' },
@@ -343,6 +344,7 @@
       const lostIds = new Set(lost.map(stage => stage.worker_id));
       const quarantined = workers.filter(worker => worker.state === 'quarantined');
       const offline = workers.filter(worker => worker.state === 'offline' && !lostIds.has(worker.id));
+      const unreachable = workers.filter(worker => worker.state === 'unreachable' && !lostIds.has(worker.id));
       const stageOf = id => model?.stages.find(stage => stage.workerId === id);
       const reason = worker => String(worker.quarantine_reason).replace(/[:\s]+$/, '');
       if (lost.length === 1) issues.push({ tone: 'bad', title: `${lost[0].worker_id} stopped answering`, detail: `It holds stage ${stageOf(lost[0].worker_id)?.n}. Check the machine and its network.`, worker: lost[0].worker_id, stage: stageOf(lost[0].worker_id)?.n });
@@ -360,6 +362,7 @@
         return stage?.moving ? `${why} Stage ${stage.n} is moving to ${stage.moving.to}, so the route needs nothing from you. Fix the machine and it rejoins after a run of healthy checks.` : `${why} Fix the machine and it rejoins after a run of healthy checks.`;
       }, worker => ({ cordon: nodeOf(worker.id) }));
       group(offline, 'bad', 'offline', () => 'It stopped checking in. Check the machine and its network.', () => ({}));
+      group(unreachable, 'warn', 'not answering', () => 'It still checks in, but did not answer its last health check within 3 s. It may be busy, or stuck.', () => ({}));
       for (const item of state.joins) issues.push({ tone: 'warn', join: item, title: `${item.name} wants to join` });
       if (data.mesh && !data.mesh.leader) issues.push({ tone: 'warn', title: 'No coordinator', detail: 'Replies keep running, but nothing can be repaired or loaded until a node takes over.' });
       const entry = model?.stages[0]?.worker?.runtime?.telemetry;
@@ -610,8 +613,9 @@
       return cordoned && now === 'standby' ? 'Cordoned' : STATES[now].label;
     }
     const CHIPS = { all: 'All', attention: 'Needs you', active: 'On the route', fetching: 'Fetching', standby: 'Idle', service: 'Cache service' };
-    const inChip = (row, chip) => chip === 'all' || (chip === 'attention' ? row.state === 'quarantined' || row.state === 'offline' : row.state === chip);
-    const groupKey = row => state.group === 'machine' ? row.host : state.group === 'accelerator' ? row.accelerator : state.group === 'none' ? '' : row.state === 'quarantined' || row.state === 'offline' ? 'Needs you' : STATES[row.state].label;
+    const needsYou = row => row.state === 'quarantined' || row.state === 'offline' || row.state === 'unreachable';
+    const inChip = (row, chip) => chip === 'all' || (chip === 'attention' ? needsYou(row) : row.state === chip);
+    const groupKey = row => state.group === 'machine' ? row.host : state.group === 'accelerator' ? row.accelerator : state.group === 'none' ? '' : needsYou(row) ? 'Needs you' : STATES[row.state].label;
     const STATE_GROUPS = ['Needs you', 'On the route', 'Fetching', 'Cache service', 'Idle'];
     const groupOrder = (a, b) => state.group === 'state' ? STATE_GROUPS.indexOf(a) - STATE_GROUPS.indexOf(b) : byName(a, b);
     const SORTS = {
@@ -670,7 +674,7 @@
     }
     function renderMachinesBay(data, rows) {
       const tally = {}; for (const row of rows) tally[row.state] = (tally[row.state] || 0) + 1;
-      const words = { offline: 'offline', quarantined: 'quarantined', active: 'on the route', fetching: 'fetching', service: 'cache service', standby: 'idle' };
+      const words = { offline: 'offline', quarantined: 'quarantined', unreachable: 'not answering', active: 'on the route', fetching: 'fetching', service: 'cache service', standby: 'idle' };
       const ranked = [...rows].sort(SORTS.state);
       const sentence = Object.keys(words).filter(key => tally[key]).map(key => `${tally[key]} ${words[key]}`).join(', ');
       if (!rows.length) { paint($('machinesBay'), '<p class="bay-note">No machines yet.</p>'); return; }
