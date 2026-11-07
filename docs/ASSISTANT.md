@@ -1096,6 +1096,34 @@ Commands on this machine act for `owner` unless given `--user`, so the first use
 
 A new key goes to a private file and never to the screen, and only a hash is stored. Keys go in `Authorization: Bearer`.
 
+### The page
+
+The page is a conversation with a rail beside it. The top bar names the assistant and who is signed in, and says how many things need that person. It has no link to a pool's chat or dashboard, because the assistant and a pool do not know each other's addresses.
+
+| Panel | Shows | Does |
+|---|---|---|
+| Approvals | What is stopped and waiting for this person, with the exact action | Approve that exact action, or decline |
+| Memory | What is remembered, where it came from, and how far it is trusted | Search, keep something, confirm what a model proposed, forget |
+| Tasks | This person's tasks and how each ended | Cancel one still running |
+| History | Earlier conversations, each named by its first line | Open one |
+| Audit | The latest 100 entries, and whether the trail is intact. A member sees only their own | |
+| Manage | The owner's parts, below | |
+
+Manage shows only for a key with the `owner` role. A part that is not installed does not show, and a refusal from the server is shown in its own words.
+
+| Part | Shows | Does |
+|---|---|---|
+| What it may do | Live grants, and everything it could ask for | Add a grant, revoke one |
+| Who answers | Each provider and whether it answers now, then the order each role tries them, with how each has done | Add, test, or remove a provider, and change the order |
+| Skills | Candidates first, then the active version, with earlier versions folded away | Test, promote, or reject |
+| Plugins | What is installed, and any that were turned off | Add or remove one |
+| Code runs | Each run's state, with its change and test results on request | Commit or reject a run that is ready |
+| Peers | This install's fingerprint and each peer's state | Invite, accept, approve after comparing fingerprints, revoke |
+
+Opening Manage tests every provider, which asks each for its models. Keys never reach the page: a provider's form takes where the key is kept. An invite's code is shown once, when it is made.
+
+When the gateway stops answering, the page says when it last heard from it and turns sending off, then picks up by itself when it is back. A reply that failed stays in its turn, with a button that puts the words back in the box. Nothing is sent again until the person sends it, since a tool may have run before the failure.
+
 ### Routes
 
 Every path needs a key except `GET /`, `GET /assistant`, `GET /assistant/`, `GET /healthz`, and the federation routes, which prove themselves. That is enforced before any route runs, so it covers routes other parts add. Such a route reads the caller from `request.state.user` and `request.state.role`, and a part leaves a route open only by listing it in its module's `PUBLIC_ROUTES`. A path the gateway already serves keeps its first owner, and the clash goes in the audit trail.
@@ -1234,7 +1262,6 @@ A tool that stores or sends text reads `CallContext.reach`, which says how far t
 - **Home or robot control.** `physical` is an effect the broker enforces: such a capability can have no grant, and every action needs a person. No such capability exists. No plugin for one has been written, and no hardware has ever been moved by this.
 - **Running a skill by itself.** A skill's instructions reach the model on every turn it applies to, but `execute` is called by no command and no part.
 - **Reflecting by itself.** `skill reflect` is a person's command. Nothing watches for finished tasks.
-- **A page for managing the assistant.** Grants, providers, routes, skills, plugins, the coder, and peers have [routes](#routes-2) and no page, so the owner uses a terminal or calls those routes. A member cannot manage any of these.
 - **Every command as a route.** `code start`, `code resume`, and `code push`, `skill rollback` and `skill gaps`, `peer offer`, `peer ask`, `peer collect`, and `peer offers`, and everything under `task` except what the routes table lists, are commands only. So is `identity set`.
 - **`provider test` as a command.** Its route has no command beside it. `provider list` checks every provider instead.
 

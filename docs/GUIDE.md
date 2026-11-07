@@ -1726,6 +1726,12 @@ isharded assistant grant add files.read NOTES_FOLDER
 
 `isharded assistant serve` runs its own web page and OpenAI-shaped API at `http://127.0.0.1:8470`, with a key for each person. It stays on loopback unless told otherwise.
 
+The page is the chat page's shell with its own rail: Approvals, Memory, Tasks, History, and Audit for everyone, and Manage for the owner. What waits for a person is counted in the top bar, and stops in Approvals with the exact action. Manage holds grants, providers and the order they are tried in, skills, plugins, code runs, and peers. A reply says who answered and which tools ran, and "What did it see?" opens what the model was shown. It has no link to the pool's pages, because neither knows the other's address. [Its guide](ASSISTANT.md#the-page) says what each panel does.
+
+![A real reply, a failed one after the pool was stopped, and an action waiting for approval](screenshots/assistant-light.png)
+
+![Manage in the dark theme on the same real install, with the pool stopped](screenshots/assistant-dark.png)
+
 Treat it as early. How far to trust it depends on the model. Qwen3-0.6B cannot be trusted with tools: each time it skipped reading a file, it said it had read it and made up what was inside. Qwen3.6-27B, split across two machines, read the file in 20 of 20 tries and invented nothing, and recalled a fact in a new session 5 of 5 times. Asked to read and then write, it reached the write 3 of 5 times, and each of those waited for a person, as a write after reading a file must. In one other try it said it had written the file when no write ran. So the `used` line at the end of a reply is the record of which tools really ran, on any model. Federation has run only between two installs on one machine. [The assistant's guide](ASSISTANT.md) is the full manual, and says what is not built or proven.
 
 ## Memory and placement
