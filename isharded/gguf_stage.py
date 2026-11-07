@@ -38,14 +38,20 @@ def draft_apart() -> bool:
     return os.environ.get("ISHARDED_DRAFT_APART") == "1"
 
 
-def load_on(host: Channel, operation: str, settings: dict[str, Any]) -> None:
-    """Has a host do this load. One that failed it does not stay."""
+def entry_seeds() -> bool:
+    """Whether the entry gives a sampled reply with no seed one of its own. See ``coupled_choice``."""
+    return os.environ.get("ISHARDED_ENTRY_SEED") != "0"
+
+
+def load_on(host: Channel, operation: str, settings: dict[str, Any]) -> dict[str, Any]:
+    """Has a host do this load, and gives its answer. One that failed it does not stay."""
     try:
-        host.call(operation, **settings)
+        answer, _ = host.call(operation, **settings)
         host.watch()
     except LlamaError:
         host.close()
         raise
+    return answer
 
 
 def start_host(operation: str, settings: dict[str, Any]) -> StageHost:
@@ -452,6 +458,8 @@ class DraftText:
     chain: list[int] = field(default_factory=list)
     # The scratch sequence has more than ``chain``, so it must start again from the slot.
     stale: bool = True
+    # The scratch sequence has more than ``chain``, but only past its end, so cutting it there will do.
+    cut: bool = False
 
 
 class DraftModel:
@@ -459,6 +467,11 @@ class DraftModel:
 
     It runs in the entry stage's process when given ``beside``, and in one of its own if not.
     """
+
+    # Attention can go back, so a miss only cuts the wrong guesses off. Recurrent state cannot.
+    rewinds = False
+    # Decodes and rows run for guesses, so a bench can count what a miss costs.
+    decodes = decoded_rows = 0
 
     def __init__(
         self,
@@ -473,7 +486,7 @@ class DraftModel:
         self.slots = slots
         self.text: dict[int, DraftText] = {}
         self.host: Channel = StageHost() if beside is None else beside.channel()
-        load_on(
+        self.rewinds = load_on(
             self.host,
             "load_draft",
             {
@@ -485,7 +498,7 @@ class DraftModel:
                 "threads": threads,
                 "slots": slots,
             },
-        )
+        ).get("rewinds", False)
 
     def _commit(self, tokens: list[int], slot: int) -> None:
         if tokens:
@@ -529,24 +542,51 @@ class DraftModel:
         right = max(keep - text.committed, 0)
         if right < len(text.chain):
             del text.chain[right:]
-            text.stale = True
+            if self.rewinds and not text.stale:
+                text.cut = True
+            else:
+                text.stale = True
 
-    def guess(self, fresh: list[int], count: int, slot: int = 0) -> list[int]:
-        """Guess what follows the text so far and ``fresh``, the tokens this draft has not seen."""
+    def guess(self, fresh: list[int], count: int, slot: int = 0, sampling: dict[str, Any] | None = None) -> list[int]:
+        """Guess what follows the text so far and ``fresh``, the tokens this draft has not seen.
+
+        ``sampling`` is the reply's, for guesses at what a pipelined pass draws. See ``coupled_choice``.
+        """
         text = self.text[slot]
+        if text.cut and not fresh:
+            # A cut leaves no logits for where the text now ends, as after a pipeline lands, so
+            # with nothing new to read the guess would follow a token that was cut off.
+            text.cut, text.stale = False, True
         if text.stale:
             commit, fresh = text.chain + fresh[:1], fresh[1:]
             rows = len(commit) + len(fresh) + count
-            answer, _ = self.host.call("guess", rows=rows, commit=commit, position=text.committed, count=count, slot=slot, fresh=fresh)
+            answer = self._ask(rows=rows, commit=commit, position=text.committed, count=count, slot=slot, fresh=fresh, sampling=sampling)
             text.committed += len(commit)
             text.chain = []
             text.stale = False
         else:
+            # After a miss, the confirmed part of the chain moves to the slot as it is.
+            catch_up = text.committed if text.cut else None
             rows = len(fresh) + count
-            answer, _ = self.host.call("guess", rows=rows, commit=[], position=self.seen(slot), count=count, slot=slot, fresh=fresh, restart=False)
+            answer = self._ask(
+                rows=rows, commit=[], position=self.seen(slot), count=count, slot=slot, fresh=fresh, restart=False, catch_up=catch_up, sampling=sampling
+            )
+            if answer["tokens"] is None:
+                text.cut, text.stale = False, True  # scratch was not what the text said: start again
+                return self.guess(fresh, count, slot, sampling)
+            if text.cut:
+                text.committed += len(text.chain)
+                text.chain = []
+                text.cut = False
         # The newest guess has not run yet. If it lands, it comes back as fresh text.
         text.chain += fresh + answer["tokens"][:-1]
         return answer["tokens"]
+
+    def _ask(self, **meta: Any) -> dict[str, Any]:
+        answer, _ = self.host.call("guess", **meta)
+        self.decodes += answer.get("decodes", 0)
+        self.decoded_rows += answer.get("decoded_rows", 0)
+        return answer
 
     def close(self) -> None:
         self.host.close()

@@ -994,7 +994,7 @@ def test_a_draft_goes_on_from_the_whole_reply_after_a_resume(entry, monkeypatch)
         def rewind(self, keep, slot) -> None:
             self.read = keep
 
-        def guess(self, fresh, count, slot) -> list[int]:
+        def guess(self, fresh, count, slot, sampling=None) -> list[int]:
             self.texts.append(list(fresh))
             self.read += len(fresh)
             return [5] * count

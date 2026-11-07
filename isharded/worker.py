@@ -92,6 +92,7 @@ from .gguf_stage import (
     ImageEncoder,
     PromptPlan,
     draft_apart,
+    entry_seeds,
     next_guess_count,
     plan_prompt,
 )
@@ -2800,18 +2801,24 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
         produced = 1
         ahead = min(INITIAL_GUESSES, runtime.speculate_tokens)
         following = request.model_copy(update=GOING_ON)
+        if draft and following.seed is None and following.temperature and entry_seeds() and runtime.ring_pipelines(following):
+            # A draft can guess the exit's own draw only if it knows the seed. A seed from the
+            # system's generator draws as the system would, so the reply means the same.
+            following = following.model_copy(update={"seed": secrets.randbelow(2**63)})
+        sampling = {"temperature": following.temperature, "top_p": following.top_p, "top_k": following.top_k, "seed": following.seed}
 
-        async def draft_guesses(fresh: list[int], count: int) -> list[int]:
+        async def draft_guesses(fresh: list[int], count: int, sampling: dict[str, Any] | None = None) -> list[int]:
             started = time.perf_counter()
             try:
-                guesses = await asyncio.to_thread(draft.guess, fresh, count, request.slot)
+                guesses = await asyncio.to_thread(draft.guess, fresh, count, request.slot, sampling)
             except LlamaError as exc:
                 raise await runtime.draft_failed(exc, draft) from exc
             runtime._record("draft", started)
             return guesses
 
         async def next_guess(fresh: list[int]) -> int:
-            return (await draft_guesses(fresh, 1))[0]
+            # Only a pipelined pass draws as plain decoding does. A checked pass draws another way.
+            return (await draft_guesses(fresh, 1, sampling))[0]
 
         async def rewind_draft(keep: int) -> None:
             draft.rewind(keep, request.slot)

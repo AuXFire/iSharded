@@ -194,6 +194,9 @@ LLAMA_FUNCTIONS = {
     "llama_memory_clear": (None, C.c_void_p, C.c_bool),
     "llama_memory_seq_rm": (C.c_bool, C.c_void_p, C.c_int32, C.c_int32, C.c_int32),
     "llama_memory_seq_cp": (None, C.c_void_p, C.c_int32, C.c_int32, C.c_int32, C.c_int32),
+    "llama_memory_seq_pos_max": (C.c_int32, C.c_void_p, C.c_int32),
+    "llama_model_is_recurrent": (C.c_bool, C.c_void_p),
+    "llama_model_is_hybrid": (C.c_bool, C.c_void_p),
     "llama_state_seq_get_size": (C.c_size_t, C.c_void_p, C.c_int32),
     "llama_state_seq_get_data": (C.c_size_t, C.c_void_p, C.c_void_p, C.c_size_t, C.c_int32),
     "llama_state_seq_set_data": (C.c_size_t, C.c_void_p, C.c_void_p, C.c_size_t, C.c_int32),
@@ -209,6 +212,8 @@ LLAMA_FUNCTIONS = {
 # Nucleus sampling keeps the head of the distribution, so a full sort of a
 # quarter-million logits per row would be wasted work.
 NUCLEUS_CANDIDATES = 4096
+# Tokens a coupled guess sums at a time. See coupled_choice.
+WALK_BLOCK = 1024
 # The arithmetic of the engine's generator.
 GOLDEN = 0x9E3779B97F4A7C15
 WORD = 2**64 - 1
@@ -313,6 +318,31 @@ def filtered_distribution(logits: np.ndarray, temperature: float, top_p: float, 
         ids, probabilities = ids[keep], probabilities[keep]
         probabilities = probabilities / probabilities.sum()
     return ids, probabilities
+
+
+def coupled_choice(logits: np.ndarray, temperature: float, top_p: float, top_k: int, generator: Draws) -> int:
+    """The token the exit would draw with ``generator`` if these were its logits.
+
+    A draft that guesses its best token lands only as often as the model happens to draw that
+    token. With the exit's own filter and draw, a draft lands whenever its distribution and the
+    model's put the draw on the same token, which is much more often when the two are close.
+    """
+    if top_k or top_p < 1.0:
+        ids, chances = filtered_distribution(logits, temperature, top_p, top_k)
+        return draw(ids, chances, generator)
+    # With no filter the exit walks the whole vocabulary in id order. Doing that in float64 took
+    # 1.4 to 2.4 ms a guess on real logits, so this finds the block the draw falls in first, and
+    # walks only that block, in one buffer. Single precision moves a boundary by about 10^-6.
+    weights = logits - logits.max()
+    weights *= np.float32(1 / temperature)
+    np.exp(weights, out=weights)
+    totals = np.cumsum(np.add.reduceat(weights, np.arange(0, weights.size, WALK_BLOCK)), dtype=np.float64)
+    point = generator.random() * totals[-1]
+    block = min(int(np.searchsorted(totals, point, side="right")), totals.size - 1)
+    start = block * WALK_BLOCK
+    inside = np.cumsum(weights[start : start + WALK_BLOCK], dtype=np.float64)
+    index = int(np.searchsorted(inside, point - (totals[block - 1] if block else 0.0), side="right"))
+    return start + min(index, inside.size - 1)
 
 
 def speculative_choice(
@@ -647,6 +677,9 @@ class LlamaStage:
             raise LlamaError("llama.cpp could not create a context")
         self.memory = lib.llama_get_memory(self.context)
         self.output_width = lib.llama_model_n_embd_out(self.model)
+        self.recurrent = bool(lib.llama_model_is_recurrent(self.model) or lib.llama_model_is_hybrid(self.model))
+        # Batches and rows run so far, so a test can tell a miss that reads text again from one that does not.
+        self.decodes = self.decoded_rows = 0
 
     def _on_eval(self, tensor: int, ask: bool, _: Any) -> bool:
         base = self.library.ggml_base
@@ -738,6 +771,8 @@ class LlamaStage:
             logits=outputs.ctypes.data,
         )
         status = self.library.llama.llama_decode(self.context, batch)
+        self.decodes += 1
+        self.decoded_rows += count
         if status != 0:
             raise LlamaError(f"llama_decode failed with status {status}")
 
@@ -749,6 +784,12 @@ class LlamaStage:
 
     def best_token(self) -> int:
         return int(np.argmax(self.logits_at(-1)))
+
+    def next_token(self, row: int, sampling: dict[str, Any] | None) -> int:
+        """A guess at what the exit makes of ``row``: its own draw when that is known, its best token if not."""
+        if not sampling or not sampling["temperature"] or sampling.get("seed") is None:
+            return self.best_token()
+        return coupled_choice(self.logits_at(-1), sampling["temperature"], sampling["top_p"], sampling["top_k"], Draws(sampling["seed"], row))
 
     def decode_tokens(self, tokens: list[int], position: int, *, sequence_id: int = 0) -> None:
         """Run token ids through a whole model, in chunks the batch can hold."""
@@ -782,7 +823,9 @@ class LlamaStage:
         scratch: int = 1,
         fresh: Sequence[int] = (),
         restart: bool = True,
-    ) -> list[int]:
+        catch_up: int | None = None,
+        sampling: dict[str, Any] | None = None,
+    ) -> list[int] | None:
         """Guess ``count`` tokens after a draft model's text.
 
         Confirmed text lives on ``slot``, and anything unconfirmed on ``scratch``, because
@@ -790,6 +833,13 @@ class LlamaStage:
         ``commit`` goes on ``slot`` in one batch, and ``scratch`` starts again as a copy of it.
         Otherwise the chain on ``scratch`` is still good, and ``position`` is where it ends.
         ``fresh`` then extends it, so a guess costs one decode however long the text.
+
+        A draft with no recurrent state need not start again. ``catch_up`` says where ``slot``
+        ends: ``scratch`` is cut at ``position``, and ``slot`` takes the cells between as a copy,
+        which in a shared cache moves no data. If ``scratch`` does not end where the text says,
+        nothing is guessed and the answer is None, so the caller starts again.
+
+        ``sampling`` makes each guess the exit's own draw. See ``coupled_choice``.
         """
         lib = self.library.llama
         if restart:
@@ -797,12 +847,18 @@ class LlamaStage:
             self.decode_tokens(commit, position, sequence_id=slot)
             lib.llama_memory_seq_cp(self.memory, slot, scratch, -1, -1)
             position += len(commit)
+        elif catch_up is not None:
+            cut = lib.llama_memory_seq_rm(self.memory, scratch, position, -1)
+            if not cut or lib.llama_memory_seq_pos_max(self.memory, scratch) != position - 1:
+                return None
+            lib.llama_memory_seq_cp(self.memory, scratch, slot, catch_up, position)
         self.decode_tokens(list(fresh), position, sequence_id=scratch)
         position += len(fresh)
-        guesses = [self.best_token()]
+        # The exit draws for a row with the row's own position, which is the token before the guess.
+        guesses = [self.next_token(position - 1, sampling)]
         for offset in range(count - 1):
             self.decode_tokens(guesses[-1:], position + offset, sequence_id=scratch)
-            guesses.append(self.best_token())
+            guesses.append(self.next_token(position + offset, sampling))
         return guesses
 
     def forward(

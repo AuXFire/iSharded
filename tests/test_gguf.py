@@ -801,11 +801,13 @@ def test_each_slot_has_its_own_scratch_sequence():
 
 
 def test_draft_settings_keep_the_cache_the_size_it_was(monkeypatch):
+    from types import SimpleNamespace
+
     from isharded import llama_host
 
     made = {}
     monkeypatch.setattr(llama_host.LlamaLibrary, "load", lambda *_: None)
-    monkeypatch.setattr(llama_host, "LlamaStage", lambda _, __, **settings: made.update(settings))
+    monkeypatch.setattr(llama_host, "LlamaStage", lambda _, __, **settings: made.update(settings) or SimpleNamespace(recurrent=False))
     host = llama_host._Host()
     meta = {"folder": "", "extra_paths": [], "path": "", "context_tokens": 4096, "gpu_layers": 0, "threads": 1}
     host.load_draft({**meta, "slots": 1}, b"")
@@ -1692,6 +1694,7 @@ def test_loading_on_a_host_starts_watching_it():
         def call(self, operation, **_):
             if self.failure:
                 raise self.failure
+            return {"rewinds": True}, b""
 
         def watch(self):
             self.watched += 1
@@ -1700,7 +1703,7 @@ def test_loading_on_a_host_starts_watching_it():
             self.closed += 1
 
     loaded = Host()
-    load_on(loaded, "load", {})
+    assert load_on(loaded, "load", {}) == {"rewinds": True}, "the host's answer comes back"
     assert (loaded.watched, loaded.closed) == (1, 0)
     refused = Host(LlamaError("no"))
     with pytest.raises(LlamaError):
