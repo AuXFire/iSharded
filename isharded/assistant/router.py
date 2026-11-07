@@ -138,6 +138,9 @@ class ModelRouter:
         self.assistant = assistant
         self.store = assistant.store
         self.store.migrate("router", SCHEMA)
+        # A reply names what really answered, and a peer or a server may call it something
+        # other than the candidate its numbers are kept under.
+        self.answered: dict[tuple[str, str], Candidate] = {}
 
     # Routes
 
@@ -180,7 +183,11 @@ class ModelRouter:
         return {role: [str(item) for item in self.candidates(role)] for role in ROLES}
 
     def can_embed(self) -> bool:
-        return bool(self.candidates("embedding"))
+        return not all(self._has_no_embeddings(self._provider(item.provider)) for item in self.candidates("embedding"))
+
+    @staticmethod
+    def _has_no_embeddings(provider: Any) -> bool:
+        return provider is not None and not hasattr(provider, "embed")
 
     # Choosing
 
@@ -203,6 +210,8 @@ class ModelRouter:
         return (Candidate(candidate.provider, model), None) if model else (None, f"{candidate}: no model is loaded")
 
     def _blocked(self, candidate: Candidate, provider: Any, request: ModelRequest) -> str | None:
+        if request.role == "embedding" and self._has_no_embeddings(provider):
+            return f"{candidate} cannot make embeddings: a {provider.kind} provider has no call for them"
         if provider.reach > request.reach:
             return (
                 f"{candidate} reaches {provider.reach.name.lower()}, and text in this request may go no further than "
@@ -293,6 +302,7 @@ class ModelRouter:
                 )
 
     def _succeeded(self, candidate: Candidate, role: str, reply: ModelReply) -> None:
+        self.answered[(reply.provider, reply.model)] = candidate
         with self.store.transaction():
             self._record(candidate, role, True, reply.prompt_tokens + reply.completion_tokens, reply.seconds)
             self.store.execute("DELETE FROM model_health WHERE provider = ? AND model = ?", (candidate.provider, candidate.model))
@@ -395,6 +405,9 @@ class ModelRouter:
         """
         if isinstance(model, ModelReply):
             model, provider = model.model, model.provider
+        served = self.answered.get((provider or "", model))
+        if served is not None:
+            model, provider = served.model, served.provider
         with self.store.transaction():
             rows = self.store.query(
                 "SELECT provider FROM model_stats WHERE model = ? AND role = ?" + (" AND provider = ?" if provider else "") + " ORDER BY provider",
