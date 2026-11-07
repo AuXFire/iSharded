@@ -2013,32 +2013,44 @@ class Orchestrator:
         link is gone, and nothing else would ever say so.
         """
         arrived: asyncio.Queue[Any] = asyncio.Queue()
+        heard_at = time.monotonic()
 
         async def pump() -> None:
+            nonlocal heard_at
             try:
                 async for line in response.aiter_lines():
+                    heard_at = time.monotonic()
                     arrived.put_nowait(line)
                 arrived.put_nowait(None)
             except (httpx.HTTPError, ValueError) as exc:
                 arrived.put_nowait(exc)
 
-        reading = asyncio.ensure_future(pump())
+        async def watch() -> None:
+            # This runs beside the reply because a timeout around each line costs every token a task.
+            nonlocal heard_at
+            while True:
+                quiet = time.monotonic() - heard_at
+                if quiet < STREAM_CHECK_SECONDS:
+                    await asyncio.sleep(STREAM_CHECK_SECONDS - quiet)
+                    continue
+                record = self.workers.get(worker_id)
+                if record is not None and not record.live:
+                    arrived.put_nowait(WorkerSilent(f"{worker_id} went silent"))
+                    return
+                heard_at = time.monotonic()
+
+        helpers = [asyncio.ensure_future(pump()), asyncio.ensure_future(watch())]
         try:
             while True:
-                try:
-                    item = await asyncio.wait_for(arrived.get(), STREAM_CHECK_SECONDS)
-                except asyncio.TimeoutError:
-                    record = self.workers.get(worker_id)
-                    if record is not None and not record.live:
-                        raise WorkerSilent(f"{worker_id} went silent") from None
-                    continue
+                item = await arrived.get()
                 if item is None:
                     return
                 if isinstance(item, Exception):
                     raise item
                 yield item
         finally:
-            reading.cancel()
+            for helper in helpers:
+                helper.cancel()
 
     async def _recover_stream(self, failure: Any, epoch: int) -> bool:
         """Put things right after a stream stopped. True if a new stream can follow.
