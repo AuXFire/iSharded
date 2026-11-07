@@ -10,6 +10,7 @@
 //! proven: a reply replays, and a lost worker is replaced.
 
 use std::collections::VecDeque;
+use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use crate::wire::{self, Ack, Answer, Hello, Kind, Nack, Pass, Refusal, Role, FLA
 const MAX_STRANGERS: usize = 16;
 const PING_EVERY: Duration = Duration::from_millis(1000);
 const WATCH_EVERY: Duration = Duration::from_millis(50);
+const ACCEPT_EVERY: Duration = Duration::from_millis(20);
 const DIAL_ATTEMPT: Duration = Duration::from_secs(5);
 const DIAL_RETRY: Duration = Duration::from_millis(250);
 /// The most replies that share one trip through the model.
@@ -116,6 +118,8 @@ pub struct Stats {
     pub compute_us: u64,
     pub wait_us: u64,
     pub link_rtt_us: u64,
+    /// A pass's trip to the next stage and its acknowledgement's trip back.
+    pub hop_us: u64,
     pub next_up: bool,
     pub closing_up: bool,
     pub epoch: Option<u64>,
@@ -135,6 +139,7 @@ struct Counters {
     compute_us: AtomicU64,
     wait_us: AtomicU64,
     link_rtt_us: AtomicU64,
+    hop_us: AtomicU64,
 }
 
 fn average(slot: &AtomicU64, sample: u64) {
@@ -212,6 +217,7 @@ struct Inner {
     strangers: AtomicUsize,
     counters: Counters,
     listening: Mutex<Option<Listening>>,
+    accepting: Mutex<Vec<thread::JoinHandle<()>>>,
     connect: Mutex<String>,
 }
 
@@ -234,6 +240,7 @@ impl Node {
             strangers: AtomicUsize::new(0),
             counters: Counters::default(),
             listening: Mutex::new(None),
+            accepting: Mutex::new(Vec::new()),
             connect: Mutex::new("idle".to_string()),
         });
         let worker = inner.clone();
@@ -273,11 +280,11 @@ impl Node {
         let text = serde_json::to_vec(&answer).map_err(|error| error.to_string())?;
         *self.inner.listening.lock() = Some(answer);
         for (listener, encrypted) in [(data, true), (local, false)] {
+            // Nothing wakes a blocking accept, and this loop must see the node stopping.
+            listener.set_nonblocking(true).map_err(|error| error.to_string())?;
             let inner = self.inner.clone();
-            thread::Builder::new()
-                .name("isharded-accept".into())
-                .spawn(move || accept_loop(&inner, &listener, encrypted))
-                .map_err(|error| error.to_string())?;
+            let thread = spawn("isharded-accept", move || accept_loop(&inner, &listener, encrypted)).map_err(|error| error.to_string())?;
+            self.inner.accepting.lock().push(thread);
         }
         Ok(text)
     }
@@ -342,6 +349,7 @@ impl Node {
             compute_us: counters.compute_us.load(Ordering::Relaxed),
             wait_us: counters.wait_us.load(Ordering::Relaxed),
             link_rtt_us: counters.link_rtt_us.load(Ordering::Relaxed),
+            hop_us: counters.hop_us.load(Ordering::Relaxed),
             next_up: ring.as_ref().is_some_and(|item| item.next.lock().is_some()),
             closing_up: ring.as_ref().is_some_and(|item| item.closing.lock().is_some() || item.entry_closing.lock().is_some()),
             epoch: ring.as_ref().map(|item| item.epoch),
@@ -356,6 +364,10 @@ impl Node {
         if let Some(local) = self.inner.local.lock().take() {
             local.close();
         }
+        // The ports are free once these end, and whoever stopped this may want them back.
+        for thread in std::mem::take(&mut *self.inner.accepting.lock()) {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -365,6 +377,12 @@ impl Drop for Node {
     }
 }
 
+fn spawn(name: &str, work: impl FnOnce() + Send + 'static) -> io::Result<thread::JoinHandle<()>> {
+    #[cfg(test)]
+    tests::spend_a_spawn()?;
+    thread::Builder::new().name(name.into()).spawn(work)
+}
+
 fn connect(inner: &Arc<Inner>, links: &Links) -> Result<bool, String> {
     let ring = inner.ring.read().clone().ok_or("no route has been opened")?;
     if let Some(next) = &links.next {
@@ -372,6 +390,9 @@ fn connect(inner: &Arc<Inner>, links: &Links) -> Result<bool, String> {
         let peer = Peer::new(link, ring.index + 1, false);
         *ring.next.lock() = Some(peer.clone());
         start_peer(inner, &ring, &peer);
+        if peer.lost.load(Ordering::Acquire) {
+            return Err("the link to the next stage could not start".to_string());
+        }
     }
     let mut closing = false;
     if let Some(entry) = &links.entry {
@@ -379,7 +400,7 @@ fn connect(inner: &Arc<Inner>, links: &Links) -> Result<bool, String> {
             let peer = Peer::new(link, 0, true);
             *ring.closing.lock() = Some(peer.clone());
             start_peer(inner, &ring, &peer);
-            closing = true;
+            closing = !peer.lost.load(Ordering::Acquire);
         }
     }
     Ok(closing)
@@ -398,20 +419,27 @@ fn dial_with_retry(target: &Address, ring: &Ring, role: Role, patience: Duration
 }
 
 fn accept_loop(inner: &Arc<Inner>, listener: &TcpListener, encrypted: bool) {
-    for connection in listener.incoming() {
-        if inner.stopping.load(Ordering::Acquire) {
-            return;
+    while !inner.stopping.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((socket, _)) => admit(inner, socket, encrypted),
+            Err(_) => thread::sleep(ACCEPT_EVERY),
         }
-        let Ok(socket) = connection else {
-            continue;
-        };
-        if inner.strangers.fetch_add(1, Ordering::AcqRel) >= MAX_STRANGERS {
-            inner.strangers.fetch_sub(1, Ordering::AcqRel);
-            continue;
-        }
-        let inner = inner.clone();
-        let spawned = thread::Builder::new().name("isharded-link".into()).spawn(move || serve(&inner, socket, encrypted));
-        drop(spawned);
+    }
+}
+
+/// Gives a connection a thread, if there is room for another stranger.
+fn admit(inner: &Arc<Inner>, socket: TcpStream, encrypted: bool) {
+    // On some systems a socket takes this from the listener, and links block.
+    if socket.set_nonblocking(false).is_err() {
+        return;
+    }
+    if inner.strangers.fetch_add(1, Ordering::AcqRel) >= MAX_STRANGERS {
+        inner.strangers.fetch_sub(1, Ordering::AcqRel);
+        return;
+    }
+    let serving = inner.clone();
+    if spawn("isharded-link", move || serve(&serving, socket, encrypted)).is_err() {
+        inner.strangers.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -536,19 +564,29 @@ fn send_back(inner: &Inner, ring: &Ring, frame: &[u8]) {
 }
 
 fn start_peer(inner: &Arc<Inner>, ring: &Arc<Ring>, peer: &Arc<Peer>) {
+    // The watcher waits behind a stuck write, so that write must fail inside the silence
+    // limit. Half leaves room for a piece that only just finished before the one that stuck.
+    let limited = peer.link.limit_writes(ring.silence_timeout / 2);
     let reading = (inner.clone(), ring.clone(), peer.clone());
-    let spawned = thread::Builder::new().name("isharded-peer".into()).spawn(move || {
-        let (inner, ring, peer) = reading;
-        read_peer(&inner, &ring, &peer);
-        peer_lost(&inner, &ring, &peer, "the link closed");
-    });
-    drop(spawned);
     let watching = (inner.clone(), ring.clone(), peer.clone());
-    let spawned = thread::Builder::new().name("isharded-watch".into()).spawn(move || {
-        let (inner, ring, peer) = watching;
-        watch_peer(&inner, &ring, &peer);
-    });
-    drop(spawned);
+    let started = limited
+        .and_then(|()| {
+            spawn("isharded-peer", move || {
+                let (inner, ring, peer) = reading;
+                read_peer(&inner, &ring, &peer);
+                peer_lost(&inner, &ring, &peer, "the link closed");
+            })
+        })
+        .and_then(|_| {
+            spawn("isharded-watch", move || {
+                let (inner, ring, peer) = watching;
+                watch_peer(&inner, &ring, &peer);
+            })
+        });
+    // A peer nobody reads or watches would fail in silence.
+    if let Err(error) = started {
+        peer_lost(inner, ring, peer, &error.to_string());
+    }
 }
 
 fn read_peer(inner: &Inner, ring: &Ring, peer: &Peer) {
@@ -561,8 +599,11 @@ fn read_peer(inner: &Inner, ring: &Ring, peer: &Peer) {
                     return;
                 };
                 let mut unacked = peer.unacked.lock();
-                if let Some(at) = unacked.iter().position(|(id, _)| *id == ack.id) {
-                    unacked.remove(at);
+                let at = unacked.iter().position(|(id, _)| *id == ack.id);
+                // A round trip that carried a real row, so unlike a heartbeat it shows
+                // what the row's size costs. It adds no traffic.
+                if let Some((_, sent)) = at.and_then(|at| unacked.remove(at)) {
+                    average(&inner.counters.hop_us, sent.elapsed().as_micros() as u64);
                 }
             }
             Kind::Pong => {
@@ -748,5 +789,86 @@ fn forward(inner: &Inner, ring: &Ring, pass: &Pass) {
     peer.unacked.lock().push_back((pass.id, Instant::now()));
     if let Err(error) = peer.link.send(&pass.encode()) {
         peer_lost(inner, ring, &peer, &error.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        static SPAWNS_LEFT: Cell<u32> = const { Cell::new(u32::MAX) };
+    }
+
+    /// A test cannot really run the machine out of threads, so it says when that happens.
+    pub(super) fn spend_a_spawn() -> io::Result<()> {
+        let left = SPAWNS_LEFT.get();
+        if left == 0 {
+            return Err(io::Error::other("no threads left"));
+        }
+        SPAWNS_LEFT.set(left - 1);
+        Ok(())
+    }
+
+    fn with_spawns<T>(left: u32, work: impl FnOnce() -> T) -> T {
+        SPAWNS_LEFT.set(left);
+        let done = work();
+        SPAWNS_LEFT.set(u32::MAX);
+        done
+    }
+
+    #[test]
+    fn a_connection_with_no_thread_gives_its_place_back() {
+        let node = Node::new().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _far = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        with_spawns(0, || admit(&node.inner, socket, false));
+        assert_eq!(node.inner.strangers.load(Ordering::Acquire), 0);
+    }
+
+    fn stage(index: u16) -> (Node, Address) {
+        let node = Node::new().unwrap();
+        node.listen("127.0.0.1", 0).unwrap();
+        node.open(Plan { epoch: 1, index, count: 2, key: vec![7], ack_timeout_ms: 60_000, silence_timeout_ms: 60_000 });
+        let listening = node.inner.listening.lock();
+        let door = listening.as_ref().unwrap();
+        let address = Address { address: format!("127.0.0.1:{}", door.port), fingerprint: door.fingerprint.clone() };
+        drop(listening);
+        (node, address)
+    }
+
+    #[test]
+    fn a_next_stage_with_no_reader_or_no_watcher_is_lost() {
+        for spawns in [0, 1] {
+            let (near, _) = stage(0);
+            let (_far, door) = stage(1);
+            let links = Links { next: Some(door), entry: None, timeout_ms: 3000 };
+            assert!(with_spawns(spawns, || near.connect(links)).is_err());
+            let stats = near.stats();
+            assert!(!stats.next_up);
+            assert_eq!(stats.refusals, 1);
+        }
+    }
+
+    #[test]
+    fn a_next_stage_with_both_threads_is_up() {
+        let (near, _) = stage(0);
+        let (_far, door) = stage(1);
+        let links = Links { next: Some(door), entry: None, timeout_ms: 3000 };
+        assert_eq!(with_spawns(2, || near.connect(links)), Ok(false));
+        assert!(near.stats().next_up);
+    }
+
+    #[test]
+    fn a_closing_link_with_no_thread_costs_nothing_but_speed() {
+        let (last, _) = stage(1);
+        let (_entry, door) = stage(0);
+        let links = Links { next: None, entry: Some(door), timeout_ms: 3000 };
+        assert_eq!(with_spawns(1, || last.connect(links)), Ok(false));
+        let stats = last.stats();
+        assert!(!stats.closing_up);
+        assert_eq!(stats.refusals, 0);
     }
 }

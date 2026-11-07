@@ -344,6 +344,8 @@ python scripts/build_engine.py
 
 `--target` builds for one of the release's targets. iSharded runs without it, over the slower Python path, and any failure on a direct link falls back to the recovery the Python path already has. Prompts, restored states, and images stay on the Python path. On the laptop test, three stages of Qwen3-0.6B went from 47.5 to 128.6 tokens/s with identical replies.
 
+Each worker reports the engine's numbers in `runtime.telemetry.ring`. `link_rtt_us` is the average heartbeat round trip to the next stage. `hop_us` is the average from a pass leaving for the next stage to its acknowledgement coming back, so it carries a real row and shows what the row's size costs. The next stage acknowledges before it computes, so its work is not in that time. Both read zero at the last stage, which has no next stage.
+
 ### Any node can coordinate
 
 Nodes agree on a coordinator without voting: they all apply the same rule to the same member list.
