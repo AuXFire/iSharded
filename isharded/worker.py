@@ -1217,8 +1217,8 @@ class WorkerRuntime:
 
     def _next_stage(self) -> StageAssignment | None:
         assert self.assignment is not None
-        index = next(i for i, stage in enumerate(self.route) if stage.worker_id == self.worker_id)
-        return self.route[index + 1] if index + 1 < len(self.route) else None
+        after = self._stages_after()
+        return self.route[-after] if after else None
 
     def _stages_after(self) -> int:
         index = next(i for i, stage in enumerate(self.route) if stage.worker_id == self.worker_id)
@@ -1231,7 +1231,7 @@ class WorkerRuntime:
         if self.gguf is not None and stale and not request.reset and not restoring:
             # llama.cpp holds one sequence and this session's is gone. Starting
             # from nothing would answer from the wrong state, so ask for a replay.
-            raise HTTPException(status_code=503, detail={"retry": True, "message": "this session's state is gone"})
+            raise retry_error("this session's state is gone")
         if request.reset or restoring or stale:
             entry = CacheEntry(epoch=request.epoch, slot=request.slot)
             if self.gguf is not None:
@@ -1276,17 +1276,22 @@ class WorkerRuntime:
         with torch.inference_mode():
             return self.adapter.embed(self.unit_weights["embed"], input_ids, positions.unsqueeze(0))
 
-    def _run_local(self, hidden: torch.Tensor, request: InferRequest, places: np.ndarray | None = None) -> torch.Tensor:
-        assert self.adapter is not None and self.assignment is not None
-        started = time.perf_counter()
+    def _pass_entry(self, request: InferRequest) -> CacheEntry:
+        """This pass's session, having forgotten anything past where the pass starts."""
         # The entry stage already reset this session before embedding.
         entry = self.caches.get(request.session_id) if self.assignment.start_layer == 0 else None
         entry = entry or self._session(request)
+        if self.gguf is not None and request.rollback_to is not None and entry.length > request.rollback_to:
+            self.gguf.truncate(request.rollback_to, request.slot)
+            entry.length = request.rollback_to
+        return entry
+
+    def _run_local(self, hidden: torch.Tensor, request: InferRequest, places: np.ndarray | None = None) -> torch.Tensor:
+        assert self.adapter is not None and self.assignment is not None
+        started = time.perf_counter()
+        entry = self._pass_entry(request)
         tokens = hidden.shape[1]
         if self.gguf is not None:
-            if request.rollback_to is not None and entry.length > request.rollback_to:
-                self.gguf.truncate(request.rollback_to, request.slot)
-                entry.length = request.rollback_to
             rows = hidden[0].float().numpy()
             if self.gguf.last and request.verify:
                 self.gguf_choices = self.gguf.verify(
@@ -1330,13 +1335,12 @@ class WorkerRuntime:
         return hidden
 
     def _sample(self, hidden: torch.Tensor, request: InferRequest, logits: torch.Tensor | None = None) -> int:
-        gguf_logits = logits if logits is not None else self.gguf_logits if self.gguf is not None else None
-        if gguf_logits is None and (self.adapter is None or "head" not in self.unit_weights):
+        if logits is None and self.gguf is not None:
+            logits = self.gguf_logits
+        if logits is None and (self.adapter is None or "head" not in self.unit_weights):
             raise ValueError("route ended on a worker without the output head")
         with torch.inference_mode():
-            if gguf_logits is not None:
-                logits = gguf_logits
-            else:
+            if logits is None:
                 logits = self.adapter.logits(self.unit_weights["head"], hidden[:, -1:, :])[0, -1].float()
             if request.temperature == 0:
                 return int(torch.argmax(logits).item())
@@ -1355,6 +1359,9 @@ class WorkerRuntime:
                 generator.manual_seed(int(step_random(request.seed, self.caches[request.session_id].length).integers(2**63)))
                 return int(torch.multinomial(probabilities, 1, generator=generator).item())
             return int(torch.multinomial(probabilities, 1).item())
+
+    def _tensor_headers(self, metadata: dict[str, Any]) -> dict[str, str]:
+        return {**auth_headers(self.pool_token), META_HEADER: encode_meta(metadata), "content-type": "application/x-safetensors"}
 
     def _cache_payload(self, session_id: str, token_count: int) -> tuple[bytes, int]:
         if self.assignment is None:
@@ -1417,13 +1424,10 @@ class WorkerRuntime:
                 "start_position": start_position,
                 "token_count": len(request.input_ids),
             }
-            headers = auth_headers(self.pool_token)
-            headers[META_HEADER] = encode_meta(metadata)
-            headers["content-type"] = "application/x-safetensors"
             response = await self.client.put(
                 self.cache_url + "/internal/cache/kv",
                 content=payload,
-                headers=headers,
+                headers=self._tensor_headers(metadata),
                 timeout=30.0,
             )
             response.raise_for_status()
@@ -1473,15 +1477,15 @@ class WorkerRuntime:
         started = time.perf_counter()
         hidden = await asyncio.to_thread(self._run_local, hidden, request, places)
         self._record("compute", started)
-        if next_stage is None and request.verify:
+        if next_stage is not None:
+            return hidden
+        if request.verify:
             return {"token_ids": self.gguf_choices}
-        if next_stage is None:
-            started = time.perf_counter()
-            result = {"token_id": await asyncio.to_thread(self._sample, hidden, request)}
-            self._record("sample", started)
-            self.schedule_checkpoint(request)
-            return result
-        return hidden
+        started = time.perf_counter()
+        result = {"token_id": await asyncio.to_thread(self._sample, hidden, request)}
+        self._record("sample", started)
+        self.schedule_checkpoint(request)
+        return result
 
     def _can_merge(self, hidden: torch.Tensor, request: InferRequest) -> bool:
         """Ordinary next-token steps can share a pass. Anything with its own state work cannot."""
