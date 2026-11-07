@@ -212,8 +212,8 @@ LLAMA_FUNCTIONS = {
 # Nucleus sampling keeps the head of the distribution, so a full sort of a
 # quarter-million logits per row would be wasted work.
 NUCLEUS_CANDIDATES = 4096
-# A token this many temperatures below the best holds under 1e-13 of the mass.
-FAINT = 30.0
+# Tokens a coupled guess sums at a time. See coupled_choice.
+WALK_BLOCK = 1024
 # The arithmetic of the engine's generator.
 GOLDEN = 0x9E3779B97F4A7C15
 WORD = 2**64 - 1
@@ -330,13 +330,19 @@ def coupled_choice(logits: np.ndarray, temperature: float, top_p: float, top_k: 
     if top_k or top_p < 1.0:
         ids, chances = filtered_distribution(logits, temperature, top_p, top_k)
         return draw(ids, chances, generator)
-    # With no filter the exit walks the whole vocabulary in id order. Faint tokens move the walk
-    # by less than rounding does, and leaving them out makes this a fraction of a millisecond.
-    best = float(logits.max())
-    ids = np.flatnonzero(logits > best - FAINT * temperature)
-    weights = np.cumsum(np.exp((logits[ids].astype(np.float64) - best) / temperature))
-    index = int(np.searchsorted(weights, generator.random() * weights[-1], side="right"))
-    return int(ids[min(index, ids.size - 1)])
+    # With no filter the exit walks the whole vocabulary in id order. Doing that in float64 took
+    # 1.4 to 2.4 ms a guess on real logits, so this finds the block the draw falls in first, and
+    # walks only that block, in one buffer. Single precision moves a boundary by about 10^-6.
+    weights = logits - logits.max()
+    weights *= np.float32(1 / temperature)
+    np.exp(weights, out=weights)
+    totals = np.cumsum(np.add.reduceat(weights, np.arange(0, weights.size, WALK_BLOCK)), dtype=np.float64)
+    point = generator.random() * totals[-1]
+    block = min(int(np.searchsorted(totals, point, side="right")), totals.size - 1)
+    start = block * WALK_BLOCK
+    inside = np.cumsum(weights[start : start + WALK_BLOCK], dtype=np.float64)
+    index = int(np.searchsorted(inside, point - (totals[block - 1] if block else 0.0), side="right"))
+    return start + min(index, inside.size - 1)
 
 
 def speculative_choice(
