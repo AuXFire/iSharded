@@ -27,7 +27,7 @@ from typing import Any
 
 import numpy as np
 
-ABI_VERSION = 3
+ABI_VERSION = 4
 MAGIC = 0x5369
 WIRE_VERSION = 3
 HEADER = struct.Struct("<HBBI")
@@ -84,6 +84,7 @@ SIGNATURES: dict[str, tuple[list[Any], Any]] = {
     "open": ([C.c_void_p, C.c_char_p], C.c_int32),
     "connect": ([C.c_void_p, C.c_char_p], C.c_int32),
     "stats": ([C.c_void_p, C.c_char_p, C.c_size_t], C.c_int32),
+    "probe": ([C.c_void_p, C.c_uint32, C.c_char_p, C.c_size_t], C.c_int32),
 }
 
 
@@ -167,6 +168,19 @@ class Engine:
         )
         self.lib.isharded_engine_attach(self.handle, C.byref(self.api))
 
+    def probe(self, slots: int) -> dict[str, Any]:
+        """How far merged passes round on this stage as rows run alone, over this many slots.
+
+        It runs passes of its own on every slot and empties them all afterwards, so it must
+        come before any reply. ``exact_merge_limit`` is the most companions a row had and
+        still came out byte for byte the same; ``verify_exact`` says whether one reply's rows
+        in one pass came out as they do one at a time.
+        """
+        out = C.create_string_buffer(TEXT_BYTES)
+        if self.lib.isharded_engine_probe(self.handle, slots, out, TEXT_BYTES) < 0:
+            raise OSError(out.value.decode("utf-8", "replace") or "the probe failed")
+        return json.loads(out.value)
+
     def forget(self, slot: int | None) -> None:
         """A slot's history changed, so what its rewinds could go back to is wrong. None means every slot."""
         self.lib.isharded_engine_forget(self.handle, -1 if slot is None else slot)
@@ -195,11 +209,16 @@ class Engine:
         return json.loads(out.value)
 
     def open(
-        self, epoch: int, index: int, count: int, keys: dict[str, bytes], ack_timeout_ms: int, silence_timeout_ms: int, pass_ms: int = 0, row_ms: int = 0, merge_passes: bool = True
+        self, epoch: int, index: int, count: int, keys: dict[str, bytes], ack_timeout_ms: int, silence_timeout_ms: int, pass_ms: int = 0, row_ms: int = 0, merge_passes: bool = True,
+        merge_most: int | None = None,
     ) -> None:
-        """Takes a place in a route, with the keys of this stage's own links: back, next, closing."""
+        """Takes a place in a route, with the keys of this stage's own links: back, next, closing.
+
+        ``merge_most`` is the most passes one trip may hold. None leaves it to the engine.
+        """
         plan = {
             "merge_passes": merge_passes,
+            "merge_most": merge_most,
             "epoch": epoch,
             "index": index,
             "count": count,

@@ -9,6 +9,7 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use serde::Serialize;
 
 use crate::node::{Compute, Failure, Output};
 use crate::sample::{self, Draws};
@@ -403,6 +404,171 @@ impl LlamaCompute {
     }
 }
 
+/// What a stage found out at load about how it rounds, before any reply could see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Exactness {
+    /// The most companions a one-row pass shared a trip with and still came out byte for byte
+    /// as it does alone, every time and at every smaller count.
+    pub exact_merge_limit: u32,
+    /// Whether one reply's rows in one pass came out as the same rows run one at a time.
+    pub verify_exact: bool,
+}
+
+/// Companion sets tried at each count. The target row moves through the batch, and each slot
+/// starts at its own place in its history, so one lucky layout cannot pass for all of them.
+const PROBE_TRIALS: usize = 3;
+const PROBE_STARTS: [u32; 4] = [1, 6, 13, 3];
+/// Rows in a probed verify pass: as many as a guess usually checks.
+const PROBE_VERIFY_ROWS: usize = 4;
+
+/// A small fixed generator, so a probe that finds a difference finds it again.
+struct Noise(u64);
+
+impl Noise {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+}
+
+impl LlamaCompute {
+    /// Runs rows of other replies beside one row, and that row alone, and compares the bytes
+    /// that come out, for 1 to `most` companions. Every slot it used is emptied afterwards,
+    /// snapshots included, so it must run before any reply is admitted.
+    pub fn probe(&mut self, slots: u32, most: usize) -> Result<Exactness, Failure> {
+        let slots = slots.max(1) as i32;
+        let found = self.probe_slots(slots, most.min(slots as usize - 1));
+        for slot in 0..slots {
+            self.empty(slot);
+        }
+        found
+    }
+
+    fn probe_slots(&mut self, slots: i32, most: usize) -> Result<Exactness, Failure> {
+        let mut noise = Noise(0x9E37_79B9_7F4A_7C15);
+        let mut limit = 0;
+        'counts: for companions in 1..=most {
+            for trial in 0..PROBE_TRIALS {
+                if !self.merge_matches(slots, companions, trial, &mut noise)? {
+                    break 'counts;
+                }
+            }
+            limit = companions;
+        }
+        let mut verify_exact = true;
+        for trial in 0..2 {
+            verify_exact &= self.verify_matches(PROBE_STARTS[trial], &mut noise)?;
+        }
+        Ok(Exactness { exact_merge_limit: limit as u32, verify_exact })
+    }
+
+    fn empty(&self, slot: i32) {
+        // Safety: the probe's caller holds the gate. A whole slot always goes, recurrent or not.
+        unsafe { (self.api.seq_rm)(self.api.memory, slot, -1, -1) };
+        self.snapshots.forget(slot);
+    }
+
+    /// A row as this stage sees one: a token's embedding on the first stage, numbers elsewhere.
+    fn probe_row(&mut self, noise: &mut Noise) -> Result<Vec<f32>, Failure> {
+        self.hidden.clear();
+        if self.api.table.is_null() || self.api.table_rows < 1 {
+            let width = self.api.width as usize;
+            return Ok((0..width).map(|_| (noise.next() % 2001) as f32 / 1000.0 - 1.0).collect());
+        }
+        self.embed(&[(noise.next() % self.api.table_rows as u64) as u32])?;
+        Ok(std::mem::take(&mut self.hidden))
+    }
+
+    fn probe_rows(&mut self, count: u32, noise: &mut Noise) -> Result<Vec<Vec<f32>>, Failure> {
+        (0..count).map(|_| self.probe_row(noise)).collect()
+    }
+
+    /// Runs rows of (position, slot, values) in one batch, and gives each row's output bytes:
+    /// its logits on the last stage, the rows it sends on elsewhere.
+    fn probe_decode(&mut self, rows: &[(u32, i32, &[f32])]) -> Result<Vec<Vec<u8>>, Failure> {
+        self.hidden.clear();
+        rows.iter().for_each(|(_, _, values)| self.hidden.extend_from_slice(values));
+        self.decode(rows.iter().map(|(position, slot, _)| (*position as i32, *slot)), true)?;
+        if self.api.last {
+            let logits = |row| self.logits(row as i32).map(|values| values.iter().flat_map(|value| value.to_le_bytes()).collect());
+            return (0..rows.len()).map(logits).collect();
+        }
+        let width = self.api.width as usize;
+        let captured = self.capture.rows.lock();
+        if captured.len() != rows.len() * width {
+            return Err(stage_error("the stage output tensor was never produced".into()));
+        }
+        Ok(captured.chunks_exact(width).map(|row| row.iter().flat_map(|value| value.to_le_bytes()).collect()).collect())
+    }
+
+    /// Gives a slot its history again from nothing, alone, as it was first built.
+    fn build(&mut self, slot: i32, history: &[Vec<f32>]) -> Result<(), Failure> {
+        self.empty(slot);
+        let rows: Vec<_> = history.iter().enumerate().map(|(position, row)| (position as u32, slot, row.as_slice())).collect();
+        self.probe_decode(&rows).map(drop)
+    }
+
+    /// Takes a slot back to `keep`, through a rebuild if the model cannot cut it there.
+    fn cut(&mut self, slot: i32, keep: u32, history: &[Vec<f32>]) -> Result<(), Failure> {
+        // Safety: the probe's caller holds the gate.
+        if unsafe { (self.api.seq_rm)(self.api.memory, slot, keep as i32, -1) } {
+            return Ok(());
+        }
+        self.build(slot, history)
+    }
+
+    fn merge_matches(&mut self, slots: i32, companions: usize, trial: usize, noise: &mut Noise) -> Result<bool, Failure> {
+        let first = (trial * 7) as i32 % slots;
+        let mut members: Vec<i32> = (0..=companions as i32).map(|step| (first + step) % slots).collect();
+        members.sort_unstable();
+        let target = [0, companions, companions / 2][trial % 3];
+        let starts: Vec<u32> = (0..members.len()).map(|index| PROBE_STARTS[(trial + index) % PROBE_STARTS.len()]).collect();
+        let mut histories = Vec::with_capacity(members.len());
+        for start in &starts {
+            histories.push(self.probe_rows(*start, noise)?);
+        }
+        let next = self.probe_rows(members.len() as u32, noise)?;
+        // The target is built alone, as its rebuild will be. The others share one batch.
+        self.build(members[target], &histories[target])?;
+        let mut others = Vec::new();
+        for (index, slot) in members.iter().enumerate().filter(|(index, _)| *index != target) {
+            self.empty(*slot);
+            others.extend(histories[index].iter().enumerate().map(|(position, row)| (position as u32, *slot, row.as_slice())));
+        }
+        self.probe_decode(&others)?;
+        let alone = self.probe_decode(&[(starts[target], members[target], &next[target])])?;
+        self.cut(members[target], starts[target], &histories[target])?;
+        // Slot order, as a merged pass runs them.
+        let together: Vec<_> = members.iter().enumerate().map(|(index, slot)| (starts[index], *slot, next[index].as_slice())).collect();
+        let merged = self.probe_decode(&together)?;
+        members.iter().for_each(|slot| self.empty(*slot));
+        Ok(alone[0] == merged[target])
+    }
+
+    fn verify_matches(&mut self, start: u32, noise: &mut Noise) -> Result<bool, Failure> {
+        let history = self.probe_rows(start, noise)?;
+        let rows = self.probe_rows(PROBE_VERIFY_ROWS as u32, noise)?;
+        self.build(0, &history)?;
+        let mut alone = Vec::with_capacity(rows.len());
+        for (step, row) in rows.iter().enumerate() {
+            alone.extend(self.probe_decode(&[(start + step as u32, 0, row)])?);
+        }
+        // Every size of verify pass up to the probed one, since a kernel picked for one size of
+        // batch can round differently from the next. Guesses past it go out under exact replies
+        // only that many at a time.
+        let together: Vec<_> = rows.iter().enumerate().map(|(step, row)| (start + step as u32, 0, row.as_slice())).collect();
+        let mut matched = true;
+        for size in 2..=together.len() {
+            self.cut(0, start, &history)?;
+            matched &= self.probe_decode(&together[..size])? == alone[..size];
+        }
+        self.empty(0);
+        Ok(matched)
+    }
+}
+
 impl Compute for LlamaCompute {
     fn run_merged(&mut self, passes: &[Pass]) -> Vec<Result<Output, Failure>> {
         let watchdog = self.watchdog.clone();
@@ -491,6 +657,14 @@ mod tests {
         /// Refuses any batch with a row of this slot, as llama.cpp does a row it cannot place.
         refused_slot: Option<i32>,
         refusals: usize,
+        /// Rows in a batch of more than this many come out a little different, as a GPU
+        /// kernel picked for a bigger batch can round differently.
+        rounds_above: Option<usize>,
+        /// Rows in a batch of exactly this many come out a little different, as a kernel picked
+        /// for one size can round differently from the sizes either side of it.
+        rounds_at: Option<usize>,
+        /// Holds each slot to positions that follow on, as llama.cpp does.
+        strict: bool,
     }
 
     #[derive(Debug, PartialEq)]
@@ -519,11 +693,14 @@ mod tests {
         assert!(std::slice::from_raw_parts(batch.n_seq_id, count).iter().all(|item| *item == 1));
         for row in 0..count {
             let state = fake.slots.entry(**batch.seq_id.add(row)).or_default();
+            assert!(!fake.strict || *batch.pos.add(row) == state.0, "a slot's positions must follow on");
             state.0 = *batch.pos.add(row) + 1;
             state.1.push(*batch.pos.add(row));
         }
-        let doubled = hidden.iter().map(|value| value * 2.0);
+        let shift = if fake.rounds_above.is_some_and(|most| count > most) || fake.rounds_at == Some(count) { 0.5 } else { 0.0 };
+        let doubled = hidden.iter().map(|value| value * 2.0 + shift);
         fake.capture.as_ref().unwrap().rows.lock().extend(doubled);
+        fake.logits[0] = shift;
         0
     }
 
@@ -534,7 +711,16 @@ mod tests {
     unsafe extern "C" fn fake_rewind(memory: *mut c_void, slot: i32, keep: i32, _end: i32) -> bool {
         let fake = &mut *memory.cast::<Fake>();
         fake.rewinds.push((slot, keep));
-        !fake.recurrent || keep >= fake.slots.get(&slot).map_or(0, |state| state.0)
+        if keep < 0 {
+            fake.slots.remove(&slot);
+            return true;
+        }
+        let allowed = !fake.recurrent || keep >= fake.slots.get(&slot).map_or(0, |state| state.0);
+        if let Some(state) = fake.slots.get_mut(&slot).filter(|_| allowed && fake.strict) {
+            state.0 = state.0.min(keep);
+            state.1.retain(|position| *position < keep);
+        }
+        allowed
     }
 
     fn state_bytes(state: &(i32, Vec<i32>)) -> Vec<u8> {
@@ -952,6 +1138,99 @@ mod tests {
     fn a_pass_that_finishes_in_time_is_left_alone() {
         let limits = Limits { pass_ms: 500, row_ms: 0 };
         assert!(!overran(50, limits, |compute| drop(compute.run(&rows_pass(0, 0, &[1.0, 2.0])))));
+    }
+
+    fn probed(fake: &mut Fake, last: bool, slots: u32) -> (Result<Exactness, Failure>, LlamaCompute) {
+        fake.strict = true;
+        let mut compute = stage(fake, last, &[]);
+        (compute.probe(slots, 63), compute)
+    }
+
+    fn emptied(fake: &Fake, slots: i32) -> bool {
+        fake.slots.is_empty() && (0..slots).all(|slot| fake.rewinds.contains(&(slot, -1)))
+    }
+
+    #[test]
+    fn a_probe_where_every_batch_rounds_alike_finds_every_count_exact() {
+        let mut fake = Fake::default();
+        let (found, _) = probed(&mut fake, false, 6);
+        assert_eq!(found.map_err(|failure| failure.message), Ok(Exactness { exact_merge_limit: 5, verify_exact: true }));
+        assert!(emptied(&fake, 6));
+        // Each count tried several companion sets, and the target ran at several positions.
+        let merged: Vec<_> = fake.batches.iter().filter(|batch| batch.slots.len() == 6 && batch.slots.windows(2).all(|pair| pair[0] < pair[1])).collect();
+        assert!(merged.len() >= PROBE_TRIALS);
+    }
+
+    #[test]
+    fn a_probe_stops_at_the_first_count_that_rounds_differently() {
+        let mut fake = Fake { rounds_above: Some(3), ..Fake::default() };
+        let (found, _) = probed(&mut fake, false, 8);
+        assert_eq!(found.map_err(|failure| failure.message), Ok(Exactness { exact_merge_limit: 2, verify_exact: false }));
+        // It stopped there: no trip of one row a slot ever held more than four.
+        let one_each = |batch: &&Seen| batch.slots.windows(2).all(|pair| pair[0] < pair[1]);
+        assert_eq!(fake.batches.iter().filter(one_each).map(|batch| batch.slots.len()).max(), Some(4));
+        assert!(emptied(&fake, 8));
+    }
+
+    #[test]
+    fn the_last_stage_compares_its_logits() {
+        let mut fake = Fake { rounds_above: Some(2), ..Fake::default() };
+        let (found, _) = probed(&mut fake, true, 4);
+        assert_eq!(found.map_err(|failure| failure.message), Ok(Exactness { exact_merge_limit: 1, verify_exact: false }));
+        let mut fake = Fake::default();
+        let (found, _) = probed(&mut fake, true, 4);
+        assert_eq!(found.map_err(|failure| failure.message), Ok(Exactness { exact_merge_limit: 3, verify_exact: true }));
+    }
+
+    #[test]
+    fn a_verify_pass_must_match_at_every_size_up_to_the_probed_one() {
+        // Four rows in one pass round as alone, three do not: a guess check of two guesses differs.
+        let mut fake = Fake { rounds_at: Some(3), ..Fake::default() };
+        let (found, _) = probed(&mut fake, false, 2);
+        assert_eq!(found.map_err(|failure| failure.message), Ok(Exactness { exact_merge_limit: 1, verify_exact: false }));
+    }
+
+    #[test]
+    fn one_slot_has_nothing_to_merge_with() {
+        let mut fake = Fake::default();
+        let (found, _) = probed(&mut fake, false, 1);
+        assert_eq!(found.map_err(|failure| failure.message), Ok(Exactness { exact_merge_limit: 0, verify_exact: true }));
+    }
+
+    #[test]
+    fn a_model_that_cannot_rewind_is_built_again_from_nothing() {
+        let mut fake = Fake { recurrent: true, rounds_above: Some(4), ..Fake::default() };
+        let (found, _) = probed(&mut fake, false, 6);
+        assert_eq!(found.map_err(|failure| failure.message), Ok(Exactness { exact_merge_limit: 3, verify_exact: true }));
+        assert!(emptied(&fake, 6));
+    }
+
+    #[test]
+    fn a_probe_leaves_no_snapshot_behind() {
+        let mut fake = Fake { strict: true, ..Fake::default() };
+        let mut compute = stage(&mut fake, false, &[]);
+        runs(&mut compute, 2, 0..3);
+        assert!(!compute.snapshots.slots.lock().is_empty());
+        assert!(compute.probe(4, 63).is_ok());
+        assert!(compute.snapshots.slots.lock().is_empty());
+        assert!(fake.slots.is_empty());
+    }
+
+    #[test]
+    fn a_probe_the_model_refuses_says_so_and_still_empties_every_slot() {
+        let mut fake = Fake { refused_slot: Some(2), ..Fake::default() };
+        let (found, _) = probed(&mut fake, false, 4);
+        assert!(matches!(found, Err(failure) if failure.message.contains("llama_decode failed")));
+        assert!(emptied(&fake, 4));
+    }
+
+    #[test]
+    fn a_first_stage_probes_with_rows_from_its_table() {
+        let mut fake = Fake { strict: true, ..Fake::default() };
+        let table = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mut compute = stage(&mut fake, false, &table);
+        assert!(compute.probe(3, 63).is_ok());
+        assert!(fake.batches.iter().all(|batch| batch.hidden.chunks_exact(WIDTH).all(|row| table.chunks_exact(WIDTH).any(|known| known == row))));
     }
 
     #[test]

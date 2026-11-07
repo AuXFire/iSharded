@@ -269,6 +269,9 @@ class ConfigureRequest(BaseModel):
     slots: int = 1
     # Let conversations share a pass through each stage. See worker._can_merge.
     merge_passes: bool = True
+    # Keep replies identical to plain decoding: merge no more than the stage's probe saw
+    # round as one row alone, and check guesses one row at a time. See worker.merge_most.
+    exact: bool = False
     # What this stage's units must hash to, when the model was loaded with hashes.
     unit_hashes: dict[str, str] = Field(default_factory=dict)
     # Run the stage in llama.cpp's embedding mode, for /v1/embeddings.
@@ -329,6 +332,8 @@ class LoadModelRequest(BaseModel):
     # None leaves it to the load, which keeps the route busy with what fits.
     parallel: int | None = Field(default=None, ge=1, le=MAX_PARALLEL)
     merge_passes: bool = True
+    # Replies identical to plain decoding at any load, at whatever merging costs.
+    exact: bool = False
     # Reuse saved prompt states. Replies are the same either way at temperature 0.
     prompt_cache: bool = True
     # How a GGUF model keeps attention KV. q8_0 takes about half the memory.

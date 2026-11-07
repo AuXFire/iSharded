@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -57,7 +57,7 @@ const REDIAL_STEADY: Duration = Duration::from_secs(30);
 /// the replay that takes over if this fails needs no link at all.
 const REDIAL_HOP: Duration = Duration::from_secs(2);
 /// The most replies that share one trip through the model.
-const MAX_MERGED: usize = 64;
+pub(crate) const MAX_MERGED: usize = 64;
 /// How far back a slot remembers. Passes on a link keep their order, so what is left over
 /// from a reply is close behind it, and a repeated answer is close behind the first.
 const GENERATIONS_KEPT: usize = 16;
@@ -130,6 +130,20 @@ pub struct Plan {
     /// gets them merged, as before the plan carried it.
     #[serde(default = "default_merge_passes")]
     pub merge_passes: bool,
+    /// The most passes one trip may hold. A route that wants exact replies sets it to what
+    /// this stage's probe found merges as rows run alone.
+    #[serde(default)]
+    pub merge_most: Option<u32>,
+}
+
+impl Plan {
+    /// How many passes one trip takes, which is one when nothing merges.
+    fn trip_most(&self) -> usize {
+        match (self.merge_passes, self.merge_most) {
+            (false, _) => 1,
+            (true, most) => most.map_or(MAX_MERGED, |most| (most as usize).clamp(1, MAX_MERGED)),
+        }
+    }
 }
 
 fn default_timeout_ms() -> u64 {
@@ -405,8 +419,9 @@ struct Inner {
     /// Taken only inside `jobs`, or with no other lock held.
     lines: Mutex<HashMap<u32, Line>>,
     ready: Condvar,
-    /// The route's choice, kept here so taking work needs no lock but `jobs`.
-    merging: AtomicBool,
+    /// The most passes one trip takes, as the route chose. Kept here so taking work needs no
+    /// lock but `jobs`.
+    merge_most: AtomicUsize,
     stopping: AtomicBool,
     strangers: Mutex<Strangers>,
     counters: Counters,
@@ -433,7 +448,7 @@ impl Node {
             jobs: Mutex::new(VecDeque::new()),
             lines: Mutex::default(),
             ready: Condvar::new(),
-            merging: AtomicBool::new(true),
+            merge_most: AtomicUsize::new(MAX_MERGED),
             stopping: AtomicBool::new(false),
             strangers: Mutex::default(),
             counters: Counters::default(),
@@ -493,7 +508,7 @@ impl Node {
         if !plan.keys.fit(plan.index, plan.count) {
             return Err("these keys do not fit this place in the route".to_string());
         }
-        self.inner.merging.store(plan.merge_passes, Ordering::Release);
+        self.inner.merge_most.store(plan.trip_most(), Ordering::Release);
         self.inner.counters.compute_us_total.store(0, Ordering::Relaxed);
         self.inner.counters.batches_total.store(0, Ordering::Relaxed);
         let ring = Arc::new(Ring {
@@ -1151,7 +1166,7 @@ fn next_batch(inner: &Inner) -> Option<Vec<Job>> {
             return None;
         }
         if let Some(job) = jobs.pop_front() {
-            return Some(take_batch(job, &mut jobs, inner.merging.load(Ordering::Acquire)));
+            return Some(take_batch(job, &mut jobs, inner.merge_most.load(Ordering::Acquire)));
         }
         inner.ready.wait(&mut jobs);
     }
@@ -1159,10 +1174,11 @@ fn next_batch(inner: &Inner) -> Option<Vec<Job>> {
 
 /// A job, and whatever waiting anywhere behind it can share its trip. There is no window to
 /// wait out: passes gather while the stage is busy, so a lone reply goes straight through.
-/// A route that asked for no merging gets its passes one at a time.
-fn take_batch(first: Job, jobs: &mut VecDeque<Job>, merging: bool) -> Vec<Job> {
+/// A route that asked for no merging gets its passes one at a time, and one that asked for
+/// exact replies no more together than were seen to round as they do alone.
+fn take_batch(first: Job, jobs: &mut VecDeque<Job>, most: usize) -> Vec<Job> {
     let mut batch = vec![first];
-    if !merging || !can_merge(&batch[0].pass) {
+    if most < 2 || !can_merge(&batch[0].pass) {
         return batch;
     }
     let epoch = batch[0].pass.epoch;
@@ -1170,7 +1186,7 @@ fn take_batch(first: Job, jobs: &mut VecDeque<Job>, merging: bool) -> Vec<Job> {
     // passes has been looked at, whether that pass went or stayed.
     let mut seen = HashSet::from([batch[0].pass.slot]);
     let mut index = 0;
-    while index < jobs.len() && batch.len() < MAX_MERGED {
+    while index < jobs.len() && batch.len() < most.min(MAX_MERGED) {
         let pass = &jobs[index].pass;
         if seen.insert(pass.slot) && can_merge(pass) && pass.epoch == epoch {
             batch.extend(jobs.remove(index));
@@ -1353,13 +1369,13 @@ mod tests {
         let mut queue: VecDeque<Job> = jobs.into();
         let first = queue.pop_front().unwrap();
         let slots = |jobs: &mut dyn Iterator<Item = &Job>| jobs.map(|job| job.pass.slot).collect();
-        (slots(&mut take_batch(first, &mut queue, true).iter()), slots(&mut queue.iter()))
+        (slots(&mut take_batch(first, &mut queue, MAX_MERGED).iter()), slots(&mut queue.iter()))
     }
 
     #[test]
     fn a_route_that_merges_nothing_takes_passes_one_at_a_time() {
         let mut queue: VecDeque<Job> = vec![job(1, 1, 1, 0), job(2, 1, 1, 0)].into();
-        assert_eq!(take_batch(job(0, 1, 1, 0), &mut queue, false).len(), 1);
+        assert_eq!(take_batch(job(0, 1, 1, 0), &mut queue, 1).len(), 1);
         assert_eq!(queue.len(), 2);
     }
 
@@ -1368,9 +1384,27 @@ mod tests {
         let node = Node::new().unwrap();
         let plan = |text: &str| serde_json::from_str::<Plan>(text).unwrap();
         node.open(plan(r#"{"epoch": 1, "index": 0, "count": 2, "keys": {"next": [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1], "closing": [9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9]}, "merge_passes": false}"#)).unwrap();
-        assert!(!node.inner.merging.load(Ordering::Acquire));
+        assert_eq!(node.inner.merge_most.load(Ordering::Acquire), 1);
         node.open(plan(r#"{"epoch": 2, "index": 0, "count": 2, "keys": {"next": [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1], "closing": [9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9]}}"#)).unwrap();
-        assert!(node.inner.merging.load(Ordering::Acquire));
+        assert_eq!(node.inner.merge_most.load(Ordering::Acquire), MAX_MERGED);
+    }
+
+    #[test]
+    fn an_exact_route_merges_no_more_than_its_plan_allows() {
+        let node = Node::new().unwrap();
+        let keys = r#""keys": {"next": [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1], "closing": [9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9]}"#;
+        let most = |extra: &str| {
+            node.open(serde_json::from_str(&format!(r#"{{"epoch": 1, "index": 0, "count": 2, {keys}{extra}}}"#)).unwrap()).unwrap();
+            node.inner.merge_most.load(Ordering::Acquire)
+        };
+        assert_eq!(most(r#", "merge_most": 3"#), 3);
+        assert_eq!(most(r#", "merge_most": 0"#), 1);
+        assert_eq!(most(r#", "merge_most": 900"#), MAX_MERGED);
+        assert_eq!(most(r#", "merge_most": 3, "merge_passes": false"#), 1);
+        let queue = (1..6).map(|slot| job(slot, 1, 1, 0)).collect::<VecDeque<_>>();
+        let mut left = queue;
+        assert_eq!(take_batch(job(0, 1, 1, 0), &mut left, 3).len(), 3);
+        assert_eq!(left.len(), 3);
     }
 
     #[test]
@@ -1446,7 +1480,7 @@ mod tests {
     #[test]
     fn a_plan_whose_keys_do_not_fit_is_refused_and_the_old_route_stays() {
         let (node, _) = stage(0);
-        let wrong = Plan { epoch: 2, index: 1, count: 3, keys: keys_for(0, 3), ack_timeout_ms: 1, silence_timeout_ms: 1, merge_passes: true };
+        let wrong = Plan { epoch: 2, index: 1, count: 3, keys: keys_for(0, 3), ack_timeout_ms: 1, silence_timeout_ms: 1, merge_passes: true, merge_most: None };
         assert!(node.open(wrong).is_err());
         assert_eq!(node.stats().epoch, Some(1));
     }
@@ -1461,7 +1495,7 @@ mod tests {
     fn stage(index: u16) -> (Node, Address) {
         let node = Node::new().unwrap();
         node.listen("127.0.0.1", 0).unwrap();
-        node.open(Plan { epoch: 1, index, count: 2, keys: keys_for(index, 2), ack_timeout_ms: 60_000, silence_timeout_ms: 60_000, merge_passes: true }).unwrap();
+        node.open(Plan { epoch: 1, index, count: 2, keys: keys_for(index, 2), ack_timeout_ms: 60_000, silence_timeout_ms: 60_000, merge_passes: true, merge_most: None }).unwrap();
         let listening = node.inner.listening.lock();
         let door = listening.as_ref().unwrap();
         let address = Address { address: format!("127.0.0.1:{}", door.port), fingerprint: door.fingerprint.clone() };
@@ -1515,7 +1549,7 @@ mod tests {
         // No route is open at the entry yet, so it turns the dial away.
         assert_eq!(last.connect(Links { next: None, entry: Some(door), timeout_ms: 100 }), Ok(false));
         assert!(!last.stats().closing_up);
-        entry.open(Plan { epoch: 1, index: 0, count: 2, keys: keys_for(0, 2), ack_timeout_ms: 60_000, silence_timeout_ms: 60_000, merge_passes: true }).unwrap();
+        entry.open(Plan { epoch: 1, index: 0, count: 2, keys: keys_for(0, 2), ack_timeout_ms: 60_000, silence_timeout_ms: 60_000, merge_passes: true, merge_most: None }).unwrap();
         let began = Instant::now();
         while !last.stats().closing_up {
             assert!(began.elapsed() < Duration::from_secs(5), "it never came up");

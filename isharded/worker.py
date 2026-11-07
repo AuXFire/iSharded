@@ -52,6 +52,7 @@ from .protocol import (
     host_model_patterns,
     hosts_model,
     pass_seconds,
+    MAX_PARALLEL,
     META_HEADER,
     PROTOCOL_VERSION,
     CacheRestoreRequest,
@@ -200,6 +201,9 @@ def hardware_info(
 
 # Past this, a new reply is refused rather than left waiting indefinitely.
 MAX_WAITING_REPLIES = 32
+# Guesses one pass checks under exact replies: the probe compares verify passes of up to four
+# rows, the token and three guesses (PROBE_VERIFY_ROWS in engine/src/llama.rs), and no larger.
+EXACT_GUESSES = 3
 # A coordinator that asked for a drain and then died must not block replies forever.
 DRAIN_LIMIT_SECONDS = 180.0
 # A control plane this worker only heard about, and that stays silent, is forgotten.
@@ -467,6 +471,9 @@ class WorkerRuntime:
         self.gguf: GgufStage | None = None
         self.gguf_logits: torch.Tensor | None = None
         self.merge_passes = False
+        self.exact = False
+        # What this stage's probe found at load about merged passes. None: nothing was probed.
+        self.exactness: dict[str, Any] | None = None
         self.replacing = asyncio.Lock()
         self.merge_queue: list[MergedStep] = []
         self.merge_task: asyncio.Task[None] | None = None
@@ -544,7 +551,12 @@ class WorkerRuntime:
         self.compute_ms_ema: float | None = None
         # A reply's pass on this stage, which is what a load counts as a row when it chooses slots.
         self.row_ms_ema: float | None = None
+        # A pass's time by how many replies rode in it, so a load can count what merging saves.
+        self.batch_ms: dict[int, float] = {}
+        # The fraction of the time since the last look that this stage spent computing.
+        self.busy_share: float | None = None
         self.ring_counted: tuple[int, int, int] | None = None
+        self.ring_busy: tuple[int, int, float] | None = None
         self.downstream_ms_ema: float | None = None
         self.last_error: str | None = None
         self.kv_snapshots_sent = 0
@@ -599,21 +611,70 @@ class WorkerRuntime:
     def _note_row(self, ms: float) -> None:
         self.row_ms_ema = round(self._ema(self.row_ms_ema, ms), 3)
 
+    def _note_batch(self, replies: float, ms: float) -> None:
+        size = max(1, round(replies))
+        self.batch_ms[size] = round(self._ema(self.batch_ms.get(size), ms), 3)
+
     def note_ring(self, stats: dict[str, Any] | None) -> None:
         """Count the engine's passes into this stage's rows.
 
-        The engine keeps an average of each batch it runs, and a batch can hold several replies,
-        so the batch's time is shared out among the passes run since the last look.
+        A batch can hold several replies, so its time is shared out among the passes run since
+        the last look. The engine's running totals give that time exactly, and how much of the
+        time since the stage was busy. An engine without them gives an average of recent batches.
         """
         if not stats or stats.get("passes") is None:
             return
         counted = (int(stats["passes"]), int(stats.get("merged_passes") or 0), int(stats.get("merged_rows") or 0))
         before, self.ring_counted = self.ring_counted, counted
+        totals = None
+        if stats.get("batches_total") is not None and stats.get("compute_us_total") is not None:
+            totals = (int(stats["batches_total"]), int(stats["compute_us_total"]), time.monotonic())
+        busy_before, self.ring_busy = self.ring_busy, totals
         if before is None or counted[0] < before[0]:
             return  # a first look, or an engine that started again, has nothing to compare
         passes, merges, merged = (now - then for now, then in zip(counted, before))
-        if passes > 0 and stats.get("compute_us"):
-            self._note_row(stats["compute_us"] / 1000 * (passes - merged + merges) / passes)
+        if passes <= 0:
+            return
+        batches, busy_us = passes - merged + merges, stats.get("compute_us")
+        if totals is not None and busy_before is not None and totals[0] > busy_before[0]:
+            batches, busy_us = totals[0] - busy_before[0], (totals[1] - busy_before[1]) / (totals[0] - busy_before[0])
+            self.busy_share = round(min((totals[1] - busy_before[1]) / 1e6 / max(totals[2] - busy_before[2], 1e-6), 1.0), 3)
+        if busy_us:
+            self._note_row(busy_us / 1000 * batches / passes)
+            self._note_batch(passes / batches, busy_us / 1000)
+
+    @property
+    def merge_most(self) -> int:
+        """The most replies one pass through this stage may hold.
+
+        A merged pass can round differently from one row alone. With exact replies asked for,
+        a pass holds no more than the probe at load saw come out the same, which is often one.
+        """
+        if not self.merge_passes:
+            return 1
+        if not self.exact:
+            return MAX_PARALLEL
+        return int((self.exactness or {}).get("exact_merge_limit") or 0) + 1
+
+    def guesses_in_one_pass(self) -> bool:
+        """Whether guesses may be checked several rows to a pass.
+
+        That rounds differently from one row at a time on most hardware. Exact replies allow it
+        only on a route of one stage whose probe saw no difference, because other stages' probes
+        are not known here.
+        """
+        return not self.exact or (len(self.route) == 1 and bool((self.exactness or {}).get("verify_exact")))
+
+    def exact_report(self) -> dict[str, Any]:
+        found = self.exactness or {}
+        return {
+            "setting": self.exact,
+            "exact_merge_limit": found.get("exact_merge_limit"),
+            "verify_exact": found.get("verify_exact"),
+            "probe_error": found.get("error"),
+            "merge_most": self.merge_most,
+            "guesses_in_one_pass": self.draft is not None and self.guesses_in_one_pass() and not (len(self.route) > 1 and self.ring_live),
+        }
 
     def _record(self, phase: str, started: float) -> None:
         elapsed = (time.perf_counter() - started) * 1000
@@ -1172,7 +1233,9 @@ class WorkerRuntime:
         self.draft_choice = DraftChoice()  # a new route can change which way is faster
         self.row_clock = RowClock()
         self.row_ms_ema = None  # another stage's rows say nothing about this one's
-        self.ring_counted = None
+        self.batch_ms = {}
+        self.busy_share = None
+        self.ring_counted = self.ring_busy = None
         adapter = create_adapter(request.architecture)
         if not isinstance(adapter, GgufAdapter) and not has_torch():
             raise ValueError(NO_TORCH)
@@ -1202,6 +1265,9 @@ class WorkerRuntime:
         folder = None if self.namespace is None or not self.state_disk_bytes else self.state_root / self.namespace
         self.copies.aim(request.copy_url, folder, self.namespace or "")
         self.merge_passes = request.merge_passes
+        self.exact = request.exact
+        # The stage process probed at load, before this worker could send it a reply.
+        self.exactness = None if self.gguf is None else (await asyncio.to_thread(self.gguf.ring_call, "exactness")).get("found")
         if self.gate.size != request.slots:
             self.gate.resize(request.slots)
         await self.release_gate()
@@ -1256,6 +1322,7 @@ class WorkerRuntime:
             ack_timeout_ms=body.get("ack_timeout_ms", RING_ACK_MS),
             silence_timeout_ms=body.get("silence_timeout_ms", RING_ACK_MS),
             merge_passes=self.merge_passes,
+            merge_most=self.merge_most,
         )
         if not answer.get("engine"):
             return {"engine": False}
@@ -1665,6 +1732,7 @@ class WorkerRuntime:
             self.prompt_tokens_computed += tokens
         else:
             self._note_row(elapsed)
+            self._note_batch(1, elapsed)
         self.compute_ms_ema = self._ema(self.compute_ms_ema, elapsed)
         return hidden
 
@@ -1833,7 +1901,7 @@ class WorkerRuntime:
     def _can_merge(self, hidden: torch.Tensor, request: InferRequest) -> bool:
         """Ordinary next-token steps can share a pass. Anything with its own state work cannot."""
         return (
-            self.merge_passes
+            self.merge_most > 1
             and self.gguf is not None
             and hidden.shape[1] == 1
             and not (request.verify or request.reset or request.prompt_rows)
@@ -1864,7 +1932,9 @@ class WorkerRuntime:
                 step.outcome.set_exception(epoch_error(self.epoch))
             else:
                 steps.append(step)
-        return steps
+        # Whatever is past the most one pass may hold goes in the next.
+        self.merge_queue = steps[self.merge_most :] + self.merge_queue
+        return steps[: self.merge_most]
 
     async def _merged_results(self, steps: list[MergedStep]) -> list[Any]:
         """Each step's answer, or the exception for it, so every waiting reply hears."""
@@ -1935,6 +2005,7 @@ class WorkerRuntime:
             self.inference_calls += len(ready)
             self.tokens_processed += len(ready)
             self._note_row((time.perf_counter() - started) * 1000 / len(ready))  # each reply had its share
+            self._note_batch(len(ready), (time.perf_counter() - started) * 1000)
         self.compute_ms_ema = self._ema(self.compute_ms_ema, (time.perf_counter() - started) * 1000)
         return [results[index] for index in range(len(steps))]
 
@@ -2212,6 +2283,9 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
             "activation_bytes_sent": runtime.activation_bytes_sent,
             "compute_ms_ema": runtime.compute_ms_ema,
             "row_ms_ema": runtime.row_ms_ema,
+            "batch_ms": {str(size): ms for size, ms in sorted(runtime.batch_ms.items())},
+            "busy_share": runtime.busy_share,
+            "exact": runtime.exact_report(),
             "downstream_ms_ema": runtime.downstream_ms_ema,
             "last_error": runtime.last_error,
             "kv_snapshots_sent": runtime.kv_snapshots_sent,
@@ -2829,8 +2903,9 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             began = time.perf_counter()
             # Checking guesses in one pass runs several rows at once, which rounds a little
             # differently. A pipeline and plain decoding run one row, so they agree exactly.
-            # So a guess from the text only ever goes out on a pipeline.
-            ways = [PIPELINED, PLAIN] if runtime.ring_pipelines(following) else [GUESSED, PLAIN] if draft else [PLAIN]
+            # So a guess from the text only ever goes out on a pipeline, and exact replies check
+            # a draft's guesses in one pass only where the probe saw that round the same.
+            ways = [PIPELINED, PLAIN] if runtime.ring_pipelines(following) else [GUESSED, PLAIN] if draft and runtime.guesses_in_one_pass() else [PLAIN]
             way = runtime.draft_choice.pick(ways)
             if way == PIPELINED:
                 if pipe is None:
@@ -2866,7 +2941,11 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
                 pipe = None
                 del runtime.pipes[request.slot]
             drafting = way == GUESSED
-            guesses = await draft_guesses(history[draft.seen(request.slot) :], min(ahead, room)) if drafting else []
+            if drafting:
+                most = min(ahead, room, EXACT_GUESSES) if runtime.exact else min(ahead, room)
+                guesses = await draft_guesses(history[draft.seen(request.slot) :], most)
+            else:
+                guesses = []
             result = await reply_step(
                 following.model_copy(update={"input_ids": [token, *guesses], "verify": drafting, "rollback_to": len(history) - 1})
             )

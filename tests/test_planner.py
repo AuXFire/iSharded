@@ -1893,7 +1893,7 @@ def running_pool(monkeypatch):
     model = ring_model()
     route, workers = zigzag(model)
     runtime = Orchestrator()
-    active = SimpleNamespace(model_id="m", profile=model, draft=None, projector=None, entry_worker=None, exit_worker=None, held={}, serving=set(), reuse_cached=True, spread=False)
+    active = SimpleNamespace(model_id="m", profile=model, draft=None, projector=None, entry_worker=None, exit_worker=None, held={}, serving=set(), reuse_cached=True, spread=False, exact=False)
     runtime.active, runtime.route, runtime.links, runtime.epoch = active, route, dict(LINKS), 7
 
     async def nothing(*args, **kwargs):

@@ -1663,9 +1663,11 @@ def test_a_stage_keeps_its_pulse_through_a_long_pass(quick_pulse, monkeypatch):
     try:
         real_stage(host, gpu_layers=0)  # on a CPU, so the pass is sure to be long
         host.watch()
-        rows = host.call("embed", tokens=(REAL_PROMPT * 40)[:200], rows=200)[1]
+        # llama.cpp runs a pass of 32 rows or more on a GPU if there is one, even with no layers
+        # there, and once the load's probe has warmed the stage that took under 0.2 s.
+        rows = host.call("embed", tokens=(REAL_PROMPT * 40)[:31], rows=31)[1]
         began = time.monotonic()
-        host.call("forward", rows, position=0, rows=200)
+        host.call("forward", rows, position=0, rows=31)
         assert time.monotonic() - began > 0.2, "the pass must outlast the pulse's limit to prove anything"
         assert host.process.poll() is None
     finally:
@@ -1842,6 +1844,17 @@ def test_lookup_is_on_unless_a_load_or_the_command_line_says_not(monkeypatch):
     assert "prompt_lookup" not in cli.load_body(parser.parse_args(["load", "m"]))
     assert cli.load_body(parser.parse_args(["load", "m", "--no-lookup"]))["prompt_lookup"] is False
     assert cli.load_body(parser.parse_args(["load", "m", "--no-draft"]))["draft_model"] == "none"
+
+
+def test_exact_replies_are_asked_for_only_by_a_flag_and_are_off_by_default():
+    from isharded import cli
+    from isharded.protocol import ConfigureRequest, LoadModelRequest
+
+    parser = cli.build_parser()
+    assert "exact" not in cli.load_body(parser.parse_args(["load", "m"]))
+    assert cli.load_body(parser.parse_args(["load", "m", "--exact"]))["exact"] is True
+    assert LoadModelRequest().exact is False
+    assert ConfigureRequest.model_fields["exact"].default is False
 
 
 def test_the_entry_reserves_a_drafts_cache_for_every_slot(local_model, tmp_path, monkeypatch):

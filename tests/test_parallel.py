@@ -12,7 +12,7 @@ import pytest
 from isharded import orchestrator as orchestrator_module
 from isharded import worker as worker_module
 from isharded.models import UnsupportedModel
-from isharded.orchestrator import ModelTarget, Orchestrator, describe_plan, draft_sizes, settled_parallel, stage_devices, wanted_slots, with_slots
+from isharded.orchestrator import ModelTarget, Orchestrator, describe_plan, draft_sizes, exactness_of, settled_parallel, stage_devices, wanted_slots, with_slots
 from isharded import planner
 from isharded.planner import Candidate, ModelProfile
 from isharded.protocol import MAX_PARALLEL, DraftModel, InferRequest, LoadModelRequest, MemoryPool, StageAssignment, TensorRef, UnitPlacement, WeightUnit
@@ -87,14 +87,44 @@ def stage(name, start, end, ms):
 def test_a_route_wants_its_round_trip_over_its_slowest_row():
     route = [stage("a", 0, 4, 10.0), stage("b", 4, 8, 20.0)]
     # 10 + 20 of work, and 25 + 1 ms each way round the ring.
-    assert wanted_slots(route, ["a", "b"], {("a", "b"): 50.0}, True) == {"round_trip_ms": 82.0, "row_ms": 20.0, "devices": 2, "wanted": 4, "measured": False}
+    assert wanted_slots(route, ["a", "b"], {("a", "b"): 50.0}, True) == {"round_trip_ms": 82.0, "row_ms": 20.0, "devices": 2, "wanted": 4, "measured": False, "merging": False}
 
 
 def test_measured_rows_stand_in_for_memory_speeds():
     route = [stage("a", 0, 4, 10.0), stage("b", 4, 8, 20.0)]
-    # 30 + 5 of work as the stages measured it, and the same 52 ms of links.
+    # 30 + 5 of work as the stages measured it, and the same 52 ms of links. Two slots would leave
+    # the 30 ms stage idle a third of each trip, and four replies would wait for a second round.
     measured = wanted_slots(route, ["a", "b"], {("a", "b"): 50.0}, True, [30.0, 5.0])
-    assert measured == {"round_trip_ms": 87.0, "row_ms": 30.0, "devices": 2, "wanted": 2, "measured": True}
+    assert measured == {"round_trip_ms": 87.0, "row_ms": 30.0, "devices": 2, "wanted": 4, "measured": True, "merging": False}
+
+
+def test_replies_past_the_slots_wait_a_round_so_a_far_route_takes_enough_for_them():
+    # 100 ms a hop round a CPU and a GPU stage: eleven 20 ms rows fit in a trip, and 16 replies on
+    # 11 slots took two rounds. Measured, 11 slots made 32 tokens/s and 16 made 45.7.
+    route = [stage("a", 0, 4, 3.2), stage("b", 4, 8, 20.0)]
+    chosen = wanted_slots(route, ["a", "b"], {("a", "b"): 198.0}, True, [3.2, 20.0])
+    assert math.floor(chosen["round_trip_ms"] / chosen["row_ms"]) == 11
+    assert chosen["wanted"] == 16
+
+
+def test_merged_passes_that_cost_less_let_a_route_take_more_replies_but_only_where_they_merge():
+    route = [stage("a", 0, 4, 3.2), stage("b", 4, 8, 20.0)]
+    links = {("a", "b"): 198.0}
+    # As measured: 16 replies in one pass took 29.5 ms on the CPU stage, against 20 for one.
+    passes = [{1: 3.2, 16: 4.7}, {1: 20.0, 16: 29.5}]
+    merged = wanted_slots(route, ["a", "b"], links, True, [3.2, 20.0], passes, merge_most=64)
+    assert merged["merging"] is True and merged["wanted"] == MAX_PARALLEL
+    assert wanted_slots(route, ["a", "b"], links, True, [3.2, 20.0], passes, merge_most=1)["wanted"] == 16
+
+
+def test_merging_counts_no_larger_a_pass_than_every_stage_measured():
+    # Measured at 30 ms a hop: the GPU stage only ever ran two together, and the CPU stage took
+    # 41 ms for three. Counting a line through those out to 64 chose 64 slots, whose caches put
+    # 9 more layers on the CPU stage and halved what 8 replies made.
+    route = [stage("a", 0, 12, 2.6), stage("b", 12, 28, 19.0)]
+    passes = [{1: 2.6, 2: 8.06}, {1: 19.0, 3: 41.2}]
+    assert wanted_slots(route, ["a", "b"], {("a", "b"): 58.0}, True, [2.6, 19.0], passes, merge_most=64)["wanted"] == 8
+    assert wanted_slots(route, ["a", "b"], {("a", "b"): 198.0}, True, [2.6, 19.0], passes, merge_most=64)["wanted"] == 16
 
 
 def test_a_trip_of_less_than_two_rows_stays_at_one():
@@ -194,7 +224,9 @@ def test_a_load_with_nothing_measured_takes_half_of_what_memory_speeds_want(pool
     wanted = target()
     choose(pool, wanted)
     route = pool.plan(wanted)
-    assert wanted.parallel["wanted"] == math.floor(wanted.parallel["round_trip_ms"] / wanted.parallel["row_ms"])
+    # 44 rows fit in the trip, and 64 replies on 44 slots would take a second round.
+    assert math.floor(wanted.parallel["round_trip_ms"] / wanted.parallel["row_ms"]) == 44
+    assert wanted.parallel["wanted"] == MAX_PARALLEL
     assert wanted.slots == wanted.parallel["slots"] == wanted.parallel["wanted"] // 2 > 1
     assert wanted.parallel["measured"] is False
     assert wanted.profile.kv_bytes_per_token == [KV_PER_TOKEN * wanted.slots] * LAYERS
@@ -225,8 +257,53 @@ def test_a_later_load_chooses_by_what_the_model_measured(pool):
     choose(pool, again)
     choice = again.parallel
     assert choice["measured"] is True and choice["row_ms"] == 60.0
-    assert again.slots == choice["wanted"] == math.floor(choice["round_trip_ms"] / 60.0)
+    # Five rows of 60 ms fit in the trip, and eight replies on five slots would take two rounds.
+    assert math.floor(choice["round_trip_ms"] / 60.0) == 5
+    assert again.slots == choice["wanted"] == 8
     assert "as this model measured on these devices" in choice["reason"]
+
+
+def test_a_later_load_counts_merged_passes_only_where_its_replies_may_merge(pool):
+    first = target()
+    choose(pool, first)
+    pool.active = first
+    pool.route = pool.plan(first)
+    pool.epoch = 5
+    for placed, row in zip(pool.route, [40.0, 60.0]):
+        telemetry = {"row_ms_ema": row, "batch_ms": {"1": row, "8": row * 1.5}, "exact": {"exact_merge_limit": 1, "merge_most": 64}}
+        health = {"status": "ok", "model": first.model_id, "epoch": 5, "assignment": placed.model_dump(), "telemetry": telemetry}
+        pool.workers[placed.worker_id] = SimpleNamespace(health=health)
+    pool.note_rows()
+    devices = stage_devices(pool.route, pool.offered)
+    assert pool.measured_passes(first, pool.route, devices) == [{1: 40.0, 8: 60.0}, {1: 60.0, 8: 90.0}]
+    assert pool.planned_merge_most(first, pool.route) == MAX_PARALLEL
+    first.exact = True
+    assert pool.planned_merge_most(first, pool.route) == 2, "every stage saw one companion come out exact"
+    first.merge_passes = False
+    assert pool.planned_merge_most(first, pool.route) == 1
+    again = target()
+    again.request = again.request.model_copy(update={"context_tokens": 2048})
+    choose(pool, again)
+    assert again.parallel["merging"] is True and again.slots > 8
+    assert "merged passes" in again.parallel["reason"]
+
+
+def test_status_says_whether_replies_are_exact_and_why_not():
+    probed = {"exact_merge_limit": 0, "verify_exact": False, "merge_most": 1, "guesses_in_one_pass": False}
+    assert exactness_of(True, [("a", probed), ("b", probed)]) == {"exact": True, "setting": True, "reasons": []}
+    merging = {**probed, "merge_most": 64}
+    guessing = {**probed, "guesses_in_one_pass": True}
+    found = exactness_of(False, [("a", merging), ("b", guessing), ("c", None)])
+    assert found["exact"] is False and found["setting"] is False
+    assert found["reasons"] == [
+        "a merges up to 64 replies in a pass, and only 1 came out as one row alone",
+        "b checks a draft's guesses several rows to a pass, which rounds differently",
+        "c has not said how its passes round",
+    ]
+    unprobed = {"exact_merge_limit": None, "verify_exact": None, "merge_most": 64, "guesses_in_one_pass": False}
+    assert exactness_of(False, [("a", unprobed)])["reasons"] == ["a merges up to 64 replies in a pass, and nothing was probed"]
+    # A stage whose probe saw every merge come out exact keeps exact replies with merging on.
+    assert exactness_of(False, [("a", {**probed, "exact_merge_limit": 63, "merge_most": 64})])["exact"] is True
 
 
 def test_a_measured_row_is_kept_per_layer_for_a_route_planned_a_little_differently(pool):
@@ -511,7 +588,8 @@ def stage_runtime(monkeypatch, clock):
     runtime = worker_module.WorkerRuntime.__new__(worker_module.WorkerRuntime)
     runtime.adapter = runtime.assignment = object()
     runtime.gguf = FakeStage()
-    runtime.compute_ms_ema = runtime.row_ms_ema = runtime.ring_counted = None
+    runtime.compute_ms_ema = runtime.row_ms_ema = runtime.ring_counted = runtime.ring_busy = runtime.busy_share = None
+    runtime.batch_ms = {}
     runtime.inference_calls = runtime.tokens_processed = runtime.prompt_tokens_computed = runtime.merged_passes = runtime.merged_rows = 0
     runtime._pass_entry = lambda request: SimpleNamespace(length=0)
     monkeypatch.setattr(worker_module.time, "perf_counter", lambda: clock[0])
@@ -551,7 +629,8 @@ def test_replies_that_share_a_pass_share_its_time(monkeypatch):
 
 def test_the_engines_passes_count_as_rows_since_the_last_look():
     runtime = worker_module.WorkerRuntime.__new__(worker_module.WorkerRuntime)
-    runtime.row_ms_ema = runtime.ring_counted = None
+    runtime.row_ms_ema = runtime.ring_counted = runtime.ring_busy = runtime.busy_share = None
+    runtime.batch_ms = {}
     runtime.note_ring({"passes": 10, "merged_passes": 0, "merged_rows": 0, "compute_us": 9000})
     assert runtime.row_ms_ema is None, "a first look has nothing to compare"
     # Four passes ran as one batch, averaged at 8 ms: 2 ms for each reply.
@@ -563,3 +642,61 @@ def test_the_engines_passes_count_as_rows_since_the_last_look():
     assert runtime.row_ms_ema == 2.0, "an engine that started again is only looked at"
     runtime.note_ring(None)
     assert runtime.ring_counted == (3, 0, 0)
+
+
+def test_the_engines_totals_give_exact_pass_times_and_how_busy_the_stage_was(monkeypatch):
+    runtime = worker_module.WorkerRuntime.__new__(worker_module.WorkerRuntime)
+    runtime.row_ms_ema = runtime.ring_counted = runtime.ring_busy = runtime.busy_share = None
+    runtime.batch_ms = {}
+    clock = [100.0]
+    monkeypatch.setattr(worker_module.time, "monotonic", lambda: clock[0])
+    runtime.note_ring({"passes": 10, "merged_passes": 0, "merged_rows": 0, "compute_us": 1, "batches_total": 10, "compute_us_total": 50_000})
+    clock[0] += 1.0
+    # 16 passes since, in 4 batches of 4 that took 120 ms between them, in one second.
+    runtime.note_ring({"passes": 26, "merged_passes": 4, "merged_rows": 16, "compute_us": 1, "batches_total": 14, "compute_us_total": 170_000})
+    assert runtime.batch_ms == {4: 30.0}
+    assert runtime.row_ms_ema == 7.5
+    assert runtime.busy_share == 0.12
+    # An engine without the totals is read as before.
+    runtime.ring_busy = None
+    runtime.note_ring({"passes": 30, "merged_passes": 5, "merged_rows": 20, "compute_us": 8000})
+    assert runtime.batch_ms[4] == pytest.approx(30.0 * 0.8 + 8.0 * 0.2)
+
+
+def exact_runtime(exact=True, limit=0, verify=False, stages=2, merge=True):
+    runtime = worker_module.WorkerRuntime.__new__(worker_module.WorkerRuntime)
+    runtime.exact, runtime.merge_passes = exact, merge
+    runtime.exactness = None if limit is None else {"exact_merge_limit": limit, "verify_exact": verify}
+    runtime.route = [object()] * stages
+    return runtime
+
+
+def test_exact_replies_merge_no_more_than_the_probe_allowed():
+    assert exact_runtime(exact=False).merge_most == MAX_PARALLEL
+    assert exact_runtime(limit=0).merge_most == 1
+    assert exact_runtime(limit=3).merge_most == 4
+    assert exact_runtime(limit=None).merge_most == 1, "a stage that probed nothing merges nothing"
+    assert exact_runtime(exact=False, merge=False).merge_most == 1
+
+
+def test_exact_replies_check_guesses_in_one_pass_only_on_one_stage_that_rounds_the_same():
+    assert exact_runtime(exact=False).guesses_in_one_pass()
+    assert not exact_runtime(stages=1, verify=False).guesses_in_one_pass()
+    assert exact_runtime(stages=1, verify=True).guesses_in_one_pass()
+    assert not exact_runtime(stages=2, verify=True).guesses_in_one_pass(), "other stages' probes are not known here"
+    assert not exact_runtime(stages=1, limit=None).guesses_in_one_pass()
+
+
+def test_a_merge_queue_hands_out_no_more_than_one_pass_may_hold():
+    runtime = exact_runtime(limit=1)
+    runtime.epoch, runtime.gguf = 1, object()
+    loop = asyncio.new_event_loop()
+    try:
+        steps = [SimpleNamespace(request=InferRequest(session_id=str(slot), epoch=1, input_ids=[1], slot=slot), outcome=loop.create_future()) for slot in range(5)]
+        runtime.merge_queue = list(steps)
+        assert runtime._take_merge_queue() == steps[:2]
+        assert runtime.merge_queue == steps[2:]
+        runtime.exact = False
+        assert runtime._take_merge_queue() == steps[2:]
+    finally:
+        loop.close()

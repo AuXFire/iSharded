@@ -18,7 +18,7 @@ from contextlib import aclosing, asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass, field, replace
 from itertools import pairwise
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlencode, urlsplit
 
 import httpx
@@ -299,6 +299,7 @@ class ModelTarget:
     # means the load has yet to choose.
     parallel: dict[str, Any] = field(default_factory=dict)
     merge_passes: bool = True
+    exact: bool = False
     embedding: bool = False
     projector: DraftModel | None = None
     image_marker: str | None = None
@@ -430,6 +431,7 @@ def build_target(
         slots=slots,
         parallel=parallel,
         merge_passes=request.merge_passes,
+        exact=request.exact,
         embedding=request.embedding,
         projector=projector,
         image_marker=image_marker,
@@ -624,30 +626,104 @@ def stage_devices(route: list[StageAssignment], candidates: list[Candidate]) -> 
     return list(map(device, route))
 
 
+# Counts of replies a slot count is judged on. Replies come in no set number, so each count
+# must get nearly what the best slot count would give it.
+REPLY_COUNTS = [count for count in (1, 2, 4, 8, 16, 32, 64) if count <= MAX_PARALLEL]
+# What a count of replies must get, against the best any slot count gives it.
+SLOTS_GOOD_ENOUGH = 0.97
+
+
+def pass_cost(row: float, measured: dict[int, float] | None) -> Callable[[int], float]:
+    """A stage's pass of k replies: one row, plus what each further reply added as measured.
+
+    With nothing measured past one reply, each reply costs a whole row, as with no merging.
+    """
+    alone = (measured or {}).get(1, row)
+    larger = max((size for size in measured or {} if size > 1), default=None)
+    extra = row if larger is None else max(measured[larger] - alone, 0.0) / (larger - 1)
+    return lambda replies: alone + extra * (replies - 1)
+
+
+def reply_speed(slots: int, replies: int, network: float, costs: list[Callable[[int], float]], devices: list[str], merge_most: int) -> float:
+    """Replies a second for this many replies on this many slots.
+
+    Replies past the slots wait for a round of their own. A round takes the trip, or the time its
+    busiest device needs for every reply's pass, whichever is longer.
+    """
+    seconds = 0.0
+    for start in range(0, replies, slots):
+        active = min(slots, replies - start)
+        together = min(active, merge_most)
+        load: Counter[str] = Counter()
+        for device, cost in zip(devices, costs):
+            load[device] += cost(together)
+        trip = network + sum(load.values())
+        seconds += max(trip, max(math.ceil(active / together) * ms for ms in load.values())) / 1000
+    return replies / seconds
+
+
 def wanted_slots(
-    route: list[StageAssignment], devices: list[str], links: dict[tuple[str, str], float], ring: bool, rows: list[float] | None = None
+    route: list[StageAssignment],
+    devices: list[str],
+    links: dict[tuple[str, str], float],
+    ring: bool,
+    rows: list[float] | None = None,
+    passes: list[dict[int, float]] | None = None,
+    merge_most: int = 1,
 ) -> dict[str, Any] | None:
     """How many replies keep a route's busiest device working, or None if a link on it has no reading.
 
-    While one reply goes round, that device can serve round trip / row time others, and only
-    whole rows count. Replies that share a route without sharing passes cost each other: measured
-    with a CPU and a GPU stage, a trip of 1.8 rows gave two replies 58 tokens/s on two slots and 65
-    to 112 on one. Stages on one device take turns on it, so their rows add up, and a route on a single
-    device has nothing to overlap: two stages on one GPU went from 128 to 70 at two slots.
-    A row is each stage's measured time when ``rows`` gives it, and its memory's speed otherwise.
+    While one reply goes round, that device can serve round trip / row time others. Replies past
+    the slot count wait for a round of their own, so 16 replies on 11 slots take two rounds: at
+    100 ms a hop they made 32 tokens/s, against 45.7 on 16 slots. So the count is the fewest slots
+    that give every count of replies nearly what the best would. Where passes merge, a merged pass
+    costs less than its rows alone, as ``passes`` measured it for each stage (ms by replies in a pass).
+    Replies that share a route without sharing passes cost each other: measured with a CPU and a
+    GPU stage, a trip of 1.8 rows gave two replies 58 tokens/s on two slots and 65 to 112 on one. So
+    a trip of less than two rows stays at one. Stages on one device take turns on it, so their rows
+    add up, and a route on a single device has nothing to overlap: two stages on one GPU went from
+    128 to 70 at two slots. A row is each stage's measured time when ``rows`` gives it, and its
+    memory's speed otherwise.
     """
     names = [stage.worker_id for stage in route]
     hops = list(pairwise(names)) + ([(names[-1], names[0])] if ring and len(names) > 1 else [])
     readings = [links.get(hop, links.get(hop[::-1])) for hop in hops]
     if any(reading is None or reading >= UNREACHABLE_LINK_MS for reading in readings):
         return None  # a probe that failed reads as 10 s, and that says nothing about the trip
+    stage_rows = list(rows or map(stage_ms, route))
     busy: Counter[str] = Counter()
-    for device, row in zip(devices, rows or map(stage_ms, route)):
+    for device, row in zip(devices, stage_rows):
         busy[device] += row
     row = max(busy.values())
-    round_trip = sum(busy.values()) + route_network_ms(route, links, ring)
+    network = route_network_ms(route, links, ring)
+    round_trip = sum(busy.values()) + network
+    merging = merge_most > 1 and passes is not None
     wanted = min(math.floor(round_trip / row), MAX_PARALLEL) if len(busy) > 1 else 1
-    return {"round_trip_ms": round(round_trip, 2), "row_ms": round(row, 2), "devices": len(busy), "wanted": wanted, "measured": rows is not None}
+    if wanted > 1:
+        costs = [pass_cost(stage_row, measured if merging else None) for stage_row, measured in zip(stage_rows, passes or [None] * len(route))]
+        # A pass is counted only as large as every stage has measured one: a CPU stage that took
+        # 19 ms for one reply took 41 for three, and nothing says how the line goes past that.
+        together = min(merge_most, *(max(measured, default=1) for measured in passes)) if merging else 1
+        speeds = {slots: [reply_speed(slots, replies, network, costs, devices, together) for replies in REPLY_COUNTS] for slots in range(1, MAX_PARALLEL + 1)}
+        best = [max(column) for column in zip(*speeds.values())]
+        wanted = next(slots for slots, row_speeds in speeds.items() if all(speed >= SLOTS_GOOD_ENOUGH * most for speed, most in zip(row_speeds, best)))
+    return {"round_trip_ms": round(round_trip, 2), "row_ms": round(row, 2), "devices": len(busy), "wanted": wanted, "measured": rows is not None, "merging": merging}
+
+
+def exactness_of(setting: bool, reports: list[tuple[str, dict[str, Any] | None]]) -> dict[str, Any]:
+    """Whether replies match plain decoding, from what each stage reported, and every reason they may not."""
+    reasons = []
+    for worker_id, report in reports:
+        if not report:
+            reasons.append(f"{worker_id} has not said how its passes round")
+            continue
+        limit, most = report.get("exact_merge_limit"), report["merge_most"]
+        if most > (limit or 0) + 1:
+            seen = "nothing was probed" if limit is None else f"only {limit + 1} came out as one row alone"
+            reasons.append(f"{worker_id} merges up to {most} replies in a pass, and {seen}")
+        if report.get("guesses_in_one_pass") and not report.get("verify_exact"):
+            reasons.append(f"{worker_id} checks a draft's guesses several rows to a pass, which rounds differently")
+    return {"exact": not reasons, "setting": setting, "reasons": reasons}
 
 
 def row_key(target: ModelTarget, stage: StageAssignment, device: str, last: bool) -> tuple[str, str, str, str, bool]:
@@ -759,6 +835,10 @@ class Orchestrator:
         self.apply_loop_tokens = int(os.getenv("ISHARDED_APPLY_LOOP_TOKENS", str(AMORTIZE_TOKENS)))
         self.applied_at = float("-inf")
         self.row_readings: dict[tuple[str, str, str, str, bool], float] = {}  # ms a layer, see row_key
+        # A pass's ms a layer by how many replies it held, under the same keys.
+        self.pass_readings: dict[tuple[str, str, str, str, bool], dict[int, float]] = {}
+        # The most companions a row had on a worker's stage and still came out exact, by model.
+        self.merge_limits: dict[tuple[str, str], int] = {}
         # The proven address each link of the route uses, where it is not the advertised one.
         self.hops: dict[tuple[str, str], str] = {}
         self.hops_checked_at = float("-inf")
@@ -2026,7 +2106,13 @@ class Orchestrator:
             same = health.get("model") == target.model_id and health.get("epoch") == self.epoch
             if row and same and (held.get("start_layer"), held.get("end_layer")) == (stage.start_layer, stage.end_layer):
                 key = row_key(target, stage, device, index == len(self.route) - 1)
-                self.row_readings[key] = float(row) / (stage.end_layer - stage.start_layer)
+                layers = stage.end_layer - stage.start_layer
+                self.row_readings[key] = float(row) / layers
+                merged = telemetry_of(record).get("batch_ms") or {}
+                self.pass_readings[key] = {int(size): float(ms) / layers for size, ms in merged.items()}
+                limit = (telemetry_of(record).get("exact") or {}).get("exact_merge_limit")
+                if limit is not None:
+                    self.merge_limits[(target.model_id, stage.worker_id)] = int(limit)
 
     def measured_rows(self, target: ModelTarget, route: list[StageAssignment], devices: list[str]) -> list[float] | None:
         """Each stage's row as this model measured it before on the same device, or None unless all are known."""
@@ -2037,6 +2123,24 @@ class Orchestrator:
                 return None
             rows.append(per_layer * (stage.end_layer - stage.start_layer))
         return rows
+
+    def measured_passes(self, target: ModelTarget, route: list[StageAssignment], devices: list[str]) -> list[dict[int, float]] | None:
+        """Each stage's pass time by replies in it, as this model measured before, or None unless all are known."""
+        found = []
+        for index, (stage, device) in enumerate(zip(route, devices)):
+            per_layer = self.pass_readings.get(row_key(target, stage, device, index == len(route) - 1))
+            if not per_layer:
+                return None
+            found.append({size: ms * (stage.end_layer - stage.start_layer) for size, ms in per_layer.items()})
+        return found
+
+    def planned_merge_most(self, target: ModelTarget, route: list[StageAssignment]) -> int:
+        """The most replies a pass will hold. Exact replies merge only what every stage's probe allowed."""
+        if not target.merge_passes:
+            return 1
+        if not target.exact:
+            return MAX_PARALLEL
+        return min(self.merge_limits.get((target.model_id, stage.worker_id), 0) for stage in route) + 1
 
     async def _fit_slots(self, target: ModelTarget, route: list[StageAssignment], links: dict[tuple[str, str], float]) -> dict[str, Any]:
         """As many slots as the route wants and can hold, on the same workers, with no more spilled.
@@ -2051,7 +2155,8 @@ class Orchestrator:
 
         def wants(plan: list[StageAssignment]) -> dict[str, Any] | None:
             devices = stage_devices(plan, preferred + standby)
-            return wanted_slots(plan, devices, links, target.profile.ring, self.measured_rows(target, plan, devices))
+            rows, passes = self.measured_rows(target, plan, devices), self.measured_passes(target, plan, devices)
+            return wanted_slots(plan, devices, links, target.profile.ring, rows, passes, self.planned_merge_most(target, plan))
 
         def goal(choice: dict[str, Any]) -> int:
             return choice["wanted"] if choice["measured"] else max(choice["wanted"] // 2, 1)
@@ -2086,7 +2191,8 @@ class Orchestrator:
         if chosen["devices"] == 1:
             trip = "every stage runs on one device, so replies could only take turns on it"
         elif chosen["measured"]:
-            trip = f"{trip}, as this model measured on these devices, wants {goal(chosen)}"
+            merged = ", with merged passes costing what they measured," if chosen.get("merging") else ""
+            trip = f"{trip}{merged} as this model measured on these devices, wants {goal(chosen)}"
         else:
             trip = f"{trip}, from memory speeds, would want {chosen['wanted']}; with nothing measured yet a load takes {goal(chosen)}"
         if low < goal(chosen):
@@ -2251,6 +2357,7 @@ class Orchestrator:
                 term=self.mesh.term if self.mesh else 0,
                 slots=target.slots,
                 merge_passes=target.merge_passes,
+                exact=target.exact,
                 prompt_cache=target.request is None or target.request.prompt_cache,
                 kv_type=target.request.kv_type if target.request else "f16",
                 copy_url=holders.get(stage.worker_id),
@@ -3338,6 +3445,7 @@ class Orchestrator:
                 else None
             ),
             "proposal": self.latest_proposal(),
+            "exact": self.route_exactness(),
             "model_profile": (
                 "protocol-test"
                 if self.model_id and Path(self.model_id).name.lower() == ".smoke-model"
@@ -3364,6 +3472,13 @@ class Orchestrator:
             "workers": {worker_id: self._worker_view(record, worker_id in on_route) for worker_id, record in self.workers.items()},
             "events": list(self.events),
         }
+
+    def route_exactness(self) -> dict[str, Any] | None:
+        """Whether the running route's replies are the same as plain decoding, and if not, why."""
+        if self.active is None or not self.route:
+            return None
+        reports = [(stage.worker_id, telemetry_of(self.workers.get(stage.worker_id)).get("exact")) for stage in self.route]
+        return exactness_of(self.active.exact, reports)
 
     async def probe(self, record: WorkerRecord) -> None:
         started = time.perf_counter()
