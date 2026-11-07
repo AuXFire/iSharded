@@ -167,7 +167,7 @@
     const MOST_IMAGE_BYTES = 10 * 1024 * 1024;
     const MOST_CHATS = 50, CHATS_KEY = 'isharded-chats', TOOLS_KEY = 'isharded-chat-tools';
     const QUIET_STREAM_MS = 15000, QUIET_NODE_MS = 30000, HELD_MS = 4000, SEAM_MS = 1500;
-    const state = { attachments: [], approved: new Set(), token: store.get('isharded-token') || '', status: null, chats: [], chat: null, turns: [], streaming: false, abort: null, link: null, selected: '', previewTimer: null, previewId: 0, lastPulse: 0, failures: 0, signedOut: false, members: {}, catalog: null, catalogFailed: false, heardAt: performance.now(), lastByte: 0, tools: [], routeAll: false, tab: {}, laneTab: {}, chatsFull: false };
+    const state = { attachments: [], approved: new Set(), token: store.get('isharded-token') || '', status: null, chats: [], chat: null, turns: [], streaming: false, abort: null, link: null, selected: '', previewTimer: null, previewId: 0, lastPulse: 0, failures: 0, signedOut: false, members: {}, catalog: null, catalogFailed: false, heardAt: performance.now(), lastByte: 0, tools: [], routeAll: false, tab: {}, laneTab: {}, chatsFull: false, joins: 0, joinsAt: 0, joinsHidden: false };
     const PHASE = { resolving: 'Reading the model\'s tensor list', fetching: 'Downloading each worker\'s shards', loading: 'Moving weights into memory' };
     const ICONS = {
       system: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor" stroke="none"/></svg>',
@@ -278,6 +278,8 @@
         state.chats.splice(state.chats.indexOf(chat), 1);
         if (chat === state.chat) openChat(newChat());
         keepChats();
+        closeSides();
+        $('prompt').focus();
       }, { once: true });
     }
     function closeSides() {
@@ -465,6 +467,7 @@
     async function reply() {
       const history = state.turns.filter(turn => !turn.error).map(toMessage);
       const turn = { role: 'assistant', text: '', pending: true, live: { recoveries: state.status?.metrics?.recoveries_total ?? 0, gap: null, chunkAt: 0 } };
+      const chat = state.chat;
       state.turns.push(turn);
       state.streaming = true; state.abort = new AbortController();
       touchChat(); syncComposer(); renderTurns(); stickToBottom(true);
@@ -542,7 +545,9 @@
       } finally {
         if (!turn.moved) await settleRepair(turn);
         turn.pending = false; state.streaming = false; state.abort = null; delete turn.live;
-        touchChat(); syncComposer(); renderTurns(); stickToBottom();
+        // Someone may have opened another conversation, or signed out, while this reply ended.
+        if (chat === state.chat) touchChat(); else if (state.chats.includes(chat)) keepChats();
+        syncComposer(); renderTurns(); stickToBottom();
       }
     }
     // A repair is invisible in the stream, so the pool's own count says whether one happened.
@@ -613,7 +618,8 @@
       const percent = active && job.bytes_total ? Math.floor(job.bytes_done / job.bytes_total * 100) : null;
       const bar = active && job.phase === 'fetching' && percent != null ? `<div class="progress" role="progressbar" aria-label="Load progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><i style="width:${percent}%"></i></div>` : '';
       const cancel = active && job.phase !== 'loading' ? '<p class="rail-action"><button class="btn small" id="cancelLoad" data-key="cancel" type="button">Cancel load</button></p>' : '';
-      const phase = active ? `${esc(PHASE[job.phase] || job.phase)}${job.phase === 'fetching' && percent != null ? `, ${percent}%` : ''}.` : '';
+      const fetched = job?.phase === 'fetching' && percent != null ? `, ${percent}%, ${size(job.bytes_done)} of ${size(job.bytes_total)}${job.bytes_from_peers ? `, ${size(job.bytes_from_peers)} from other nodes` : ''}${job.bytes_reused ? `, ${size(job.bytes_reused)} already here` : ''}` : '';
+      const phase = active ? `${esc(PHASE[job.phase] || job.phase)}${fetched}.` : '';
       let head, foot = '';
       if (lane) {
         head = `<h2>Where ${esc(modelName(lane.model))} runs</h2><p class="rail-note">Lane ${esc(lane.name)}, ${count(model?.stages.length ?? 0, 'stage')}.</p>`;
@@ -667,11 +673,21 @@
       if (models.includes(chosen)) pick.value = chosen;
     }
 
-    /* The same word the dashboard shows. Machines asking to join are left out, as this page does not read them. */
+    /* The same word the dashboard shows. */
+    async function readJoins() {
+      if (state.joinsHidden || document.hidden || Date.now() - state.joinsAt < 8000) return;
+      state.joinsAt = Date.now();
+      try {
+        const answer = await fetch('/join/requests', { headers: headers() });
+        if (answer.ok) state.joins = ((await answer.json()).requests || []).length;
+        // A key that cannot read the list, or a node without one, has nothing to count here.
+        else if ([401, 403, 404].includes(answer.status)) { state.joins = 0; state.joinsHidden = true; }
+      } catch {}
+    }
     function poolWord(status, model) {
       const workers = Object.entries(status.workers || {}), route = status.route || [], job = status.load_job;
       const lost = route.filter(stage => !status.workers?.[stage.worker_id]?.live), lostIds = new Set(lost.map(stage => stage.worker_id));
-      const alerts = workers.filter(([id, worker]) => worker.state === 'quarantined' || (worker.state === 'offline' && !lostIds.has(id))).length + lost.length + (job?.phase === 'failed' ? 1 : 0) + (status.lanes || []).filter(lane => lane.error).length + (status.last_audit && status.last_audit.verdict !== 'agree' ? 1 : 0) + (model?.stages || []).filter(stage => stage.spillSlow).length + (status.mesh && !status.mesh.leader ? 1 : 0);
+      const alerts = workers.filter(([id, worker]) => worker.state === 'quarantined' || (worker.state === 'offline' && !lostIds.has(id))).length + lost.length + (job?.phase === 'failed' ? 1 : 0) + (status.lanes || []).filter(lane => lane.error).length + (status.last_audit && status.last_audit.verdict !== 'agree' ? 1 : 0) + (model?.stages || []).filter(stage => stage.spillSlow).length + (status.mesh && !status.mesh.leader ? 1 : 0) + state.joins;
       const need = [alerts ? 'warn' : 'idle', alerts ? 'warn' : 'idle', `${alerts} need${alerts === 1 ? 's' : ''} you`];
       if (status.status === 'ready') return lost.length ? ['bad', 'bad', 'Route lost'] : alerts ? need : jobRunning(status) ? ['work', 'work', 'Loading'] : ['idle', '', 'Healthy'];
       if (jobRunning(status)) return ['work', 'work', route.length && job.model === status.model ? 'Repairing' : 'Loading'];
@@ -728,6 +744,9 @@
     async function poll() {
       clearTimeout(pollTimer);
       $('signOut').hidden = !state.token;
+      // A dead worker can hold the answer for seconds, and the last word may be an all-clear.
+      const slow = setTimeout(() => { if (state.status && !state.failures) setWord('work', 'work', 'Checking'); }, 5000);
+      const noticesWere = $('notices').offsetHeight;
       try {
         const status = await api('/admin/status', { timeout: 15000 });
         state.status = status; state.failures = 0; state.signedOut = false; state.heardAt = performance.now();
@@ -746,7 +765,11 @@
           if (!state.status && !state.turns.length) renderTurns();
         } else if (error.status === 401) { renderSignedOut(); }
       }
+      clearTimeout(slow);
+      // A notice takes room from the log, and the end of a reply must stay in view.
+      if ($('notices').offsetHeight !== noticesWere) stickToBottom();
       if (state.signedOut) return;
+      readJoins();
       const wait = document.hidden ? 10000 : state.status?.status === 'loading' ? 1000 : 2500;
       pollTimer = setTimeout(poll, state.failures ? Math.min(wait * state.failures, 10000) : wait);
     }
@@ -907,7 +930,11 @@
       if (!target) return;
       if ('copy' in target.dataset) copyText(target.closest('.code').querySelector('code').textContent, target);
       else if (target.dataset.action === 'send-results') sendResults();
-      else if (target.dataset.action === 'retry' && !state.streaming && state.status?.status === 'ready') { state.turns.pop(); reply(); }
+      else if (target.dataset.action === 'retry') {
+        if (!state.streaming && state.status?.status === 'ready') { state.turns.pop(); reply(); return; }
+        target.textContent = state.streaming ? 'A reply is running' : 'The pool is not ready yet';
+        setTimeout(() => { target.textContent = 'Try again'; }, 2500);
+      }
     });
     $('turns').addEventListener('input', event => {
       if (event.target.dataset.result == null) return;
