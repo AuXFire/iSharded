@@ -1031,19 +1031,25 @@ def test_a_real_route_that_merges_nothing_never_merges_passes() -> None:
         host.close()
 
 
-def test_a_new_load_starts_its_pipeline_counts_again(monkeypatch) -> None:
+def test_a_load_of_another_model_starts_its_pipeline_counts_again(monkeypatch) -> None:
+    """A stage that restarts reloads the same model, and its counts still describe it."""
     from isharded.protocol import ConfigureRequest
 
     def stop(_):
         raise ValueError("stop here")
 
     monkeypatch.setattr(worker_module, "create_adapter", stop)
-    item = runtime(pipeline_tokens=900, pipeline_misses=40, term=5, roles={"inference"}, host_models=[], worker_id="w", ring_client=None)
+    item = runtime(pipeline_tokens=900, pipeline_misses=40, term=5, roles={"inference"}, host_models=[], worker_id="w", ring_client=None, model_id="m")
     stage = StageAssignment(worker_id="w", url="http://w", start_layer=0, end_layer=1)
-    order = ConfigureRequest(model_id="m", revision="r", architecture={}, epoch=9, assignment=stage, route=[stage], term=5)
-    with pytest.raises(ValueError, match="stop here"):
-        asyncio.run(item.configure(order))
-    assert (item.pipeline_tokens, item.pipeline_misses) == (0, 0)
+
+    def load(model_id):
+        order = ConfigureRequest(model_id=model_id, revision="r", architecture={}, epoch=9, assignment=stage, route=[stage], term=5)
+        with pytest.raises(ValueError, match="stop here"):
+            asyncio.run(item.configure(order))
+        return item.pipeline_tokens, item.pipeline_misses
+
+    assert load("m") == (900, 40)
+    assert load("other") == (0, 0)
 
 
 def waiting_ring(client, **fields):
