@@ -1587,7 +1587,7 @@ def test_a_frozen_stage_does_not_cost_a_long_prompt_its_whole_deadline(quick_pul
         host.close()
 
 
-@pytest.mark.parametrize("payload", [b"", bytes(1 << 24)], ids=["waiting for an answer", "stuck in the pipe"])
+@pytest.mark.parametrize("payload", [b"", bytes(1 << 14), bytes(1 << 24)], ids=["waiting for an answer", "one wide row stuck in the pipe", "stuck in the pipe"])
 def test_a_call_in_flight_hears_when_the_pulse_stops_a_stage_that_takes_no_kill(quick_pulse, payload):
     import psutil
 
@@ -1605,6 +1605,29 @@ def test_a_call_in_flight_hears_when_the_pulse_stops_a_stage_that_takes_no_kill(
     finally:
         del host.process.kill
         host.close()
+
+
+def test_a_machine_that_slept_is_no_hung_stage(monkeypatch, quick_deadlines):
+    """The clock jumps over a sleep, and the stage slept through it too."""
+    from multiprocessing import Pipe
+    from types import SimpleNamespace
+
+    ours, theirs = Pipe()
+
+    def answers():
+        theirs.recv_bytes()
+        theirs.recv_bytes()
+        time.sleep(0.4)
+        theirs.send_bytes(b'{"ok":true}')
+        theirs.send_bytes(b"")
+
+    threading.Thread(target=answers, daemon=True).start()
+    stopped = []
+    channel = quick_deadlines.Channel(SimpleNamespace(kill=lambda: stopped.append(1)), ours, threading.Event())
+    began, clock = time.monotonic(), time.monotonic
+    monkeypatch.setattr(time, "monotonic", lambda: clock() + 1000 * (clock() - began > 0.1))
+    channel.call("forward")
+    assert not stopped
 
 
 def test_a_stage_keeps_its_pulse_through_a_long_pass(quick_pulse, monkeypatch):

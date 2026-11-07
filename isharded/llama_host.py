@@ -23,7 +23,6 @@ import secrets
 import subprocess
 import sys
 import threading
-import time
 from typing import Any
 
 import numpy as np
@@ -48,8 +47,9 @@ PULSE_EVERY = 2.0
 PULSE_SECONDS = 10.0
 # How often a call that is waiting looks up to see whether its process has been stopped.
 ANSWER_LOOK_SECONDS = 0.25
-# Past this, a write can stick until the far end reads.
-PIPE_BYTES = 64 * 1024
+# Past this, a write can stick until the far end reads. A Windows pipe holds 8 KiB, which
+# one row of a wide model is over, and a call sends two messages.
+PIPE_BYTES = 4 * 1024
 # Encoded images kept for the next turn. A conversation resends its images every time.
 ENCODED_IMAGE_BYTES = 128 * 1024 * 1024
 # States a draft model keeps. It is small, and a draft that loses one just reads more.
@@ -367,8 +367,8 @@ class Channel:
         self.stopped = stopped
 
     def _send(self, payload: bytes) -> None:
-        """Sends a call's rows. Many rows can stick in the pipe with no way to time them out, so
-        they go from a thread of their own, which a stop can leave behind.
+        """Sends part of a call. Much of it can stick in the pipe with no way to time it out, so
+        it goes from a thread of its own, which a stop can leave behind.
         """
         if len(payload) <= PIPE_BYTES:
             self.connection.send_bytes(payload)
@@ -394,21 +394,24 @@ class Channel:
         """Waits for an answer, and says whether it came in time.
 
         It looks up now and then. A process that takes no kill leaves this pipe open, so a
-        stop made through another connection would otherwise reach nobody waiting here.
+        stop made through another connection would otherwise reach nobody waiting here. It
+        counts those looks and reads no clock: a laptop that slept has run for none of that time.
         """
-        ends = None if seconds is None else time.monotonic() + seconds
+        left = seconds
         while not self.connection.poll(ANSWER_LOOK_SECONDS):
             if self.stopped.is_set():
                 raise StageLost("the stage process was stopped", self)
-            if ends is not None and time.monotonic() > ends:
-                return False
+            if left is not None:
+                left -= ANSWER_LOOK_SECONDS
+                if left <= 0:
+                    return False
         return True
 
     def _exchange(self, operation: str, payload: bytes, meta: dict[str, Any], seconds: float | None) -> Reply:
         if self.stopped.is_set():
             raise StageLost("the stage process was stopped", self)
         try:
-            self.connection.send_bytes(json.dumps({"op": operation, **meta}).encode())
+            self._send(json.dumps({"op": operation, **meta}).encode())
             self._send(payload)
             if not self._answered(seconds):
                 self.stopped.set()
