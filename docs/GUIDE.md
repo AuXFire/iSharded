@@ -1341,7 +1341,7 @@ client = Anthropic(base_url="http://NODE:8209", api_key="KEY")
 reply = client.messages.create(model=MODEL, max_tokens=1024, messages=[{"role": "user", "content": "Say hello."}])
 ```
 
-Other tools usually read `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`. The key may come as `x-api-key` or as `Authorization: Bearer`. If both are sent, `Authorization` is the one used. `x-api-key` works on these routes and on `/v1/models`, and nowhere else. It is taken off every request on every path before anything else sees it, so it stays on the node you gave it to.
+Other tools usually read `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`. The key may come as `x-api-key` or as `Authorization: Bearer`. If both are sent, `Authorization` is the one used. `x-api-key` works on these routes and on `/v1/models`, and nowhere else. It is taken off every request on every path before anything else sees it, so it stays on the node you gave it to. `/v1/models` gives everything as one page, so `limit` and the paging ids do nothing there, and fields such as `max_tokens` are null.
 
 | Field | What happens to it |
 |---|---|

@@ -1277,6 +1277,38 @@ def test_the_real_anthropic_client(mesh, served):
     assert refused.value.body["error"]["type"] == "not_found_error"
 
 
+def test_the_real_anthropic_client_reads_how_a_reply_ended_and_what_it_reasoned(mesh, served):
+    anthropic = pytest.importorskip("anthropic")
+    client = anthropic.Anthropic(base_url=served, api_key="unused", max_retries=0)
+    mesh.use(QWEN3, "Hello END there")
+    reply = client.messages.create(model="scripted", max_tokens=64, messages=SAY["messages"], stop_sequences=["END"])
+    assert (reply.stop_reason, reply.stop_sequence, reply.content[0].text) == ("stop_sequence", "END", "Hello ")
+    mesh.use(QWEN3, THOUGHT)
+    reply = client.messages.create(model="scripted", max_tokens=64, messages=SAY["messages"])
+    assert [block.type for block in reply.content] == ["thinking", "text"] and reply.content[0].thinking == "Let me see." and reply.content[0].signature
+    mesh.use(QWEN3, THOUGHT)
+    with client.messages.stream(model="scripted", max_tokens=64, messages=SAY["messages"]) as stream:
+        final = stream.get_final_message()
+    assert final.content[0].thinking == "Let me see." and final.content[0].signature and final.content[1].text == "Hello there"
+    mesh.use(QWEN3, "Sure")
+    history = [*SAY["messages"], {"role": "assistant", "content": [block.model_dump() for block in reply.content]}, {"role": "user", "content": "more"}]
+    assert client.messages.create(model="scripted", max_tokens=64, messages=history).content[0].text == "Sure"
+
+
+def test_the_real_anthropic_client_lists_models(keyed, served):
+    anthropic = pytest.importorskip("anthropic")
+    client = anthropic.Anthropic(base_url=served, api_key=keyed.key, max_retries=0)
+    assert [model.id for model in client.models.list()] == ["scripted"]
+    assert client.models.retrieve("scripted").display_name == "scripted"
+
+
+def test_the_real_ollama_client_reads_reasoning_and_takes_seed_minus_one(mesh, served):
+    ollama_library = pytest.importorskip("ollama")
+    mesh.use(QWEN3, THOUGHT)
+    reply = ollama_library.Client(host=served).chat(model="scripted", messages=SAY["messages"], options={"seed": -1})
+    assert reply.message.thinking == "Let me see." and reply.message.content == "Hello there"
+
+
 def test_the_real_anthropic_client_sends_its_key_as_x_api_key(keyed, served):
     anthropic = pytest.importorskip("anthropic")
     assert anthropic.Anthropic(base_url=served, api_key=keyed.key, max_retries=0).messages.create(model="scripted", max_tokens=64, messages=SAY["messages"]).content

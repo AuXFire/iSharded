@@ -485,6 +485,38 @@ def test_a_report_says_what_ran():
     assert "probe 3.25 ms" in shown["Stages"] and "bfloat16" in shown["Stages"]
 
 
+def test_status_gives_what_a_report_needs(monkeypatch):
+    from types import SimpleNamespace
+
+    from isharded import orchestrator
+    from isharded.models import GgufAdapter
+    from isharded.protocol import StageAssignment
+
+    monkeypatch.setattr(orchestrator, "source_commit", lambda: "0123456789ab")
+    assert orchestrator.Orchestrator().status()["commit"] == "0123456789ab"
+    adapter = object.__new__(GgufAdapter)
+    adapter.header = {"general.file_type": 15}
+    adapter.config, adapter.num_layers = {"model_type": "qwen3"}, 2
+    target = SimpleNamespace(
+        model_id="m", adapter=adapter, slots=4, draft=None, embedding=False, projector=None, units={}, held={},
+        profile=SimpleNamespace(total_bytes=1, ring=False, context_tokens=8192),
+    )  # fmt: skip
+    route = [StageAssignment(worker_id="w", url="http://worker", start_layer=0, end_layer=2)]
+    plan = orchestrator.describe_plan(target, route)
+    assert (plan["slots"], plan["quantization"], plan["context_tokens"]) == (4, "Q4_K_M", 8192)
+
+
+def test_a_checkout_knows_its_commit_and_an_install_does_not(monkeypatch, tmp_path):
+    import isharded
+
+    isharded.source_commit.cache_clear()
+    assert isharded.source_commit() is None or len(isharded.source_commit()) == 12
+    monkeypatch.setattr(isharded, "__file__", str(tmp_path / "isharded" / "__init__.py"))
+    isharded.source_commit.cache_clear()
+    assert isharded.source_commit() is None
+    isharded.source_commit.cache_clear()
+
+
 def test_the_quantization_a_node_reports_outranks_the_file_name():
     node = FakeNode()
     node.statuses[1]["active_plan"]["quantization"] = "Q6_K"
