@@ -28,11 +28,18 @@ STOP_WORDS = frozenset(
 )
 MAX_SEARCH_WORDS = 32
 JSON_ATTEMPTS = 64  # bounded, so a reply of nested braces costs little
-MACHINE_ACTORS = ("skill:", "peer:", "task:", "model")  # none of these may commit, push, or promote
+PEER_PREFIX = "peer:"
+SKILL_PREFIX = "skill:"
+# Actors that act for a person but are not one. None of these may grant, decide, commit, push, promote, or reject.
+MACHINE_ACTORS = (PEER_PREFIX, SKILL_PREFIX, "task:", "model", "plugin:", "conversation")
 
 
 def actor(user: str) -> str:
     return f"user:{user}"
+
+
+def is_person(name: str) -> bool:
+    return bool(name) and not name.startswith(MACHINE_ACTORS)
 
 
 def owner_of(assistant: Any) -> str:

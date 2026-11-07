@@ -32,6 +32,7 @@ import time
 from typing import Any
 
 from .contracts import CallContext, ModelRequest, Reach, ToolCall, Trust
+from .mind import is_person
 from .schema import errors as schema_errors
 
 DEFAULT_USER = "owner"
@@ -52,7 +53,6 @@ MAX_BACKOFF = 3600.0
 DEFAULT_WORKERS = 8
 DEFAULT_ESCALATION = ("planning",)
 GATE_CAPABILITY = "task.approval"
-NOT_A_PERSON = ("peer:", "skill:", "task:", "model:", "plugin:", "conversation")  # the broker's list; importing it would make tasks need the broker part
 
 TASK_ENDED = ("done", "partial", "failed", "cancelled", "missed")
 STEP_ENDED = ("done", "failed", "skipped", "cancelled")
@@ -847,10 +847,6 @@ def process_alive(pid: int, started: float) -> bool:
         return abs(process.create_time() - started) < 1.0 and process.status() != psutil.STATUS_ZOMBIE
     except psutil.Error:
         return False
-
-
-def is_person(name: str) -> bool:
-    return bool(name) and not name.startswith(NOT_A_PERSON)
 
 
 def ladder(spec: Mapping[str, Any]) -> list[str]:

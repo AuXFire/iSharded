@@ -380,13 +380,16 @@ def test_a_change_after_the_tests_passed_cannot_be_committed(assistant, repo):
     assert assistant.broker.calls == []
 
 
-@pytest.mark.parametrize("actor", ["skill:sk_1", "peer:abc", "task:9", "model"])
-def test_only_the_owner_can_approve_or_push(assistant, repo, actor):
+@pytest.mark.parametrize("actor", ["skill:sk_1", "peer:abc", "task:9", "model", "model:x", "plugin:weather", "conversation"])
+def test_only_the_owner_can_approve_push_or_reject(assistant, repo, actor):
     run = assistant.coder.start(repo, "Fix add")
     with pytest.raises(CoderError, match="Only the owner"):
         assistant.coder.approve(run.id, by=actor)
     with pytest.raises(CoderError, match="Only the owner"):
         assistant.coder.push(run.id, by=actor)
+    with pytest.raises(CoderError, match="Only the owner"):
+        assistant.coder.reject(run.id, by=actor)
+    assert assistant.coder.run(run.id).state == run.state and run.tree.exists()
 
 
 def test_the_coder_gives_models_no_way_to_approve(assistant):

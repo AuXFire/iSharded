@@ -34,7 +34,7 @@ from .contracts import (
     ToolCall,
     Verdict,
 )
-from .mind import MACHINE_ACTORS, first_json_object, owner_of, printing
+from .mind import first_json_object, is_person, owner_of, printing
 
 CREATED, INSPECTING, PROPOSING, APPLYING, TESTING, REVIEWING = "created", "inspecting", "proposing", "applying", "testing", "reviewing"
 READY, COMMITTED, PUSHED, STOPPED, REJECTED = "ready", "committed", "pushed", "stopped", "rejected"
@@ -807,7 +807,7 @@ Nothing here changes stored data unless the diff says so, so read it for new mig
 
     def _acting_person(self, by: str | None, action: str) -> str:
         by = by or self.owner
-        if by.startswith(MACHINE_ACTORS):
+        if not is_person(by):
             raise CoderError(f"{by} cannot {action}. Only the owner can.")
         return by
 
@@ -898,6 +898,7 @@ Nothing here changes stored data unless the diff says so, so read it for new mig
 
     def reject(self, run_id: str, reason: str = "", by: str | None = None, user: str | None = None) -> Run:
         """Throw the work away. A branch already committed stays, as that was the owner's own decision."""
+        by = self._acting_person(by, "reject a change")
         run = self.run(run_id, user)
         if run.state == REJECTED:
             raise CoderError("This run was already rejected.")
@@ -909,7 +910,7 @@ Nothing here changes stored data unless the diff says so, so read it for new mig
             self._git(run.repo, "branch", "-D", run.branch, check=False)
         shutil.rmtree(run.folder, ignore_errors=True)
         self._save(run.id, state=REJECTED, problem=reason or "rejected by the owner", applied=b"", pending="")
-        self.audit.record(by or self.owner, "coder.rejected", run.branch, {"run": run.id, "reason": reason})
+        self.audit.record(by, "coder.rejected", run.branch, {"run": run.id, "reason": reason})
         return self.run(run.id)
 
 

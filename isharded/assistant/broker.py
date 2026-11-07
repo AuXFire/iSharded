@@ -36,15 +36,12 @@ from .contracts import (
     Trust,
     Verdict,
 )
+from .mind import is_person, PEER_PREFIX, SKILL_PREFIX
 from .schema import errors
 from .store import canonical
 
 ANY_SCOPE = "*"
 DEFAULT_USER = "owner"
-PEER_PREFIX = "peer:"
-SKILL_PREFIX = "skill:"
-# Actors that act for a person but are not one. None of these may grant or decide.
-NOT_A_PERSON = (PEER_PREFIX, SKILL_PREFIX, "task:", "model:", "plugin:", "conversation")
 PATH_FIELDS = {"path", "file", "dir", "directory", "folder", "cwd", "workdir", "root", "repo", "repository"}
 PATH_SUFFIXES = ("path", "dir", "file", "folder")
 URL_SUFFIXES = ("url", "uri")
@@ -90,10 +87,6 @@ SCHEMA = [
 
 def argument_hash(arguments: Any) -> str:
     return hashlib.sha256(canonical(arguments).encode("utf-8", "surrogatepass")).hexdigest()
-
-
-def is_person(name: str) -> bool:
-    return bool(name) and not name.startswith(NOT_A_PERSON)
 
 
 def redacted(arguments: dict[str, Any]) -> dict[str, Any]:

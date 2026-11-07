@@ -30,8 +30,9 @@ from typing import Any
 
 from isharded.mcp_client import START_SECONDS, LineRpc, content_parts
 
-from .broker import DEFAULT_USER, is_person
+from .broker import DEFAULT_USER
 from .contracts import CallContext, Capability, Effect, Provenance, ToolResult, Trust
+from .mind import is_person
 from .sandbox import CappedReader, ProcessTree, run_tree, scrubbed_env
 from .store import canonical
 
