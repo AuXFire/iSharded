@@ -380,7 +380,7 @@ def test_a_full_queue_is_a_429(worker_client, monkeypatch):
 
 def test_the_chat_page_leaves_embedding_models_out_of_its_picker():
     text = (Path(orchestrator_module.__file__).parent / "chat.html").read_text(encoding="utf-8")
-    choice = text[text.index("function renderChoice"):text.index("function setPill")]
+    choice = text[text.index("function renderChoice"):text.index("function readJoins")]
     assert "status.kind !== 'embedding'" in choice and "lane.kind !== 'embedding'" in choice
 
 

@@ -346,10 +346,11 @@ def test_token_ids_stay_inside_the_embedding_table():
 
 def test_pages_escape_what_workers_report():
     pages = Path(orchestrator_module.__file__).parent
-    assert "${esc(TIER[kind] || kind)}" in (pages / "chat.html").read_text(encoding="utf-8")
+    # A pool kind no page knows is drawn as disk, so the chat page never shows one as written.
+    assert "return TIER_NAMES[kind] ? kind : 'disk';" in (pages / "ui.js").read_text(encoding="utf-8")
     dashboard = (pages / "dashboard.html").read_text(encoding="utf-8")
-    assert "${esc(TIERS[kind]?.[0]||kind)}" in dashboard
-    assert "Number(assignment.start_layer)" in dashboard
+    assert "${esc(TIERS[kind]?.[0] || kind)}" in dashboard
+    assert "start_layer: Number(assignment.start_layer)" in dashboard
 
 
 def test_a_page_on_a_dead_node_can_still_fail_over_but_a_revoked_one_cannot():

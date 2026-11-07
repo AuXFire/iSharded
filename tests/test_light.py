@@ -264,7 +264,7 @@ def test_the_refusal_reaches_whoever_asked():
 
     pool.plan = plan
     with pytest.raises(HTTPException) as refused:
-        Orchestrator.plan_or_refuse(pool, None)
+        Orchestrator.plan_or_refuse(pool, SimpleNamespace(draft=None))
     assert refused.value.status_code == 507
     assert refused.value.detail.startswith("no worker offers any memory for weights. light left out") and "isharded[torch]" in refused.value.detail
 

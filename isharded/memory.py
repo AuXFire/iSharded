@@ -316,11 +316,12 @@ def live_free_bytes(pool: MemoryPool, cache_dir: Path) -> int:
         return shutil.disk_usage(cache_dir).free
     if pool.kind == "ram" or pool.device == "mps":
         return ram().available
-    if pool.device.startswith("cuda:") and not has_torch():
+    if pool.device.startswith("cuda:") and has_torch() and torch.cuda.is_available():
+        return torch.cuda.mem_get_info(int(pool.device.split(":", 1)[1]))[0]
+    if pool.device.startswith("cuda:"):
+        # No torch, or one built without CUDA, as on a CPU-only install.
         _read_nvidia_free(int(time.monotonic() / NVIDIA_FREE_SECONDS))
         return NVIDIA_FREE.get(pool.device, pool.free_bytes)
-    if pool.device.startswith("cuda:"):
-        return torch.cuda.mem_get_info(int(pool.device.split(":", 1)[1]))[0]
     return pool.free_bytes
 
 
