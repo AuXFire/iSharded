@@ -11,6 +11,7 @@ each other the way nodes already do, so they add no new kind of trust.
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from .access import ROLE_MEMBER, node_of
+from .tls import BEHALF_HEADER, FORWARD_MARK
 
 LANE_PORT_STEP = 1000
 MAX_LANES = 7
@@ -32,6 +34,13 @@ LANE_ASK_ATTEMPTS = 10
 # A new process needs room for its own runtime before any weights arrive.
 LANE_GPU_OVERHEAD_GB = 0.5
 GIB = 1024**3
+
+
+def _refused(status: int, detail: str) -> Exception:
+    """An HTTP error. The supervisor imports this file, and it has no use for FastAPI."""
+    from fastapi import HTTPException
+
+    return HTTPException(status_code=status, detail=detail)
 
 
 def lane_port(port: int, slot: int) -> int:
@@ -163,8 +172,14 @@ class LaneDoor:
             write_lanes(self.path, clean_lanes(mesh.lanes), mesh.lanes_version)
             self.written = mesh.lanes_version
 
+    def _lanes(self) -> dict[str, dict[str, Any]]:
+        return clean_lanes(self.runtime.mesh.lanes)
+
+    async def _look_all(self) -> None:
+        await asyncio.gather(*(self._look(name) for name in self._lanes()))
+
     def _sibling(self, name: str) -> str | None:
-        lane = clean_lanes(self.runtime.mesh.lanes).get(name)
+        lane = self._lanes().get(name)
         return lane_url(self.runtime.mesh.url, lane["slot"]) if lane else None
 
     def _sending(self, caller: Any, path: str, target: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -172,8 +187,6 @@ class LaneDoor:
 
         The bytes are made here because the statement covers exactly those.
         """
-        from .tls import BEHALF_HEADER, FORWARD_MARK
-
         runtime = self.runtime
         content = b"" if payload is None else json.dumps(payload).encode()
         headers = {FORWARD_MARK: runtime.mesh.node_id, "content-type": "application/json"}
@@ -215,10 +228,8 @@ class LaneDoor:
         if url is None or self.runtime.access.authority is None:
             return
         document = self.runtime.access.document()
-        try:
+        with suppress(httpx.HTTPError):
             await self.runtime.client.post(url + "/internal/lane/access", json=document, headers=self._node_headers(), timeout=5.0)
-        except httpx.HTTPError:
-            pass
 
     def _behind(self, name: str) -> bool:
         """A new lane starts with an empty list, and cannot check anyone until it has one."""
@@ -235,7 +246,7 @@ class LaneDoor:
             await asyncio.sleep(LANE_REFRESH_SECONDS)
             try:
                 self.sync()
-                names = list(clean_lanes(self.runtime.mesh.lanes))
+                names = list(self._lanes())
                 for gone in set(self.seen) - set(names):
                     self.seen.pop(gone, None)
                 await asyncio.gather(*(self._look(name) for name in names))
@@ -258,12 +269,9 @@ class LaneDoor:
         """The lane for a request. A lane may have just finished loading, and this view can be seconds old."""
         lane = self.serving(model)
         if lane is None and model and self.active and model != self.runtime.model_id:
-            await asyncio.gather(*(self._look(name) for name in clean_lanes(self.runtime.mesh.lanes)))
+            await self._look_all()
             lane = self.serving(model)
         return lane
-
-    def models(self) -> list[str]:
-        return sorted({str(info["model"]) for info in self.seen.values() if info.get("ready") and info.get("model")})
 
     def model_kinds(self) -> dict[str, dict[str, Any]]:
         """What each running lane's model is for, as /v1/models reports it."""
@@ -278,14 +286,11 @@ class LaneDoor:
         info = self.seen.get(name, {})
         target = self._sibling(name) if info.get("ready") else info.get("leader_url")
         if not target:
-            from fastapi import HTTPException
-
-            raise HTTPException(status_code=503, detail=f"lane {name} has no coordinator yet; try again in a few seconds")
+            raise _refused(503, f"lane {name} has no coordinator yet; try again in a few seconds")
         return str(target).rstrip("/"), f"{self.runtime.mesh.node_id if info.get('ready') else info.get('leader')}/{name}"
 
     async def forward(self, name: str, path: str, payload: dict[str, Any], caller: Any) -> Any:
         """Relay a reply, streamed or not, exactly as the lane sends it."""
-        from fastapi import HTTPException
         from starlette.background import BackgroundTask
         from starlette.responses import StreamingResponse
 
@@ -295,7 +300,7 @@ class LaneDoor:
         try:
             response = await client.send(request, stream=True)
         except httpx.HTTPError as exc:
-            raise HTTPException(status_code=503, detail=f"lane {name} did not answer: {exc}") from exc
+            raise _refused(503, f"lane {name} did not answer: {exc}") from exc
         return StreamingResponse(
             response.aiter_raw(),
             status_code=response.status_code,
@@ -317,7 +322,7 @@ class LaneDoor:
         """One whole reply from a lane, waiting out a change of coordinator."""
         from fastapi import HTTPException
 
-        for attempt in range(LANE_ASK_ATTEMPTS):
+        for _ in range(LANE_ASK_ATTEMPTS):
             try:
                 url, target = self._target(name)
                 path = "/v1/chat/completions"
@@ -341,25 +346,23 @@ class LaneDoor:
         return held
 
     def create(self, name: str, gpu_gb: float | None, ram_gb: float | None, by: str = "", apart: bool = False) -> None:
-        from fastapi import HTTPException
-
         if not self.active:
-            raise HTTPException(status_code=409, detail="this node does not run lanes; start it with isharded node")
+            raise _refused(409, "this node does not run lanes; start it with isharded node")
         if not LANE_NAME.fullmatch(name):
-            raise HTTPException(status_code=422, detail="a lane name is lowercase letters, digits, and hyphens")
+            raise _refused(422, "a lane name is lowercase letters, digits, and hyphens")
         mesh = self.runtime.mesh
-        lanes = clean_lanes(mesh.lanes)
+        lanes = self._lanes()
         if name in lanes:
             return
         slot = next((slot for slot in range(1, MAX_LANES + 1) if slot not in {lane["slot"] for lane in lanes.values()}), None)
         if slot is None:
-            raise HTTPException(status_code=409, detail=f"this pool already runs {MAX_LANES} lanes")
+            raise _refused(409, f"this pool already runs {MAX_LANES} lanes")
         spare = spare_budgets(self.runtime.workers)
         if apart:
             spare = {node: left for node, left in spare.items() if node not in self.nodes_in_use()}
         budgets = lane_budgets(spare, self.settled(lanes), gpu_gb, ram_gb)
         if not any(budget["gpu_gb"] or budget["ram_gb"] for budget in budgets.values()):
-            raise HTTPException(status_code=409, detail="no node has memory left under the limits its owner set")
+            raise _refused(409, "no node has memory left under the limits its owner set")
         lanes[name] = {"slot": slot, "budgets": budgets, "by": by}
         mesh.publish_lanes(lanes)
         self.sync()
@@ -368,7 +371,7 @@ class LaneDoor:
     async def _start_load(self, name: str, payload: dict[str, Any], caller: Any) -> None:
         """Wait for the lane's workers to come up, then load in it."""
         loop = asyncio.get_running_loop()
-        lane = clean_lanes(self.runtime.mesh.lanes)[name]
+        lane = self._lanes()[name]
         expected = sum(1 for budget in lane["budgets"].values() if budget["gpu_gb"] or budget["ram_gb"])
         deadline = loop.time() + LANE_WORKERS_WAIT_SECONDS
         leader, steady = None, 0
@@ -395,7 +398,7 @@ class LaneDoor:
     async def load(self, body: Any, caller: Any) -> dict[str, Any]:
         name = body.lane
         if self.active:
-            await asyncio.gather(*(self._look(known) for known in clean_lanes(self.runtime.mesh.lanes)))
+            await self._look_all()
         self.create(name, body.lane_gpu_gb, body.lane_ram_gb, proposer(caller, self.runtime.mesh.node_id), body.lane_apart)
         self.problems.pop(name, None)
         payload = body.model_dump(exclude_none=True, exclude={"lane", "lane_gpu_gb", "lane_ram_gb", "lane_apart"})
@@ -412,14 +415,12 @@ class LaneDoor:
         return {"status": "started", "lane": name}
 
     def remove(self, name: str, caller: Any) -> None:
-        from fastapi import HTTPException
-
         mesh = self.runtime.mesh
-        lanes = clean_lanes(mesh.lanes) if self.active else {}
+        lanes = self._lanes() if self.active else {}
         if name not in lanes:
-            raise HTTPException(status_code=404, detail=f"no lane named {name}")
+            raise _refused(404, f"no lane named {name}")
         if caller.role == ROLE_MEMBER and lanes[name]["by"] != proposer(caller, mesh.node_id):
-            raise HTTPException(status_code=403, detail="only the node that proposed a lane can remove it")
+            raise _refused(403, "only the node that proposed a lane can remove it")
         del lanes[name]
         mesh.publish_lanes(lanes)
         self.sync()
@@ -442,7 +443,7 @@ class LaneDoor:
         if not self.active:
             return []
         rows = []
-        for name, lane in sorted(clean_lanes(self.runtime.mesh.lanes).items()):
+        for name, lane in sorted(self._lanes().items()):
             info = self.seen.get(name, {})
             rows.append(
                 {
