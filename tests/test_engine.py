@@ -280,7 +280,9 @@ def test_a_ring_opens_every_stage_before_any_dials_and_the_last_dials_the_entry(
         return httpx.Response(200, json={})
 
     orchestrator = pool(handler)
+    orchestrator.ring_closing_down = 1.0  # an open ring starts its closing link's clock again
     run_ring(orchestrator)
+    assert orchestrator.ring_closing_down is None
     opens = [call for call in calls if call[1].endswith("/open")]
     connects = {call[0]: call[2] for call in calls if call[1].endswith("/connect")}
     assert [call[0] for call in calls[:3]] == ["a", "b", "c"]

@@ -367,7 +367,9 @@ class EngineClient:
         self.next_id += 1
         future: asyncio.Future[list[int]] = asyncio.get_running_loop().create_future()
         slot = fields["slot"]
-        generation = self.generations.setdefault(slot, secrets.randbits(64) | 1)  # zero means every pass
+        generation = self.generations.get(slot)
+        if generation is None:
+            generation = self.generations[slot] = secrets.randbits(64) or 1  # zero means every pass
         self.waiting[identity] = Flight(future, slot, generation, time.perf_counter())
         self.newest[slot] = future
         future.add_done_callback(lambda done: self._landed(identity, done))

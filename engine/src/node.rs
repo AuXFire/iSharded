@@ -886,14 +886,13 @@ fn peer_lost(inner: &Arc<Inner>, ring: &Arc<Ring>, peer: &Arc<Peer>, why: &str, 
     let door = ring.next_door.lock().clone().filter(|_| silent && peer.proven.load(Ordering::Acquire) && !ring.is_shut());
     ring.next_dialling.store(door.is_some(), Ordering::Release);
     ring.next.lock().take();
-    if let Some(door) = door {
-        let (dialling, ring, stage, reason) = (inner.clone(), ring.clone(), peer.stage, why.to_string());
-        let (inner_copy, ring_copy) = (inner.clone(), ring.clone());
-        if spawn("isharded-redial", move || redial_next(&dialling, &ring, &door, stage, &reason)).is_err() {
-            give_up_on_next(&inner_copy, &ring_copy, stage, why);
-        }
-    } else {
+    let Some(door) = door else {
         give_up_on_next(inner, ring, peer.stage, why);
+        return;
+    };
+    let (dialling, place, stage, reason) = (inner.clone(), ring.clone(), peer.stage, why.to_string());
+    if spawn("isharded-redial", move || redial_next(&dialling, &place, &door, stage, &reason)).is_err() {
+        give_up_on_next(inner, ring, stage, why);
     }
 }
 
