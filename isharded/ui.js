@@ -232,8 +232,12 @@ const UI = (() => {
       stages.forEach((stage, index) => { if ((time[index].t1 - time[index].t0) / 100 * width >= 15) blocks[index].block.textContent = stage.n; });
       const placed = [];
       for (const { stage, note } of notes) {
-        const index = stage.n - 1, mid = ((x[index].x0 + x[index].x1) / 2 + (time[index].t0 + time[index].t1) / 2) / 2 / 100 * width, half = note.offsetWidth / 2;
-        const at = Math.max(half, Math.min(mid, width - half));
+        // The note stays inside its band, and a band too narrow to hold it leaves the figure to the readout.
+        const index = stage.n - 1, mid = ((x[index].x0 + x[index].x1) / 2 + (time[index].t0 + time[index].t1) / 2) / 2 / 100 * width;
+        const room = ((x[index].x1 - x[index].x0) + (time[index].t1 - time[index].t0)) / 2 / 100 * width - 12;
+        if (room < 84) { note.remove(); continue; }
+        if (note.offsetWidth > room) note.style.width = `${room}px`;
+        const half = note.offsetWidth / 2, at = Math.max(half, Math.min(mid, width - half));
         if (placed.some(other => Math.abs(other - at) < half * 2 + 12)) { note.remove(); continue; }
         placed.push(at);
         note.style.left = `${at}px`;

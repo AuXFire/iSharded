@@ -944,7 +944,7 @@
       finally { button.disabled = false; }
     }
     function askRebalance() {
-      const held = Object.values(state.data?.workers || {}).filter(worker => worker.quarantined).length;
+      const held = Object.values(state.data?.workers || {}).filter(worker => worker.quarantined && worker.live).length;
       if (held) confirmSheet({ title: 'Rebalance', text: `Rebalance gives ${count(held, 'quarantined machine')} another chance. ${held === 1 ? 'It' : 'They'} may fail again.`, yes: 'Rebalance', no: 'Keep them out', run: rebalance });
       else rebalance().catch(error => toast(error.message));
     }
@@ -958,7 +958,7 @@
       } catch (error) {
         if (error.status !== 409) throw error;
         const costly = /use force/.test(error.message);
-        confirmSheet({ title: `Cordon ${node}`, text: error.message, yes: 'Cordon anyway', no: 'Keep it in', run: costly ? () => cordon(node, true) : null });
+        confirmSheet({ title: `Cordon ${node}`, text: error.message[0].toUpperCase() + error.message.slice(1), yes: 'Cordon anyway', no: 'Keep it in', run: costly ? () => cordon(node, true) : null });
         return false;
       }
     }
@@ -1044,7 +1044,8 @@
       state.polling = true;
       $('signOut').hidden = !state.token;
       try {
-        const data = await api('/admin/status', { timeout: 8000 });
+        // The coordinator probes every worker first, and a dead one can hold the answer for seconds.
+        const data = await api('/admin/status', { timeout: 15000 });
         state.failures = 0; state.signedOut = false; state.problem = ''; state.updatedAt = Date.now();
         if ($('auth').open) $('auth').close();
         render(data);

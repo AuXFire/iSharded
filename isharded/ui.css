@@ -304,7 +304,7 @@ b { font-weight: 600; }
 .m-fan polygon.warn { fill: var(--warn-soft); }
 .m-fan polygon.bad { fill: var(--bad-soft); }
 .m-fan polygon.on { stroke: var(--ink-2); }
-.band-note { position: absolute; top: 50%; padding: 0 var(--s-1); color: var(--ink-2); font: 400 var(--t-sm)/16px var(--font-narrow); white-space: nowrap; transform: translate(-50%, -50%); pointer-events: none; }
+.band-note { position: absolute; top: 50%; width: max-content; color: var(--ink-2); font: 400 var(--t-sm)/16px var(--font-narrow); text-align: center; transform: translate(-50%, -50%); pointer-events: none; }
 .m-name { position: absolute; bottom: 3px; color: var(--ink-2); font: 400 var(--t-sm)/16px var(--font-narrow); white-space: nowrap; }
 .m-name b { display: block; color: var(--ink); }
 .m-name.end { text-align: right; }
@@ -455,8 +455,8 @@ b { font-weight: 600; }
 .mini th { padding: 0 var(--s-2) 2px 0; color: var(--ink-2); font: 400 var(--t-sm)/16px var(--font-narrow); text-align: left; }
 .mini td { padding: 2px var(--s-2) 2px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .mini th:last-child, .mini td:last-child { padding-right: 0; text-align: right; }
-.mini .mini-name { width: 46%; }
-.mini .mini-rtt { width: 26%; }
+.mini .mini-name { width: 44%; }
+.mini .mini-rtt { width: 23%; }
 .mini td .glyph { margin-right: 6px; }
 .mini tr.warn td, .mini tr.warn .name-link { color: var(--warn); font-weight: 600; }
 .mini tr.bad td, .mini tr.bad .name-link { color: var(--bad); font-weight: 600; }
