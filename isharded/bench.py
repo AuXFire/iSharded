@@ -591,7 +591,7 @@ def method(report: dict[str, Any]) -> list[str]:
     return [
         f"Measured {report.get('asked_from', 'from an unknown place')} at {report['at']}, as any client would feel it: streamed replies from /v1/chat/completions, timed where they arrive.",
         "First token is the time from sending a request to its first text. Tokens/s per reply leaves that out: tokens after the first, over the time from the first text to the last. Total tokens/s is every token of a round, over the whole of that round.",
-        f"Each case ran {rounds}, after {options['warmup']} replies thrown away for each prompt size. Every prompt starts differently, so none is read from the cache unless the table says cached.",
+        f"Each case ran {rounds}. Replies thrown away first, for each prompt size: {options['warmup']}. Every prompt starts differently, so none is read from the cache unless the table says cached.",
         "A link is the direct link's own round trip to the next stage, where one was up. A probe is the same trip over HTTP, measured when the route was planned. Each number is the median, with the lowest and highest in brackets.",
     ]
 
@@ -673,7 +673,7 @@ def compare_reports(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
         rows.append({"prompt_tokens": key[0], "parallel": key[1], **changes})
     notes = [f"Prompts of {size} tokens, {parallel} at once, ran in only one of these." for size, parallel in sorted(old_levels.keys() ^ new_levels.keys())]
     if any(item["old"] != item["new"] for item in setup):
-        notes.insert(0, "These runs differ in what ran, so a change below may come from that and not from the code.")
+        notes.insert(0, "These runs differ in what ran, so a change here may come from that and not from the code.")
     return {
         "format": REPORT_FORMAT,
         "old": {"at": old["at"], "commit": old.get("commit"), "version": old["version"]},
