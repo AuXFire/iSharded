@@ -116,6 +116,11 @@ ACTIVATE_RETRY_SECONDS = 5.0
 # How long a measured link is believed, how many tries make one measurement, and the
 # most a load waits for measuring.
 RING_RETRY_SECONDS = 30.0
+# How long a closing link may stay down before the ring is reopened, and the longest that
+# wait grows to. It doubles because on some routes that link can never exist, and reopening
+# costs running replies a replay.
+RING_CLOSING_SECONDS = 30.0
+RING_CLOSING_MOST_SECONDS = 1800.0
 RING_CALL_SECONDS = 30.0
 LINK_TTL_SECONDS = 600.0
 LINK_PROBE_ROUNDS = 5
@@ -542,6 +547,8 @@ class Orchestrator:
         self.ring_tried: int | None = None
         self.no_engine_told: int | None = None
         self.ring_tried_at = 0.0
+        self.ring_closing_down: float | None = None
+        self.ring_closing_wait = RING_CLOSING_SECONDS
         self.links: dict[tuple[str, str], float] = {}  # round trip in ms, from one worker to another
         self.links_checked: dict[tuple[str, str], float] = {}
         self.link_readings: dict[tuple[str, str], dict[str, Any]] = {}  # what /admin/status publishes
@@ -1272,6 +1279,22 @@ class Orchestrator:
             ring_broke = ring and (ring.get("epoch") != self.epoch or (index < last and not ring.get("next_up")))
             if ring_broke or (index == 0 and telemetry.get("ring_live") is False):
                 self.ring_epoch = None
+            elif index == last and index > 0 and ring:
+                self._check_closing(bool(ring.get("closing_up")))
+
+    def _check_closing(self, closing_up: bool) -> None:
+        """The last stage redials its closing link. A ring it stays lost on is slow, so reopen it."""
+        now = time.monotonic()
+        if closing_up:
+            self.ring_closing_down = None
+            self.ring_closing_wait = RING_CLOSING_SECONDS
+        elif self.ring_closing_down is None:
+            self.ring_closing_down = now
+        elif now - self.ring_closing_down > self.ring_closing_wait:
+            self.add_event("mesh", "Closing link down", f"Answers have walked back for {self.ring_closing_wait:.0f} s, so the direct links are reopening")
+            self.ring_epoch = None
+            self.ring_closing_down = None
+            self.ring_closing_wait = min(self.ring_closing_wait * 2, RING_CLOSING_MOST_SECONDS)
 
     async def _start_ring(self) -> None:
         """Open direct links along the route, for the passes every token makes.
@@ -1322,6 +1345,7 @@ class Orchestrator:
             return
         if self.epoch == epoch:
             self.ring_epoch = epoch
+            self.ring_closing_down = None
             self.add_event("mesh", "Direct links up", f"Tokens now cross {len(route)} stages on the native path")
 
     async def measure_links(self, row: int = 0) -> None:

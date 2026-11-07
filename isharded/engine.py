@@ -22,6 +22,7 @@ import secrets
 import socket
 import struct
 import sys
+import time
 from typing import Any
 
 import numpy as np
@@ -267,6 +268,7 @@ class Flight:
     future: asyncio.Future[list[int]]
     slot: int
     generation: int
+    sent: float
 
 
 class EngineClient:
@@ -280,6 +282,8 @@ class EngineClient:
         self.newest: dict[int, asyncio.Future[list[int]]] = {}
         # The reply on each slot. A slot that has settled has none, so its next pass starts one.
         self.generations: dict[int, int] = {}
+        # What a pass has been taking, there and back, or None until one has come back.
+        self.round_trip: float | None = None
         self.next_id = 1
         self.alive = True
         self.task: asyncio.Task[None] | None = None
@@ -351,6 +355,8 @@ class EngineClient:
         if flight is None or flight.generation != generation or flight.future.done():
             return None
         del self.waiting[identity]
+        took = time.perf_counter() - flight.sent
+        self.round_trip = took if self.round_trip is None else (self.round_trip * 7 + took) / 8
         return flight
 
     def send(self, **fields: Any) -> asyncio.Future[list[int]]:
@@ -362,7 +368,7 @@ class EngineClient:
         future: asyncio.Future[list[int]] = asyncio.get_running_loop().create_future()
         slot = fields["slot"]
         generation = self.generations.setdefault(slot, secrets.randbits(64) | 1)  # zero means every pass
-        self.waiting[identity] = Flight(future, slot, generation)
+        self.waiting[identity] = Flight(future, slot, generation, time.perf_counter())
         self.newest[slot] = future
         future.add_done_callback(lambda done: self._landed(identity, done))
         self.writer.write(pass_frame(identity, generation, **fields))

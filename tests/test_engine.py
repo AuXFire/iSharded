@@ -17,6 +17,7 @@ import pytest
 
 from isharded import engine as native
 from isharded import llama_host
+from isharded import orchestrator as orchestrator_module
 from isharded import worker as worker_module
 from isharded.engine import EngineClient, EngineRefusal, find_library, library_name, pass_frame
 from isharded.gguf_stage import DRAFT_TRIAL_TOKENS, GUESSED, PIPELINED, PLAIN, DraftChoice
@@ -375,9 +376,6 @@ def test_a_ring_that_lost_a_link_is_noticed(entry, middle, stays) -> None:
 HEARD: dict[int, int] = {}  # each pass id's generation, as the door last heard it
 
 
-HEARD: dict[int, int] = {}  # each pass id's generation, as the door last heard it
-
-
 def closing_pool(closing_up: bool | None) -> Orchestrator:
     orchestrator = pool(lambda item: httpx.Response(200, json={}), ("a", "b"))
     orchestrator.ring_epoch = 4
@@ -573,6 +571,51 @@ def test_a_slot_that_will_not_settle_drops_what_is_left_and_starts_again() -> No
 
     assert asyncio.run(with_door(answers, use)) == (False, [2], True, {})
     assert HEARD[1] != HEARD[2]
+
+
+def test_a_round_trip_is_measured_once_something_comes_back() -> None:
+    async def use(client):
+        before = client.round_trip
+        await client.run(5, **FIELDS)
+        return before, client.round_trip
+
+    before, after = asyncio.run(with_door(lambda identity: answer(identity, [1]), use))
+    assert before is None and 0 < after < 5
+
+
+@pytest.mark.parametrize(
+    ("round_trip", "seconds"),
+    [
+        (None, worker_module.pass_seconds(1, 2)),
+        (0.01, worker_module.RING_ANSWER_FLOOR_SECONDS),
+        (4.0, worker_module.RING_ACK_MS / 1000 + 8.0),
+    ],
+)
+def test_an_answer_is_waited_for_by_what_the_ring_measured(monkeypatch, round_trip, seconds) -> None:
+    waits = []
+
+    async def wait_for(answer, timeout):
+        waits.append(timeout)
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(worker_module.asyncio, "wait_for", wait_for)
+    item = runtime(ring_client=SimpleNamespace(alive=True, round_trip=round_trip))
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(item.ring_answer(None))
+    assert caught.value.detail["retry"] and not item.ring_live
+    assert waits == [pytest.approx(seconds)]
+
+
+def test_a_ring_that_has_left_still_waits_the_old_way(monkeypatch) -> None:
+    waits = []
+
+    async def wait_for(answer, timeout):
+        waits.append(timeout)
+        return [7]
+
+    monkeypatch.setattr(worker_module.asyncio, "wait_for", wait_for)
+    assert asyncio.run(runtime(ring_client=None).ring_answer(None)) == 7
+    assert waits == [worker_module.pass_seconds(1, 2)]
 
 
 def test_a_refused_pass_raises_and_the_link_stays_up() -> None:
