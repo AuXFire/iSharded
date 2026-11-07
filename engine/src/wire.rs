@@ -18,7 +18,9 @@ pub const MAX_MESSAGE_BYTES: usize = 1024;
 pub const FLAG_VERIFY: u8 = 1;
 pub const FLAG_TOKENS: u8 = 2;
 pub const FLAG_BF16: u8 = 4;
-const KNOWN_FLAGS: u8 = FLAG_VERIFY | FLAG_TOKENS | FLAG_BF16;
+/// Keep state after this pass, so a later rewind can reach it.
+pub const FLAG_KEEP: u8 = 8;
+const KNOWN_FLAGS: u8 = FLAG_VERIFY | FLAG_TOKENS | FLAG_BF16 | FLAG_KEEP;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -216,6 +218,10 @@ impl Pass {
 
     pub fn is_bf16(&self) -> bool {
         self.flags & FLAG_BF16 != 0
+    }
+
+    pub fn keeps_state(&self) -> bool {
+        self.flags & FLAG_KEEP != 0
     }
 
     /// How many rows run through a stage, however they arrived.
@@ -520,6 +526,16 @@ mod tests {
     fn a_token_pass_survives_the_wire() {
         let original = Pass { flags: FLAG_TOKENS, tokens: vec![5, 6], rows: 0, width: 0, data: vec![], rollback_to: None, ..pass() };
         assert_eq!(Pass::decode(body(&original.encode())).unwrap(), original);
+    }
+
+    #[test]
+    fn the_keep_flag_survives_the_wire_and_the_next_flag_is_still_refused() {
+        let original = Pass { flags: FLAG_VERIFY | FLAG_KEEP, ..pass() };
+        let decoded = Pass::decode(body(&original.encode())).unwrap();
+        assert!(decoded.keeps_state() && !pass().keeps_state());
+        assert_eq!(decoded, original);
+        let unknown = Pass { flags: 16, ..pass() }.encode();
+        assert_eq!(Pass::decode(body(&unknown)), Err(WireError::Invalid("unknown flags")));
     }
 
     #[test]

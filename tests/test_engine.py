@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import os
 from pathlib import Path
 import struct
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ import httpx
 import pytest
 
 from isharded import engine as native
+from isharded import llama_host
 from isharded import worker as worker_module
 from isharded.engine import EngineClient, EngineRefusal, find_library, library_name, pass_frame
 from isharded.gguf_stage import DRAFT_TRIAL_TOKENS, GUESSED, PIPELINED, PLAIN, DraftChoice
@@ -68,6 +70,99 @@ def test_no_rollback_and_no_seed_have_their_own_encoding() -> None:
     fields = struct.unpack_from("<QQIIIBffIBQ", frame, 8)
     assert fields[4] == native.NO_ROLLBACK
     assert fields[9:] == (0, 0)
+
+
+def test_only_a_pass_that_asks_carries_the_keep_flag() -> None:
+    arguments = (1, 1, 0, 0, None, [1], [], False, 0.0, 1.0, 0, None)
+    flags = lambda frame: struct.unpack_from("<QQIIIB", frame, 8)[5]  # noqa: E731
+    assert flags(pass_frame(*arguments)) == native.FLAG_TOKENS
+    assert flags(pass_frame(*arguments, keep=True)) == native.FLAG_TOKENS | native.FLAG_KEEP
+    assert len(pass_frame(*arguments, keep=True)) == len(pass_frame(*arguments))
+
+
+@pytest.mark.parametrize(("rewinds", "keep"), [(True, False), (False, True)])
+def test_only_a_model_that_cannot_rewind_pays_for_snapshots(rewinds, keep) -> None:
+    sent = {}
+
+    class Client:
+        alive = True
+
+        def send(self, **fields):
+            sent.update(fields)
+            return "answer"
+
+    item = runtime(ring_client=Client(), rewinds=rewinds, caches={"s": worker_module.CacheEntry(epoch=3, length=4)}, inference_calls=0, tokens_processed=0)
+    assert item.ring_send(request(), 7, 4, 4) == "answer"
+    assert sent["keep"] is keep
+    assert (sent["position"], sent["rollback_to"], sent["tokens"]) == (4, 4, [7])
+
+
+@pytest.mark.parametrize("rewinds", [True, False])
+def test_a_ring_of_two_stages_pipelines_with_or_without_rewinding(rewinds) -> None:
+    assert runtime(rewinds=rewinds).ring_pipelines(request())
+    assert not runtime(rewinds=rewinds, route=[SimpleNamespace(worker_id="a")]).ring_pipelines(request())
+    assert not runtime(rewinds=rewinds, ring_live=False).ring_pipelines(request())
+
+
+@pytest.mark.parametrize(
+    ("operation", "meta", "forgotten"),
+    [
+        ("clear", {"slot": 2}, [2]),
+        ("clear", {}, [None]),
+        ("restore", {"slot": 1, "key": "k"}, [1]),
+        ("truncate", {"slot": 3, "keep": 9}, [3]),
+        ("forward", {"slot": 1}, []),
+        ("save", {"slot": 1}, []),
+    ],
+)
+def test_a_stage_forgets_snapshots_only_when_a_slot_changes_history(monkeypatch, operation, meta, forgotten) -> None:
+    calls = []
+
+    class Engine:
+        def lock(self) -> None:
+            calls.append("lock")
+
+        def unlock(self) -> None:
+            calls.append("unlock")
+
+        def forget(self, slot) -> None:
+            calls.append(slot)
+
+    class Host:
+        engine = Engine()
+
+        def __getattr__(self, name):
+            return lambda meta, payload: ({}, b"")
+
+    class Connection:
+        def __init__(self) -> None:
+            self.incoming = [json.dumps({"op": operation, **meta}).encode(), b""]
+            self.sent = []
+
+        def recv_bytes(self) -> bytes:
+            if not self.incoming:
+                raise EOFError
+            return self.incoming.pop(0)
+
+        def send_bytes(self, data: bytes) -> None:
+            self.sent.append(data)
+
+    connection = Connection()
+    monkeypatch.setattr(llama_host, "Client", lambda address, authkey: connection)
+    monkeypatch.setattr(llama_host, "_Host", Host)
+    llama_host.run(None, b"")
+    assert json.loads(connection.sent[0])["ok"]
+    assert calls == ["lock", *forgotten, "unlock"]  # under the lock, so no pass can land between
+
+
+def test_forgetting_every_slot_reaches_the_library_as_a_negative_slot() -> None:
+    told = []
+    item = native.Engine.__new__(native.Engine)
+    item.handle = 5
+    item.lib = SimpleNamespace(isharded_engine_forget=lambda handle, slot: told.append((handle, slot)))
+    item.forget(None)
+    item.forget(3)
+    assert told == [(5, -1), (5, 3)]
 
 
 @pytest.mark.parametrize(
@@ -492,3 +587,103 @@ def test_a_steady_link_costs_less_than_a_jittery_one_of_the_same_median() -> Non
 
     assert link_cost({"median_ms": 40.0, "max_ms": 41.0}) < link_cost({"median_ms": 40.0, "max_ms": 120.0})
     assert link_cost({"median_ms": 40.0}) == 40.0
+
+
+BUILD = os.environ.get("ISHARDED_TEST_LLAMA_DIR", "")
+MODEL = os.environ.get("ISHARDED_TEST_GGUF", "")
+needs_real_stage = pytest.mark.skipif(not (BUILD and MODEL and find_library()), reason="needs a real model and the built engine")
+PROMPT = [151644, 872, 198, 9707, 1879, 11, 3838, 374, 279, 6722, 315, 9625, 30]
+
+
+def real_stage():
+    from isharded.gguf import read_file_header
+    from isharded.llama_host import StageHost
+
+    header = read_file_header(MODEL)
+    table = header.tensors["token_embd.weight"]
+    embed = {"path": MODEL, "offset": header.data_start + table.offset, "length": table.nbytes, "ggml_type": table.ggml_type}
+    host = StageHost()
+    host.call(
+        "load", folder=BUILD, extra_paths=[], path=MODEL, last=True, context_tokens=256, gpu_layers=0, threads=4,
+        table=embed, cpu_tensors=[], rollback_tokens=4, slots=2,
+    )  # fmt: skip
+    return host, bool(header.arch_key("ssm.state_size"))
+
+
+async def real_ring(host) -> EngineClient:
+    door = host.call("ring_open", host="127.0.0.1", port=0, epoch=1, index=0, count=1, key=bytes(32).hex(), ack_timeout_ms=30000, silence_timeout_ms=30000)[0]
+    host.call("ring_connect", links={"next": None, "entry": None, "timeout_ms": 5000})
+    while (state := host.call("ring_stats")[0].get("connect")) == "dialling":
+        await asyncio.sleep(0.02)
+    assert state == "up"
+    return await EngineClient.open(door["local_port"], bytes(door["local_key"]))
+
+
+def real_pass(client, tokens, position, rollback_to=None, keep=False, temperature=0.0, seed=None):
+    return client.send(
+        epoch=1, slot=0, position=position, rollback_to=rollback_to, tokens=tokens, guesses=[], verify=False,
+        temperature=temperature, top_p=1.0, top_k=0, seed=seed, keep=keep,
+    )  # fmt: skip
+
+
+@needs_real_stage
+@pytest.mark.parametrize(("temperature", "seed"), [(0.0, None), (0.8, 7)])
+def test_a_real_stage_undoes_finished_passes_and_gives_the_reply_it_would_have_given(temperature, seed) -> None:
+    sampling = {"temperature": temperature, "seed": seed}
+
+    async def reply(client, guessing: bool) -> list[int]:
+        token = (await real_pass(client, PROMPT, 0, keep=guessing, **sampling))[0]
+        made, position = [token], len(PROMPT)
+        for _ in range(8):
+            answer = real_pass(client, [token], position, position, keep=guessing, **sampling)
+            if guessing:
+                # Waited for, so these have really run and only a rewind can undo them.
+                await asyncio.gather(*(real_pass(client, [1000 + ahead], position + ahead, keep=True, **sampling) for ahead in (1, 2)))
+            token = (await answer)[0]
+            made.append(token)
+            position += 1
+        return made
+
+    async def both(host) -> tuple[list[int], list[int]]:
+        client = await real_ring(host)
+        try:
+            plain = await reply(client, False)
+            host.call("clear", slot=0)
+            return plain, await reply(client, True)
+        finally:
+            client.close()
+
+    host, _ = real_stage()
+    try:
+        plain, guessed = asyncio.run(both(host))
+    finally:
+        host.close()
+    assert guessed == plain
+
+
+@needs_real_stage
+def test_a_real_stage_never_goes_back_to_a_snapshot_from_before_a_clear() -> None:
+    async def run(host) -> None:
+        client = await real_ring(host)
+        try:
+            await real_pass(client, PROMPT, 0, keep=True)
+            await real_pass(client, [1], len(PROMPT), keep=True)
+            await real_pass(client, [2], len(PROMPT) + 1, keep=True)
+            host.call("clear", slot=0)
+            await real_pass(client, PROMPT[::-1], 0)
+            await real_pass(client, [3], len(PROMPT))
+            await real_pass(client, [4], len(PROMPT) + 1)
+            # Without the clear reaching the engine, this restores the old reply's state.
+            with pytest.raises(EngineRefusal) as caught:
+                await real_pass(client, [5], len(PROMPT) + 1, len(PROMPT) + 1)
+            assert caught.value.refusal == native.REFUSE_RETRY
+        finally:
+            client.close()
+
+    host, recurrent = real_stage()
+    try:
+        if not recurrent:
+            pytest.skip("attention rewinds by itself, so this model never needs a snapshot")
+        asyncio.run(run(host))
+    finally:
+        host.close()

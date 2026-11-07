@@ -15,16 +15,17 @@ pub mod wire;
 use std::ffi::{c_char, c_void, CStr};
 use std::sync::Arc;
 
-use llama::{Capture, LlamaCompute, StageApi, TensorApi};
+use llama::{Capture, LlamaCompute, Snapshots, StageApi, TensorApi};
 use node::{Links, Node, Plan};
 use serde::de::DeserializeOwned;
 
 /// Bumped when the functions below change, so a stale library is refused and not misused.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 /// One stage's engine, as Python holds it.
 pub struct Engine {
     capture: Arc<Capture>,
+    snapshots: Arc<Snapshots>,
     node: Node,
 }
 
@@ -73,7 +74,7 @@ pub unsafe extern "C" fn isharded_engine_new(target: *const c_char, tensors: *co
         return std::ptr::null_mut();
     };
     let capture = Arc::new(Capture::new(CStr::from_ptr(target).to_owned(), *tensors));
-    Box::into_raw(Box::new(Engine { capture, node }))
+    Box::into_raw(Box::new(Engine { capture, snapshots: Arc::default(), node }))
 }
 
 /// The eval callback, with the engine as its user data.
@@ -108,7 +109,17 @@ pub unsafe extern "C" fn isharded_engine_capture_read(engine: *mut Engine, out: 
 #[no_mangle]
 pub unsafe extern "C" fn isharded_engine_attach(engine: *mut Engine, api: *const StageApi) {
     let engine = &*engine;
-    engine.node.set_compute(Box::new(LlamaCompute::new(*api, engine.capture.clone())));
+    engine.node.set_compute(Box::new(LlamaCompute::new(*api, engine.capture.clone(), engine.snapshots.clone())));
+}
+
+/// Forgets what a rewind could go back to, because Python changed what a slot holds. A
+/// negative slot means all of them.
+///
+/// # Safety
+/// `engine` must come from `isharded_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn isharded_engine_forget(engine: *mut Engine, slot: i32) {
+    (*engine).snapshots.forget(slot);
 }
 
 /// # Safety
