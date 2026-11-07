@@ -89,7 +89,7 @@ from .gguf_stage import (
     next_guess_count,
     plan_prompt,
 )
-from .pipeline import Pipeline
+from .pipeline import Pipeline, RowClock
 from . import __version__
 from .llamacpp import PINNED_BUILD, LlamaError, StageLost, ensure_build, pick_build, rocm_library_paths, speculative_choice, step_draws, step_random
 from .pool import check_exposure, load_token
@@ -345,6 +345,7 @@ class WorkerRuntime:
         self.term = 0
         self.advertised_url = os.getenv("ISHARDED_ADVERTISE_URL", "http://127.0.0.1:8100").rstrip("/")
         self.draft_choice = DraftChoice()
+        self.row_clock = RowClock()
         self.ring_live = False
         self.ring_epoch: int | None = None
         self.ring_door: dict[str, Any] | None = None
@@ -1042,6 +1043,7 @@ class WorkerRuntime:
         self.term = request.term
         self.ring_stop()
         self.draft_choice = DraftChoice()  # a new route can change which way is faster
+        self.row_clock = RowClock()
         adapter = create_adapter(request.architecture)
         if not (0 <= request.assignment.start_layer < request.assignment.end_layer <= adapter.num_layers):
             raise ValueError("invalid layer interval")
@@ -2453,6 +2455,7 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
                         rewind=rewind_draft,
                         sharing=lambda: runtime.gate.size - len(runtime.gate.free),
                         told=draft.seen(request.slot),
+                        clock=runtime.row_clock,
                     )
                     runtime.pipes[request.slot] = pipe
                 made, misses = pipe.tokens_made, pipe.misses

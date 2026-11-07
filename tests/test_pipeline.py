@@ -12,7 +12,8 @@ from fastapi import HTTPException
 import pytest
 
 from isharded import worker as worker_module
-from isharded.pipeline import Pipeline
+from isharded import pipeline as pipeline_module
+from isharded.pipeline import Pipeline, RowClock
 from isharded.protocol import GenerateRequest, InferRequest, SavePoint
 from isharded.statestore import pass_ends, prompt_parts
 
@@ -177,20 +178,102 @@ def test_nothing_is_sent_past_a_guess_that_ends_the_reply() -> None:
     assert route.sent == 1
 
 
+def priced(replies: int, trip: float, row: float, limit: int = 16) -> Pipeline:
+    pipe = pipeline(Route([1]), Draft(1.0), [1, 2], 500, limit=limit, sharing=lambda: replies)
+    pipe.right = 0.99
+    pipe.trip, pipe.step = trip, row * replies
+    pipe.clock.row = row
+    return pipe
+
+
 def test_a_route_full_of_other_replies_gets_no_guesses() -> None:
+    # Six replies at one pass each already ask for all a route of these times can pass.
     async def run() -> tuple[Route, Draft]:
         prompt = [3, 4]
         history = [*prompt, model(prompt)]
         route, draft = Route(history[:-1]), Draft(1.0)
         pipe = pipeline(route, draft, history, 30, sharing=lambda: 6)
+        pipe.trip, pipe.clock.row = 0.006, 0.001
         async for _ in pipe.tokens(30):
-            pass
+            pipe.trip, pipe.clock.row = 0.006, 0.001
         await pipe.close()
         return route, draft
 
     route, draft = asyncio.run(run())
     assert route.most_out == 1
     assert draft.calls == 0
+
+
+def test_eight_replies_on_a_far_route_each_keep_more_than_one_pass_out() -> None:
+    assert priced(8, trip=0.250, row=0.010).depth() == 3
+
+
+@pytest.mark.parametrize("replies", [2, 3, 5, 8, 16, 32])
+@pytest.mark.parametrize("trip", [0.02, 0.1, 0.25, 0.7])
+@pytest.mark.parametrize("row", [0.001, 0.008, 0.03])
+def test_the_rows_replies_ask_for_stay_within_what_a_route_passes(replies: int, trip: float, row: float) -> None:
+    depth = priced(replies, trip, row).depth()
+    assert depth == 1 or replies * depth / trip <= 1 / row
+
+
+def test_the_price_never_lifts_the_fill_and_worth_limits() -> None:
+    pipe = priced(2, trip=0.5, row=0.001)
+    pipe.step = 0.1
+    assert pipe.depth() == 6, "filling the route still limits it"
+    pipe.step = 0.002
+    pipe.right = 0.3
+    assert pipe.depth() == 3, "and so does what guesses are worth"
+
+
+def test_a_reply_on_its_own_pays_no_row_price() -> None:
+    pipe = priced(1, trip=0.036, row=0.009)
+    pipe.step = 0.009
+    assert pipe.depth() == 5, "enough to fill the route, as it always was"
+
+
+def test_the_price_follows_a_reply_that_joins_at_once() -> None:
+    replies = [1]
+    pipe = pipeline(Route([1]), Draft(1.0), [1, 2], 500, limit=16, sharing=lambda: replies[0])
+    pipe.right = 0.99
+    pipe.trip, pipe.step, pipe.clock.row = 0.1, 0.01, 0.01
+    assert pipe.depth() == 11
+    replies[0] = 5
+    assert pipe.depth() == 2, "without waiting for the step to notice"
+
+
+def test_a_reply_with_nothing_measured_still_gets_to_measure() -> None:
+    pipe = pipeline(Route([1]), Draft(1.0), [1, 2], 500, sharing=lambda: 8)
+    assert pipe.depth() == 5, "one pass out could never show a gap between answers"
+
+
+def test_the_row_clock_keeps_the_shortest_gap_and_forgets_it_slowly() -> None:
+    clock = RowClock()
+    clock.tick(1.0)
+    assert clock.row is None
+    clock.tick(1.5)
+    clock.tick(1.51)
+    assert clock.row == pytest.approx(0.01)
+    clock.tick(2.5)
+    assert clock.row == pytest.approx(0.0102), "a route with room to spare says little"
+    for at in range(200):
+        clock.tick(3.0 + at)
+    assert clock.row > 0.1, "but a route can get slower"
+
+
+def test_replies_on_one_route_share_a_row_clock_so_many_replies_do_not_look_like_a_slow_route(monkeypatch) -> None:
+    # Eight replies take turns on a route passing one row every 10 ms, so each hears its own
+    # answers 80 ms apart, while the route is as fast as ever.
+    clock = RowClock()
+    pipes = [pipeline(Route([1]), Draft(1.0), [1, 2], 500) for _ in range(8)]
+    now = [0.0]
+    monkeypatch.setattr(pipeline_module.time, "perf_counter", lambda: now[0])
+    for pipe in pipes:
+        pipe.clock = clock
+    for answer in range(80):
+        now[0] += 0.01
+        pipes[answer % 8]._timed(pipeline_module.Flight(1, 1, None, 0.0, False))
+    assert clock.row == pytest.approx(0.01)
+    assert pipes[0].step == pytest.approx(0.08)
 
 
 def test_depth_fills_the_route_without_running_away() -> None:

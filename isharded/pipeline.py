@@ -37,6 +37,23 @@ FIRST_RIGHT = 0.6
 STEP_WEIGHT = 0.2
 # The fastest trip is forgotten slowly, because a route can get slower.
 TRIP_DRIFT = 1.02
+class RowClock:
+    """How long one row takes on a route, measured like a pipeline's step, between answers.
+
+    The clock is shared, because a reply on a busy route hears only its own answers, and the gap
+    between those says how many replies there are as much as how fast the route is. The shortest
+    gap lately is the one to keep: a route with room to spare answers less often than it could.
+    """
+
+    def __init__(self) -> None:
+        self.row: float | None = None
+        self.answered: float | None = None
+
+    def tick(self, now: float) -> None:
+        if self.answered is not None:
+            gap = now - self.answered
+            self.row = gap if self.row is None else min(gap, self.row * TRIP_DRIFT)
+        self.answered = now
 
 
 @dataclass(slots=True)
@@ -69,6 +86,7 @@ class Pipeline:
         rewind: Callable[[int], Awaitable[None]],
         sharing: Callable[[], int] = lambda: 1,
         told: int = 0,
+        clock: RowClock | None = None,
     ) -> None:
         self.history = history
         self.room = room
@@ -81,6 +99,7 @@ class Pipeline:
         self.rewind = rewind
         self.sharing = sharing
         self.told = told
+        self.clock = clock or RowClock()
         self.flights: deque[Flight] = deque()
         self.right = FIRST_RIGHT
         self.trip: float | None = None
@@ -98,18 +117,29 @@ class Pipeline:
         self.tokens_made = 0
         self.misses = 0
 
+    def _priced(self) -> int:
+        """The most passes this reply may keep out, now that other replies want the route too.
+
+        N replies with D passes out, each out for a round trip R, ask the route for N x D / R
+        rows a second, and it passes 1 / T. So D stops at R / (N x T). Alone, a reply only
+        competes with itself, and filling the route is already the limit.
+        """
+        replies, row = self.sharing(), self.clock.row
+        if replies <= 1 or not self.trip or not row:
+            return self.limit
+        return max(1, int(self.trip / (replies * row)))
+
     def depth(self) -> int:
         """How many passes to keep out: enough to fill the route, and no more.
 
         A pass beyond that waits behind the others, and a wrong guess then has to wait behind
-        passes that no longer count. Other replies on the route fill it too, so a busy route
-        gets no guesses at all.
+        passes that no longer count.
         """
         filled = self.stages + 1
         if self.trip is not None and self.step:
             filled = math.ceil(self.trip / self.step) + 1
         worth = math.ceil(WORTH_LOG / math.log(min(max(self.right, 0.05), 0.99)))
-        return max(1, -(-min(filled, worth, self.limit) // max(1, self.sharing())))
+        return max(1, min(filled, worth, self.limit, self._priced()))
 
     def _launch(self, token: int, position: int, rollback_to: int | None = None) -> None:
         answer = self.send(token, position, rollback_to)
@@ -161,6 +191,7 @@ class Pipeline:
 
     def _timed(self, flight: Flight) -> None:
         now = time.perf_counter()
+        self.clock.tick(now)
         if flight.alone:
             took = now - flight.sent
             self.trip = took if self.trip is None else min(took, self.trip * TRIP_DRIFT)

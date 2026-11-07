@@ -1513,7 +1513,7 @@ A token has to cross every stage in turn, so a reply on its own would leave all 
 
 So a guess can only save time. Each pass is one row at its own position, which is what plain decoding runs, so every token is the one plain decoding gives, seed and all. It needs the [native engine](#the-native-engine) and at least two stages.
 
-The entry keeps just enough passes out to fill the route, up to `draft_tokens`, and fewer when guesses are landing badly. Other replies fill a route too, so a busy route gets no guesses at all.
+The entry keeps just enough passes out to fill the route, up to `draft_tokens`, and fewer when guesses are landing badly. Other replies want the route too, so each reply keeps out only its share. N replies with D passes out, each out for a round trip R, ask for N × D / R rows a second, and a route passes 1 / T, where T is the time one row takes. So D stops at R / (N × T), and never goes below one. T is the shortest gap lately between any two answers on the route, so it does not change with the number of replies. A reply on its own is limited by filling the route, as above.
 
 A model with recurrent layers cannot rewind past a finished pass by itself, so its passes also ask each stage to keep a snapshot. After such a pass a stage saves that slot's recurrent state, and a rewind restores the snapshot of the right position and then cuts attention back as usual. A stage holds `draft_tokens` + 2 snapshots for each slot, in RAM, and a slot's snapshots go when it is cleared. If a rewind finds none, the reply replays over HTTP, and the route stays off its direct links until they reopen. Attention models keep no snapshots and pay nothing.
 
