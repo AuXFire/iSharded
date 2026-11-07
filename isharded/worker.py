@@ -134,6 +134,11 @@ def choose_dtype(requested: str) -> torch.dtype | None:
     return getattr(torch, choose_dtype_name(requested))
 
 
+def env_gib(name: str, default: str = "0") -> int:
+    """Bytes, from a size in GiB in the environment."""
+    return int(float(os.getenv(name, default)) * 1024**3)
+
+
 def parse_ram_budget(value: str) -> int | None:
     """Read a RAM budget: unset, ``auto``, or a size in GiB."""
     if not value:
@@ -262,13 +267,7 @@ class MemoryStore:
         self.items[key] = StoredSnapshot(payload=payload, metadata=metadata)
         self.used_bytes += len(payload)
 
-    def get_layers(
-        self,
-        session_id: str,
-        epoch: int,
-        start_layer: int,
-        end_layer: int,
-    ) -> bytes:
+    def get_layers(self, session_id: str, epoch: int, start_layer: int, end_layer: int) -> bytes:
         chunks: dict[str, dict[int, torch.Tensor]] = {}
         touched: list[str] = []
         for key, snapshot in self.items.items():
@@ -351,22 +350,12 @@ class WorkerRuntime:
         self.requires_identity = bool(os.getenv("ISHARDED_CA_FILE"))
         self.authority = load_authority()
         self.revoked_nodes: set[str] = set()
-        self.roles = {
-            role.strip()
-            for role in os.getenv("ISHARDED_ROLES", "inference").split(",")
-            if role.strip()
-        }
+        self.roles = {role.strip() for role in os.getenv("ISHARDED_ROLES", "inference").split(",") if role.strip()}
         self.cpu_threads = max(0, int(os.getenv("ISHARDED_CPU_THREADS", "0")))
-        self.ram_budget_bytes = max(
-            0,
-            int(float(os.getenv("ISHARDED_RAM_BUDGET_GB", "0")) * 1024**3),
-        )
-        self.accelerator_memory_budget_bytes = max(
-            0,
-            int(float(os.getenv("ISHARDED_GPU_MEMORY_GB", "0")) * 1024**3),
-        )
+        self.ram_budget_bytes = max(0, env_gib("ISHARDED_RAM_BUDGET_GB"))
+        self.accelerator_memory_budget_bytes = max(0, env_gib("ISHARDED_GPU_MEMORY_GB"))
         self.weights_ram_bytes = parse_ram_budget(os.getenv("ISHARDED_WEIGHTS_RAM_GB", ""))
-        self.weights_disk_bytes = int(float(os.getenv("ISHARDED_WEIGHTS_DISK_GB", "0")) * 1024**3)
+        self.weights_disk_bytes = env_gib("ISHARDED_WEIGHTS_DISK_GB")
         self.standby = os.getenv("ISHARDED_STANDBY", "0").lower() in {"1", "true", "yes"}
         self.host_models = host_model_patterns()
         self.requested_device = os.getenv("ISHARDED_DEVICE", "auto")
@@ -374,7 +363,7 @@ class WorkerRuntime:
         self.cache_dir = Path(os.getenv("ISHARDED_CACHE_DIR") or DEFAULT_CACHE_DIR)
         self.unit_cache = UnitCache(
             self.cache_dir,
-            budget_bytes=int(float(os.getenv("ISHARDED_CACHE_BUDGET_GB", "0")) * 1024**3),
+            budget_bytes=env_gib("ISHARDED_CACHE_BUDGET_GB"),
             concurrency=int(os.getenv("ISHARDED_FETCH_CONCURRENCY", "4")),
             local_dirs=tuple(Path(item) for item in os.getenv("ISHARDED_GGUF_DIRS", "").split(os.pathsep) if item),
         )
@@ -415,8 +404,8 @@ class WorkerRuntime:
         # What the stages can restore, on an entry worker. Any sequence can take any state.
         self.prefix = PrefixIndex()
         self.prompt_cache = True
-        self.state_ram_bytes = int(float(os.getenv("ISHARDED_STATE_RAM_GB", "1")) * 1024**3)
-        self.state_disk_bytes = int(float(os.getenv("ISHARDED_STATE_DISK_GB", "8")) * 1024**3)
+        self.state_ram_bytes = env_gib("ISHARDED_STATE_RAM_GB", "1")
+        self.state_disk_bytes = env_gib("ISHARDED_STATE_DISK_GB", "8")
         self.prompt_tokens_computed = 0
         self.tokens_reused: dict[str, int] = {}
         self.state_misses = 0
@@ -1976,23 +1965,14 @@ async def diag_runtime(authorization: str | None = Header(default=None)) -> dict
 
 
 @app.get("/internal/shards/index")
-async def shard_index(
-    model_id: str,
-    revision: str,
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
+async def shard_index(model_id: str, revision: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     verify_token(authorization)
     held = await asyncio.to_thread(runtime.unit_cache.held, model_id, revision)
     return {"units": held, "serves_peers": runtime.peer_serve}
 
 
 @app.get("/internal/shards/file")
-async def shard_file(
-    model_id: str,
-    revision: str,
-    unit: str,
-    authorization: str | None = Header(default=None),
-) -> FileResponse:
+async def shard_file(model_id: str, revision: str, unit: str, authorization: str | None = Header(default=None)) -> FileResponse:
     verify_token(authorization)
     if not runtime.peer_serve:
         raise HTTPException(status_code=403, detail="this worker does not serve shards to peers")
@@ -2202,13 +2182,7 @@ async def store_kv(
 
 
 @app.get("/internal/cache/kv/{session_id}/{epoch}")
-async def fetch_kv(
-    session_id: str,
-    epoch: int,
-    start_layer: int,
-    end_layer: int,
-    authorization: str | None = Header(default=None),
-) -> Response:
+async def fetch_kv(session_id: str, epoch: int, start_layer: int, end_layer: int, authorization: str | None = Header(default=None)) -> Response:
     verify_token(authorization)
     try:
         payload = runtime.memory_store.get_layers(session_id, epoch, start_layer, end_layer)
@@ -2218,10 +2192,7 @@ async def fetch_kv(
 
 
 @app.post("/internal/restore")
-async def restore_kv(
-    body: CacheRestoreRequest,
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
+async def restore_kv(body: CacheRestoreRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     verify_token(authorization)
     async with runtime.lock:
         try:
