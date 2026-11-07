@@ -194,8 +194,17 @@ class Engine:
             raise OSError(out.value.decode("utf-8", "replace") or "the engine could not listen")
         return json.loads(out.value)
 
-    def open(self, epoch: int, index: int, count: int, key: bytes, ack_timeout_ms: int, silence_timeout_ms: int) -> None:
-        plan = {"epoch": epoch, "index": index, "count": count, "key": list(key), "ack_timeout_ms": ack_timeout_ms, "silence_timeout_ms": silence_timeout_ms}
+    def open(self, epoch: int, index: int, count: int, key: bytes, ack_timeout_ms: int, silence_timeout_ms: int, pass_ms: int = 0, row_ms: int = 0) -> None:
+        plan = {
+            "epoch": epoch,
+            "index": index,
+            "count": count,
+            "key": list(key),
+            "ack_timeout_ms": ack_timeout_ms,
+            "silence_timeout_ms": silence_timeout_ms,
+            "pass_ms": pass_ms,
+            "row_ms": row_ms,
+        }
         if self.lib.isharded_engine_open(self.handle, json.dumps(plan).encode()) != 0:
             raise OSError("the engine refused its place in the route")
 

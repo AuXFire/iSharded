@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use isharded_engine::link::{self, Frames, Link};
+use isharded_engine::watchdog::{Limits, Watchdog};
 use isharded_engine::node::{Address, Compute, Failure, Links, Node, Output, Plan};
 use isharded_engine::wire::{Answer, Kind, Nack, Pass, Refusal, Role, Sampling, FLAG_TOKENS};
 
@@ -368,6 +369,28 @@ fn losing_a_stage_is_reported_to_the_entry_naming_it() {
     let nack = Nack::decode(&body).unwrap();
     assert_eq!((nack.id, nack.refusal, nack.stage), (0, Refusal::FailedStage, 2));
     assert!(began.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn a_stage_that_hangs_says_so_before_it_ends() {
+    let mut ring = ring(3, true, Duration::ZERO, 60_000);
+    let ended = Arc::new(AtomicBool::new(false));
+    let end = ended.clone();
+    let watchdog = Watchdog::new(ring.nodes[1].refuser(), move || end.store(true, Ordering::Release));
+    watchdog.set_limits(Limits { pass_ms: 200, row_ms: 0 });
+    let _hung = watchdog.time(1);
+    let (kind, body) = ring.frames.next().unwrap();
+    assert_eq!(kind, Kind::Nack);
+    let nack = Nack::decode(&body).unwrap();
+    assert_eq!((nack.id, nack.refusal, nack.stage), (0, Refusal::FailedStage, 1));
+    assert!(nack.message.contains("hung"), "{}", nack.message);
+    wait_until("the process to end", || ended.load(Ordering::Acquire));
+    assert_eq!(ring.nodes[1].stats().refusals, 1);
+}
+
+#[test]
+fn a_stage_with_no_route_has_nobody_to_tell() {
+    Node::new().unwrap().refuser()("nothing was in flight".into());
 }
 
 #[test]

@@ -3,6 +3,9 @@ import os
 from pathlib import Path
 import re
 import struct
+import subprocess
+import threading
+import time
 
 import httpx
 import numpy as np
@@ -27,7 +30,7 @@ from isharded.gguf import GgufHeader, split_parts
 from isharded.gguf_stage import cpu_tensor_patterns
 from isharded.models import create_adapter
 from isharded.planner import Candidate, ModelProfile, plan_placement, stored_bytes
-from isharded.protocol import MemoryPool, TensorRef, UnitPlacement, WeightUnit
+from isharded.protocol import MemoryPool, SavePoint, TensorRef, UnitPlacement, WeightUnit
 from isharded.weights import build_manifest, iter_unit_tensor, unit_tensor_span, UnitCache, FetchProgress
 
 WIDTH = 8
@@ -830,14 +833,14 @@ def test_a_draft_joins_the_entry_stage_unless_it_cannot(monkeypatch, tmp_path, a
     assert seen == [host if shared else None]
 
 
-def real_stage(host):
+def real_stage(host, gpu_layers=-1):
     """Loads the whole model as one stage."""
     from isharded.gguf import read_file_header
 
     header = read_file_header(MODEL)
     table = header.tensors["token_embd.weight"]
     embed = {"path": MODEL, "offset": header.data_start + table.offset, "length": table.nbytes, "ggml_type": table.ggml_type}
-    host.call("load", path=MODEL, last=True, table=embed, folder=BUILD, extra_paths=[], context_tokens=256, gpu_layers=-1, threads=2, cpu_tensors=[])
+    host.call("load", path=MODEL, last=True, table=embed, folder=BUILD, extra_paths=[], context_tokens=256, gpu_layers=gpu_layers, threads=2, cpu_tensors=[])
 
 
 def real_draft(slots=1, beside=None):
@@ -1445,3 +1448,335 @@ def test_an_unseeded_gguf_pass_samples_as_it_always_did(monkeypatch):
     monkeypatch.setattr(runtime, "gguf_logits", torch.tensor([0.0, 50.0, 0.0]))
     request = InferRequest(session_id="s", epoch=1, input_ids=[1], temperature=0.8)
     assert runtime._sample(None, request) == 1
+
+
+@pytest.fixture
+def quick_deadlines(monkeypatch):
+    """Every call may take half a second, plus a little for each row."""
+    from isharded import llama_host
+
+    monkeypatch.setattr(llama_host, "pass_seconds", lambda rows, hops=1: 0.5 + rows / 100)
+    return llama_host
+
+
+def test_a_call_gets_the_time_its_rows_need_and_a_load_gets_all_it_wants():
+    from isharded.deadlines import pass_seconds
+    from isharded.llama_host import SLOW_ROWS, seconds_for
+
+    assert seconds_for("forward", 1) == pass_seconds(1)
+    assert seconds_for("forward", 4000) == pass_seconds(4000), "a long prompt is no false alarm"
+    assert seconds_for("restore", 1) == pass_seconds(SLOW_ROWS), "a state can be gigabytes on a slow disk"
+    assert seconds_for("encode_image", 1) == pass_seconds(SLOW_ROWS)
+    for operation in ("load", "load_draft", "load_projector"):
+        assert seconds_for(operation, 1) is None
+
+
+def test_a_stage_call_says_how_many_rows_it_carries():
+    from isharded.gguf_stage import DraftModel, DraftText, GgufStage, PromptPlan
+
+    class Host:
+        def __init__(self):
+            self.rows = {}
+
+        def call(self, operation, payload=b"", rows=1, **_):
+            self.rows.setdefault(operation, []).append(rows)
+            return {"tokens": [1, 2], "width": 4}, np.zeros(4 * 7, dtype=np.float32).tobytes()
+
+    stage = GgufStage.__new__(GgufStage)
+    stage.host, stage.states, stage.last, stage.width = Host(), {}, True, 4
+    hidden = np.zeros((7, 4), dtype=np.float32)
+    stage.embed([1, 2, 3])
+    stage.forward(hidden, 0)
+    stage.forward_many(hidden, list(range(7)), list(range(7)))
+    stage.verify(hidden, 0, guesses=[])
+    stage.pool([[1, 2]] * 7)
+    assert stage.host.rows == {"embed": [3], "forward": [7], "forward_many": [7], "verify": [7], "pool": [14]}
+    stage.forward(hidden, 0, saves=[SavePoint(at=3, length=3, key="k", kind="history")])
+    assert stage.host.rows["forward"][-1] > 7 + 100, "saving a state on the way takes as long as saving one"
+
+    draft = DraftModel.__new__(DraftModel)
+    draft.host, draft.slots, draft.text = Host(), 1, {0: DraftText()}
+    draft.prepare([1, 2, 3, 4], PromptPlan())
+    draft.guess([5, 6], 4)
+    assert draft.host.rows["commit"] == [4]
+    assert draft.host.rows["guess"] == [6]
+
+
+def test_a_stage_that_hangs_is_stopped_and_reads_as_lost(quick_deadlines):
+    import psutil
+
+    from isharded.llamacpp import StageLost
+
+    host = quick_deadlines.StageHost()
+    try:
+        assert host.call("state_stats")[0]["states"] is not None
+        psutil.Process(host.process.pid).suspend()
+        began = time.monotonic()
+        with pytest.raises(StageLost, match="did not answer"):
+            host.call("state_stats")
+        assert time.monotonic() - began < 5
+        assert host.process.wait(10) != 0
+    finally:
+        host.close()
+
+
+def test_once_a_stage_is_given_up_on_nobody_waits_on_it_again(quick_deadlines):
+    """A kill the system has not finished leaves the pipe open, and each call would sit out its deadline."""
+    import psutil
+
+    from isharded.llamacpp import StageLost
+
+    host = quick_deadlines.StageHost()
+    beside = host.channel()
+    try:
+        psutil.Process(host.process.pid).suspend()
+        host.process.kill = lambda: None  # as a process stuck in a driver takes a kill
+        with pytest.raises(StageLost):
+            host.call("state_stats")
+        began = time.monotonic()
+        for channel in (host, beside):
+            with pytest.raises(StageLost):
+                channel.call("state_stats")
+        assert time.monotonic() - began < 0.4
+    finally:
+        del host.process.kill
+        host.close()
+
+
+@pytest.fixture
+def quick_pulse(monkeypatch):
+    from isharded import llama_host
+
+    monkeypatch.setattr(llama_host, "PULSE_EVERY", 0.05)
+    monkeypatch.setattr(llama_host, "PULSE_SECONDS", 0.5)
+    return llama_host
+
+
+def test_a_frozen_stage_is_stopped_with_nobody_calling_it(quick_pulse):
+    """A pass on the engine goes past every call here, so this is all that can see it freeze."""
+    import psutil
+
+    from isharded.llamacpp import StageLost
+
+    host = quick_pulse.StageHost()
+    try:
+        host.watch()
+        psutil.Process(host.process.pid).suspend()
+        assert host.process.wait(5) != 0
+        with pytest.raises(StageLost):
+            host.call("state_stats")
+    finally:
+        host.close()
+
+
+def test_a_frozen_stage_does_not_cost_a_long_prompt_its_whole_deadline(quick_pulse):
+    import psutil
+
+    from isharded.llamacpp import StageLost
+
+    host = quick_pulse.StageHost()
+    try:
+        host.watch()
+        psutil.Process(host.process.pid).suspend()
+        began = time.monotonic()
+        with pytest.raises(StageLost):
+            # More than a pipe holds, so this sticks in the write before it ever reaches a wait.
+            host.call("forward", bytes(1 << 24), rows=4000)
+        assert time.monotonic() - began < 5
+    finally:
+        host.close()
+
+
+@pytest.mark.parametrize("payload", [b"", bytes(1 << 14), bytes(1 << 24)], ids=["waiting for an answer", "one wide row stuck in the pipe", "stuck in the pipe"])
+def test_a_call_in_flight_hears_when_the_pulse_stops_a_stage_that_takes_no_kill(quick_pulse, payload):
+    import psutil
+
+    from isharded.llamacpp import StageLost
+
+    host = quick_pulse.StageHost()
+    try:
+        host.watch()
+        host.process.kill = lambda: None
+        psutil.Process(host.process.pid).suspend()
+        began = time.monotonic()
+        with pytest.raises(StageLost, match="stopped"):
+            host.call("forward", payload, rows=4000)
+        assert time.monotonic() - began < 5
+    finally:
+        del host.process.kill
+        host.close()
+
+
+def test_a_machine_that_slept_is_no_hung_stage(monkeypatch, quick_deadlines):
+    """The clock jumps over a sleep, and the stage slept through it too."""
+    from multiprocessing import Pipe
+    from types import SimpleNamespace
+
+    ours, theirs = Pipe()
+
+    def answers():
+        theirs.recv_bytes()
+        theirs.recv_bytes()
+        time.sleep(0.4)
+        theirs.send_bytes(b'{"ok":true}')
+        theirs.send_bytes(b"")
+
+    threading.Thread(target=answers, daemon=True).start()
+    stopped = []
+    channel = quick_deadlines.Channel(SimpleNamespace(kill=lambda: stopped.append(1)), ours, threading.Event())
+    began, clock = time.monotonic(), time.monotonic
+    monkeypatch.setattr(time, "monotonic", lambda: clock() + 1000 * (clock() - began > 0.1))
+    channel.call("forward")
+    assert not stopped
+
+
+def test_a_stage_keeps_its_pulse_through_a_long_pass(quick_pulse, monkeypatch):
+    monkeypatch.setattr(quick_pulse, "PULSE_SECONDS", 0.2)
+    if not (BUILD and MODEL):
+        pytest.skip("needs a real model")
+    host = quick_pulse.StageHost()
+    try:
+        real_stage(host, gpu_layers=0)  # on a CPU, so the pass is sure to be long
+        host.watch()
+        rows = host.call("embed", tokens=(REAL_PROMPT * 40)[:200], rows=200)[1]
+        began = time.monotonic()
+        host.call("forward", rows, position=0, rows=200)
+        assert time.monotonic() - began > 0.2, "the pass must outlast the pulse's limit to prove anything"
+        assert host.process.poll() is None
+    finally:
+        host.close()
+
+
+def test_closing_a_watched_host_stops_watching_it(quick_pulse):
+    host = quick_pulse.StageHost()
+    host.watch()
+    time.sleep(0.2)
+    host.close()
+    assert host.quiet.is_set()
+    assert host.process.poll() == 0, "it left by itself, and nothing had to stop it"
+
+
+def test_loading_on_a_host_starts_watching_it():
+    from isharded.gguf_stage import load_on
+    from isharded.llamacpp import LlamaError
+
+    class Host:
+        watched = closed = 0
+
+        def __init__(self, failure=None):
+            self.failure = failure
+
+        def call(self, operation, **_):
+            if self.failure:
+                raise self.failure
+
+        def watch(self):
+            self.watched += 1
+
+        def close(self):
+            self.closed += 1
+
+    loaded = Host()
+    load_on(loaded, "load", {})
+    assert (loaded.watched, loaded.closed) == (1, 0)
+    refused = Host(LlamaError("no"))
+    with pytest.raises(LlamaError):
+        load_on(refused, "load", {})
+    assert (refused.watched, refused.closed) == (0, 1)
+
+
+def test_a_stage_that_dies_mid_call_is_still_lost_at_once(quick_deadlines):
+    from isharded.llamacpp import StageLost
+
+    host = quick_deadlines.StageHost()
+    try:
+        host.process.kill()
+        with pytest.raises(StageLost, match="died"):
+            host.call("state_stats")
+    finally:
+        host.close()
+
+
+class StubbornProcess:
+    """Takes every kill and never goes."""
+
+    pid = 2**31 - 1  # nobody
+
+    def __init__(self):
+        self.kills = 0
+
+    def poll(self):
+        return None
+
+    def kill(self):
+        self.kills += 1
+
+    def wait(self, seconds=None):
+        raise subprocess.TimeoutExpired("stage", seconds)
+
+
+def stubborn_host():
+    from types import SimpleNamespace
+
+    from isharded.llama_host import StageHost
+    from isharded.llamacpp import LlamaError
+
+    def refuses(*_):
+        raise LlamaError("no")
+
+    host = StageHost.__new__(StageHost)
+    host.process, host.lock, host.stopped, host.quiet = StubbornProcess(), threading.Lock(), threading.Event(), threading.Event()
+    host.connection = SimpleNamespace(close=lambda: None)
+    host.listener = SimpleNamespace(close=lambda: None)
+    host._exchange = refuses
+    return host
+
+
+def test_a_host_that_will_not_exit_is_killed_harder_and_left_behind(monkeypatch):
+    from isharded import llama_host
+
+    harder = []
+
+    class Found:
+        def __init__(self, pid=None):
+            self.pid = pid
+
+        def children(self, recursive):
+            return [Found("child")]
+
+        def kill(self):
+            harder.append(self.pid)
+
+    monkeypatch.setattr(llama_host.psutil, "Process", Found)
+    host = stubborn_host()
+    host.close()
+    assert host.process.kills == 1 and harder == ["child", host.process.pid]
+
+
+def test_a_host_gone_past_finding_does_not_stop_a_close_either():
+    host = stubborn_host()
+    host.close()  # no such process for the harder kill to find, and that is no reason to fail
+
+
+def test_a_suspended_host_cannot_hold_up_a_close(monkeypatch, quick_deadlines):
+    import psutil
+
+    monkeypatch.setattr(quick_deadlines, "EXIT_SECONDS", 0.5)
+    host = quick_deadlines.StageHost()
+    psutil.Process(host.process.pid).suspend()
+    began = time.monotonic()
+    host.close()
+    assert time.monotonic() - began < 5
+    assert host.process.poll() is not None
+
+
+def test_a_close_does_not_wait_behind_a_call_that_is_stuck(monkeypatch):
+    from isharded import llama_host
+
+    monkeypatch.setattr(llama_host, "EXIT_SECONDS", 0.1)
+    monkeypatch.setattr(llama_host, "KILL_SECONDS", 0.1)
+    host = stubborn_host()
+    with host.lock:  # as a pass with a long deadline ahead of it holds it
+        began = time.monotonic()
+        host.close()
+    assert time.monotonic() - began < 2

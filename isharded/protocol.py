@@ -15,6 +15,8 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field, HttpUrl
 from safetensors.torch import load as load_safetensors
 from safetensors.torch import save as save_safetensors
 
+from .deadlines import PASS_SECONDS, PASS_SECONDS_PER_TOKEN, pass_seconds  # noqa: F401
+
 
 META_HEADER = "x-isharded-meta"
 # Raised whenever workers and the orchestrator stop being able to talk safely.
@@ -142,10 +144,6 @@ def _gguf_file(value: str) -> str:
         raise ValueError(f"not a GGUF file: {value[:80]!r}")
     return value
 
-
-# Far beyond any real pass, and far short of leaving a reply hung on a dead link.
-PASS_SECONDS = 30.0
-PASS_SECONDS_PER_TOKEN = 1.0
 
 PlainName = Annotated[str, AfterValidator(_plain_name)]
 ModelFile = Annotated[str, AfterValidator(_file_in_folder)]
@@ -447,15 +445,6 @@ class ChatCompletionRequest(BaseModel):
     tools: list[dict[str, Any]] | None = None
     tool_choice: str | dict[str, Any] | None = None
     parallel_tool_calls: bool | None = None
-
-
-def pass_seconds(tokens: int, hops: int = 1) -> float:
-    """How long a pass may take before the stage after this one counts as silent.
-
-    A lost link often gives no error at all: packets just stop. Each hop waits
-    longer than the next one in, so the failure is blamed on the right stage.
-    """
-    return (PASS_SECONDS + tokens * PASS_SECONDS_PER_TOKEN) * max(hops, 1)
 
 
 def auth_headers(token: str | None) -> dict[str, str]:

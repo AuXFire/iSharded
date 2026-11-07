@@ -201,6 +201,8 @@ RING_ACK_MS = 5000
 # A stage that loses a link says so inside the limit above, and an answer the closing link
 # held comes back by walking soon after. This leaves room for that, however fast the ring.
 RING_ANSWER_FLOOR_SECONDS = 2 * RING_ACK_MS / 1000
+# How often a wait for a slot's passes looks up to see whether the ring is still there.
+SETTLE_LOOK_SECONDS = 0.25
 RING_DIAL_MS = 10_000
 # Off is for checking results against a prompt that went out whole.
 PROMPT_PARTS = os.getenv("ISHARDED_PROMPT_PARTS", "1") != "0"
@@ -348,6 +350,8 @@ class WorkerRuntime:
         self.term = 0
         self.advertised_url = os.getenv("ISHARDED_ADVERTISE_URL", "http://127.0.0.1:8100").rstrip("/")
         self.draft_choice = DraftChoice()
+        # The stage that would not restart, for as long as it is still this worker's stage.
+        self.stage_down: Any = None
         self.ring_live = False
         self.ring_epoch: int | None = None
         self.ring_door: dict[str, Any] | None = None
@@ -712,6 +716,7 @@ class WorkerRuntime:
             if self.gguf is not None and lost.host is not None and lost.host is not self.gguf.host:
                 return retry
             self.last_error = str(lost)
+            self.ring_live = False  # every pass on it went through that process
             self.caches.clear()
             draft = self.draft
             try:
@@ -719,7 +724,11 @@ class WorkerRuntime:
                 await asyncio.to_thread(self.gguf.respawn)
             except (LlamaError, OSError, AssertionError) as exc:
                 self.last_error = f"stage would not restart: {exc}"
-                return HTTPException(status_code=500, detail=self.last_error)
+                self.stage_down = self.gguf
+                # Not a 500, which reads as a request the stage refused: that ends the reply
+                # and blames nobody. This node has lost its stage, so it goes and the reply goes on.
+                return HTTPException(status_code=502, detail={"failed_worker": self.worker_id, "message": self.last_error})
+            self.stage_down = None
             self.stage_restarts += 1
         if self.draft_request is not None and not draft_apart():
             await self.replace_draft(lost, draft)  # it lived in that process
@@ -1206,10 +1215,20 @@ class WorkerRuntime:
             raise self._ring_silent() from exc
 
     async def ring_settle(self, slot: int) -> None:
-        """Waits for a slot's passes, so none reaches a stage after the next reply has begun."""
+        """Waits for a slot's passes, so none reaches a stage after the next reply has begun.
+
+        A ring known to be lost is not waited on. Replays leave it, so nothing of this slot's
+        can reach them, and this runs before the slot is free for the replay to take.
+        """
         client = self.ring_client
-        if client is not None and not await client.settled(slot, pass_seconds(1, len(self.route))):
-            self.ring_live = False
+        if client is None:
+            return
+        left = pass_seconds(1, len(self.route))
+        while self.ring_live and left > 0:
+            if await client.settled(slot, min(left, SETTLE_LOOK_SECONDS)):
+                return
+            left -= SETTLE_LOOK_SECONDS
+        self.ring_live = False
 
     def ring_refused(self, refused: EngineRefusal) -> HTTPException:
         """The error the HTTP path would have raised, so recovery is the same."""
@@ -1847,6 +1866,9 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
     if not authorized(authorization):
         return {"status": "ok"}  # hardware and layout are nobody else's business
     if runtime.gguf is not None:
+        if runtime.stage_down is runtime.gguf:
+            # A report that this node lost its stage is checked here, and must not hear all is well.
+            raise HTTPException(status_code=503, detail=runtime.last_error)
         await asyncio.to_thread(runtime.gguf.refresh_states)
     assignment = runtime.assignment.model_dump() if runtime.assignment else None
     return {

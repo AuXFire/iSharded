@@ -785,8 +785,8 @@ def real_stage():
     return host, bool(header.arch_key("ssm.state_size"))
 
 
-async def real_ring(host) -> EngineClient:
-    door = host.call("ring_open", host="127.0.0.1", port=0, epoch=1, index=0, count=1, key=bytes(32).hex(), ack_timeout_ms=30000, silence_timeout_ms=30000)[0]
+async def real_ring(host, **limits) -> EngineClient:
+    door = host.call("ring_open", host="127.0.0.1", port=0, epoch=1, index=0, count=1, key=bytes(32).hex(), ack_timeout_ms=30000, silence_timeout_ms=30000, **limits)[0]
     host.call("ring_connect", links={"next": None, "entry": None, "timeout_ms": 5000})
     while (state := host.call("ring_stats")[0].get("connect")) == "dialling":
         await asyncio.sleep(0.02)
@@ -862,3 +862,110 @@ def test_a_real_stage_never_goes_back_to_a_snapshot_from_before_a_clear() -> Non
         asyncio.run(run(host))
     finally:
         host.close()
+
+
+@needs_real_stage
+def test_a_real_pass_past_its_limit_refuses_and_ends_the_process() -> None:
+    from isharded.llamacpp import StageLost
+
+    async def run(host) -> EngineRefusal:
+        client = await real_ring(host, pass_ms=1, row_ms=0)
+        try:
+            with pytest.raises(EngineRefusal) as caught:
+                # Enough rows to outlast the watchdog's first look on any machine.
+                await client.run(60, epoch=1, slot=0, position=0, rollback_to=None, tokens=PROMPT * 16, guesses=[], verify=False, temperature=0.0, top_p=1.0, top_k=0, seed=None)
+            return caught.value
+        finally:
+            client.close()
+
+    host, _ = real_stage()
+    try:
+        refused = asyncio.run(run(host))
+        assert refused.refusal == native.REFUSE_FAILED_STAGE and "hung" in refused.message
+        assert host.process.wait(10) != 0
+        with pytest.raises(StageLost):
+            host.call("clear", slot=0)
+    finally:
+        host.close()
+
+
+@needs_real_stage
+def test_a_real_pass_inside_its_limit_is_left_alone() -> None:
+    async def run(host) -> list[int]:
+        client = await real_ring(host)
+        try:
+            return await real_pass(client, PROMPT, 0)
+        finally:
+            client.close()
+
+    host, _ = real_stage()
+    try:
+        assert asyncio.run(run(host))
+        assert host.process.poll() is None
+    finally:
+        host.close()
+
+
+def test_a_passs_deadline_reaches_the_engine_in_the_plan_it_already_reads() -> None:
+    from isharded.deadlines import pass_seconds
+
+    plans = []
+
+    def opened(_, plan):
+        plans.append(json.loads(plan))
+        return 0
+
+    engine = native.Engine.__new__(native.Engine)
+    engine.lib, engine.handle = SimpleNamespace(isharded_engine_open=opened), None
+    host = llama_host._Host()
+    host.stage = SimpleNamespace(engine=engine)
+    engine.listen = lambda *_: {}
+    host.ring_open({"host": "h", "port": 0, "epoch": 1, "index": 0, "count": 2, "key": "00", "ack_timeout_ms": 5, "silence_timeout_ms": 5}, b"")
+    assert plans[0]["pass_ms"] + plans[0]["row_ms"] == pass_seconds(1, 1) * 1000
+    assert plans[0]["pass_ms"] + 9 * plans[0]["row_ms"] == pass_seconds(9, 1) * 1000
+
+
+def waiting_ring(client, **fields):
+    """A worker whose ring has a pass out that will never come back."""
+    client.send(**FIELDS)
+    return runtime(ring_client=client, **fields)
+
+
+def test_settling_does_not_wait_on_a_ring_known_to_be_lost() -> None:
+    async def use(client):
+        await asyncio.wait_for(waiting_ring(client, ring_live=False).ring_settle(0), 1)
+        return True
+
+    assert asyncio.run(with_door(lambda identity: b"", use))
+
+
+def test_settling_stops_when_the_ring_is_lost_during_the_wait() -> None:
+    """Another reply can find the stage lost while this one waits on the same ring."""
+
+    async def use(client):
+        item = waiting_ring(client)
+        asyncio.get_running_loop().call_later(0.05, lambda: setattr(item, "ring_live", False))
+        await asyncio.wait_for(item.ring_settle(0), 2)
+        return True
+
+    assert asyncio.run(with_door(lambda identity: b"", use))
+
+
+def test_a_pass_that_never_settles_still_turns_the_ring_off(monkeypatch) -> None:
+    monkeypatch.setattr(worker_module, "pass_seconds", lambda tokens, hops=1: 0.05)
+
+    async def use(client):
+        item = waiting_ring(client)
+        await item.ring_settle(0)
+        return item.ring_live
+
+    assert asyncio.run(with_door(lambda identity: b"", use)) is False
+
+
+def test_a_slot_that_settles_leaves_the_ring_up() -> None:
+    async def use(client):
+        item = waiting_ring(client)
+        await item.ring_settle(0)
+        return item.ring_live
+
+    assert asyncio.run(with_door(lambda identity: answer(identity, [identity]), use)) is True

@@ -10,6 +10,7 @@ pub mod link;
 pub mod llama;
 pub mod node;
 pub mod sample;
+pub mod watchdog;
 pub mod wire;
 
 use std::ffi::{c_char, c_void, CStr};
@@ -18,6 +19,7 @@ use std::sync::Arc;
 use llama::{Capture, LlamaCompute, Snapshots, StageApi, TensorApi};
 use node::{Links, Node, Plan};
 use serde::de::DeserializeOwned;
+use watchdog::{Limits, Watchdog};
 
 /// Bumped when the functions below change, so a stale library is refused and not misused.
 pub const ABI_VERSION: u32 = 2;
@@ -26,6 +28,7 @@ pub const ABI_VERSION: u32 = 2;
 pub struct Engine {
     capture: Arc<Capture>,
     snapshots: Arc<Snapshots>,
+    watchdog: Arc<Watchdog>,
     node: Node,
 }
 
@@ -74,7 +77,8 @@ pub unsafe extern "C" fn isharded_engine_new(target: *const c_char, tensors: *co
         return std::ptr::null_mut();
     };
     let capture = Arc::new(Capture::new(CStr::from_ptr(target).to_owned(), *tensors));
-    Box::into_raw(Box::new(Engine { capture, snapshots: Arc::default(), node }))
+    let watchdog = Arc::new(Watchdog::new(node.refuser(), || std::process::abort()));
+    Box::into_raw(Box::new(Engine { capture, snapshots: Arc::default(), watchdog, node }))
 }
 
 /// The eval callback, with the engine as its user data.
@@ -109,7 +113,7 @@ pub unsafe extern "C" fn isharded_engine_capture_read(engine: *mut Engine, out: 
 #[no_mangle]
 pub unsafe extern "C" fn isharded_engine_attach(engine: *mut Engine, api: *const StageApi) {
     let engine = &*engine;
-    engine.node.set_compute(Box::new(LlamaCompute::new(*api, engine.capture.clone(), engine.snapshots.clone())));
+    engine.node.set_compute(Box::new(LlamaCompute::new(*api, engine.capture.clone(), engine.snapshots.clone(), engine.watchdog.clone())));
 }
 
 /// Forgets what a rewind could go back to, because Python changed what a slot holds. A
@@ -159,9 +163,10 @@ pub unsafe extern "C" fn isharded_engine_listen(engine: *mut Engine, host: *cons
 /// `plan` must be a NUL-terminated JSON string.
 #[no_mangle]
 pub unsafe extern "C" fn isharded_engine_open(engine: *mut Engine, plan: *const c_char) -> i32 {
-    let Some(plan) = read_json::<Plan>(plan) else {
+    let (Some(limits), Some(plan)) = (read_json::<Limits>(plan), read_json::<Plan>(plan)) else {
         return -1;
     };
+    (*engine).watchdog.set_limits(limits);
     (*engine).node.open(plan);
     0
 }

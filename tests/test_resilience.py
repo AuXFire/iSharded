@@ -2254,3 +2254,131 @@ def test_a_replay_on_the_slow_way_still_waits_for_the_repair():
 
     asyncio.run(scenario())
     assert asked == [3]
+
+
+def stuck_stage(reason):
+    from types import SimpleNamespace
+
+    def fails():
+        raise reason
+
+    return SimpleNamespace(host=object(), respawn=fails)
+
+
+def failed_restart(reason):
+    from types import SimpleNamespace
+
+    from isharded.llamacpp import StageLost
+    from isharded.worker import WorkerRuntime
+
+    async def scenario():
+        worker = SimpleNamespace(
+            replacing=asyncio.Lock(), gguf=stuck_stage(reason), last_error=None, caches={}, stage_restarts=0, draft=None, draft_request=None, worker_id="w2", ring_live=True
+        )
+        return worker, await WorkerRuntime.replace_stage(worker, StageLost("gone", worker.gguf.host))
+
+    return asyncio.run(scenario())
+
+
+def test_a_stage_that_will_not_restart_names_its_worker():
+    from isharded.llamacpp import LlamaError
+
+    worker, answer = failed_restart(LlamaError("the file is gone"))
+    assert answer.status_code == 502
+    assert answer.detail["failed_worker"] == "w2"
+    assert "would not restart" in answer.detail["message"] and "the file is gone" in answer.detail["message"]
+    assert "would not restart" in worker.last_error
+    assert worker.stage_restarts == 0
+
+
+def test_the_stage_before_passes_on_who_would_not_restart():
+    """Blame stays with the stage that saw it. Its neighbour must not take it, or lose it."""
+    from isharded.llamacpp import LlamaError
+    from isharded.worker import failure_report
+
+    _, answer = failed_restart(LlamaError("no"))
+    assert failure_report(httpx.Response(answer.status_code, json={"detail": answer.detail})) == answer.detail
+
+
+def test_a_failed_restart_is_no_refused_request_and_the_reply_goes_on(monkeypatch):
+    from isharded.llamacpp import LlamaError
+    from isharded.orchestrator import Orchestrator
+
+    _, answer = failed_restart(LlamaError("no"))
+    orchestrator = Orchestrator()
+    response = httpx.Response(answer.status_code, json={"detail": answer.detail})
+    assert not orchestrator._refused_request(response), "that drops the reply and blames nobody"
+    assert Orchestrator._failed_worker(response, "w1") == "w2"
+
+    quarantined, repairs = [], []
+    monkeypatch.setattr(orchestrator, "_quarantine", lambda worker, reason: quarantined.append(worker))
+
+    async def rebalance():
+        repairs.append(1)
+
+    monkeypatch.setattr(orchestrator, "rebalance", rebalance)
+    assert asyncio.run(orchestrator._recover_stream(answer.detail, 3)), "a new stream follows on the new route"
+    assert quarantined == ["w2"] and repairs == [1]
+
+
+def test_a_stage_that_will_not_restart_fails_the_check_a_report_gets(monkeypatch):
+    """A follower reports the node to the coordinator, which only believes what /health says."""
+    from isharded import worker as worker_module
+    from isharded.llamacpp import LlamaError
+
+    worker, _ = failed_restart(LlamaError("no"))
+    assert worker.stage_down is worker.gguf
+
+    stage = SimpleNamespace(refresh_states=lambda: None, ring_stats=lambda: None, states={})
+    monkeypatch.setattr(worker_module, "authorized", lambda _: True)
+    monkeypatch.setattr(worker_module.runtime, "gguf", stage)
+    monkeypatch.setattr(worker_module.runtime, "stage_down", stage)
+    client = TestClient(worker_module.app)
+    assert client.get("/health").status_code == 503
+    monkeypatch.setattr(worker_module, "authorized", lambda _: False)
+    assert client.get("/health").json() == {"status": "ok"}, "a stranger hears nothing of it"
+
+    monkeypatch.setattr(worker_module, "authorized", lambda _: True)
+    monkeypatch.setattr(worker_module.runtime, "stage_down", object())  # the stage of an older route
+    assert client.get("/health").status_code == 200
+
+
+def test_a_coordinator_believes_a_report_of_a_stage_that_will_not_restart(monkeypatch):
+    orchestrator = gguf_pool(w1=record())
+    orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(503, json={})))
+    quarantined = []
+    monkeypatch.setattr(orchestrator, "_quarantine", lambda worker, reason: quarantined.append(worker))
+
+    async def rebalance(**_):
+        pass
+
+    monkeypatch.setattr(orchestrator, "rebalance", rebalance)
+    asyncio.run(orchestrator.handle_report("w1", "reply failed"))
+    assert quarantined == ["w1"]
+
+
+def test_a_stage_that_restarts_takes_back_its_good_name():
+    from isharded.llamacpp import StageLost
+    from isharded.worker import WorkerRuntime
+
+    async def scenario():
+        stage = RestartingStage()
+        worker = SimpleNamespace(replacing=asyncio.Lock(), gguf=stage, last_error=None, caches={}, stage_restarts=0, draft=None, draft_request=None, ring_live=True, stage_down=stage)
+        await WorkerRuntime.replace_stage(worker, StageLost("gone", stage.host))
+        return worker
+
+    assert asyncio.run(scenario()).stage_down is None
+
+
+def test_a_lost_stage_takes_its_ring_with_it(monkeypatch):
+    from types import SimpleNamespace
+
+    from isharded.llamacpp import StageLost
+    from isharded.worker import WorkerRuntime
+
+    async def scenario():
+        worker = SimpleNamespace(replacing=asyncio.Lock(), gguf=RestartingStage(), last_error=None, caches={}, stage_restarts=0, draft=None, draft_request=None, ring_live=True)
+        await WorkerRuntime.replace_stage(worker, StageLost("gone", worker.gguf.host))
+        return worker
+
+    assert asyncio.run(scenario()).ring_live is False

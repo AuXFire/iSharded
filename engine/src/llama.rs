@@ -12,6 +12,7 @@ use parking_lot::Mutex;
 
 use crate::node::{Compute, Failure, Output};
 use crate::sample::{self, Draws};
+use crate::watchdog::Watchdog;
 use crate::wire::{Pass, Refusal};
 
 /// `llama_batch`, passed by value.
@@ -175,6 +176,7 @@ pub struct LlamaCompute {
     api: StageApi,
     capture: Arc<Capture>,
     snapshots: Arc<Snapshots>,
+    watchdog: Arc<Watchdog>,
     /// The rows of the coming batch.
     hidden: Vec<f32>,
     positions: Vec<i32>,
@@ -212,11 +214,12 @@ fn to_wire(rows: &[f32], bf16: bool) -> Vec<u8> {
 }
 
 impl LlamaCompute {
-    pub fn new(api: StageApi, capture: Arc<Capture>, snapshots: Arc<Snapshots>) -> LlamaCompute {
+    pub fn new(api: StageApi, capture: Arc<Capture>, snapshots: Arc<Snapshots>, watchdog: Arc<Watchdog>) -> LlamaCompute {
         LlamaCompute {
             api,
             capture,
             snapshots,
+            watchdog,
             hidden: Vec::new(),
             positions: Vec::new(),
             slots: Vec::new(),
@@ -406,6 +409,8 @@ impl LlamaCompute {
 
 impl Compute for LlamaCompute {
     fn run_merged(&mut self, passes: &[Pass]) -> Vec<Result<Output, Failure>> {
+        let watchdog = self.watchdog.clone();
+        let _timed = watchdog.time(passes.len() as u64);
         match self.merged(passes) {
             Ok(results) => results,
             Err(failure) => passes.iter().map(|_| Err(failure.clone())).collect(),
@@ -413,6 +418,10 @@ impl Compute for LlamaCompute {
     }
 
     fn run(&mut self, pass: &Pass) -> Result<Output, Failure> {
+        // Around the whole pass: llama_decode can return with the work still queued, so a hung
+        // GPU may only show when the output is read.
+        let watchdog = self.watchdog.clone();
+        let _timed = watchdog.time(pass.row_count() as u64);
         self.hidden.clear();
         self.load(pass)?;
         let count = pass.row_count();
@@ -443,7 +452,10 @@ impl Compute for LlamaCompute {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::watchdog::Limits;
     use crate::wire::{Sampling, FLAG_KEEP, FLAG_TOKENS};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     const WIDTH: usize = 2;
 
@@ -462,6 +474,8 @@ mod tests {
         saves: usize,
         refuse_saves: bool,
         refuse_restores: bool,
+        /// How long a decode takes.
+        stall: Duration,
     }
 
     #[derive(Debug, PartialEq)]
@@ -473,6 +487,7 @@ mod tests {
     }
 
     unsafe extern "C" fn fake_decode(context: *mut c_void, batch: Batch) -> i32 {
+        std::thread::sleep((*context.cast::<Fake>()).stall);
         let fake = &mut *context.cast::<Fake>();
         let count = batch.n_tokens as usize;
         let hidden = std::slice::from_raw_parts(batch.embd, count * WIDTH).to_vec();
@@ -550,6 +565,10 @@ mod tests {
 
     unsafe extern "C" fn no_get(_tensor: *const c_void, _out: *mut c_void, _offset: usize, _size: usize) {}
 
+    fn watching() -> Arc<Watchdog> {
+        Arc::new(Watchdog::new(|_| {}, || {}))
+    }
+
     fn stage(fake: &mut Fake, last: bool, table: &[f32]) -> LlamaCompute {
         let tensors = TensorApi { name: no_name, bytes: no_bytes, get: no_get };
         let capture = Arc::new(Capture::new(CString::default(), tensors));
@@ -575,7 +594,7 @@ mod tests {
             to_float: None,
             keep_limit: 3,
         };
-        LlamaCompute::new(api, capture, Arc::default())
+        LlamaCompute::new(api, capture, Arc::default(), watching())
     }
 
     fn rows_pass(slot: u32, position: u32, values: &[f32]) -> Pass {
@@ -840,6 +859,39 @@ mod tests {
         states.drop_past(2);
         assert_eq!(states.spare.len(), 1);
         assert_eq!(states.buffer(3).capacity(), 8);
+    }
+
+    /// Runs a pass that stalls, under a limit, and says whether the watchdog saw it.
+    fn overran(stall_ms: u64, limits: Limits, go: impl FnOnce(&mut LlamaCompute)) -> bool {
+        let ended = Arc::new(AtomicBool::new(false));
+        let end = ended.clone();
+        let mut fake = Fake { stall: Duration::from_millis(stall_ms), ..Fake::default() };
+        let mut compute = stage(&mut fake, false, &[]);
+        compute.watchdog = Arc::new(Watchdog::new(|_| {}, move || end.store(true, Ordering::Release)));
+        compute.watchdog.set_limits(limits);
+        go(&mut compute);
+        std::thread::sleep(Duration::from_millis(250));
+        ended.load(Ordering::Acquire)
+    }
+
+    #[test]
+    fn a_pass_that_stalls_past_its_limit_is_seen() {
+        let limits = Limits { pass_ms: 200, row_ms: 0 };
+        assert!(overran(700, limits, |compute| drop(compute.run(&rows_pass(0, 0, &[1.0, 2.0])))));
+    }
+
+    #[test]
+    fn a_merged_pass_has_the_time_of_all_its_rows() {
+        let limits = Limits { pass_ms: 200, row_ms: 300 };
+        let passes = [rows_pass(0, 0, &[1.0, 2.0]), rows_pass(1, 0, &[1.0, 2.0])];
+        assert!(!overran(700, limits, |compute| drop(compute.run_merged(&passes))), "two rows have 800 ms");
+        assert!(overran(700, Limits { pass_ms: 200, row_ms: 50 }, |compute| drop(compute.run_merged(&passes))), "two rows have 300 ms");
+    }
+
+    #[test]
+    fn a_pass_that_finishes_in_time_is_left_alone() {
+        let limits = Limits { pass_ms: 500, row_ms: 0 };
+        assert!(!overran(50, limits, |compute| drop(compute.run(&rows_pass(0, 0, &[1.0, 2.0])))));
     }
 
     #[test]
