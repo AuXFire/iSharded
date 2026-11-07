@@ -23,7 +23,7 @@ from isharded import replies
 from isharded.assistant import federation, gateway
 from isharded.assistant.app import Assistant
 from isharded.assistant.cli import add_arguments, run
-from isharded.assistant.contracts import Effect, Provenance, Reach, ToolCall, Trust, Verdict
+from isharded.assistant.contracts import Effect, ModelReply, Provenance, Reach, ToolCall, Trust, Verdict
 from isharded.assistant.gateway import Users, backup, check_bind, create_app, restore
 from test_assistant_fakes import FakeBroker, FakeModelServer, Reply, ScriptedRouter, model_reply, wait_until
 
@@ -1270,3 +1270,41 @@ def test_a_request_that_asks_for_no_tools_is_honoured(alice, assistant, extra):
 
 def test_a_client_cannot_ask_for_a_longer_reply_than_a_turn_gives(alice, assistant):
     assert asked(alice, assistant, max_tokens=10**9).max_tokens == assistant.conversation.reply_tokens
+
+
+# How a reply ended
+
+
+def test_a_reply_cut_short_by_the_cap_reports_length(alice, assistant):
+    with FakeModelServer([Reply(text="Cut off in the mid", finish="length"), Reply(text="Whole.")], mesh_shape=True) as server:
+        assistant.providers.add("pool", server.url, mesh=True, model="fake-model")
+        cut = chat(alice, "Tell me everything")
+        assert cut["choices"][0]["finish_reason"] == "length" and cut["choices"][0]["message"]["content"] == "Cut off in the mid"
+        assert chat(alice, "And briefly?")["choices"][0]["finish_reason"] == "stop"
+
+
+def test_a_stream_cut_short_by_the_cap_reports_length(alice, assistant):
+    with FakeModelServer([Reply(text="Cut off in the mid", finish="length")], mesh_shape=True) as server:
+        assistant.providers.add("pool", server.url, mesh=True, model="fake-model")
+        with alice.stream("POST", "/v1/chat/completions", json={"messages": [{"role": "user", "content": "Hi"}], "stream": True}) as response:
+            events = events_of(response)
+    assert events[-2]["choices"][0]["finish_reason"] == "length"
+    assert [event["choices"][0]["finish_reason"] for event in events[:-2]] == [None] * (len(events) - 2)
+
+
+def test_only_the_last_reply_of_a_turn_says_how_it_ended(alice, assistant):
+    """A round of tools that hit the limit and went on is not a cut reply."""
+    first = ModelReply("Looking.", (ToolCall("notes.read", {}),), "m", "p", 1, 1, 0.1, "length")
+    assistant.broker = FakeBroker()
+    assistant.broker.add("notes.read")
+    assistant.router = ScriptedRouter(first, model_reply("All done."), skip_workers=True)
+    assert chat(alice, "Read my notes")["choices"][0]["finish_reason"] == "stop"
+
+
+def test_a_turn_that_waits_for_a_person_was_not_cut_short(alice, assistant):
+    cut = ModelReply("Writing.", (ToolCall("notes.write", {}),), "m", "p", 1, 1, 0.1, "length")
+    assistant.broker = FakeBroker()
+    assistant.broker.add("notes.write", verdict=Verdict.ASK)
+    assistant.router = ScriptedRouter(cut, skip_workers=True)
+    body = chat(alice, "Write my notes")
+    assert body["assistant"]["status"] == "awaiting_approval" and body["choices"][0]["finish_reason"] == "stop"

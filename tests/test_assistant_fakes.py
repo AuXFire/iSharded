@@ -43,6 +43,7 @@ class Reply:
     error_after: int | None = None  # an error event after this many pieces, as the mesh sends
     no_finish: bool = False  # end cleanly without saying it finished
     model: str | None = None
+    finish: str = "stop"  # the finish_reason it reports
 
 
 class FakeModelServer:
@@ -136,7 +137,7 @@ class FakeModelServer:
             message: dict[str, Any] = {"role": "assistant", "content": reply.text}
             if reply.tool_calls:
                 message["tool_calls"] = reply.tool_calls
-            payload: dict[str, Any] = {"model": reply.model or body.get("model"), "choices": [{"index": 0, "message": message, "finish_reason": "stop"}]}
+            payload: dict[str, Any] = {"model": reply.model or body.get("model"), "choices": [{"index": 0, "message": message, "finish_reason": reply.finish}]}
             if reply.usage:
                 payload["usage"] = reply.usage
             self.send_json(handler, 200, payload)
@@ -184,7 +185,7 @@ class FakeModelServer:
             send({"model": reply.model or "fake-model", "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]})
         if reply.no_finish:
             return
-        final: dict[str, Any] = {"model": reply.model or "fake-model", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+        final: dict[str, Any] = {"model": reply.model or "fake-model", "choices": [{"index": 0, "delta": {}, "finish_reason": reply.finish}]}
         if reply.usage:
             final["usage"] = reply.usage
         send(final)

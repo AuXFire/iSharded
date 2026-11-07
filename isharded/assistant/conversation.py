@@ -125,6 +125,7 @@ class TurnResult:
     tools: tuple[str, ...] = ()
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    finish_reason: str = "stop"  # or length, when the token limit cut the last reply short
 
 
 def final_result(items: Iterable[str | TurnResult]) -> TurnResult:
@@ -157,6 +158,7 @@ class Turn:
     completion_tokens: int = 0
     max_tokens: int | None = None  # what a client asked for, across the whole turn
     temperature: float | None = None
+    finish_reason: str = "stop"  # the last reply's
 
     def sampling(self, default_tokens: int) -> dict[str, Any]:
         """What the next request asks of a model. A limit covers every round, as a client sees one reply.
@@ -324,6 +326,7 @@ class Conversation:
         turn.model, turn.provider = reply.model, reply.provider
         turn.prompt_tokens += reply.prompt_tokens
         turn.completion_tokens += reply.completion_tokens
+        turn.finish_reason = reply.finish_reason
         if reply.text:
             turn.said.append(reply.text)
             turn.transcript.append({"kind": "assistant", "text": reply.text})
@@ -351,6 +354,7 @@ class Conversation:
         return TurnResult(
             status, "\n\n".join([*turn.said, *([notice] if notice else [])]), turn.user, turn.conversation_id, turn.turn_id, turn.model, turn.provider,
             turn.tainted, turn.reach, pending, None, tuple(turn.tools), turn.prompt_tokens, turn.completion_tokens,
+            turn.finish_reason if status == "done" else "stop",
         )
 
     # Tools

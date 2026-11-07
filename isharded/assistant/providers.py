@@ -711,15 +711,16 @@ class OpenAICompatible:
             raise self._failed(response)
         try:
             payload = response.json()
-            message = payload["choices"][0]["message"]
+            choice = payload["choices"][0]
+            message = choice["message"]
         except (ValueError, KeyError, IndexError, TypeError):
             raise ProviderError(f"{self.name} sent a reply that could not be read") from None
         raw = str(message.get("content") or "")
         answered_by = payload.get("model") or model
-        return self._reply(raw, message.get("tool_calls") or [], request, body, payload.get("usage") or {}, answered_by, started)
+        return self._reply(raw, message.get("tool_calls") or [], request, body, payload.get("usage") or {}, answered_by, started, choice.get("finish_reason"))
 
     def _reply(
-        self, raw: str, native_calls: list[Any], request: ModelRequest, body: dict[str, Any], usage: dict[str, Any], model: Any, started: float
+        self, raw: str, native_calls: list[Any], request: ModelRequest, body: dict[str, Any], usage: dict[str, Any], model: Any, started: float, ended: Any
     ) -> ModelReply:
         text, calls = parse_tool_calls(raw, request.tools)
         found = as_calls(native_calls, frozenset(tool.name for tool in request.tools))
@@ -731,6 +732,7 @@ class OpenAICompatible:
             prompt_tokens=int(usage.get("prompt_tokens") or sum(estimate_tokens(item["content"]) for item in body["messages"])),
             completion_tokens=int(usage.get("completion_tokens") or estimate_tokens(raw)),
             seconds=time.perf_counter() - started,
+            finish_reason="length" if ended == "length" else "stop",
         )
 
     def stream(self, request: ModelRequest, model: str) -> Iterator[str | ModelReply]:
@@ -751,6 +753,7 @@ class OpenAICompatible:
         usage: dict[str, Any] = {}
         answered_by = model
         finished = False
+        ended = None
         try:
             opened = self._client().stream(
                 "POST", f"{self.base_url}/chat/completions", json=body, headers=self._headers(), timeout=seconds_to_wait(self.read_seconds)
@@ -774,7 +777,8 @@ class OpenAICompatible:
                             yield piece
                         for call in delta.get("tool_calls") or []:
                             gather_call(streamed, call)
-                        finished = finished or bool(choice.get("finish_reason"))
+                        ended = choice.get("finish_reason") or ended
+                        finished = finished or bool(ended)
         except httpx.TimeoutException:
             raise ProviderError(f"{self.name} went silent for {self.read_seconds:.0f} s") from None
         except httpx.HTTPError as error:
@@ -785,7 +789,7 @@ class OpenAICompatible:
             return
         if not finished:
             raise ProviderError(f"{self.name} stopped before finishing its reply")
-        yield self._reply("".join(parts), [streamed[index] for index in sorted(streamed)], request, body, usage, answered_by, started)
+        yield self._reply("".join(parts), [streamed[index] for index in sorted(streamed)], request, body, usage, answered_by, started, ended)
 
     def _events(self, response: httpx.Response) -> Iterator[dict[str, Any] | None]:
         for line in response.iter_lines():

@@ -389,7 +389,7 @@ def create_app(assistant: Any) -> FastAPI:
             "object": "chat.completion",
             "created": created,
             "model": persona(),
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": result.text}, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": result.text}, "finish_reason": result.finish_reason}],
             "usage": usage_of(result),
             "assistant": public_result(result),
         }
@@ -408,7 +408,7 @@ def create_app(assistant: Any) -> FastAPI:
                 rest = item.text[len(sent) :] if item.text.startswith(sent) else ""
                 if rest:  # a notice that came after the model's words
                     yield words(rest)
-                yield server_sent({**envelope, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": usage_of(item), "assistant": public_result(item)})
+                yield server_sent({**envelope, "choices": [{"index": 0, "delta": {}, "finish_reason": item.finish_reason}], "usage": usage_of(item), "assistant": public_result(item)})
             else:
                 sent += item
                 yield words(item)

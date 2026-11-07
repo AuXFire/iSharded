@@ -860,3 +860,18 @@ def test_a_mesh_reads_tool_calls_from_the_stream_and_falls_back_when_it_has_none
     refuse["now"] = True
     reply = mesh.complete(request, "m")  # this model has no tool calling, so the prompt takes over
     assert reply.text == "plain" and mesh.tool_mode == "prompt"
+# How a reply ended
+
+
+@pytest.mark.parametrize("kind", [OpenAICompatible, MeshProvider])
+@pytest.mark.parametrize("said, read", [("length", "length"), ("stop", "stop"), ("tool_calls", "stop"), ("content_filter", "stop")])
+def test_a_reply_says_whether_the_limit_ended_it(kind, said, read):
+    with FakeModelServer([Reply(finish=said)]) as server:
+        assert kind("p", server.url).complete(request(), "m").finish_reason == read
+
+
+def test_a_stream_says_so_too():
+    with FakeModelServer([Reply(finish="length")]) as server:
+        assert list(OpenAICompatible("p", server.url).stream(request(), "m"))[-1].finish_reason == "length"
+
+

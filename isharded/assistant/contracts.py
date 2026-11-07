@@ -173,6 +173,7 @@ class ModelReply:
     prompt_tokens: int
     completion_tokens: int
     seconds: float
+    finish_reason: str = "stop"  # or length, when the token limit cut it short
 
 
 class Provider(Protocol):
