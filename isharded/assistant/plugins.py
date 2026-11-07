@@ -19,14 +19,16 @@ is trusting its code, and ``plugin add`` is a person's decision.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from functools import partial
 import hashlib
 import json
 import os
 from pathlib import Path
-import queue
 import re
 import threading
 from typing import Any
+
+from isharded.mcp_client import START_SECONDS, LineRpc, content_parts
 
 from .broker import DEFAULT_USER, is_person
 from .contracts import CallContext, Capability, Effect, Provenance, ToolResult, Trust
@@ -42,11 +44,8 @@ MAX_TIMEOUT = 3600.0
 DEFAULT_MEMORY_MB = 2048
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_STDERR_BYTES = 64 * 1024
-MAX_LINE_BYTES = 8 * 1024 * 1024
-MAX_TOOLS = 500
 MAX_SUMMARY = 200
 MCP_PROTOCOL = "2025-06-18"
-MCP_START_SECONDS = 20.0
 
 SCHEMA = [
     """
@@ -72,6 +71,15 @@ class ToolError(Exception):
     """It answered properly, and the answer was an error. The plugin itself is fine."""
 
 
+class ToolChanged(Exception):
+    """A server changed what a tool claims. Not a crash: it did it on purpose, or was changed."""
+
+
+def require_person(by: str, action: str) -> None:
+    if not is_person(by):
+        raise ValueError(f"{by or 'Nobody'} is not a person, and only a person can {action} a plugin.")
+
+
 def parse_effects(words: Sequence[str]) -> list[str]:
     effects = []
     for word in words:
@@ -92,19 +100,15 @@ def fingerprint(tool: dict[str, Any]) -> str:
 
 def text_of(content: Any) -> str:
     """The text of an MCP result, saying what was left out."""
-    if not isinstance(content, list):
-        return ""
-    parts = []
-    for item in content:
-        if isinstance(item, dict) and item.get("type") == "text":
-            parts.append(str(item.get("text", "")))
-        else:
-            parts.append(f"[{item.get('type', 'unknown') if isinstance(item, dict) else 'unknown'} content omitted]")
-    return "\n".join(parts)
+    return "\n".join(content_parts(content)) if isinstance(content, list) else ""
 
 
-class McpSession:
-    """A stdio MCP client: JSON-RPC, one message per line, over a long-lived process."""
+class McpSession(LineRpc):
+    """A stdio MCP client over a long-lived process, held in the sandbox's process walls."""
+
+    failure = PluginFailure
+    refusal = ToolError
+    ensure_ascii = True
 
     def __init__(self, command: Sequence[str], cwd: str | None, env: dict[str, str], memory_mb: int) -> None:
         try:
@@ -112,101 +116,16 @@ class McpSession:
         except OSError as error:
             raise PluginFailure(f"it would not start: {error}") from None
         self.stderr = CappedReader(self.tree.process.stderr, MAX_STDERR_BYTES)
-        self.lock = threading.Lock()
-        self.next_id = 0
-        self.waiting: dict[int, queue.Queue[dict[str, Any] | None]] = {}
-        self.alive = True
-        threading.Thread(target=self._read, daemon=True).start()
+        super().__init__(self.tree.process.stdin, self.tree.process.stdout)
 
-    def _read(self) -> None:
-        stream = self.tree.process.stdout
-        try:
-            while True:
-                line = stream.readline(MAX_LINE_BYTES + 1)
-                if not line or len(line) > MAX_LINE_BYTES:
-                    break
-                self._receive(line)
-        except (OSError, ValueError):
-            pass  # the pipe closed under us
-        self.alive = False
-        with self.lock:
-            boxes = list(self.waiting.values())
-        for box in boxes:
-            box.put(None)
+    def _too_slow(self, method: str, timeout: float) -> str:
+        return f"{method} took longer than {timeout:g} seconds"
 
-    def _receive(self, line: bytes) -> None:
-        try:
-            message = json.loads(line)
-        except ValueError:
-            return  # some servers print banners; they cannot stand in for a reply
-        if not isinstance(message, dict):
-            return
-        if "method" in message:
-            if "id" in message:
-                self._answer_server(message)
-            return
-        with self.lock:
-            box = self.waiting.get(message.get("id"))  # type: ignore[arg-type]
-        if box:
-            box.put(message)
-
-    def _answer_server(self, message: dict[str, Any]) -> None:
-        """A server gets nothing from us: no model to sample, no folders to list."""
-        if message["method"] == "ping":
-            self._send({"jsonrpc": "2.0", "id": message["id"], "result": {}})
-        else:
-            self._send({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32601, "message": "Not offered."}})
-
-    def _send(self, message: dict[str, Any]) -> None:
-        data = json.dumps(message, separators=(",", ":")).encode() + b"\n"
-        try:
-            with self.lock:
-                self.tree.process.stdin.write(data)
-                self.tree.process.stdin.flush()
-        except (OSError, ValueError):
-            raise PluginFailure("it stopped listening") from None
-
-    def request(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
-        with self.lock:
-            self.next_id += 1
-            number = self.next_id
-            box: queue.Queue[dict[str, Any] | None] = queue.Queue(1)
-            self.waiting[number] = box
-        try:
-            self._send({"jsonrpc": "2.0", "id": number, "method": method, "params": params})
-            reply = box.get(timeout=timeout)
-        except queue.Empty:
-            raise PluginFailure(f"{method} took longer than {timeout:g} seconds") from None
-        finally:
-            with self.lock:
-                self.waiting.pop(number, None)
-        if reply is None:
-            raise PluginFailure("it stopped while answering")
-        if "error" in reply:
-            error = reply["error"]
-            raise ToolError(str(error.get("message", error)) if isinstance(error, dict) else str(error))
-        result = reply.get("result")
-        return result if isinstance(result, dict) else {}
-
-    def start(self, timeout: float = MCP_START_SECONDS) -> None:
+    def start(self) -> None:
         identity = {"name": "isharded-assistant", "version": "1"}
         # We offer no sampling and no roots: a server cannot call back into a model.
-        self.request("initialize", {"protocolVersion": MCP_PROTOCOL, "capabilities": {}, "clientInfo": identity}, timeout)
+        self.request("initialize", {"protocolVersion": MCP_PROTOCOL, "capabilities": {}, "clientInfo": identity}, START_SECONDS)
         self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-
-    def list_tools(self, timeout: float = MCP_START_SECONDS) -> list[dict[str, Any]]:
-        tools: list[dict[str, Any]] = []
-        cursor = None
-        while len(tools) < MAX_TOOLS:
-            page = self.request("tools/list", {"cursor": cursor} if cursor else {}, timeout)
-            tools += [tool for tool in page.get("tools", []) if isinstance(tool, dict)]
-            cursor = page.get("nextCursor")
-            if not cursor:
-                break
-        return tools[:MAX_TOOLS]
-
-    def call_tool(self, name: str, arguments: dict[str, Any], timeout: float) -> dict[str, Any]:
-        return self.request("tools/call", {"name": name, "arguments": arguments}, timeout)
 
     def close(self) -> None:
         self.tree.close()
@@ -240,8 +159,7 @@ class Plugins:
         env: Sequence[str] = (),
     ) -> list[str]:
         """Install from a manifest, or re-enable it if it is the same. Returns its capabilities."""
-        if not is_person(by):
-            raise ValueError(f"{by or 'Nobody'} is not a person, and only a person can install a plugin.")
+        require_person(by, "install")
         file = Path(path)
         try:
             manifest = json.loads(file.read_text(encoding="utf-8"))
@@ -355,12 +273,13 @@ class Plugins:
 
     def _install(self, spec: dict[str, Any], by: str) -> None:
         name = spec["name"]
-        existing = self.store.one("SELECT spec FROM plugins WHERE name = ?", (name,))
-        same = existing is not None and json.loads(existing["spec"]) == spec
+        row = self.store.one("SELECT spec FROM plugins WHERE name = ?", (name,))
+        existing = json.loads(row["spec"]) if row is not None else None
+        same = existing == spec
         with self.lock:
             self._drop_session(name)
         if existing is not None and not same:
-            self._forget(name, json.loads(existing["spec"]), by)  # what was granted was for the old claims
+            self._forget(existing, by)  # what was granted was for the old claims
         with self.store.transaction():
             self.store.execute(
                 "INSERT INTO plugins (name, protocol, spec, enabled, failures, installed_by, installed_at) VALUES (?, ?, ?, 1, 0, ?, ?) "
@@ -387,31 +306,24 @@ class Plugins:
                 scope_field=entry["scope_field"],
                 idempotent=entry["idempotent"],
             )
-            broker.register(capability, self._handler(name, entry))
+            broker.register(capability, partial(self.call, name, entry))
 
-    def _handler(self, name: str, entry: dict[str, Any]) -> Any:
-        def run(arguments: dict[str, Any], context: CallContext) -> ToolResult:
-            return self.call(name, entry, arguments, context)
-
-        return run
-
-    def _forget(self, name: str, spec: dict[str, Any], by: str) -> int:
-        revoked = 0
+    def _forget(self, spec: dict[str, Any], by: str) -> None:
+        broker = self.broker
+        if broker is None:
+            return
         for entry in spec["capabilities"]:
-            if self.broker is not None:
-                self.broker.unregister(entry["name"])
-                revoked += self.broker.revoke_capability(entry["name"], by)
-        return revoked
+            broker.unregister(entry["name"])
+            broker.revoke_capability(entry["name"], by)
 
     def remove(self, name: str, by: str = DEFAULT_USER) -> bool:
-        if not is_person(by):
-            raise ValueError(f"{by or 'Nobody'} is not a person, and only a person can remove a plugin.")
+        require_person(by, "remove")
         row = self.store.one("SELECT spec FROM plugins WHERE name = ?", (name,))
         if row is None:
             return False
         with self.lock:
             self._drop_session(name)
-        self._forget(name, json.loads(row["spec"]), by)
+        self._forget(json.loads(row["spec"]), by)
         with self.store.transaction():
             self.store.execute("DELETE FROM plugins WHERE name = ?", (name,))
             self.audit.record(by, "plugin.remove", name, {})
@@ -523,7 +435,7 @@ class Plugins:
 
     def _call_mcp(self, name: str, spec: dict[str, Any], entry: dict[str, Any], arguments: dict[str, Any]) -> ToolResult:
         try:
-            result = self._session(name, spec).call_tool(entry["tool"], arguments, spec["timeout"])
+            result = self._session(name, spec).request("tools/call", {"name": entry["tool"], "arguments": arguments}, spec["timeout"])
         except ToolChanged as changed:
             return self._result(name, False, f"Tool {changed} changed what it claims since it was installed, so plugin {name} is turned off.")
         except ToolError as error:
@@ -544,10 +456,6 @@ class Plugins:
         with self.lock:
             for name in list(self.sessions):
                 self._drop_session(name)
-
-
-class ToolChanged(Exception):
-    """A server changed what a tool claims. Not a crash: it did it on purpose, or was changed."""
 
 
 def attach(assistant: Any) -> None:

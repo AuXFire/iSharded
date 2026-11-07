@@ -12,6 +12,7 @@ so otherwise it could plant a command there for a later "read" to run outside.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+import fnmatch
 import hashlib
 import ipaddress
 import json
@@ -32,7 +33,7 @@ import psutil
 
 from .broker import path_within
 from .contracts import CallContext, Capability, Effect, Provenance, Reach, ToolResult, Trust
-from .sandbox import KEPT_EVERYWHERE, KEPT_ON_WINDOWS, WINDOWS, run_tree, scrubbed_env
+from .sandbox import KEPT, run_tree, scrubbed_env
 
 MAX_READ_BYTES = 1024 * 1024
 MAX_LIST_ENTRIES = 2000
@@ -80,6 +81,10 @@ def path_property(words: str) -> dict[str, Any]:
 
 def schema(required: list[str], **properties: Any) -> dict[str, Any]:
     return {"type": "object", "required": required, "properties": properties, "additionalProperties": False}
+
+
+def both_streams(stdout: str, stderr: str) -> str:
+    return "\n".join(part for part in (stdout, stderr) if part)
 
 
 def is_public(address: str) -> bool:
@@ -303,8 +308,6 @@ class Builtins:
 
     def files_search(self, arguments: dict[str, Any], context: CallContext) -> ToolResult:
         """Plain text only. A regular expression from a model could hang this process."""
-        import fnmatch
-
         root = self._usable(arguments["path"])
         ignore = arguments.get("ignore_case", False)
         wanted = arguments["text"].lower() if ignore else arguments["text"]
@@ -339,11 +342,11 @@ class Builtins:
         if os.path.isdir(path):
             raise Refusal("That is a folder, not a file.")
         data = arguments["content"].encode("utf-8", "surrogatepass")
-        undo = self._keep_previous(path, digest(data), context.user)
-        folder = os.path.dirname(path)
-        os.makedirs(folder, exist_ok=True)
+        written = digest(data)
+        undo = self._keep_previous(path, written, context.user)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         replace_atomically(path, data)
-        return self.result("files.write", True, f"Wrote {len(data)} bytes.", {"bytes": len(data), "sha256": digest(data), "undo": undo}, path)
+        return self.result("files.write", True, f"Wrote {len(data)} bytes.", {"bytes": len(data), "sha256": written, "undo": undo}, path)
 
     def _keep_previous(self, path: str, written: str, user: str) -> str:
         undo = f"{int(self.clock() * 1000):015d}-{secrets.token_hex(4)}"
@@ -400,7 +403,7 @@ class Builtins:
         if hasattr(sandbox, "stop") and context.task_id:
             options["label"] = context.task_id  # so cancelling the task stops this
         run = sandbox.run(arguments["command"], Path(folder), **options)
-        output = "\n".join(part for part in (run.stdout, run.stderr) if part)
+        output = both_streams(run.stdout, run.stderr)
         data = {
             "exit_code": run.exit_code,
             "timed_out": run.timed_out,
@@ -458,10 +461,12 @@ class Builtins:
         left = max(deadline - time.monotonic(), 0.1)
         verify: Any = trust_store() if parts.scheme == "https" else True
         try:
-            with httpx.Client(verify=verify, trust_env=False, follow_redirects=False, timeout=left) as client:
-                with client.stream("GET", pinned, headers=headers, extensions={"sni_hostname": name}) as response:
-                    body, cut = self._read_limited(response, limit, deadline)
-                    return response.status_code, response.headers.get("location"), response.headers.get("content-type", ""), body, cut
+            with (
+                httpx.Client(verify=verify, trust_env=False, follow_redirects=False, timeout=left) as client,
+                client.stream("GET", pinned, headers=headers, extensions={"sni_hostname": name}) as response,
+            ):
+                body, cut = self._read_limited(response, limit, deadline)
+                return response.status_code, response.headers.get("location"), response.headers.get("content-type", ""), body, cut
         except httpx.HTTPError as error:
             raise Refusal(f"Could not fetch that page: {type(error).__name__}: {error}") from None
 
@@ -479,34 +484,34 @@ class Builtins:
 
     # Other parts.
 
+    def _part(self, attribute: str, tool: str, label: str) -> Any:
+        part = getattr(self.assistant, attribute, None)
+        if part is None:
+            raise Refusal(f"{tool} needs the {label} part, which is not installed.")
+        return part
+
     def memory_search(self, arguments: dict[str, Any], context: CallContext) -> ToolResult:
-        memory = getattr(self.assistant, "memory", None)
-        if memory is None:
-            raise Refusal("memory.search needs the memory part, which is not installed.")
+        memory = self._part("memory", "memory.search", "memory")
         return self._items("memory.search", memory.search(context.user, arguments["query"], arguments.get("limit", 8)))
 
     def library_search(self, arguments: dict[str, Any], context: CallContext) -> ToolResult:
-        library = getattr(self.assistant, "library", None)
-        if library is None:
-            raise Refusal("library.search needs the knowledge part, which is not installed.")
+        library = self._part("library", "library.search", "knowledge")
         return self._items("library.search", library.search(context.user, arguments["query"], arguments.get("limit", 8)))
 
     def _items(self, name: str, items: Any) -> ToolResult:
-        found = list(items)
-        lines, sources = [], []
-        for number, item in enumerate(found, 1):
+        lines, sources, reaches = [], [], []
+        for number, item in enumerate(items, 1):
             provenance = getattr(item, "provenance", None)
             source = getattr(provenance, "source_id", "") if provenance else ""
+            if provenance:
+                reaches.append(provenance.reach)
             sources.append(source)
             lines.append(f"[{number}] {getattr(item, 'text', item)}" + (f" ({source})" if source else ""))
         # The strictest item decides how far all of this may go.
-        reaches = [item.provenance.reach for item in found if getattr(item, "provenance", None)]
-        return self.result(name, True, "\n".join(lines), {"count": len(found), "sources": sources}, reach=min(reaches, default=Reach.POOL))
+        return self.result(name, True, "\n".join(lines), {"count": len(lines), "sources": sources}, reach=min(reaches, default=Reach.POOL))
 
     def memory_remember(self, arguments: dict[str, Any], context: CallContext) -> ToolResult:
-        memory = getattr(self.assistant, "memory", None)
-        if memory is None:
-            raise Refusal("memory.remember needs the memory part, which is not installed.")
+        memory = self._part("memory", "memory.remember", "memory")
         # A tool call is a model or a task acting, never the person saying it.
         trust = Trust.EXTERNAL if context.tainted else Trust.MODEL
         # What is kept can be no freer than what it was written from, or a private file
@@ -548,7 +553,7 @@ class Builtins:
 
     def _git_env(self) -> dict[str, str]:
         """The owner's identity and keys, with the settings that could prompt or redirect removed."""
-        names = (*KEPT_EVERYWHERE, *(KEPT_ON_WINDOWS if WINDOWS else ()), "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "SSH_AUTH_SOCK")
+        names = (*KEPT, "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "SSH_AUTH_SOCK")
         environment = {name: os.environ[name] for name in names if name in os.environ}
         environment.update({"GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat", "GIT_EDITOR": "true", "GIT_ASKPASS": "", "SSH_ASKPASS": "", "LC_ALL": "C"})
         return environment
@@ -567,9 +572,9 @@ class Builtins:
         }
         return ["--no-pager", *(word for key, value in pinned.items() for word in ("-c", f"{key}={value}"))]
 
-    def _git_refuse_unsafe(self, repo: str) -> None:
+    def _git_refuse_unsafe(self, repo: str, environment: dict[str, str]) -> None:
         command = ["git", "config", "--show-scope", "--name-only", "--list"]
-        listed = run_tree(command, repo, self._git_env(), timeout=GIT_SECONDS)
+        listed = run_tree(command, repo, environment, timeout=GIT_SECONDS)
         if listed.exit_code != 0:
             return  # not a repository: the command itself will say so
         for line in listed.stdout.splitlines():
@@ -583,12 +588,13 @@ class Builtins:
 
     def _git(self, name: str, repo: str, words: list[str], timeout: float = GIT_SECONDS, data: dict[str, Any] | None = None) -> ToolResult:
         folder = self._usable(repo)
-        self._git_refuse_unsafe(folder)
+        environment = self._git_env()
+        self._git_refuse_unsafe(folder, environment)
         try:
-            ran = run_tree(["git", *self._git_flags(), *words], folder, self._git_env(), timeout=timeout, output_bytes=GIT_OUTPUT_BYTES)
+            ran = run_tree(["git", *self._git_flags(), *words], folder, environment, timeout=timeout, output_bytes=GIT_OUTPUT_BYTES)
         except OSError:
             raise Refusal("git is not installed.") from None
-        output = "\n".join(part for part in (ran.stdout, ran.stderr) if part)
+        output = both_streams(ran.stdout, ran.stderr)
         if ran.timed_out:
             output = f"{output}\nStopped after {timeout:g} seconds.".strip()
         return self.result(name, ran.exit_code == 0, output, {"exit_code": ran.exit_code, "timed_out": ran.timed_out, **(data or {})}, folder)

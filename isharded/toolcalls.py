@@ -12,6 +12,8 @@ the two can never disagree about what counts as a call.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
+from itertools import islice
 import json
 import re
 from typing import Any
@@ -24,6 +26,7 @@ THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
 # Written as special tokens by some models. Decoding drops those unless told not to.
 MARKER_TOKENS = ("<tool_call>", "</tool_call>", "[TOOL_CALLS]", "[ARGS]", "[CALL_ID]", "<|python_tag|>", THINK_OPEN, THINK_CLOSE)
 OBJECT = json.JSONDecoder()
+TOOL_CHOICE_RULE = 'tool_choice must be auto, none, required, or {"type": "function", "function": {"name": ...}}'
 
 
 class ToolRequestError(ValueError):
@@ -154,7 +157,7 @@ def _checked_names(tools: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
 def _named_choice(choice: dict[str, Any]) -> str:
     function = choice.get("function")
     if choice.get("type") != "function" or not isinstance(function, dict) or not isinstance(function.get("name"), str):
-        raise ToolRequestError('tool_choice must be auto, none, required, or {"type": "function", "function": {"name": ...}}')
+        raise ToolRequestError(TOOL_CHOICE_RULE)
     return function["name"]
 
 
@@ -163,7 +166,7 @@ def plan_tools(
 ) -> ToolPlan | None:
     """Check a request's tools. None means answer without any."""
     if isinstance(tool_choice, str) and tool_choice not in {"auto", "none", "required"}:
-        raise ToolRequestError('tool_choice must be auto, none, required, or {"type": "function", "function": {"name": ...}}')
+        raise ToolRequestError(TOOL_CHOICE_RULE)
     named = _named_choice(tool_choice) if isinstance(tool_choice, dict) else None
     schemas = _checked_names(tools or [])
     if not schemas:
@@ -269,6 +272,16 @@ def _closed_by(text: str, closer: str) -> int | None:
     return None if found < 0 else found + len(closer)
 
 
+def _value_end(text: str, start: int = 0) -> int | None:
+    """Where the JSON value after any space ends, or None if it is not whole yet."""
+    while start < len(text) and text[start].isspace():
+        start += 1
+    try:
+        return OBJECT.raw_decode(text, start)[1]
+    except ValueError:
+        return None
+
+
 class HermesCalls:
     """``<tool_call>{"name": ..., "arguments": ...}</tool_call>``: Qwen2.5, Qwen3, Hermes."""
 
@@ -353,6 +366,7 @@ class XmlCalls:
 
 
 NEW_MISTRAL = re.compile(r"\s*([\w.-]+)(?:\[CALL_ID\][^\[]*)?\[ARGS\](.*)\Z", re.S)
+MISTRAL_START = re.compile(r"\s*(?:[\[{]|[\w.-]*(?:\[|\Z))")
 
 
 class MistralCalls:
@@ -364,18 +378,12 @@ class MistralCalls:
 
     def end(self, opener: str, text: str) -> int | None:
         marker = text.find("[ARGS]")
-        start = marker + len("[ARGS]") if marker >= 0 else len(text) - len(text.lstrip())
-        if marker < 0 and text.lstrip()[:1] not in {"[", "{"}:
-            return None
-        while start < len(text) and text[start].isspace():
-            start += 1
-        try:
-            return OBJECT.raw_decode(text, start)[1]
-        except ValueError:
-            return None
+        if marker >= 0:
+            return _value_end(text, marker + len("[ARGS]"))
+        return _value_end(text) if text.lstrip()[:1] in {"[", "{"} else None
 
     def plausible(self, opener: str, text: str) -> bool:
-        return bool(re.match(r"\s*(?:[\[{]|[\w.-]*(?:\[|\Z))", text))
+        return bool(MISTRAL_START.match(text))
 
     def read(self, opener: str, text: str, schemas: dict[str, dict[str, Any]]) -> list[tuple[str, dict[str, Any]]] | None:
         match = NEW_MISTRAL.match(text)
@@ -394,14 +402,11 @@ class LlamaCalls:
     starts = ('{"name"', '{"parameters"')
 
     def end(self, opener: str, text: str) -> int | None:
-        start = len(text) - len(text.lstrip())
-        try:
-            return OBJECT.raw_decode(text, start)[1]
-        except ValueError:
-            return None
+        return _value_end(text)
 
     def plausible(self, opener: str, text: str) -> bool:
-        compact = re.sub(r"\s+", "", text)[:16]
+        # This runs on every token of a held call, so it stops as soon as it has enough.
+        compact = "".join(islice((char for char in text if not char.isspace()), 16))
         return any(start.startswith(compact) or compact.startswith(start) for start in self.starts)
 
     def read(self, opener: str, text: str, schemas: dict[str, dict[str, Any]]) -> list[tuple[str, dict[str, Any]]] | None:
@@ -423,10 +428,18 @@ def tool_deltas(call: dict[str, Any], index: int) -> list[dict[str, Any]]:
     return [{"tool_calls": [head]}, {"tool_calls": [{"index": index, "function": {"arguments": function["arguments"]}}]}]
 
 
+@lru_cache(maxsize=None)
+def _marker_starts(markers: tuple[str, ...]) -> tuple[frozenset[str], int]:
+    """Every start of a marker, and the size of the longest one that can be held."""
+    longest = max(map(len, markers)) - 1
+    return frozenset(marker[:size] for marker in markers for size in range(1, longest + 1)), longest
+
+
 def _unfinished(text: str, markers: tuple[str, ...]) -> int:
     """How much of the end of a text could be the start of a marker."""
-    for size in range(min(len(text), max(map(len, markers)) - 1), 0, -1):
-        if any(marker.startswith(text[-size:]) for marker in markers):
+    starts, longest = _marker_starts(markers)
+    for size in range(min(len(text), longest), 0, -1):
+        if text[-size:] in starts:
             return size
     return 0
 
@@ -444,6 +457,8 @@ class ReplyScanner:
 
     def __init__(self, plan: ToolPlan, thinking: bool = False, opening: str = "") -> None:
         self.plan = plan
+        self.forcing = plan.forced is not None
+        self.truncated = False
         self.style = FORMATS[plan.format]
         self.buffer = opening
         self.opening = opening
@@ -458,12 +473,13 @@ class ReplyScanner:
 
     def feed(self, text: str) -> list[dict[str, Any]]:
         self.buffer += text
-        return self._run(False, False)
+        return self._run(False)
 
     def finish(self, truncated: bool = False) -> list[dict[str, Any]]:
         """Settle what is left. ``truncated`` means the reply was cut off, so an open call stays unfinished."""
-        items = self._run(True, truncated)
-        if self.plan.forced is not None:
+        self.truncated = truncated
+        items = self._run(True)
+        if self.forcing:
             items += self._forced_outcome()
         elif not self.calls and self.spaces:
             items.append({"text": self.spaces})
@@ -478,10 +494,9 @@ class ReplyScanner:
         said = f"This request required {wanted}, and the model did not write a usable one, so no tool was called."
         return [{"text": f"{said} It wrote: {written}" if written.strip() else said}]
 
-    def _run(self, final: bool, truncated: bool) -> list[dict[str, Any]]:
+    def _run(self, final: bool) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
-        step = {"text": self._text, "think": self._think, "call": self._call}
-        while step[self.state](items, final, truncated):
+        while self.STEPS[self.state](self, items, final):
             pass
         return items
 
@@ -494,12 +509,12 @@ class ReplyScanner:
         if not kept:
             return
         self.fresh = self.fresh and not visible
-        if self.plan.forced is not None:
+        if self.forcing:
             self.held.append(kept)
         else:
             items.append({"text": kept})
 
-    def _think(self, items: list[dict[str, Any]], final: bool, truncated: bool) -> bool:
+    def _think(self, items: list[dict[str, Any]], final: bool) -> bool:
         closed = _closed_by(self.buffer, THINK_CLOSE)
         if closed is not None:
             self._show(items, self.buffer[:closed], visible=False)
@@ -522,7 +537,7 @@ class ReplyScanner:
                 return False
         return None
 
-    def _text(self, items: list[dict[str, Any]], final: bool, truncated: bool) -> bool:
+    def _text(self, items: list[dict[str, Any]], final: bool) -> bool:
         if self.after_call:
             swallowed = self._swallow_joiner(final)
             if swallowed is not None:
@@ -535,7 +550,7 @@ class ReplyScanner:
                 self.fresh = self.after_call = False
                 self.buffer, self.opener, self.state = start, "", "call"
                 return True
-        found = [(self.buffer.find(marker), marker) for marker in self.markers if marker in self.buffer]
+        found = [(position, marker) for marker in self.markers if (position := self.buffer.find(marker)) >= 0]
         if found:
             position, marker = min(found)
             self._show(items, self.buffer[:position], visible=bool(self.buffer[:position].strip()))
@@ -554,14 +569,14 @@ class ReplyScanner:
         self.buffer = self.buffer[len(self.buffer) - hold :]
         return False
 
-    def _call(self, items: list[dict[str, Any]], final: bool, truncated: bool) -> bool:
+    def _call(self, items: list[dict[str, Any]], final: bool) -> bool:
         end = self.style.end(self.opener, self.buffer)
         if end is None and not final:
             if self.style.plausible(self.opener, self.buffer):
                 return False
             self._give_up(items)
             return True
-        if end is None and truncated:
+        if end is None and self.truncated:
             self._written(items, self.opener + self.buffer)
             self.buffer, self.state = "", "text"
             return False
@@ -576,6 +591,8 @@ class ReplyScanner:
         self.state = "text"
         self.opener = ""
         return bool(self.buffer) or not final
+
+    STEPS = {"text": _text, "think": _think, "call": _call}
 
     def _give_up(self, items: list[dict[str, Any]]) -> None:
         """This is not a call after all, so what held it back was only text."""
