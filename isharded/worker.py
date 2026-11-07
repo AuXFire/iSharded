@@ -660,6 +660,7 @@ class WorkerRuntime:
     def _load_draft(self, request: ConfigureRequest, folder: str, threads: int) -> None:
         """Speculation only speeds things up, so a draft that fails must not stop the load."""
         self.speculate_tokens = request.speculate_tokens
+        self.draft_request = None  # a stage restart must not bring back the last model's draft
         if request.draft is None or request.assignment.start_layer != 0:
             return
         self.draft_request = (request, folder, threads)
@@ -706,6 +707,7 @@ class WorkerRuntime:
                 return retry
             self.last_error = str(lost)
             self.caches.clear()
+            draft = self.draft
             try:
                 assert self.gguf is not None
                 await asyncio.to_thread(self.gguf.respawn)
@@ -714,7 +716,7 @@ class WorkerRuntime:
                 return HTTPException(status_code=500, detail=self.last_error)
             self.stage_restarts += 1
         if self.draft_request is not None and not draft_apart():
-            await self.replace_draft(lost)  # it lived in that process
+            await self.replace_draft(lost, draft)  # it lived in that process
         return retry
 
     async def replace_draft(self, reason: Exception, failed: DraftModel | None = None) -> RuntimeError:
@@ -734,6 +736,17 @@ class WorkerRuntime:
             if self.draft_request is not None:
                 await asyncio.to_thread(self._load_draft, *self.draft_request)
         return lost
+
+    async def draft_failed(self, reason: LlamaError, draft: DraftModel) -> Exception:
+        """What a reply raises for a draft that failed.
+
+        A draft in the stage's process often hears first when that process dies. That is a
+        lost stage, which asks for a replay, and not a lost draft, which ends the stream.
+        """
+        shared = self.gguf is not None and draft.host.process is self.gguf.host.process
+        if isinstance(reason, StageLost) and shared and draft is self.draft:
+            return StageLost(str(reason), self.gguf.host)
+        return await self.replace_draft(reason, draft)
 
     @staticmethod
     def _stage_signature(request: ConfigureRequest) -> tuple[Any, ...]:
@@ -2357,7 +2370,7 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
         try:
             await prepared
         except LlamaError as exc:
-            raise await runtime.replace_draft(exc, draft) from exc
+            raise await runtime.draft_failed(exc, draft) from exc
         history = [*body.input_ids, token]
         produced = 1
         ahead = min(INITIAL_GUESSES, runtime.speculate_tokens)
@@ -2368,7 +2381,7 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             try:
                 guesses = await asyncio.to_thread(draft.guess, fresh, count, request.slot)
             except LlamaError as exc:
-                raise await runtime.replace_draft(exc, draft) from exc
+                raise await runtime.draft_failed(exc, draft) from exc
             runtime._record("draft", started)
             return guesses
 

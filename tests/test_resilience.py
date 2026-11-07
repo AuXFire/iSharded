@@ -1066,7 +1066,7 @@ def test_a_dead_stage_is_only_restarted_once():
             self.host = object()
 
     async def scenario():
-        worker = SimpleNamespace(replacing=asyncio.Lock(), gguf=Stage(), last_error=None, caches={}, stage_restarts=0, draft_request=None)
+        worker = SimpleNamespace(replacing=asyncio.Lock(), gguf=Stage(), last_error=None, caches={}, stage_restarts=0, draft=None, draft_request=None)
         lost = [StageLost("gone", current), StageLost("gone", current)]
         return await asyncio.gather(*(WorkerRuntime.replace_stage(worker, item) for item in lost))
 
@@ -1140,6 +1140,85 @@ def test_a_draft_in_its_own_process_outlives_a_stage_restart(monkeypatch):
     assert alive.closed == 0
     assert worker.draft is alive
     assert not worker.loads
+
+
+def test_a_new_model_without_a_draft_forgets_the_last_ones():
+    """A stage restart reloads what this holds, on a stage that may have no draft now."""
+    from types import SimpleNamespace
+
+    from isharded.worker import WorkerRuntime
+
+    worker = SimpleNamespace(speculate_tokens=4, draft_request=("the last model",))
+    for request in (
+        SimpleNamespace(speculate_tokens=0, draft=None, assignment=SimpleNamespace(start_layer=0)),
+        SimpleNamespace(speculate_tokens=0, draft=object(), assignment=SimpleNamespace(start_layer=12)),
+    ):
+        worker.draft_request = ("the last model",)
+        WorkerRuntime._load_draft(worker, request, "folder", 2)
+        assert worker.draft_request is None
+
+
+def test_a_stage_restart_keeps_the_draft_a_reply_already_replaced(monkeypatch):
+    from isharded.llamacpp import StageLost
+    from isharded.worker import WorkerRuntime
+
+    monkeypatch.delenv("ISHARDED_DRAFT_APART", raising=False)
+
+    async def scenario():
+        worker = draft_worker(RestartingStage())
+        worker.draft = dead = FakeDraft()
+        respawn = worker.gguf.respawn
+
+        def reply_gets_there_first():
+            respawn()
+            worker.draft = FakeDraft()
+
+        worker.gguf.respawn = reply_gets_there_first
+        await WorkerRuntime.replace_stage(worker, StageLost("gone", worker.gguf.host))
+        return worker, dead
+
+    worker, dead = asyncio.run(scenario())
+    assert not worker.loads
+    assert worker.draft is not dead and worker.draft.closed == 0
+
+
+def shared_draft():
+    """A worker whose draft lives in its stage's process."""
+    from types import SimpleNamespace
+
+    process = object()
+    worker = draft_worker(SimpleNamespace(host=SimpleNamespace(process=process)))
+    worker.draft = FakeDraft()
+    worker.draft.host = SimpleNamespace(process=process)
+    return worker
+
+
+def test_a_draft_that_hears_first_reports_the_stage_as_lost():
+    from isharded.llamacpp import StageLost
+    from isharded.worker import WorkerRuntime
+
+    worker = shared_draft()
+    answer = asyncio.run(WorkerRuntime.draft_failed(worker, StageLost("gone", object()), worker.draft))
+    assert isinstance(answer, StageLost) and answer.host is worker.gguf.host
+    assert not worker.loads, "the restart brings the draft back"
+
+
+@pytest.mark.parametrize("case", ["replaced", "own process", "not lost"])
+def test_a_draft_failure_alone_leaves_the_stage_running(case):
+    from types import SimpleNamespace
+
+    from isharded.llamacpp import LlamaError, StageLost
+    from isharded.worker import WorkerRuntime
+
+    worker = shared_draft()
+    draft = worker.draft
+    reason = LlamaError("decode failed") if case == "not lost" else StageLost("closed", object())
+    if case == "replaced":
+        worker.draft = FakeDraft()  # a closed connection reads as lost, and this process is fine
+    if case == "own process":
+        draft.host = SimpleNamespace(process=object())
+    answer = asyncio.run(WorkerRuntime.draft_failed(worker, reason, draft))
+    assert not isinstance(answer, StageLost)
 
 
 def test_replies_on_one_dead_draft_load_one_new_draft():

@@ -1265,7 +1265,7 @@ Guessing does not always pay, so the entry measures. It keeps whichever way has 
 
 For `qwen3`, `qwen3moe`, `qwen35`, and `qwen35moe` models the draft is chosen automatically (`Qwen3-0.6B` or `Qwen3.5-0.8B`, which share their vocabulary). Name another with `--draft`, or turn this off with `--no-draft`. A named draft must have the same vocabulary as the model, and a draft that cannot load leaves the model running without one.
 
-A draft keeps confirmed text on one sequence and its guesses on a scratch sequence, one of each per conversation. A guess that lands costs one decode. A wrong one drops the scratch sequence, adds what was confirmed in one batch, and copies the result to scratch again. Recurrent state cannot go back, so every draft works this way, and a miss costs the same however long the conversation is. The scratch sequences share the draft's cache and do not make it bigger.
+A draft keeps confirmed text on one sequence and its guesses on a scratch sequence, one of each per conversation. A guess that lands costs one decode. A wrong one drops the scratch sequence, adds what was confirmed in one batch, and copies the result to scratch again. Recurrent state cannot go back, so every draft works this way. A miss costs what was confirmed since the last one, however long the conversation is. The scratch sequences share the draft's key-value cache and do not make it bigger.
 
 ### Conversation reuse
 
