@@ -32,6 +32,7 @@ import httpx
 from . import __version__
 from .mcp_server import LEGACY_VERSIONS, MODERN_VERSIONS, NAME_PARAMETERS, SERVER_KEY, UNSUPPORTED_VERSION, VERSION_KEY, as_header, as_object, encode_line
 from .toolcalls import without_reasoning
+from .vision import MOST_IMAGE_BYTES, MOST_IMAGES, ImageRefused, check_image, read_image_url, too_much_image
 
 CLIENT_INFO = {"name": "isharded-mcp-run", "version": __version__}
 CLIENT_INFO_KEY = "io.modelcontextprotocol/clientInfo"
@@ -411,14 +412,71 @@ class HttpServer(McpConnection):
         self.client.close()
 
 
-def content_parts(content: Iterable[Any]) -> list[str]:
-    """The text of an MCP result, saying what was left out."""
+def omitted(item: Any, why: str = "") -> str:
+    """Says what was left out of a result, as far as a stranger's words can tell."""
+    fields = item if isinstance(item, dict) else {}
+    details = [str(fields["mimeType"])[:64]] if "mimeType" in fields else []
+    if details and isinstance(fields.get("data"), str):
+        details.append(f"{len(fields['data']) * 3 // 4} bytes")
+    said = f"[{fields.get('type', 'unknown')} content omitted"
+    return said + (": " + ", ".join(details) if details else "") + (f". {why}]" if why else "]")
+
+
+class ImageTray:
+    """Images from tools, on their way to a model.
+
+    What goes in is checked against the mesh's own limits, because one bad image
+    would otherwise have the mesh refuse the whole conversation.
+    """
+
+    def __init__(self, can_see: Callable[[], bool]) -> None:
+        self.can_see = can_see
+        self.sees: bool | None = None  # asked only if a tool sends an image
+        self.waiting: list[str] = []
+        self.taken = 0
+        self.taken_bytes = 0
+
+    def take(self, item: dict[str, Any]) -> str | None:
+        """Keep an image for the next message. Returns why not, if not."""
+        if self.sees is None:
+            self.sees = self.can_see()
+        if not self.sees:
+            return "This model cannot see images"
+        if not isinstance(item.get("mimeType"), str):
+            return "It named no type"
+        url = f"data:{item['mimeType']};base64,{item.get('data')}"
+        try:
+            data = read_image_url(url)
+            check_image(data)
+        except ImageRefused as exc:
+            return f"It could not be used: {exc}"
+        if self.taken >= MOST_IMAGES or self.taken_bytes + len(data) > MOST_IMAGE_BYTES:
+            return f"It would not fit: {too_much_image()}, at most {MOST_IMAGES} in all"
+        self.taken += 1
+        self.taken_bytes += len(data)
+        self.waiting.append(url)
+        return None
+
+    def message(self) -> dict[str, Any] | None:
+        """Everything waiting, as the one kind of message that can hold images."""
+        if not self.waiting:
+            return None
+        images = [{"type": "image_url", "image_url": {"url": url}} for url in self.waiting]
+        self.waiting = []
+        return {"role": "user", "content": [{"type": "text", "text": TOOL_IMAGES_NOTE}, *images]}
+
+
+def content_parts(content: Iterable[Any], tray: ImageTray | None = None) -> list[str]:
+    """The text of an MCP result, saying what was left out. A ``tray`` takes the images it can."""
     parts = []
     for item in content:
         if isinstance(item, dict) and item.get("type") == "text":
             parts.append(str(item.get("text", "")))
+        elif tray is not None and isinstance(item, dict) and item.get("type") == "image":
+            why = tray.take(item)
+            parts.append(omitted(item, why) if why else f"[image from this tool: {item['mimeType'][:64]}, in the next message]")
         else:
-            parts.append(f"[{item.get('type', 'unknown') if isinstance(item, dict) else 'unknown'} content omitted]")
+            parts.append(omitted(item))
     return parts
 
 
@@ -433,9 +491,9 @@ def input_refusal(result: dict[str, Any]) -> str:
     return f"The tool stopped to ask for more input, and this client has no way to give any, so it did not finish.{wanted} Call it again with what it needs in the arguments, or tell the person what it asked for."
 
 
-def result_text(result: dict[str, Any]) -> str:
+def result_text(result: dict[str, Any], tray: ImageTray | None = None) -> str:
     """What a tool sent back, as the text a model will read."""
-    parts = content_parts(result.get("content") or [])
+    parts = content_parts(result.get("content") or [], tray)
     if not parts and result.get("structuredContent") is not None:
         parts.append(json.dumps(result["structuredContent"], ensure_ascii=False))
     text = "\n".join(parts)
@@ -476,7 +534,7 @@ class Toolbox:
         annotations = self.tools[name][1].get("annotations")
         return isinstance(annotations, dict) and annotations.get("readOnlyHint") is True
 
-    def call(self, name: str, arguments: dict[str, Any], timeout: float) -> str:
+    def call(self, name: str, arguments: dict[str, Any], timeout: float, tray: ImageTray | None = None) -> str:
         server, tool = self.tools[name]
         try:
             result = server.request("tools/call", {"name": tool["name"], "arguments": arguments}, timeout)
@@ -486,7 +544,7 @@ class Toolbox:
             return f"The tool failed: {exc}"
         if result.get("resultType") == "input_required":
             return input_refusal(result)
-        text = result_text(result)
+        text = result_text(result, tray)
         return f"The tool reported an error: {text}" if result.get("isError") else text
 
 
@@ -506,7 +564,9 @@ def ask_at_terminal(name: str, arguments: dict[str, Any]) -> bool:
     return answer.strip().lower() in {"y", "yes"}
 
 
-def run_call(toolbox: Toolbox, call: dict[str, Any], allowed: set[str], timeout: float, ask: Callable[[str, dict[str, Any]], bool]) -> str:
+def run_call(
+    toolbox: Toolbox, call: dict[str, Any], allowed: set[str], timeout: float, ask: Callable[[str, dict[str, Any]], bool], tray: ImageTray | None = None
+) -> str:
     function = call["function"]
     name = function["name"]
     if name not in toolbox.tools:
@@ -520,7 +580,7 @@ def run_call(toolbox: Toolbox, call: dict[str, Any], allowed: set[str], timeout:
     if not (toolbox.read_only(name) or name in allowed or ask(name, arguments)):
         return "The person running this did not allow that call. Answer without it, or say what you would need."
     print(f"Calling {name} with {json.dumps(arguments, ensure_ascii=False)}", file=sys.stderr)
-    return toolbox.call(name, arguments, timeout)
+    return toolbox.call(name, arguments, timeout, tray)
 
 
 def ask_model(client: httpx.Client, body: dict[str, Any]) -> dict[str, Any]:
@@ -534,6 +594,15 @@ def ask_model(client: httpx.Client, body: dict[str, Any]) -> dict[str, Any]:
     return response.json()["choices"][0]
 
 
+def model_sees(client: httpx.Client, model: str) -> bool:
+    """Whether the mesh says this model can see. If it will not say, no: a refused image would end the run."""
+    try:
+        rows = client.get("/v1/models").json().get("data", [])
+    except (httpx.HTTPError, ValueError, AttributeError):
+        return False
+    return any(isinstance(row, dict) and row.get("id") == model and row.get("vision") is True for row in rows)
+
+
 def agent_loop(
     client: httpx.Client, toolbox: Toolbox, model: str, prompt: str, allowed: set[str], max_turns: int, max_tokens: int | None, timeout: float,
     ask: Callable[[str, dict[str, Any]], bool] = ask_at_terminal,
@@ -541,6 +610,7 @@ def agent_loop(
     """Let the model call tools until it answers. Returns the answer, or raises CutOff with what there is of it."""
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
     tools = toolbox.for_model()
+    tray = ImageTray(lambda: model_sees(client, model))
     for _ in range(max_turns):
         body: dict[str, Any] = {"model": model, "messages": messages, "tools": tools}
         if max_tokens:
@@ -555,7 +625,10 @@ def agent_loop(
             return answer
         messages.append(message)
         for call in calls:
-            messages.append({"role": "tool", "tool_call_id": call["id"], "content": run_call(toolbox, call, allowed, timeout, ask)})
+            messages.append({"role": "tool", "tool_call_id": call["id"], "content": run_call(toolbox, call, allowed, timeout, ask, tray)})
+        shown = tray.message()
+        if shown:
+            messages.append(shown)
     raise ServerError(f"the model was still calling tools after {max_turns} turns. Raise --max-turns, or ask for less")
 
 

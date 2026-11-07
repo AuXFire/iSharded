@@ -71,6 +71,7 @@ from isharded.mcp_server import (
 )
 from isharded.protocol import StageAssignment
 from isharded.tokenizer import ChatTokenizer
+from isharded.vision import MOST_IMAGES, chat_images
 
 ROOT = Path(__file__).resolve().parents[1]
 TEST_SERVER = Path(__file__).with_name("mcp_test_server.py")
@@ -1705,3 +1706,100 @@ def test_what_a_server_asks_cannot_flood_the_model():
     assert len(Toolbox([FakeServer("a", ["pay"], {"resultType": "input_required", "inputRequests": asks})]).call("pay", {}, 5)) < 1000
 
 
+# --- images in tool results
+
+
+PICTURE = base64.b64encode(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR" + struct.pack(">II", 2, 2) + b"rest").decode()
+IMAGE = {"type": "image", "mimeType": "image/png", "data": PICTURE}
+
+
+def seeing_model(*replies, vision=True):
+    """A scripted mesh that also answers /v1/models."""
+    asked = []
+    remaining = list(replies)
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "small", "kind": "chat", "vision": vision}]})
+        asked.append(json.loads(request.content))
+        reply = remaining.pop(0)
+        if reply != "look":
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": reply}, "finish_reason": "stop"}]})
+        calls = [{"id": "call_0", "type": "function", "function": {"name": reply, "arguments": "{}"}}]
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": calls}, "finish_reason": "tool_calls"}]})
+
+    return httpx.Client(transport=httpx.MockTransport(answer), base_url="http://mesh"), asked
+
+
+def tool_with(*content) -> Toolbox:
+    toolbox = Toolbox([FakeServer("a", ["look"], {"content": list(content)})])
+    server, tool = toolbox.tools["look"]
+    toolbox.tools["look"] = (server, {**tool, "annotations": {"readOnlyHint": True}})
+    return toolbox
+
+
+def test_a_model_that_can_see_is_shown_a_tools_image():
+    client, asked = seeing_model("look", "It is a cat.")
+    assert run_loop(client, tool_with({"type": "text", "text": "here"}, IMAGE)) == "It is a cat."
+    messages = asked[1]["messages"]
+    assert "here" in tool_results(asked)[0] and "in the next message" in tool_results(asked)[0]
+    assert messages[-1]["role"] == "user" and "no request from the person" in messages[-1]["content"][0]["text"]
+    assert messages[-1]["content"][1] == {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{PICTURE}"}}
+    plain, images = chat_images(messages)
+    assert len(images) == 1 and len(plain) == len(messages), "the mesh itself must take this as it is"
+
+
+def test_an_image_is_shown_once_and_stays_in_the_conversation():
+    client, asked = seeing_model("look", "look", "Done.")
+    run_loop(client, tool_with(IMAGE))
+    assert sum(message["role"] == "user" and isinstance(message["content"], list) for message in asked[2]["messages"]) == 2
+
+
+def test_a_model_that_cannot_see_is_told_what_it_missed():
+    client, asked = seeing_model("look", "I cannot tell.", vision=False)
+    run_loop(client, tool_with(IMAGE))
+    said = tool_results(asked)[0]
+    assert said.startswith("[image content omitted: image/png, ") and "bytes. This model cannot see images]" in said
+    assert not any(isinstance(message["content"], list) for message in asked[1]["messages"])
+
+
+def test_a_model_the_mesh_will_not_describe_is_treated_as_blind():
+    def answer(request):
+        if request.url.path == "/v1/models":
+            return httpx.Response(500, text="no")
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "Done."}, "finish_reason": "stop"}]})
+
+    assert mcp_client.model_sees(httpx.Client(transport=httpx.MockTransport(answer), base_url="http://mesh"), "small") is False
+
+
+def test_the_mesh_is_only_asked_about_sight_if_a_tool_sends_an_image(started):
+    client, asked = scripted_model([("add", {"a": 2, "b": 3})], "It is 5.")
+    assert run_loop(client, Toolbox([started()])) == "It is 5."
+
+
+@pytest.mark.parametrize(
+    "image, words",
+    [
+        ({"type": "image", "mimeType": "image/png", "data": "!!!not base64"}, "not valid base64"),
+        ({"type": "image", "mimeType": "image/png", "data": base64.b64encode(b"just some bytes").decode()}, "not an image"),
+        ({"type": "image", "data": PICTURE}, "named no type"),
+    ],
+)
+def test_one_bad_image_does_not_end_the_run(image, words):
+    client, asked = seeing_model("look", "Done.")
+    assert run_loop(client, tool_with(image)) == "Done."
+    assert words in tool_results(asked)[0]
+    assert len(asked[1]["messages"]) == 3, "nothing for the mesh to refuse"
+
+
+def test_images_past_the_mesh_limit_are_named_and_the_rest_still_go():
+    client, asked = seeing_model("look", "Done.")
+    run_loop(client, tool_with(*[IMAGE] * (MOST_IMAGES + 1)))
+    assert tool_results(asked)[0].count("would not fit") == 1
+    plain, images = chat_images(asked[1]["messages"])
+    assert len(images) == MOST_IMAGES
+
+
+def test_without_anywhere_to_put_an_image_the_text_says_what_it_was():
+    assert result_text({"content": [IMAGE]}).startswith("[image content omitted: image/png, ")
+    assert result_text({"content": [{"type": "audio", "mimeType": "audio/wav", "data": "AAAA"}]}) == "[audio content omitted: audio/wav, 3 bytes]"

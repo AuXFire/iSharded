@@ -702,6 +702,12 @@ def test_a_tool_that_needs_input_is_a_failed_call_that_says_so(assistant, mcp):
     assert not result.ok and "did not finish" in result.output and "Which account?" in result.output
 
 
+def test_an_image_a_plugin_cannot_carry_is_described(assistant, mcp):
+    (name,) = assistant.plugins.add(mcp.manifest([tool_named("picture")]))
+    grant(assistant, name)
+    assert invoke(assistant, name).output == "[image content omitted: image/png, 3 bytes]"
+
+
 def test_a_server_that_will_not_start_is_refused_at_install(assistant, tmp_path):
     path = write_plugin(tmp_path, "import sys; sys.exit(1)", protocol="mcp")
     with pytest.raises(ValueError, match="Could not talk"):
