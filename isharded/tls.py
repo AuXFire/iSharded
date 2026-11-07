@@ -84,7 +84,8 @@ def node_proven() -> None:
 def probe_options() -> list[tuple[int, int, int]]:
     """Socket options that have the system probe a connection while it sits idle."""
     options = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
-    timing = {"TCP_KEEPIDLE": PROBE_IDLE_SECONDS, "TCP_KEEPINTVL": PROBE_INTERVAL_SECONDS, "TCP_KEEPCNT": PROBE_COUNT}
+    idle = "TCP_KEEPIDLE" if hasattr(socket, "TCP_KEEPIDLE") else "TCP_KEEPALIVE"  # a Mac has only the second
+    timing = {idle: PROBE_IDLE_SECONDS, "TCP_KEEPINTVL": PROBE_INTERVAL_SECONDS, "TCP_KEEPCNT": PROBE_COUNT}
     return options + [(socket.IPPROTO_TCP, getattr(socket, name), value) for name, value in timing.items() if hasattr(socket, name)]
 
 

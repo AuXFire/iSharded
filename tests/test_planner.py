@@ -12,7 +12,6 @@ import pytest
 from isharded import cli, planner
 from isharded.gguf import holds_both_kinds
 from isharded.orchestrator import Orchestrator
-from isharded import planner
 from isharded.planner import Candidate, ModelProfile, PlacementError, keep_layers, memory_report, plan_placement, stored_bytes
 from isharded.protocol import LoadModelRequest, MemoryPool, TensorRef, WeightUnit
 

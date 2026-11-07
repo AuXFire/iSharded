@@ -389,3 +389,12 @@ def test_idle_connections_get_probed_on_both_sides():
     with serving_at(answers_at_once, http=Recording) as port:
         assert asyncio.run(ask(port)) == "ok"
     assert seen["server"]
+
+
+def test_a_mac_gets_its_probes_at_the_same_idle_time(monkeypatch):
+    """A Mac calls the idle time TCP_KEEPALIVE. Missing it there leaves the system's two hours."""
+    from isharded.tls import PROBE_IDLE_SECONDS, probe_options
+
+    monkeypatch.delattr(socket, "TCP_KEEPIDLE", raising=False)
+    monkeypatch.setattr(socket, "TCP_KEEPALIVE", 0x10, raising=False)
+    assert (socket.IPPROTO_TCP, 0x10, PROBE_IDLE_SECONDS) in probe_options()
