@@ -11,8 +11,10 @@ from __future__ import annotations
 from collections.abc import Iterable
 import json
 from datetime import datetime
+from functools import lru_cache
 from typing import Any
 
+from jinja2 import Template
 from jinja2.exceptions import TemplateError
 from jinja2.ext import loopcontrols
 from jinja2.sandbox import ImmutableSandboxedEnvironment
@@ -63,6 +65,20 @@ def _parse_tokenizer(text: str) -> Tokenizer:
             raise WeightSourceError(f"tokenizer.json could not be parsed: {original}") from original
         data["model"]["merges"] = [" ".join(pair) for pair in merges]
         return Tokenizer.from_str(json.dumps(data))
+
+
+@lru_cache(maxsize=16)
+def compiled_template(source: str) -> Template:
+    """A chat template, ready to render. Compiling is slow, and every request renders twice."""
+    environment = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=[loopcontrols])
+    environment.filters["tojson"] = template_json
+
+    def raise_exception(message: str) -> None:
+        raise TemplateError(message)
+
+    environment.globals["raise_exception"] = raise_exception
+    environment.globals["strftime_now"] = lambda spec: datetime.now().strftime(spec)
+    return environment.from_string(source)
 
 
 class MarkerDecoder:
@@ -132,20 +148,12 @@ class ChatTokenizer:
         if not template:
             lines = [f"{item['role'].title()}: {item['content']}" for item in messages]
             return "\n".join(lines) + ("\nAssistant:" if add_generation_prompt else "\n")
-        environment = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=[loopcontrols])
-        environment.filters["tojson"] = template_json
-
-        def raise_exception(message: str) -> None:
-            raise TemplateError(message)
-
-        environment.globals["raise_exception"] = raise_exception
-        environment.globals["strftime_now"] = lambda spec: datetime.now().strftime(spec)
         options: dict[str, Any] = {}
         if enable_thinking is not None:
             options["enable_thinking"] = enable_thinking
         if tools:
             options["tools"] = tools
-        return environment.from_string(template).render(
+        return compiled_template(template).render(
             messages=messages,
             add_generation_prompt=add_generation_prompt,
             **self.special_tokens,
@@ -220,9 +228,8 @@ def tokenizer_from_gguf(header: GgufHeader) -> ChatTokenizer:
         if header.get(key) is not None
     }
     special = {"bos_token": "", "eos_token": "", "pad_token": "", "unk_token": ""}
-    for name in ("bos", "eos", "padding", "unknown"):
+    for name, label in (("bos", "bos"), ("eos", "eos"), ("padding", "pad"), ("unknown", "unk")):
         index = header.get(f"tokenizer.ggml.{name}_token_id")
-        label = {"padding": "pad", "unknown": "unk"}.get(name, name)
         if index is not None and int(index) < len(tokens):
             special[f"{label}_token"] = tokens[int(index)]
     return ChatTokenizer(tokenizer, header.get("tokenizer.chat_template"), stops, special, gguf_marks(header), header.get("tokenizer.chat_template.tool_use"))
