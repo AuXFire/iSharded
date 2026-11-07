@@ -1060,6 +1060,35 @@ def test_settling_does_not_wait_on_a_ring_known_to_be_lost() -> None:
     assert asyncio.run(with_door(lambda identity: b"", use))
 
 
+def test_a_lost_ring_still_ends_the_replys_generation() -> None:
+    async def use(client):
+        await waiting_ring(client, ring_live=False).ring_settle(0)
+        return 0 in client.generations
+
+    assert asyncio.run(with_door(lambda identity: b"", use)) is False
+
+
+def test_a_pipe_that_fails_to_close_still_ends_the_replys_generation(monkeypatch) -> None:
+    released = []
+
+    async def broken():
+        raise RuntimeError("the pipe broke")
+
+    async def release(slot):
+        released.append(slot)
+
+    async def use(client):
+        item = waiting_ring(client, pipes={0: SimpleNamespace(close=broken)}, slot_used_at={}, gate=SimpleNamespace(release=release))
+        monkeypatch.setattr(worker_module, "runtime", item)
+        with pytest.raises(RuntimeError, match="the pipe broke"):
+            await worker_module.finish_reply(0)
+        return 0 in client.generations
+
+    monkeypatch.setattr(worker_module, "pass_seconds", lambda tokens, hops=1: 0.05)
+    assert asyncio.run(with_door(lambda identity: b"", use)) is False
+    assert released == [0]
+
+
 def test_settling_stops_when_the_ring_is_lost_during_the_wait() -> None:
     """Another reply can find the stage lost while this one waits on the same ring."""
 

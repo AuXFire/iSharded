@@ -1290,6 +1290,7 @@ class WorkerRuntime:
                 return
             left -= SETTLE_LOOK_SECONDS
         self.ring_live = False
+        await client.settled(slot, 0)  # it ends the reply's generation, which a lost ring still needs
 
     def ring_refused(self, refused: EngineRefusal) -> HTTPException:
         """The error the HTTP path would have raised, so recovery is the same."""
@@ -2597,9 +2598,11 @@ async def state_in_reach(key: str) -> bool:
 async def finish_reply(slot: int) -> None:
     try:
         pipe = runtime.pipes.pop(slot, None)
-        if pipe is not None:
-            await pipe.close()
-        await runtime.ring_settle(slot)
+        try:
+            if pipe is not None:
+                await pipe.close()
+        finally:
+            await runtime.ring_settle(slot)  # it ends the reply's generation, so it always runs
     finally:
         runtime.slot_used_at[slot] = time.monotonic()
         await runtime.gate.release(slot)
