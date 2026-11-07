@@ -104,10 +104,9 @@ class ControlMesh:
 
     def targets(self) -> set[str]:
         """Every address worth gossiping to, including ones not heard from yet."""
-        known = {peer.url for peer in self.peers.values()}
         now = self.clock()
         self.rumors = {url: heard for url, heard in self.rumors.items() if now - heard < RUMOR_SECONDS}
-        return (known | set(self.rumors) | set(self.seeds)) - {self.url} - self.barred
+        return (self.known_urls() | set(self.rumors) | set(self.seeds)) - {self.url} - self.barred
 
     def forget(self, names: Iterable[str]) -> None:
         """Stop talking to revoked nodes, so nothing of theirs comes back in a reply."""
@@ -136,16 +135,7 @@ class ControlMesh:
         if sender == self.node_id:
             return False
         self.peers[sender] = Peer(sender, clean_url(message["url"]), self.clock())
-        known = {peer.url for peer in self.peers.values()} | {self.url} | self.barred
-        for url in message.get("peers", []):
-            try:
-                heard = clean_url(url)
-            except ValueError:
-                continue  # one bad address must not cost the rest of the message
-            if heard not in known and (heard in self.rumors or len(self.rumors) < MAX_RUMORS):
-                self.rumors[heard] = self.clock()
-        for url in known:
-            self.rumors.pop(url, None)
+        self._hear_of(message.get("peers", []))
 
         term = int(message.get("term", 0))
         claimed = message.get("leader_id")
@@ -163,6 +153,24 @@ class ControlMesh:
             self.leader_id = str(claimed)
         elif term > self.term:
             self.term = term
+        self._take_state(message, sender)
+        return was_leader and not self.is_leader
+
+    def _hear_of(self, urls: Iterable[Any]) -> None:
+        """Note the addresses a peer passed on that this node does not know yet."""
+        known = self.known_urls() | self.barred
+        for url in urls:
+            try:
+                heard = clean_url(url)
+            except ValueError:
+                continue  # one bad address must not cost the rest of the message
+            if heard not in known and (heard in self.rumors or len(self.rumors) < MAX_RUMORS):
+                self.rumors[heard] = self.clock()
+        for url in known:
+            self.rumors.pop(url, None)
+
+    def _take_state(self, message: dict[str, Any], sender: str) -> None:
+        """Keep what the leader sent, unless this node already holds something newer."""
         replica = message.get("replica")
         if replica is not None and sender == self.leader_id and message.get("replica_version", 0) >= self.replica_version:
             self.replica = replica
@@ -171,7 +179,6 @@ class ControlMesh:
         if isinstance(lanes, dict) and sender == self.leader_id and int(message.get("lanes_version", 0)) >= self.lanes_version:
             self.lanes = lanes
             self.lanes_version = int(message["lanes_version"])
-        return was_leader and not self.is_leader
 
     def _outranks(self, term: int, candidate: str) -> bool:
         """Whether a claimed leader beats the one this node follows."""
