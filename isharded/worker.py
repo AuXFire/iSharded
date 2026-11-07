@@ -1130,30 +1130,43 @@ class WorkerRuntime:
         """
         return self.rewinds and len(self.route) > 1 and self.ring_ready(request)
 
+    def _ring_entry(self, request: InferRequest) -> CacheEntry:
+        """This session's entry, marked as having left the Python path."""
+        entry = self.caches.get(request.session_id)
+        if entry is None or entry.epoch != request.epoch:
+            raise retry_error("this session's state is gone")
+        entry.ring = True
+        return entry
+
+    @staticmethod
+    def _ring_pass(request: InferRequest, position: int, rollback_to: int | None, tokens: list[int], verify: bool = False) -> dict[str, Any]:
+        return {
+            "epoch": request.epoch,
+            "slot": request.slot,
+            "position": position,
+            "rollback_to": rollback_to,
+            "tokens": tokens,
+            "guesses": tokens[1:] if verify else [],
+            "verify": verify,
+            "temperature": request.temperature,
+            "top_p": request.top_p,
+            "top_k": request.top_k,
+            "seed": request.seed,
+        }
+
+    def _ring_silent(self) -> HTTPException:
+        self.ring_live = False
+        return retry_error("a pass did not come back")
+
     def ring_send(self, request: InferRequest, token: int, position: int, rollback_to: int | None) -> asyncio.Future[list[int]]:
         """One pass along the ring, not waited for. Passes run in the order they are sent."""
         assert self.ring_client is not None
-        entry = self.caches.get(request.session_id)
-        if entry is None or entry.epoch != request.epoch:
-            raise HTTPException(status_code=503, detail={"retry": True, "message": "this session's state is gone"})
-        entry.ring = True
+        entry = self._ring_entry(request)
         entry.length = position + 1
         self.inference_calls += 1
         self.tokens_processed += 1
         try:
-            return self.ring_client.send(
-                epoch=request.epoch,
-                slot=request.slot,
-                position=position,
-                rollback_to=rollback_to,
-                tokens=[token],
-                guesses=[],
-                verify=False,
-                temperature=request.temperature,
-                top_p=request.top_p,
-                top_k=request.top_k,
-                seed=request.seed,
-            )
+            return self.ring_client.send(**self._ring_pass(request, position, rollback_to, [token]))
         except EngineRefusal as refused:
             raise self.ring_refused(refused) from refused
 
@@ -1163,8 +1176,7 @@ class WorkerRuntime:
         except EngineRefusal as refused:
             raise self.ring_refused(refused) from refused
         except asyncio.TimeoutError as exc:
-            self.ring_live = False
-            raise HTTPException(status_code=503, detail={"retry": True, "message": "a pass did not come back"}) from exc
+            raise self._ring_silent() from exc
 
     async def ring_settle(self, slot: int) -> None:
         """Waits for a slot's passes, so none reaches a stage after the next reply has begun."""
@@ -1175,43 +1187,29 @@ class WorkerRuntime:
     def ring_refused(self, refused: EngineRefusal) -> HTTPException:
         """The error the HTTP path would have raised, so recovery is the same."""
         if refused.refusal == REFUSE_EPOCH:
-            return HTTPException(status_code=409, detail=f"pipeline epoch mismatch; worker has {self.epoch}")
+            return epoch_error(self.epoch)
         if refused.refusal == REFUSE_STAGE_ERROR:
             return HTTPException(status_code=500, detail={"stage_error": refused.message})
         # A dead link does not say a worker is dead: its stage may just need restarting. So
         # nobody is blamed here. The replay runs over HTTP, which finds out what really
         # happened, and a worker that is still there keeps its place and its weights.
         self.ring_live = False
-        return HTTPException(status_code=503, detail={"retry": True, "message": refused.message})
+        return retry_error(refused.message)
 
     async def ring_step(self, request: InferRequest) -> dict[str, Any]:
         """One pass along the ring. Nothing on this machine waits on a stage but this."""
         assert self.ring_client is not None
-        entry = self.caches.get(request.session_id)
-        if entry is None or entry.epoch != request.epoch:
-            raise HTTPException(status_code=503, detail={"retry": True, "message": "this session's state is gone"})
+        entry = self._ring_entry(request)
         position = entry.length if request.rollback_to is None else min(entry.length, request.rollback_to)
-        entry.ring = True
         try:
             tokens = await self.ring_client.run(
                 pass_seconds(len(request.input_ids), len(self.route)),
-                epoch=request.epoch,
-                slot=request.slot,
-                position=position,
-                rollback_to=request.rollback_to,
-                tokens=request.input_ids,
-                guesses=request.input_ids[1:] if request.verify else [],
-                verify=request.verify,
-                temperature=request.temperature,
-                top_p=request.top_p,
-                top_k=request.top_k,
-                seed=request.seed,
+                **self._ring_pass(request, position, request.rollback_to, request.input_ids, request.verify),
             )
         except EngineRefusal as refused:
             raise self.ring_refused(refused) from refused
         except asyncio.TimeoutError as exc:
-            self.ring_live = False
-            raise HTTPException(status_code=503, detail={"retry": True, "message": "a pass did not come back"}) from exc
+            raise self._ring_silent() from exc
         entry.length = position + len(request.input_ids)
         self.inference_calls += 1
         self.tokens_processed += len(request.input_ids)
