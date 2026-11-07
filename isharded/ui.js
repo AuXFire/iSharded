@@ -372,11 +372,11 @@ const UI = (() => {
       const stop = make('li', `route-stop${stage.trouble ? ` ${stage.trouble}` : ''}`);
       const who = make('span', 'route-who');
       if (stage.trouble) who.insertAdjacentHTML('beforeend', glyphHtml(stage.trouble));
-      const name = make('button', 'name-link', stage.workerId);
-      name.type = 'button'; name.dataset.worker = stage.workerId; name.dataset.key = `r:${stage.workerId}`;
+      const name = make(options.plain ? 'span' : 'button', options.plain ? '' : 'name-link', stage.workerId);
+      if (!options.plain) { name.type = 'button'; name.dataset.worker = stage.workerId; name.dataset.key = `r:${stage.workerId}`; }
       who.append(name);
       const note = stage.worker?.quarantined ? ', quarantined' : stage.trouble === 'bad' ? ', not answering' : stage.slowest && stages.length > 1 ? ', slowest stage' : stage.spilledBytes ? `, ${bytes(stage.spilledBytes)} below its best memory` : '';
-      stop.append(make('span', 'route-no', stage.n), who, make('span', 'route-val', ms(stage.computeMs)), make('span', 'route-sub', `Layers ${span(stage.start, stage.end)}${note}`));
+      stop.append(make('span', 'route-no', stage.n), who, make('span', 'route-val', ms(stage.computeMs)), make('span', 'route-sub', `Layers ${span(stage.start, stage.end)}${note}${options.memory && stage.tiers.length ? `, ${options.memory(stage)}` : ''}`));
       if (stage.computeMs != null && slowest) { const bar = make('span', 'route-bar'), fill = make('i'); fill.style.width = `${stage.computeMs / slowest * 100}%`; bar.append(fill); stop.append(bar); }
       if (stage.moving) {
         const move = make('div', 'route-move', `${stage.moving.to}: ${bytes(stage.moving.bytesDone)} of ${bytes(stage.moving.bytesTotal)}`), bar = make('div', 'lay'), fill = make('i');
