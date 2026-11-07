@@ -121,25 +121,26 @@ impl<'a> Cursor<'a> {
         Ok(head)
     }
 
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], WireError> {
+        let mut value = [0; N];
+        value.copy_from_slice(self.take(N)?);
+        Ok(value)
+    }
+
     fn byte(&mut self) -> Result<u8, WireError> {
         Ok(self.take(1)?[0])
     }
 
     fn word(&mut self) -> Result<u16, WireError> {
-        let bytes = self.take(2)?;
-        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+        Ok(u16::from_le_bytes(self.array()?))
     }
 
     fn int(&mut self) -> Result<u32, WireError> {
-        let bytes = self.take(4)?;
-        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        Ok(u32::from_le_bytes(self.array()?))
     }
 
     fn long(&mut self) -> Result<u64, WireError> {
-        let bytes = self.take(8)?;
-        let mut value = [0; 8];
-        value.copy_from_slice(bytes);
-        Ok(u64::from_le_bytes(value))
+        Ok(u64::from_le_bytes(self.array()?))
     }
 
     fn float(&mut self) -> Result<f32, WireError> {
@@ -270,10 +271,9 @@ impl Pass {
         let tokens = cursor.tokens()?;
         let rows = cursor.int()?;
         let width = cursor.int()?;
-        let data = cursor.data.to_vec();
         let element = if flags & FLAG_BF16 != 0 { 2 } else { 4 };
         let expected = (rows as usize).checked_mul(width as usize).and_then(|cells| cells.checked_mul(element));
-        if expected != Some(data.len()) {
+        if expected != Some(cursor.data.len()) {
             return Err(WireError::Invalid("rows do not match their size"));
         }
         if flags & FLAG_TOKENS != 0 && (tokens.is_empty() || rows != 0) {
@@ -284,7 +284,7 @@ impl Pass {
         }
         let sampling = Sampling { temperature, top_p, top_k, seed: (seeded != 0).then_some(seed) };
         let rollback_to = (rollback != u32::MAX).then_some(rollback);
-        Ok(Pass { id, epoch, slot, position, rollback_to, flags, sampling, guesses, tokens, rows, width, data })
+        Ok(Pass { id, epoch, slot, position, rollback_to, flags, sampling, guesses, tokens, rows, width, data: cursor.data.to_vec() })
     }
 }
 
@@ -296,16 +296,11 @@ pub struct Ack {
 
 impl Ack {
     pub fn encode(&self) -> Vec<u8> {
-        let mut frame = start_frame(Kind::Ack, 8);
-        frame.extend_from_slice(&self.id.to_le_bytes());
-        finish_frame(frame)
+        beat(Kind::Ack, self.id)
     }
 
     pub fn decode(body: &[u8]) -> Result<Ack, WireError> {
-        let mut cursor = Cursor { data: body };
-        let id = cursor.long()?;
-        cursor.finished()?;
-        Ok(Ack { id })
+        Ok(Ack { id: read_beat(body)? })
     }
 }
 
@@ -403,6 +398,7 @@ fn floor_char_boundary(text: &str, mut index: usize) -> usize {
 }
 
 /// A link's heartbeat, and its answer. The stamp comes back unchanged, to time the link.
+/// An acknowledgement has the same shape, with the pass's id for a stamp.
 pub fn beat(kind: Kind, stamp: u64) -> Vec<u8> {
     let mut frame = start_frame(kind, 8);
     frame.extend_from_slice(&stamp.to_le_bytes());
@@ -456,8 +452,7 @@ impl Hello {
             _ => return Err(WireError::Invalid("unknown role")),
         };
         let epoch = cursor.long()?;
-        let mut nonce = [0; NONCE_BYTES];
-        nonce.copy_from_slice(cursor.take(NONCE_BYTES)?);
+        let nonce = cursor.array()?;
         cursor.finished()?;
         Ok(Hello { role, epoch, nonce })
     }
@@ -475,11 +470,8 @@ pub fn read_hello_ok(body: &[u8]) -> Result<([u8; NONCE_BYTES], [u8; MAC_BYTES])
     if body.len() != NONCE_BYTES + MAC_BYTES {
         return Err(WireError::Invalid("wrong size"));
     }
-    let mut nonce = [0; NONCE_BYTES];
-    let mut mac = [0; MAC_BYTES];
-    nonce.copy_from_slice(&body[..NONCE_BYTES]);
-    mac.copy_from_slice(&body[NONCE_BYTES..]);
-    Ok((nonce, mac))
+    let mut cursor = Cursor { data: body };
+    Ok((cursor.array()?, cursor.array()?))
 }
 
 /// The dialling side's proof that it holds the route's key.
