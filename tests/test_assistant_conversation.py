@@ -1062,3 +1062,30 @@ def test_a_failed_turn_is_a_failure_and_not_a_cancel(assistant):
     scripted(assistant, RuntimeError("no model"))
     assert assistant.conversation.say("alice", "Hello there", learn="off").status == "failed"
     assert cancelled(assistant) == []
+
+
+class Streams(ScriptedRouter):
+    def stream(self, request):
+        reply = self.complete(request)
+        yield reply.text
+        yield reply
+
+
+def test_ctrl_c_during_a_tool_keeps_what_was_said_once(assistant):
+    assistant.broker = FakeBroker()
+    assistant.broker.add("notes.read", output=KeyboardInterrupt())
+    assistant.router = Streams(model_reply("Looking.", ToolCall("notes.read", {})))
+    with pytest.raises(KeyboardInterrupt):
+        list(assistant.conversation.stream("alice", "Read my notes", "chat-1", learn="off"))
+    assert [row["content"] for row in assistant.memory.recent("alice", "chat-1") if row["role"] == "assistant"] == ["Looking."]
+    assert len(cancelled(assistant)) == 1
+
+
+def test_ctrl_c_while_a_turn_is_being_prepared_leaves_an_audit_row(assistant, monkeypatch):
+    def interrupted(*_args, **_options):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(assistant.context, "build", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        assistant.conversation.say("alice", "Hello there", learn="off")
+    assert len(cancelled(assistant)) == 1

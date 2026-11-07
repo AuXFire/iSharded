@@ -246,6 +246,9 @@ class Conversation:
         except ContextTooSmall as error:
             yield self._finish(turn, "failed", str(error))
             return
+        except KeyboardInterrupt:
+            self._finish(turn, "cancelled", "")
+            raise
         yield from self._advance(turn, streaming)
 
     def _build(self, turn: Turn) -> None:
@@ -303,6 +306,7 @@ class Conversation:
                     yield self._failed(turn, error, "".join(partial))
                     return
                 self._note_reply(turn, reply)
+                partial = []
                 if not reply.tool_calls or final_round:
                     yield self._finish(turn, "done", "")
                     return
