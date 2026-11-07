@@ -185,7 +185,7 @@
 
   <script>
     /* isharded:ui.js */
-    const { routeModel, drawBoard, drawRouteList, drawRail, focusStage, keyStages, sparkline, glyphHtml, tierOf, median, num, bytes, ms, duration, relative, clock, count, whole, span, modelName, jobRunning, TIER_ORDER } = UI;
+    const { routeModel, drawBoard, drawRouteList, drawRail, focusStage, keyStages, sparkline, glyphHtml, tierOf, median, num, bytes, ms, duration, relative, clock, count, whole, span, modelName, jobRunning, relayout, needsTorch, runsTorch, TIER_ORDER } = UI;
     const $ = id => document.getElementById(id);
     const store = {
       get: key => { try { return localStorage.getItem(key); } catch { return null; } },
@@ -197,7 +197,7 @@
       samples: [], polling: false, timer: null, failures: 0, signedOut: false, problem: '', updatedAt: null, lastMembers: {},
       text: '', chip: 'all', group: store.get('isharded-group') || 'state', sortKey: 'state', sortDir: 1, groupsOpen: new Map(), limit: 50,
       allStages: false, allRoute: false, openStage: null, allNeeds: false, feed: 'all', openWorker: null, selected: '', previewTimer: null, previewId: 0, markKey: '', confirmRun: null,
-      joins: [], joinsHidden: false, joinsAt: 0, joinBusy: new Set(), joinErrors: new Map(),
+      joins: [], joinsHidden: false, joinsAt: 0, joinBusy: new Set(), joinErrors: new Map(), repairJob: null, keysChecked: false, keys: null,
     };
     const phone = matchMedia('(max-width: 760px)');
 
@@ -335,6 +335,13 @@
       if (data.status === 'ready' && route.length > 1 && entry?.ring && entry.ring_live === false) issues.push({ tone: 'info', title: 'Direct links are down', detail: 'Tokens are using the slower HTTP path.' });
       const battery = Object.entries(state.inventory).filter(([, item]) => item.battery && item.battery.on_mains === false).map(([node]) => node);
       if (battery.length) issues.push({ tone: 'info', title: `${count(battery.length, 'machine')} on battery`, detail: battery.slice(0, 4).join(', ') + (battery.length > 4 ? ` and ${battery.length - 4} more` : '') });
+      // Only information: nothing can apply a proposal, so this offers a closer look and no button.
+      const proposal = data.proposal;
+      if (proposal) issues.push({
+        tone: 'info', title: `Another order would save ${num(proposal.saved_ms_per_token)} ms a token`,
+        detail: `The same machines in a shorter loop: ${num(proposal.current.loop_ms)} ms a loop now, ${num(proposal.proposed.loop_ms)} ms then. Moving there fetches ${bytes(proposal.moved_bytes)} and pays for itself after ${whole(proposal.break_even_tokens)} tokens. Nothing has moved, and nothing here applies it. To look closer:`,
+        command: `isharded plan --url ${location.origin} --token YOUR_ADMIN_KEY`,
+      });
 
       issues.sort((a, b) => ['bad', 'warn', 'info'].indexOf(a.tone) - ['bad', 'warn', 'info'].indexOf(b.tone));
       const alerts = issues.filter(issue => issue.tone !== 'info');
@@ -349,7 +356,14 @@
         const where = `${count(route.length, 'stage')} on ${count(machineCount(route, data), 'machine')}`;
         return look('idle', '', 'Healthy', 'Serving, and nothing needs you', speed ? `${where}, ${rate(speed)} tokens/s.` : `${where}. No replies yet.`);
       }
-      if (running && route.length && job.model === data.model && model) {
+      // In a repair's last seconds the server clears the route while every stage takes its layers.
+      // The page remembers the repair, so that does not read as a first load.
+      if (relayout(data) && !route.length) {
+        const repair = state.repairJob === job.job_id;
+        return look('work', 'work', repair ? 'Repairing' : 'Loading', repair ? `Finishing the repair of ${name}` : `Moving ${name} to its new layout`, 'Every stage is taking its layers. New replies wait until the route is whole.');
+      }
+      if (relayout(data) && model) {
+        state.repairJob = job.job_id;
         const moving = model.stages.filter(stage => stage.moving);
         const wait = `New replies wait until the route is whole again${left != null ? `, about ${left} s at this rate` : ''}.`;
         if (moving.length === 1) return look('work', 'work', 'Repairing', `Moving stage ${moving[0].n} off ${moving[0].workerId}`, wait);
@@ -432,13 +446,19 @@
     }
 
     const sizeBytes = text => { const match = /([\d.]+)\s*(MB|GB|TB)/i.exec(text || ''); return match ? Number(match[1]) * { MB: 1e6, GB: 1e9, TB: 1e12 }[match[2].toUpperCase()] : 0; };
+    // A pool where no worker has PyTorch can run only GGUF models, so the rest say why they would fail.
+    const torchless = data => { const live = Object.values(data?.workers || {}).filter(worker => worker.live); return live.length > 0 && !live.some(runsTorch); };
     function modelRows(models, budget) {
-      return models.map(model => { const big = budget && sizeBytes(model.size) > budget; return `<li><button class="model-row${big ? ' too-big' : ''}" type="button" data-model="${esc(model.id)}" data-key="m:${esc(model.id)}" aria-pressed="${model.id === state.selected}"><span class="id">${esc(modelName(model.id))}</span><span class="meta">${esc(big ? 'Larger than this pool' : model.kind)}</span><span class="meta">${esc(model.size)}</span></button></li>`; }).join('');
+      const noTorch = torchless(state.data);
+      return models.map(model => {
+        const big = budget && sizeBytes(model.size) > budget, why = noTorch && needsTorch(model.id) ? 'Needs PyTorch, which no worker here has' : big ? 'Larger than this pool' : '';
+        return `<li><button class="model-row${why ? ' too-big' : ''}" type="button" data-model="${esc(model.id)}" data-key="m:${esc(model.id)}" aria-pressed="${model.id === state.selected}"><span class="id">${esc(modelName(model.id))}</span><span class="meta">${esc(why || model.kind)}</span><span class="meta">${esc(model.size)}</span></button></li>`;
+      }).join('');
     }
     const memoryMeter = (kind, used, budget) => `<div class="mem-row"><div><span>${esc(TIERS[kind]?.[0] || kind)}</span><span>${bytes(used)} of ${bytes(budget)}</span></div><div class="meter" role="img" aria-label="${budget ? Math.round(used / budget * 100) : 0} percent in use">${used ? `<i class="tier-${TIERS[kind] ? kind : 'disk'}" style="width:${(used / budget * 100).toFixed(1)}%"></i>` : ''}</div></div>`;
     function firstRun(data) {
       const { budget } = memoryOf(data);
-      const fit = (state.catalog || []).filter(model => !budget || sizeBytes(model.size) <= budget).sort((a, b) => sizeBytes(b.size) - sizeBytes(a.size)).slice(0, 6);
+      const fit = (state.catalog || []).filter(model => (!budget || sizeBytes(model.size) <= budget) && !(torchless(data) && needsTorch(model.id))).sort((a, b) => sizeBytes(b.size) - sizeBytes(a.size)).slice(0, 6);
       const list = state.catalogFailed ? '<p class="list-note">The model list could not be read. You can still load a model by name.</p>' : state.catalog ? (fit.length ? `<ul class="model-list">${modelRows(fit, budget)}</ul>` : '<p class="list-note">No listed model fits this memory. Add a machine, or load a smaller model by name.</p>') : '<p class="list-note">Reading the model list</p>';
       return `<div class="first-run"><div><p>Nothing is loaded. Pick a model to see where it would run before anything downloads.</p><p class="capacity-note">Each machine holds only its share, so a model can be larger than any one of them.</p></div><div><h2>Models that fit</h2><div class="scroll-list">${list}</div><p class="capacity-note"><button class="link" type="button" data-action="load" data-key="all-models">See every model</button></p></div></div>`;
     }
@@ -458,7 +478,8 @@
       if (issue.stage) buttons.push(`<button class="btn small" type="button" data-show-stage="${issue.stage}" data-key="i:s:${key}">Show on the route</button>`);
       if (issue.filter) buttons.push(`<button class="btn small" type="button" data-action="show-attention" data-key="i:f:${key}">Show them</button>`);
       if (issue.retry) buttons.push(`<button class="btn small" type="button" data-model="${esc(issue.retry)}" data-key="i:r:${key}">Try again</button>`);
-      return `<div class="issue">${glyphHtml(mark)}<div class="issue-body"><b>${esc(issue.title)}</b><p>${esc(issue.detail)}</p>${buttons.length ? `<div class="issue-actions">${buttons.slice(0, 2).join('')}</div>` : ''}</div></div>`;
+      const command = issue.command ? `<code class="issue-command">${esc(issue.command)}</code>` : '';
+      return `<div class="issue">${glyphHtml(mark)}<div class="issue-body"><b>${esc(issue.title)}</b><p>${esc(issue.detail)}</p>${command}${buttons.length ? `<div class="issue-actions">${buttons.slice(0, 2).join('')}</div>` : ''}</div></div>`;
     }
     function renderNeeds(view) {
       const slot = phone.matches ? $('needsTop') : $('needsBay'), other = phone.matches ? $('needsBay') : $('needsTop');
@@ -728,6 +749,8 @@
       const slots = data.active_plan?.slots;
       parts.push(fact('Epoch', data.epoch), fact('Machines', data.virtual_hardware?.hosts ?? 0), fact('Requests', whole(metrics.requests_total)), fact('Tokens', whole(metrics.tokens_generated)), fact('Recoveries', whole(metrics.recoveries_total)), fact('Up', duration(data.uptime_seconds)));
       if (slots != null) parts.push(fact('Reply slots', slots));
+      const live = Object.values(data.workers || {}).filter(worker => worker.live), torch = live.filter(runsTorch).length;
+      if (live.length) parts.push(fact('PyTorch models', torch ? `${torch} of ${count(live.length, 'worker')} can run them` : 'No worker can run them, only GGUF'));
       if ((data.cordoned_nodes || []).length) parts.push(fact('Cordoned', data.cordoned_nodes.join(', ')));
       if (data.cache_url) parts.push(fact('KV cache', 'Protected in RAM'));
       parts.push(fact('Updated', clock(state.updatedAt)));
@@ -779,7 +802,7 @@
         <section class="detail"><h3>Live readings</h3>${readings(id)}</section>
         <section class="detail"><h3>Placement</h3>${row('Layer range', a ? span(a.start_layer, a.end_layer) : 'Not on the active route')}${row('Pipeline epoch', rt.epoch ?? '—')}${row('Address', w.advertised_url)}${flagged(w.country) ? row('Country', countryName(w.country)) : ''}</section>
         <section class="detail"><h3>Memory for weights</h3>${(rt.memory_pools || hw.memory_pools || []).map(pool => row(`${TIERS[pool.kind]?.[0] || pool.kind} (${pool.pool_id})`, `${bytes(pool.used_bytes || 0)} of ${bytes(pool.budget_bytes)}, ${pool.dtype}, ${pool.bandwidth_gbps} GB/s`)).join('') || row('Pools', 'None')}</section>
-        <section class="detail"><h3>Hardware</h3>${row('Machine', hw.host_id || '—')}${row('Backend', (hw.backend || '—').toUpperCase())}${row('Runtime', hw.runtime_version || '—')}${row('Accelerator', hw.accelerator_name || 'None')}${row('Accelerator memory', bytes(hw.accelerator_memory_bytes))}${row('System memory', bytes(hw.ram_total_bytes))}${row('CPU cores', hw.cpu_cores ?? '—')}</section>
+        <section class="detail"><h3>Hardware</h3>${row('Machine', hw.host_id || '—')}${row('Backend', (hw.backend || '—').toUpperCase())}${row('Runtime', hw.runtime_version || '—')}${row('Accelerator', hw.accelerator_name || 'None')}${row('PyTorch models', hw.pytorch === false ? 'No PyTorch here, so GGUF only' : hw.backend === 'vulkan' ? 'Not on a Vulkan GPU, so GGUF only' : 'Can run them')}${row('Accelerator memory', bytes(hw.accelerator_memory_bytes))}${row('System memory', bytes(hw.ram_total_bytes))}${row('CPU cores', hw.cpu_cores ?? '—')}</section>
         <section class="detail"><h3>Contribution</h3>${row('Roles', (contribution.roles || []).join(', ') || '—')}${row('CPU threads', contribution.cpu_threads ?? 0)}${row('RAM budget', bytes(contribution.ram_budget_bytes))}${row('Accelerator budget', bytes(contribution.accelerator_memory_budget_bytes))}${row('Standby', contribution.standby ? 'Yes' : 'No')}</section>
         <section class="detail"><h3>Telemetry</h3>${row('Round trip', `${num(w.control_latency_ms)} ms`)}${row('Local compute', `${num(tel.compute_ms_ema)} ms`)}${row('Downstream', `${num(tel.downstream_ms_ema)} ms`)}${row('Tokens processed', tel.tokens_processed ?? 0)}${row('Activations sent', bytes(tel.activation_bytes_sent))}${row('KV snapshots sent', tel.kv_snapshots_sent ?? 0)}${row('KV restores', tel.kv_restores ?? 0)}${row('RAM cache used', bytes(cache.used_bytes))}${row('RAM cache budget', bytes(cache.budget_bytes))}</section>
       </div>`);

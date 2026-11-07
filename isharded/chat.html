@@ -156,7 +156,7 @@
 
   <script>
     /* isharded:ui.js */
-    const { routeModel, drawRouteList, drawRail, glyphHtml, jobRunning: running, modelName, bytes: size, count, num } = UI;
+    const { routeModel, drawRouteList, drawRail, glyphHtml, jobRunning: running, relayout, needsTorch, runsTorch, modelName, bytes: size, count, num } = UI;
     const $ = id => document.getElementById(id);
     const store = {
       get: key => { try { return localStorage.getItem(key); } catch { return null; } },
@@ -372,15 +372,21 @@
       return { byKind, budget: Object.values(byKind).reduce((n, kind) => n + (kind.budget_bytes || 0), 0) || status?.virtual_hardware?.ram_total_bytes || 0 };
     }
     const sizeBytes = text => { const match = /([\d.]+)\s*(MB|GB|TB)/i.exec(text || ''); return match ? Number(match[1]) * { MB: 1e6, GB: 1e9, TB: 1e12 }[match[2].toUpperCase()] : 0; };
+    // A pool where no worker has PyTorch can run only GGUF models, so the rest say why they would fail.
+    const torchless = status => { const live = Object.values(status?.workers || {}).filter(worker => worker.live); return live.length > 0 && !live.some(runsTorch); };
     function modelRows(models, budget) {
-      return models.map(model => { const big = budget && sizeBytes(model.size) > budget; return `<li><button class="model-row${big ? ' too-big' : ''}" type="button" data-model="${esc(model.id)}" data-key="m:${esc(model.id)}" aria-pressed="${model.id === state.selected}"><span class="id">${esc(modelName(model.id))}</span><span class="meta">${esc(big ? 'Larger than this pool' : model.kind)}</span><span class="meta">${esc(model.size)}</span></button></li>`; }).join('');
+      const noTorch = torchless(state.status);
+      return models.map(model => {
+        const big = budget && sizeBytes(model.size) > budget, why = noTorch && needsTorch(model.id) ? 'Needs PyTorch, which no worker here has' : big ? 'Larger than this pool' : '';
+        return `<li><button class="model-row${why ? ' too-big' : ''}" type="button" data-model="${esc(model.id)}" data-key="m:${esc(model.id)}" aria-pressed="${model.id === state.selected}"><span class="id">${esc(modelName(model.id))}</span><span class="meta">${esc(why || model.kind)}</span><span class="meta">${esc(model.size)}</span></button></li>`;
+      }).join('');
     }
     const greeting = (title, body = '', actions = '') => `<div class="greeting"><h1>${esc(title)}</h1>${body}${actions ? `<div class="greeting-actions">${actions}</div>` : ''}</div>`;
     function firstRun(status) {
       const { byKind, budget } = memoryOf(status), workers = liveWorkers(status);
       const kinds = UI.TIER_ORDER.filter(kind => byKind[kind]?.budget_bytes);
       const capacity = kinds.length ? `<div class="legend">${kinds.map(kind => `<span><i class="tier-${kind}"></i>${UI.TIER_NAMES[kind]} ${size(byKind[kind].budget_bytes)}</span>`).join('')}</div>` : '';
-      const fit = (state.catalog || []).filter(model => !budget || sizeBytes(model.size) <= budget).sort((a, b) => sizeBytes(b.size) - sizeBytes(a.size)).slice(0, 5);
+      const fit = (state.catalog || []).filter(model => (!budget || sizeBytes(model.size) <= budget) && !(torchless(status) && needsTorch(model.id))).sort((a, b) => sizeBytes(b.size) - sizeBytes(a.size)).slice(0, 5);
       const list = state.catalogFailed ? '<p class="list-note">The model list could not be read. You can still load a model by name.</p>' : state.catalog ? (fit.length ? `<ul class="model-list">${modelRows(fit, budget)}</ul>` : '<p class="list-note">No listed model fits this memory. You can load a smaller one by name.</p>') : '<p class="list-note">Reading the model list</p>';
       return greeting('Nothing is loaded yet', `<p>${count(workers, 'worker')} connected, with ${size(budget)} for weights. Pick a model to see where it would run before anything downloads.</p>${capacity}<div class="scroll-list">${list}</div>`, '<button class="btn primary" type="button" id="emptyPick">See every model</button>');
     }
@@ -392,7 +398,7 @@
       if (ready && jobRunning(status)) return greeting(`Ask ${name} something`, `<p>${esc(job.model === status.model ? 'A new layout is being prepared.' : `${modelName(job.model)} is being prepared beside it.`)} Replies stay on the current route until every shard is in place.</p>`);
       if (ready) return greeting(`Ask ${name} something`, `<p>It runs on ${stages} across your pool.</p>`);
       if (jobRunning(status)) {
-        if ((status.route || []).length && job.model === status.model) return greeting(`Moving ${name}`);
+        if (relayout(status)) return greeting(`Moving ${name}`);
         const percent = job.bytes_total ? Math.floor(job.bytes_done / job.bytes_total * 100) : 0;
         const bar = job.phase === 'fetching' && job.bytes_total ? `<div class="progress" role="progressbar" aria-label="Load progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><i style="width:${percent}%"></i></div>` : '';
         return greeting(`Loading ${modelName(job.model)}`, `${bar}<p>${esc(PHASE[job.phase] || job.phase)}${job.phase === 'fetching' && job.bytes_total ? `, ${percent}%` : ''}. Chat opens when every shard is in place.</p>`);
@@ -690,7 +696,9 @@
       const alerts = workers.filter(([id, worker]) => worker.state === 'quarantined' || (worker.state === 'offline' && !lostIds.has(id))).length + lost.length + (job?.phase === 'failed' ? 1 : 0) + (status.lanes || []).filter(lane => lane.error).length + (status.last_audit && status.last_audit.verdict !== 'agree' ? 1 : 0) + (model?.stages || []).filter(stage => stage.spillSlow).length + (status.mesh && !status.mesh.leader ? 1 : 0) + state.joins;
       const need = [alerts ? 'warn' : 'idle', alerts ? 'warn' : 'idle', `${alerts} need${alerts === 1 ? 's' : ''} you`];
       if (status.status === 'ready') return lost.length ? ['bad', 'bad', 'Route lost'] : alerts ? need : jobRunning(status) ? ['work', 'work', 'Loading'] : ['idle', '', 'Healthy'];
-      if (jobRunning(status)) return ['work', 'work', route.length && job.model === status.model ? 'Repairing' : 'Loading'];
+      // A repair's last seconds have no route. Remembering the repair keeps them from reading as a first load.
+      if (relayout(status) && route.length) state.repairJob = job.job_id;
+      if (jobRunning(status)) return ['work', 'work', relayout(status) && state.repairJob === job.job_id ? 'Repairing' : 'Loading'];
       if (status.status === 'recovering') return ['work', 'work', 'Recovering'];
       if (status.status === 'repairing') return ['work', 'work', 'Repairing'];
       if (job?.phase === 'failed') return ['bad', 'bad', 'Load failed'];
@@ -707,8 +715,8 @@
     // Why a reply cannot run now, for the line above the message box.
     function holdUp(status) {
       if (!status || status.status === 'ready') return '';
-      const job = status.load_job, route = (status.route || []).length;
-      if (jobRunning(status) && route && job.model === status.model) {
+      const job = status.load_job;
+      if (relayout(status)) {
         const left = job.bytes_per_second ? Math.ceil(Math.max((job.bytes_total || 0) - (job.bytes_done || 0), 0) / job.bytes_per_second) : null;
         return `The route is moving. Replies start again ${left != null ? `in about ${left} s` : 'when it is whole'}.`;
       }
