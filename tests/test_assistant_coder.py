@@ -1215,3 +1215,8 @@ def test_a_run_is_read_afresh_once_the_lock_is_held(assistant, repo):
     assistant.store.execute("UPDATE coder_runs SET note = 'changed' WHERE id = ?", (run.id,))
     with assistant.coder._held(run.id) as held:
         assert held.note == "changed"
+
+
+def test_a_goal_cannot_name_the_folder_the_locks_are_kept_in(assistant, repo):
+    run = assistant.coder.start(repo, "Locks")
+    assert run.state == READY and run.folder.name == "locks-2"  # rejecting a run removes its folder

@@ -415,6 +415,7 @@ class Coder:
         root = self._repository(Path(repo))
         base = self._text(root, "rev-parse", "--verify", "HEAD^{commit}")
         run_id = f"cr_{secrets.token_hex(6)}"
+        (self.home / "locks").mkdir(parents=True, exist_ok=True)  # taken, so that no run is given this folder
         slug = self._free_slug(root, slug_of(goal))
         branch = f"assistant/{slug}"
         now = self.clock()
