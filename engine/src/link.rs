@@ -7,7 +7,8 @@
 //! hold the route's key, so a stranger who reaches the port gets nothing.
 
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,8 +80,9 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
     bytes
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+fn fingerprint_of(certificate: &CertificateDer<'_>) -> String {
+    let hash = digest::digest(&digest::SHA256, certificate.as_ref());
+    hash.as_ref().iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// This process's key and certificate.
@@ -94,7 +96,7 @@ impl Identity {
         let made = rcgen::generate_simple_self_signed(vec!["isharded".to_string()]).map_err(|error| error.to_string())?;
         let certificate: CertificateDer<'static> = made.cert.der().clone();
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(made.key_pair.serialize_der()));
-        let fingerprint = hex(digest::digest(&digest::SHA256, certificate.as_ref()).as_ref());
+        let fingerprint = fingerprint_of(&certificate);
         let server = ServerConfig::builder_with_provider(Arc::new(provider::default_provider()))
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|error| error.to_string())?
@@ -121,8 +123,7 @@ impl ServerCertVerifier for Pinned {
         _ocsp: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        let seen = hex(digest::digest(&digest::SHA256, end_entity.as_ref()).as_ref());
-        if seen == self.fingerprint {
+        if fingerprint_of(end_entity) == self.fingerprint {
             Ok(ServerCertVerified::assertion())
         } else {
             Err(rustls::Error::General("this is not the certificate the coordinator named".into()))
@@ -167,6 +168,7 @@ fn client_config(fingerprint: &str) -> Result<Arc<ClientConfig>, LinkError> {
 pub struct Link {
     socket: TcpStream,
     tls: Option<Mutex<Connection>>,
+    /// Keeps a frame whole on a link with no TLS, whose lock does that job otherwise.
     sending: Mutex<()>,
     closed: AtomicBool,
 }
@@ -190,9 +192,11 @@ impl Link {
         if self.is_closed() {
             return Err(LinkError::Closed);
         }
-        let _whole = self.sending.lock();
         match &self.tls {
-            None => (&self.socket).write_all(frame)?,
+            None => {
+                let _whole = self.sending.lock();
+                (&self.socket).write_all(frame)?;
+            }
             Some(connection) => {
                 // Held while writing to the socket, so a stalled peer stalls this sender
                 // and nobody else. The write timeout turns that into a dead link.
@@ -207,14 +211,24 @@ impl Link {
     }
 
     pub fn reader(self: &Arc<Self>, limit: usize) -> Frames {
-        Frames { link: self.clone(), plain: Vec::with_capacity(1 << 16), start: 0, raw: vec![0; 1 << 16].into_boxed_slice(), limit }
+        Frames { link: self.clone(), plain: Vec::with_capacity(1 << 16), last: 0, start: 0, raw: vec![0; 1 << 16].into_boxed_slice(), limit }
     }
+}
+
+/// Moves what TLS has decrypted to the end of `plain`.
+fn take_plaintext(connection: &mut Connection, plain: &mut Vec<u8>, ready: usize) -> io::Result<()> {
+    let end = plain.len();
+    plain.resize(end + ready, 0);
+    connection.reader().read_exact(&mut plain[end..])
 }
 
 /// Reads whole frames from a link.
 pub struct Frames {
     link: Arc<Link>,
     plain: Vec<u8>,
+    /// Where the frame `next` gave out begins. It ends at `start`.
+    last: usize,
+    /// Where what has not been read yet begins.
     start: usize,
     raw: Box<[u8]>,
     limit: usize,
@@ -225,7 +239,22 @@ impl Frames {
         self.limit = limit;
     }
 
-    fn take_frame(&mut self) -> Result<Option<(Kind, Vec<u8>)>, LinkError> {
+    /// The frame `next` gave out, header and all, for passing on as it came.
+    pub fn whole(&self) -> &[u8] {
+        &self.plain[self.last..self.start]
+    }
+
+    /// Finds the next frame's body in `plain`. The body handed out before this one lived
+    /// in there, so this is the first moment the buffer may move.
+    fn take_frame(&mut self) -> Result<Option<(Kind, Range<usize>)>, LinkError> {
+        if self.start == self.plain.len() {
+            self.plain.clear();
+            self.start = 0;
+        } else if self.start > 1 << 20 {
+            self.plain.drain(..self.start);
+            self.start = 0;
+        }
+        self.last = self.start;
         let have = self.plain.len() - self.start;
         if have < HEADER_BYTES {
             return Ok(None);
@@ -240,16 +269,8 @@ impl Frames {
             return Ok(None);
         }
         let begin = self.start + HEADER_BYTES;
-        let body = self.plain[begin..begin + length].to_vec();
         self.start = begin + length;
-        if self.start == self.plain.len() {
-            self.plain.clear();
-            self.start = 0;
-        } else if self.start > 1 << 20 {
-            self.plain.drain(..self.start);
-            self.start = 0;
-        }
-        Ok(Some((kind, body)))
+        Ok(Some((kind, begin..self.start)))
     }
 
     /// Moves what TLS already holds into this reader. Data can arrive with the handshake's
@@ -261,18 +282,17 @@ impl Frames {
         let mut connection = connection.lock();
         let ready = connection.process_new_packets()?.plaintext_bytes_to_read();
         if ready > 0 {
-            let end = self.plain.len();
-            self.plain.resize(end + ready, 0);
-            connection.reader().read_exact(&mut self.plain[end..])?;
+            take_plaintext(&mut connection, &mut self.plain, ready)?;
         }
         Ok(ready > 0)
     }
 
-    /// Blocks until a whole frame has arrived.
-    pub fn next(&mut self) -> Result<(Kind, Vec<u8>), LinkError> {
+    /// Blocks until a whole frame has arrived. The body stays in this reader's buffer, and
+    /// is good until the next call.
+    pub fn next(&mut self) -> Result<(Kind, &[u8]), LinkError> {
         loop {
-            if let Some(frame) = self.take_frame()? {
-                return Ok(frame);
+            if let Some((kind, body)) = self.take_frame()? {
+                return Ok((kind, &self.plain[body]));
             }
             if self.pull_held()? {
                 continue;
@@ -291,9 +311,7 @@ impl Frames {
                         let state = connection.process_new_packets()?;
                         let ready = state.plaintext_bytes_to_read();
                         if ready > 0 {
-                            let end = self.plain.len();
-                            self.plain.resize(end + ready, 0);
-                            connection.reader().read_exact(&mut self.plain[end..])?;
+                            take_plaintext(&mut connection, &mut self.plain, ready)?;
                         }
                         if state.peer_has_closed() {
                             return Err(LinkError::Closed);
@@ -334,23 +352,24 @@ fn prepare(socket: &TcpStream) -> Result<(), LinkError> {
     Ok(())
 }
 
-fn resolve(address: &str) -> Result<SocketAddr, LinkError> {
-    address.to_socket_addrs()?.next().ok_or(LinkError::Refused("the address resolved to nothing"))
+fn shake_hands(socket: &mut TcpStream, connection: impl Into<Connection>) -> Result<Connection, LinkError> {
+    let mut connection: Connection = connection.into();
+    while connection.is_handshaking() {
+        connection.complete_io(socket)?;
+    }
+    Ok(connection)
 }
 
 /// Opens a link to another node, proving this end holds `key`.
 pub fn dial(address: &str, fingerprint: Option<&str>, key: &[u8], role: Role, epoch: u64, timeout: Duration) -> Result<Arc<Link>, LinkError> {
-    let mut socket = TcpStream::connect_timeout(&resolve(address)?, timeout)?;
+    let target = address.to_socket_addrs()?.next().ok_or(LinkError::Refused("the address resolved to nothing"))?;
+    let mut socket = TcpStream::connect_timeout(&target, timeout)?;
     prepare(&socket)?;
     let tls = match fingerprint {
         None => None,
         Some(fingerprint) => {
             let name = ServerName::try_from("isharded").map_err(|_| LinkError::Refused("bad server name"))?;
-            let mut connection = ClientConnection::new(client_config(fingerprint)?, name)?;
-            while connection.is_handshaking() {
-                connection.complete_io(&mut socket)?;
-            }
-            Some(Connection::Client(connection))
+            Some(shake_hands(&mut socket, ClientConnection::new(client_config(fingerprint)?, name)?)?)
         }
     };
     let link = Link::new(socket, tls);
@@ -361,7 +380,7 @@ pub fn dial(address: &str, fingerprint: Option<&str>, key: &[u8], role: Role, ep
     if kind != Kind::HelloOk {
         return Err(LinkError::Refused("the other node did not greet this one"));
     }
-    let (nonce, mac) = wire::read_hello_ok(&body)?;
+    let (nonce, mac) = wire::read_hello_ok(body)?;
     let pin = fingerprint.unwrap_or("");
     if !same(&mac, &proof(key, SERVER_LABEL, &hello, &nonce, pin)) {
         return Err(LinkError::Refused("the other node does not hold this route's key"));
@@ -380,13 +399,7 @@ pub fn accept(
     prepare(&socket)?;
     let tls = match identity {
         None => None,
-        Some(identity) => {
-            let mut connection = ServerConnection::new(identity.server.clone())?;
-            while connection.is_handshaking() {
-                connection.complete_io(&mut socket)?;
-            }
-            Some(Connection::Server(connection))
-        }
+        Some(identity) => Some(shake_hands(&mut socket, ServerConnection::new(identity.server.clone())?)?),
     };
     let link = Link::new(socket, tls);
     let mut frames = link.reader(STRANGER_BYTES);
@@ -394,13 +407,13 @@ pub fn accept(
     if kind != Kind::Hello {
         return Err(LinkError::Refused("a link must open with a greeting"));
     }
-    let hello = Hello::decode(&body)?;
+    let hello = Hello::decode(body)?;
     let key = key_for(hello.role, hello.epoch).ok_or(LinkError::Refused("no route here for that greeting"))?;
     let nonce: [u8; NONCE_BYTES] = random_bytes();
     let pin = identity.map_or("", |item| item.fingerprint.as_str());
     link.send(&wire::hello_ok(&nonce, &proof(&key, SERVER_LABEL, &hello, &nonce, pin)))?;
     let (kind, body) = frames.next()?;
-    if kind != Kind::Auth || !same(&body, &proof(&key, CLIENT_LABEL, &hello, &nonce, pin)) {
+    if kind != Kind::Auth || !same(body, &proof(&key, CLIENT_LABEL, &hello, &nonce, pin)) {
         return Err(LinkError::Refused("the other node does not hold this route's key"));
     }
     link.socket.set_read_timeout(None)?;
@@ -426,7 +439,7 @@ mod tests {
             let (kind, body) = frames.next()?;
             assert_eq!(kind, Kind::Ack);
             link.send(&Ack { id: 2 }.encode())?;
-            Ok(hello.epoch + Ack::decode(&body)?.id)
+            Ok(hello.epoch + Ack::decode(body)?.id)
         });
         (address, handle)
     }
@@ -438,8 +451,10 @@ mod tests {
         let (address, server) = serve(identity, KEY);
         let link = dial(&address, Some(&pin), KEY, Role::Hop, 40, Duration::from_secs(5)).unwrap();
         link.send(&Ack { id: 2 }.encode()).unwrap();
-        let (kind, body) = link.reader(1024).next().unwrap();
-        assert_eq!((kind, Ack::decode(&body).unwrap().id), (Kind::Ack, 2));
+        let mut frames = link.reader(1024);
+        let (kind, body) = frames.next().unwrap();
+        assert_eq!((kind, Ack::decode(body).unwrap().id), (Kind::Ack, 2));
+        assert_eq!(frames.whole(), Ack { id: 2 }.encode());
         assert_eq!(server.join().unwrap().unwrap(), 42);
     }
 
@@ -500,7 +515,7 @@ mod tests {
             let mut seen = vec![];
             for _ in 0..4000 {
                 let (_, body) = frames.next().unwrap();
-                seen.push(Ack::decode(&body).unwrap().id);
+                seen.push(Ack::decode(body).unwrap().id);
             }
             seen
         });
