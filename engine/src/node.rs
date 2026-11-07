@@ -536,6 +536,12 @@ fn send_back(inner: &Inner, ring: &Ring, frame: &[u8]) {
 }
 
 fn start_peer(inner: &Arc<Inner>, ring: &Arc<Ring>, peer: &Arc<Peer>) {
+    // A ping leaves at most a third of the limit after the peer was last heard, so a write
+    // stuck on it still fails inside the limit, and the watcher is back on watch.
+    if let Err(error) = peer.link.limit_writes(ring.silence_timeout * 2 / 3) {
+        peer_lost(inner, ring, peer, &error.to_string());
+        return;
+    }
     let reading = (inner.clone(), ring.clone(), peer.clone());
     let spawned = thread::Builder::new().name("isharded-peer".into()).spawn(move || {
         let (inner, ring, peer) = reading;

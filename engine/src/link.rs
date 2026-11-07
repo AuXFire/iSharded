@@ -167,15 +167,17 @@ fn client_config(fingerprint: &str) -> Result<Arc<ClientConfig>, LinkError> {
 /// One open, authenticated connection. Any thread may send; one thread reads.
 pub struct Link {
     socket: TcpStream,
+    /// Never held across a socket write, so a stalled peer cannot stop the reader.
     tls: Option<Mutex<Connection>>,
-    /// Keeps a frame whole on a link with no TLS, whose lock does that job otherwise.
-    sending: Mutex<()>,
+    /// Held for a whole frame, which keeps frames whole and in order. Inside is the space
+    /// for encrypted bytes on their way to the socket.
+    sending: Mutex<Vec<u8>>,
     closed: AtomicBool,
 }
 
 impl Link {
     fn new(socket: TcpStream, tls: Option<Connection>) -> Arc<Link> {
-        Arc::new(Link { socket, tls: tls.map(Mutex::new), sending: Mutex::new(()), closed: AtomicBool::new(false) })
+        Arc::new(Link { socket, tls: tls.map(Mutex::new), sending: Mutex::new(Vec::new()), closed: AtomicBool::new(false) })
     }
 
     pub fn is_closed(&self) -> bool {
@@ -188,26 +190,45 @@ impl Link {
         let _ = self.socket.shutdown(Shutdown::Both);
     }
 
+    /// Shortens how long a stalled write may hold on, for a link with a tighter limit.
+    pub fn limit_writes(&self, limit: Duration) -> io::Result<()> {
+        self.socket.set_write_timeout(Some(limit.min(Duration::from_secs(WRITE_SECONDS))))
+    }
+
     pub fn send(&self, frame: &[u8]) -> Result<(), LinkError> {
         if self.is_closed() {
             return Err(LinkError::Closed);
         }
-        match &self.tls {
-            None => {
-                let _whole = self.sending.lock();
-                (&self.socket).write_all(frame)?;
+        let mut sealed = self.sending.lock();
+        let sent = match &self.tls {
+            None => (&self.socket).write_all(frame).map_err(LinkError::from),
+            Some(connection) => self.send_sealed(connection, frame, &mut sealed),
+        };
+        if sent.is_err() {
+            // Part of the frame may have gone, and nothing after it could be read.
+            self.close();
+        }
+        sent
+    }
+
+    /// Encrypts under the lock and writes outside it. TLS buffers a limited amount, so a
+    /// long frame goes in pieces.
+    fn send_sealed(&self, connection: &Mutex<Connection>, frame: &[u8], sealed: &mut Vec<u8>) -> Result<(), LinkError> {
+        let mut left = frame;
+        loop {
+            sealed.clear();
+            let mut connection = connection.lock();
+            let taken = connection.writer().write(left)?;
+            left = &left[taken..];
+            while connection.wants_write() {
+                connection.write_tls(sealed)?;
             }
-            Some(connection) => {
-                // Held while writing to the socket, so a stalled peer stalls this sender
-                // and nobody else. The write timeout turns that into a dead link.
-                let mut connection = connection.lock();
-                connection.writer().write_all(frame)?;
-                while connection.wants_write() {
-                    connection.write_tls(&mut &self.socket)?;
-                }
+            drop(connection);
+            (&self.socket).write_all(sealed)?;
+            if left.is_empty() {
+                return Ok(());
             }
         }
-        Ok(())
     }
 
     pub fn reader(self: &Arc<Self>, limit: usize) -> Frames {
@@ -317,9 +338,9 @@ impl Frames {
                             return Err(LinkError::Closed);
                         }
                     }
-                    while connection.wants_write() {
-                        connection.write_tls(&mut &self.link.socket)?;
-                    }
+                    // Whatever TLS wants to say by itself leaves with the next send, and
+                    // heartbeats keep those coming. Written here, it could land inside a
+                    // frame going out, and it could stall this reader.
                 }
             }
         }
@@ -426,7 +447,9 @@ mod tests {
     use super::*;
     use crate::wire::Ack;
     use std::net::TcpListener;
+    use std::sync::mpsc;
     use std::thread;
+    use std::time::Instant;
 
     const KEY: &[u8] = b"route key";
 
@@ -501,6 +524,46 @@ mod tests {
         };
         stranger.write_all(&frame.encode()).unwrap();
         assert!(matches!(handle.join().unwrap(), Err(LinkError::Refused(_))));
+    }
+
+    #[test]
+    fn a_stalled_write_leaves_the_reader_free_and_then_ends_the_link() {
+        let identity = Arc::new(Identity::generate().unwrap());
+        let pin = identity.fingerprint.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (finish, finished) = mpsc::channel::<()>();
+        // Takes the link and never reads from it.
+        let far = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let _held = accept(socket, Some(&identity), |_, _| Some(KEY.to_vec())).unwrap();
+            let _ = finished.recv();
+        });
+        let link = dial(&address, Some(&pin), KEY, Role::Hop, 1, Duration::from_secs(5)).unwrap();
+        link.limit_writes(Duration::from_secs(2)).unwrap();
+        let began = Instant::now();
+        let writer = {
+            let link = link.clone();
+            thread::spawn(move || {
+                let frame = vec![0; 1 << 20];
+                loop {
+                    if let Err(error) = link.send(&frame) {
+                        return error;
+                    }
+                }
+            })
+        };
+        thread::sleep(Duration::from_millis(500));
+        // The lock is what the reader needs. Hearing the far end through a stalled socket
+        // is not something every loopback allows, so this looks at the lock itself.
+        assert!(link.tls.as_ref().unwrap().try_lock_for(Duration::from_millis(200)).is_some());
+        assert!(!writer.is_finished(), "the write was meant to be stuck during that");
+        assert!(matches!(writer.join().unwrap(), LinkError::Io(_)));
+        assert!(began.elapsed() < Duration::from_secs(WRITE_SECONDS / 2));
+        assert!(link.is_closed());
+        assert!(matches!(link.send(b"more"), Err(LinkError::Closed)));
+        drop(finish);
+        far.join().unwrap();
     }
 
     #[test]

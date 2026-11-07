@@ -1,7 +1,9 @@
 //! Real nodes over real TLS links on loopback, with a stand-in for the model.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -65,14 +67,84 @@ fn listening(node: &Node) -> Listening {
     }
 }
 
+/// Stands in the middle of one link, so a test can do to it what a network does.
+struct Relay {
+    port: u16,
+    held: Arc<AtomicBool>,
+    sockets: Arc<Mutex<Vec<TcpStream>>>,
+}
+
+impl Relay {
+    fn to(port: u16) -> Relay {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let relay = Relay { port: listener.local_addr().unwrap().port(), held: Arc::default(), sockets: Arc::default() };
+        let (held, sockets) = (relay.held.clone(), relay.sockets.clone());
+        thread::spawn(move || {
+            let (near, _) = listener.accept().unwrap();
+            let far = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            sockets.lock().unwrap().extend([near.try_clone().unwrap(), far.try_clone().unwrap()]);
+            for (from, to) in [(near.try_clone().unwrap(), far.try_clone().unwrap()), (far, near)] {
+                let held = held.clone();
+                thread::spawn(move || carry(from, to, &held));
+            }
+        });
+        relay
+    }
+
+    /// Nothing is read or passed on any more, as when the far machine freezes.
+    fn hold(&self) {
+        self.held.store(true, Ordering::SeqCst);
+    }
+
+    fn cut(&self) {
+        for socket in self.sockets.lock().unwrap().iter() {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        self.held.store(false, Ordering::SeqCst);
+        self.cut();
+    }
+}
+
+fn carry(mut from: TcpStream, mut to: TcpStream, held: &AtomicBool) {
+    let mut buffer = vec![0; 1 << 16];
+    while let Ok(count) = from.read(&mut buffer) {
+        while held.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        if count == 0 || to.write_all(&buffer[..count]).is_err() {
+            break;
+        }
+    }
+    let _ = to.shutdown(Shutdown::Both);
+}
+
 struct Ring {
     nodes: Vec<Node>,
     seen: Vec<Arc<AtomicU64>>,
     client: Arc<Link>,
     frames: Frames,
+    relay: Option<Relay>,
+    doors: Vec<Listening>,
 }
 
 fn ring(count: u16, closing: bool, delay: Duration, ack_timeout_ms: u64) -> Ring {
+    build_ring(count, closing, delay, ack_timeout_ms, None)
+}
+
+/// A ring whose dial to one stage goes through a relay. Only the closing link dials stage
+/// zero, so naming stage zero puts the relay on that link.
+fn ring_through(door: usize, count: u16, closing: bool, delay: Duration, ack_timeout_ms: u64) -> (Ring, Relay) {
+    let mut ring = build_ring(count, closing, delay, ack_timeout_ms, Some(door));
+    let relay = ring.relay.take().unwrap();
+    (ring, relay)
+}
+
+fn build_ring(count: u16, closing: bool, delay: Duration, ack_timeout_ms: u64, relayed: Option<usize>) -> Ring {
     let mut nodes = vec![];
     let mut seen = vec![];
     let mut doors = vec![];
@@ -87,15 +159,19 @@ fn ring(count: u16, closing: bool, delay: Duration, ack_timeout_ms: u64) -> Ring
     for (index, node) in nodes.iter().enumerate() {
         node.open(Plan { epoch: 7, index: index as u16, count, key: KEY.to_vec(), ack_timeout_ms, silence_timeout_ms: ack_timeout_ms });
     }
-    let address = |door: &Listening| Address { address: format!("127.0.0.1:{}", door.port), fingerprint: door.fingerprint.clone() };
+    let relay = relayed.map(|door| Relay::to(doors[door].port));
+    let address = |at: usize| {
+        let port = relay.as_ref().filter(|_| relayed == Some(at)).map_or(doors[at].port, |item| item.port);
+        Address { address: format!("127.0.0.1:{port}"), fingerprint: doors[at].fingerprint.clone() }
+    };
     for (index, node) in nodes.iter().enumerate() {
-        let next = doors.get(index + 1).map(address);
-        let entry = (closing && index + 1 == count as usize && count > 1).then(|| address(&doors[0]));
+        let next = (index + 1 < doors.len()).then(|| address(index + 1));
+        let entry = (closing && index + 1 == count as usize && count > 1).then(|| address(0));
         node.connect(Links { next, entry, timeout_ms: 3000 }).unwrap();
     }
     let client = link::dial(&format!("127.0.0.1:{}", doors[0].local_port), None, &doors[0].local_key, Role::Local, 0, Duration::from_secs(3)).unwrap();
     let frames = client.reader(1 << 20);
-    Ring { nodes, seen, client, frames }
+    Ring { nodes, seen, client, frames, relay, doors }
 }
 
 fn pass(id: u64, token: u32, position: u32) -> Pass {
@@ -112,6 +188,20 @@ fn pass(id: u64, token: u32, position: u32) -> Pass {
         rows: 0,
         width: 0,
         data: vec![],
+    }
+}
+
+/// A pass that already carries rows, as big as a test needs.
+fn rows(id: u64, count: u32) -> Pass {
+    let data = vec![0; count as usize * WIDTH as usize * 4];
+    Pass { flags: 0, tokens: vec![], rows: count, width: WIDTH, data, ..pass(id, 0, 9) }
+}
+
+fn wait_until(what: &str, done: impl Fn() -> bool) {
+    let began = Instant::now();
+    while !done() {
+        assert!(began.elapsed() < Duration::from_secs(5), "{what} never happened");
+        thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -207,6 +297,41 @@ fn a_stage_that_goes_silent_is_noticed_without_any_traffic() {
     assert_eq!(kind, Kind::Nack);
     assert_eq!(Nack::decode(&body).unwrap().stage, 1);
     assert!(began.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn a_peer_that_stops_reading_is_lost_within_the_silence_limit() {
+    let silence = Duration::from_millis(1000);
+    let (mut ring, relay) = ring_through(1, 2, false, Duration::ZERO, silence.as_millis() as u64);
+    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+    answer(&mut ring);
+    relay.hold();
+    let began = Instant::now();
+    // More than the sockets on the way can hold, so a write stops partway through a frame.
+    for id in 2..514 {
+        ring.client.send(&rows(id, 2048).encode()).unwrap();
+    }
+    loop {
+        let (kind, body) = ring.frames.next().unwrap();
+        assert_eq!(kind, Kind::Nack);
+        let nack = Nack::decode(&body).unwrap();
+        assert_eq!(nack.refusal, Refusal::FailedStage);
+        if nack.id == 0 {
+            assert_eq!(nack.stage, 1);
+            break;
+        }
+    }
+    // The margin is for a busy machine: one turn of the watcher and some scheduling.
+    let took = began.elapsed();
+    assert!(took < silence + Duration::from_millis(500), "took {took:?}");
+    assert!(!ring.nodes[0].stats().next_up);
+}
+
+#[test]
+fn a_frame_too_big_for_one_tls_buffer_crosses_a_link() {
+    let mut ring = ring(3, true, Duration::ZERO, 2000);
+    ring.client.send(&rows(1, 1 << 16).encode()).unwrap();
+    assert_eq!(answer(&mut ring).tokens, vec![123, 9]);
 }
 
 #[test]
