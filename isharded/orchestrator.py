@@ -331,8 +331,8 @@ def build_target(
     draft = resolve_draft(request, manifest, adapter, sources, token)
     projector, image_marker = resolve_projector(request, adapter, sources, token)
     speculate_tokens = request.draft_tokens if draft else 0
-    slotted = isinstance(adapter, GgufAdapter) and not request.embedding
-    slots = (request.parallel or 1) if slotted else 1
+    parallel = settled_parallel(request, isinstance(adapter, GgufAdapter) and not request.embedding)
+    slots = parallel.get("slots", 1)
     units = adapter.partition(manifest.tensors)
     if request.model_hashes:
         apply_model_hashes(manifest, units, request.model_hashes)
@@ -355,9 +355,6 @@ def build_target(
         attention_interval=getattr(adapter, "interval", 0),
     )
     hosted_copy = manifest.revision.startswith("local-") and control_source != request.model_id
-    settled = {"slots": slots, "reason": "set by the operator"} if slotted and request.parallel else {}
-    if not slotted:
-        settled = {"slots": 1, "reason": "this kind of model runs one reply at a time"}
     return ModelTarget(
         model_id=request.model_id,
         manifest=manifest,
@@ -377,12 +374,19 @@ def build_target(
         request=request,
         file_sources=holders,
         slots=slots,
-        parallel=settled,
+        parallel=parallel,
         merge_passes=request.merge_passes,
         embedding=request.embedding,
         projector=projector,
         image_marker=image_marker,
     )
+
+
+def settled_parallel(request: LoadModelRequest, slotted: bool) -> dict[str, Any]:
+    """What a request settles about its slots, which is nothing if the load is to choose."""
+    if not slotted:
+        return {"slots": 1, "reason": "this kind of model runs one reply at a time"}
+    return {"slots": request.parallel, "reason": "set by the operator"} if request.parallel else {}
 
 
 def context_sizes(adapter: Adapter, request: LoadModelRequest, slots: int, speculate_tokens: int) -> dict[str, list[int]]:

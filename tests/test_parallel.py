@@ -9,7 +9,8 @@ from pydantic import ValidationError
 import pytest
 
 from isharded import orchestrator as orchestrator_module
-from isharded.orchestrator import ModelTarget, Orchestrator, describe_plan, stage_devices, wanted_slots, with_slots
+from isharded.models import UnsupportedModel
+from isharded.orchestrator import ModelTarget, Orchestrator, describe_plan, draft_cache_bytes, settled_parallel, stage_devices, wanted_slots, with_slots
 from isharded.planner import Candidate, ModelProfile
 from isharded.protocol import MAX_PARALLEL, DraftModel, LoadModelRequest, MemoryPool, StageAssignment, TensorRef, UnitPlacement, WeightUnit
 
@@ -137,6 +138,26 @@ def test_the_cap_is_64_and_nothing_set_leaves_it_to_the_load():
     assert LoadModelRequest(model_id="m", parallel=64).parallel == 64
     with pytest.raises(ValidationError):
         LoadModelRequest(model_id="m", parallel=65)
+
+
+def test_only_a_model_with_slots_is_left_for_the_load_to_settle():
+    assert settled_parallel(LoadModelRequest(model_id="m"), True) == {}
+    assert settled_parallel(LoadModelRequest(model_id="m", parallel=3), True) == {"slots": 3, "reason": "set by the operator"}
+    assert settled_parallel(LoadModelRequest(model_id="m", parallel=3), False)["slots"] == 1
+
+
+def test_a_draft_cache_is_every_layer_of_it(monkeypatch):
+    adapter = SimpleNamespace(num_layers=3, kv_bytes_per_token=lambda layer, itemsize: (layer + 1) * itemsize)
+    monkeypatch.setattr(orchestrator_module, "create_adapter", lambda config: adapter)
+    assert draft_cache_bytes(SimpleNamespace(config={})) == 12
+
+
+def test_a_draft_of_an_unknown_family_still_loads(monkeypatch):
+    def refuse(config):
+        raise UnsupportedModel("no")
+
+    monkeypatch.setattr(orchestrator_module, "create_adapter", refuse)
+    assert draft_cache_bytes(SimpleNamespace(config={})) == 0
 
 
 def test_a_load_with_room_takes_what_the_route_wants(pool):
