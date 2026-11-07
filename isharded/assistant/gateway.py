@@ -12,12 +12,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 import hashlib
 import json
 import os
 from pathlib import Path
-import queue
 import re
 import secrets
 import sqlite3
@@ -33,6 +32,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from isharded.pool import LOOPBACK
+from isharded.replies import server_sent
 from isharded.serving import BodyLimit, keep_listening, NoDelayHTTPProtocol
 
 from .broker import PEER_PREFIX
@@ -48,7 +48,6 @@ PUBLIC_PATHS = frozenset({"/", "/assistant", "/assistant/", "/healthz"})
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
 HTML_FILE = Path(__file__).with_name("assistant.html")
 SHARED_STYLES = Path(__file__).parent.parent / "ui.css"  # the design system every page in iSharded uses
-STREAM_POLL_SECONDS = 0.01
 
 BACKUP_MAGIC = b"SMAB1\n"
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2**15, 8, 1
@@ -243,38 +242,31 @@ def conversation_for(user: str, messages: list[Any], given: str | None) -> str:
     return "chat-" + hashlib.sha256(f"{user}\0{first}".encode()).hexdigest()[:24]
 
 
-def server_sent(payload: dict[str, Any] | str) -> str:
-    return f"data: {payload if isinstance(payload, str) else json.dumps(payload)}\n\n"
-
-
-def turn_in_background(assistant: Any, user: str, text: str, conversation_id: str) -> queue.Queue[Any]:
+def turn_in_background(assistant: Any, user: str, text: str, conversation_id: str) -> asyncio.Queue[Any]:
     """Run a turn on its own thread, handing text over as it comes.
 
     The turn belongs to the assistant and not to the connection. If a client goes
     away the reply is still finished and stored, so nothing said is lost.
     """
-    items: queue.Queue[Any] = queue.Queue()
+    items: asyncio.Queue[Any] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def hand_over(item: Any) -> None:
+        with suppress(RuntimeError):  # the server has stopped, and the turn still has to finish
+            loop.call_soon_threadsafe(items.put_nowait, item)
 
     def work() -> None:
         try:
             for item in assistant.conversation.stream(user, text, conversation_id, learn="background"):
-                items.put(item)
+                hand_over(item)
         except Exception as error:
-            items.put(error)
+            hand_over(error)
         finally:
-            items.put(None)
+            hand_over(None)
             assistant.store.close()
 
     threading.Thread(target=work, name="assistant-turn", daemon=True).start()
     return items
-
-
-async def next_item(items: queue.Queue[Any]) -> Any:
-    while True:
-        try:
-            return items.get_nowait()
-        except queue.Empty:
-            await asyncio.sleep(STREAM_POLL_SECONDS)
 
 
 class ClientMessage(BaseModel):
@@ -375,14 +367,14 @@ def create_app(assistant: Any) -> FastAPI:
             "assistant": public_result(result),
         }
 
-    async def events(items: queue.Queue[Any], identifier: str, created: int) -> AsyncIterator[str]:
+    async def events(items: asyncio.Queue[Any], identifier: str, created: int) -> AsyncIterator[str]:
         envelope = {"id": identifier, "object": "chat.completion.chunk", "created": created, "model": persona()}
 
         def words(text: str) -> str:
             return server_sent({**envelope, "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]})
 
         sent = ""
-        while (item := await next_item(items)) is not None:
+        while (item := await items.get()) is not None:
             if isinstance(item, Exception):
                 yield server_sent({"error": {"message": str(item)}})
             elif isinstance(item, TurnResult):
