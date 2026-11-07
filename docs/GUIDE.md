@@ -1139,7 +1139,7 @@ The state folder is `%LOCALAPPDATA%\iSharded` on Windows and `~/.cache/iSharded`
 | `--device` | `auto` | `auto`, `cpu`, `cuda:0`, `mps`, or `xpu:0` |
 | `--roles` | `inference` | `inference`, or `kv-cache,checkpoint` for a memory worker |
 | `--dtype` | `auto` | `auto` is BF16. `float32` runs this worker at full precision |
-| `--cpu-threads` | 0 | CPU threads. 0 uses half the cores for a stage |
+| `--cpu-threads` | 0 | CPU threads. 0 uses half the logical cores for a stage, and half the physical cores for a stage on the CPU of a machine with a GPU. See [CPU threads](#cpu-threads) |
 | `--gpu-memory-gb` | 0 (auto) | VRAM budget per accelerator |
 | `--weights-ram-gb` | None | System RAM for model weights, or `auto` |
 | `--weights-disk-gb` | 0 | Disk for memory-mapped model weights |
@@ -1724,13 +1724,27 @@ A stage's row time is what it measured, once this model has run on the same devi
 
 Measured on that laptop with Qwen3-0.6B and 30 ms added to each hop, the load chose 4 slots with nothing measured and 5 after. Against 4 and 8 fixed slots run the same hour, its total tokens per second was within 4% of the best up to 4 replies. At 8 and 16 replies the 5 slots it chose after measuring were 6 to 12% under 4 fixed slots, because the fifth slot's cache moved a layer onto the CPU stage, and the rule's choices were 7 to 19% under 8 slots, where 8 slots gave each reply 7.5 tokens per second against 12.8 at 4. With 100 ms added to each hop it chose 11 both times: within 2% of 16 fixed slots up to 8 replies, but 32 tokens per second against 46 at 16 replies, because 11 slots run 16 replies in two rounds, and passes that merge under load make each row cheaper than a row alone.
 
-Only whole rows count, because replies that share a route without sharing passes cost each other: with a CPU stage and a GPU stage and a trip of 1.8 rows, two replies made 65 to 112 tokens per second on one slot and 58 on two. On one machine the cause is that both stages run on the same CPU cores. A CPU stage takes half the logical cores by default, which on an 8-core laptop is all of them, and the GPU stage needs a core too. Measured there with Qwen3-0.6B, a CPU stage of 12 or 13 layers and a GPU stage of the rest: two replies made 44 tokens per second on two slots and 49 on one, as the CPU stage's pass went from 14.6 to 20.3 ms and the GPU stage's from 2.9 to 6.2 ms while both ran at once. With `--cpu-threads 4` on the CPU worker, one reply alone ran at 60, and two replies made 72 on two slots against 60 on one. Measured row times count all of this. Stages that all run on one device stay at 1, because they can only take turns on it: two stages on one GPU went from 128 tokens per second for two replies to 70 with two slots. A link nobody has measured, or whose probe failed, also means 1. `--parallel` always wins, and on one machine it can pay: on CPU stages, eight replies went from 14 to 22 tokens per second to 27 to 30 at `--parallel 8`, because they share passes, and their first tokens came in 1 second and not 15, though each reply ran about four times slower.
+Only whole rows count, because replies that share a route without sharing passes cost each other: with a CPU stage and a GPU stage and a trip of 1.8 rows, two replies made 65 to 112 tokens per second on one slot and 58 on two. On one machine the cause is that both stages run on the same CPU cores. A CPU stage used to take half the logical cores, which on an 8-core laptop is all of them, and the GPU stage needs a core too. Measured there with Qwen3-0.6B, a CPU stage of 12 or 13 layers and a GPU stage of the rest: two replies made 44 tokens per second on two slots and 49 on one, as the CPU stage's pass went from 14.6 to 20.3 ms and the GPU stage's from 2.9 to 6.2 ms while both ran at once. With `--cpu-threads 4` on the CPU worker, one reply alone ran at 60, and two replies made 72 on two slots against 60 on one. So a stage with no GPU layers, on a machine with a GPU, now takes half the physical cores unless `--cpu-threads` says otherwise; [CPU threads](#cpu-threads) has the numbers. Measured row times count all of this. Stages that all run on one device stay at 1, because they can only take turns on it: two stages on one GPU went from 128 tokens per second for two replies to 70 with two slots. A link nobody has measured, or whose probe failed, also means 1. `--parallel` always wins, and on one machine it can pay: on CPU stages, eight replies went from 14 to 22 tokens per second to 27 to 30 at `--parallel 8`, because they share passes, and their first tokens came in 1 second and not 15, though each reply ran about four times slower.
 
 `active_plan.parallel` in `/admin/status` is the number, and `active_plan.parallel_choice` says why, with `reason`, `round_trip_ms`, `row_ms`, `devices`, `wanted`, and `measured`, which is true when the rows came from what the stages measured and false when they came from memory speeds. `POST /admin/plan` shows what a load would choose. Slots are part of what a stage is, so changing them restarts it. The choice therefore stands through repairs, a coordinator restart, and the same load again. It is made afresh only by another load, or when the pool has lost so much that the model would not fit at it.
 
 Single-token steps from different conversations also share a pass through a stage, because reading the weights is what a pass costs. On one stage, four conversations went from 12 to 32 tokens per second. Across two stages the same load gained only 10%, from 34 to 37, because the stages stagger the conversations. A merge takes every waiting step it can, wherever it sits in the queue, and a reply's own steps still run in order. A step a stage refuses is refused alone, and the rest of its merge runs. Steps with speculative guesses do not merge, so a draft limits this. `--no-merge-passes` turns it off, on the native path as well as over HTTP.
 
 Past `--parallel`, replies queue at the entry worker, and past 32 waiting they are refused with a 429.
+
+### CPU threads
+
+A stage gives llama.cpp half the logical cores, which is every physical core on most machines. A stage with no layers on a GPU, on a machine that has one, gives it half the physical cores instead, because a GPU stage beside it needs cores to feed its card, and every core there slowed both. `--cpu-threads` overrides either. A machine with no GPU keeps half the logical cores.
+
+Measured on the laptop, a Ryzen 9 6900HS with 8 cores and an RTX 3060, with Qwen3-0.6B, one CPU worker beside one GPU worker, 3 rounds each, layers as the planner placed them:
+
+| CPU stage | 8 threads | 6 threads | 4 threads |
+|---|---|---|---|
+| 9 layers, ms a token for one reply | 17.2 to 19.3 | 15.7 to 17.5 | 13.8 to 14.8 |
+| 9 layers, tokens/s for two replies | 49.8 to 57.0 | 54.8 to 60.8 | 67.7 to 70.1 |
+| 1 layer, ms a token for one reply (2 rounds at 8 threads) | 7.1 to 8.1 | 6.9 to 8.1 | 6.7 to 7.5 |
+
+The same laptop with its GPU idle and one CPU stage holding the whole model made a token in 40.3 to 41.8 ms on 8 threads and 29.7 to 37.5 ms on 4, in the seven of nine rounds where nothing else was busy. That is why the rule asks only whether the machine has a GPU. A machine with no GPU was not measured, and neither was a prompt's time, which more threads can shorten, so those keep the old default.
 
 ### How a model loads
 

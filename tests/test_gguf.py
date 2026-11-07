@@ -1925,3 +1925,25 @@ def test_a_named_draft_that_leaves_the_model_no_room_is_refused(local_model, tmp
     with pytest.raises(HTTPException) as refused:
         node.plan_or_refuse(target)
     assert refused.value.status_code == 507 and target.draft is not None
+
+
+def test_a_cpu_stage_beside_a_gpu_takes_half_the_physical_cores(monkeypatch) -> None:
+    from isharded import worker
+
+    monkeypatch.setattr(worker.os, "cpu_count", lambda: 16)
+    monkeypatch.setattr(worker.psutil, "cpu_count", lambda logical=True: 16 if logical else 8)
+    assert worker.stage_threads(0, beside_gpu=False) == 8  # half the logical cores, as before
+    assert worker.stage_threads(0, beside_gpu=True) == 4
+    assert worker.stage_threads(6, beside_gpu=True) == 6  # the operator's choice stands
+    monkeypatch.setattr(worker.psutil, "cpu_count", lambda logical=True: None)
+    assert worker.stage_threads(0, beside_gpu=True) == 1
+
+
+def test_a_gpu_probe_that_fails_leaves_the_default_alone(monkeypatch) -> None:
+    from isharded import worker
+
+    def broken(_: str) -> list:
+        raise OSError("no driver")
+
+    monkeypatch.setattr(worker, "discover_accelerators", broken)
+    assert worker.machine_has_gpu() is False
