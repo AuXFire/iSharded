@@ -117,6 +117,16 @@ def test_merged_passes_that_cost_less_let_a_route_take_more_replies_but_only_whe
     assert wanted_slots(route, ["a", "b"], links, True, [3.2, 20.0], passes, merge_most=1)["wanted"] == 16
 
 
+def test_merging_counts_no_larger_a_pass_than_every_stage_measured():
+    # Measured at 30 ms a hop: the GPU stage only ever ran two together, and the CPU stage took
+    # 41 ms for three. Counting a line through those out to 64 chose 64 slots, whose caches put
+    # 9 more layers on the CPU stage and halved what 8 replies made.
+    route = [stage("a", 0, 12, 2.6), stage("b", 12, 28, 19.0)]
+    passes = [{1: 2.6, 2: 8.06}, {1: 19.0, 3: 41.2}]
+    assert wanted_slots(route, ["a", "b"], {("a", "b"): 58.0}, True, [2.6, 19.0], passes, merge_most=64)["wanted"] == 8
+    assert wanted_slots(route, ["a", "b"], {("a", "b"): 198.0}, True, [2.6, 19.0], passes, merge_most=64)["wanted"] == 16
+
+
 def test_a_trip_of_less_than_two_rows_stays_at_one():
     route = [stage("a", 0, 4, 2.0), stage("b", 4, 8, 12.0)]
     assert wanted_slots(route, ["a", "b"], {("a", "b"): 6.0}, True)["wanted"] == 1

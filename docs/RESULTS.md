@@ -352,6 +352,7 @@ Every comparison count on record, newest work last within each group.
 | Nearby seeds | Tool-call measurement, consecutive seeds | One draw put the same rare token into 11 of 72 replies (fixed) | Measured | 2026-11-06 | 2f9c5fe |
 | Silent relays and kills on the ring | See [Silent and lost links](#silent-and-lost-links) | Same text on every run listed there | Measured | 2026-11-07 | Round 4 ring lane |
 | Replies when passes merge | The round-five slots runs, temperature 0, from 4 replies at once | Not identical. Once passes merged, the same prompt gave different text from round to round, in every sweep and in the verifier's rerun; never with nothing merged. A merged pass rounds differently from single passes | Measured | 2026-11-07 | Round 5 slots lane and its verifier, [guide](GUIDE.md#several-conversations-at-once) |
+| Exact-merge probe at load | Laptop, CUDA build of llama.cpp, one stage loaded whole as a last stage and as a middle stage, 16 slots, 3 rounds | `exact_merge_limit` and `verify_exact` the same in all 3 rounds: Qwen3-0.6B Q8_0 on CPU 0 and false, so one companion already changes a row; on the RTX 3060 3 and true. Qwen3.5-0.8B Q8_0 3 and true on CPU and on the GPU. So with `--exact` this laptop's CPU stage of Qwen3-0.6B merges nothing and the others merge up to 4 replies | Measured | 2026-11-07 | Round 6 exact lane |
 
 ## Security probes
 
@@ -395,6 +396,7 @@ Every comparison count on record, newest work last within each group.
 | Finding a GPU without PyTorch | RTX 3060 Laptop GPU | cuda:0, 6 GiB, free VRAM read in 108 ms through nvidia-smi (cached 30 s); moved to a thread, about 2.7 ms a call. A light pool on the GPU 3.6 s for four replies against about 18.6 s on CPU | Measured | 2026-11-07 | 83f6ee1 |
 | Installing on Linux | WSL Ubuntu, fresh home folder, a local release mirror | A clean curl-style install under dash took 44 s, picked the manylinux wheel with the engine, and the node answered 200 on `/chat`; stopping left no processes. The x86_64 Linux library's newest glibc symbol is exactly 2.28. Inno Setup 7.1.0 compiled `iSharded-Setup.exe` (not run) | Measured | 2026-11-06 | 22e80a5 |
 | Fetch rate on the dashboard | A main load of Qwen3.5-0.8B over 3 loopback CPU workers | About 457 MiB/s to 1.5 GiB/s as the status page read it, a reading and not a benchmark. The window of a cleared route during repair was caught once and missed in 4 later tries, including with 8 samplers | Measured | 2026-11-07 | Round 5 UI lane |
+| What the probe adds to a load | The stages of the exact-merge probe row in [Replies identical](#replies-identical), 16 slots, base code against this lane's, interleaved, 3 rounds | Qwen3-0.6B: 0.43 to 0.79 s before, 0.97 to 1.87 s after. Qwen3.5-0.8B on the GPU: 0.86 to 1.18 s before, 1.64 to 2.17 s after; on CPU 0.73 to 1.17 s before, 6.1 to 11.0 s after. Where the CPU case spends that time was not measured | Measured | 2026-11-07 | Round 6 exact lane |
 
 ## Automated tests
 

@@ -680,7 +680,9 @@ def wanted_slots(
     wanted = min(math.floor(round_trip / row), MAX_PARALLEL) if len(busy) > 1 else 1
     if wanted > 1:
         costs = [pass_cost(stage_row, measured if merging else None) for stage_row, measured in zip(stage_rows, passes or [None] * len(route))]
-        together = merge_most if merging else 1
+        # A pass is counted only as large as every stage has measured one: a CPU stage that took
+        # 19 ms for one reply took 41 for three, and nothing says how the line goes past that.
+        together = min(merge_most, *(max(measured, default=1) for measured in passes)) if merging else 1
         speeds = {slots: [reply_speed(slots, replies, network, costs, devices, together) for replies in REPLY_COUNTS] for slots in range(1, MAX_PARALLEL + 1)}
         best = [max(column) for column in zip(*speeds.values())]
         wanted = next(slots for slots, row_speeds in speeds.items() if all(speed >= SLOTS_GOOD_ENOUGH * most for speed, most in zip(row_speeds, best)))
