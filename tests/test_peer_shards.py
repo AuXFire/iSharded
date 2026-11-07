@@ -61,6 +61,23 @@ def test_a_peer_copy_is_identical_and_loads(held, tmp_path: Path) -> None:
     assert set(load_unit(destination, "cpu", None, lambda name: False).tensors) == {"a", "b"}
 
 
+def test_a_peer_copy_stays_off_any_proxy(held, tmp_path: Path, monkeypatch) -> None:
+    made: list[httpx.Client] = []
+
+    class Seen(httpx.Client):
+        def __init__(self, **options) -> None:
+            super().__init__(**options)
+            made.append(self)
+
+        def stream(self, *args, **options):
+            raise httpx.ConnectError("no peer here")
+
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setattr(httpx, "Client", Seen)
+    assert not fetch_from_peer("http://peer", None, "m", "r", held[0], tmp_path / "copy" / "unit.safetensors", lambda count: None)
+    assert [client.trust_env for client in made] == [False]
+
+
 @pytest.mark.parametrize("options", [{"status": 404}, {"status": 500}, {"cut": 10}, {"tamper": True}], ids=["missing", "error", "short", "wrong-header"])
 def test_a_bad_peer_leaves_nothing_behind(held, tmp_path: Path, options: dict) -> None:
     unit, file = held
