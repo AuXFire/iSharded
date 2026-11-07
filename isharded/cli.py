@@ -492,7 +492,7 @@ def add_load_command(subparsers: Any, token: str | None) -> None:
     load.add_argument("--no-reuse-cached", action="store_true", help="plan as if no worker held any shards")
     load.add_argument("--draft", help="small GGUF for speculative decoding; chosen automatically if not set")
     load.add_argument("--no-draft", action="store_true", help="turn speculative decoding off")
-    load.add_argument("--parallel", type=int, help="replies to run at once; each costs its own context memory")
+    load.add_argument("--parallel", type=int, help="replies to run at once, each with its own context memory; left out, the load chooses")
     load.add_argument("--no-peer-fetch", action="store_true", help="download every shard from the model host")
     add_token(load, token, "an admin key; defaults to this machine's pool token")
     load.add_argument("--no-merge-passes", dest="merge_passes", action="store_false", help="make conversations take turns on each stage")

@@ -271,6 +271,7 @@ class FailingTarget:
     """Just enough of a target for the deploy loop."""
 
     profile = type("Profile", (), {"total_bytes": 10})()
+    parallel = {"slots": 1, "reason": "set by the operator"}
 
 
 def deploy_pool(monkeypatch, outcomes, moved_bytes):
@@ -688,6 +689,7 @@ def test_saving_state_is_atomic_and_round_trips(tmp_path, monkeypatch):
 
     class Saved:
         request = LoadModelRequest(model_id="m")
+        parallel = {}
 
         class manifest:
             revision = "r"

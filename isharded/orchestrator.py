@@ -4,16 +4,18 @@ import argparse
 import asyncio
 import base64
 import json
+import math
 import os
 import secrets
 import re
 import socket
 import time
 import uuid
-from collections import deque
+from collections import Counter, deque
 from collections.abc import AsyncIterator
 from contextlib import aclosing, asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass, field, replace
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlsplit
@@ -47,6 +49,7 @@ from .protocol import (
     ChatCompletionRequest,
     CompletionRequest,
     ConfigureRequest,
+    MAX_PARALLEL,
     PROTOCOL_VERSION,
     DraftModel,
     EmbeddingRequest,
@@ -252,6 +255,9 @@ class ModelTarget:
     # Workers that hold the whole GGUF, for a pool that cannot reach a model host.
     file_sources: list[str] = field(default_factory=list)
     slots: int = 1
+    # How slots was settled, for people and for whoever takes over the route. Empty
+    # means the load has yet to choose.
+    parallel: dict[str, Any] = field(default_factory=dict)
     merge_passes: bool = True
     embedding: bool = False
     projector: DraftModel | None = None
@@ -325,8 +331,8 @@ def build_target(
     draft = resolve_draft(request, manifest, adapter, sources, token)
     projector, image_marker = resolve_projector(request, adapter, sources, token)
     speculate_tokens = request.draft_tokens if draft else 0
-    slots = request.parallel if isinstance(adapter, GgufAdapter) and not request.embedding else 1
-    kv_share = KV_TYPES[request.kv_type if isinstance(adapter, GgufAdapter) else "f16"][1]
+    slotted = isinstance(adapter, GgufAdapter) and not request.embedding
+    slots = (request.parallel or 1) if slotted else 1
     units = adapter.partition(manifest.tensors)
     if request.model_hashes:
         apply_model_hashes(manifest, units, request.model_hashes)
@@ -337,9 +343,7 @@ def build_target(
         units=units,
         num_layers=adapter.num_layers,
         expert_active_fraction=adapter.expert_active_fraction,
-        kv_bytes_per_token=[adapter.kv_bytes_per_token(i, 2) * slots * kv_share // KV_TYPES["f16"][1] for i in range(adapter.num_layers)],
-        # Rewinding needs a snapshot of recurrent state for each guess.
-        state_bytes=[adapter.recurrent_state_bytes(i) * (1 + speculate_tokens) * slots for i in range(adapter.num_layers)],
+        **context_sizes(adapter, request, slots, speculate_tokens),
         context_tokens=request.context_tokens,
         # Only a lone embedding table can be shared: GPT-2's unit also holds
         # position embeddings, which the head does not have.
@@ -347,11 +351,13 @@ def build_target(
         amortize_tokens=AMORTIZE_TOKENS if reuse_cached else 0,
         stage_workspace_bytes=GGUF_STAGE_WORKSPACE_BYTES if isinstance(adapter, GgufAdapter) else 0,
         ring=isinstance(adapter, GgufAdapter) and os.getenv("ISHARDED_RING", "1") != "0",
-        entry_extra_bytes=(draft.file_size + DRAFT_WORKSPACE_BYTES if draft else 0)
-        + (projector.file_size + PROJECTOR_WORKSPACE_BYTES if projector else 0),
+        entry_extra_bytes=entry_bytes(draft, projector),
         attention_interval=getattr(adapter, "interval", 0),
     )
     hosted_copy = manifest.revision.startswith("local-") and control_source != request.model_id
+    settled = {"slots": slots, "reason": "set by the operator"} if slotted and request.parallel else {}
+    if not slotted:
+        settled = {"slots": 1, "reason": "this kind of model runs one reply at a time"}
     return ModelTarget(
         model_id=request.model_id,
         manifest=manifest,
@@ -371,10 +377,41 @@ def build_target(
         request=request,
         file_sources=holders,
         slots=slots,
+        parallel=settled,
         merge_passes=request.merge_passes,
         embedding=request.embedding,
         projector=projector,
         image_marker=image_marker,
+    )
+
+
+def context_sizes(adapter: Adapter, request: LoadModelRequest, slots: int, speculate_tokens: int) -> dict[str, list[int]]:
+    """What each layer keeps per token of context, and for good, across this many slots."""
+    kv_share = KV_TYPES[request.kv_type if isinstance(adapter, GgufAdapter) else "f16"][1]
+    layers = range(adapter.num_layers)
+    return {
+        "kv_bytes_per_token": [adapter.kv_bytes_per_token(i, 2) * slots * kv_share // KV_TYPES["f16"][1] for i in layers],
+        # Rewinding needs a snapshot of recurrent state for each guess.
+        "state_bytes": [adapter.recurrent_state_bytes(i) * (1 + speculate_tokens) * slots for i in layers],
+    }
+
+
+def entry_bytes(draft: DraftModel | None, projector: DraftModel | None) -> int:
+    return (draft.file_size + DRAFT_WORKSPACE_BYTES if draft else 0) + (projector.file_size + PROJECTOR_WORKSPACE_BYTES if projector else 0)
+
+
+def with_slots(target: ModelTarget, slots: int) -> None:
+    """Size a target for this many slots, when the load is the one choosing them.
+
+    Past one slot the draft's cache counts too: it holds a context for each, and one more.
+    """
+    assert target.request is not None
+    draft_cache = target.draft.kv_bytes_per_token * target.request.context_tokens * (slots + 1) if target.draft and slots > 1 else 0
+    target.slots = slots
+    target.profile = replace(
+        target.profile,
+        **context_sizes(target.adapter, target.request, slots, target.speculate_tokens),
+        entry_extra_bytes=entry_bytes(target.draft, target.projector) + draft_cache,
     )
 
 
@@ -438,7 +475,17 @@ def resolve_draft(
         file_size=draft.config["gguf_file_size"],
         revision=draft.revision,
         file_sources=holders,
+        kv_bytes_per_token=draft_cache_bytes(draft),
     )
+
+
+def draft_cache_bytes(draft: Manifest) -> int:
+    """A draft of a family nobody planned for still guesses, and its cache just goes uncounted."""
+    try:
+        adapter = create_adapter(draft.config)
+    except UnsupportedModel:
+        return 0
+    return sum(adapter.kv_bytes_per_token(layer, 2) for layer in range(adapter.num_layers))
 
 
 def resolve_projector(
@@ -479,13 +526,51 @@ def check_image_marker(target: ModelTarget) -> None:
         raise UnsupportedModel(f"this model's chat template has no {marker} for images, so {target.projector.file} cannot be used with it")
 
 
+def stage_ms(stage: StageAssignment) -> float:
+    """A row's time on a stage, from its memory's measured speed."""
+    # Bandwidth alone flatters small active sets, such as a MoE's: every layer still
+    # costs its kernel launches.
+    return max(stage.estimated_ms_per_token, (stage.end_layer - stage.start_layer) * LAYER_FLOOR_MS)
+
+
+def stage_devices(route: list[StageAssignment], candidates: list[Candidate]) -> list[str]:
+    """The physical memory each stage mostly runs from, which is the device that does its work."""
+    groups = {(candidate.worker_id, pool.pool_id): pool.capacity_group for candidate in candidates for pool in candidate.pools}
+
+    def device(stage: StageAssignment) -> str:
+        held: Counter[str] = Counter()
+        for item in stage.placements:
+            held[groups.get((stage.worker_id, item.pool_id), stage.worker_id)] += item.bytes
+        return held.most_common(1)[0][0] if held else stage.worker_id
+
+    return list(map(device, route))
+
+
+def wanted_slots(route: list[StageAssignment], devices: list[str], links: dict[tuple[str, str], float], ring: bool) -> dict[str, Any] | None:
+    """How many replies keep a route's busiest device working, or None if a link on it is unmeasured.
+
+    While one reply goes round, that device can serve round trip / row time others. Stages on
+    one device take turns on it, so their rows add up. A route on a single device has nothing
+    to overlap: measured with two stages on one GPU, two slots took two replies from 128 to 70
+    tokens/s, because neither stage can run while the other does.
+    """
+    names = [stage.worker_id for stage in route]
+    hops = list(pairwise(names)) + ([(names[-1], names[0])] if ring and len(names) > 1 else [])
+    if any(hop not in links and hop[::-1] not in links for hop in hops):
+        return None
+    busy: Counter[str] = Counter()
+    for stage, device in zip(route, devices):
+        busy[device] += stage_ms(stage)
+    row = max(busy.values())
+    round_trip = sum(busy.values()) + route_network_ms(route, links, ring)
+    wanted = min(math.ceil(round_trip / row), MAX_PARALLEL) if len(busy) > 1 else 1
+    return {"round_trip_ms": round(round_trip, 2), "row_ms": round(row, 2), "devices": len(busy), "wanted": wanted}
+
+
 def describe_plan(target: ModelTarget, route: list[StageAssignment]) -> dict[str, Any]:
     """Summarize a plan for people: what goes where, and what it will cost."""
-    # Bandwidth alone flatters small active sets, such as a MoE's: every layer still
-    # costs its kernel launches, and every stage boundary costs a network hop.
-    milliseconds = sum(
-        max(stage.estimated_ms_per_token, (stage.end_layer - stage.start_layer) * LAYER_FLOOR_MS) for stage in route
-    ) + route_network_ms(route, runtime.links, target.profile.ring)
+    # Every stage boundary costs a network hop as well.
+    milliseconds = sum(map(stage_ms, route)) + route_network_ms(route, runtime.links, target.profile.ring)
     download = sum(
         target.units[item.unit].nbytes
         for stage in route
@@ -506,6 +591,8 @@ def describe_plan(target: ModelTarget, route: list[StageAssignment]) -> dict[str
         "entry_worker": route[0].worker_id,
         "exit_worker": route[-1].worker_id,
         "estimated_tokens_per_second": round(1000 / milliseconds, 1) if milliseconds else None,
+        "parallel": target.slots,
+        "parallel_choice": target.parallel,
     }
 
 
@@ -523,6 +610,12 @@ def link_reading(measured: dict[str, Any], sizes: list[int]) -> dict[str, float]
     median = float(small["median_ms"])
     transfer = max(float(row["median_ms"]) - median, 0.0)
     return {"median_ms": median, "max_ms": float(small.get("max_ms", median)), "cost_ms": round(link_cost(small) + transfer, 2)}
+
+
+def same_load(held: ModelTarget, target: ModelTarget) -> bool:
+    """Whether a load asks for what is already running. How it waits changes nothing."""
+    asked = [item.request.model_dump(exclude={"wait"}) for item in (held, target) if item.request]
+    return len(asked) == 2 and asked[0] == asked[1] and held.manifest.revision == target.manifest.revision
 
 
 def row_bytes(target: ModelTarget) -> int:
@@ -689,6 +782,7 @@ class Orchestrator:
             "epoch": self.epoch,
             "route": [stage.model_dump() for stage in self.route],
             "term": self.mesh.term if self.mesh else 0,
+            "parallel": target.parallel,
         }
         if self.mesh is not None:
             self.mesh.publish(state)
@@ -861,6 +955,10 @@ class Orchestrator:
             self.active = target
             self.model_id = target.model_id
             self.tokenizer = target.tokenizer
+        if (state.get("parallel") or {}).get("auto"):
+            # The running stages hold these slots, so a later repair must keep them.
+            with_slots(self.active, int(state["parallel"]["slots"]))
+            self.active.parallel = state["parallel"]
         self.route = [StageAssignment.model_validate(item) for item in state["route"]]
         self.active_cache_url = None
         self.epoch = int(state["epoch"])
@@ -1409,6 +1507,59 @@ class Orchestrator:
             raise PlacementError(f"{target.model_id} would take {len(route)} stages here, and an embedding model cannot be split; it needs one worker that can hold it all")
         return route
 
+    def _route_or_none(self, target: ModelTarget) -> list[StageAssignment] | None:
+        try:
+            return self.plan(target)
+        except PlacementError:
+            return None
+
+    def choose_slots(self, target: ModelTarget) -> None:
+        """Settle how many replies a load runs at once, if the operator left that open.
+
+        Slots are in every stage's signature, so changing them restarts stages. This
+        decides once, and looks again only if the pool lost so much that nothing else
+        would hold the model.
+        """
+        if target.parallel.get("auto") and target.slots > 1 and self._route_or_none(target) is None:
+            target.parallel = {}
+        if target.parallel:
+            return
+        held = self.active
+        if held is not None and held is not target and held.parallel.get("auto") and same_load(held, target):
+            with_slots(target, held.slots)  # the same load again leaves its stages running
+            target.parallel = held.parallel
+            return
+        with_slots(target, 1)
+        route = self._route_or_none(target)
+        if route is None:
+            return  # the plan that follows says why
+        target.parallel = self._fit_slots(target, route)
+        self.add_event("model", f"{target.slots} at once", target.parallel["reason"])
+
+    def _fit_slots(self, target: ModelTarget, route: list[StageAssignment]) -> dict[str, Any]:
+        """As many slots as the route wants and can hold, on the same workers, with no more spilled."""
+        preferred, standby = self.candidate_groups()
+        wanted = wanted_slots(route, stage_devices(route, preferred + standby), self.links, target.profile.ring)
+        if wanted is None:
+            return {"auto": True, "slots": 1, "reason": "a link on this route has not been measured, so nothing says more would help"}
+        workers = {stage.worker_id for stage in route}
+        spilled = self.plan_memory(target, route)["spilled_bytes"]
+
+        def fits(slots: int) -> bool:
+            with_slots(target, slots)
+            plan = self._route_or_none(target)
+            return plan is not None and {stage.worker_id for stage in plan} == workers and self.plan_memory(target, plan)["spilled_bytes"] <= spilled
+
+        low, high = (wanted["wanted"], wanted["wanted"] + 1) if fits(wanted["wanted"]) else (1, wanted["wanted"])
+        while high - low > 1:
+            middle = (low + high) // 2
+            low, high = (middle, high) if fits(middle) else (low, middle)
+        with_slots(target, low)
+        trip = f"a {wanted['round_trip_ms']:.1f} ms round trip at {wanted['row_ms']:.1f} ms a row wants {wanted['wanted']}"
+        if wanted["devices"] == 1:
+            trip = "every stage runs on one device, so replies could only take turns on it"
+        return {"auto": True, "slots": low, **wanted, "reason": trip if low == wanted["wanted"] else f"{trip}, and {low} fit in memory"}
+
     def plan_or_refuse(self, target: ModelTarget, **options: bool) -> list[StageAssignment]:
         try:
             return self.plan(target, **options)
@@ -1676,6 +1827,7 @@ class Orchestrator:
             await self.refresh_worker_metrics()
             await self.refresh_holdings(target)
             await self.measure_links(row_bytes(target))
+            self.choose_slots(target)
             route = self.plan_or_refuse(target)
             job.route = route
             job.workers = {}
@@ -3058,6 +3210,7 @@ async def preview_plan(body: LoadModelRequest, authorization: str | None = Heade
     await runtime.refresh_worker_metrics()
     await runtime.refresh_holdings(target)
     await runtime.measure_links(row_bytes(target))
+    runtime.choose_slots(target)
     route = runtime.plan_or_refuse(target, honor_pins_strictly=True)
     return {**describe_plan(target, route), "memory": runtime.plan_memory(target, route)}
 

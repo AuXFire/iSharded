@@ -19,7 +19,9 @@ from safetensors.torch import save as save_safetensors
 META_HEADER = "x-isharded-meta"
 # Raised whenever workers and the orchestrator stop being able to talk safely.
 # A node on another version is refused at the door, not found out mid-request.
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 7
+# The most replies a route runs at once.
+MAX_PARALLEL = 64
 
 
 class ResourceContribution(BaseModel):
@@ -218,6 +220,8 @@ class DraftModel(BaseModel):
     file_size: int
     revision: PlainName
     file_sources: list[str] = Field(default_factory=list)
+    # What it keeps per token of context, which every slot adds to the entry stage.
+    kv_bytes_per_token: int = 0
 
 
 class ConfigureRequest(BaseModel):
@@ -297,7 +301,8 @@ class LoadModelRequest(BaseModel):
     draft_model: str = "auto"
     draft_tokens: int = Field(default=6, ge=1, le=16)  # the most guesses out at once
     # Replies the pipeline runs at once. Each costs its own context memory.
-    parallel: int = Field(default=1, ge=1, le=32)
+    # None leaves it to the load, which keeps the route busy with what fits.
+    parallel: int | None = Field(default=None, ge=1, le=MAX_PARALLEL)
     merge_passes: bool = True
     # Reuse saved prompt states. Replies are the same either way at temperature 0.
     prompt_cache: bool = True
