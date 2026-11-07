@@ -323,6 +323,10 @@ class CacheEntry:
     length: int = 0
     # This reply's passes left the Python path, so the later stages' own counts are stale.
     ring: bool = False
+    # The saved state and length this reply began from, if it began from one.
+    began: tuple[str, int] | None = None
+    # Where a state restored ahead of the first pass came from, until that pass comes.
+    ahead: str | None = None
 
 
 @dataclass(slots=True)
@@ -1119,6 +1123,49 @@ class WorkerRuntime:
         except asyncio.TimeoutError:
             return False
 
+    async def restore_ahead(self, request: InferRequest) -> None:
+        """Has every later stage restore a reply's state now, all at once.
+
+        Otherwise each restores when the first pass reaches it, one after another along
+        the route. This runs once the slot is this reply's, so after ``ring_settle`` has
+        ended the last reply's generation there, and nothing older can land on it. A stage
+        that cannot restore it answers no, and the pass restores there as it always did,
+        so a state it does not hold still comes back as missing.
+        """
+        body = {"session_id": request.session_id, "epoch": request.epoch, "slot": request.slot, "key": request.checkpoint_key, "length": request.restore_length}
+
+        async def ahead(stage: StageAssignment) -> None:
+            with suppress(httpx.HTTPError):
+                await self.client.post(
+                    stage.url.rstrip("/") + "/internal/state/restore",
+                    json=body,
+                    headers=auth_headers(self.pool_token),
+                    timeout=httpx.Timeout(FETCH_SECONDS, connect=PEER_SECONDS),
+                )
+
+        await asyncio.gather(*(ahead(stage) for stage in self.route if stage.worker_id != self.worker_id))
+
+    async def take_restore(self, session_id: str, epoch: int, slot: int, key: str, length: int) -> bool:
+        """Restores a state on a slot before the pass that wants it comes.
+
+        A restore that comes after its pass does nothing, since the pass restored it already.
+        One that comes for any other reply takes the slot as a first pass would, so a pass
+        that went on from what the slot held is refused and replayed, never run on this.
+        """
+        async with self.lock:
+            held = self.caches.get(session_id)
+            if self.gguf is None or epoch != self.epoch or (held is not None and (held.epoch, held.slot, held.began) == (epoch, slot, (key, length))):
+                return False
+            self.caches = {name: item for name, item in self.caches.items() if item.slot != slot}
+            try:
+                tier = await asyncio.to_thread(self.gguf.restore, key, slot)
+            except StageLost:
+                raise
+            except LlamaError:
+                return False
+            self.caches[session_id] = CacheEntry(epoch=epoch, slot=slot, length=length, began=(key, length), ahead=tier)
+            return True
+
     def _materialize_gguf(self, request: ConfigureRequest, adapter: GgufAdapter) -> None:
         """Assemble this stage's file from cached units and load it into llama.cpp."""
         self._drop_units()
@@ -1625,17 +1672,21 @@ class WorkerRuntime:
     def _session(self, request: InferRequest) -> CacheEntry:
         entry = self.caches.get(request.session_id)
         restoring = request.restore_length is not None
-        stale = entry is None or entry.epoch != request.epoch
+        began = (request.checkpoint_key, request.restore_length) if restoring else None
+        # A state restored ahead is only for the first pass it was restored for. Any other
+        # pass must not go on from it.
+        ahead = entry.ahead if entry is not None and (entry.epoch, entry.slot, entry.began) == (request.epoch, request.slot, began) else None
+        stale = entry is None or entry.epoch != request.epoch or entry.ahead is not None
         if self.gguf is not None and stale and not request.reset and not restoring:
             # llama.cpp holds one sequence and this session's is gone. Starting
             # from nothing would answer from the wrong state, so ask for a replay.
             raise retry_error("this session's state is gone")
         if request.reset or restoring or stale:
-            entry = CacheEntry(epoch=request.epoch, slot=request.slot)
+            entry = CacheEntry(epoch=request.epoch, slot=request.slot, began=began)
             if self.gguf is not None:
                 if restoring:
                     try:
-                        tier = self.gguf.restore(request.checkpoint_key, request.slot)
+                        tier = ahead or self.gguf.restore(request.checkpoint_key, request.slot)
                     except StageLost:
                         raise
                     except LlamaError as exc:
@@ -2636,6 +2687,23 @@ async def prepare_state(body: dict[str, Any], authorization: str | None = Header
     return {"ready": bool(NAME.fullmatch(key)) and await runtime.ensure_state(key)}
 
 
+@app.post("/internal/state/restore")
+async def take_restore(body: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, bool]:
+    """Restore a state on a slot ahead of the reply's first pass. See ``restore_ahead``."""
+    verify_token(authorization)
+    try:
+        key, session_id = str(body["key"]), str(body["session_id"])
+        slot, epoch, length = int(body["slot"]), int(body["epoch"]), int(body["length"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="a restore needs a key, session, slot, epoch and length") from exc
+    if not NAME.fullmatch(key) or not 0 <= slot < runtime.gate.size or length <= 0:
+        raise HTTPException(status_code=400, detail="no such state or slot")
+    try:
+        return {"restored": await runtime.take_restore(session_id, epoch, slot, key, length)}
+    except StageLost as exc:
+        raise await stage_failure(exc) from exc
+
+
 @app.post("/internal/state/keep")
 async def keep_states(body: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, str]:
     """Forget copies for anything no stage is running any more."""
@@ -2825,7 +2893,19 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             }
         )
         pieces = prompt_parts(plan.cuts, len(prompt) - start) if PROMPT_PARTS and rows is None and len(runtime.route) > 1 else []
-        result = await (runtime.run_in_parts(whole, pieces, reply_step) if len(pieces) > 1 else reply_step(whole, part))
+        restoring = runtime.gguf is not None and whole.restore_length is not None and len(runtime.route) > 1
+        ahead = asyncio.ensure_future(runtime.restore_ahead(whole)) if restoring else None
+        failed = True
+        try:
+            result = await (runtime.run_in_parts(whole, pieces, reply_step) if len(pieces) > 1 else reply_step(whole, part))
+            failed = False
+        finally:
+            if ahead is not None:
+                # One still on its way could land after the slot has gone to another reply.
+                # A failed pass may mean a silent stage, whose restore would hold the reply
+                # for its whole timeout, so then it gets only as long as a silent hop.
+                with suppress(Exception):
+                    await asyncio.wait_for(asyncio.shield(ahead), HOP_SILENCE_SECONDS if failed else None)
         for save in plan.saves:
             if save.replaces:
                 runtime.prefix.drop(save.replaces)

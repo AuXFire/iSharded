@@ -81,6 +81,7 @@ def test_copies_for_other_stages_stay_out_of_a_listing(node, tmp_path):
         ("get", "/internal/state/index"),
         ("post", "/internal/state/prepare"),
         ("post", "/internal/state/keep"),
+        ("post", "/internal/state/restore"),
     ],
 )
 def test_a_stranger_gets_nothing(node, method, path):
@@ -179,6 +180,38 @@ def test_a_stage_asked_to_prepare_answers(node):
 
     node.ensure_state = ensure
     assert client().post("/internal/state/prepare", json={"key": "abc"}, headers=token()).json() == {"ready": True}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"key": "../evil", "session_id": "s", "slot": 0, "epoch": 1, "length": 10},
+        {"key": "abc", "session_id": "s", "slot": 2, "epoch": 1, "length": 10},
+        {"key": "abc", "session_id": "s", "slot": -1, "epoch": 1, "length": 10},
+        {"key": "abc", "session_id": "s", "slot": 0, "epoch": 1, "length": 0},
+        {"key": "abc", "slot": 0, "epoch": 1, "length": 10},
+        {"key": "abc", "session_id": "s", "slot": "x", "epoch": 1, "length": 10},
+    ],
+)
+def test_a_restore_ahead_for_a_bad_name_or_slot_does_nothing(node, body):
+    async def take_restore(*_):
+        raise AssertionError("a request like that goes nowhere near a slot")
+
+    node.gate, node.take_restore = SimpleNamespace(size=2), take_restore
+    assert client().post("/internal/state/restore", json=body, headers=token()).status_code == 400
+
+
+def test_a_stage_asked_to_restore_ahead_answers(node):
+    asked = []
+
+    async def take_restore(*args):
+        asked.append(args)
+        return True
+
+    node.gate, node.take_restore = SimpleNamespace(size=2), take_restore
+    body = {"key": "abc", "session_id": "s", "slot": 1, "epoch": 3, "length": 10}
+    assert client().post("/internal/state/restore", json=body, headers=token()).json() == {"restored": True}
+    assert asked == [("s", 3, 1, "abc", 10)]
 
 
 def test_the_index_says_what_this_stage_can_restore(node):
