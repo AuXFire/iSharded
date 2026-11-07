@@ -162,7 +162,7 @@ def test_a_first_run_keeps_its_location(tmp_path):
     parser = argparse.ArgumentParser()
     up.add_arguments(parser.add_subparsers())
     args = parser.parse_args(["up", "--location", "de", "--address", "100.64.0.1"])
-    assert up.first_settings(args, tmp_path)["location"] == "DE"
+    assert up.first_settings(args)["location"] == "DE"
 
 
 def test_every_country_has_exactly_one_flag_and_every_table_entry_is_a_country():

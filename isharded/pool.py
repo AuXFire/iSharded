@@ -8,7 +8,9 @@ service, so a pool on a closed network can set itself up.
 from __future__ import annotations
 
 import base64
+import contextlib
 import datetime
+import hashlib
 import ipaddress
 import os
 from pathlib import Path
@@ -37,6 +39,10 @@ def load_token() -> str | None:
     if path.is_file():
         return path.read_text(encoding="utf-8").strip() or None
     return None
+
+
+def bearer_headers(token: str | None) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"} if token else {}
 
 
 class ExposedPool(ValueError):
@@ -86,10 +92,30 @@ def check_exposure(
 
 def _write_private(path: Path, data: bytes) -> None:
     path.write_bytes(data)
-    try:
+    with contextlib.suppress(OSError):  # Windows keeps this to the file's inherited permissions
         path.chmod(0o600)
-    except OSError:
-        pass  # Windows keeps this to the file's inherited permissions
+
+
+def _write_key(path: Path, key: Any) -> None:
+    from cryptography.hazmat.primitives import serialization
+
+    _write_private(path, key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+
+
+def _subject(name: str) -> Any:
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+
+    return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)])
+
+
+def _authority(root: Path) -> tuple[Any, Any]:
+    """The pool authority's certificate and private key."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+
+    certificate = x509.load_pem_x509_certificate((root / "ca.pem").read_bytes())
+    return certificate, serialization.load_pem_private_key((root / "ca.key").read_bytes(), password=None)
 
 
 def init_pool(folder: str) -> Path:
@@ -97,7 +123,6 @@ def init_pool(folder: str) -> Path:
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec
-    from cryptography.x509.oid import NameOID
 
     root = Path(folder)
     if (root / "ca.key").exists():
@@ -106,7 +131,7 @@ def init_pool(folder: str) -> Path:
     _write_private(root / "pool.token", (secrets.token_urlsafe(32) + "\n").encode())
 
     key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "iSharded pool authority")])
+    name = _subject("iSharded pool authority")
     now = datetime.datetime.now(datetime.timezone.utc)
     certificate = (
         x509.CertificateBuilder()
@@ -127,10 +152,7 @@ def init_pool(folder: str) -> Path:
         )
         .sign(key, hashes.SHA256())
     )
-    _write_private(
-        root / "ca.key",
-        key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()),
-    )
+    _write_key(root / "ca.key", key)
     (root / "ca.pem").write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
     return root
 
@@ -140,7 +162,6 @@ def request_membership(folder: str, name: str, addresses: list[str]) -> str:
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec
-    from cryptography.x509.oid import NameOID
 
     root = Path(folder)
     root.mkdir(parents=True, exist_ok=True)
@@ -149,10 +170,10 @@ def request_membership(folder: str, name: str, addresses: list[str]) -> str:
         key = serialization.load_pem_private_key(key_path.read_bytes(), password=None)
     else:
         key = ec.generate_private_key(ec.SECP256R1())
-        _write_private(key_path, key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+        _write_key(key_path, key)
     request = (
         x509.CertificateSigningRequestBuilder()
-        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)]))
+        .subject_name(_subject(name))
         .add_extension(x509.SubjectAlternativeName(_alternative_names(addresses)), critical=False)
         .sign(key, hashes.SHA256())
     )
@@ -162,7 +183,7 @@ def request_membership(folder: str, name: str, addresses: list[str]) -> str:
 def read_membership_request(text: str) -> dict[str, Any]:
     """What a request claims, once its own signature checks out. ValueError if it does not."""
     from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives import serialization
     from cryptography.x509.oid import ExtensionOID, NameOID
 
     request = x509.load_pem_x509_csr(text.encode())
@@ -177,9 +198,7 @@ def read_membership_request(text: str) -> dict[str, Any]:
         raise ValueError("a request lists the node's addresses") from None
     addresses = [str(value) for value in [*extension.get_values_for_type(x509.IPAddress), *extension.get_values_for_type(x509.DNSName)]]
     public = request.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
-    digest = hashes.Hash(hashes.SHA256())
-    digest.update(public)
-    return {"name": str(names[0].value), "addresses": addresses, "fingerprint": digest.finalize().hex()[:16]}
+    return {"name": str(names[0].value), "addresses": addresses, "fingerprint": hashlib.sha256(public).hexdigest()[:16]}
 
 
 def approve_membership(folder: str, text: str) -> str:
@@ -189,9 +208,7 @@ def approve_membership(folder: str, text: str) -> str:
 
     request = x509.load_pem_x509_csr(text.encode())
     details = read_membership_request(text)
-    root = Path(folder)
-    authority = x509.load_pem_x509_certificate((root / "ca.pem").read_bytes())
-    signer = serialization.load_pem_private_key((root / "ca.key").read_bytes(), password=None)
+    authority, signer = _authority(Path(folder))
     certificate = _certificate(details["name"], details["addresses"], request.public_key(), authority, signer)
     return certificate.public_bytes(serialization.Encoding.PEM).decode()
 
@@ -224,12 +241,12 @@ def _alternative_names(addresses: list[str]) -> list[Any]:
 def _certificate(name: str, addresses: list[str], public_key: Any, authority: Any, signer: Any) -> Any:
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes
-    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+    from cryptography.x509.oid import ExtendedKeyUsageOID
 
     now = datetime.datetime.now(datetime.timezone.utc)
     return (
         x509.CertificateBuilder()
-        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)]))
+        .subject_name(_subject(name))
         .issuer_name(authority.subject)
         .public_key(public_key)
         .serial_number(x509.random_serial_number())
@@ -247,19 +264,14 @@ def _certificate(name: str, addresses: list[str], public_key: Any, authority: An
 
 def add_node(folder: str, name: str, addresses: list[str]) -> tuple[Path, Path]:
     """Issue a node its certificate. It proves the node's name in both directions."""
-    from cryptography import x509
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import ec
 
     root = Path(folder)
-    authority = x509.load_pem_x509_certificate((root / "ca.pem").read_bytes())
-    signer = serialization.load_pem_private_key((root / "ca.key").read_bytes(), password=None)
+    authority, signer = _authority(root)
     key = ec.generate_private_key(ec.SECP256R1())
     certificate = _certificate(name, addresses, key.public_key(), authority, signer)
     certificate_path, key_path = root / f"{name}.pem", root / f"{name}.key"
     certificate_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
-    _write_private(
-        key_path,
-        key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()),
-    )
+    _write_key(key_path, key)
     return certificate_path, key_path

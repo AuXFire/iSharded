@@ -13,7 +13,6 @@ stays there. Nothing else in the mesh can admit anyone.
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import hmac
 import json
@@ -28,20 +27,22 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 import webbrowser
 
 import httpx
 import psutil
 
-from .access import digest
+from .access import create_key, digest, new_key
+from .commons import identity_name, make_identity, write_policy
 from .discovery import find_meshes
 from .geo import country_code
 from .inventory import ram
 from .node import add_node_arguments, detect_address, run_node
 from .tls import OWN_ADDRESS, stay_on_this_machine
-from .pool import _private_link, _write_private, add_node, approve_membership, home as pool_home, init_pool, request_membership, sign_entry
+from .pool import _private_link, _write_private, add_node, approve_membership, bearer_headers, home as pool_home, init_pool, request_membership, sign_entry
 from .statements import VERIFIER_LENGTH, key_verifier
+from .tickets import _decode, _encode
 
 DEFAULT_PORT = 8209
 INVITE_PREFIX = "isi-"
@@ -104,7 +105,7 @@ def make_owner(home: Path, name: str, address: str) -> None:
     """A new mesh: its authority, this node's certificate, and the owner's key."""
     init_pool(str(home))
     add_node(str(home), name, [address, "127.0.0.1"])
-    key = "isk-" + secrets.token_urlsafe(32)
+    key = new_key()
     _write_private(home / "admin.key", key.encode())
     signed = sign_entry(str(home), {"type": "key", "name": "owner", "role": "admin", "sha256": digest(key), "requests_per_minute": 0, "verifier": key_verifier(key)})
     (home / "access.json").write_text(json.dumps({"version": 1, "keys": [], "signed": [signed]}), encoding="utf-8")
@@ -144,16 +145,15 @@ def create_invite(home: Path, urls: list[str], uses: int = 1, hours: float = 24.
     invites = [invite for invite in read_invites(home) if invite["expires_at"] > clock() and invite["uses"] > 0]
     write_invites(home, [*invites, {"secret": secret, "uses": max(int(uses), 1), "expires_at": expires_at}])
     body = {"urls": urls[:INVITE_ADDRESSES], "authority": authority_hash((home / "ca.pem").read_text(encoding="utf-8")), "secret": secret}
-    code = INVITE_PREFIX + base64.urlsafe_b64encode(json.dumps(body, separators=(",", ":")).encode()).decode().rstrip("=")
+    code = INVITE_PREFIX + _encode(json.dumps(body, separators=(",", ":")).encode())
     return {"code": code, "command": f"isharded up --invite {code}", "expires_at": expires_at}
 
 
 def read_invite(code: str) -> dict[str, Any]:
     if not code.startswith(INVITE_PREFIX):
         raise ValueError(f"an invite starts with {INVITE_PREFIX}")
-    text = code[len(INVITE_PREFIX):]
     try:
-        body = json.loads(base64.urlsafe_b64decode(text + "=" * (-len(text) % 4)))
+        body = json.loads(_decode(code[len(INVITE_PREFIX):]))
         return {"urls": [str(url).rstrip("/") for url in body["urls"]], "authority": str(body["authority"]), "secret": str(body["secret"])}
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("this invite is damaged; copy the whole code") from exc
@@ -178,9 +178,12 @@ def matching_invite(invites: list[dict[str, Any]], item: dict[str, Any], clock: 
     return None
 
 
+def mesh_client(verify: Any, timeout: float = 30.0) -> httpx.Client:
+    return httpx.Client(event_hooks={"request": [stay_on_this_machine]}, timeout=timeout, trust_env=False, verify=verify)
+
+
 def client_for(settings: dict[str, Any], home: Path) -> httpx.Client:
-    verify: Any = str(home / "ca.pem") if settings.get("tls") else True
-    return httpx.Client(event_hooks={"request": [stay_on_this_machine]}, timeout=30.0, trust_env=False, verify=verify)
+    return mesh_client(str(home / "ca.pem") if settings.get("tls") else True)
 
 
 def local_url(settings: dict[str, Any]) -> str:
@@ -236,7 +239,7 @@ def fetch_authority(invite: dict[str, Any]) -> tuple[str, str]:
     for url in invite["urls"]:
         try:
             # Nothing is trusted yet, so the connection proves nothing. The hash does.
-            with httpx.Client(event_hooks={"request": [stay_on_this_machine]}, timeout=15.0, verify=False, trust_env=False) as client:
+            with mesh_client(False, timeout=15.0) as client:
                 answer = client.get(url + "/join/authority")
             answer.raise_for_status()
             pem = answer.json()["authority"]
@@ -277,15 +280,14 @@ def join_mesh(home: Path, invite: dict[str, Any], name: str, address: str) -> st
     url, pem = fetch_authority(invite)
     home.mkdir(parents=True, exist_ok=True)
     (home / "ca.pem").write_text(pem, encoding="utf-8")
-    verify: Any = str(home / "ca.pem") if url.startswith("https") else True
-    key = "isk-" + secrets.token_urlsafe(32)
+    key = new_key()
     request = request_membership(str(home), name, [address, "127.0.0.1"])
     key_hash, verifier = digest(key), key_verifier(key)
     secret = invite.get("secret")
     asking = {"request": request, "key_sha256": key_hash, "key_verifier": verifier}
     if secret:
         asking["proof"] = invite_proof(secret, request, key_hash, verifier)
-    with httpx.Client(event_hooks={"request": [stay_on_this_machine]}, timeout=30.0, trust_env=False, verify=verify) as client:
+    with mesh_client(str(home / "ca.pem") if url.startswith("https") else True) as client:
         answer = ask_to_join(client, url, asking, time.monotonic() + APPROVAL_WAIT_SECONDS)
         if answer.status_code != 200:
             raise ValueError(answer.text[:200])
@@ -317,7 +319,6 @@ def node_arguments(settings: dict[str, Any], home: Path) -> argparse.Namespace:
         "--node-id", name,
         "--control-port", str(port),
         "--base-port", str(settings.get("worker_port") or port - 9),
-        "--control-port", str(port),
         "--advertise-host", settings["address"],
         "--keys-file", str(home / "access.json"),
         "--weights-ram-gb", settings.get("ram_gb") or "auto",
@@ -355,16 +356,21 @@ def sign_in_key(home: Path) -> str | None:
     return None
 
 
-def wait_until_healthy(client: httpx.Client, base: str) -> bool:
-    deadline = time.monotonic() + HEALTH_WAIT_SECONDS
+def keep_asking(ask: Callable[[], bool], seconds: float) -> bool:
+    """Ask once a second until the answer is yes. A failed attempt counts as a no."""
+    deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         try:
-            if client.get(base + "/health", timeout=3.0).status_code == 200:
+            if ask():
                 return True
-        except httpx.HTTPError:
+        except (httpx.HTTPError, ValueError):
             pass
         time.sleep(1.0)
     return False
+
+
+def wait_until_healthy(client: httpx.Client, base: str) -> bool:
+    return keep_asking(lambda: client.get(base + "/health", timeout=3.0).status_code == 200, HEALTH_WAIT_SECONDS)
 
 
 def can_load(answer: httpx.Response) -> bool:
@@ -379,22 +385,14 @@ def can_load(answer: httpx.Response) -> bool:
 
 
 def wait_until_settled(client: httpx.Client, base: str, key: str | None) -> bool:
-    headers = {"Authorization": f"Bearer {key}"} if key else {}
-    deadline = time.monotonic() + SETTLE_WAIT_SECONDS
-    while time.monotonic() < deadline:
-        try:
-            if can_load(client.get(base + "/admin/status", headers=headers, timeout=5.0)):
-                return True
-        except (httpx.HTTPError, ValueError):
-            pass
-        time.sleep(1.0)
-    return False
+    headers = bearer_headers(key)
+    return keep_asking(lambda: can_load(client.get(base + "/admin/status", headers=headers, timeout=5.0)), SETTLE_WAIT_SECONDS)
 
 
 def load_first_model(settings: dict[str, Any], home: Path, key: str | None, model: str) -> None:
     """Follows the load to its end, since a refused or failed model would otherwise say nothing."""
     base = local_url(settings)
-    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    headers = bearer_headers(key)
     with client_for(settings, home) as client:
         try:
             answer = client.post(base + "/admin/load", json={"model_id": model, "wait": False}, headers=headers, timeout=30.0)
@@ -419,6 +417,21 @@ def load_first_model(settings: dict[str, Any], home: Path, key: str | None, mode
                 return
 
 
+def sign_in_machines(home: Path, client: httpx.Client, base: str, key: str) -> None:
+    """The owner's machine, for as long as it runs: nobody else can sign anyone in."""
+    try:
+        give_owner_a_verifier(home, client, base, key)
+    except (httpx.HTTPError, OSError, ValueError) as exc:
+        print(f"Could not update the owner's key: {exc}", flush=True)
+    while True:
+        time.sleep(APPROVAL_SECONDS)
+        try:
+            for name in approve_invited(home, client, base, key):
+                print(f"Added {name} to the mesh.", flush=True)
+        except (httpx.HTTPError, OSError, ValueError) as exc:
+            print(f"Could not check for new machines: {exc}", flush=True)
+
+
 def keep_watch(home: Path, settings: dict[str, Any], args: argparse.Namespace) -> None:
     """Runs beside the node: says it is ready, and signs in invited machines."""
     base = local_url(settings)
@@ -429,8 +442,9 @@ def keep_watch(home: Path, settings: dict[str, Any], args: argparse.Namespace) -
             return
         settled = wait_until_settled(client, base, key)
         page = f"{base}/chat"
+        holds_authority = (home / "ca.key").is_file()
         print(f"\niSharded is up as {settings['name']}.\n  Chat and dashboard: {page}", flush=True)
-        if (home / "ca.key").is_file():
+        if holds_authority:
             print("  Add a machine:      isharded invite\n", flush=True)
         if not settled:
             print(f"It has no coordinator or worker yet, so it cannot load a model. Its log is {home / 'node.log'}.", flush=True)
@@ -439,19 +453,8 @@ def keep_watch(home: Path, settings: dict[str, Any], args: argparse.Namespace) -
         if args.model and settled:
             # A big model takes minutes, and invited machines should not wait behind it.
             threading.Thread(target=load_first_model, args=(settings, home, key, args.model), daemon=True).start()
-        if settings.get("ownerless") or not (home / "ca.key").is_file():
-            return
-        try:
-            give_owner_a_verifier(home, client, base, key or "")
-        except (httpx.HTTPError, OSError, ValueError) as exc:
-            print(f"Could not update the owner's key: {exc}", flush=True)
-        while True:
-            time.sleep(APPROVAL_SECONDS)
-            try:
-                for name in approve_invited(home, client, base, key or ""):
-                    print(f"Added {name} to the mesh.", flush=True)
-            except (httpx.HTTPError, OSError, ValueError) as exc:
-                print(f"Could not check for new machines: {exc}", flush=True)
+        if holds_authority and not settings.get("ownerless"):
+            sign_in_machines(home, client, base, key or "")
 
 
 def choose_mesh(found: list[dict[str, str]], args: argparse.Namespace) -> dict[str, str] | None:
@@ -468,14 +471,14 @@ def choose_mesh(found: list[dict[str, str]], args: argparse.Namespace) -> dict[s
     if not sys.stdin.isatty():
         print("Starting a new mesh instead. Run isharded up --find to ask to join.", flush=True)
         return None
-    answer = input(f"Join which? Enter a number, or n for a new mesh [{1}]: ").strip().lower()
+    answer = input("Join which? Enter a number, or n for a new mesh [1]: ").strip().lower()
     if answer in {"n", "no"}:
         return None
     index = int(answer) - 1 if answer.isdigit() else 0
     return found[index] if 0 <= index < len(found) else None
 
 
-def first_settings(args: argparse.Namespace, home: Path) -> dict[str, Any]:
+def first_settings(args: argparse.Namespace) -> dict[str, Any]:
     address = args.address or detect_address()
     tls = bool(args.tls) or needs_tls(address, args.trusted_network)
     return {
@@ -498,9 +501,6 @@ def first_settings(args: argparse.Namespace, home: Path) -> dict[str, Any]:
 
 
 def make_ownerless(home: Path, settings: dict[str, Any], joining: str, trust: list[str] | None = None) -> None:
-    from .access import create_key
-    from .commons import identity_name, make_identity, write_policy
-
     make_identity(home / "commons")
     write_policy(home / "commons", joining, trust=trust)
     settings["name"] = identity_name(home / "commons")
@@ -516,6 +516,16 @@ def become_member(home: Path, settings: dict[str, Any], invite: dict[str, Any]) 
     write_settings(home, settings)
 
 
+def start_mesh(home: Path, settings: dict[str, Any], args: argparse.Namespace) -> None:
+    if settings["ownerless"]:
+        make_ownerless(home, settings, args.joining, args.trust)
+    else:
+        make_owner(home, settings["name"], settings["address"])
+    write_settings(home, settings)
+    owns = "Nobody owns it, and this node is named " + settings["name"] if settings["ownerless"] else "This machine owns it"
+    print(f"Made a new mesh in {home}. {owns}. Keep that folder safe.", flush=True)
+
+
 def run_up(args: argparse.Namespace) -> int:
     home = up_home()
     os.environ["ISHARDED_UP_HOME"] = str(home)
@@ -528,21 +538,15 @@ def run_up(args: argparse.Namespace) -> int:
             if settings:
                 print(f"This machine already belongs to a mesh, kept in {home}. Remove that folder to join another.", file=sys.stderr)
                 return 1
-            settings = first_settings(args, home)
+            settings = first_settings(args)
             become_member(home, settings, read_invite(args.invite))
         elif settings is None:
-            settings = first_settings(args, home)
+            settings = first_settings(args)
             mesh = None if args.new_mesh or args.ownerless or args.no_discovery else choose_mesh(find_meshes(), args)
             if mesh:
                 become_member(home, settings, {"urls": [mesh["url"]], "authority": mesh["authority"]})
             else:
-                if settings["ownerless"]:
-                    make_ownerless(home, settings, args.joining, args.trust)
-                else:
-                    make_owner(home, settings["name"], settings["address"])
-                write_settings(home, settings)
-                owns = "Nobody owns it, and this node is named " + settings["name"] if settings["ownerless"] else "This machine owns it"
-                print(f"Made a new mesh in {home}. {owns}. Keep that folder safe.", flush=True)
+                start_mesh(home, settings, args)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -635,12 +639,12 @@ def checks() -> list[tuple[bool, str, str]]:
     try:
         import cryptography  # noqa: F401
 
-        found.append((True, "cryptography is installed", ""))
+        check(True, "cryptography is installed", "")
     except ImportError:
-        found.append((False, "cryptography is missing", "pip install cryptography"))
+        check(False, "cryptography is missing", "pip install cryptography")
     address = detect_address()
     private = _private_link(address)
-    found.append((True, f"This machine would advertise {address}" + (" (encrypted by Tailscale)" if private else ""), ""))
+    check(True, f"This machine would advertise {address}" + (" (encrypted by Tailscale)" if private else ""), "")
     if not private:
         found.append((True, "No Tailscale address found", "Nodes will use TLS with their own certificates. Tailscale is the easier way to link machines in different places"))
     with socket.socket() as probe:

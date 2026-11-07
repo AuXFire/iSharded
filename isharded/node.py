@@ -18,6 +18,7 @@ from .lanes import lane_port, lane_url, read_lanes
 from .tls import OWN_ADDRESS
 from .pool import check_exposure, load_token
 
+
 def is_remote_path(path: str | Path) -> bool:
     """True for a UNC path, an RDP redirected drive, or a mapped network drive."""
     text = str(path)
@@ -165,25 +166,24 @@ def _control_urls(args: argparse.Namespace) -> str:
     return ",".join(dict.fromkeys([*local, *_seeds(args)]))
 
 
-def _control_command(args: argparse.Namespace) -> list[str]:
+def _trust_flags(args: argparse.Namespace) -> list[str]:
     return [
-        sys.executable,
-        "-m",
-        "isharded.orchestrator",
-        "--host",
-        args.bind_host,
-        "--port",
-        str(_control_port(args)),
-        "--node-id",
-        args.node_id,
-        "--advertise-url",
-        _local_control(args),
-        "--join",
-        ",".join(_seeds(args)),
         *(["--open"] if getattr(args, "open_pool", False) else []),
         *(["--trusted-network"] if getattr(args, "trusted_network", False) else []),
-        *_lane_flags(args),
     ]
+
+
+def _control_command(args: argparse.Namespace) -> list[str]:
+    return [
+        sys.executable, "-m", "isharded.orchestrator",
+        "--host", args.bind_host,
+        "--port", str(_control_port(args)),
+        "--node-id", args.node_id,
+        "--advertise-url", _local_control(args),
+        "--join", ",".join(_seeds(args)),
+        *_trust_flags(args),
+        *_lane_flags(args),
+    ]  # fmt: skip
 
 
 def data_folder() -> Path:
@@ -197,54 +197,32 @@ def _lane_flags(args: argparse.Namespace) -> list[str]:
     if not lane:
         return []
     return [
-        "--lane",
-        lane,
-        "--state-file",
-        str(lane_state_file(args.node_id, lane)),
-        "--audit-file",
-        str(data_folder() / f"audit-{args.node_id}-{lane}.jsonl"),
-        "--keys-file",
-        str(data_folder() / f"access-{args.node_id}-{lane}.json"),
-    ]
+        "--lane", lane,
+        "--state-file", str(lane_state_file(args.node_id, lane)),
+        "--audit-file", str(data_folder() / f"audit-{args.node_id}-{lane}.jsonl"),
+        "--keys-file", str(data_folder() / f"access-{args.node_id}-{lane}.json"),
+    ]  # fmt: skip
 
 
 def lane_state_file(node_id: str, lane: str) -> Path:
     return data_folder() / f"orchestrator-state-{node_id}-{lane}.json"
 
 
-def _worker_command(
-    args: argparse.Namespace,
-    worker_id: str,
-    port: int,
-    device: str,
-    roles: str,
-    extra: list[str],
-) -> list[str]:
-    advertised_url = f"{args.advertise_scheme}://{args.advertise_host}:{port}"
+def _worker_command(args: argparse.Namespace, worker_id: str, port: int, device: str, roles: str, extra: list[str]) -> list[str]:
     return [
-        sys.executable,
-        "-m",
-        "isharded.worker",
-        "--host",
-        args.bind_host,
-        "--port",
-        str(port),
-        "--worker-id",
-        worker_id,
-        "--orchestrator-url",
-        _control_urls(args),
-        "--advertise-url",
-        advertised_url,
-        "--device",
-        device,
-        "--roles",
-        roles,
-        *(["--open"] if getattr(args, "open_pool", False) else []),
-        *(["--trusted-network"] if getattr(args, "trusted_network", False) else []),
+        sys.executable, "-m", "isharded.worker",
+        "--host", args.bind_host,
+        "--port", str(port),
+        "--worker-id", worker_id,
+        "--orchestrator-url", _control_urls(args),
+        "--advertise-url", f"{args.advertise_scheme}://{args.advertise_host}:{port}",
+        "--device", device,
+        "--roles", roles,
+        *_trust_flags(args),
         *(["--host-models", args.host_models] if getattr(args, "host_models", "") else []),
         *(["--location", args.location] if getattr(args, "location", None) else []),
         *extra,
-    ]
+    ]  # fmt: skip
 
 
 def _weight_memory_flags(args: argparse.Namespace) -> list[str]:
@@ -268,10 +246,7 @@ def _cache_flags(args: argparse.Namespace) -> list[str]:
     for name in ("state_ram_gb", "state_disk_gb", "state_copy_mb"):
         if getattr(args, name, None) is not None:
             flags += ["--" + name.replace("_", "-"), str(getattr(args, name))]
-    if getattr(args, "no_peer_fetch", False):
-        flags.append("--no-peer-fetch")
-    if getattr(args, "no_peer_serve", False):
-        flags.append("--no-peer-serve")
+    flags += [flag for flag, name in (("--no-peer-fetch", "no_peer_fetch"), ("--no-peer-serve", "no_peer_serve")) if getattr(args, name, False)]
     if getattr(args, "llama_dir", None):
         flags += ["--llama-dir", args.llama_dir]
     for folder in getattr(args, "gguf_dir", None) or []:
@@ -343,6 +318,19 @@ class Service:
             self.process.kill()
 
 
+def _has_accelerator() -> bool:
+    # Import the accelerator runtime only when discovery was requested.
+    # CPU/RAM-only contributors should not depend on CUDA/ROCm driver
+    # initialization merely to join the pool.
+    import torch
+
+    from .memory import vulkan_accelerators
+
+    has_mps = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    has_xpu = hasattr(torch, "xpu") and torch.xpu.is_available()
+    return torch.cuda.is_available() or has_mps or has_xpu or bool(vulkan_accelerators())
+
+
 def node_specs(args: argparse.Namespace) -> list[tuple[str, list[str]]]:
     """What this node runs: a label and a command for each process."""
     specs: list[tuple[str, list[str]]] = []
@@ -351,61 +339,30 @@ def node_specs(args: argparse.Namespace) -> list[tuple[str, list[str]]]:
     dtype = getattr(args, "gpu_dtype", "auto")
     weight_flags = _weight_memory_flags(args)
     cache_flags = _cache_flags(args)
-    if gpu_device == "auto":
-        # Import the accelerator runtime only when discovery was requested.
-        # CPU/RAM-only contributors should not depend on CUDA/ROCm driver
-        # initialization merely to join the pool.
-        import torch
-
-        has_mps = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-        has_xpu = hasattr(torch, "xpu") and torch.xpu.is_available()
-        from .memory import vulkan_accelerators
-
-        gpu_device = "auto" if torch.cuda.is_available() or has_mps or has_xpu or vulkan_accelerators() else "none"
+    thread_flags = ["--cpu-threads", str(args.cpu_threads)] if args.cpu_threads else []
+    if gpu_device == "auto" and not _has_accelerator():
+        gpu_device = "none"
     # A worker with weights in several memory types executes all of them
     # itself: the CPU runs the RAM and disk tiers, the GPU the VRAM tier.
     spans_tiers = gpu_device != "none" and bool(weight_flags)
     if gpu_device != "none":
         extra = ["--gpu-memory-gb", str(args.gpu_memory_gb), "--dtype", dtype, *cache_flags]
         if spans_tiers:
-            extra += weight_flags
-            if args.cpu_threads:
-                extra += ["--cpu-threads", str(args.cpu_threads)]
-        specs.append(
-            (
-                "GPU + RAM/disk inference" if spans_tiers else "GPU inference",
-                _worker_command(args, f"{args.node_id}-gpu", port, gpu_device, "inference", extra),
-            )
-        )
+            extra += [*weight_flags, *thread_flags]
+        label = "GPU + RAM/disk inference" if spans_tiers else "GPU inference"
+        specs.append((label, _worker_command(args, f"{args.node_id}-gpu", port, gpu_device, "inference", extra)))
         port += 1
     if not spans_tiers and (args.cpu_threads > 0 or weight_flags):
-        extra = ["--dtype", dtype, *cache_flags, *weight_flags]
-        if args.cpu_threads:
-            extra += ["--cpu-threads", str(args.cpu_threads)]
+        extra = ["--dtype", dtype, *cache_flags, *weight_flags, *thread_flags]
         if not args.cpu_active:
             extra.append("--standby")
-        specs.append(
-            (
-                "CPU inference" + ("" if args.cpu_active else " standby"),
-                _worker_command(args, f"{args.node_id}-cpu", port, "cpu", "inference", extra),
-            )
-        )
+        label = "CPU inference" + ("" if args.cpu_active else " standby")
+        specs.append((label, _worker_command(args, f"{args.node_id}-cpu", port, "cpu", "inference", extra)))
         port += 1
     if args.ram_budget_gb > 0:
-        specs.append(
-            (
-                "RAM KV cache",
-                _worker_command(
-                    args,
-                    f"{args.node_id}-memory",
-                    port,
-                    "cpu",
-                    "kv-cache,checkpoint",
-                    # It keeps copies of saved states too, in the same places as any worker here.
-                    ["--ram-budget-gb", str(args.ram_budget_gb), *cache_flags],
-                ),
-            )
-        )
+        # It keeps copies of saved states too, in the same places as any worker here.
+        extra = ["--ram-budget-gb", str(args.ram_budget_gb), *cache_flags]
+        specs.append(("RAM KV cache", _worker_command(args, f"{args.node_id}-memory", port, "cpu", "kv-cache,checkpoint", extra)))
     if not specs and not getattr(args, "lane", None):
         raise ValueError("node contributes nothing; enable a GPU, CPU threads, or a RAM or disk budget")
     if not getattr(args, "no_control", False):
@@ -485,7 +442,8 @@ def join_commons(args: argparse.Namespace) -> None:
     print(f"This node is {args.node_id}.", flush=True)
 
 
-def run_node(args: argparse.Namespace) -> int:
+def _publish_settings(args: argparse.Namespace) -> None:
+    """Put what this node's processes share in the environment, and refuse an unsafe start."""
     if getattr(args, "ownerless", None):
         join_commons(args)
     if getattr(args, "pool_token_file", None):
@@ -507,18 +465,13 @@ def run_node(args: argparse.Namespace) -> int:
             # The same certificate also signs what TLS cannot vouch for: gossip replies.
             os.environ.setdefault("ISHARDED_IDENTITY_CERT", str(Path(args.tls_cert).resolve()))
             os.environ.setdefault("ISHARDED_IDENTITY_KEY", str(Path(args.tls_key).resolve()))
-    check_exposure(
-        args.bind_host,
-        load_token(),
-        os.getenv("ISHARDED_CA_FILE"),
-        getattr(args, "open_pool", False),
-        args.advertise_host,
-        getattr(args, "trusted_network", False),
-    )
-    for seed in _seeds(args):  # credentials go to the peers named here, too
-        check_exposure(args.bind_host, load_token(), os.getenv("ISHARDED_CA_FILE"), getattr(args, "open_pool", False), seed, getattr(args, "trusted_network", False))
-    specs = node_specs(args)
+    token, authority = load_token(), os.getenv("ISHARDED_CA_FILE")
+    for address in (args.advertise_host, *_seeds(args)):  # credentials go to the peers named here, too
+        check_exposure(args.bind_host, token, authority, getattr(args, "open_pool", False), address, getattr(args, "trusted_network", False))
 
+
+def _child_environment(args: argparse.Namespace) -> tuple[dict[str, str], Path]:
+    """What this node's processes run with, and the folder they run from."""
     env = os.environ.copy()
     if args.bind_host in {"0.0.0.0", "::"}:  # loopback reaches this node's services only then
         env.setdefault(OWN_ADDRESS, args.advertise_host)
@@ -540,8 +493,16 @@ def run_node(args: argparse.Namespace) -> int:
     ):
         if getattr(args, option, None):
             env[variable] = str(Path(getattr(args, option)).resolve())
+    return env, code_root
+
+
+def run_node(args: argparse.Namespace) -> int:
+    _publish_settings(args)
+    specs = node_specs(args)
+    env, code_root = _child_environment(args)
     output = open_log(getattr(args, "log_file", None))
     extra = {"stdout": output, "stderr": subprocess.STDOUT} if output else {}
+
     def make_service(label: str, command: list[str]) -> Service:
         return Service(label, lambda: subprocess.Popen(command, env=env, cwd=code_root, **extra))
 

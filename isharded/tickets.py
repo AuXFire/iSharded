@@ -56,14 +56,14 @@ class TicketMaker:
         self.lock = threading.Lock()
 
     def ticket(self, audience: str) -> str:
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.asymmetric import ec
-
         now = self.clock()
         with self.lock:
             held = self.held.get(audience)
             if held and held[0] > now + TICKET_SECONDS / 2:
                 return held[1]
+            from cryptography.hazmat.primitives import hashes
+            from cryptography.hazmat.primitives.asymmetric import ec
+
             expires = now + TICKET_SECONDS
             body = json.dumps(
                 {"aud": audience, "exp": expires, "cert": self.certificate.decode()}, sort_keys=True, separators=(",", ":")
@@ -185,14 +185,11 @@ class TicketIdentity:
         self.checker: TicketChecker | None = None
         self.ready = False
 
-    def _prepare(self) -> None:
-        self.ready = True
-        self.checker = make_checker(own_audiences())
-
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope["type"] == "http":
             if not self.ready:
-                self._prepare()
+                self.ready = True
+                self.checker = make_checker(own_audiences())
             if self.checker is not None:
                 presented = dict(scope["headers"]).get(b"authorization", b"").decode("latin-1")
                 if presented.startswith("Bearer " + PREFIX):
