@@ -701,6 +701,8 @@ class Orchestrator:
         self.links: dict[tuple[str, str], float] = {}  # round trip in ms, from one worker to another
         self.links_checked: dict[tuple[str, str], float] = {}
         self.link_readings: dict[tuple[str, str], dict[str, Any]] = {}  # what /admin/status publishes
+        # The running route's shorter loop and the epoch it was worked out for. Status only reads it.
+        self.proposal: tuple[int, dict[str, Any] | None] = (0, None)
         # The proven address each link of the route uses, where it is not the advertised one.
         self.hops: dict[tuple[str, str], str] = {}
         self.hops_checked_at = float("-inf")
@@ -1745,6 +1747,28 @@ class Orchestrator:
         pins = {"entry": active.entry_worker, "exit_": active.exit_worker, "entry_bytes": extra, "tokens_per_miss": self.tokens_per_miss(active)}
         return await asyncio.to_thread(propose, list(self.route), workers, dict(self.links), active.profile, **pins)
 
+    async def keep_proposal(self) -> None:
+        """Work out the running route's shorter loop once, after its links were measured.
+
+        Proposing grows slow on a big pool, far too slow for every status call.
+        A failure here costs only the proposal, so it is said and nothing else changes.
+        """
+        epoch, active = self.epoch, self.active
+        if active is None:
+            return
+        try:
+            found = await self.propose_order(active)
+        except Exception as exc:  # a proposal is advice, and must never stop the route it advises on
+            self.add_event("failure", "No proposal for this route", f"{type(exc).__name__}: {exc}"[:200])
+            return
+        if self.epoch == epoch and self.active is active:
+            self.proposal = (epoch, found)
+
+    def latest_proposal(self) -> dict[str, Any] | None:
+        """The kept proposal, while the route it was made for still runs."""
+        epoch, found = self.proposal
+        return found if epoch == self.epoch and self.route else None
+
     def _route_or_none(self, target: ModelTarget, links: dict[tuple[str, str], float] | None = None) -> list[StageAssignment] | None:
         try:
             return self.plan(target, links=links)
@@ -2124,6 +2148,7 @@ class Orchestrator:
                         await asyncio.sleep(ACTIVATE_RETRY_SECONDS)
                         failed = await self._activate(target, route)
             if not failed:
+                self.spawn(self.keep_proposal())  # the links were measured for this route above
                 return route
             await self._refuse_big_move(target, failed)
             for worker_id, reason in failed.items():
@@ -3030,6 +3055,7 @@ class Orchestrator:
                 if self.active and self.route
                 else None
             ),
+            "proposal": self.latest_proposal(),
             "model_profile": (
                 "protocol-test"
                 if self.model_id and Path(self.model_id).name.lower() == ".smoke-model"

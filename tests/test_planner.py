@@ -2012,6 +2012,72 @@ def test_a_load_that_lands_during_a_proposal_ends_it(monkeypatch) -> None:
     assert asyncio.run(runtime.propose_order(SimpleNamespace(model_id="m"))) is None
 
 
+def proposing_pool(monkeypatch):
+    """A running pool whose status can be read whole."""
+    runtime = running_pool(monkeypatch)
+    runtime.active.embedding = False
+    return runtime
+
+
+def test_a_load_keeps_its_proposal_once_links_are_measured(monkeypatch) -> None:
+    runtime = proposing_pool(monkeypatch)
+    said = []
+
+    async def measured(row=0):
+        said.append("links")
+
+    async def proposed(target):
+        said.append("proposal")
+        return await Orchestrator.propose_order(runtime, target)
+
+    async def activated(*args):
+        return {}
+
+    async def load():
+        route = await Orchestrator.deploy(runtime, runtime.active, orchestrator_module.LoadJob(job_id="j", model_id="m"), generation_lock_held=True)
+        await asyncio.gather(*runtime.background)
+        return route
+
+    runtime.measure_links, runtime.propose_order, runtime._activate, runtime._prefetch = measured, proposed, activated, activated
+    asyncio.run(load())
+    assert said == ["links", "proposal"]
+    assert runtime.status()["proposal"]["current"]["order"] == ZIGZAG
+
+
+def test_status_reads_the_kept_proposal_and_never_proposes(monkeypatch) -> None:
+    runtime = proposing_pool(monkeypatch)
+    assert runtime.status()["proposal"] is None  # the key is there before any proposal, as its neighbours are
+    asyncio.run(runtime.keep_proposal())
+    kept = runtime.status()["proposal"]
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("status must not propose")
+
+    monkeypatch.setattr(orchestrator_module, "propose", refuse)
+    assert runtime.status()["proposal"] == kept and kept["saved_ms_per_token"] > 0
+
+
+def test_a_proposal_ends_with_the_route_it_was_made_for(monkeypatch) -> None:
+    runtime = proposing_pool(monkeypatch)
+    asyncio.run(runtime.keep_proposal())
+    runtime.epoch += 1
+    assert runtime.status()["proposal"] is None
+
+
+def test_a_failed_proposal_is_said_and_changes_nothing(monkeypatch) -> None:
+    runtime = proposing_pool(monkeypatch)
+    before = [stage.model_dump() for stage in runtime.route]
+
+    async def broken(target):
+        raise httpx.ConnectError("a node went quiet")
+
+    runtime.refresh_holdings = broken
+    asyncio.run(runtime.keep_proposal())
+    assert runtime.status()["proposal"] is None
+    assert runtime.events[0]["title"] == "No proposal for this route"
+    assert [stage.model_dump() for stage in runtime.route] == before
+
+
 def test_the_plan_command_says_when_it_was_refused(monkeypatch, capsys) -> None:
     refused = SimpleNamespace(status_code=401, text="bad key", json=lambda: {"detail": "bad key"})
     monkeypatch.setattr(cli, "httpx", SimpleNamespace(get=lambda url, **kwargs: refused))

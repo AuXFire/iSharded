@@ -1208,7 +1208,7 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `POST` | `/api/pull`, `/api/push`, `/api/create`, `/api/copy`, `/api/blobs/{digest}` | User key | Refused with a 400 that says to load models through iSharded |
 | `DELETE` | `/api/delete` | User key | The same |
 | `POST` | `/mcp` | User key | [MCP](#mcp) over Streamable HTTP. `GET` and `DELETE` answer 405, since there is no stream or session |
-| `GET` | `/admin/status` | User key | Workers and their `country`, memory pools, route, measured [`links`](#what-a-route-costs), epoch, mesh, lanes, load progress, the last answer check, and how many [replies run at once](#several-conversations-at-once) and why |
+| `GET` | `/admin/status` | User key | Workers and their `country`, memory pools, route, measured [`links`](#what-a-route-costs), epoch, mesh, lanes, load progress, the last answer check, how many [replies run at once](#several-conversations-at-once) and why, and the running route's [shorter loop](#a-shorter-loop), if there is one |
 | `GET` | `/admin/catalog` | User key | Suggested models and supported architectures |
 | `POST` | `/admin/plan` | Admin key | Show where a model would run, and any [shorter loop](#a-shorter-loop) for the route already running, without moving anything |
 | `POST` | `/admin/load` | Admin key | Load a model |
@@ -1950,6 +1950,8 @@ To find one, nodes with a link of 15 ms or less are grouped as a site, and the r
 | `move_seconds` | How long that takes with nodes fetching side by side, at each node's measured rate. A node with no measured rate counts as 40 MB/s, and a copy from a peer as at least 100 MB/s |
 | `stages_changed` | Stages that would restart with other layers. Their reload is not in `move_seconds` |
 | `break_even_tokens` | Tokens until the saving has paid for the move |
+
+`/admin/status` has the same `proposal` for the route that is running, or `null`. The coordinator works it out once each load, repair or rebalance has measured its links, off the event loop, because proposing grows slow on a big pool. Status only reads what was kept, and a new route clears it. The dashboard shows it under Needs you as information: the time a token would save, the bytes that would move, the tokens until the move pays for itself, and the `isharded plan` command to look closer.
 
 Nothing applies a proposal yet. `POST /admin/rebalance` and `POST /admin/load` plan afresh and cannot be told an order, and pins only fix the two ends. So a proposal is there to read, and to decide on.
 
