@@ -5,15 +5,17 @@ import math
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+import numpy as np
 from pydantic import ValidationError
 import pytest
 
 from isharded import orchestrator as orchestrator_module
+from isharded import worker as worker_module
 from isharded.models import UnsupportedModel
 from isharded.orchestrator import ModelTarget, Orchestrator, describe_plan, draft_sizes, settled_parallel, stage_devices, wanted_slots, with_slots
 from isharded import planner
 from isharded.planner import Candidate, ModelProfile
-from isharded.protocol import MAX_PARALLEL, DraftModel, LoadModelRequest, MemoryPool, StageAssignment, TensorRef, UnitPlacement, WeightUnit
+from isharded.protocol import MAX_PARALLEL, DraftModel, InferRequest, LoadModelRequest, MemoryPool, StageAssignment, TensorRef, UnitPlacement, WeightUnit
 
 MIB = 1024**2
 GIB = 1024**3
@@ -85,7 +87,14 @@ def stage(name, start, end, ms):
 def test_a_route_wants_its_round_trip_over_its_slowest_row():
     route = [stage("a", 0, 4, 10.0), stage("b", 4, 8, 20.0)]
     # 10 + 20 of work, and 25 + 1 ms each way round the ring.
-    assert wanted_slots(route, ["a", "b"], {("a", "b"): 50.0}, True) == {"round_trip_ms": 82.0, "row_ms": 20.0, "devices": 2, "wanted": 4}
+    assert wanted_slots(route, ["a", "b"], {("a", "b"): 50.0}, True) == {"round_trip_ms": 82.0, "row_ms": 20.0, "devices": 2, "wanted": 4, "measured": False}
+
+
+def test_measured_rows_stand_in_for_memory_speeds():
+    route = [stage("a", 0, 4, 10.0), stage("b", 4, 8, 20.0)]
+    # 30 + 5 of work as the stages measured it, and the same 52 ms of links.
+    measured = wanted_slots(route, ["a", "b"], {("a", "b"): 50.0}, True, [30.0, 5.0])
+    assert measured == {"round_trip_ms": 87.0, "row_ms": 30.0, "devices": 2, "wanted": 2, "measured": True}
 
 
 def test_a_trip_of_less_than_two_rows_stays_at_one():
@@ -181,15 +190,72 @@ def test_a_draft_whose_header_cannot_size_its_cache_still_loads(monkeypatch):
     assert draft_sizes(SimpleNamespace(config={})) == {"kv_bytes_per_token": 0, "state_bytes": 0}
 
 
-def test_a_load_with_room_takes_what_the_route_wants(pool):
+def test_a_load_with_nothing_measured_takes_half_of_what_memory_speeds_want(pool):
     wanted = target()
     choose(pool, wanted)
     route = pool.plan(wanted)
-    assert wanted.slots == wanted.parallel["slots"] == wanted.parallel["wanted"] > 1
-    assert wanted.slots == math.floor(wanted.parallel["round_trip_ms"] / wanted.parallel["row_ms"])
+    assert wanted.parallel["wanted"] == math.floor(wanted.parallel["round_trip_ms"] / wanted.parallel["row_ms"])
+    assert wanted.slots == wanted.parallel["slots"] == wanted.parallel["wanted"] // 2 > 1
+    assert wanted.parallel["measured"] is False
     assert wanted.profile.kv_bytes_per_token == [KV_PER_TOKEN * wanted.slots] * LAYERS
-    assert str(wanted.slots) in wanted.parallel["reason"]
+    assert f"from memory speeds, would want {wanted.parallel['wanted']}; with nothing measured yet a load takes {wanted.slots}" in wanted.parallel["reason"]
     assert {item.worker_id for item in route} == {"a", "b"}
+
+
+def running(pool, item, rows, epoch=5, model=None):
+    """A route as it runs, each stage's worker reporting the row it measured."""
+    pool.active = item
+    pool.route = pool.plan(item)
+    pool.epoch = 5
+    for placed, row in zip(pool.route, rows):
+        telemetry = {"row_ms_ema": row}
+        health = {"status": "ok", "model": model or item.model_id, "epoch": epoch, "assignment": placed.model_dump(), "telemetry": telemetry}
+        pool.workers[placed.worker_id] = SimpleNamespace(health=health)
+    pool.note_rows()
+    return pool.route
+
+
+def test_a_later_load_chooses_by_what_the_model_measured(pool):
+    first = target()
+    choose(pool, first)
+    route = running(pool, first, [40.0, 60.0])
+    assert [item.end_layer - item.start_layer for item in route] == [4, 4]
+    again = target()
+    again.request = again.request.model_copy(update={"context_tokens": 2048})  # another load, so it chooses afresh
+    choose(pool, again)
+    choice = again.parallel
+    assert choice["measured"] is True and choice["row_ms"] == 60.0
+    assert again.slots == choice["wanted"] == math.floor(choice["round_trip_ms"] / 60.0)
+    assert "as this model measured on these devices" in choice["reason"]
+
+
+def test_a_measured_row_is_kept_per_layer_for_a_route_planned_a_little_differently(pool):
+    first = target()
+    choose(pool, first)
+    route = running(pool, first, [40.0, 60.0])
+    shifted = [route[0].model_copy(update={"end_layer": 2}), route[1].model_copy(update={"start_layer": 2})]
+    devices = stage_devices(shifted, pool.offered)
+    assert pool.measured_rows(first, shifted, devices) == [20.0, 90.0]
+
+
+def test_the_stage_with_the_head_is_measured_apart(pool):
+    first = target()
+    choose(pool, first)
+    route = running(pool, first, [40.0, 60.0])
+    turned = [route[1].model_copy(update={"start_layer": 0, "end_layer": 4}), route[0].model_copy(update={"start_layer": 4, "end_layer": 8})]
+    assert pool.measured_rows(first, turned, stage_devices(turned, pool.offered)) is None
+
+
+def test_only_a_report_for_the_running_stage_counts(pool):
+    for stale in ({"epoch": 4}, {"model": "other.gguf"}):
+        pool.row_readings.clear()
+        item = target()
+        choose(pool, item)
+        running(pool, item, [40.0, 60.0], **stale)
+        assert pool.row_readings == {}
+    item = target()
+    running(pool, item, [None, 60.0])
+    assert len(pool.row_readings) == 1, "a stage that has run no rows yet says nothing"
 
 
 def test_a_load_stops_where_memory_would_spill(pool):
@@ -408,3 +474,72 @@ def test_saved_state_carries_the_choice(pool, tmp_path):
     pool.save_state(wanted)
     assert written["parallel"]["slots"] == wanted.slots
     assert written["request"]["parallel"] is None
+
+
+class FakeStage:
+    last = False
+
+    def forward(self, rows, position, slot, places, cuts, saves):
+        return rows
+
+    def forward_many(self, rows, positions, slots):
+        return rows
+
+
+def stage_runtime(monkeypatch, clock):
+    """A stage whose clock moves only as the test says."""
+    runtime = worker_module.WorkerRuntime.__new__(worker_module.WorkerRuntime)
+    runtime.adapter = runtime.assignment = object()
+    runtime.gguf = FakeStage()
+    runtime.compute_ms_ema = runtime.row_ms_ema = runtime.ring_counted = None
+    runtime.inference_calls = runtime.tokens_processed = runtime.prompt_tokens_computed = runtime.merged_passes = runtime.merged_rows = 0
+    runtime._pass_entry = lambda request: SimpleNamespace(length=0)
+    monkeypatch.setattr(worker_module.time, "perf_counter", lambda: clock[0])
+    return runtime
+
+
+def test_a_stage_counts_a_replys_pass_as_a_row_and_a_prompt_as_none(monkeypatch):
+    clock = [0.0]
+    runtime = stage_runtime(monkeypatch, clock)
+    original = FakeStage.forward
+
+    def timed(self, rows, *rest):
+        clock[0] += 0.012 * len(rows)
+        return original(self, rows, *rest)
+
+    monkeypatch.setattr(FakeStage, "forward", timed)
+    prompt = InferRequest(session_id="s", epoch=1, input_ids=[1, 2, 3], prompt_rows=True)
+    runtime._run_local(np.ones((1, 3, 4), dtype=np.float32), prompt)
+    assert runtime.row_ms_ema is None
+    runtime._run_local(np.ones((1, 1, 4), dtype=np.float32), InferRequest(session_id="s", epoch=1, input_ids=[7]))
+    assert runtime.row_ms_ema == pytest.approx(12.0)
+
+
+def test_replies_that_share_a_pass_share_its_time(monkeypatch):
+    clock = [0.0]
+    runtime = stage_runtime(monkeypatch, clock)
+
+    def timed(rows, positions, slots):
+        clock[0] += 0.016
+        return rows
+
+    runtime.gguf.forward_many = timed
+    steps = [SimpleNamespace(hidden=np.ones((1, 1, 4), dtype=np.float32), request=InferRequest(session_id="s", epoch=1, input_ids=[1], slot=index)) for index in range(4)]
+    runtime._run_merged(steps)
+    assert runtime.row_ms_ema == pytest.approx(4.0)
+
+
+def test_the_engines_passes_count_as_rows_since_the_last_look():
+    runtime = worker_module.WorkerRuntime.__new__(worker_module.WorkerRuntime)
+    runtime.row_ms_ema = runtime.ring_counted = None
+    runtime.note_ring({"passes": 10, "merged_passes": 0, "merged_rows": 0, "compute_us": 9000})
+    assert runtime.row_ms_ema is None, "a first look has nothing to compare"
+    # Four passes ran as one batch, averaged at 8 ms: 2 ms for each reply.
+    runtime.note_ring({"passes": 14, "merged_passes": 1, "merged_rows": 4, "compute_us": 8000})
+    assert runtime.row_ms_ema == 2.0
+    runtime.note_ring({"passes": 14, "merged_passes": 1, "merged_rows": 4, "compute_us": 3000})
+    assert runtime.row_ms_ema == 2.0, "with no passes since, the average is from before"
+    runtime.note_ring({"passes": 3, "merged_passes": 0, "merged_rows": 0, "compute_us": 3000})
+    assert runtime.row_ms_ema == 2.0, "an engine that started again is only looked at"
+    runtime.note_ring(None)
+    assert runtime.ring_counted == (3, 0, 0)
