@@ -205,7 +205,7 @@ Requests above 16 MiB are refused from their headers before any of the body is r
 
 The two routes that take a body with no credentials, `POST /join/requests` and `POST /access/entries`, take 16 KiB. Every real request fits in a few. An entry that is badly signed, or that changes nothing, counts against the sender's address: 20 at once, then 6 a minute. A good entry is never limited, so strangers cannot lock out the owner.
 
-A node drops a client that stops sending partway through a request, or sends less than 1 KiB in 30 seconds. An idle connection closes after 15 seconds. Neither touches a request that has fully arrived, so a reply can stream for as long as it needs, and a stage's large body is safe while it keeps moving. A node holds 2048 connections, then answers 503, which `ISHARDED_MAX_CONNECTIONS` changes.
+A node drops a client that stops sending partway through a request, or sends less than 1 KiB in 30 seconds. An idle connection closes after 15 seconds, or after about an hour once a request on it has proved a node is on the other end. A connection that has only ever asked for public routes never gets the longer time, so a stranger cannot hold a place in the connection limit with one. A node started with `--open` has no credentials to check, so any request there earns the longer time. Neither touches a request that has fully arrived, so a reply can stream for as long as it needs, and a stage's large body is safe while it keeps moving. A node holds 2048 connections, then answers 503, which `ISHARDED_MAX_CONNECTIONS` changes.
 
 The pages that describe the API, `/docs`, `/redoc`, and `/openapi.json`, are off. `/ready` says only whether a node can serve.
 

@@ -26,7 +26,7 @@ from isharded.gguf import (
     read_strings,
     write_stage,
 )
-from isharded.gguf import GgufHeader, split_parts
+from isharded.gguf import split_parts
 from isharded.gguf_stage import cpu_tensor_patterns
 from isharded.models import create_adapter
 from isharded.planner import Candidate, ModelProfile, plan_placement, stored_bytes
@@ -1838,3 +1838,90 @@ def test_lookup_is_on_unless_a_load_or_the_command_line_says_not(monkeypatch):
     assert "prompt_lookup" not in cli.load_body(parser.parse_args(["load", "m"]))
     assert cli.load_body(parser.parse_args(["load", "m", "--no-lookup"]))["prompt_lookup"] is False
     assert cli.load_body(parser.parse_args(["load", "m", "--no-draft"]))["draft_model"] == "none"
+
+
+def test_the_entry_reserves_a_drafts_cache_for_every_slot(local_model, tmp_path, monkeypatch):
+    """Measured by what ``load_draft`` asks for: one context per slot, and one more for guesses."""
+    from isharded import orchestrator
+    from isharded.models import GgufAdapter
+    from isharded.protocol import LoadModelRequest
+
+    monkeypatch.setattr(GgufAdapter, "recurrent_state_bytes", lambda self, layer: 1000)
+    draft = tmp_path / "draft.gguf"
+    draft.write_bytes(build_file())
+
+    def extra(parallel, tokens=2048):
+        request = LoadModelRequest(model_id=str(local_model), draft_model=str(draft), parallel=parallel, context_tokens=tokens)
+        return orchestrator.build_target(request).profile.entry_extra_bytes
+
+    adapter = create_adapter(build_manifest(str(draft)).config)
+    token = sum(adapter.kv_bytes_per_token(layer, 2) for layer in range(adapter.num_layers))
+    state = sum(adapter.recurrent_state_bytes(layer) for layer in range(adapter.num_layers))
+    assert token and state
+    assert extra(1) == draft.stat().st_size + orchestrator.DRAFT_WORKSPACE_BYTES + token * 2048 * 2 + state * 2
+    assert extra(4) - extra(1) == token * 2048 * 3 + state * 6
+
+
+def test_a_recurrent_model_counts_its_snapshots_while_guessing(local_model, tmp_path, monkeypatch):
+    from isharded import orchestrator
+    from isharded.models import GgufAdapter
+    from isharded.protocol import LoadModelRequest
+
+    monkeypatch.setattr(GgufAdapter, "recurrent_state_bytes", lambda self, layer: 1000 * (layer % 2))
+    draft = tmp_path / "draft.gguf"
+    draft.write_bytes(build_file())
+    request = LoadModelRequest(model_id=str(local_model), draft_model=str(draft), parallel=3, draft_tokens=5)
+    target = orchestrator.build_target(request)
+    held = [target.adapter.recurrent_state_bytes(layer) for layer in range(target.adapter.num_layers)]
+    assert any(held)
+    assert target.profile.snapshot_bytes == [state * (5 + 2) * 3 for state in held]
+    plain = orchestrator.build_target(LoadModelRequest(model_id=str(local_model), draft_model="none", prompt_lookup=False, parallel=3))
+    assert not any(plain.profile.snapshot_bytes)
+    looking = orchestrator.build_target(LoadModelRequest(model_id=str(local_model), draft_model="none", parallel=3))
+    assert looking.profile.snapshot_bytes == [state * (looking.speculate_tokens + 2) * 3 for state in held], "guesses from the text rewind too"
+
+
+def draft_that_leaves_no_room(local_model, tmp_path, monkeypatch, choice, lookup=False):
+    """A draft whose cache is far larger than anything on offer, on a model that fits without it."""
+    from isharded import orchestrator
+    from isharded.models import GgufAdapter
+    from isharded.protocol import LoadModelRequest
+
+    monkeypatch.setattr(GgufAdapter, "recurrent_state_bytes", lambda self, layer: 1000)
+    draft = tmp_path / "draft.gguf"
+    draft.write_bytes(build_file())
+    request = LoadModelRequest(model_id=str(local_model), draft_model=str(draft), context_tokens=262144, parallel=4, prompt_lookup=lookup)
+    target = orchestrator.build_target(request)
+    target.request = request.model_copy(update={"draft_model": choice})
+    ram = MemoryPool(pool_id="ram", kind="ram", device="cpu", capacity_group="ram", budget_bytes=2**40, free_bytes=2**40, bandwidth_gbps=30, dtype="bfloat16")
+    ram.budget_bytes = ram.free_bytes = target.profile.total_bytes + sum(target.profile.context_bytes(layer) for layer in range(target.profile.num_layers)) + 200 * 2**20
+    assert target.profile.entry_extra_bytes > ram.budget_bytes
+    node = orchestrator.Orchestrator()
+    node.plan = lambda target, **options: plan_placement([Candidate(worker_id="w", url="http://w", pools=[ram])], [], target.profile)
+    return node, target
+
+
+def test_an_automatic_draft_that_leaves_the_model_no_room_goes_without(local_model, tmp_path, monkeypatch):
+    node, target = draft_that_leaves_no_room(local_model, tmp_path, monkeypatch, "auto")
+    state = target.adapter.recurrent_state_bytes(0) * target.slots
+    assert node.plan_or_refuse(target)
+    assert target.draft is None and target.speculate_tokens == 0
+    assert target.profile.entry_extra_bytes == 0 and not any(target.profile.snapshot_bytes)
+    assert set(target.profile.state_bytes) == {state}
+
+
+def test_a_dropped_draft_leaves_prompt_lookup_its_room(local_model, tmp_path, monkeypatch):
+    node, target = draft_that_leaves_no_room(local_model, tmp_path, monkeypatch, "auto", lookup=True)
+    assert node.plan_or_refuse(target)
+    assert target.draft is None and target.speculate_tokens == 6
+    assert target.profile.entry_extra_bytes == 0
+    assert set(target.profile.snapshot_bytes) == {1000 * (6 + 2) * target.slots}
+
+
+def test_a_named_draft_that_leaves_the_model_no_room_is_refused(local_model, tmp_path, monkeypatch):
+    from fastapi import HTTPException
+
+    node, target = draft_that_leaves_no_room(local_model, tmp_path, monkeypatch, "named")
+    with pytest.raises(HTTPException) as refused:
+        node.plan_or_refuse(target)
+    assert refused.value.status_code == 507 and target.draft is not None

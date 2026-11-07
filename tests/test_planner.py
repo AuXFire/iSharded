@@ -1911,7 +1911,7 @@ def running_pool(monkeypatch):
     monkeypatch.setattr(orchestrator_module, "runtime", runtime)
     monkeypatch.setattr(orchestrator_module, "build_target", lambda *args: SimpleNamespace(model_id=args[0].model_id))
     monkeypatch.setattr(orchestrator_module, "row_bytes", lambda target: 0)
-    monkeypatch.setattr(orchestrator_module, "describe_plan", lambda target, plan: {"model": target.model_id})
+    monkeypatch.setattr(orchestrator_module, "describe_plan", lambda target, plan, links=None: {"model": target.model_id})
     return runtime
 
 
@@ -2018,3 +2018,177 @@ def test_the_plan_command_says_when_it_was_refused(monkeypatch, capsys) -> None:
     assert cli.run_plan(plan_args()) == 1
     said = capsys.readouterr().err
     assert "bad key" in said and "No model is running" not in said
+
+
+def with_draft(extra: int, **fields) -> ModelProfile:
+    model = profile(**fields)
+    model.entry_extra_bytes = extra
+    return model
+
+
+def used_in(report: dict, pool_id: str) -> int:
+    return next(row["used_bytes"] for row in report["pools"] if pool_id in row["pools"])
+
+
+def test_a_draft_keeps_its_vram_when_the_first_layer_has_to_spill() -> None:
+    """It runs on the GPU. Left with the layer, it went to RAM on paper and failed to load in fact."""
+    workers = [worker("one", pool("cuda:0", "vram", 800 * MIB, 300), pool("ram", "ram", 4 * GIB, 30))]
+    model = with_draft(600 * MIB)
+    route = plan_placement(workers, [], model)
+    report = memory_report(route, workers, model)
+    weights = sum(item.bytes for item in route[0].placements if item.pool_id == "cuda:0")
+    assert weights + 600 * MIB == used_in(report, "cuda:0") - sum(
+        model.context_bytes(layer) for layer in range(8) if any(item.unit == f"layer-{layer:05d}.dense" and item.pool_id == "cuda:0" for item in route[0].placements)
+    )
+    assert weights <= 800 * MIB * 0.9 - 600 * MIB
+    assert report["spilled_bytes"] > 0  # weights moved over so that the draft could stay
+
+
+def test_a_draft_is_held_once_and_only_by_the_entry() -> None:
+    workers = [worker("one", pool("cuda:0", "vram", 4 * GIB, 300)), worker("two", pool("cuda:1", "vram", 4 * GIB, 300))]
+    model = with_draft(GIB)
+    route = plan_placement(workers, [], model, spread=True)
+    report = memory_report(route, workers, model)
+    weights = sum(item.bytes for item in route[0].placements) + sum(model.context_bytes(layer) for layer in range(route[0].end_layer))
+    assert used_in(report, route[0].placements[0].pool_id) == weights + GIB
+    assert route[0].worker_id != route[1].worker_id
+
+
+def test_a_draft_is_not_doubled_by_a_float32_pool() -> None:
+    """It is a GGUF, which is the same size in any pool."""
+    workers = [worker("one", pool("ram", "ram", 2 * GIB, 30, dtype="float32"))]
+    model = with_draft(GIB, layers=2, dense=MIB, context_tokens=1)
+    report = memory_report(plan_placement(workers, [], model), workers, model)
+    assert GIB < used_in(report, "ram") < GIB + 300 * MIB
+
+
+def test_a_draft_on_a_mapped_layer_is_still_counted() -> None:
+    workers = [worker("one", pool("ram", "ram", 512 * MIB, 30), pool("disk", "disk", 8 * GIB, 1))]
+    with pytest.raises(PlacementError):
+        plan_placement(workers, [], with_draft(GIB))
+
+
+def test_a_draft_comes_before_weights_on_every_route_that_can_hold_it() -> None:
+    fast = worker("fast", pool("cuda:0", "vram", 2 * GIB, 300))
+    tight = worker("tight", pool("cuda:1", "vram", 600 * MIB, 300))
+    model = with_draft(800 * MIB, layers=4)
+    route = plan_placement([fast, tight], [], model, spread=True)
+    assert route[0].worker_id == "fast"
+    with pytest.raises(PlacementError):
+        plan_placement([fast, tight], [], model, spread=True, entry_worker="tight")
+
+
+def two_on_one_machine(vram: int, ram: int) -> list[Candidate]:
+    return [
+        worker(name, pool("cuda:0", "vram", vram, 300, group="gpu"), pool(f"ram-{name}", "ram", ram, 30, group="memory"))
+        for name in ("a", "b")
+    ]
+
+
+def small_model(extra: int) -> ModelProfile:
+    """Close to what a verifier saw: 0.7 GiB of weights and a 1.1 GiB draft, on one machine."""
+    model = with_draft(extra, layers=28, dense=25 * MIB, context_tokens=1024)
+    model.stage_workspace_bytes = 768 * MIB
+    return model
+
+
+@pytest.mark.parametrize("spread", [True, False, None])
+def test_workers_on_one_machine_can_share_it_with_a_draft(spread) -> None:
+    """Split evenly, neither half could take a draft that the whole machine had room for."""
+    workers = two_on_one_machine(int(1.7 * GIB), int(1.5 * GIB))
+    model = small_model(int(1.1 * GIB))
+    route = plan_placement(workers, [], model, spread=spread)
+    assert route[0].start_layer == 0 and route[-1].end_layer == 28
+    report = memory_report(route, workers, model)
+    for row in report["pools"]:
+        assert row["used_bytes"] <= row["offered_bytes"] - row["reserved_bytes"]
+
+
+def test_workers_on_one_machine_never_plan_more_than_it_has() -> None:
+    workers = two_on_one_machine(GIB, GIB)
+    model = small_model(int(0.9 * GIB))
+    model.stage_workspace_bytes = 0
+    route = plan_placement(workers, [], model, spread=True)
+    assert len(route) == 2
+    for row in memory_report(route, workers, model)["pools"]:
+        assert row["used_bytes"] <= row["offered_bytes"] - row["reserved_bytes"]
+
+
+def test_an_even_split_is_unchanged_with_nothing_to_set_aside() -> None:
+    workers = two_on_one_machine(GIB, GIB)
+    rooms = planner._group_rooms(planner._all_pools(workers))
+    shares = planner._capacities(workers, 1.0)
+    assert shares["a"] == shares["b"] == {group: room // 2 for group, room in rooms.items()}
+
+
+def test_only_memory_that_is_shared_sets_anything_aside() -> None:
+    workers = [worker("a", pool("cuda:0", "vram", GIB, 300)), worker("b", pool("cuda:1", "vram", GIB, 300))]
+    assert planner._capacities(workers, 1.0, 0, 512 * MIB) == planner._capacities(workers, 1.0)
+    assert not planner._capacities(workers, 1.0, 0, 512 * MIB)["a"].set_aside
+
+
+def test_a_refusal_says_why_when_the_totals_look_like_they_fit() -> None:
+    """Three machines' worth of little pieces can add up to more than one stage can use."""
+    units_too_big = with_draft(0, layers=2, dense=GIB)
+    workers = [worker(f"w{index}", pool(f"cuda:{index}", "vram", 900 * MIB, 300)) for index in range(4)]
+    with pytest.raises(PlacementError, match=r"a stage has to fit in its own worker.* 0\.\d GiB"):
+        plan_placement(workers, [], units_too_big)
+
+
+def test_a_refusal_counts_only_what_stages_can_use() -> None:
+    model = with_draft(GIB, layers=8)
+    model.stage_workspace_bytes = 768 * MIB
+    workers = [worker("one", pool("cuda:0", "vram", int(1.8 * GIB), 300))]
+    with pytest.raises(PlacementError, match=r"the pool offers 1\.0 GiB"):
+        plan_placement(workers, [], model)
+
+
+def recurrent(snapshot: int, layers: int = 8) -> ModelProfile:
+    model = profile(layers=layers)
+    model.snapshot_bytes = [snapshot] * layers
+    return model
+
+
+def test_snapshots_are_counted_in_ram_on_every_stage() -> None:
+    workers = [
+        worker(name, pool(f"cuda:{name}", "vram", 2 * GIB, 300), pool(f"ram-{name}", "ram", GIB, 30))
+        for name in ("a", "b")
+    ]
+    model = recurrent(16 * MIB)
+    route = plan_placement(workers, [], model, spread=True)
+    report = memory_report(route, workers, model)
+    for stage in route:
+        assert used_in(report, f"ram-{stage.worker_id}") == (stage.end_layer - stage.start_layer) * 16 * MIB
+    assert report["spilled_bytes"] == 0
+
+
+def test_snapshots_take_ram_before_weights_do() -> None:
+    workers = [worker("one", pool("ram", "ram", 1200 * MIB, 30))]
+    plan_placement(workers, [], profile())
+    with pytest.raises(PlacementError, match="of RAM for snapshots"):
+        plan_placement(workers, [], recurrent(100 * MIB))
+
+
+def test_a_worker_with_no_ram_on_offer_has_nothing_to_charge_snapshots_to() -> None:
+    workers = [worker("one", pool("cuda:0", "vram", 2 * GIB, 300))]
+    model = recurrent(100 * MIB)
+    assert used_in(memory_report(plan_placement(workers, [], model), workers, model), "cuda:0") == used_in(
+        memory_report(plan_placement(workers, [], profile()), workers, profile()), "cuda:0"
+    )
+
+
+def test_unified_memory_holds_snapshots_like_ram() -> None:
+    workers = [worker("mac", pool("mps", "unified", 4 * GIB, 300))]
+    plain, model = profile(), recurrent(10 * MIB)
+    extra = used_in(memory_report(plan_placement(workers, [], model), workers, model), "mps")
+    assert extra == used_in(memory_report(plan_placement(workers, [], plain), workers, plain), "mps") + 80 * MIB
+
+
+def test_keeping_layers_holds_a_draft_for_a_spare_at_the_entry() -> None:
+    model = with_draft(GIB)
+    gone, stays = worker("gone", pool("cuda:0", "vram", 4 * GIB, 300)), worker("stays", pool("cuda:1", "vram", 4 * GIB, 300))
+    route = plan_placement([gone, stays], [], model, spread=True)
+    small = worker("small", pool("cuda:2", "vram", 800 * MIB, 300))
+    assert keep_layers(route, [small, stays], [], model) is None
+    big = worker("big", pool("cuda:3", "vram", 4 * GIB, 300))
+    assert keep_layers(route, [big, stays], [], model)[0].worker_id == "big"

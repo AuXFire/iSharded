@@ -588,6 +588,8 @@ If the connection to a node drops, retry against another node. Replies survive a
 | A split GGUF, by any part | `owner/repo:Q6_K/model-00001-of-00004.gguf` | Each worker fetches only its share, from whichever parts hold it |
 | A local safetensors folder | `D:\models\qwen3-8b` | That machine. In a secured pool it must be in `--model-dir` |
 
+Once a route is up, the coordinator runs a one-token reply through it, so that the first real reply does not pay for first use. On two local GPU stages of a 0.6B model that took the first reply from 175 to 92 ms on a quiet machine, and from 659 to 169 ms on a busy one, the medians of three and four loads. On CPU it made little difference, 308 to 280 ms. A stage restart gets no such pass, because the reply that found the stage dead has already paid.
+
 Loading a model replaces the main one. To run another beside it, see [Several models at once](#several-models-at-once). To see where a model would go without moving anything, use [isharded plan](#isharded-plan), `POST /admin/plan`, or the picker on the chat page.
 
 Gated models need `HF_TOKEN` set on each worker.
@@ -688,7 +690,7 @@ With real processes, as three nodes on one machine started with `isharded node`,
 | `--location` | Set it on Tailscale, on a LAN, behind a relay, or in a cloud | The address cannot show the right country there |
 | `--gguf-dir` | Point it at LM Studio's or your own model folder | Files there are read locally, not downloaded |
 
-The entry node also carries the draft model, about 1.7 GiB of VRAM for the default one, and the planner does not reserve room for it. If you want it on a particular machine, pin that machine with `--entry`.
+The entry node also carries the draft model. The planner reserves its file, 512 MiB of working space, and its cache: one context for each slot, plus one more for guesses. That comes out of the entry's VRAM before any weights, so the entry's weights spill first. If the pool has no room for all of that, a draft chosen automatically is left out, and a draft you named refuses the load. If you want it on a particular machine, pin that machine with `--entry`.
 
 ### Load settings
 
@@ -714,6 +716,8 @@ A draft does far better at `--parallel 1`, where one conversation reached 19 to 
 ### Network
 
 Use wired links if you can: every token crosses every stage, so a pass costs at least one round trip per stage. Both test machines were on Wi-Fi with a 15 ms ping, and the desktop's 144 Mbps link limited model transfers to about 8 MiB/s. Fewer stages are faster, so do not add a slow machine unless the model needs its memory.
+
+Nodes keep their connections to each other open for an hour, because a new one costs round trips at every hop, one after another. The system sends a small probe on an idle connection every 30 seconds, which keeps it alive in a home router and finds a peer that left without a word. If a kept connection breaks anyway, the reply replays. The stage behind it is asked first, and loses its place only if it does not answer.
 
 ### A worked example
 
@@ -1587,7 +1591,7 @@ Supported architectures are `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`, `qwen35`, 
 - A worker assembles a stage file from its cached units: its layers renumbered from zero, with placeholders for anything it never evaluates. To llama.cpp this is a small complete model, so stock release builds work with no patches.
 - Hidden states enter through `llama_batch.embd` and leave through the eval callback at the stage's last layer. On Qwen3.6-27B, a two-stage split gives the same tokens and logits as the whole model, and the boundary costs under 3 ms a token.
 - Each stage runs in its own process. PyTorch and llama.cpp each load an OpenMP runtime and abort when they share one, and this way a native crash cannot take the worker down.
-- The draft model runs in the entry stage's process, on a thread of its own. Two processes on one GPU take turns on it, and this way the draft and the stage share one CUDA context and run at once. It also means a crash in either stops both. The worker restarts the stage, and the draft comes back with it. `ISHARDED_DRAFT_APART=1` keeps the draft in a process of its own, as a worker with no stage process always does.
+- The draft model runs in the entry stage's process, on a thread of its own. Two processes on one GPU take turns on it, and this way the draft and the stage share one CUDA context and run at once. It also means a crash in either stops both. The worker restarts the stage, and the draft comes back with it. The direct links went with that process, so replies use HTTP until the coordinator's next maintenance pass reopens them, and then go back to the pipeline. `ISHARDED_DRAFT_APART=1` keeps the draft in a process of its own, as a worker with no stage process always does.
 - Stages read their weights once, unless some are on the disk tier, which needs the file mapped. Mapping kept the whole file in RAM even with the tensors in VRAM: 15.1 GiB against 1.0 GiB on a 15 GiB model, at the same speed.
 - Experts are placed separately from the rest of a layer, so a MoE can keep attention on the GPU and its experts in RAM.
 
@@ -1601,7 +1605,7 @@ So a guess can only save time. Each pass is one row at its own position, which i
 
 The entry keeps just enough passes out to fill the route, up to `draft_tokens`, and fewer when guesses are landing badly. Left unset, `draft_tokens` is 16 on a route that rewinds by itself and 6 on a model with recurrent layers, where each one costs every stage a snapshot. Other replies want the route too, so each reply keeps out only its share. N replies with D passes out, each out for a round trip R, ask for N × D / R rows a second, and a route passes 1 / T, where T is the time one row takes. So D stops at R / (N × T), and never goes below one. T is the shortest gap lately between any two answers on the route, so it does not change with the number of replies. Answers less than 2 ms apart came out of one merged pass and say nothing about a row, so they do not count. A reply on its own is limited by filling the route, as above.
 
-A model with recurrent layers cannot rewind past a finished pass by itself, so its passes also ask each stage to keep a snapshot. After such a pass a stage saves that slot's recurrent state, and a rewind restores the snapshot of the right position and then cuts attention back as usual. A stage holds `draft_tokens` + 2 snapshots for each slot, in RAM, and a slot's snapshots go when it is cleared. If a rewind finds none, the reply replays over HTTP, and the route stays off its direct links until they reopen. Attention models keep no snapshots and pay nothing.
+A model with recurrent layers cannot rewind past a finished pass by itself, so its passes also ask each stage to keep a snapshot. After such a pass a stage saves that slot's recurrent state, and a rewind restores the snapshot of the right position and then cuts attention back as usual. A stage holds `draft_tokens` + 2 snapshots for each slot, in RAM, and a slot's snapshots go when it is cleared. The planner counts them against the RAM each stage's worker offers, ahead of any weights there. A worker that offers no RAM has no budget to charge them to. If a rewind finds none, the reply replays over HTTP, and the route stays off its direct links until they reopen. Attention models keep no snapshots and pay nothing.
 
 A snapshot leaves attention out, so its size does not grow with the reply: 19.3 MiB for the whole of Qwen3.5-0.8B. It does cost time on every pass. On a laptop RTX 3060 it took 11 ms beside an 8 ms pass, and on a CPU 3 ms beside a 68 ms pass, so it can cost more than it saves on a small, fast model. The measuring described below is what decides.
 
@@ -2209,7 +2213,7 @@ Reusing prompts, on Qwen3-0.6B Q8_0 over two stages on CPU, all on one machine, 
 
 With the cache on and off, 48 of 48 replies were the same on this model at temperature 0, and 19 of 19 on Qwen3.5-0.8B, with images and with a draft. That was one reply at a time, on one route, on CPU. Four conversations over two sequences, with a stage killed among them, finished all 24 replies on each model.
 
-Planner estimates leave out the draft and are rough. The figures above were measured. For failure timings, see [What happens when something fails](#what-happens-when-something-fails).
+Planner estimates of speed leave out the draft and are rough. The figures above were measured. For failure timings, see [What happens when something fails](#what-happens-when-something-fails).
 
 ## Development
 
@@ -2298,8 +2302,6 @@ Behavior:
 - Hybrid Qwen models on the PyTorch path process prompts token by token. This is exact, but slower than a chunked kernel on long prompts.
 - Long-context rope scaling (YaRN) and sliding-window attention are refused rather than run incorrectly.
 - Expert placement is per layer, not per expert: frequently used experts are not promoted to faster memory.
-- The planner does not reserve VRAM for a draft model. It loads into what is left on the entry node, and if it does not fit the model runs without it.
-- The planner does not count the snapshots a recurrent model keeps while guessing: up to `draft_tokens` + 2 copies of a stage's recurrent state for each slot, in RAM.
 - Multi-token batches cross between GGUF stages as BF16, and single tokens as FP32. A node set to `--dtype float32` keeps everything in FP32.
 - A stage file duplicates that node's cached units on disk.
 - GGUF files are parsed by native code in the stage process, so load them only from sources you trust.

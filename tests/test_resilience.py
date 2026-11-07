@@ -1,9 +1,8 @@
 import asyncio
 import json
-from pathlib import Path
 import re
 import time
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
@@ -724,8 +723,8 @@ def test_draft_memory_is_planned_on_the_entry_stage():
         state_bytes=[0, 0],
         entry_extra_bytes=500,
     )
-    entry = {item.unit.name: item.extra_bytes for item in _stage_items(profile, 0, 1)}
-    later = {item.unit.name: item.extra_bytes for item in _stage_items(profile, 1, 2)}
+    entry = {item.unit.name: item.entry_bytes for item in _stage_items(profile, 0, 1)}
+    later = {item.unit.name: item.entry_bytes for item in _stage_items(profile, 1, 2)}
     assert entry["layer-00000.dense"] == 500
     assert later["layer-00001.dense"] == 0
 
@@ -1073,7 +1072,7 @@ def test_a_dead_stage_is_only_restarted_once():
             self.host = object()
 
     async def scenario():
-        worker = SimpleNamespace(replacing=asyncio.Lock(), gguf=Stage(), last_error=None, caches={}, stage_restarts=0, draft=None, draft_request=None)
+        worker = SimpleNamespace(replacing=asyncio.Lock(), gguf=Stage(), last_error=None, caches={}, stage_restarts=0, draft=None, draft_request=None, ring_stop=lambda: None)
         lost = [StageLost("gone", current), StageLost("gone", current)]
         return await asyncio.gather(*(WorkerRuntime.replace_stage(worker, item) for item in lost))
 
@@ -1103,7 +1102,7 @@ def draft_worker(gguf=None):
 
     from isharded.worker import WorkerRuntime
 
-    worker = SimpleNamespace(replacing=asyncio.Lock(), gguf=gguf, last_error=None, caches={}, stage_restarts=0, draft=None, draft_request=("request",), loads=[])
+    worker = SimpleNamespace(replacing=asyncio.Lock(), gguf=gguf, last_error=None, caches={}, stage_restarts=0, draft=None, draft_request=("request",), loads=[], ring_stop=lambda: None)
 
     def load(_):
         worker.loads.append(FakeDraft())
@@ -1399,8 +1398,8 @@ def test_a_row_is_a_float32_per_hidden_unit_in_every_model_family() -> None:
     assert orchestrator_module.row_bytes(SimpleNamespace()) == 0
 
 
-def stage_answering(status, body):
-    """A middle stage whose next stage gives this answer."""
+def stage_answering(status, body, failure=None):
+    """A middle stage whose next stage gives this answer, or whose request ends in this failure."""
     import torch
     from types import SimpleNamespace
 
@@ -1408,6 +1407,8 @@ def stage_answering(status, body):
 
     class Client:
         async def post(self, url, content, headers, timeout):
+            if failure is not None:
+                raise failure
             return httpx.Response(status, request=httpx.Request("POST", url), **body)
 
     runtime = worker_module.WorkerRuntime.__new__(worker_module.WorkerRuntime)
@@ -2318,8 +2319,9 @@ def failed_restart(reason):
 
     async def scenario():
         worker = SimpleNamespace(
-            replacing=asyncio.Lock(), gguf=stuck_stage(reason), last_error=None, caches={}, stage_restarts=0, draft=None, draft_request=None, worker_id="w2", ring_live=True
+            replacing=asyncio.Lock(), gguf=stuck_stage(reason), last_error=None, caches={}, stage_restarts=0, draft=None, draft_request=None, worker_id="w2", ring_live=True, ring_epoch=None, ring_door=None, ring_client=None
         )
+        worker.ring_stop = MethodType(WorkerRuntime.ring_stop, worker)
         return worker, await WorkerRuntime.replace_stage(worker, StageLost("gone", worker.gguf.host))
 
     return asyncio.run(scenario())
@@ -2408,7 +2410,8 @@ def test_a_stage_that_restarts_takes_back_its_good_name():
 
     async def scenario():
         stage = RestartingStage()
-        worker = SimpleNamespace(replacing=asyncio.Lock(), gguf=stage, last_error=None, caches={}, stage_restarts=0, draft=None, draft_request=None, ring_live=True, stage_down=stage)
+        worker = SimpleNamespace(replacing=asyncio.Lock(), gguf=stage, last_error=None, caches={}, stage_restarts=0, draft=None, draft_request=None, ring_live=True, stage_down=stage, ring_epoch=None, ring_door=None, ring_client=None)
+        worker.ring_stop = MethodType(WorkerRuntime.ring_stop, worker)
         await WorkerRuntime.replace_stage(worker, StageLost("gone", stage.host))
         return worker
 
@@ -2422,8 +2425,341 @@ def test_a_lost_stage_takes_its_ring_with_it(monkeypatch):
     from isharded.worker import WorkerRuntime
 
     async def scenario():
-        worker = SimpleNamespace(replacing=asyncio.Lock(), gguf=RestartingStage(), last_error=None, caches={}, stage_restarts=0, draft=None, draft_request=None, ring_live=True)
+        worker = SimpleNamespace(replacing=asyncio.Lock(), gguf=RestartingStage(), last_error=None, caches={}, stage_restarts=0, draft=None, draft_request=None, ring_live=True, ring_epoch=None, ring_door=None, ring_client=None)
+        worker.ring_stop = MethodType(WorkerRuntime.ring_stop, worker)
         await WorkerRuntime.replace_stage(worker, StageLost("gone", worker.gguf.host))
         return worker
 
     assert asyncio.run(scenario()).ring_live is False
+
+
+def test_a_connection_that_broke_is_not_blamed_on_the_stage_behind_it() -> None:
+    """A kept connection can break while the next stage is fine. Someone should ask it first."""
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(stage_answering(200, {}, httpx.RemoteProtocolError("Server disconnected without sending a response."))())
+    assert caught.value.status_code == 502
+    assert caught.value.detail["lost"] == caught.value.detail["failed_worker"] == "next"
+
+
+def test_a_stage_that_does_not_answer_is_still_blamed_at_once() -> None:
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(stage_answering(200, {}, httpx.ReadTimeout("nothing came back"))())
+    assert caught.value.detail["failed_worker"] == "next"
+    assert "lost" not in caught.value.detail
+
+
+def test_a_stale_connection_to_the_next_stage_replays_the_reply_and_moves_nothing() -> None:
+    """The failure a worker reports for one, as it reaches the coordinator."""
+    from isharded.worker import failure_report
+
+    orchestrator = pool(one=record("one"), two=record("two"))
+    detail = {"failed_worker": "two", "lost": "two", "message": "Server disconnected"}
+    assert failure_report(httpx.Response(502, json={"detail": detail})) == detail
+    rebalanced = []
+
+    async def rebalance(*args, **options):
+        rebalanced.append(1)
+
+    orchestrator.rebalance = rebalance
+
+    async def run():
+        orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json={})))
+        return await orchestrator._recover_stream(detail, 1)
+
+    assert asyncio.run(run())
+    assert not orchestrator.workers["two"].quarantined and not rebalanced
+    done(orchestrator)
+
+
+def test_a_broken_connection_to_a_stage_that_also_stopped_answering_is_a_failure() -> None:
+    orchestrator = pool(one=record("one"), two=record("two"))
+    rebalanced = []
+
+    async def rebalance(*args, **options):
+        rebalanced.append(1)
+
+    orchestrator.rebalance = rebalance
+
+    def gone(request):
+        raise httpx.ConnectError("refused")
+
+    async def run():
+        orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(gone))
+        return await orchestrator._recover_stream({"failed_worker": "two", "lost": "two", "message": "gone"}, 1)
+
+    assert asyncio.run(run())
+    assert orchestrator.workers["two"].quarantined and rebalanced
+    done(orchestrator)
+
+
+def test_a_real_kept_connection_that_went_stale_reaches_recovery() -> None:
+    """A real socket, kept by a node's own pool, closed by a peer after the request went out."""
+    from isharded.tls import node_transport
+
+    async def scenario():
+        seen = []
+
+        async def peer(reader, writer):
+            while await reader.readline():
+                while (await reader.readline()).strip():
+                    pass
+                seen.append(1)
+                if len(seen) > 1:
+                    writer.close()
+                    return
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                await writer.drain()
+
+        server = await asyncio.start_server(peer, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        async with server, httpx.AsyncClient(transport=node_transport(), trust_env=False) as client:
+            assert (await client.get(f"http://127.0.0.1:{port}/")).text == "ok"
+            with pytest.raises(httpx.HTTPError) as caught:
+                await client.get(f"http://127.0.0.1:{port}/")
+            return caught.value
+
+    from isharded.worker import BROKEN_CONNECTION
+
+    assert isinstance(asyncio.run(scenario()), BROKEN_CONNECTION)
+
+
+def test_a_restarted_stage_leaves_the_ring_so_that_the_ring_can_come_back() -> None:
+    """Its links died with the process. Saying the ring is live would keep it down for good."""
+    from isharded.llamacpp import StageLost
+    from isharded.worker import WorkerRuntime
+
+    class Stage:
+        host = object()
+
+        def respawn(self):
+            self.host = object()
+
+    class Client:
+        alive, closed = False, False
+
+        def close(self):
+            self.closed = True
+
+    async def scenario():
+        worker = WorkerRuntime.__new__(WorkerRuntime)
+        worker.replacing, worker.gguf, worker.last_error, worker.caches = asyncio.Lock(), Stage(), None, {}
+        worker.stage_restarts, worker.draft, worker.draft_request = 0, None, None
+        worker.ring_live, worker.ring_epoch, worker.ring_door, worker.ring_client = True, 3, {}, Client()
+        client = worker.ring_client
+        await worker.replace_stage(StageLost("gone", worker.gguf.host))
+        return worker, client
+
+    worker, client = asyncio.run(scenario())
+    assert not worker.ring_live and worker.ring_epoch is None and client.closed
+    assert worker.stage_restarts == 1
+
+
+def test_a_coordinator_reopens_the_ring_of_an_entry_whose_stage_restarted() -> None:
+    orchestrator = pool(one=record("one", health={"telemetry": {"ring_live": False}}), two=record("two", health={"telemetry": {}}))
+    orchestrator.route = [stage("one", 0, 1), stage("two", 1, 2)]
+    orchestrator.epoch = orchestrator.ring_epoch = 4
+    orchestrator._check_ring()
+    assert orchestrator.ring_epoch is None
+    done(orchestrator)
+
+
+def links_pool():
+    orchestrator = pool(one=record("one"), two=record("two"))
+
+    def handler(request):
+        return httpx.Response(200, json={"100": {"median_ms": 5.0, "max_ms": 6.0}, "4096": {"median_ms": 50.0, "max_ms": 60.0}})
+
+    return orchestrator, handler
+
+
+def test_a_preview_leaves_the_running_models_link_costs_alone() -> None:
+    orchestrator, handler = links_pool()
+    measure(orchestrator, handler, 0)
+    before = dict(orchestrator.links), dict(orchestrator.links_checked), dict(orchestrator.link_readings), orchestrator.link_row_bytes
+
+    async def run():
+        orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        return await orchestrator.preview_links(4096)
+
+    costs = asyncio.run(run())
+    assert costs[("one", "two")] > before[0][("one", "two")]
+    assert (orchestrator.links, orchestrator.links_checked, orchestrator.link_readings, orchestrator.link_row_bytes) == before
+    done(orchestrator)
+
+
+def test_a_preview_of_the_same_rows_reuses_what_is_fresh() -> None:
+    orchestrator, handler = links_pool()
+    measure(orchestrator, handler, 4096)
+    asked = []
+
+    def counting(request):
+        asked.append(1)
+        return handler(request)
+
+    async def run():
+        orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(counting))
+        return await orchestrator.preview_links(4096)
+
+    assert asyncio.run(run()) == orchestrator.links and not asked
+    done(orchestrator)
+
+
+def test_the_plan_preview_route_plans_by_its_own_link_costs(monkeypatch) -> None:
+    from fastapi.testclient import TestClient as Client
+
+    orchestrator, handler = links_pool()
+    measure(orchestrator, handler, 0)
+    running = dict(orchestrator.links)
+    seen = {}
+
+    async def nothing(*args, **kwargs):
+        return {}
+
+    async def preview(row):
+        return {("one", "two"): 99.0}
+
+    def plan(target, **options):
+        seen["links"] = options["links"]
+        return []
+
+    orchestrator.gguf_sources = orchestrator.refresh_worker_metrics = orchestrator.refresh_holdings = orchestrator.choose_slots = nothing
+    orchestrator.preview_links = preview
+    orchestrator.plan_or_refuse = plan
+    orchestrator.plan_memory = lambda target, route: {}
+    monkeypatch.setattr(orchestrator_module, "runtime", orchestrator)
+    monkeypatch.setattr(orchestrator_module, "build_target", lambda *args: SimpleNamespace())
+    monkeypatch.setattr(orchestrator_module, "row_bytes", lambda target: 4096)
+    monkeypatch.setattr(orchestrator_module, "describe_plan", lambda target, route, links: {"links": len(links)})
+    answer = Client(orchestrator_module.app).post("/admin/plan", json={"model_id": "m"})
+    assert answer.status_code == 200 and answer.json()["links"] == 1
+    assert seen["links"] == {("one", "two"): 99.0}
+    assert orchestrator.links == running
+    done(orchestrator)
+
+
+def test_a_plan_can_be_given_link_costs_of_its_own() -> None:
+    from isharded.orchestrator import describe_plan
+
+    route = [stage("one", 0, 1), stage("two", 1, 2)]
+    target = SimpleNamespace(
+        profile=SimpleNamespace(ring=False, total_bytes=1, context_tokens=1), adapter=SimpleNamespace(config={}, num_layers=2), units={}, held={}, model_id="m",
+        draft=None, embedding=False, projector=None, slots=1, parallel={},
+    )  # fmt: skip
+    near = describe_plan(target, route, {("one", "two"): 1.0})
+    far = describe_plan(target, route, {("one", "two"): 500.0})
+    assert near["estimated_tokens_per_second"] > far["estimated_tokens_per_second"]
+
+
+def test_readings_for_workers_that_left_are_forgotten() -> None:
+    """A pool with members coming and going would otherwise hold a reading for every pair ever seen."""
+    orchestrator, handler = links_pool()
+    orchestrator.workers["three"] = record("three")
+    measure(orchestrator, handler, 0)
+    assert len(orchestrator.link_readings) == 6
+    del orchestrator.workers["three"]
+    orchestrator.workers["two"].quarantined = True
+    measure(orchestrator, handler, 0)
+    for table in (orchestrator.links, orchestrator.links_checked, orchestrator.link_readings):
+        assert not table
+    done(orchestrator)
+
+
+def test_a_worker_that_comes_back_is_measured_afresh() -> None:
+    orchestrator, handler = links_pool()
+    measure(orchestrator, handler, 0)
+    orchestrator.workers["two"].quarantined = True
+    measure(orchestrator, handler, 0)
+    orchestrator.workers["two"].quarantined = False
+    measure(orchestrator, handler, 0)
+    assert set(orchestrator.links) == {("one", "two"), ("two", "one")}
+    done(orchestrator)
+
+
+def warming_pool(handler):
+    orchestrator = pool(one=record("one"))
+    orchestrator.route = [stage("one", 0, 1)]
+    orchestrator.epoch = 5
+    orchestrator.active = SimpleNamespace(embedding=False)
+    orchestrator.tokenizer = SimpleNamespace(encode=lambda text: [7, 8])
+    orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return orchestrator
+
+
+def test_a_new_route_runs_one_short_reply_and_clears_it_away() -> None:
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path, json.loads(request.content) if request.content else None))
+        return httpx.Response(200, text='{"token_id": 1}\n')
+
+    async def run():
+        orchestrator = warming_pool(handler)
+        await orchestrator._warm_route(5)
+        await orchestrator.close()
+
+    asyncio.run(run())
+    (method, path, body), (cleared, gone, _) = seen
+    assert (method, path) == ("POST", "/v1/generate")
+    assert (body["input_ids"], body["max_tokens"], body["epoch"]) == ([7, 8], 1, 5)
+    assert (cleared, gone) == ("DELETE", f"/internal/sessions/{body['session_id']}")
+
+
+@pytest.mark.parametrize("failure", [httpx.ConnectError("refused"), httpx.ReadTimeout("slow")])
+def test_a_warm_pass_that_fails_blames_nobody(failure) -> None:
+    def handler(request):
+        raise failure
+
+    async def run():
+        orchestrator = warming_pool(handler)
+        await orchestrator._warm_route(5)
+        await orchestrator.close()
+        return orchestrator.workers["one"]
+
+    assert not asyncio.run(run()).quarantined
+
+
+@pytest.mark.parametrize(("epoch", "embedding", "replying"), [(4, False, 0), (5, True, 0), (5, False, 1)])
+def test_there_is_nothing_to_warm_on_some_routes(epoch, embedding, replying) -> None:
+    """One that moved on, one that makes no replies, and one a real reply is already warming."""
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200)
+
+    async def run():
+        orchestrator = warming_pool(handler)
+        orchestrator.active.embedding = embedding
+        orchestrator.replies_in_flight = replying
+        await orchestrator._warm_route(epoch)
+        await orchestrator.close()
+
+    asyncio.run(run())
+    assert not seen
+
+
+def test_an_answer_lost_to_a_broken_connection_asks_before_it_blames() -> None:
+    """A kept connection can break under a healthy entry. Its model should not move for that."""
+    orchestrator = pool(one=record("one"))
+    orchestrator.route, orchestrator.epoch = [stage("one", 0, 1)], 3
+    posts = []
+
+    def handler(request):
+        if request.url.path == "/health":
+            return httpx.Response(200, json={})
+        posts.append(request)
+        if len(posts) == 1:
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        return httpx.Response(200, json={"done": True})
+
+    async def run():
+        orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        return await orchestrator.ask_entry("/v1/embed", {}, 5.0)
+
+    assert asyncio.run(run()) == {"done": True}
+    assert len(posts) == 2 and not orchestrator.workers["one"].quarantined
+    done(orchestrator)

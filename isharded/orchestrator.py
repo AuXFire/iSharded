@@ -75,7 +75,7 @@ from .serving import MAX_STRANGER_BYTES, AddressLimit, BodyLimit, ChunkedRespons
 from .mesh import clean_url
 from .statements import Refused, Statements, make_statement
 from .tickets import PREFIX as TICKET_PREFIX, NodeTickets, TicketChecker, TicketIdentity, client_auth, make_checker, reply_audience
-from .tls import BEHALF, BEHALF_HEADER, FORWARD_MARK, INTERCEPTED, KEY_HELD, STATEMENT, intercepted, PEER, client_verify, node_transport, stay_on_this_machine_async
+from .tls import BEHALF, BEHALF_HEADER, FORWARD_MARK, INTERCEPTED, KEY_HELD, STATEMENT, intercepted, PEER, client_verify, node_proven, node_transport, stay_on_this_machine_async
 from .tokenizer import ChatTokenizer, IncrementalText, load_tokenizer
 from .toolcalls import (
     MARKER_TOKENS,
@@ -132,6 +132,8 @@ RING_RETRY_SECONDS = 30.0
 RING_CLOSING_SECONDS = 30.0
 RING_CLOSING_MOST_SECONDS = 1800.0
 RING_CALL_SECONDS = 30.0
+WARM_PROMPT = "Hello"
+WARM_SECONDS = 120.0
 LINK_TTL_SECONDS = 600.0
 LINK_PROBE_ROUNDS = 5
 LINK_PROBE_BYTES = 100
@@ -164,6 +166,8 @@ RESTART_WAIT_SECONDS = 30.0
 MAX_ROUTE_MOVES = 8
 # New streams a reply may open while recovering, before going one token at a time.
 STREAM_ATTEMPTS = 6
+# How a kept connection fails when the far side closed it, or a router forgot it.
+BROKEN_CONNECTION = (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError)
 DRAIN_WAIT_SECONDS = 45.0
 # Long enough for a planned move to finish, for a reply that arrives during one.
 MOVE_WAIT_SECONDS = 90.0
@@ -382,7 +386,7 @@ def build_target(
         amortize_tokens=AMORTIZE_TOKENS if reuse_cached else 0,
         stage_workspace_bytes=GGUF_STAGE_WORKSPACE_BYTES if isinstance(adapter, GgufAdapter) else 0,
         ring=isinstance(adapter, GgufAdapter) and os.getenv("ISHARDED_RING", "1") != "0",
-        entry_extra_bytes=entry_bytes(draft, projector),
+        entry_extra_bytes=entry_bytes(draft, projector, request.context_tokens, slots),
         attention_interval=getattr(adapter, "interval", 0),
     )
     hosted_copy = manifest.revision.startswith("local-") and control_source != request.model_id
@@ -430,25 +434,24 @@ def context_sizes(adapter: Adapter, request: LoadModelRequest, slots: int, specu
         "kv_bytes_per_token": [adapter.kv_bytes_per_token(i, 2) * slots * kv_share // KV_TYPES["f16"][1] for i in layers],
         # Rewinding needs a snapshot of recurrent state for each guess.
         "state_bytes": [adapter.recurrent_state_bytes(i) * (1 + speculate_tokens) * slots for i in layers],
+        "snapshot_bytes": [adapter.recurrent_state_bytes(i) * (speculate_tokens + 2) * slots if speculate_tokens else 0 for i in layers],
     }
 
 
-def entry_bytes(draft: DraftModel | None, projector: DraftModel | None) -> int:
-    return (draft.file_size + DRAFT_WORKSPACE_BYTES if draft else 0) + (projector.file_size + PROJECTOR_WORKSPACE_BYTES if projector else 0)
+def entry_bytes(draft: DraftModel | None, projector: DraftModel | None, context_tokens: int, slots: int) -> int:
+    """What the entry stage holds beside its layers: a draft with its cache, and a projector."""
+    drafting = draft.file_size + DRAFT_WORKSPACE_BYTES + draft_cache_bytes(draft, context_tokens, slots) if draft else 0
+    return drafting + (projector.file_size + PROJECTOR_WORKSPACE_BYTES if projector else 0)
 
 
 def with_slots(target: ModelTarget, slots: int) -> None:
-    """Size a target for this many slots, when the load is the one choosing them.
-
-    Past one slot the draft's cache counts too: it holds a context for each, and one more.
-    """
+    """Size a target for this many slots, and for the draft and guesses it has now."""
     assert target.request is not None
-    draft_cache = target.draft.kv_bytes_per_token * target.request.context_tokens * (slots + 1) if target.draft and slots > 1 else 0
     target.slots = slots
     target.profile = replace(
         target.profile,
         **context_sizes(target.adapter, target.request, slots, target.speculate_tokens),
-        entry_extra_bytes=entry_bytes(target.draft, target.projector) + draft_cache,
+        entry_extra_bytes=entry_bytes(target.draft, target.projector, target.request.context_tokens, slots),
     )
 
 
@@ -464,6 +467,24 @@ def check_pooling(request: LoadModelRequest, adapter: Adapter) -> None:
         raise UnsupportedModel(f"{request.model_id} declares no pooling, so it is not an embedding model; load it without --embedding")
     if not request.embedding and pooling in POOLED_TYPES:
         raise UnsupportedModel(f"{request.model_id} is an embedding model; load it with --embedding")
+
+
+def draft_cache_bytes(draft: DraftModel, context_tokens: int, slots: int) -> int:
+    """What a draft's cache takes, sized as ``load_draft`` sizes it.
+
+    Every slot has two sequences. Scratch shares the confirmed text's cells, so together
+    they take one context per slot and one more for guesses.
+    """
+    cells = context_tokens * (slots + 1)
+    return draft.kv_bytes_per_token * cells + draft.state_bytes * 2 * slots
+
+
+def drop_draft(target: ModelTarget) -> None:
+    """Take a draft and all it reserves out of a plan. Guesses from the text, if on, still need their room."""
+    target.draft = None
+    if not target.prompt_lookup:
+        target.speculate_tokens = 0
+    with_slots(target, target.slots)
 
 
 def holders_of(sources: dict[str, list[str]], model: str) -> list[str]:
@@ -512,17 +533,18 @@ def resolve_draft(
         file_size=draft.config["gguf_file_size"],
         revision=draft.revision,
         file_sources=holders,
-        kv_bytes_per_token=draft_cache_bytes(draft),
+        **draft_sizes(draft),
     )
 
 
-def draft_cache_bytes(draft: Manifest) -> int:
-    """A draft of a family nobody planned for still guesses, and its cache just goes uncounted."""
+def draft_sizes(draft: Manifest) -> dict[str, int]:
+    """A draft's cache per token and per slot. One of a family nobody planned for still guesses, uncounted."""
     try:
         adapter = create_adapter(draft.config)
-        return sum(adapter.kv_bytes_per_token(layer, 2) for layer in range(adapter.num_layers))
+        layers = range(adapter.num_layers)
+        return {"kv_bytes_per_token": sum(adapter.kv_bytes_per_token(layer, 2) for layer in layers), "state_bytes": sum(map(adapter.recurrent_state_bytes, layers))}
     except (UnsupportedModel, KeyError, TypeError, ValueError, ZeroDivisionError):
-        return 0
+        return {"kv_bytes_per_token": 0, "state_bytes": 0}
 
 
 def resolve_projector(
@@ -599,9 +621,9 @@ def wanted_slots(route: list[StageAssignment], devices: list[str], links: dict[t
     return {"round_trip_ms": round(round_trip, 2), "row_ms": round(row, 2), "devices": len(busy), "wanted": wanted}
 
 
-def describe_plan(target: ModelTarget, route: list[StageAssignment]) -> dict[str, Any]:
+def describe_plan(target: ModelTarget, route: list[StageAssignment], links: dict[tuple[str, str], float] | None = None) -> dict[str, Any]:
     """Summarize a plan for people: what goes where, and what it will cost."""
-    loop, pace = route_times(route, runtime.links, target.profile.ring)
+    loop, pace = route_times(route, runtime.links if links is None else links, target.profile.ring)
     tokens_per_miss = runtime.tokens_per_miss(target)
     download = sum(
         target.units[item.unit].nbytes
@@ -1595,16 +1617,35 @@ class Orchestrator:
         that would send, and a link that fails stays on record so that no route needs it.
         A slow link also feels how big a token's row is, so ``row`` is probed as well.
         """
-        urls = {
-            worker_id: worker_url(record)
-            for worker_id, record in self.workers.items()
-            if record.live and not record.quarantined
-        }
-        now = time.monotonic()
-        sizes = [LINK_PROBE_BYTES, row] if row > LINK_PROBE_BYTES else [LINK_PROBE_BYTES]
         if row != self.link_row_bytes:
             self.link_row_bytes = row
             self.links_checked.clear()  # those costs were for another model's rows
+        urls = self._link_urls()
+        for table in (self.links, self.links_checked, self.link_readings):
+            for pair in [pair for pair in table if not urls.keys() >= set(pair)]:
+                del table[pair]  # a pool that changes members would otherwise grow these forever
+        await self._probe_links(urls, row, self.links, self.links_checked, self.link_readings)
+
+    async def preview_links(self, row: int) -> dict[tuple[str, str], float]:
+        """What links would cost a model that is not loaded, kept apart from the running one's."""
+        same = row == self.link_row_bytes
+        links, checked = (dict(self.links), dict(self.links_checked)) if same else ({}, {})
+        await self._probe_links(self._link_urls(), row, links, checked, {})
+        return links
+
+    def _link_urls(self) -> dict[str, str]:
+        return {worker_id: worker_url(record) for worker_id, record in self.workers.items() if record.live and not record.quarantined}
+
+    async def _probe_links(
+        self,
+        urls: dict[str, str],
+        row: int,
+        links: dict[tuple[str, str], float],
+        checked: dict[tuple[str, str], float],
+        readings: dict[tuple[str, str], dict[str, Any]],
+    ) -> None:
+        now = time.monotonic()
+        sizes = [LINK_PROBE_BYTES, row] if row > LINK_PROBE_BYTES else [LINK_PROBE_BYTES]
 
         async def probe(source: str, target: str) -> None:
             reading: dict[str, Any] = {"median_ms": None, "max_ms": None, "cost_ms": UNREACHABLE_LINK_MS}
@@ -1620,15 +1661,15 @@ class Orchestrator:
                 reading = link_reading(response.json(), sizes)
             except (httpx.HTTPError, KeyError, TypeError, ValueError):
                 pass
-            self.links[source, target] = reading["cost_ms"]
-            self.link_readings[source, target] = {**reading, "checked_at": int(time.time())}
-            self.links_checked[source, target] = now
+            links[source, target] = reading["cost_ms"]
+            readings[source, target] = {**reading, "checked_at": int(time.time())}
+            checked[source, target] = now
 
         async def from_one(source: str) -> None:
             for target in urls:
                 # A link on a shorter address is timed there, and the long way would overwrite it.
-                due = now - self.links_checked.get((source, target), -LINK_TTL_SECONDS) >= LINK_TTL_SECONDS
-                if target != source and due and (source, target) not in self.hops:
+                kept = links is self.links and (source, target) in self.hops
+                if target != source and not kept and now - checked.get((source, target), -LINK_TTL_SECONDS) >= LINK_TTL_SECONDS:
                     await probe(source, target)
 
         allowed = LINK_PROBE_SECONDS * len(sizes)
@@ -1650,12 +1691,15 @@ class Orchestrator:
         candidates += [self._candidate(name, self.workers[name]) for name in sorted(running) if name in self.workers]
         return memory_report(route, candidates, target.profile)
 
-    def plan(self, target: ModelTarget, *, honor_pins_strictly: bool = False) -> list[StageAssignment]:
+    def plan(
+        self, target: ModelTarget, *, honor_pins_strictly: bool = False, links: dict[tuple[str, str], float] | None = None
+    ) -> list[StageAssignment]:
         """Plan a route. A pin on a lost worker is dropped, not fatal.
 
         Recovery must not fail because a preferred machine died, so only an
         explicit request treats an unavailable pin as an error.
         """
+        links = self.links if links is None else links
         preferred, standby = self.candidate_groups()
         available = {candidate.worker_id for candidate in preferred + standby}
         pins: dict[str, str | None] = {"entry_worker": target.entry_worker, "exit_worker": target.exit_worker}
@@ -1664,11 +1708,11 @@ class Orchestrator:
                 if worker_id and worker_id not in available:
                     self.add_event("failure", f"{worker_id} is unavailable", f"Planning without its {role} pin")
                     pins[role] = None
-        preferred = with_links(self._with_holdings(preferred, target), self.links)
-        standby = with_links(self._with_holdings(standby, target), self.links)
+        preferred = with_links(self._with_holdings(preferred, target), links)
+        standby = with_links(self._with_holdings(standby, target), links)
         kept = None if honor_pins_strictly else self._keep_stages(target, preferred, standby, available, pins)
         route = kept or plan_placement(
-            preferred, standby, target.profile, spread=target.spread, links=self.links, tokens_per_miss=self.tokens_per_miss(target), **pins
+            preferred, standby, target.profile, spread=target.spread, links=links, tokens_per_miss=self.tokens_per_miss(target), **pins
         )
         if target.embedding and len(route) > 1:
             # Pooling happens at the end of the model, in llama.cpp, for whole
@@ -1701,23 +1745,23 @@ class Orchestrator:
         pins = {"entry": active.entry_worker, "exit_": active.exit_worker, "entry_bytes": extra, "tokens_per_miss": self.tokens_per_miss(active)}
         return await asyncio.to_thread(propose, list(self.route), workers, dict(self.links), active.profile, **pins)
 
-    def _route_or_none(self, target: ModelTarget) -> list[StageAssignment] | None:
+    def _route_or_none(self, target: ModelTarget, links: dict[tuple[str, str], float] | None = None) -> list[StageAssignment] | None:
         try:
-            return self.plan(target)
+            return self.plan(target, links=links)
         except PlacementError:
             return None
 
-    async def choose_slots(self, target: ModelTarget, *, preview: bool = False) -> None:
+    async def choose_slots(self, target: ModelTarget, *, preview: bool = False, links: dict[tuple[str, str], float] | None = None) -> None:
         """Settle how many replies a load runs at once, if the operator left that open.
 
         Slots are in every stage's signature, so changing them restarts stages. This
         decides once, and looks again only if the pool lost so much that nothing else
         would hold the model.
         """
-        if target.parallel.get("auto") and target.slots > 1 and self._route_or_none(target) is None:
+        if target.parallel.get("auto") and target.slots > 1 and self._route_or_none(target, links) is None:
             slots = target.slots
             with_slots(target, 1)
-            if self._route_or_none(target) is None:
+            if self._route_or_none(target, links) is None:
                 with_slots(target, slots)  # nothing holds it for now, and its stages may yet return
                 return
             target.parallel = {}
@@ -1726,21 +1770,21 @@ class Orchestrator:
         held = self.active
         if held is not None and held is not target and held.parallel.get("auto") and same_load(held, target):
             with_slots(target, held.slots)  # the same load again leaves its stages running
-            if self._route_or_none(target) is not None:
+            if self._route_or_none(target, links) is not None:
                 target.parallel = held.parallel
                 return
         with_slots(target, 1)
-        route = self._route_or_none(target)
+        route = self._route_or_none(target, links)
         if route is None:
             return  # the plan that follows says why
-        target.parallel = await self._fit_slots(target, route)
+        target.parallel = await self._fit_slots(target, route, self.links if links is None else links)
         if not preview:
             self.add_event("model", f"{target.slots} at once", target.parallel["reason"])
 
-    async def _fit_slots(self, target: ModelTarget, route: list[StageAssignment]) -> dict[str, Any]:
+    async def _fit_slots(self, target: ModelTarget, route: list[StageAssignment], links: dict[tuple[str, str], float]) -> dict[str, Any]:
         """As many slots as the route wants and can hold, on the same workers, with no more spilled."""
         preferred, standby = self.candidate_groups()
-        wanted = wanted_slots(route, stage_devices(route, preferred + standby), self.links, target.profile.ring)
+        wanted = wanted_slots(route, stage_devices(route, preferred + standby), links, target.profile.ring)
         if wanted is None:
             return {"auto": True, "slots": 1, "reason": "a link on this route has not been measured, so nothing says more would help"}
         workers = {stage.worker_id for stage in route}
@@ -1749,7 +1793,7 @@ class Orchestrator:
         async def fits(slots: int) -> bool:
             await asyncio.sleep(0)  # a plan on a big pool takes seconds, and heartbeats must not wait for several
             with_slots(target, slots)
-            plan = self._route_or_none(target)
+            plan = self._route_or_none(target, links)
             return plan is not None and {stage.worker_id for stage in plan} == workers and self.plan_memory(target, plan)["spilled_bytes"] <= spilled
 
         low, high = (wanted["wanted"], wanted["wanted"] + 1) if await fits(wanted["wanted"]) else (1, wanted["wanted"])
@@ -1762,10 +1806,15 @@ class Orchestrator:
             trip = "every stage runs on one device, so replies could only take turns on it"
         return {"auto": True, "slots": low, **wanted, "reason": trip if low == wanted["wanted"] else f"{trip}, and {low} fit in memory"}
 
-    def plan_or_refuse(self, target: ModelTarget, **options: bool) -> list[StageAssignment]:
+    def plan_or_refuse(self, target: ModelTarget, **options: Any) -> list[StageAssignment]:
         try:
             return self.plan(target, **options)
         except PlacementError as exc:
+            if target.draft is not None and target.request is not None and target.request.draft_model == "auto":
+                # A draft nobody asked for must never cost a model its load.
+                self.add_event("rebalance", "Planning without a draft", f"{target.model_id} has no room for {target.draft.file} and its cache")
+                drop_draft(target)
+                return self.plan_or_refuse(target, **options)
             note = self._left_out()
             raise HTTPException(status_code=507, detail=f"{str(exc).rstrip('.')}.{note}" if note else str(exc)) from exc
 
@@ -1966,9 +2015,28 @@ class Orchestrator:
         if self.mesh is not None:
             self.spawn(self._gossip_round())  # peers should not wait for the next tick
         self.spawn(self._start_ring())
+        self.spawn(self._warm_route(new_epoch))
         summary = " → ".join(f"{stage.worker_id} L{stage.start_layer}–{stage.end_layer - 1}" for stage in route)
         self.add_event("rebalance", f"Pipeline epoch {new_epoch}", summary)
         return {}
+
+    async def _warm_route(self, epoch: int) -> None:
+        """Run a one-token reply, so that a new route's first real reply does not pay for first use.
+
+        On two local GPU stages of a 0.6B model this took a first reply from 175 to 92 ms on a quiet
+        machine and 659 to 169 on a busy one, against 308 to 280 on CPU. A restarted stage showed no such gain: the reply that found it dead has
+        already paid. Nobody waits for this one, so a failure only means the next reply pays.
+        """
+        active = self.active
+        if active is None or active.embedding or self.tokenizer is None or not self.route or self.epoch != epoch or self.replies_in_flight:
+            return
+        session = SessionState(tokens=await asyncio.to_thread(self.tokenizer.encode, WARM_PROMPT), epoch=epoch)
+        request = GenerateRequest(session_id=session.session_id, epoch=epoch, input_ids=session.tokens, reset=True, temperature=0.0, max_tokens=1)
+        url = self.route[0].url.rstrip("/") + "/v1/generate"
+        with suppress(httpx.HTTPError):
+            async with self.client.stream("POST", url, json=request.model_dump(), headers=auth_headers(self.pool_token), timeout=WARM_SECONDS) as response:
+                await response.aread()
+        await self.clear_session(session.session_id)
 
     async def _drain_entries(self, route: list[StageAssignment]) -> None:
         """Let replies finish before anything moves.
@@ -2566,7 +2634,7 @@ class Orchestrator:
                     timeout=httpx.Timeout(seconds, connect=10.0),
                 )
             except httpx.HTTPError as exc:
-                problem = {"failed_worker": entry.worker_id, "message": str(exc)}
+                problem = {"lost" if isinstance(exc, BROKEN_CONNECTION) else "failed_worker": entry.worker_id, "message": str(exc)}
             else:
                 if response.is_success:
                     return response.json()
@@ -3031,6 +3099,8 @@ def require(authorization: str | None, role: str) -> Caller:
         raise HTTPException(status_code=401, detail="a valid key is required")
     if not runtime.access.permits(caller, role):
         raise HTTPException(status_code=403, detail=f"this needs the {role} role")
+    if behalf:
+        node_proven()  # only a node can pass a person's request on
     return caller
 
 
@@ -3058,6 +3128,7 @@ def require_own_node(authorization: str | None, name: str) -> Caller:
 def verify_token(authorization: str | None) -> None:
     """Node to node. API keys do not reach this far."""
     require(authorization, ROLE_NODE)
+    node_proven()
 
 
 def verify_worker_name(worker_id: str) -> None:
@@ -3423,10 +3494,12 @@ async def preview_plan(body: LoadModelRequest, authorization: str | None = Heade
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     await runtime.refresh_worker_metrics()
     await runtime.refresh_holdings(target)
-    await runtime.measure_links(row_bytes(target))
-    await runtime.choose_slots(target, preview=True)
-    route = runtime.plan_or_refuse(target, honor_pins_strictly=True)
-    return {**describe_plan(target, route), "memory": runtime.plan_memory(target, route), "proposal": await runtime.propose_order(target)}
+    # A preview is one model among several that might load. Its costs must not reach the
+    # running route's next repair, which would plan by another model's rows.
+    links = await runtime.preview_links(row_bytes(target))
+    await runtime.choose_slots(target, preview=True, links=links)
+    route = runtime.plan_or_refuse(target, honor_pins_strictly=True, links=links)
+    return {**describe_plan(target, route, links), "memory": runtime.plan_memory(target, route), "proposal": await runtime.propose_order(target)}
 
 
 @app.get("/admin/keys")

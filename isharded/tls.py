@@ -14,6 +14,7 @@ from __future__ import annotations
 from contextvars import ContextVar
 from functools import lru_cache
 import os
+import socket
 import ssl
 from typing import Any
 
@@ -25,6 +26,8 @@ BEHALF: ContextVar[tuple[str, str] | None] = ContextVar("isharded_behalf", defau
 KEY_HELD: ContextVar[str | None] = ContextVar("isharded_key_held", default=None)
 # The statement that proved BEHALF, when the person's key stayed on another node.
 STATEMENT: ContextVar[str | None] = ContextVar("isharded_statement", default=None)
+# The connection serving this request, for marking it as one a node holds.
+CONNECTION: ContextVar[Any] = ContextVar("isharded_connection", default=None)
 FORWARD_MARK = "x-isharded-forwarded"
 BEHALF_HEADER = "x-isharded-on-behalf"
 
@@ -34,6 +37,14 @@ OWN_ADDRESS = "ISHARDED_OWN_ADDRESS"
 # failed, against none between the data centers. A failed connect never reached the
 # other side, so trying again is always safe.
 CONNECT_RETRIES = 3
+# A new connection costs two or three round trips, one hop after another down a route,
+# so a reply after a pause should find the old ones still open.
+NODE_KEEP_ALIVE_SECONDS = 3600.0
+# An idle connection gets a probe this often. That holds its place in a home router, which
+# can forget one in minutes, and finds a peer that went without a word before a reply does.
+PROBE_IDLE_SECONDS = 30
+PROBE_INTERVAL_SECONDS = 10
+PROBE_COUNT = 3
 
 
 @lru_cache(maxsize=8)
@@ -63,11 +74,27 @@ async def stay_on_this_machine_async(request: Any) -> None:
     stay_on_this_machine(request)
 
 
+def node_proven() -> None:
+    """Say that this request's connection belongs to a node, so it can stay open for long."""
+    connection = CONNECTION.get()
+    if connection is not None:
+        connection.proven = True
+
+
+def probe_options() -> list[tuple[int, int, int]]:
+    """Socket options that have the system probe a connection while it sits idle."""
+    options = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+    idle = "TCP_KEEPIDLE" if hasattr(socket, "TCP_KEEPIDLE") else "TCP_KEEPALIVE"  # a Mac has only the second
+    timing = {idle: PROBE_IDLE_SECONDS, "TCP_KEEPINTVL": PROBE_INTERVAL_SECONDS, "TCP_KEEPCNT": PROBE_COUNT}
+    return options + [(socket.IPPROTO_TCP, getattr(socket, name), value) for name, value in timing.items() if hasattr(socket, name)]
+
+
 def node_transport() -> Any:
-    """How one node reaches another: it tries a failed connection again."""
+    """How one node reaches another: it tries a failed connection again, and keeps a good one."""
     import httpx
 
-    return httpx.AsyncHTTPTransport(retries=CONNECT_RETRIES, verify=client_verify())
+    limits = httpx.Limits(max_connections=100, max_keepalive_connections=100, keepalive_expiry=NODE_KEEP_ALIVE_SECONDS)
+    return httpx.AsyncHTTPTransport(retries=CONNECT_RETRIES, verify=client_verify(), limits=limits, socket_options=probe_options())
 
 
 def client_verify() -> Any:

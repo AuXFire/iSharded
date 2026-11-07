@@ -13,11 +13,14 @@ from typing import Any
 import uvicorn
 from uvicorn.protocols.http.auto import AutoHTTPProtocol
 
-from .tls import PEER, peer_name, server_options
+from .tls import CONNECTION, NODE_KEEP_ALIVE_SECONDS, PEER, peer_name, probe_options, server_options
 
 # Over the five seconds clients hold an idle connection, so that a client always closes
 # first, and never sends on a connection the server is dropping that same moment.
 KEEP_ALIVE_SECONDS = 15
+# The same for a connection that proved it belongs to a node. Anyone else gets the short
+# time above, because every open connection counts against ``limit_concurrency``.
+NODE_KEEP_ALIVE_MARGIN_SECONDS = 60
 # Every peer and worker holds a connection or two. Past this a node answers 503.
 MAX_CONNECTIONS = 2048
 # A client still sending a request must get this much across in this long. Heads and
@@ -30,6 +33,14 @@ def set_nodelay(transport: asyncio.BaseTransport) -> None:
     sock = transport.get_extra_info("socket")
     if sock is not None and sock.family in (socket.AF_INET, socket.AF_INET6):
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+
+def set_probes(transport: asyncio.BaseTransport) -> None:
+    """Without these, a peer that vanished holds its place here until keep-alive runs out."""
+    sock = transport.get_extra_info("socket")
+    if sock is not None and sock.family in (socket.AF_INET, socket.AF_INET6):
+        for option in probe_options():
+            sock.setsockopt(*option)
 
 
 class NoDelayHTTPProtocol(AutoHTTPProtocol):  # type: ignore[misc, valid-type]
@@ -45,22 +56,28 @@ class NoDelayHTTPProtocol(AutoHTTPProtocol):  # type: ignore[misc, valid-type]
     ``limit_concurrency``, so a stranger could hold a node at its limit with connections
     that say nothing. Nothing here looks at a request once it has arrived whole, so a
     reply can take as long as it likes.
+
+    A connection is held open for long only once a route says a node is on the other end,
+    so a stranger's stays short and cannot sit on a place in that limit.
     """
 
     def connection_made(self, transport: Any) -> None:
         set_nodelay(transport)
+        set_probes(transport)
         super().connection_made(transport)
         self.heard_bytes = 0
+        self.proven = False
         self.stall_watch = self.loop.call_later(STALL_SECONDS, self._check_stalled)
         peer = peer_name(transport.get_extra_info("peercert"))
-        if peer:
-            inner = self.app
+        inner = self.app
 
-            async def with_identity(scope: Any, receive: Any, send: Any) -> None:
+        async def with_identity(scope: Any, receive: Any, send: Any) -> None:
+            CONNECTION.set(self)
+            if peer:
                 PEER.set(peer)
-                await inner(scope, receive, send)
+            await inner(scope, receive, send)
 
-            self.app = with_identity
+        self.app = with_identity
 
     def data_received(self, data: bytes) -> None:
         self.heard_bytes += len(data)
@@ -71,6 +88,8 @@ class NoDelayHTTPProtocol(AutoHTTPProtocol):  # type: ignore[misc, valid-type]
         super().connection_lost(exc)
 
     def on_response_complete(self) -> None:
+        if self.proven:
+            self.timeout_keep_alive = NODE_KEEP_ALIVE_SECONDS + NODE_KEEP_ALIVE_MARGIN_SECONDS
         super().on_response_complete()
         if not self.transport.is_closing():
             self._watch_again()  # the next request gets its full time, and keep-alive comes first
@@ -82,8 +101,10 @@ class NoDelayHTTPProtocol(AutoHTTPProtocol):  # type: ignore[misc, valid-type]
 
     def _waiting_on_client(self) -> bool:
         cycle = self.cycle
-        if cycle is None or cycle.response_complete:
+        if cycle is None:
             return True
+        if cycle.response_complete:
+            return self.heard_bytes > 0  # with nothing heard it is idle, and that is keep-alive's to end
         # Reading paused means this side is behind, and the client is not to blame.
         return cycle.more_body and not self.flow.read_paused
 

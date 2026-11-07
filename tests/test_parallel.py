@@ -10,7 +10,7 @@ import pytest
 
 from isharded import orchestrator as orchestrator_module
 from isharded.models import UnsupportedModel
-from isharded.orchestrator import ModelTarget, Orchestrator, describe_plan, draft_cache_bytes, settled_parallel, stage_devices, wanted_slots, with_slots
+from isharded.orchestrator import ModelTarget, Orchestrator, describe_plan, draft_sizes, settled_parallel, stage_devices, wanted_slots, with_slots
 from isharded import planner
 from isharded.planner import Candidate, ModelProfile
 from isharded.protocol import MAX_PARALLEL, DraftModel, LoadModelRequest, MemoryPool, StageAssignment, TensorRef, UnitPlacement, WeightUnit
@@ -160,9 +160,9 @@ def test_only_a_model_with_slots_is_left_for_the_load_to_settle():
 
 
 def test_a_draft_cache_is_every_layer_of_it(monkeypatch):
-    adapter = SimpleNamespace(num_layers=3, kv_bytes_per_token=lambda layer, itemsize: (layer + 1) * itemsize)
+    adapter = SimpleNamespace(num_layers=3, kv_bytes_per_token=lambda layer, itemsize: (layer + 1) * itemsize, recurrent_state_bytes=lambda layer: layer)
     monkeypatch.setattr(orchestrator_module, "create_adapter", lambda config: adapter)
-    assert draft_cache_bytes(SimpleNamespace(config={})) == 12
+    assert draft_sizes(SimpleNamespace(config={})) == {"kv_bytes_per_token": 12, "state_bytes": 3}
 
 
 def test_a_draft_of_an_unknown_family_still_loads(monkeypatch):
@@ -170,7 +170,7 @@ def test_a_draft_of_an_unknown_family_still_loads(monkeypatch):
         raise UnsupportedModel("no")
 
     monkeypatch.setattr(orchestrator_module, "create_adapter", refuse)
-    assert draft_cache_bytes(SimpleNamespace(config={})) == 0
+    assert draft_sizes(SimpleNamespace(config={})) == {"kv_bytes_per_token": 0, "state_bytes": 0}
 
 
 def test_a_draft_whose_header_cannot_size_its_cache_still_loads(monkeypatch):
@@ -178,7 +178,7 @@ def test_a_draft_whose_header_cannot_size_its_cache_still_loads(monkeypatch):
         raise TypeError("head counts given per layer")
 
     monkeypatch.setattr(orchestrator_module, "create_adapter", lambda config: SimpleNamespace(num_layers=1, kv_bytes_per_token=unreadable))
-    assert draft_cache_bytes(SimpleNamespace(config={})) == 0
+    assert draft_sizes(SimpleNamespace(config={})) == {"kv_bytes_per_token": 0, "state_bytes": 0}
 
 
 def test_a_load_with_room_takes_what_the_route_wants(pool):
@@ -226,7 +226,8 @@ def test_slots_never_pull_in_another_worker(pool):
 
 
 def test_a_draft_cache_counts_against_the_entry(pool):
-    pool.offered = [worker("a", 2 * GIB), worker("b", 2 * GIB)]
+    # Little RAM, so the cache has nowhere to go but beside the layers in VRAM.
+    pool.offered = [worker("a", 2 * GIB, GIB), worker("b", 2 * GIB, GIB)]
     plain = target()
     choose(pool, plain)
     draft = DraftModel(source="d", file="d.gguf", file_size=1, revision="r", kv_bytes_per_token=128 * 1024)
@@ -236,11 +237,13 @@ def test_a_draft_cache_counts_against_the_entry(pool):
     assert drafted.profile.entry_extra_bytes >= 128 * 1024 * 1024 * (drafted.slots + 1)
 
 
-def test_one_slot_plans_exactly_as_it_always_has():
+def test_one_slot_still_holds_a_drafts_cache():
     draft = DraftModel(source="d", file="d.gguf", file_size=1, revision="r", kv_bytes_per_token=128 * 1024)
     drafted = target(draft=draft)
     with_slots(drafted, 1)
-    assert drafted.profile.entry_extra_bytes == orchestrator_module.entry_bytes(draft, None)
+    cache = orchestrator_module.draft_cache_bytes(draft, drafted.request.context_tokens, 1)
+    assert cache == 128 * 1024 * drafted.request.context_tokens * 2, "one context for the reply, and one for guesses"
+    assert drafted.profile.entry_extra_bytes == draft.file_size + orchestrator_module.DRAFT_WORKSPACE_BYTES + cache
 
 
 def test_an_explicit_parallel_always_wins(pool):

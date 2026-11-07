@@ -103,7 +103,7 @@ from .statestore import HISTORY, PARTIAL, PrefixIndex, StateStore, clear_other_s
 from .access import load_authority
 from .addresses import ECHO_PATH, NodeProof, claim, direct_client, host_port, prove, reach_options, reach_urls
 from .tickets import TicketIdentity, client_auth
-from .tls import client_verify, node_transport, PEER, stay_on_this_machine_async
+from .tls import client_verify, node_proven, node_transport, PEER, stay_on_this_machine_async
 from .vision import PromptPart, PromptRows, lay_out
 from .weights import FetchProgress, LoadedUnit, UnitCache, WeightSourceError, gguf_reader, has_model_host, load_unit, map_unit
 
@@ -218,6 +218,9 @@ ADDRESS_PROBE_SECONDS = 6.0
 # What a shorter address can do wrong. A certificate failure arrives as a plain OSError,
 # and whoever has the address may answer with anything.
 LINK_FAILURES = (httpx.HTTPError, OSError, ValueError)
+# How a kept connection fails when the far side closed it, or a router forgot it. The stage
+# behind it may be fine, unlike one that will not connect or does not answer.
+BROKEN_CONNECTION = (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError)
 # Off is for checking results against a prompt that went out whole.
 PROMPT_PARTS = os.getenv("ISHARDED_PROMPT_PARTS", "1") != "0"
 UNAVAILABLE_STATUSES = {502, 503, 504}
@@ -760,8 +763,8 @@ class WorkerRuntime:
             if self.gguf is not None and lost.host is not None and lost.host is not self.gguf.host:
                 return retry
             self.last_error = str(lost)
-            self.ring_live = False  # every pass on it went through that process
             self.caches.clear()
+            self.ring_stop()  # its links died with the process, and this says so to whoever reopens them
             draft = self.draft
             try:
                 assert self.gguf is not None
@@ -1942,7 +1945,10 @@ class WorkerRuntime:
             if status is not None and status not in UNAVAILABLE_STATUSES:
                 # The next stage is up and refused this request, so blame the request.
                 raise HTTPException(status_code=500, detail={"stage_error": str(exc)}) from exc
-            raise HTTPException(status_code=502, detail={"failed_worker": next_stage.worker_id, "message": str(exc)}) from exc
+            detail = {"failed_worker": next_stage.worker_id, "message": str(exc)}
+            if isinstance(exc, BROKEN_CONNECTION):
+                detail["lost"] = next_stage.worker_id  # which may be all that went, so someone should ask first
+            raise HTTPException(status_code=502, detail=detail) from exc
 
 
 def failure_report(response: httpx.Response) -> dict[str, Any] | None:
@@ -1991,6 +1997,7 @@ def authorized(authorization: str | None) -> bool:
 def verify_token(authorization: str | None) -> None:
     if not authorized(authorization):
         raise HTTPException(status_code=401, detail="a pool token or node certificate is required")
+    node_proven()
 
 
 def require_entry(input_ids: list[int]) -> None:

@@ -65,12 +65,12 @@ def test_server_answers_through_the_protocol():
 
 
 @contextlib.contextmanager
-def serving_at(app):
+def serving_at(app, **options):
     """A real server, because the timers under test live in the protocol."""
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, http=NoDelayHTTPProtocol, log_level="warning", lifespan="off"))
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", lifespan="off", **{"http": NoDelayHTTPProtocol, **options}))
     thread = threading.Thread(target=lambda: asyncio.run(server.serve()), daemon=True)
     thread.start()
     try:
@@ -321,3 +321,92 @@ def test_a_failed_accept_does_not_close_the_listening_socket(steady) -> None:
         windows_events.IocpProactor.accept = real
         loop.close()
     assert answer == (b"ok" if steady else None)
+
+
+def node_app(proven_paths=("/node",)):
+    """A route that says a node asked, as verify_token does, and one that does not."""
+    from isharded.tls import node_proven
+
+    async def app(scope, receive, send):
+        if scope["path"] in proven_paths:
+            node_proven()
+        await answers_at_once(scope, receive, send)
+
+    return app
+
+
+def asked(connection, path):
+    connection.sendall(f"GET {path} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+    reply = b""
+    while not reply.endswith(b"ok"):
+        piece = connection.recv(4096)
+        assert piece, "the connection was closed"
+        reply += piece
+
+
+def test_a_node_keeps_its_connection_long_past_where_a_stranger_loses_theirs(monkeypatch):
+    monkeypatch.setattr(serving, "STALL_SECONDS", 0.5)
+    with serving_at(node_app(), timeout_keep_alive=1) as port:
+        with socket.create_connection(("127.0.0.1", port)) as node, socket.create_connection(("127.0.0.1", port)) as stranger:
+            asked(node, "/node")
+            asked(stranger, "/anyone")
+            assert closed_by_server(stranger, 3.0)
+            time.sleep(1.2)  # past both the stranger's keep-alive and the stall watch, twice over
+            asked(node, "/node")
+
+
+def test_a_node_that_stops_halfway_through_a_request_still_loses_its_connection(monkeypatch):
+    monkeypatch.setattr(serving, "STALL_SECONDS", 0.3)
+    with serving_at(node_app()) as port:
+        with socket.create_connection(("127.0.0.1", port)) as connection:
+            asked(connection, "/node")
+            connection.sendall(b"GET /node HT")
+            assert closed_by_server(connection, 3.0)
+
+
+def test_a_connection_that_never_asks_is_still_dropped_on_a_node(monkeypatch):
+    monkeypatch.setattr(serving, "STALL_SECONDS", 0.3)
+    with serving_at(node_app()) as port:
+        with socket.create_connection(("127.0.0.1", port)) as connection:
+            assert closed_by_server(connection, 3.0)
+
+
+def test_a_node_closes_an_idle_connection_before_the_node_it_talks_to(monkeypatch):
+    """Otherwise a request can go out on a connection the other node is closing that same moment."""
+    from isharded.tls import NODE_KEEP_ALIVE_SECONDS, node_transport
+
+    expiry = node_transport()._pool._keepalive_expiry
+    assert expiry == NODE_KEEP_ALIVE_SECONDS >= 600
+    assert NODE_KEEP_ALIVE_SECONDS + serving.NODE_KEEP_ALIVE_MARGIN_SECONDS > expiry
+
+
+def test_idle_connections_get_probed_on_both_sides():
+    """A home router forgets a quiet connection, and a kept one is quiet for a long time."""
+    from isharded.tls import node_transport
+
+    seen = {}
+
+    class Recording(NoDelayHTTPProtocol):
+        def connection_made(self, transport):
+            super().connection_made(transport)
+            seen["server"] = transport.get_extra_info("socket").getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE)
+
+    options = node_transport()._pool._socket_options
+    assert (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1) in options
+
+    async def ask(port):
+        async with httpx.AsyncClient(transport=node_transport(), trust_env=False) as client:
+            return (await client.get(f"http://127.0.0.1:{port}/")).text
+
+    with serving_at(answers_at_once, http=Recording) as port:
+        assert asyncio.run(ask(port)) == "ok"
+    assert seen["server"]
+
+
+def test_a_mac_gets_its_probes_at_the_same_idle_time(monkeypatch):
+    """A Mac calls the idle time TCP_KEEPALIVE. Missing it there leaves the system's two hours."""
+    from isharded.tls import PROBE_IDLE_SECONDS, probe_options
+
+    monkeypatch.delattr(socket, "TCP_KEEPIDLE", raising=False)
+    monkeypatch.setattr(socket, "TCP_KEEPALIVE", 0x10, raising=False)
+    assert (socket.IPPROTO_TCP, 0x10, PROBE_IDLE_SECONDS) in probe_options()

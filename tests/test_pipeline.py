@@ -5,13 +5,23 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 import json
+import os
+from pathlib import Path
 import random
+import shutil
+import socket
+import subprocess
+import sys
+import time
 from types import SimpleNamespace
 
 from fastapi import HTTPException
+import httpx
+import psutil
 import pytest
 
 from isharded import worker as worker_module
+from isharded.engine import find_library
 from isharded import pipeline as pipeline_module
 from isharded.pipeline import LOOKUP_BEATS_DRAFT, LOOKUP_SHORTEST, LOOKUP_WINDOW, Pipeline, PromptLookup, RowClock
 from isharded.protocol import GenerateRequest, InferRequest, SavePoint
@@ -1070,3 +1080,128 @@ def test_the_choice_can_leave_a_lookup_pipeline_and_come_back(lookup_only, monke
     body = GenerateRequest(session_id="s", epoch=1, input_ids=QUOTING_PROMPT, max_tokens=4, reset=True)
     assert len(asyncio.run(stream_of(body))) == 4
     assert ring.sent == [], "plain was faster, so nothing guessed"
+
+
+BUILD = os.environ.get("ISHARDED_TEST_LLAMA_DIR", "")
+MODEL = os.environ.get("ISHARDED_TEST_GGUF", "")
+PIPELINE_TRIALS = 8
+needs_real_route = pytest.mark.skipif(not (BUILD and MODEL and find_library()), reason="needs a real model and the built engine")
+
+
+def free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+class RealRoute:
+    """A real control plane and two CPU workers, each with its own stage process."""
+
+    def __init__(self, folder: Path) -> None:
+        models = folder / "models"
+        models.mkdir()
+        self.model, self.draft = models / "model.gguf", models / "draft.gguf"
+        for link in (self.model, self.draft):
+            shutil.copyfile(MODEL, link)  # a draft must go by another name, or it would only guess at itself
+        self.folder = folder
+        self.processes: list[subprocess.Popen] = []
+        self.client = httpx.Client(timeout=300, trust_env=False)
+        self.control, self.ports = free_port(), [free_port(), free_port()]
+        self.env = {
+            **{key: value for key, value in os.environ.items() if not key.startswith("ISHARDED_") or key == "ISHARDED_ENGINE_LIB"},
+            "ISHARDED_LLAMA_DIR": BUILD, "ISHARDED_POOL_TOKEN_FILE": str(folder / "no-token"), "ISHARDED_HOST": "127.0.0.1",
+            "CUDA_VISIBLE_DEVICES": "-1", "NO_PROXY": "*",
+        }  # fmt: skip
+
+    def launch(self, *arguments: str, url: str) -> None:
+        self.processes.append(subprocess.Popen([sys.executable, "-m", *arguments], env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        self.wait_for(lambda: self.client.get(url + "/health", timeout=2).status_code == 200, 120)
+
+    def wait_for(self, check, seconds: float) -> None:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            try:
+                if check():
+                    return
+            except httpx.HTTPError:
+                pass
+            time.sleep(0.25)
+        raise AssertionError("that never happened")
+
+    def start(self) -> None:
+        url = f"http://127.0.0.1:{self.control}"
+        files = [f"--{name}-file={self.folder / name}" for name in ("keys", "state", "audit")]
+        self.launch("isharded.orchestrator", "--host", "127.0.0.1", "--port", str(self.control), *files, url=url)
+        for index, port in enumerate(self.ports):
+            own = f"http://127.0.0.1:{port}"
+            self.launch(
+                "isharded.worker", "--host", "127.0.0.1", "--port", str(port), "--worker-id", f"w{index}", "--orchestrator-url", url,
+                "--advertise-url", own, "--device", "cpu", "--gguf-dir", str(self.model.parent), "--cache-dir", str(self.folder / f"cache{index}"),
+                "--llama-dir", BUILD, "--state-disk-gb", "0", "--state-ram-gb", "0", "--weights-ram-gb", "4", url=own,
+            )  # fmt: skip
+        self.wait_for(lambda: len(self.status()["workers"]) == 2, 30)
+        body = {"model_id": str(self.model), "wait": False, "placement": "spread", "context_tokens": 512, "parallel": 1, "draft_model": str(self.draft), "prompt_cache": False}
+        assert self.client.post(url + "/admin/load", json=body).status_code < 300
+        self.wait_for(self.loaded, 240)
+
+    def loaded(self) -> bool:
+        status = self.status()
+        refused = (status.get("load_job") or {}).get("error")
+        if refused and "the pool offers" in refused:
+            pytest.skip(f"this machine has too little memory free: {refused}")
+        assert not refused, refused
+        return status["status"] == "ready" and bool(self.entry()["ring_live"])
+
+    def status(self) -> dict:
+        return self.client.get(f"http://127.0.0.1:{self.control}/admin/status").json()
+
+    def entry_port(self) -> int:
+        return self.ports[int(self.status()["route"][0]["worker_id"][1:])]
+
+    def entry(self) -> dict:
+        return self.client.get(f"http://127.0.0.1:{self.entry_port()}/health").json()["telemetry"]
+
+    def ask(self, prompt: str) -> str:
+        body = {"messages": [{"role": "user", "content": prompt}], "max_tokens": 32, "temperature": 0, "enable_thinking": False}
+        answer = self.client.post(f"http://127.0.0.1:{self.control}/v1/chat/completions", json=body)
+        answer.raise_for_status()
+        return answer.json()["choices"][0]["message"]["content"]
+
+    def kill_entry_stage(self) -> None:
+        worker = self.processes[1 + self.ports.index(self.entry_port())]
+        psutil.Process(worker.pid).children()[0].kill()
+
+    def stop(self) -> None:
+        for process in self.processes:
+            for child in psutil.Process(process.pid).children(recursive=True):
+                child.kill()
+            process.kill()
+            process.wait()
+        self.client.close()
+
+
+@needs_real_route
+def test_a_reply_goes_back_to_the_pipeline_after_the_entry_stage_restarts(tmp_path) -> None:
+    """Before this, the ring stayed down for good, and replies kept to the guessed way."""
+    if psutil.virtual_memory().available < 4 * 1024**3:
+        pytest.skip("this machine has too little memory free for two stages and a draft")
+    route = RealRoute(tmp_path)
+    try:
+        route.start()
+        prompt = "List five facts about the moon."
+        before = route.ask(prompt)
+        made = route.entry()["pipeline"]["tokens"]
+        assert made, "the reply never used the pipeline, so this would prove nothing"
+        route.kill_entry_stage()
+        assert route.ask(prompt)  # the reply survives, on whatever way is open
+        assert route.entry()["stage_restarts"] == 1
+        route.wait_for(lambda: route.entry()["ring_live"], 90)
+        # The entry keeps to whichever way has been faster, and plain decoding can win on a
+        # busy machine. It gives the pipeline a trial now and then, as long as the ring is up.
+        for _ in range(PIPELINE_TRIALS):
+            assert route.ask(prompt) == before
+            if route.entry()["pipeline"]["tokens"] > made:
+                break
+        assert route.entry()["pipeline"]["tokens"] > made, route.entry()["draft_ways"]
+    finally:
+        route.stop()
