@@ -1062,8 +1062,9 @@ Tools go through the model's own chat template, which is how it was trained to s
 | Llama 3.1, 3.2 | `{"name": ..., "parameters": ...}`, sometimes after `<\|python_tag\|>` | The same, and they cannot load here yet. Their templates take one call per message, so a conversation holding parallel calls is refused |
 | Mistral 7B v0.3 | `[TOOL_CALLS]` and a JSON list | The same, and it cannot load here yet |
 | Mistral Small 3.2 | `[TOOL_CALLS]name[ARGS]{...}` | The same, and it cannot load here yet |
+| GLM-4.5, 4.6, 4.7 | `<tool_call>name<arg_key>key</arg_key><arg_value>value</arg_value></tool_call>` | The same, and they cannot load here yet |
 
-"Cannot load here yet" means the parser is ready and the mesh is not: GGUF tokenizers cover `qwen2` and `qwen35` vocabularies only, and neither family is on the PyTorch path. See [Supported families](#supported-families). Other families, such as GLM and DeepSeek, are refused rather than guessed at.
+"Cannot load here yet" means the parser is ready and the mesh is not: GGUF tokenizers cover `qwen2` and `qwen35` vocabularies only, and neither family is on the PyTorch path. See [Supported families](#supported-families). Other families, such as DeepSeek, are refused rather than guessed at.
 
 What comes back:
 

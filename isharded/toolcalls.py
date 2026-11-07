@@ -24,7 +24,7 @@ DEFAULT_REPLY_TOKENS = 32
 TOOL_REPLY_TOKENS = 4096
 THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
 # Written as special tokens by some models. Decoding drops those unless told not to.
-MARKER_TOKENS = ("<tool_call>", "</tool_call>", "[TOOL_CALLS]", "[ARGS]", "[CALL_ID]", "<|python_tag|>", THINK_OPEN, THINK_CLOSE)
+MARKER_TOKENS = ("<tool_call>", "</tool_call>", "[TOOL_CALLS]", "[ARGS]", "[CALL_ID]", "<|python_tag|>", "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>", THINK_OPEN, THINK_CLOSE)
 OBJECT = json.JSONDecoder()
 TOOL_CHOICE_RULE = 'tool_choice must be auto, none, required, or {"type": "function", "function": {"name": ...}}'
 
@@ -41,7 +41,7 @@ def tool_format(template: str | None) -> str | None:
     if "<function=" in text and "<parameter=" in text:
         return "xml"
     if "<arg_key>" in text:  # GLM puts its own format inside <tool_call>
-        return None
+        return "glm"
     if "<tool_call>" in text:
         return "hermes"
     if "[TOOL_CALLS]" in text:
@@ -223,6 +223,9 @@ def forced_opening(plan: ToolPlan) -> str:
         return ""
     if plan.format == "xml":
         return f"<tool_call>\n<function={name}>\n" if name else "<tool_call>\n<function"
+    if plan.format == "glm":
+        # GLM-4.5 and 4.6 write a newline after the name, and 4.7 does not, so the model picks.
+        return f"<tool_call>{name}"
     if plan.format == "mistral":
         if plan.new_style:
             return f"[TOOL_CALLS]{name}[ARGS]" if name else "[TOOL_CALLS]"
@@ -365,6 +368,35 @@ class XmlCalls:
         return calls or None
 
 
+GLM_CALL = re.compile(r"\s*([\w.-]+)\s*(.*)\Z", re.S)
+GLM_START = re.compile(r"\s*[\w.-]*\s*(?:<|\Z)")
+GLM_ARGUMENT = re.compile(r"\s*<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>\s*", re.S)
+
+
+class GlmCalls:
+    """``<tool_call>name<arg_key>key</arg_key><arg_value>value</arg_value></tool_call>``: GLM-4.5 to 4.7."""
+
+    opens = ("<tool_call>",)
+    bare = False
+    joiners: tuple[str, ...] = ()
+
+    def end(self, opener: str, text: str) -> int | None:
+        return _closed_by(text, "</tool_call>")
+
+    def plausible(self, opener: str, text: str) -> bool:
+        return bool(GLM_START.match(text))
+
+    def read(self, opener: str, text: str, schemas: dict[str, dict[str, Any]]) -> list[tuple[str, dict[str, Any]]] | None:
+        match = GLM_CALL.match(text.removesuffix("</tool_call>"))
+        if not match:
+            return None
+        name, body = match.groups()
+        if GLM_ARGUMENT.sub("", body).strip():
+            return None  # something else is in there, so this was not a call
+        properties = schemas.get(name, {}).get("properties") or {}
+        return [(name, {key: typed_value(value, properties.get(key) or {}) for key, value in GLM_ARGUMENT.findall(body)})]
+
+
 NEW_MISTRAL = re.compile(r"\s*([\w.-]+)(?:\[CALL_ID\][^\[]*)?\[ARGS\](.*)\Z", re.S)
 MISTRAL_START = re.compile(r"\s*(?:[\[{]|[\w.-]*(?:\[|\Z))")
 
@@ -413,7 +445,7 @@ class LlamaCalls:
         return _calls_from_json(text)
 
 
-FORMATS: dict[str, Any] = {"hermes": HermesCalls(), "xml": XmlCalls(), "mistral": MistralCalls(), "llama3": LlamaCalls()}
+FORMATS: dict[str, Any] = {"hermes": HermesCalls(), "xml": XmlCalls(), "mistral": MistralCalls(), "llama3": LlamaCalls(), "glm": GlmCalls()}
 
 
 def new_call_id(kind: str) -> str:
