@@ -77,6 +77,7 @@ def add_node_arguments(parser: argparse.ArgumentParser) -> None:
         help="the address other nodes reach this one on; auto prefers Tailscale, then the LAN",
     )
     parser.add_argument("--advertise-scheme", choices=["http", "https"], default="http", help="set to https for you by --tls-cert")
+    parser.add_argument("--reach-hosts", default=None, help="other hosts this node answers on, comma separated, tried between stages; default auto finds this machine's, none registers only the advertised one")
     parser.add_argument("--location", type=country_code, default=None, help="two letter country code for the dashboard's flag, or none to show no flag; default is looked up from --advertise-host")
     parser.add_argument("--base-port", type=int, default=8200, help="first worker's port; later workers take the next ones")
     parser.add_argument(
@@ -219,6 +220,7 @@ def _worker_command(args: argparse.Namespace, worker_id: str, port: int, device:
         "--device", device,
         "--roles", roles,
         *_trust_flags(args),
+        *(["--reach-hosts", args.reach_hosts] if getattr(args, "reach_hosts", None) else []),
         *(["--host-models", args.host_models] if getattr(args, "host_models", "") else []),
         *(["--location", args.location] if getattr(args, "location", None) else []),
         *extra,

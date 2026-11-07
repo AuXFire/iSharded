@@ -29,6 +29,8 @@ import httpx
 from .tls import PEER
 
 PREFIX = "smn-"
+# On a request: who it is for, when that is not who the URL names.
+AUDIENCE = "isharded_audience"
 TICKET_SECONDS = 120
 # Clocks differ between machines, and a ticket from slightly ahead is still good.
 CLOCK_SKEW_SECONDS = 60
@@ -61,17 +63,24 @@ class TicketMaker:
             held = self.held.get(audience)
             if held and held[0] > now + TICKET_SECONDS / 2:
                 return held[1]
-            from cryptography.hazmat.primitives import hashes
-            from cryptography.hazmat.primitives.asymmetric import ec
-
             expires = now + TICKET_SECONDS
-            body = json.dumps(
-                {"aud": audience, "exp": expires, "cert": self.certificate.decode()}, sort_keys=True, separators=(",", ":")
-            ).encode()
-            signature = self.key.sign(body, ec.ECDSA(hashes.SHA256()))
-            ticket = f"{PREFIX}{_encode(body)}.{_encode(signature)}"
+            ticket = self._signed(audience, expires)
             self.held[audience] = (expires, ticket)
             return ticket
+
+    def fresh(self, audience: str) -> str:
+        """A ticket for one use, so nothing here grows with each challenge."""
+        return self._signed(audience, self.clock() + TICKET_SECONDS)
+
+    def _signed(self, audience: str, expires: float) -> str:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        body = json.dumps(
+            {"aud": audience, "exp": expires, "cert": self.certificate.decode()}, sort_keys=True, separators=(",", ":")
+        ).encode()
+        signature = self.key.sign(body, ec.ECDSA(hashes.SHA256()))
+        return f"{PREFIX}{_encode(body)}.{_encode(signature)}"
 
 
 class TicketChecker:
@@ -138,7 +147,7 @@ class NodeTickets(httpx.Auth):
 
     def auth_flow(self, request: httpx.Request) -> Any:
         if "authorization" not in request.headers:
-            audience = request.url.netloc.decode()
+            audience = request.extensions.get(AUDIENCE) or request.url.netloc.decode()
             request.headers["Authorization"] = f"Bearer {self.maker.ticket(audience)}"
         yield request
 

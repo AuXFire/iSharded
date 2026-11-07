@@ -89,6 +89,9 @@ class WorkerRegistration(BaseModel):
     code_version: str = "unknown"
     # From --location or the advertised address. None means nobody knows.
     country: str | None = Field(default=None, pattern=r"^[A-Z]{2}$")
+    # Other ways to reach this worker, tried between stages. Only the coordinator and a
+    # stage's neighbour hear them: they are private, and no status may show them.
+    addresses: list[HttpUrl] = Field(default_factory=list, max_length=16)
 
 
 class Heartbeat(BaseModel):

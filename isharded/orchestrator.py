@@ -26,6 +26,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from starlette.background import BackgroundTask
 
 from . import __version__
+from .addresses import host_port
 from .access import INVITE_FIELDS, load_authority, NeedsAuthority, node_of, ROLE_ADMIN, ROLE_MEMBER, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, Caller
 from .embedding import POOLED_TYPES, dimensions_problem, encoded, inputs_problem, length_problem, passes, shaped, smallest_dimensions
 from .engine import find_library
@@ -126,6 +127,11 @@ LINK_TTL_SECONDS = 600.0
 LINK_PROBE_ROUNDS = 5
 LINK_PROBE_BYTES = 100
 LINK_PROBE_SECONDS = 30.0
+# How often a route's links try their other addresses, and how long one try may take.
+HOP_CHECK_SECONDS = 60.0
+HOP_PROBE_SECONDS = 10.0
+# Noise must not move a live link, and the ring has to redial for it.
+HOP_SWITCH_RATIO = 0.9
 # Replanning around a worker that is alive but failed may move this much at most.
 REPLAN_MOVE_LIMIT_BYTES = 2 * 1024**3
 # A restarted worker is back in seconds with its weights on disk, while moving them
@@ -552,6 +558,12 @@ class Orchestrator:
         self.links: dict[tuple[str, str], float] = {}  # round trip in ms, from one worker to another
         self.links_checked: dict[tuple[str, str], float] = {}
         self.link_readings: dict[tuple[str, str], dict[str, Any]] = {}  # what /admin/status publishes
+        # The proven address each link of the route uses, where it is not the advertised one.
+        self.hops: dict[tuple[str, str], str] = {}
+        self.hops_checked_at = float("-inf")
+        self.hop_lock = asyncio.Lock()
+        self.ring_moved = False
+        self.ring_fell_back_at: float | None = None
         self.link_row_bytes = 0
         self.model_id: str | None = None
         self.planning_model: str | None = None
@@ -920,6 +932,8 @@ class Orchestrator:
         await self._adopt_saved_route()
         await self._repair_route()
         self._check_ring()
+        await self._aim_hops()
+        self._redial_moved_ring()
         await self._start_ring()
 
     def _review_quarantine(self) -> None:
@@ -1279,6 +1293,7 @@ class Orchestrator:
             ring_broke = ring and (ring.get("epoch") != self.epoch or (index < last and not ring.get("next_up")))
             if ring_broke or (index == 0 and telemetry.get("ring_live") is False):
                 self.ring_epoch = None
+                self.hops_checked_at = float("-inf")  # the address that broke must not be dialled again
             elif index == last and index > 0 and ring:
                 self._check_closing(bool(ring.get("closing_up")))
 
@@ -1293,8 +1308,81 @@ class Orchestrator:
         elif now - self.ring_closing_down > self.ring_closing_wait:
             self.add_event("mesh", "Closing link down", f"Answers have walked back for {self.ring_closing_wait:.0f} s, so the direct links are reopening")
             self.ring_epoch = None
+            self.hops_checked_at = float("-inf")  # the address that broke must not be dialled again
             self.ring_closing_down = None
             self.ring_closing_wait = min(self.ring_closing_wait * 2, RING_CLOSING_MOST_SECONDS)
+
+    def _redial_moved_ring(self) -> None:
+        """A better address waits for a quiet moment, as a redial sends running replies to a replay."""
+        # A proven address the ring could not dial may work later, but each try stops the ring.
+        again = self.ring_fell_back_at is not None and time.monotonic() - self.ring_fell_back_at >= LINK_TTL_SECONDS
+        if (self.ring_moved or again) and self.ring_epoch is not None and not self.replies_in_flight:
+            self.ring_moved = False
+            self.ring_epoch = self.ring_tried = None
+
+    def _route_links(self) -> list[tuple[str, str]]:
+        """Each link of the route, ending with the one the ring closes on."""
+        names = [stage.worker_id for stage in self.route]
+        return [*zip(names, names[1:]), (names[-1], names[0])] if len(names) > 1 else []
+
+    async def _aim_hops(self) -> None:
+        """Give each link of the route the fastest address that has proved itself.
+
+        Only these pairs are tried, so a large pool sends no traffic for pairs that do not
+        talk, and a node hears the addresses of its neighbours and of nobody else.
+        """
+        async with self.hop_lock:
+            if time.monotonic() - self.hops_checked_at < HOP_CHECK_SECONDS:
+                return
+            self.hops_checked_at = time.monotonic()
+            links = self._route_links()
+            self.hops = {link: url for link, url in self.hops.items() if link in links}
+            await asyncio.gather(*(self._aim_hop(source, target, index < len(links) - 1) for index, (source, target) in enumerate(links)))
+
+    async def _aim_hop(self, source: str, target: str, passes_on: bool) -> None:
+        sender, receiver = self.workers.get(source), self.workers.get(target)
+        held = self.hops.get((source, target))
+        if sender is None or receiver is None or not (receiver.registration.addresses or held):
+            return
+        via = worker_url(receiver)
+        sizes = [LINK_PROBE_BYTES, self.link_row_bytes] if self.link_row_bytes > LINK_PROBE_BYTES else [LINK_PROBE_BYTES]
+        addresses = [str(url).rstrip("/") for url in receiver.registration.addresses]
+        try:
+            response = await self.client.post(
+                worker_url(sender) + "/internal/diag/probe",
+                json={"url": via, "worker_id": target, "addresses": addresses, "sizes": sizes, "rounds": LINK_PROBE_ROUNDS},
+                headers=auth_headers(self.pool_token),
+                timeout=HOP_PROBE_SECONDS,
+            )
+            response.raise_for_status()
+            measured = response.json()
+        except (httpx.HTTPError, ValueError):
+            measured = {}
+        # None stands for the advertised address, which needs no proof: the pool knows it already.
+        readings: dict[str | None, dict[str, Any]] = {url: link_reading(item, sizes) for url, item in measured.get("addresses", {}).items() if item.get("proved") and url in addresses}
+        if str(sizes[0]) in measured:
+            readings[None] = link_reading(measured, sizes)
+        best = min(readings, key=lambda url: readings[url]["cost_ms"], default=None)
+        used = held if held in readings else None
+        if used in readings and readings[best]["cost_ms"] > HOP_SWITCH_RATIO * readings[used]["cost_ms"]:
+            best = used
+        self._use_hop(source, target, best, readings.get(best))
+        if passes_on and (best or held):
+            await self._tell(worker_url(sender) + "/internal/hop", json={"worker_id": target, "url": best}, timeout=HOP_PROBE_SECONDS)
+
+    def _use_hop(self, source: str, target: str, url: str | None, reading: dict[str, Any] | None) -> None:
+        link = source, target
+        was = self.hops.pop(link, None)
+        if url is not None:
+            self.hops[link] = url
+        if reading is not None:
+            self.links[link] = reading["cost_ms"]
+            self.link_readings[link] = {**reading, "direct": url is not None, "checked_at": int(time.time())}
+            self.links_checked[link] = time.monotonic()
+        if url != was:
+            self.ring_moved = True
+            # The address stays out of this: events are in every status.
+            self.add_event("mesh", f"{source} to {target} found a shorter way" if url else f"{source} to {target} went back to its advertised address", f"{reading['median_ms']:.0f} ms a round trip" if reading else "")
 
     async def _start_ring(self) -> None:
         """Open direct links along the route, for the passes every token makes.
@@ -1308,6 +1396,17 @@ class Orchestrator:
         if self.ring_tried == epoch and time.monotonic() - self.ring_tried_at < RING_RETRY_SECONDS:
             return
         self.ring_tried, self.ring_tried_at = epoch, time.monotonic()
+        await self._aim_hops()
+        self.ring_moved = False
+        # An address that passed over HTTP can still fail here, as a door has its own port.
+        hops = dict(self.hops)
+        self.ring_fell_back_at = None
+        if not await self._open_ring(route, epoch, hops) and hops:
+            self.ring_fell_back_at = time.monotonic()
+            await self._open_ring(route, epoch, {})
+
+    async def _open_ring(self, route: list[StageAssignment], epoch: int, hops: dict[tuple[str, str], str]) -> bool:
+        """Returns False if a link could not be opened, when other addresses might do better."""
         headers = auth_headers(self.pool_token)
 
         async def ask(stage: StageAssignment, path: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -1325,13 +1424,18 @@ class Orchestrator:
                 if self.no_engine_told != epoch:  # asked again every few seconds, but said once
                     self.no_engine_told = epoch
                     self.add_event("mesh", "Native path off", f"No native engine on {', '.join(without)}, so replies stay on HTTP")
-                return
-            links = [{"address": door["address"], "fingerprint": door["fingerprint"]} for door in doors]
+                return True
             last = len(route) - 1
 
+            def link(source: int, target: int) -> dict[str, Any]:
+                """What one stage dials. The pinned fingerprint stops a stranger at a reused address."""
+                door = doors[target]
+                url = hops.get((route[source].worker_id, route[target].worker_id))
+                return {"address": host_port(urlsplit(url).hostname or "", door["port"]) if url else door["address"], "fingerprint": door["fingerprint"]}
+
             def connect(index: int) -> dict[str, Any]:
-                entry = links[0] if index == last and last > 0 else None
-                return {"epoch": epoch, "next": links[index + 1] if index < last else None, "entry": entry}
+                entry = link(index, 0) if index == last and last > 0 else None
+                return {"epoch": epoch, "next": link(index, index + 1) if index < last else None, "entry": entry}
 
             await asyncio.gather(*(ask(stage, "/internal/ring/connect", connect(index)) for index, stage in enumerate(route)))
             await ask(route[0], "/internal/ring/go", {"epoch": epoch})
@@ -1339,14 +1443,16 @@ class Orchestrator:
             # A worker a step behind or ahead of this epoch is a route moving, not a fault.
             if exc.response.status_code != 409:
                 self.add_event("mesh", "Direct links not up", f"Replies stay on HTTP for now: HTTP {exc.response.status_code}")
-            return
+                return False
+            return True
         except (httpx.HTTPError, KeyError, ValueError) as exc:
             self.add_event("mesh", "Direct links not up", f"Replies stay on HTTP for now: {str(exc) or type(exc).__name__}")
-            return
+            return False
         if self.epoch == epoch:
             self.ring_epoch = epoch
             self.ring_closing_down = None
             self.add_event("mesh", "Direct links up", f"Tokens now cross {len(route)} stages on the native path")
+        return True
 
     async def measure_links(self, row: int = 0) -> None:
         """Time the links between workers, which the planner routes by.
@@ -1387,7 +1493,9 @@ class Orchestrator:
 
         async def from_one(source: str) -> None:
             for target in urls:
-                if target != source and now - self.links_checked.get((source, target), -LINK_TTL_SECONDS) >= LINK_TTL_SECONDS:
+                # A link on a shorter address is timed there, and the long way would overwrite it.
+                due = now - self.links_checked.get((source, target), -LINK_TTL_SECONDS) >= LINK_TTL_SECONDS
+                if target != source and due and (source, target) not in self.hops:
                     await probe(source, target)
 
         allowed = LINK_PROBE_SECONDS * len(sizes)
@@ -1627,6 +1735,7 @@ class Orchestrator:
         self.installed_epoch = new_epoch
         self.saved_state = None
         self.save_state(target)
+        self.hops_checked_at = float("-inf")
         if saved_states:
             self.spawn(self._clear_old_copies(target, route))
         if self.mesh is not None:
@@ -2582,7 +2691,7 @@ class Orchestrator:
         else:
             state = "standby" if "inference" in record.registration.hardware.contribution.roles else "service"
         return {
-            **record.registration.model_dump(mode="json"),
+            **record.registration.model_dump(mode="json", exclude={"addresses"}),
             "live": record.live,
             "quarantined": record.quarantined,
             "quarantine_reason": record.quarantine_reason,

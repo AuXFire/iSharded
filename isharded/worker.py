@@ -19,7 +19,7 @@ from urllib.parse import urlsplit
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Callable, Collection, Iterator
 import contextlib
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -98,6 +98,7 @@ from .slots import SlotGate
 from .statecopy import CopySender, fetch_file
 from .statestore import HISTORY, PARTIAL, PrefixIndex, StateStore, clear_other_stores, prompt_parts, stage_namespace
 from .access import load_authority
+from .addresses import ECHO_PATH, NodeProof, claim, direct_client, host_port, prove, reach_options, reach_urls
 from .tickets import TicketIdentity, client_auth
 from .tls import client_verify, node_transport, PEER, stay_on_this_machine_async
 from .vision import PromptPart, PromptRows, lay_out
@@ -204,6 +205,15 @@ RING_ANSWER_FLOOR_SECONDS = 2 * RING_ACK_MS / 1000
 # How often a wait for a slot's passes looks up to see whether the ring is still there.
 SETTLE_LOOK_SECONDS = 0.25
 RING_DIAL_MS = 10_000
+# A silent link answers nothing, so a shorter address is checked while it is in use. It
+# gets as long without an answer as a ring link gets without an acknowledgement.
+HOP_WATCH_SECONDS = 1.0
+HOP_SILENCE_SECONDS = RING_ACK_MS / 1000
+# Longest one address may take to prove itself and be timed.
+ADDRESS_PROBE_SECONDS = 6.0
+# What a shorter address can do wrong. A certificate failure arrives as a plain OSError,
+# and whoever has the address may answer with anything.
+LINK_FAILURES = (httpx.HTTPError, OSError, ValueError)
 # Off is for checking results against a prompt that went out whole.
 PROMPT_PARTS = os.getenv("ISHARDED_PROMPT_PARTS", "1") != "0"
 UNAVAILABLE_STATUSES = {502, 503, 504}
@@ -218,6 +228,24 @@ def retry_error(message: str) -> HTTPException:
 
 def epoch_error(epoch: int) -> HTTPException:
     return HTTPException(status_code=409, detail=f"pipeline epoch mismatch; worker has {epoch}")
+
+
+@dataclass(slots=True, eq=False)
+class NextHop:
+    """A proven shorter way to the next stage. Its advertised address stays as the way back."""
+
+    worker_id: str
+    via: str
+    url: str
+    client: httpx.AsyncClient
+    lost: asyncio.Event = field(default_factory=asyncio.Event)
+    watch: asyncio.Task[None] | None = None
+    retired: bool = False
+    passes: int = 0  # on their way now
+
+    @property
+    def options(self) -> dict[str, Any]:
+        return reach_options(self.via)
 
 
 def free_memory() -> None:
@@ -340,6 +368,9 @@ class MergedStep:
 
 
 class WorkerRuntime:
+    hop: NextHop | None = None
+    hop_fallbacks = 0
+
     def __init__(self) -> None:
         self.worker_id = os.getenv("ISHARDED_WORKER_ID", socket.gethostname())
         self.host_id = os.getenv("ISHARDED_HOST_ID", socket.gethostname())
@@ -452,6 +483,8 @@ class WorkerRuntime:
         self.client = httpx.AsyncClient(transport=node_transport(), event_hooks={"request": [stay_on_this_machine_async]}, timeout=httpx.Timeout(1800.0, connect=10.0), verify=client_verify(), auth=client_auth())
         rate = int(float(os.getenv("ISHARDED_STATE_COPY_MB", "10")) * 1024**2)
         self.copies = CopySender(self.client, lambda: auth_headers(self.pool_token), rate)
+        self.reach_urls = [url for url in os.getenv("ISHARDED_REACH_URLS", "").split(",") if url]
+        self.proof = NodeProof(self.pool_token, getattr(self.client.auth, "maker", None))
         self.registration_task: asyncio.Task[None] | None = None
         self.inference_calls = 0
         self.tokens_processed = 0
@@ -515,6 +548,8 @@ class WorkerRuntime:
     async def close(self) -> None:
         if self.registration_task:
             self.registration_task.cancel()
+        if self.hop is not None:
+            self._forget_hop(self.hop)
         await self.client.aclose()
 
     def registration(self) -> WorkerRegistration:
@@ -526,6 +561,7 @@ class WorkerRuntime:
             protocol_version=PROTOCOL_VERSION,
             code_version=__version__,
             country=self.country,
+            addresses=self.reach_urls,
         )
 
     async def _check_in(self, url: str, link: ControlLink) -> None:
@@ -1111,7 +1147,7 @@ class WorkerRuntime:
         self.ring_door = answer
         self.ring_epoch = body["epoch"]
         host = urlsplit(self.advertised_url).hostname or "127.0.0.1"
-        return {"engine": True, "address": f"[{host}]:{answer['port']}" if ":" in host else f"{host}:{answer['port']}", "fingerprint": answer["fingerprint"]}
+        return {"engine": True, "address": host_port(host, answer["port"]), "port": answer["port"], "fingerprint": answer["fingerprint"]}
 
     async def ring_connect(self, body: dict[str, Any]) -> dict[str, Any]:
         if self.gguf is None or self.ring_door is None or body["epoch"] != self.ring_epoch:
@@ -1269,6 +1305,130 @@ class WorkerRuntime:
     def _stages_after(self) -> int:
         index = next(i for i, stage in enumerate(self.route) if stage.worker_id == self.worker_id)
         return len(self.route) - index - 1
+
+    async def aim_hop(self, body: dict[str, Any]) -> None:
+        """Take the address the coordinator proved for the next stage, or go back to the old one."""
+        next_stage = self._next_stage() if self.assignment is not None else None
+        if next_stage is None or next_stage.worker_id != body["worker_id"]:
+            raise HTTPException(status_code=409, detail="that worker is not the next stage")
+        via, url = next_stage.url.rstrip("/"), body.get("url")
+        if self.hop is not None and self.hop.url == url and self.hop.via == via:
+            return
+        hop = NextHop(next_stage.worker_id, via, str(url).rstrip("/"), direct_client(self.client.auth)) if url else None
+        # Any node may call this route, so its word alone must not move a stage's traffic.
+        proved = hop is not None and await self._proves(hop.client, hop.url, via, hop.worker_id)
+        if self.hop is not None:
+            self._retire_hop(self.hop)
+        if proved:
+            self.hop = hop
+            hop.watch = asyncio.create_task(self._watch_hop(hop))
+        elif hop is not None:
+            await hop.client.aclose()
+
+    async def _proves(self, client: httpx.AsyncClient, url: str, via: str, worker_id: str) -> bool:
+        try:
+            return await prove(client, self.proof, url, via, worker_id, self.revoked_nodes)
+        except LINK_FAILURES:
+            return False
+
+    def _hop_to(self, next_stage: StageAssignment) -> NextHop | None:
+        """The shorter way to this stage. One learned for an earlier route is not it."""
+        hop = self.hop
+        if hop is not None and (hop.worker_id != next_stage.worker_id or hop.via != next_stage.url.rstrip("/")):
+            self._retire_hop(hop)
+            return None
+        return hop
+
+    def _forget_hop(self, hop: NextHop) -> None:
+        hop.lost.set()
+        if self.hop is hop:
+            self.hop = None
+
+    def _retire_hop(self, hop: NextHop) -> None:
+        """Nothing failed, so passes on their way finish there and no reply has to replay."""
+        hop.retired = True
+        if self.hop is hop:
+            self.hop = None
+        if not hop.passes:
+            hop.lost.set()
+
+    def _hop_failed(self, hop: NextHop) -> None:
+        self.hop_fallbacks += self.hop is hop
+        self._forget_hop(hop)
+
+    async def _watch_hop(self, hop: NextHop) -> None:
+        """A link that goes silent raises nothing, and a pass on it would wait out its deadline."""
+        heard = time.monotonic()
+        try:
+            while not hop.lost.is_set():
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(hop.lost.wait(), HOP_WATCH_SECONDS)
+                    return
+                try:
+                    answer = await hop.client.post(hop.url + ECHO_PATH, headers=auth_headers(self.pool_token), extensions=hop.options, timeout=HOP_WATCH_SECONDS * 2)
+                    answer.raise_for_status()
+                    heard = time.monotonic()
+                except LINK_FAILURES:
+                    if time.monotonic() - heard >= HOP_SILENCE_SECONDS:
+                        self._hop_failed(hop)
+        finally:
+            self._forget_hop(hop)  # its client closes here, and no pass may be sent to that
+            await hop.client.aclose()
+
+    async def _over_hop(self, hop: NextHop, payload: bytes, headers: dict[str, str], timeout: httpx.Timeout) -> httpx.Response:
+        """One pass by the shorter way. If that fails, the reply is replayed by the old one.
+
+        A pass that went unanswered may have run, and only a replay is safe to do twice.
+        The error says nothing of the address, because it can travel as far as a status.
+        """
+        sending = asyncio.ensure_future(hop.client.post(hop.url + "/internal/forward", content=payload, headers=headers, timeout=timeout, extensions=hop.options))
+        lost = asyncio.ensure_future(hop.lost.wait())
+        hop.passes += 1
+        try:
+            await asyncio.wait({sending, lost}, return_when=asyncio.FIRST_COMPLETED)
+            response = sending.result() if sending.done() else None
+        except LINK_FAILURES:
+            response = None
+        finally:
+            sending.cancel()
+            lost.cancel()
+            hop.passes -= 1
+            if hop.retired and not hop.passes:
+                hop.lost.set()
+        # A refusal here may come from whoever has this address now, not from the next stage.
+        if response is None or (response.status_code >= 300 and response.status_code != 409 and failure_report(response) is None):
+            self._hop_failed(hop)
+            raise retry_error("the shorter way to the next stage failed")
+        return response
+
+    async def time_link(self, client: httpx.AsyncClient, url: str, sizes: list[int], rounds: int, **options: Any) -> dict[str, Any]:
+        """Time echoes to one address, from this end."""
+        results: dict[str, Any] = {}
+        for size in sizes:
+            payload = bytes(int(size))
+            times: list[float] = []
+            for _ in range(rounds):
+                started = time.perf_counter()
+                response = await client.post(url + ECHO_PATH, content=payload, headers=auth_headers(self.pool_token), **options)
+                response.raise_for_status()
+                times.append((time.perf_counter() - started) * 1000)
+            times.sort()
+            results[str(size)] = {"median_ms": round(times[len(times) // 2], 1), "min_ms": round(times[0], 1), "max_ms": round(times[-1], 1)}
+        return results
+
+    async def try_address(self, url: str, via: str, worker_id: str, sizes: list[int], rounds: int) -> dict[str, Any]:
+        """Time one address of another worker. It hears no credential until it has proved whose it is."""
+
+        async def attempt() -> dict[str, Any]:
+            async with direct_client(self.client.auth) as client:
+                if not await self._proves(client, url, via, worker_id):
+                    return {"proved": False}
+                return {"proved": True, **await self.time_link(client, url, sizes, rounds, extensions=reach_options(via))}
+
+        try:
+            return await asyncio.wait_for(attempt(), ADDRESS_PROBE_SECONDS)
+        except (asyncio.TimeoutError, *LINK_FAILURES):
+            return {"proved": False}
 
     def _session(self, request: InferRequest) -> CacheEntry:
         entry = self.caches.get(request.session_id)
@@ -1728,13 +1888,13 @@ class WorkerRuntime:
         self._record("encode", started)
         self.activation_bytes_sent += len(payload)
         started = time.perf_counter()
+        timeout = httpx.Timeout(pass_seconds(rows, self._stages_after()), connect=10.0)
+        hop = self._hop_to(next_stage)
         try:
-            response = await self.client.post(
-                next_stage.url.rstrip("/") + "/internal/forward",
-                content=payload,
-                headers=headers,
-                timeout=httpx.Timeout(pass_seconds(rows, self._stages_after()), connect=10.0),
-            )
+            if hop is not None:
+                response = await self._over_hop(hop, payload, headers, timeout)
+            else:
+                response = await self.client.post(next_stage.url.rstrip("/") + "/internal/forward", content=payload, headers=headers, timeout=timeout)
             report = failure_report(response)
             if report is not None:
                 # Said further down the route. Only the stage that saw it knows who failed.
@@ -1909,6 +2069,8 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
             "phases_ms": runtime.phases,
             "ring": await asyncio.to_thread(runtime.gguf.ring_stats) if runtime.gguf is not None else None,
             "ring_live": runtime.ring_live,
+            "hop_direct": runtime.hop is not None,
+            "hop_fallbacks": runtime.hop_fallbacks,
         },
     }
 
@@ -1937,21 +2099,50 @@ async def diag_echo(request: Request, authorization: str | None = Header(default
 
 @app.post("/internal/diag/probe")
 async def diag_probe(body: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    """Time requests from this worker to another, to measure a link from this end."""
+    """Time requests from this worker to another, to measure a link from this end.
+
+    With ``addresses`` it also tries each of them. Those can go on when the old address
+    has failed, so here that one's failure is only a missing reading.
+    """
     verify_token(authorization)
-    target = str(body["url"]).rstrip("/") + "/internal/diag/echo"
-    results: dict[str, Any] = {}
-    for size in body.get("sizes", [100, 6144, 236544]):
-        payload = bytes(int(size))
-        times: list[float] = []
-        for _ in range(int(body.get("rounds", 10))):
-            started = time.perf_counter()
-            response = await runtime.client.post(target, content=payload, headers=auth_headers(runtime.pool_token))
-            response.raise_for_status()
-            times.append((time.perf_counter() - started) * 1000)
-        times.sort()
-        results[str(size)] = {"median_ms": round(times[len(times) // 2], 1), "min_ms": round(times[0], 1), "max_ms": round(times[-1], 1)}
-    return results
+    via = str(body["url"]).rstrip("/")
+    sizes, rounds = body.get("sizes", [100, 6144, 236544]), int(body.get("rounds", 10))
+    addresses = [str(url).rstrip("/") for url in body.get("addresses", [])]
+    if not addresses:
+        return await runtime.time_link(runtime.client, via, sizes, rounds)
+
+    async def old_way() -> dict[str, Any]:
+        try:
+            return await asyncio.wait_for(runtime.time_link(runtime.client, via, sizes, rounds), ADDRESS_PROBE_SECONDS)
+        except (asyncio.TimeoutError, *LINK_FAILURES):
+            return {}
+
+    tried = [runtime.try_address(url, via, str(body["worker_id"]), sizes, rounds) for url in addresses]
+    old, *found = await asyncio.gather(old_way(), *tried)
+    return {**old, "addresses": dict(zip(addresses, found))}
+
+
+@app.post("/internal/diag/prove")
+async def diag_prove(body: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, str | None]:
+    """Sign for one of this worker's addresses.
+
+    A credential must not go to an address until it has answered this, so a caller shows
+    it is in the pool by signing the same challenge, which is good for nothing else.
+    """
+    nonce, url, worker_id = str(body["nonce"]), str(body["url"]).rstrip("/"), str(body["worker_id"])
+    signer = runtime.proof.signer((authorization or "").removeprefix("Bearer "), claim("ask", nonce, url, worker_id))
+    if signer is None or signer in runtime.revoked_nodes:
+        raise HTTPException(status_code=401, detail="a pool token or node certificate is required")
+    if worker_id != runtime.worker_id or url not in {runtime.advertised_url, *runtime.reach_urls}:
+        raise HTTPException(status_code=404, detail="not an address of this worker")
+    return {"proof": runtime.proof.sign(claim("answer", nonce, url, worker_id))}
+
+
+@app.post("/internal/hop")
+async def aim_hop(body: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, str]:
+    verify_token(authorization)
+    await runtime.aim_hop(body)
+    return {"status": "aimed"}
 
 
 @app.get("/internal/inventory")
@@ -2671,6 +2862,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="one or more control planes, comma separated; the rest are found from them",
     )
     parser.add_argument("--advertise-url", default=os.getenv("ISHARDED_ADVERTISE_URL"), help="how other nodes reach this worker")
+    parser.add_argument("--reach-hosts", default=os.getenv("ISHARDED_REACH_HOSTS", "auto"), help="other hosts this worker answers on, comma separated; auto finds this machine's, none registers only the advertised one")
     parser.add_argument("--location", type=country_code, default=os.getenv("ISHARDED_LOCATION") or None, help="two letter country code to report, or none to report no country; default is looked up from the advertised address")
     parser.add_argument("--device", default=os.getenv("ISHARDED_DEVICE", "auto"), help="auto, cpu, cuda:0, mps, or xpu:0")
     parser.add_argument("--roles", default=os.getenv("ISHARDED_ROLES", "inference"), help="inference, or kv-cache,checkpoint for a memory worker")
@@ -2723,6 +2915,12 @@ def main() -> None:
     os.environ["ISHARDED_PEER_SERVE"] = "0" if args.no_peer_serve else "1"
     os.environ["ISHARDED_LLAMA_DIR"] = args.llama_dir or ""
     check_exposure(args.host, load_token(), os.getenv("ISHARDED_CA_FILE"), args.open, args.advertise_url, args.trusted_network)
+    # With no identity to check, nothing could prove an address, so none would ever count.
+    provable = bool(load_token() or os.getenv("ISHARDED_CA_FILE"))
+    urls, left_out = reach_urls(args.reach_hosts if provable else "none", os.environ["ISHARDED_ADVERTISE_URL"], args.host, args.port, args.open or args.trusted_network)
+    if left_out:
+        print(f"{left_out} of this machine's addresses stay unregistered: they would carry credentials unencrypted. Use TLS, or --trusted-network if nobody else can read them.", flush=True)
+    os.environ["ISHARDED_REACH_URLS"] = ",".join(urls)
     os.environ["ISHARDED_GGUF_DIRS"] = os.pathsep.join(args.gguf_dir or [])
     os.environ["ISHARDED_DTYPE"] = args.dtype
     os.environ["ISHARDED_STANDBY"] = "1" if args.standby else "0"

@@ -725,6 +725,7 @@ Starts a node with everything worked out, and is the easy way in. See [Quick sta
 | `--port` | 8209 | Port for the chat page and API |
 | `--worker-port` | Nine below `--port` | This node's worker port, for clouds that hand out ports |
 | `--address` | Found for you | The address other nodes reach this one on |
+| `--reach-hosts` | `auto` | Other hosts this machine answers on, comma separated. See [Shorter paths](#shorter-paths). `auto` finds them, `none` uses only `--address`. Kept for next time |
 | `--location` | Looked up from `--address` | Two letter country code for the dashboard's flag, such as `DE`, or `none` to show no flag. Kept for next time, and a new one replaces it |
 | `--tls` | Off on Tailscale | Use TLS even on Tailscale |
 | `--trusted-network` | Off | Skip TLS, because nobody else can read this network |
@@ -798,6 +799,7 @@ Network:
 |---|---|---|
 | `--bind-host` | `0.0.0.0` | Address to listen on |
 | `--advertise-host` | `auto` | Address other nodes reach this one on. `auto` prefers Tailscale, then the LAN |
+| `--reach-hosts` | `auto` | Other hosts this node answers on, comma separated. See [Shorter paths](#shorter-paths). `auto` finds them, `none` registers only the advertised one |
 | `--advertise-scheme` | `http` | `http` or `https`. Set to `https` for you by `--tls-cert` |
 | `--location` | Looked up from `--advertise-host` | Two letter country code for the dashboard's flag, such as `DE`, or `none` to show no flag |
 | `--base-port` | 8200 | First worker's port. Later workers take the next ones |
@@ -1062,6 +1064,7 @@ The state folder is `%LOCALAPPDATA%\iSharded` on Windows and `~/.cache/iSharded`
 | `--worker-id` | Computer name | Unique name. Use `node-gpu`, `node-cpu`, or `node-memory` so certificates match |
 | `--orchestrator-url` | `http://127.0.0.1:8000` | One or more control planes, comma separated. The rest are found from them |
 | `--advertise-url` | `http://127.0.0.1:PORT` | How other nodes reach this worker |
+| `--reach-hosts` | `auto` | Other hosts this worker answers on, comma separated. See [Shorter paths](#shorter-paths) |
 | `--location` | Looked up from `--advertise-url` | Two letter country code to report |
 | `--device` | `auto` | `auto`, `cpu`, `cuda:0`, `mps`, or `xpu:0` |
 | `--roles` | `inference` | `inference`, or `kv-cache,checkpoint` for a memory worker |
@@ -1119,6 +1122,8 @@ A flag takes priority over its variable.
 | `ISHARDED_RING` | Set to `0` on the coordinator to keep replies off the direct links between stages |
 | `ISHARDED_PROMPT_PARTS` | Set to `0` on the entry worker to send each prompt whole instead of in parts |
 | `ISHARDED_DATA_PORT` | The port for direct links between stages. It must be reachable from the other stages. Default: any free port |
+| `ISHARDED_REACH_HOSTS` | The worker's `--reach-hosts` |
+| `ISHARDED_REACH_URLS` | Set for you from `--reach-hosts`: the addresses a worker registers |
 | `ISHARDED_HOST_ID` | Which physical machine a worker is on. Defaults to the computer name, so workers sharing a host do not count its RAM twice |
 | `ISHARDED_FETCH_CONCURRENCY` | Units a worker fetches at once. Default 4 |
 | `ISHARDED_ACCESS_LOG` | Set to `1` to log every request while debugging. Off by default, because nodes poll each other constantly |
@@ -1184,7 +1189,7 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `GET` | `/metrics` | Admin key | Prometheus metrics |
 | `GET` | `/chat`, `/dashboard` | None | The pages. They ask for a key themselves |
 
-Routes under `/internal` are for nodes only. `GET /internal/mesh` shows a node's own view of the mesh, and `GET /internal/diag/tasks` shows where everything in a process is waiting, which is the place to look when a reply stalls.
+Routes under `/internal` are for nodes only. `GET /internal/mesh` shows a node's own view of the mesh, and `GET /internal/diag/tasks` shows where everything in a process is waiting, which is the place to look when a reply stalls. `POST /internal/diag/prove` and `POST /internal/hop` are how a stage finds a [shorter path](#shorter-paths).
 
 ### Chat and completion requests
 
@@ -1868,6 +1873,22 @@ The full guide is [iSharded security](SECURITY.md).
 | Remote machines over the internet | Use a pool authority and TLS on every node. Expect each extra stage to cost the round trip between those machines |
 
 A pool can mix these, as long as every node can reach every other node's advertised address.
+
+### Shorter paths
+
+A node that registers through a relay or tunnel would send every pass that way, even to a machine on the same LAN. So each worker also registers the other addresses it answers on. `--reach-hosts` sets them, and `auto` finds them on this machine's network adapters. The ports are the worker's own, so a relay in front of the worker does not change them, and a direct link needs `ISHARDED_DATA_PORT` open on those hosts too.
+
+For each link of the active route, the coordinator asks the stage that would send to try the next stage's addresses, once a minute and after anything breaks. Each direction is tried on its own. An address counts only once the far end has signed a fresh challenge that names that address and that worker, with its node certificate, or with the pool token in a pool with no authority. This matters because two sites can reuse one private address. Neither end sends a credential before that, so a stranger at an address learns nothing. Over TLS, the certificate is also checked against the advertised name, so a shorter address needs no new certificate.
+
+A stage then hears the fastest address that passed, for its next stage alone. It proves that address again itself before it uses it. HTTP passes use it, and so does the ring, which dials the same host on the next stage's data port and still pins its fingerprint. A new address must beat the one in use by 10%. The ring moves over when no reply is running.
+
+The advertised address stays in use until another one passes, and it is always the way back. A stage checks a shorter address every second while it uses it. After 5 seconds of silence, or on any failure, it goes back to the advertised address and the reply is replayed, so it comes out the same with a pause. `hop_direct` and `hop_fallbacks` in a stage's `telemetry` show this. A link's entry in `links` has `direct` set when it uses a shorter address, and the coordinator's events say when one changes.
+
+Three things to know:
+
+- An address with no encryption is left out unless `--trusted-network` or `--open` says that network is safe, as a shorter path must not lose what TLS or Tailscale gave. A worker says how many it left out when it starts.
+- A pool with no pool token and no authority has no identity to prove, so it registers no other addresses.
+- Other addresses go to the control planes and to a stage's neighbours. They never appear in `/admin/status`, `/health`, events, or errors. They are read when a worker starts, so a machine that moves to a new network needs a restart.
 
 Who can do what:
 

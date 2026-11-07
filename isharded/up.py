@@ -349,6 +349,8 @@ def node_arguments(settings: dict[str, Any], home: Path) -> argparse.Namespace:
         arguments += ["--gguf-dir", folder]
     if settings.get("location"):
         arguments += ["--location", settings["location"]]
+    if settings.get("reach_hosts"):
+        arguments += ["--reach-hosts", settings["reach_hosts"]]
     parser = argparse.ArgumentParser()
     add_node_arguments(parser)
     return parser.parse_args(arguments)
@@ -604,6 +606,7 @@ def first_settings(args: argparse.Namespace) -> dict[str, Any]:
         "name": args.name or machine_name(),
         "address": address,
         "location": args.location,
+        "reach_hosts": args.reach_hosts,
         "port": args.port,
         "worker_port": args.worker_port,
         "tls": tls and not args.ownerless,
@@ -672,6 +675,9 @@ def run_up(args: argparse.Namespace) -> int:
         return 1
     if args.location and args.location != settings.get("location"):  # a node that already exists can say where it is
         settings["location"] = args.location
+        write_settings(home, settings)
+    if args.reach_hosts and args.reach_hosts != settings.get("reach_hosts"):
+        settings["reach_hosts"] = args.reach_hosts
         write_settings(home, settings)
     address = settings["address"]
     if not settings["tls"] and not _private_link(address) and not settings.get("trusted_network"):
@@ -838,6 +844,7 @@ def add_arguments(subparsers: Any) -> None:
     up.add_argument("--port", type=int, default=DEFAULT_PORT, help="port for the chat page and API")
     up.add_argument("--address", default=None, help="the address other nodes reach this one on; found for you if not set")
     up.add_argument("--location", type=country_code, default=None, help="two letter country code for the dashboard's flag, or none to show no flag, kept for next time; default is looked up from --address")
+    up.add_argument("--reach-hosts", default=None, help="other hosts this machine answers on, comma separated, tried between stages; found for you if not set, none uses only --address")
     up.add_argument("--tls", action="store_true", help="use TLS even on Tailscale")
     up.add_argument("--trusted-network", action="store_true", help="skip TLS, because nobody else can read this network")
     up.add_argument("--no-gpu", action="store_true", help="contribute CPU and RAM only")
