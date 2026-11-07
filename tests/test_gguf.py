@@ -1126,3 +1126,73 @@ def test_a_missing_part_or_tensor_is_refused_by_name(tmp_path):
     second.unlink()
     with pytest.raises(Exception, match="m-00002-of-00002"):
         build_manifest(str(first))
+
+
+# A reply can leave the ring for the Python path part way, so the two must draw alike.
+
+
+def test_python_draws_the_numbers_the_engine_draws():
+    """The engine's generator is splitmix64, so its published numbers pin both."""
+    from isharded.llamacpp import Draws
+
+    draws = Draws.__new__(Draws)
+    draws.state = 0
+    published = [0xE220A8397B1DCDAF, 0x6E789E6AA1B965F4, 0x06C45D188009454F]
+    assert [draws.random() for _ in published] == [(value >> 11) / 2**53 for value in published]
+
+
+def test_seeded_draws_follow_the_seed_and_the_position_and_nothing_else():
+    from isharded.llamacpp import step_draws
+
+    first = step_draws(5, 9).random()
+    assert first == step_draws(5, 9).random()
+    assert len({step_draws(seed, position).random() for seed in range(20) for position in range(20)}) == 400
+
+
+def test_an_unseeded_reply_draws_from_the_system():
+    from isharded.llamacpp import step_draws
+
+    assert step_draws(None, 9).random() != step_draws(None, 9).random()
+
+
+@pytest.mark.parametrize("point, token", [(0.1, 10), (0.2, 20), (0.49, 20), (0.5, 30), (0.99, 30), (1.0, 30)])
+def test_a_draw_walks_the_distribution_as_the_engine_does(point, token):
+    """The engine stops at the first token that takes the number below zero, and a sliver past the end is the last."""
+    from isharded.llamacpp import draw
+
+    generator = type("Fixed", (), {"random": lambda self: point})()
+    assert draw(np.array([10, 20, 30]), np.array([0.2, 0.3, 0.5]), generator) == token
+
+
+def test_a_seeded_plain_pass_on_a_gguf_stage_draws_as_the_engine_does(monkeypatch):
+    """A plain pass ran at the place before the one it leaves the sequence at, as the ring numbers it."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from isharded import worker as worker_module
+    from isharded.llamacpp import Draws, draw, filtered_distribution
+    from isharded.protocol import InferRequest
+
+    runtime = worker_module.runtime
+    logits = np.linspace(0.0, 3.0, 64, dtype=np.float32)
+    monkeypatch.setattr(runtime, "gguf", object())
+    monkeypatch.setattr(runtime, "gguf_logits", torch.from_numpy(logits))
+    request = InferRequest(session_id="s", epoch=1, input_ids=[1], temperature=0.8, top_p=0.9, seed=5)
+    ids, chances = filtered_distribution(logits, 0.8, 0.9, 0)
+    for length in range(1, 40):
+        monkeypatch.setitem(runtime.caches, "s", SimpleNamespace(length=length))
+        assert runtime._sample(None, request) == draw(ids, chances, Draws(5, length - 1))
+
+
+def test_an_unseeded_gguf_pass_samples_as_it_always_did(monkeypatch):
+    import torch
+
+    from isharded import worker as worker_module
+    from isharded.protocol import InferRequest
+
+    runtime = worker_module.runtime
+    monkeypatch.setattr(runtime, "gguf", object())
+    monkeypatch.setattr(runtime, "gguf_logits", torch.tensor([0.0, 50.0, 0.0]))
+    request = InferRequest(session_id="s", epoch=1, input_ids=[1], temperature=0.8)
+    assert runtime._sample(None, request) == 1

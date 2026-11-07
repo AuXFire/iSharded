@@ -90,7 +90,7 @@ from .gguf_stage import (
 )
 from .pipeline import Pipeline
 from . import __version__
-from .llamacpp import PINNED_BUILD, LlamaError, StageLost, ensure_build, pick_build, rocm_library_paths, step_random
+from .llamacpp import PINNED_BUILD, LlamaError, StageLost, ensure_build, pick_build, rocm_library_paths, speculative_choice, step_draws, step_random
 from .pool import check_exposure, load_token
 from .serving import MAX_STAGE_BYTES, MAX_STATE_BYTES, BodyLimit, serve, where_everything_is
 from .slots import SlotGate
@@ -1336,6 +1336,11 @@ class WorkerRuntime:
                 logits = self.adapter.logits(self.unit_weights["head"], hidden[:, -1:, :])[0, -1].float()
             if request.temperature == 0:
                 return int(torch.argmax(logits).item())
+            if self.gguf is not None and request.seed is not None:
+                # A reply leaves the ring for this path when a stage fails, so a seed has
+                # to draw here what it draws there.
+                draws = step_draws(request.seed, self.caches[request.session_id].length - 1)
+                return speculative_choice(lambda _: logits.numpy(), [], request.temperature, request.top_p, request.top_k, draws)[0]
             if request.top_k:
                 cutoff = torch.topk(logits, min(request.top_k, logits.numel())).values[-1]
                 logits = logits.masked_fill(logits < cutoff, float("-inf"))
