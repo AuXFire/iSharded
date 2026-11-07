@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import struct
+import threading
 from types import SimpleNamespace
 
 from fastapi import HTTPException
@@ -267,6 +268,30 @@ def pool(handler, names=("a", "b", "c")) -> Orchestrator:
 
 def run_ring(orchestrator: Orchestrator) -> None:
     asyncio.run(orchestrator._start_ring())
+
+
+def test_a_pass_out_when_the_stage_is_stopped_fails_though_its_door_stays_open() -> None:
+    async def scenario() -> None:
+        async def held(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            await reader.read()  # a process no kill ended: nothing ever comes back
+            writer.close()
+
+        server = await asyncio.start_server(held, "127.0.0.1", 0)
+        client = EngineClient(*await asyncio.open_connection(*server.sockets[0].getsockname()[:2]))
+        client.task = asyncio.create_task(client._read_loop())
+        out = asyncio.get_running_loop().create_future()
+        client.waiting[1] = native.Flight(out, 0, 1, 0.0)
+        stopped = threading.Event()
+        guard = asyncio.create_task(runtime()._close_with_stage(client, stopped))
+        stopped.set()
+        with pytest.raises(EngineRefusal):
+            await asyncio.wait_for(out, 2)
+        await guard
+        assert not client.alive
+        server.close()
+        await server.wait_closed()
+
+    asyncio.run(scenario())
 
 
 def test_a_ring_opens_every_stage_before_any_dials_and_the_last_dials_the_entry() -> None:

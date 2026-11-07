@@ -206,7 +206,7 @@ RING_ACK_MS = 5000
 # A stage that loses a link says so inside the limit above, and an answer the closing link
 # held comes back by walking soon after. This leaves room for that, however fast the ring.
 RING_ANSWER_FLOOR_SECONDS = 2 * RING_ACK_MS / 1000
-# How often a wait for a slot's passes looks up to see whether the ring is still there.
+# How often a wait on the ring looks up to see whether it, or the stage under it, is still there.
 SETTLE_LOOK_SECONDS = 0.25
 RING_DIAL_MS = 10_000
 # A silent link answers nothing, so a shorter address is checked while it is in use. It
@@ -391,6 +391,7 @@ class WorkerRuntime:
         self.ring_epoch: int | None = None
         self.ring_door: dict[str, Any] | None = None
         self.ring_client: EngineClient | None = None
+        self.ring_guard: asyncio.Task[None] | None = None
         self.country = node_country(self.advertised_url, os.getenv("ISHARDED_LOCATION"))
         self.pool_token = load_token()
         self.requires_identity = bool(os.getenv("ISHARDED_CA_FILE"))
@@ -1170,7 +1171,14 @@ class WorkerRuntime:
             raise HTTPException(status_code=502, detail=f"could not reach the next stage: {state}")
         if self.assignment is not None and self.assignment.start_layer == 0:
             self.ring_client = await EngineClient.open(self.ring_door["local_port"], bytes(self.ring_door["local_key"]))
+            self.ring_guard = asyncio.create_task(self._close_with_stage(self.ring_client, self.gguf.host.stopped))
         return {"connected": True}
+
+    async def _close_with_stage(self, client: EngineClient, stopped: threading.Event) -> None:
+        """A process that takes no kill keeps the local door open, so nothing would tell a reply."""
+        while client.alive and not stopped.is_set():
+            await asyncio.sleep(SETTLE_LOOK_SECONDS)
+        client.close()
 
     def ring_go(self, body: dict[str, Any]) -> None:
         if body["epoch"] != self.ring_epoch or self.ring_client is None:

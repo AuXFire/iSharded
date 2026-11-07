@@ -424,9 +424,7 @@ Qwen3-0.6B Q8_0 over two CPU stages on one machine, frozen 12 chunks into a repl
 | One llama.cpp thread, so a pass hangs | Entry | 35.4 s | |
 | One llama.cpp thread, so a pass hangs | Exit | 37.4 s | |
 | The whole process, and no kill works | Exit | 26.1 s | 29.1 s |
-| The whole process, and no kill works | Entry | 75.6 s | |
-
-The last row waits out the entry's 62 s limit on a pass, because a process that takes no kill leaves its local link open.
+| The whole process, and no kill works | Entry | 24.0 s | |
 
 ### Joining an owned network
 
