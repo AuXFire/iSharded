@@ -28,7 +28,11 @@ function Select-Wheel([string[]]$Lines, [string]$Tag) {
 }
 
 function Assert-Hash([string]$Path, [string]$Expected) {
-    $found = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+    # Get-FileHash's module can fail to load in a Windows PowerShell started from PowerShell 7.
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($Path)
+    try { $found = ([System.BitConverter]::ToString($sha.ComputeHash($stream)) -replace '-', '').ToLowerInvariant() }
+    finally { $stream.Dispose(); $sha.Dispose() }
     if ($found -ne $Expected.ToLowerInvariant()) {
         throw "$(Split-Path -Leaf $Path) does not match its SHA-256, so it was not installed. Expected $Expected, got $found."
     }

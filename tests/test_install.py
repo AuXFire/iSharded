@@ -280,7 +280,7 @@ def test_every_target_is_built_by_the_release_and_picked_by_an_installer() -> No
 
 def test_ci_runs_on_a_mac_and_tests_the_engine_everywhere() -> None:
     tests = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
-    assert tests.count("macos-14") == 2 and "cargo test" in tests
+    assert tests.count("macos-latest") == 2 and "cargo test" in tests
 
 
 def test_the_release_publishes_only_what_was_checked() -> None:

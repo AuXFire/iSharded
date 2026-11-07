@@ -247,7 +247,8 @@ def test_nothing_is_served_from_the_cache_unless_asked():
     result = run(node, "--parallel", "1,3", "--warmup", "1")
     timed = [body["messages"][0]["content"] for body in measured(node)][:-2]  # the repeat check repeats on purpose
     assert len(set(timed)) == len(timed)
-    assert all(level["first_token_ms"]["max"] == 250 for level in result["results"][0]["levels"])
+    # Replies at once share this clock, so one can read longer, but only a cached one reads shorter.
+    assert all(level["first_token_ms"]["min"] >= 250 for level in result["results"][0]["levels"])
     assert "cached_first_token_ms" not in result["results"][0]
 
 
