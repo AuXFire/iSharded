@@ -1513,7 +1513,7 @@ class Orchestrator:
         except PlacementError:
             return None
 
-    def choose_slots(self, target: ModelTarget) -> None:
+    async def choose_slots(self, target: ModelTarget) -> None:
         """Settle how many replies a load runs at once, if the operator left that open.
 
         Slots are in every stage's signature, so changing them restarts stages. This
@@ -1533,10 +1533,10 @@ class Orchestrator:
         route = self._route_or_none(target)
         if route is None:
             return  # the plan that follows says why
-        target.parallel = self._fit_slots(target, route)
+        target.parallel = await self._fit_slots(target, route)
         self.add_event("model", f"{target.slots} at once", target.parallel["reason"])
 
-    def _fit_slots(self, target: ModelTarget, route: list[StageAssignment]) -> dict[str, Any]:
+    async def _fit_slots(self, target: ModelTarget, route: list[StageAssignment]) -> dict[str, Any]:
         """As many slots as the route wants and can hold, on the same workers, with no more spilled."""
         preferred, standby = self.candidate_groups()
         wanted = wanted_slots(route, stage_devices(route, preferred + standby), self.links, target.profile.ring)
@@ -1545,15 +1545,16 @@ class Orchestrator:
         workers = {stage.worker_id for stage in route}
         spilled = self.plan_memory(target, route)["spilled_bytes"]
 
-        def fits(slots: int) -> bool:
+        async def fits(slots: int) -> bool:
+            await asyncio.sleep(0)  # a plan on a big pool takes seconds, and heartbeats must not wait for several
             with_slots(target, slots)
             plan = self._route_or_none(target)
             return plan is not None and {stage.worker_id for stage in plan} == workers and self.plan_memory(target, plan)["spilled_bytes"] <= spilled
 
-        low, high = (wanted["wanted"], wanted["wanted"] + 1) if fits(wanted["wanted"]) else (1, wanted["wanted"])
+        low, high = (wanted["wanted"], wanted["wanted"] + 1) if await fits(wanted["wanted"]) else (1, wanted["wanted"])
         while high - low > 1:
             middle = (low + high) // 2
-            low, high = (middle, high) if fits(middle) else (low, middle)
+            low, high = (middle, high) if await fits(middle) else (low, middle)
         with_slots(target, low)
         trip = f"a {wanted['round_trip_ms']:.1f} ms round trip at {wanted['row_ms']:.1f} ms a row wants {wanted['wanted']}"
         if wanted["devices"] == 1:
@@ -1827,7 +1828,7 @@ class Orchestrator:
             await self.refresh_worker_metrics()
             await self.refresh_holdings(target)
             await self.measure_links(row_bytes(target))
-            self.choose_slots(target)
+            await self.choose_slots(target)
             route = self.plan_or_refuse(target)
             job.route = route
             job.workers = {}
@@ -3210,7 +3211,7 @@ async def preview_plan(body: LoadModelRequest, authorization: str | None = Heade
     await runtime.refresh_worker_metrics()
     await runtime.refresh_holdings(target)
     await runtime.measure_links(row_bytes(target))
-    runtime.choose_slots(target)
+    await runtime.choose_slots(target)
     route = runtime.plan_or_refuse(target, honor_pins_strictly=True)
     return {**describe_plan(target, route), "memory": runtime.plan_memory(target, route)}
 

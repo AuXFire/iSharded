@@ -72,6 +72,10 @@ def pool():
     asyncio.run(runtime.close())
 
 
+def choose(runtime, item):
+    asyncio.run(runtime.choose_slots(item))
+
+
 def stage(name, start, end, ms):
     return StageAssignment(worker_id=name, url=f"http://{name}", start_layer=start, end_layer=end, estimated_ms_per_token=ms, placements=[])
 
@@ -123,7 +127,7 @@ def test_two_workers_on_one_gpu_stay_at_one_slot_and_say_why(pool):
     shared = [item.model_copy(update={"capacity_group": "host:cuda:0"}) for item in worker("a").pools[:1]]
     pool.offered = [Candidate("a", "http://a", shared), Candidate("b", "http://b", [shared[0].model_copy(update={"pool_id": "b-gpu"})])]
     wanted = target()
-    pool.choose_slots(wanted)
+    choose(pool, wanted)
     assert wanted.slots == 1
     assert "one device" in wanted.parallel["reason"]
 
@@ -137,7 +141,7 @@ def test_the_cap_is_64_and_nothing_set_leaves_it_to_the_load():
 
 def test_a_load_with_room_takes_what_the_route_wants(pool):
     wanted = target()
-    pool.choose_slots(wanted)
+    choose(pool, wanted)
     route = pool.plan(wanted)
     assert wanted.slots == wanted.parallel["slots"] == wanted.parallel["wanted"] > 1
     assert wanted.slots == math.ceil(wanted.parallel["round_trip_ms"] / wanted.parallel["row_ms"])
@@ -150,7 +154,7 @@ def test_a_load_stops_where_memory_would_spill(pool):
     # A stage's weights leave room for a few of its 64 MiB slots, far from what 200 ms wants.
     pool.offered = [worker("a", 876 * MIB), worker("b", 876 * MIB)]
     wanted = target()
-    pool.choose_slots(wanted)
+    choose(pool, wanted)
     assert 1 < wanted.slots < wanted.parallel["wanted"]
     assert pool.plan_memory(wanted, pool.plan(wanted))["spilled_bytes"] == 0
     assert "fit in memory" in wanted.parallel["reason"]
@@ -164,7 +168,7 @@ def test_a_pool_that_already_spills_may_spill_no_more(pool):
     with_slots(wanted, 1)
     spilled = pool.plan_memory(wanted, pool.plan(wanted))["spilled_bytes"]
     assert spilled > 0
-    pool.choose_slots(wanted)
+    choose(pool, wanted)
     assert pool.plan_memory(wanted, pool.plan(wanted))["spilled_bytes"] <= spilled
 
 
@@ -175,17 +179,17 @@ def test_slots_never_pull_in_another_worker(pool):
     wanted.spread = None
     with_slots(wanted, 1)
     workers = {item.worker_id for item in pool.plan(wanted)}
-    pool.choose_slots(wanted)
+    choose(pool, wanted)
     assert {item.worker_id for item in pool.plan(wanted)} == workers
 
 
 def test_a_draft_cache_counts_against_the_entry(pool):
     pool.offered = [worker("a", 2 * GIB), worker("b", 2 * GIB)]
     plain = target()
-    pool.choose_slots(plain)
+    choose(pool, plain)
     draft = DraftModel(source="d", file="d.gguf", file_size=1, revision="r", kv_bytes_per_token=128 * 1024)
     drafted = target(draft=draft)
-    pool.choose_slots(drafted)
+    choose(pool, drafted)
     assert drafted.slots < plain.slots
     assert drafted.profile.entry_extra_bytes >= 128 * 1024 * 1024 * (drafted.slots + 1)
 
@@ -200,7 +204,7 @@ def test_one_slot_plans_exactly_as_it_always_has():
 def test_an_explicit_parallel_always_wins(pool):
     pool.offered = [worker("a", 876 * MIB), worker("b", 876 * MIB)]
     set_by_hand = target(parallel=6)
-    pool.choose_slots(set_by_hand)
+    choose(pool, set_by_hand)
     assert set_by_hand.slots == 6
     assert set_by_hand.parallel == {"slots": 6, "reason": "set by the operator"}
 
@@ -208,49 +212,66 @@ def test_an_explicit_parallel_always_wins(pool):
 def test_with_a_link_unmeasured_a_load_stays_at_one_and_says_why(pool):
     pool.links = {}
     wanted = target()
-    pool.choose_slots(wanted)
+    choose(pool, wanted)
     assert wanted.slots == 1
     assert "not been measured" in wanted.parallel["reason"]
 
 
+def test_heartbeats_get_a_turn_while_a_load_chooses(pool):
+    turns = []
+
+    async def both():
+        async def beat():
+            while True:
+                turns.append(1)
+                await asyncio.sleep(0)
+
+        beating = asyncio.create_task(beat())
+        await pool.choose_slots(target())
+        beating.cancel()
+
+    asyncio.run(both())
+    assert turns
+
+
 def test_a_choice_stands_when_the_links_change_later(pool):
     wanted = target()
-    pool.choose_slots(wanted)
+    choose(pool, wanted)
     chosen = wanted.slots
     pool.links = {("a", "b"): 1.0, ("b", "a"): 1.0}
-    pool.choose_slots(wanted)  # a rebalance deploys the same target
+    choose(pool, wanted)  # a rebalance deploys the same target
     assert wanted.slots == chosen
 
 
 def test_the_same_load_again_keeps_the_running_stages(pool):
     pool.active = target()
-    pool.choose_slots(pool.active)
+    choose(pool, pool.active)
     chosen = pool.active.slots
     pool.links = {("a", "b"): 1.0, ("b", "a"): 1.0}
     again = target()
     again.request = again.request.model_copy(update={"wait": False})
-    pool.choose_slots(again)
+    choose(pool, again)
     assert again.slots == chosen
 
 
 def test_another_load_chooses_for_itself(pool):
     pool.active = target()
-    pool.choose_slots(pool.active)
+    choose(pool, pool.active)
     pool.links = {("a", "b"): 1.0, ("b", "a"): 1.0}
     other = target()
     other.request = other.request.model_copy(update={"context_tokens": 2048})
-    pool.choose_slots(other)
+    choose(pool, other)
     assert other.slots < pool.active.slots
 
 
 def test_a_pool_that_shrank_past_the_choice_chooses_again(pool):
     wanted = target()
-    pool.choose_slots(wanted)
+    choose(pool, wanted)
     assert wanted.slots > 1
     # What is left holds the model at one slot, and at the choice not even with its RAM.
     pool.offered = [worker("a", 700 * MIB, 100 * MIB), worker("b", 700 * MIB, 100 * MIB)]
     chosen = wanted.slots
-    pool.choose_slots(wanted)
+    choose(pool, wanted)
     assert wanted.slots < chosen
     assert pool.plan(wanted)
 
@@ -258,7 +279,7 @@ def test_a_pool_that_shrank_past_the_choice_chooses_again(pool):
 def test_status_shows_the_choice_and_why(pool, monkeypatch):
     monkeypatch.setattr(orchestrator_module, "runtime", pool)
     wanted = target()
-    pool.choose_slots(wanted)
+    choose(pool, wanted)
     described = describe_plan(wanted, pool.plan(wanted))
     assert described["parallel"] == wanted.slots
     assert described["parallel_choice"]["reason"] == wanted.parallel["reason"]
@@ -280,7 +301,7 @@ def test_the_preview_shows_what_a_load_would_choose(pool, monkeypatch):
 
 def test_a_follower_takes_the_choice_with_the_route(pool, monkeypatch):
     leader_target = target()
-    pool.choose_slots(leader_target)
+    choose(pool, leader_target)
     state = {
         "request": leader_target.request.model_dump(),
         "revision": "r",
@@ -299,13 +320,13 @@ def test_a_follower_takes_the_choice_with_the_route(pool, monkeypatch):
     assert fresh.slots == leader_target.slots
     assert fresh.profile.kv_bytes_per_token == leader_target.profile.kv_bytes_per_token
     assert fresh.parallel == leader_target.parallel
-    pool.choose_slots(fresh)
+    choose(pool, fresh)
     assert fresh.slots == leader_target.slots
 
 
 def test_saved_state_carries_the_choice(pool, tmp_path):
     wanted = target()
-    pool.choose_slots(wanted)
+    choose(pool, wanted)
     written = {}
     pool._write_state = written.update
     pool.save_state(wanted)
