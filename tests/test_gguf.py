@@ -1660,9 +1660,11 @@ def test_a_stage_keeps_its_pulse_through_a_long_pass(quick_pulse, monkeypatch):
     try:
         real_stage(host, gpu_layers=0)  # on a CPU, so the pass is sure to be long
         host.watch()
-        rows = host.call("embed", tokens=(REAL_PROMPT * 40)[:200], rows=200)[1]
+        # llama.cpp runs a pass of 32 rows or more on a GPU if there is one, even with no layers
+        # there, and once the load's probe has warmed the stage that took under 0.2 s.
+        rows = host.call("embed", tokens=(REAL_PROMPT * 40)[:31], rows=31)[1]
         began = time.monotonic()
-        host.call("forward", rows, position=0, rows=200)
+        host.call("forward", rows, position=0, rows=31)
         assert time.monotonic() - began > 0.2, "the pass must outlast the pulse's limit to prove anything"
         assert host.process.poll() is None
     finally:
