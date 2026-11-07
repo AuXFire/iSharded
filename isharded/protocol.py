@@ -23,7 +23,8 @@ META_HEADER = "x-isharded-meta"
 # Raised whenever workers and the orchestrator stop being able to talk safely.
 # A node on another version is refused at the door, not found out mid-request.
 PROTOCOL_VERSION = 7
-# PyTorch's own bit pattern for a NaN in BF16.
+# A NaN in BF16. PyTorch writes this one on x86 and 0x7FC0 on Apple chips. Either is a NaN,
+# and a row that holds one is broken whichever it is.
 BFLOAT16_NAN = np.uint16(0xFFFF)
 # What a pass can hold, by the names the safetensors format gives them, in the order that
 # format's writer lays them out. BF16 is read as bits.

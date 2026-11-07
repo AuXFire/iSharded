@@ -9,11 +9,13 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
 const TICK: Duration = Duration::from_millis(100);
+/// The most one tick may count for, however late it wakes.
+const LONGEST_TICKS: u32 = 5;
 /// How long a refusal gets to leave. It writes to a link, and a stuck link cannot be let
 /// keep a hung process alive.
 const REFUSAL_PATIENCE: Duration = Duration::from_secs(1);
@@ -102,13 +104,17 @@ impl Drop for Watchdog {
     }
 }
 
-/// Counts ticks and does not read a clock. A process frozen and later woken, as a closed
-/// laptop is, has run for none of that time, so its pass has not overrun.
+/// Adds up ticks, each by its real length but never more than a few ticks' worth. A process
+/// frozen and later woken, as a closed laptop is, has run for none of that time, so its pass
+/// has not overrun. A busy machine that wakes this thread late still counts the time that
+/// went by: macOS runners slept 100 ms ticks for more than twice that.
 fn watch(shared: &Shared) -> Option<String> {
     let mut seen = 0;
     let mut held = Duration::ZERO;
     while !shared.stopping.load(Ordering::Acquire) {
+        let began = Instant::now();
         thread::sleep(TICK);
+        let slept = began.elapsed().min(TICK * LONGEST_TICKS);
         let rows = shared.rows.load(Ordering::Acquire);
         let pass = shared.passes.load(Ordering::Acquire);
         if rows == 0 || pass != seen {
@@ -116,7 +122,7 @@ fn watch(shared: &Shared) -> Option<String> {
             held = Duration::ZERO;
             continue;
         }
-        held += TICK;
+        held += slept;
         if shared.limit(rows).is_some_and(|limit| held > limit) {
             return Some(format!("a pass of {rows} rows has run for {} s, so this stage has hung", held.as_secs()));
         }

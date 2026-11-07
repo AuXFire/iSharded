@@ -58,10 +58,20 @@ def test_a_nan_stays_a_nan_with_nothing_but_numpy():
     assert np.isnan(from_bfloat16(to_bfloat16(rows))).all()
 
 
+def same_bfloat16(ours: np.ndarray, theirs: np.ndarray) -> bool:
+    """Bit for bit, except that a NaN may be any NaN: PyTorch writes a different one on Apple chips."""
+    ours, theirs = ours.view(np.uint16).ravel(), theirs.view(np.uint16).ravel()
+
+    def nan(bits: np.ndarray) -> np.ndarray:
+        return ((bits & 0x7F80) == 0x7F80) & ((bits & 0x007F) != 0)
+
+    return bool(np.array_equal(nan(ours), nan(theirs)) and np.array_equal(ours[~nan(ours)], theirs[~nan(theirs)]))
+
+
 def test_bfloat16_conversion_is_the_same_bytes_as_pytorch():
-    assert to_bfloat16(special_rows()).tobytes() == torch_bits(special_rows()).tobytes()
+    assert same_bfloat16(to_bfloat16(special_rows()), torch_bits(special_rows()))
     every_pattern = np.random.default_rng(1).integers(0, 2**32, 1 << 20, dtype=np.uint32).view(np.float32)
-    assert to_bfloat16(every_pattern).tobytes() == torch_bits(every_pattern).tobytes()
+    assert same_bfloat16(to_bfloat16(every_pattern), torch_bits(every_pattern))
 
 
 @pytest.mark.parametrize("narrow", [False, True], ids=["fp32", "bf16"])
