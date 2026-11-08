@@ -1304,7 +1304,9 @@ class WorkerRuntime:
         if request.term < self.term:
             raise ValueError(f"order from term {request.term}, but term {self.term} already took over")
         self.term = request.term
-        if request.staged:
+        # Read so, an order built without the field, as unstaged callers and tests build it, is unstaged.
+        staged = bool(getattr(request, "staged", False))
+        if staged:
             # The flip of a stage that serves both routes: same model, same KV, no reload, and
             # the ring it staged takes over from the one it serves. See flip_staged.
             if self.gguf is None or self._stage_signature(request) != self.gguf_signature:
@@ -1353,7 +1355,7 @@ class WorkerRuntime:
         self.exactness = None if self.gguf is None else (await asyncio.to_thread(self.gguf.ring_call, "exactness")).get("found")
         if self.gate.size != request.slots:
             self.gate.resize(request.slots)
-        if request.staged:
+        if staged:
             await self.flip_staged(request)
         await self.release_gate()
 
