@@ -161,6 +161,34 @@ At temperature 0, some replies were not word-for-word the same as an earlier rep
 
 These runs total under two hours on two machines. Leaks that take days to show would not appear here.
 
+## Scale harness
+
+Before a pool grows past the machines it has run on, the scale harness shows what its control plane will cost. It starts N emulated nodes on one machine. Each is the real control plane (gossip, elections, check-ins, health probes, status) and a real worker's check-in loop, with no model and a fixed stand-in for the hardware probe, so many fit on one box. Then it measures, for each node: calls and bytes per second by kind, how many others each node calls, CPU and memory, the status call's latency, what one pass of link timing costs, and how long the mesh takes to settle after a join, a leave, a coordinator kill, a frozen coordinator and a partition. [Results](RESULTS.md#control-plane-at-scale) has the numbers so far.
+
+```bash
+# One size, the default phases, results as JSON (about 5 minutes at N=10):
+python tests/scale/harness.py --nodes 50 --out scale-50.json
+
+# Every phase, including an unplugged node, a frozen coordinator and a partition (about 7 minutes at N=20):
+python tests/scale/harness.py --nodes 20 --phases all --out scale-20.json
+
+# N=100 and N=200 on a big CPU box (a 96-core pod), one process a node, growth table at the end:
+python tests/scale/harness.py --sweep 10,50,100,200 --phases all --per-process 1 --normal-priority --out-dir scale-results
+
+# The table again, from files written earlier:
+python tests/scale/report.py scale-results/scale-*.json
+```
+
+Run it from a checkout with the package installed (`pip install -e .`). It listens on 127.0.0.1 only, on free ports it picks, and keeps each run's files and logs in `--run-dir` (a temporary folder by default). It lowers its own processes' priority; `--normal-priority` turns that off.
+
+- **Sizes.** By default nodes share processes, about N divided by the core count to each, which keeps memory to about 55-75 MB a node. Anything a phase kills or freezes always runs alone. What limits a run is CPU: a node's control plane used 0.04 cores at N=10, 0.08 at N=20 and 0.15 at N=30, and the need grows faster than N. Keep the machine's CPU, which each steady window records, well under 90%; past that the nodes slow each other and the numbers describe the box, not the code. A 16-thread laptop shared with other work kept up to about N=20. `--per-process 1` gives each node a process of its own, as a real node has, at about 95 MB a node: N=200 that way needs about 19 GB and, by the CPU trend, a core or more per node, so a 96-core pod should take N=100 cleanly and N=200 only as a measure of where it breaks. On Linux the harness raises its own open-file limit, since every node keeps a connection to every other.
+- **Phases.** `--phases` picks them: `steady`, `status`, `links` (the coordinator has every worker time its link to every other, as it does before planning a route), `join`, `leave` (the process killed), `silent-leave` (the node unplugged), `kill-leader`, `freeze-leader` (suspended, then resumed) and `partition` (two halves that cannot hear each other, then healed). A phase named twice runs twice; the default runs `steady` before and after a leave. A steady window in which any process's event loop stopped for 2 s or more (paging, or a busy machine) is measured again, `--stall-retries` times (1 by default), and the result says how many windows it threw away and whether the last one stalled too.
+- **Network.** `--delay-ms`, `--jitter-ms` and `--loss` emulate the network inside each node's HTTP client: every call waits the delay each way, and a lost call goes silent. A silent call, whether lost, unplugged or partitioned, fails after as long as a real one would: one read timeout over a connection that was open, or every connect attempt and its retry back-off with none. No root or netem is needed, so it runs the same on Windows, macOS and Linux.
+- **Smoke test.** `tests/test_scale.py` runs five nodes through `steady`, `links`, `join`, `leave` and `kill-leader` in 60 to 100 seconds as part of the normal suite, and checks the counts against what the code's own periods say: gossip to every peer every 3 s, a check-in with every control plane every 5 s, a health probe of every worker every 10 s, 20 link probes of 5 echoes each, and one election when the coordinator dies.
+- **Nightly.** The `scale` workflow runs N=20 with every phase each night on a 4-core Linux runner, puts the table in the run's summary and keeps the JSON and the logs. N=50 needs about four times the cores a standard runner has, so it is not the nightly size; started by hand on a larger runner, the workflow takes another size or other phases.
+
+What it does not show: model traffic, a route being planned or repaired (the `links` phase times links the way planning does, but plans nothing), TLS, and real wide-area networks. Linux network namespaces with `tc netem` would put delay and loss in the kernel rather than in each node's client, but need root on every box; the client-side emulation gives the same timeouts and runs anywhere. Every node is on one machine, so CPU figures include the harness's counting, and a busy machine slows every node at once: the machine CPU and loop lag figures say when that happened.
+
 ## What to watch
 
 Every node serves these for itself.
