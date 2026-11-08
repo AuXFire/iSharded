@@ -114,6 +114,27 @@ def test_a_live_member_dropped_counts_as_a_false_alarm(tmp_path):
         asyncio.run(pool.close())
 
 
+def test_a_mesh_that_never_settles_is_still_measured(tmp_path, monkeypatch):
+    async def start(self):
+        return {"settled": False, "settle_s": None}
+
+    async def steady(self):
+        return {"measured": True}
+
+    monkeypatch.setattr(harness.Pool, "start", start)
+    monkeypatch.setattr(harness.Pool, "steady", steady)
+    monkeypatch.setitem(harness.PHASES, "steady", steady)
+    args = harness.parse_args(["--nodes", "5", "--phases", "steady,join,leave,steady", "--run-dir", str(tmp_path)])
+    result = asyncio.run(harness.run(args, 5))
+    assert "error" not in result
+    assert result["phases"] == {
+        "steady": {"measured": True},
+        "join": {"skipped": "the mesh never settled"},
+        "leave": {"skipped": "the mesh never settled"},
+        "steady-2": {"measured": True},
+    }
+
+
 def test_a_repeated_phase_is_recorded_again():
     args = harness.parse_args(["--nodes", "5"])
     assert args.phases.count("steady") == 2
@@ -142,7 +163,7 @@ def test_five_nodes_settle_join_leave_and_elect(tmp_path):
     result = asyncio.run(harness.run(args, 5))
     out.write_text(json.dumps(result), encoding="utf-8")
     assert "error" not in result, result.get("error")
-    assert result["startup"]["leader"] == "n000"
+    assert result["startup"]["settled"] and result["startup"]["leader"] == "n000"
 
     steady = result["phases"]["steady"]
     rates = {key: value["mean"] for key, value in steady["per_node"].items()}

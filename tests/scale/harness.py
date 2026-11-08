@@ -63,6 +63,8 @@ from report import growth_table  # noqa: E402
 DEFAULT_PHASES = ("steady", "status", "links", "join", "leave", "steady", "kill-leader")
 ALL_PHASES = (*DEFAULT_PHASES, "silent-leave", "steady", "freeze-leader", "partition")
 POLL_SECONDS = 0.5
+# Phases that still mean something when the mesh never agreed: the rest wait for it to.
+UNSETTLED_PHASES = {"steady", "status", "links"}
 # A steady window in which some host's event loop stopped this long is measured again.
 STALL_MS = 2000.0
 
@@ -287,17 +289,34 @@ class Pool:
         expected = self.names[:-1]
         await self.until(lambda: all(name in self.reports and self.reports[name]["ready_at"] for name in expected), self.args.settle_timeout, "every node starting")
         ready = max(self.reports[name]["ready_at"] for name in expected)
-        await self.until(lambda: self.settled(expected), self.args.settle_timeout, "the mesh settling")
+        try:
+            await self.until(lambda: self.settled(expected), self.args.settle_timeout, "the mesh settling")
+            settled = True
+        except TimeoutError:
+            # A mesh that never agrees is a result too: what it costs is still measured.
+            settled = False
         settled_at = max(self.last_event(name, {"peers+", "workers+", "controls+", "leader"}) or 0 for name in expected)
         return {
             "processes": len(self.processes),
             "start_s": round(ready - launched, 2),
-            "settle_s": round(settled_at - ready, 2),
+            "settled": settled,
+            "settle_s": round(settled_at - ready, 2) if settled else None,
+            "view": self.view(expected),
             "leader": self.reports[self.leader]["leader"],
             # A node that hears no leader within the join grace elects itself, so a slow start
             # shows here as extra elections and step-downs before the mesh agrees.
             "elections": sum(len(self.reports[name]["takeovers"]) for name in expected),
             "stepdowns": sum(len(self.reports[name]["stepdowns"]) for name in expected),
+        }
+
+    def view(self, names: list[str]) -> dict[str, Any]:
+        """How far each node's view is from the whole: peers and live workers it sees, and leaders."""
+        reports = [self.reports[name] for name in names if name in self.reports]
+        return {
+            "peers_seen": spread([float(report["peers"]) for report in reports]),
+            "peers_seen_min": min((report["peers"] for report in reports), default=None),
+            "workers_live_min": min((report["workers_live"] for report in reports), default=None),
+            "leaders": len({report["leader"] for report in reports}),
         }
 
     def cpu_seconds(self) -> dict[str, float]:
@@ -371,10 +390,12 @@ class Pool:
         await self.mark()
         await self.poll()
         before = self.counts()
+        psutil.cpu_percent(None)
         cpu_before, began = self.cpu_seconds(), time.time()
         await asyncio.sleep(self.args.steady_seconds)
         await self.poll()
         cpu_after, seconds = self.cpu_seconds(), time.time() - began
+        machine = psutil.cpu_percent(None)
         members = [name for name in self.members() if name in before]
         rates = self.rates(before, seconds, members)
         fanout: dict[str, list[float]] = {}
@@ -395,6 +416,9 @@ class Pool:
             "cpu_cores_per_node": round(sum(cpu.values()) / nodes, 4),
             "cpu_busiest_process_cores": round(max(cpu.values()), 3) if cpu else None,
             "rss_mb_per_node": round(self.memory_bytes() / nodes / 2**20, 1),
+            # Every node shares this machine: near 100%, the nodes slow each other down.
+            "machine_cpu_percent": machine,
+            "view": self.view(members),
             "loop_lag_p99_ms": max((lag.get("p99_ms", 0.0) for lag in lags), default=None),
             "loop_lag_max_ms": max((lag.get("max_ms", 0.0) for lag in lags), default=None),
         }
@@ -637,10 +661,15 @@ async def run(args: argparse.Namespace, nodes: int) -> dict[str, Any]:
     }
     try:
         result["startup"] = await pool.start()
+        settled = result["startup"]["settled"]
+        print(f"[N={nodes}] startup: {json.dumps(result['startup'])}", flush=True)
         for phase in args.phases:
             # A phase run again is recorded as steady-2, steady-3 and so on.
             runs = sum(name == phase or (name.startswith(phase + "-") and name[len(phase) + 1 :].isdigit()) for name in result["phases"])
             key = f"{phase}-{runs + 1}" if runs else phase
+            if not settled and phase not in UNSETTLED_PHASES:
+                result["phases"][key] = {"skipped": "the mesh never settled"}
+                continue
             print(f"[N={nodes}] {key} ...", flush=True)
             result["phases"][key] = await PHASES[phase](pool)
             print(f"[N={nodes}] {key}: {json.dumps(result['phases'][key])[:400]}", flush=True)
@@ -702,7 +731,7 @@ def main(argv: list[str] | None = None) -> int:
             print(text)
     if len(results) > 1:
         print(growth_table(results))
-    return 1 if any("error" in result for result in results) else 0
+    return 1 if any("error" in result or not result.get("startup", {}).get("settled") for result in results) else 0
 
 
 if __name__ == "__main__":
