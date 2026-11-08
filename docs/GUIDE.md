@@ -365,7 +365,7 @@ python scripts/build_engine.py
 
 Each worker reports the engine's numbers in `runtime.telemetry.ring`. `link_rtt_us` is the average heartbeat round trip to the next stage. `hop_us` is the average from a pass leaving for the next stage to its acknowledgement coming back, so it carries a real row and shows what the row's size costs. The next stage acknowledges before it computes, so its work is not in that time. Both read zero at the last stage, which has no next stage. `closing_up` says whether the closing link is up, at the entry and at the last stage. `resent` counts passes and answers sent again after a link went quiet. `answers_held` is how many answers the last stage still keeps. `dropped` counts work thrown away: passes past a rewind, anything left over from an earlier reply on a slot, and repeats. `forged` counts answers the entry threw away because the last stage had not sealed them.
 
-The same numbers say where a token's time goes outside compute. No two stages share a clock, so each is an average of times taken on one stage. `compute_us` is a batch's compute, which includes turning rows into bytes and, at the last stage, `sample_us`, the time to pick a token. `queue_us` runs from compute ending to the frame being queued on the link onward, and `write_us` from there to its last byte reaching the socket. At the next stage, `enqueue_us` runs from a frame being read whole to its pass being queued, and `wait_us` from there to compute starting. At the entry, `turnaround_us` runs from an answer reaching the worker to the worker's next pass for that reply arriving, so it holds the worker's own Python and the local link both ways. On a route that guesses ahead, the next pass may already be out, and then it reads only what was left. `compute_us_total` and `batches_total` count all compute and batches since the ring opened, so two looks apart tell how busy a stage was between them. [The split tax measured](RESULTS.md#native-engine-against-the-python-path) has what these show on the laptop.
+The same numbers say where a token's time goes outside compute. No two stages share a clock, so each is an average of times taken on one stage. `compute_us` is a batch's compute, which includes turning rows into bytes and, at the last stage, `sample_us`, the time to pick a token. `queue_us` runs from compute ending to the frame being queued on the link onward, and `write_us` from there to its last byte reaching the socket. At the next stage, `enqueue_us` runs from a frame being read whole to its pass being queued, and `wait_us` from there to compute starting. At the entry, `turnaround_us` runs from an answer reaching the worker to the worker's next pass for that reply arriving, so it holds the worker's own Python and the local link both ways. On a route that guesses ahead, the next pass may already be out, and then it reads only what was left. `compute_us_total` and `batches_total` count all compute and batches since the ring opened, so two looks apart tell how busy a stage was between them. On a model with recurrent state, a pipelined pass asks each stage to copy its slot's state to host after the decode and before the output goes on. `keep_us` and `keep_bytes` are a recent average of one copy and its size, and `keeps_total` and `keep_us_total` count every copy since the model loaded, the load's own probe included. The copy is part of `compute_us`. [The split tax measured](RESULTS.md#native-engine-against-the-python-path) has what these show on the laptop.
 
 A link can go silent with both its ends alive, and the engine treats that apart from a stage dying:
 
@@ -854,6 +854,8 @@ Network:
 | `--advertise-scheme` | `http` | `http` or `https`. Set to `https` for you by `--tls-cert` |
 | `--location` | Looked up from `--advertise-host` | Two letter country code for the dashboard's flag, such as `DE`, or `none` to show no flag |
 | `--base-port` | 8200 | First worker's port. Later workers take the next ones |
+| `--price-per-hour` | None | What this machine costs an hour, for `isharded bench`'s cost per token. Pool users see it in `/admin/status` |
+| `--measure-power` | Off | Read each GPU's power every `MS` milliseconds, 1000 if not given, for `isharded bench`'s energy per token. See [What a token costs](#what-a-token-costs) |
 
 Security:
 
@@ -984,6 +986,8 @@ isharded bench
 isharded bench --url http://node-a:8209 --key YOUR_KEY --markdown result.md
 isharded bench --prompt-tokens 128 --parallel 1,2 --repeat 5 --text code --json result.json
 isharded bench --compare before.json after.json
+isharded bench --pace --tokens 512 --price-per-hour 0.59
+isharded bench --stage Qwen3-0.6B-Q8_0.gguf --llama-dir path/to/llama.cpp --measure-power
 ```
 
 | Option | Default | What it does |
@@ -1002,6 +1006,9 @@ isharded bench --compare before.json after.json
 | `--url` | This machine's node | Any node's address |
 | `--key` | This machine's own | An API key. A user key is enough. See below |
 | `--compare` | Off | Two files saved with `--json`, old then new. Sets them side by side and measures nothing. `--json` and `--markdown` save the comparison |
+| `--pace` | Off | One reply at a time only, and report the draft's real time per guess on the entry. See [What a token costs](#what-a-token-costs) |
+| `--price-per-hour` | None | What each machine costs an hour, for machines whose node set no `--price-per-hour` of its own. Gives cost per million tokens |
+| `--stage` | Off | A GGUF file on this machine. Times one-token passes on this machine's GPU instead of asking a node. See [Timing a pass on this machine](#timing-a-pass-on-this-machine) |
 
 With no `--url` it reads the `up` folder, so `isharded bench` on a node just works. The saved key, or the pool token, goes only to this machine's own node. For any other `--url`, give `--key`, so that benching someone else's mesh cannot hand them your key. In the same way this mesh's certificate authority is used only for this machine's own node. For a node elsewhere whose certificate comes from a mesh's own authority, name that authority's file in `ISHARDED_CA_FILE`.
 
@@ -1016,12 +1023,46 @@ What it reports:
 | Tokens/s per reply | Tokens after the first, divided by the time between the first and the last. Token counts come from the node's usage line |
 | Total tokens/s | All the tokens of a round, divided by the whole round, reading prompts included. This is what the mesh delivers |
 | Repeat of a seeded reply identical | The same seeded request, sent twice. `NO` deserves a look, as one route should repeat itself. It does not fail the run |
+| Cost per M tokens | The route's machines' price an hour, over every token of the level and the whole time its rounds ran. Only when every machine on the route has a price |
+| J/token, Watts | The measured devices' energy over the same tokens and time, and its average power. Only where nodes run with `--measure-power` |
+| Draft guess (g) | The draft's own time per guess during this run, on the entry, as a pipelined pass waited for it. Steady guesses ran one row; the rest read text again after a miss |
+| CUDA graphs | Whether the route's stages ran with CUDA graphs, or `mixed` |
+| Stage times, us | Each stage's engine averages: compute, kept state, queue, write, enqueue, wait, hop, link round trip, sampling and the entry's turnaround. [The native engine](#the-native-engine) says what each is |
+| Kept state | For each stage that copied recurrent state for pipelined passes during this run: how many copies, their size, the time each took, and their share of that stage's compute |
 
 Each number is the median of the measurements, with the lowest and highest in brackets. The report also says what explains them: the model, its quantization (what the GGUF says, or else what its name says) and its slots, how many machines the route spans, each stage's layers, GPU, precision and country, link times, the pipeline's tokens, misses and depth, any draft's passes in this run and its tokens per pass since the stage started, whether the native engine was on, the iSharded version nodes report, the commit of the node that was asked and of the copy running the bench, where each is a git checkout, and how the numbers were taken. A link is the direct link's own round trip to the next stage, and a probe is the same trip over HTTP, measured when the route was planned. It leaves out addresses, keys, machine names and paths, so it is safe to post. Countries appear only where a node's operator shows one.
 
 `--compare` shows what ran differently, then each case both runs have, as old and new median with the change in percent. A change counts as better or worse only if the two runs' lowest-to-highest ranges do not overlap, and otherwise it says within noise. A case with one sample has no range, so it says within noise too. If the two runs differ in what ran, it says so first, because the change may come from that. It exits with 1 if a file is not a report.
 
-`GET /admin/status` gives what this needs: `commit` beside `status`, and `slots`, `quantization` and `context_tokens` in `active_plan`.
+`GET /admin/status` gives what this needs: `commit` beside `status`, and `slots`, `quantization` and `context_tokens` in `active_plan`. Each worker's `runtime.telemetry` adds `draft_guess`, `power`, `price_per_hour` and `cuda_graphs`, described under [What a token costs](#what-a-token-costs). A report saved with `--json` is format 3. `--compare` still reads format 2, which has none of these.
+
+#### What a token costs
+
+A node's operator can set what the machine costs, in any currency an hour, with `isharded node --price-per-hour 0.59`, or `ISHARDED_PRICE_PER_HOUR` for `isharded up`. Each of its workers then reports it. The bench adds the route's machines once each, stages sharing a machine counting it once, and gives the cost per million tokens at each level. A machine with no price takes the bench's `--price-per-hour`. If any machine on the route has neither, there is no cost, and a note says how many lacked one, because a cost that leaves a machine out reads as the whole.
+
+`isharded node --measure-power` (or `ISHARDED_POWER_SAMPLE_MS=1000`) reads each GPU worker's card every second, or every `MS` milliseconds given after the flag, at least 100. On NVIDIA cards `nvidia-smi` keeps running beside the worker and prints a reading each interval, which costs far less than starting it each time. `rocm-smi` has no such loop, so it is asked each interval. A CPU worker on Linux reads the package's energy counter in `/sys/class/powercap`, where it is readable, and that counts the whole package and not only the worker. Power is the whole board's, to within the vendor's stated 5 W, and it holds each reading until the next. Off by default, because it keeps a tool running. Each worker reports `power` with `source`, `device`, `joules` since it started, the last `watts`, `samples`, `seconds` and any `error`. The bench reads it around each level, so a run with power on reads `/admin/status` twice more for each. Two workers on one card count it once. Energy covers idle gaps and prompt reading, as the bill does.
+
+`draft_guess` on the entry worker counts every guess a pipelined pass waited for, with `guesses` and `ms_total`, and `steady` and `steady_ms_total` for those that ran one row. This is the `g` of [the law](#what-a-route-costs) as a real reply pays it: on the entry, sharing the device with the entry stage, and through the worker's own threads. A draft timed by itself is faster. On the 235B mesh the real runs fitted 18.6 ms where a draft alone measured 3.6 to 4.2 ms. `isharded bench --pace` runs one reply at a time, which is when the draft sets the pace, and says so in a note if nothing was guessed. Use a long `--tokens`, so there are enough guesses to count.
+
+`cuda_graphs` is false where the worker's environment has `GGML_CUDA_DISABLE_GRAPHS`. llama.cpp turns CUDA graphs off for any value of it, `0` included. To compare a route with graphs on and off, start its nodes with the variable and without it, bench each, and `--compare` the two: a change of CUDA graphs shows as a change in what ran.
+
+#### Timing a pass on this machine
+
+`isharded bench --stage FILE.gguf` asks no node. It loads the model on this machine and times one-token passes in four cases: as the last stage, which reads the logits, and as a stage before it, which takes the last layer's output as such a stage does, each fed token ids and fed rows of hidden state. Every stage of a route is fed rows, the entry included, since it looks its tokens up itself, while llama.cpp's own tools feed token ids. So this shows whether rows cost a GPU anything a token does not, such as CUDA graphs. Each `--cuda-graphs` setting runs in a process of its own, since llama.cpp reads the variable once, and the settings take turns for `--repeat` rounds. It needs the native engine for the stage before the last, as stages use it; without it, the slower Python callback runs.
+
+| Option | Default | What it does |
+|---|---|---|
+| `--cuda-graphs` | on,off | `on`, `off`, or both |
+| `--feed` | tokens,rows | What a pass is fed |
+| `--role` | last,middle | The last stage, a stage before it, or both |
+| `--passes` | 200 | One-token passes timed in each case, after 16 thrown away |
+| `--gpu-layers` | -1 | Layers on the GPU; -1 is all |
+| `--stage-threads` | 4 | CPU threads |
+| `--device` | cuda:0 | The card `--measure-power` reads |
+| `--measure-power` | Off | Read the card's power every `MS` milliseconds, 200 if not given, for joules per token |
+| `--llama-dir` | `ISHARDED_LLAMA_DIR` | A llama.cpp build |
+
+`--price-per-hour`, `--repeat`, `--json` and `--markdown` work as above. The table gives each case's median ms a pass, the 10th to 90th percentile, and each round's median, and notes under it say what rows cost against tokens and what turning graphs off cost. [The first run](RESULTS.md#cuda-graphs-for-a-stage-fed-rows) is in the results.
 
 Notes under the table say when something bent the numbers: a route that moved, cache use nobody asked for, `--cached` with no cache behind it, replies that ended before `--tokens`, sizes skipped. A node keeps prompt states only with room for them, in `--state-ram-gb` or `--state-disk-gb`. It exits with 1 if any reply failed, or if nothing could be measured. A repeat that differs does not fail it, and neither does a size the model has no room for.
 
@@ -1194,6 +1235,9 @@ A flag takes priority over its variable.
 | `ISHARDED_RING` | Set to `0` on the coordinator to keep replies off the direct links between stages |
 | `ISHARDED_APPLY_LOOP` | Set to `1` on the coordinator to let it apply a [shorter loop](#a-shorter-loop) by itself, between replies. Off by default, because it moves weights |
 | `ISHARDED_APPLY_LOOP_TOKENS` | The most tokens an applied loop may take to pay back its move. Default 20000 |
+| `ISHARDED_PRICE_PER_HOUR` | `--price-per-hour` on a node, read by its workers |
+| `ISHARDED_POWER_SAMPLE_MS` | `--measure-power` on a node, read by its workers. `0` or unset is off |
+| `GGML_CUDA_DISABLE_GRAPHS` | llama.cpp's own: present with any value, `0` included, it turns CUDA graphs off in every stage process of that worker. Workers report it as `cuda_graphs` |
 | `ISHARDED_DRAFT_SHARES_DEVICE` | Set to `1` on the coordinator to count each guess of the draft on the entry stage's device when planning. Off by default; see [Speculative decoding](#speculative-decoding) |
 | `ISHARDED_PROMPT_PARTS` | Set to `0` on the entry worker to send each prompt whole instead of in parts |
 | `ISHARDED_DATA_PORT` | The port for direct links between stages. It must be reachable from the other stages. Default: any free port |
