@@ -183,7 +183,6 @@ def request_membership(folder: str, name: str, addresses: list[str]) -> str:
 def read_membership_request(text: str) -> dict[str, Any]:
     """What a request claims, once its own signature checks out. ValueError if it does not."""
     from cryptography import x509
-    from cryptography.hazmat.primitives import serialization
     from cryptography.x509.oid import ExtensionOID, NameOID
 
     request = x509.load_pem_x509_csr(text.encode())
@@ -197,8 +196,29 @@ def read_membership_request(text: str) -> dict[str, Any]:
     except x509.ExtensionNotFound:
         raise ValueError("a request lists the node's addresses") from None
     addresses = [str(value) for value in [*extension.get_values_for_type(x509.IPAddress), *extension.get_values_for_type(x509.DNSName)]]
-    public = request.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
-    return {"name": str(names[0].value), "addresses": addresses, "fingerprint": hashlib.sha256(public).hexdigest()[:16]}
+    return {"name": str(names[0].value), "addresses": addresses, "fingerprint": key_fingerprint(request.public_key())}
+
+
+def key_fingerprint(public_key: Any) -> str:
+    """The short name of a node's key, as a person compares it and a retirement names it."""
+    from cryptography.hazmat.primitives import serialization
+
+    public = public_key.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    return hashlib.sha256(public).hexdigest()[:16]
+
+
+def certificate_fingerprint(certificate: str | bytes) -> str | None:
+    """The fingerprint of the key a certificate, PEM or DER, was issued for. None if it is no certificate."""
+    from cryptography import x509
+
+    try:
+        if isinstance(certificate, str):
+            loaded = x509.load_pem_x509_certificate(certificate.encode())
+        else:
+            loaded = x509.load_der_x509_certificate(certificate)
+        return key_fingerprint(loaded.public_key())
+    except ValueError:
+        return None
 
 
 def approve_membership(folder: str, text: str) -> str:
@@ -211,6 +231,25 @@ def approve_membership(folder: str, text: str) -> str:
     authority, signer = _authority(Path(folder))
     certificate = _certificate(details["name"], details["addresses"], request.public_key(), authority, signer)
     return certificate.public_bytes(serialization.Encoding.PEM).decode()
+
+
+def admission_entries(folder: str, held: dict[str, Any]) -> list[dict[str, Any]]:
+    """What the authority signs to let one request in.
+
+    A request under a name that a member already holds, with another key, is a machine
+    that lost its folder, or a different machine. Either way an invite or a person let it
+    in, so the old key is retired first and stops proving that name anywhere. What it
+    retires comes from the owner's own node, never from the request.
+    """
+    request = str(held["request"])
+    details = read_membership_request(request)
+    entries: list[dict[str, Any]] = []
+    retires = held.get("retires")
+    if isinstance(retires, dict) and isinstance(retires.get("fingerprint"), str) and retires["fingerprint"] != details["fingerprint"]:
+        keys = [item for item in retires.get("keys", []) if isinstance(item, str)] if isinstance(retires.get("keys"), list) else []
+        entries.append({"type": "retire_key", "name": details["name"], "fingerprint": retires["fingerprint"], "keys": keys})
+    entries.append({"type": "member", "name": details["name"], "certificate": approve_membership(folder, request)})
+    return entries
 
 
 def sign_entry(folder: str, entry: dict[str, Any]) -> dict[str, Any]:

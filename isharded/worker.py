@@ -108,7 +108,7 @@ from .statestore import HISTORY, PARTIAL, PrefixIndex, StateStore, clear_other_s
 from .access import load_authority, node_of
 from .addresses import ECHO_PATH, NodeProof, claim, direct_client, host_port, prove, reach_options, reach_urls
 from .tickets import TicketIdentity, client_auth
-from .tls import client_verify, node_proven, node_transport, PEER, stay_on_this_machine_async
+from .tls import client_verify, node_proven, node_transport, PEER, retire_keys, stay_on_this_machine_async
 from .vision import PromptPart, PromptRows, lay_out
 from .weights import FetchProgress, LoadedUnit, UnitCache, WeightSourceError, gguf_reader, has_model_host, load_unit, map_unit
 
@@ -756,6 +756,11 @@ class WorkerRuntime:
             entry = self.authority.verified(signed)
             if entry is not None and entry.get("type") == "revoke":
                 self.revoked_nodes.add(str(entry.get("name")))
+        # A key retired when its name rejoined with another proves nothing here either.
+        for signed in answer.get("signed_retirements", []):
+            entry = self.authority.verified(signed)
+            if entry is not None and entry.get("type") == "retire_key" and isinstance(entry.get("fingerprint"), str):
+                retire_keys([entry["fingerprint"]])
 
     async def registration_loop(self) -> None:
         """Stay known to every control plane, so a new coordinator needs no introduction.

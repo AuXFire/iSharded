@@ -19,7 +19,7 @@ from .assistant.cli import add_arguments as add_assistant_arguments, run as run_
 from .bench import add_arguments as add_bench_arguments
 from .commons import make_identity, sign_vouch, write_policy
 from .node import add_node_arguments, run_node
-from .pool import add_node, approve_membership, bearer_headers, init_pool, load_token, read_membership_request, request_membership, sign_entry
+from .pool import add_node, admission_entries, bearer_headers, certificate_fingerprint, init_pool, load_token, read_membership_request, request_membership, sign_entry
 from .statements import key_verifier
 from .up import add_arguments as add_up_arguments
 
@@ -337,11 +337,15 @@ def request_join(args: argparse.Namespace, url: str) -> int:
     if state in {"refused", "busy"}:
         print("This pool has refused this node." if state == "refused" else "Too many nodes are waiting. Try again later.")
         return 1
-    print(f"Asked to join as {args.name}. Tell the owner this key fingerprint: {answer.json()['fingerprint']}")
+    mine = answer.json()["fingerprint"]
+    print(f"Asked to join as {args.name}. Tell the owner this key fingerprint: {mine}")
+    if answer.json().get("replaces"):
+        print(f"{args.name} is already a member with key {answer.json()['replaces']}. Approving this retires that key.")
     asked_at = time.monotonic()
     while args.wait:
         found = httpx.get(f"{url}/join/certificate/{args.name}", timeout=30, trust_env=False)
-        if found.status_code == 200:
+        # Until the owner answers, a name already in use still shows its old certificate.
+        if found.status_code == 200 and certificate_fingerprint(found.json()["certificate"]) == mine:
             folder = Path(args.dir)
             (folder / f"{args.name}.pem").write_text(found.json()["certificate"], encoding="utf-8")
             (folder / "ca.pem").write_text(found.json()["authority"], encoding="utf-8")
@@ -377,8 +381,10 @@ def run_membership(args: argparse.Namespace) -> int:
         send_signed(args, {"type": "deny", "name": args.name, "fingerprint": read_membership_request(held["request"])["fingerprint"]})
         print(f"Denied {args.name}.")
         return 0
-    send_signed(args, {"type": "member", "name": args.name, "certificate": approve_membership(args.dir, held["request"])})
-    print(f"Approved {args.name}, key {held['fingerprint']}.")
+    for entry in admission_entries(args.dir, held):
+        send_signed(args, entry)
+    retired = (held.get("retires") or {}).get("fingerprint")
+    print(f"Approved {args.name}, key {held['fingerprint']}." + (f" Its old key {retired} is retired." if retired else ""))
     return 0
 
 

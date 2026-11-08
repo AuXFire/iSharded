@@ -228,18 +228,25 @@ def test_asking_to_join_gives_up_at_the_deadline(monkeypatch: pytest.MonkeyPatch
 def test_waiting_for_an_answer_keeps_the_request_from_expiring(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from isharded import cli
 
+    from isharded.pool import approve_membership
+
+    authority = owner(tmp_path)
     asked: list[dict[str, str]] = []
-    looks = iter([httpx.Response(404), httpx.Response(200, json={"certificate": "c", "authority": "a"})])
+
+    def certificate() -> httpx.Response:
+        return httpx.Response(200, json={"certificate": approve_membership(str(authority), asked[0]["request"]), "authority": "a"})
+
+    looks = iter([lambda: httpx.Response(404), certificate])
 
     def post(url: str, **options: object) -> httpx.Response:
         asked.append(options["json"])  # type: ignore[arg-type]
-        return httpx.Response(200, json={"status": "waiting", "fingerprint": "f"})
+        return httpx.Response(200, json={"status": "waiting", "fingerprint": read_membership_request(asked[0]["request"])["fingerprint"]})
 
     monkeypatch.setattr(cli, "ASK_AGAIN_SECONDS", -1.0)
     monkeypatch.setattr(cli.time, "sleep", lambda _: None)
     monkeypatch.setattr(cli.httpx, "post", post)
-    monkeypatch.setattr(cli.httpx, "get", lambda *_, **__: next(looks))
-    args = argparse.Namespace(url="http://a:1", pool_command="request-join", dir=str(tmp_path), name="joiner", address=["100.64.0.2"], wait=True)
+    monkeypatch.setattr(cli.httpx, "get", lambda *_, **__: next(looks)())
+    args = argparse.Namespace(url="http://a:1", pool_command="request-join", dir=str(tmp_path / "joiner"), name="joiner", address=["100.64.0.2"], wait=True)
     assert cli.run_membership(args) == 0
     assert len(asked) == 2 and asked[0] == asked[1]
 

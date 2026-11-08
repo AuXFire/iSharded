@@ -34,7 +34,7 @@ import threading
 import time
 from typing import Any, Callable, TextIO
 
-from .pool import read_membership_request
+from .pool import certificate_fingerprint, read_membership_request
 
 ROLE_USER = "user"
 # In a network nobody owns, another node's operator: they may propose, not command.
@@ -55,6 +55,11 @@ INVITE_FIELDS = ("proof", "key_sha256", "key_verifier")
 # three minutes, and the owner's machine answers one in seconds. A person takes longer.
 INVITED_REQUEST_SECONDS = 300
 JOIN_REQUEST_SECONDS = 1800
+FINGERPRINT_LENGTH = 16
+
+
+def _is_fingerprint(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == FINGERPRINT_LENGTH and all(char in "0123456789abcdef" for char in value)
 
 
 def node_of(worker_id: str) -> str:
@@ -163,8 +168,15 @@ class AccessControl:
     # Requests to join, by node name, until the owner answers. Carried by gossip
     # unsigned: a request grants nothing, and the owner checks its fingerprint.
     join_requests: dict[str, dict[str, Any]] = field(default_factory=dict)
-    # Certificates the owner issued, for new members to collect.
+    # Certificates the owner issued, for new members to collect: each name's newest one
+    # whose key has not been retired.
     certificates: dict[str, str] = field(default_factory=dict)
+    # Every certificate signed for each name, by its key's fingerprint, with when it was
+    # signed. Signed entries arrive in no fixed order, so the choice is made from all of them.
+    issued: dict[str, dict[str, tuple[str, str]]] = field(default_factory=dict)
+    # Fingerprints of node keys the owner retired, when a machine rejoined under its name
+    # with a new key. A certificate for one of these proves nothing any more.
+    retired_keys: set[str] = field(default_factory=set)
     denied: set[str] = field(default_factory=set)
     # Join requests travel between machines, so their age has to mean the same on each.
     wall_clock: Callable[[], float] = time.time
@@ -287,8 +299,25 @@ class AccessControl:
             self.join_requests.pop(name, None)
             return True
         if kind == "member" and name and isinstance(entry.get("certificate"), str):
-            self.certificates[name] = entry["certificate"]
-            self.join_requests.pop(name, None)
+            issued_for = certificate_fingerprint(entry["certificate"]) or ""
+            self.issued.setdefault(name, {})[issued_for] = (str(entry.get("issued_at", "")), entry["certificate"])
+            self._choose_certificate(name)
+            held = self.join_requests.get(name)
+            if held is not None and held.get("fingerprint") == issued_for:
+                del self.join_requests[name]
+            return True
+        if kind == "retire_key" and name and _is_fingerprint(entry.get("fingerprint")):
+            # A machine came back under its name with a new key, by an invite or a person's
+            # word. The old key is done with everywhere, as are its owner's API keys.
+            self.retired_keys.add(entry["fingerprint"])
+            for hashed in entry.get("keys", []) if isinstance(entry.get("keys"), list) else []:
+                if isinstance(hashed, str) and hashed in self.keys:
+                    del self.keys[hashed]
+                    self.removed.add(hashed)
+            self._choose_certificate(name)
+            held = self.join_requests.get(name)
+            if held is not None and held.get("fingerprint") in self.retired_keys:
+                del self.join_requests[name]
             return True
         if kind == "deny" and name:
             # By the request, not the name: asking again with a new key is a new request.
@@ -298,6 +327,29 @@ class AccessControl:
                 del self.join_requests[name]
             return True
         return False
+
+    def _choose_certificate(self, name: str) -> None:
+        """The newest certificate for a name whose key still counts, the same on every node."""
+        good = [(issued_at, held, certificate) for held, (issued_at, certificate) in self.issued.get(name, {}).items() if held not in self.retired_keys]
+        if good:
+            self.certificates[name] = max(good)[2]
+        else:
+            self.certificates.pop(name, None)
+
+    def certificate_key(self, name: str) -> str | None:
+        """The fingerprint of the key a name's certificate is for, if it has one."""
+        certificate = self.certificates.get(name)
+        if certificate is None:
+            return None
+        return next((held for held, (_, issued) in self.issued.get(name, {}).items() if issued == certificate), None)
+
+    def replaced_by(self, name: str, fingerprint: str) -> str | None:
+        """The key a request would retire: the one a member of that name holds now, if not this one."""
+        held = self.certificate_key(name)
+        return held if held and held != fingerprint else None
+
+    def signed_retirements(self) -> list[dict[str, Any]]:
+        return [signed for signed in self.signed.values() if signed["entry"].get("type") == "retire_key"]
 
     def expire_join_requests(self) -> None:
         """Drop requests nobody is waiting on. Any stranger can make one, so none lasts."""
@@ -329,10 +381,12 @@ class AccessControl:
         request so that nodes cannot keep handing an expired one back to each other.
         """
         name = details["name"]
-        if name in self.revoked or details["fingerprint"] in self.denied:
+        if name in self.revoked or details["fingerprint"] in self.denied or details["fingerprint"] in self.retired_keys:
             return "refused"
-        if name in self.certificates:
+        if name in self.certificates and self.replaced_by(name, details["fingerprint"]) is None:
             return "approved"
+        # A known name with a new key is held like any request. Only an invite or a person
+        # lets it in, and letting it in retires the key that name had.
         self.expire_join_requests()
         now = self.wall_clock()
         try:

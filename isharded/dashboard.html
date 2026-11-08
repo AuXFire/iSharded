@@ -533,7 +533,11 @@
     function joinLine(item) {
       const name = String(item.name ?? ''), busy = state.joinBusy.has(name) ? ' disabled' : '', failure = state.joinErrors.get(name);
       const addresses = [].concat(item.addresses ?? []).join(', ') || 'None given';
-      return `<div class="issue">${glyphHtml('warn')}<div class="issue-body"><b>${esc(name)} wants to join</b><dl class="join-facts"><dt>Addresses</dt><dd>${esc(addresses)}</dd><dt>Key fingerprint</dt><dd><code>${esc(item.fingerprint ?? 'Unknown')}</code></dd></dl>${failure ? `<p class="error" role="alert">${esc(failure)}</p>` : ''}<div class="issue-actions"><button class="btn small" type="button" data-join="approve" data-name="${esc(name)}" data-key="j:a:${esc(name)}"${busy}>Approve</button><button class="btn small" type="button" data-join="deny" data-name="${esc(name)}" data-key="j:d:${esc(name)}"${busy}>Deny</button></div></div></div>`;
+      // A member's name with a new key: its own machine after losing its folder, or another one.
+      const old = item.retires && item.retires.fingerprint ? String(item.retires.fingerprint) : '';
+      const title = old ? `${esc(name)} wants to rejoin with a new key` : `${esc(name)} wants to join`;
+      const retiring = old ? `<dt>Replaces key</dt><dd><code>${esc(old)}</code>, which stops working if you approve</dd>` : '';
+      return `<div class="issue">${glyphHtml('warn')}<div class="issue-body"><b>${title}</b><dl class="join-facts"><dt>Addresses</dt><dd>${esc(addresses)}</dd><dt>Key fingerprint</dt><dd><code>${esc(item.fingerprint ?? 'Unknown')}</code></dd>${retiring}</dl>${failure ? `<p class="error" role="alert">${esc(failure)}</p>` : ''}<div class="issue-actions"><button class="btn small" type="button" data-join="approve" data-name="${esc(name)}" data-key="j:a:${esc(name)}"${busy}>Approve</button><button class="btn small" type="button" data-join="deny" data-name="${esc(name)}" data-key="j:d:${esc(name)}"${busy}>Deny</button></div></div></div>`;
     }
     function joinsChanged() {
       if (!state.data) return;
