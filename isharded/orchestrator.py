@@ -2610,7 +2610,7 @@ class Orchestrator:
             await self._call_off_staged(route, epoch, term, kept, lender)
             self.add_event("rebalance", "Staged switch called off", f"{str(exc) or type(exc).__name__}"[:300] + "; switching the usual way")
             return False
-        flipping = time.monotonic()
+        flipping = time.perf_counter()  # monotonic ticks every 15.6 ms on Windows
         staged_stages = [stage for stage in route if stage.worker_id in kept]
         results = await asyncio.gather(*(self._configure_stage(target, stage, route, epoch, None, holders, True, staged=True) for stage in staged_stages), return_exceptions=True)
         failed = {stage.worker_id: str(result) for stage, result in zip(staged_stages, results) if isinstance(result, BaseException)}
@@ -2619,7 +2619,7 @@ class Orchestrator:
             await self._call_off_staged(route, epoch, term, kept, lender)
             self.add_event("failure", "Staged flip failed", f"{failed}"[:300] + "; switching the usual way")
             return False
-        timings["flip_ms"] = round((time.monotonic() - flipping) * 1000, 1)
+        timings["flip_ms"] = round((time.perf_counter() - flipping) * 1000, 1)
         timings["quiet"] = all(isinstance(result, dict) and result.get("flip_quiet") is not False for result in results)
         if route[0].worker_id not in old_ids:
             await self._tell(route[0].url.rstrip("/") + "/internal/ring/go", json={"epoch": epoch, "term": term}, timeout=RING_CALL_SECONDS)
