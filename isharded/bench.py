@@ -27,6 +27,7 @@ import httpx
 from . import __version__, source_commit
 from .pool import bearer_headers, load_token
 from .tls import client_verify
+from .stagebench import add_arguments as stage_arguments, run_stage
 from .up import local_url, mesh_client, read_settings, sign_in_key, up_home
 
 LOCAL_NODE = "http://127.0.0.1:8000"
@@ -971,6 +972,8 @@ def run_compare(args: argparse.Namespace) -> int:
 def run_bench(args: argparse.Namespace) -> int:
     if args.compare:
         return run_compare(args)
+    if args.stage:
+        return run_stage(args)
     try:
         url, headers, client = connect(args)
         with client:
@@ -1012,4 +1015,5 @@ def add_arguments(subparsers: Any) -> None:
     bench.add_argument("--compare", nargs=2, metavar=("OLD", "NEW"), default=None, help="set two runs saved with --json side by side, and measure nothing")
     bench.add_argument("--pace", action="store_true", help="one reply at a time only, and time the draft's real guesses on the entry")
     bench.add_argument("--price-per-hour", type=price, default=None, help="what each machine costs an hour, for those whose node set no price")
+    stage_arguments(bench)
     bench.set_defaults(handler=run_bench)
