@@ -800,7 +800,9 @@ A folder runs one node. Running `isharded up` again while it is up points you at
 
 ### isharded stop
 
-Stops the node `isharded up` started on this machine, in the foreground or the background, as Ctrl+C would. It waits up to a minute, then kills the node's processes. A start-at-login task stays in place, so the node comes back at the next login.
+Stops the node `isharded up` started on this machine, in the foreground or the background. If the running route uses this node, it first [cordons](#running-a-pool) it and waits for the route to move off, so a reply running at the time pauses only for the move, and not for a route that lost a stage. It waits up to 30 seconds for that, or as long as `--wait SECONDS` says, and `--wait 0` skips it. Then the node's processes stop together, as Ctrl+C would, each given 10 seconds before it is killed.
+
+If no coordinator answers, the cordon is refused because the rest of the pool cannot hold the model, or the route has not moved in time, the node stops anyway and the pool repairs itself as it would after any lost node. The command says which of these happened. A cordon the stop made is undone when the node next starts, so it goes back into service by itself. A cordon you set yourself stays until you lift it. A start-at-login task stays in place, so the node comes back at the next login.
 
 ### isharded invite
 
@@ -1184,6 +1186,7 @@ A flag takes priority over its variable.
 | `ISHARDED_OWNERLESS` | `--ownerless` |
 | `ISHARDED_UP_HOME` | Where `isharded up` keeps its settings and keys |
 | `ISHARDED_DISCOVERABLE` | Set by `isharded up`: answer machines looking for a mesh |
+| `ISHARDED_STOP_DRAIN_SECONDS` | How long [`isharded stop`](#isharded-stop) waits for the route to move off the node, when `--wait` is not given. Default 30 |
 | `ISHARDED_HOST_MODELS` | `--host-models` |
 | `ISHARDED_MODEL_DIRS` | `--model-dir`, separated by the system's path separator |
 | `ISHARDED_REUSE_CACHED`, `ISHARDED_PEER_FETCH` | Set to `0` for the control plane's `--no-reuse-cached`, `--no-peer-fetch` |

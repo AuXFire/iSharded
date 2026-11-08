@@ -218,6 +218,13 @@ class FakeService:
     def stop(self) -> None:
         self.stopped += 1
 
+    def ask_to_stop(self) -> None:
+        self.asked = True
+
+    def finish(self, deadline: float) -> None:
+        assert self.asked, "every service is asked before any is waited on"
+        self.stopped += 1
+
     def supervise(self) -> None:
         self.supervised += 1
 
