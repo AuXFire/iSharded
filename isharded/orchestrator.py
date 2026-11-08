@@ -358,6 +358,14 @@ class LoadJob:
     workers: dict[str, dict[str, Any]] = field(default_factory=dict)
     total_bytes: int = 0
     cancelled: bool = False
+    # Each plan in a load fetches under its own name. A worker takes a second request
+    # under a name it knows as a repeat, so a re-plan that gives a worker more layers
+    # would otherwise be told the first plan's download was its own, and load without them.
+    attempt: int = 0
+
+    @property
+    def fetch_id(self) -> str:
+        return self.job_id if self.attempt == 0 else f"{self.job_id}-{self.attempt}"
 
     def snapshot(self) -> dict[str, Any]:
         def total(key: str) -> int:
@@ -2287,7 +2295,7 @@ class Orchestrator:
             # A zero-byte placement shares the head's tensors: nothing to fetch.
             units = [target.units[item.unit] for item in stage.placements if item.bytes]
             request = PrepareRequest(
-                job_id=job.job_id,
+                job_id=job.fetch_id,
                 model_id=target.model_id,
                 source=target.source_for(stage.worker_id),
                 revision=target.manifest.revision,
@@ -2316,7 +2324,7 @@ class Orchestrator:
             for worker_id, stage in list(pending.items()):
                 try:
                     response = await self.client.get(
-                        stage.url.rstrip("/") + f"/internal/prepare/{job.job_id}",
+                        stage.url.rstrip("/") + f"/internal/prepare/{job.fetch_id}",
                         headers=headers,
                         timeout=10.0,
                     )
@@ -2344,7 +2352,7 @@ class Orchestrator:
             await asyncio.gather(
                 *(
                     self.client.delete(
-                        stage.url.rstrip("/") + f"/internal/prepare/{job.job_id}",
+                        stage.url.rstrip("/") + f"/internal/prepare/{job.fetch_id}",
                         headers=headers,
                         timeout=10.0,
                     )
@@ -2608,7 +2616,8 @@ class Orchestrator:
             raise
 
     async def _deploy(self, target: ModelTarget, job: LoadJob, *, generation_lock_held: bool) -> list[StageAssignment]:
-        for _ in range(MAX_DEPLOY_ATTEMPTS):
+        for attempt in range(MAX_DEPLOY_ATTEMPTS):
+            job.attempt = attempt
             await self.refresh_worker_metrics()
             await self.refresh_holdings(target)
             await self.measure_links(row_bytes(target))

@@ -142,6 +142,24 @@ def test_the_route_is_planned_again_without_a_stalled_worker_and_not_retried(mon
     assert orchestrator.workers["w1"].quarantine_reason.startswith(STALLED)
 
 
+
+def test_each_plan_of_a_load_fetches_under_its_own_name(monkeypatch):
+    # Measured on a real pool: after a stalled worker, the new plan gave the other worker
+    # the layers the stalled one had. A worker takes a known fetch name as a repeat, so it
+    # answered with the first plan's finished download and the load failed for want of them.
+    stall = {"w1": f"{STALLED}: nothing moved for 30 s, 46 s into a load given 46 s for 0.80 GiB"}
+    orchestrator, _ = deploy_pool(monkeypatch, [stall, {}], 0)
+    names = []
+
+    async def prefetch(target, route, job):
+        names.append(job.fetch_id)
+        return {}
+
+    orchestrator._prefetch = prefetch
+    assert run_deploy(orchestrator)
+    assert names == ["j", "j-1"]
+
+
 # --- the worker's side
 
 
