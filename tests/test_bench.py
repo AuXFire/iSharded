@@ -886,20 +886,39 @@ def test_a_machine_with_no_price_takes_the_benchs_and_otherwise_there_is_no_cost
 
 
 def test_energy_per_token_is_read_around_each_level_and_a_shared_card_counts_once():
-    def reading(joules: float) -> dict:
+    def reading(joules: float, seconds: float, samples: int, older: float = 0.0) -> dict:
         base = status(100)
-        for worker in (ENTRY, EXIT):  # two stages on one machine's one card
-            base["workers"][worker]["runtime"]["telemetry"]["power"] = {"source": "nvidia-smi", "device": "0", "joules": joules, "watts": 100.0}
+        # Two stages on one machine's one card. The second worker's meter started later and
+        # has counted less, and the oldest is the one read.
+        for worker, less in ((ENTRY, 0.0), (EXIT, older)):
+            base["workers"][worker]["runtime"]["telemetry"]["power"] = {
+                "source": "nvidia-smi", "device": "0", "joules": joules - less, "seconds": seconds - less / 100, "samples": samples, "watts": 100.0,
+            }  # fmt: skip
         return base
 
     node = FakeNode()
-    # Before the run, then around the one level, then after it.
-    node.statuses = [reading(1000.0), reading(1500.0), reading(1500.0 + 33.0), reading(9999.0)]
+    # Before the run, then around the one level, then after it. The readings around the level
+    # cover 1.5 s at 22 W on average, whatever the level's own wall.
+    node.statuses = [reading(1000.0, 10.0, 20), reading(1500.0, 15.0, 30, older=300.0), reading(1533.0, 16.5, 33, older=300.0), reading(9999.0, 99.0, 99)]
     level = run(node, *ONE_ROUND)["results"][0]["levels"][0]
-    assert (level["joules_per_token"], level["power_devices"]) == (3.0, 1)
-    assert level["watts"] == round(33.0 / ROUND_SECONDS, 1)
+    assert (level["watts"], level["power_devices"]) == (22.0, 1)
+    assert level["joules_per_token"] == round(22.0 * ROUND_SECONDS / 11, 3), "the level's own wall at the readings' power"
     report = run(FakeNode(), *ONE_ROUND)
     assert "joules_per_token" not in report["results"][0]["levels"][0], "no node measured power"
+
+
+def test_a_level_shorter_than_a_few_power_readings_gives_no_energy_and_says_so():
+    def reading(joules: float, seconds: float, samples: int) -> dict:
+        base = status(100)
+        base["workers"][ENTRY]["runtime"]["telemetry"]["power"] = {"source": "nvidia-smi", "device": "0", "joules": joules, "seconds": seconds, "samples": samples}
+        return base
+
+    node = FakeNode()
+    node.statuses = [reading(1000.0, 10.0, 20), reading(1500.0, 15.0, 30), reading(1550.0, 15.5, 31), reading(1600.0, 16.0, 32)]
+    report = run(node, *ONE_ROUND)
+    level = report["results"][0]["levels"][0]
+    assert "joules_per_token" not in level and level["power_too_short"] is True
+    assert any("too few power readings" in note for note in report["notes"])
 
 
 def test_cost_and_energy_columns_show_only_when_measured():
@@ -908,7 +927,7 @@ def test_cost_and_energy_columns_show_only_when_measured():
     report["results"][0]["levels"][0] |= {"cost_per_million_tokens": 5.2, "joules_per_token": 3.0, "watts": 94.3}
     headers, rows = bench.table(report)
     assert headers[-3:] == ["Cost per M tokens", "J/token", "Watts"] and rows[0][-3:] == ["5.2", "3", "94.3"]
-    assert any("J/token and watts" in sentence for sentence in bench.method(report))
+    assert any("J/token is that power" in sentence for sentence in bench.method(report))
 
 
 def test_cuda_graphs_are_reported_and_a_change_is_a_change_in_setup(tmp_path, capsys):

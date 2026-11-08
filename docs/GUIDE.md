@@ -1024,7 +1024,7 @@ What it reports:
 | Total tokens/s | All the tokens of a round, divided by the whole round, reading prompts included. This is what the mesh delivers |
 | Repeat of a seeded reply identical | The same seeded request, sent twice. `NO` deserves a look, as one route should repeat itself. It does not fail the run |
 | Cost per M tokens | The route's machines' price an hour, over every token of the level and the whole time its rounds ran. Only when every machine on the route has a price |
-| J/token, Watts | The measured devices' energy over the same tokens and time, and its average power. Only where nodes run with `--measure-power` |
+| J/token, Watts | The measured devices' average power over the level, from their own readings, and that power over the level's whole time and tokens. Only where nodes run with `--measure-power`, and only for a level that spans at least three readings; a shorter one says so in a note |
 | Draft guess (g) | The draft's own time per guess during this run, on the entry, as a pipelined pass waited for it. Steady guesses ran one row; the rest read text again after a miss |
 | CUDA graphs | Whether the route's stages ran with CUDA graphs, or `mixed` |
 | Stage times, us | Each stage's engine averages: compute, kept state, queue, write, enqueue, wait, hop, link round trip, sampling and the entry's turnaround. [The native engine](#the-native-engine) says what each is |

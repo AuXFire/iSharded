@@ -368,27 +368,45 @@ def route_price(status: dict[str, Any], fallback: float | None) -> tuple[float |
     return (None if missing or not route_hosts(status) else total), missing
 
 
-def power_readings(status: dict[str, Any]) -> dict[tuple[str, str, str], float]:
-    """Each measured device's energy so far, in joules. Two workers on one card count it once."""
-    readings: dict[tuple[str, str, str], float] = {}
+Reading = tuple[float, float, int]  # a meter's joules, the seconds its readings cover, and their count
+# Fewer gaps between readings than this inside a level say too little about its power.
+FEWEST_POWER_GAPS = 3
+
+
+def power_readings(status: dict[str, Any]) -> dict[tuple[str, str, str], Reading]:
+    """Each measured device's meter so far. Two workers on one card count it once."""
+    readings: dict[tuple[str, str, str], Reading] = {}
     for host, workers in route_hosts(status).items():
         for worker_id in workers:
             power = telemetry_of(status, worker_id).get("power") or {}
             if power.get("source") and isinstance(power.get("joules"), (int, float)):
                 key = (host, str(power["source"]), str(power.get("device")))
-                readings[key] = max(readings.get(key, 0.0), float(power["joules"]))
+                found = (float(power["joules"]), float(power.get("seconds") or 0.0), int(power.get("samples") or 0))
+                # Each worker on a card runs a meter of its own, and the oldest has counted most.
+                readings[key] = max(readings.get(key, found), found)
     return readings
 
 
-def energy_between(start: dict[tuple[str, str, str], float], end: dict[tuple[str, str, str], float]) -> tuple[float, int] | None:
-    """Joules the measured devices used between two readings, and how many devices that is."""
+def energy_between(start: dict[tuple[str, str, str], Reading], end: dict[tuple[str, str, str], Reading]) -> tuple[float, int] | None:
+    """The measured devices' average power together between two looks, and how many devices.
+
+    A meter's joules cover the time between its readings, not between the looks, which can
+    differ by an interval at each end. Their average power does not depend on that. A level
+    shorter than a few intervals gives too few readings to say, and then there is none.
+    """
     both = start.keys() & end.keys()
     if not both:
         return None
-    return sum(max(end[key] - start[key], 0.0) for key in both), len(both)
+    watts = 0.0
+    for key in both:
+        joules, seconds, samples = (after - before for after, before in zip(end[key], start[key]))
+        if samples < FEWEST_POWER_GAPS or seconds <= 0:
+            return None
+        watts += max(joules, 0.0) / seconds
+    return watts, len(both)
 
 
-def add_costs(level: dict[str, Any], rounds: list[tuple[list[Reply], float]], price: float | None, energy: tuple[float, int] | None) -> None:
+def add_costs(level: dict[str, Any], rounds: list[tuple[list[Reply], float]], price: float | None, power: tuple[float, int] | None) -> None:
     """Money and energy per token at one level, over all its rounds.
 
     Both count the whole time the rounds ran, so a route that sits idle between tokens pays for
@@ -400,10 +418,10 @@ def add_costs(level: dict[str, Any], rounds: list[tuple[list[Reply], float]], pr
         return
     if price is not None:
         level["cost_per_million_tokens"] = round(price / 3600 * seconds / tokens * 1e6, 4)
-    if energy is not None:
-        joules, devices = energy
-        level["joules_per_token"] = round(joules / tokens, 3)
-        level["watts"] = round(joules / seconds, 1)
+    if power is not None:
+        watts, devices = power
+        level["joules_per_token"] = round(watts * seconds / tokens, 3)
+        level["watts"] = round(watts, 1)
         level["power_devices"] = devices
 
 
@@ -550,7 +568,10 @@ class Bench:
                     cached.append(self.ask(batch[0], CACHED_REPLY_TOKENS))
             end = self.power_now() if start else {}
             level = level_result(parallel, rounds, options.tokens)
-            add_costs(level, rounds, price, energy_between(start, end))
+            power = energy_between(start, end)
+            add_costs(level, rounds, price, power)
+            if start and end and power is None:
+                level["power_too_short"] = True
             levels.append(level)
         result = {"wanted_prompt_tokens": wanted, "units": units, "levels": levels}
         if options.cached:
@@ -558,7 +579,7 @@ class Bench:
             result["cached_failed"] = sum(1 for reply in cached if reply.error)
         return result
 
-    def power_now(self) -> dict[tuple[str, str, str], float]:
+    def power_now(self) -> dict[tuple[str, str, str], Reading]:
         if not power_readings(self.before):
             return {}
         try:
@@ -639,6 +660,9 @@ def build_report(options: argparse.Namespace, before: dict[str, Any], after: dic
     if repeat and repeat.get("error"):
         notes.append(f"The repeat of a seeded reply could not be checked: {repeat['error']}")
     decoding = decoding_facts(before, after)
+    short = [result["wanted_prompt_tokens"] for result in results for level in result.get("levels", []) if level.get("power_too_short")]
+    if short:
+        notes.append(f"Some levels ran for too few power readings to give energy (prompts of {', '.join(map(str, sorted(set(short))))} tokens). Run more --repeat or --tokens, or read power more often.")
     if getattr(options, "pace", False) and not decoding["draft_guess"]:
         notes.append("--pace found no guesses to time: the route has no draft, or its replies never pipelined.")
     fallback = getattr(options, "price_per_hour", None)
@@ -791,7 +815,7 @@ def method(report: dict[str, Any]) -> list[str]:
         f"Each case ran {rounds}. Replies thrown away first, for each prompt size: {options['warmup']}. Every prompt starts differently, so none is read from the cache unless the table says cached.",
         "A link is the direct link's own round trip to the next stage, where one was up. A probe is the same trip over HTTP, measured when the route was planned. Each number is the median, with the lowest and highest in brackets.",
         *(
-            ["Cost per M tokens is the route's machines' price an hour, over every token of a level and the whole time its rounds ran. J/token and watts are the measured devices' energy over the same tokens and time, idle gaps included."]
+            ["Cost per M tokens is the route's machines' price an hour, over every token of a level and the whole time its rounds ran. Watts are the measured devices' average power from their own readings during a level, and J/token is that power over the same tokens and time, idle gaps included."]
             if any(label in table(report)[0] for label, _ in COST_COLUMNS)
             else []
         ),
