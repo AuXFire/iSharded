@@ -80,7 +80,7 @@ def time_case(library: Any, path: str, role: str, feed: str, passes: int, gpu_la
         for position in range(PROMPT_TOKENS, PROMPT_TOKENS + WARMUP_PASSES):
             one(position)
         times = []
-        energy = meter.energy.snapshot()["joules"] if meter is not None else None
+        energy = meter.energy.snapshot() if meter is not None else None
         began = time.perf_counter()
         for position in range(PROMPT_TOKENS + WARMUP_PASSES, PROMPT_TOKENS + WARMUP_PASSES + passes):
             started = time.perf_counter()
@@ -88,13 +88,33 @@ def time_case(library: Any, path: str, role: str, feed: str, passes: int, gpu_la
             times.append((time.perf_counter() - started) * 1000)
         wall = time.perf_counter() - began
         result: dict[str, Any] = {"role": role, "feed": feed, "ms": times, "engine": stage.engine is not None}
-        if meter is not None:
-            time.sleep(meter.interval_ms / 1000 * 1.5)  # the reading that covers the last pass
-            result["joules"] = meter.energy.snapshot()["joules"] - energy
-            result["seconds"] = wall
+        if meter is not None and energy is not None:
+            watts = average_watts(meter, energy)
+            if watts is not None:
+                result["joules"] = watts * wall
+                result["seconds"] = wall
         return result
     finally:
         stage.close()
+
+
+def average_watts(meter: Any, start: dict[str, Any]) -> float | None:
+    """The card's average power over the readings taken since ``start``.
+
+    Readings come every interval and say nothing of the time between the last one and now,
+    so the joules counted since ``start`` cover a span that need not match the timed passes.
+    Their average power does not depend on that span, and times the passes' own wall it
+    gives their energy. A run shorter than one interval waits for the next reading.
+    """
+    deadline = time.monotonic() + meter.interval_ms / 1000 * 3
+    while True:
+        now = meter.energy.snapshot()
+        seconds = now["seconds"] - start["seconds"]
+        if seconds > 0:
+            return (now["joules"] - start["joules"]) / seconds
+        if time.monotonic() > deadline:
+            return None
+        time.sleep(meter.interval_ms / 1000 / 4)
 
 
 def child(arguments: dict[str, Any]) -> dict[str, Any]:

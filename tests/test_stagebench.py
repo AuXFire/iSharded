@@ -112,3 +112,19 @@ def test_a_real_model_is_timed_fed_tokens_and_rows_in_both_roles():
     result = stagebench.child({"llama_dir": BUILD, "path": MODEL, "roles": ["last", "middle"], "feeds": ["tokens", "rows"], "passes": 6, "gpu_layers": -1, "threads": 4, "power_ms": None, "device": "cuda:0"})
     assert [(item["role"], item["feed"]) for item in result["cases"]] == [("last", "tokens"), ("last", "rows"), ("middle", "tokens"), ("middle", "rows")]
     assert all(len(item["ms"]) == 6 and min(item["ms"]) > 0 for item in result["cases"])
+
+
+def test_a_cases_energy_is_its_passes_wall_at_the_cards_average_power():
+    """Readings come each interval, so joules since the start cover more than the passes did."""
+    from isharded.meter import Energy
+
+    meter = SimpleNamespace(interval_ms=100, energy=Energy())
+    meter.energy.add(20.0, 0.0)  # idle before the passes
+    start = meter.energy.snapshot()
+    for at in (0.1, 0.2, 0.3):
+        meter.energy.add(80.0, at)
+    # 0.3 s of readings: 5 J on the way up from idle, then 8 J and 8 J, so 70 W on average.
+    assert stagebench.average_watts(meter, start) == pytest.approx(70.0)
+    still = SimpleNamespace(interval_ms=100, energy=Energy())
+    still.energy.add(50.0, 0.0)
+    assert stagebench.average_watts(still, still.energy.snapshot()) is None, "no reading came"
