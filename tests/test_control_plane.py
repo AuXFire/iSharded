@@ -350,3 +350,17 @@ def test_a_held_loop_says_where_it_was_held(pool, capsys):
     assert "hold_the_loop_here" in line and "test_control_plane.py" in line
     assert pool.loop_stall_where is None, "a place is told once, with the stall it belongs to"
     assert not any(thread.name == "isharded-loop-watch" for thread in threading.enumerate()), "the watcher's thread ends with it"
+
+
+def test_a_place_caught_after_a_stall_is_not_told_with_the_next(pool, capsys):
+    """The watcher can catch the loop just after a stall's line was written; that place belongs to no stall."""
+    pool.loop_stall_where = (1.0, "late.py:1 caught_after_the_line")  # caught after the tick that followed 1.0
+    pool.note_loop_lag(0.0, since=2.0)
+    pool.loop_stall_where = (3.0, "plan.py:9 held_here")
+    pool.note_loop_lag(0.5, since=3.0)
+    pool.loop_stall_where = (3.5, "late.py:1 caught_after_the_line")
+    pool.note_loop_lag(0.6, since=4.0)
+    lines = [line for line in capsys.readouterr().out.splitlines() if "event loop was held" in line]
+    assert len(lines) == 2
+    assert "plan.py:9 held_here" in lines[0]
+    assert "caught_after_the_line" not in lines[1] and ", in " not in lines[1]

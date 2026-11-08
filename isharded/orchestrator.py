@@ -920,7 +920,8 @@ class Orchestrator:
         self.loop_lag_worst: deque[tuple[float, float]] = deque()
         self.loop_stalls = 0
         # Where the loop was while it was held, caught by a thread, told with the stall's log line.
-        self.loop_stall_where: str | None = None
+        # It carries the tick it was caught after, so a place caught late never names another stall.
+        self.loop_stall_where: tuple[float, str] | None = None
         self.mesh: ControlMesh | None = None
         seen_as = os.getenv("ISHARDED_NODE_URL")
         if seen_as:
@@ -1285,7 +1286,7 @@ class Orchestrator:
             while True:
                 planned = loop.time() + LOOP_TICK_SECONDS
                 await asyncio.sleep(LOOP_TICK_SECONDS)
-                self.note_loop_lag(max(loop.time() - planned, 0.0))
+                self.note_loop_lag(max(loop.time() - planned, 0.0), since=beat[0])
                 beat[0] = time.monotonic()
         finally:
             stop.set()
@@ -1303,10 +1304,11 @@ class Orchestrator:
                 continue
             asyncio_dir = os.sep + "asyncio" + os.sep  # the loop's own frames say nothing about what held it
             stack = [item for item in traceback.extract_stack(frame) if asyncio_dir not in item.filename]
-            self.loop_stall_where = " < ".join(f"{Path(item.filename).name}:{item.lineno} {item.name}" for item in reversed(stack[-6:]))
+            self.loop_stall_where = (last, " < ".join(f"{Path(item.filename).name}:{item.lineno} {item.name}" for item in reversed(stack[-6:])))
             caught = last
 
-    def note_loop_lag(self, lag: float) -> None:
+    def note_loop_lag(self, lag: float, *, since: float | None = None) -> None:
+        """Keep one wake's lag. ``since`` is the tick it followed, which a caught place must match."""
         now = time.monotonic()
         self.loop_lag_seconds = lag
         worst = self.loop_lag_worst  # falling lags, oldest first: the worst of the minute is in front
@@ -1314,9 +1316,12 @@ class Orchestrator:
             worst.pop()
         worst.append((now, lag))
         self.worst_loop_lag()  # drops what is older than the minute
+        caught, self.loop_stall_where = self.loop_stall_where, None
+        # The thread may catch the loop just after a stall ended and this line was written; that
+        # place then carries the old tick and is dropped here, not told with the next stall.
+        where = caught[1] if caught is not None and (since is None or caught[0] == since) else None
         if lag > LOOP_LAG_LOG_SECONDS:
             self.loop_stalls += 1
-            where, self.loop_stall_where = self.loop_stall_where, None
             held_in = f", in {where}" if where else ""
             with suppress(OSError, ValueError):  # a full disk or an odd console must not fail what is being logged
                 print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} loop: the event loop was held {lag * 1000:.0f} ms; replies and status waited as long{held_in}", flush=True)
