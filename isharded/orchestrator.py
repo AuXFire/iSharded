@@ -155,8 +155,18 @@ APPLY_QUIET_SECONDS = 120.0
 # How often a route's links try their other addresses, and how long one try may take.
 HOP_CHECK_SECONDS = 60.0
 HOP_PROBE_SECONDS = 10.0
-# How long a worker's health may take to answer, retries and all. Status waits for it.
+# How long a worker's health may take to answer, retries and all.
 PROBE_SECONDS = 3.0
+# Status shows worker health from the last check and never waits for one. Checks run this
+# often, and ask at most this many workers at once, so a big pool does not open hundreds.
+HEALTH_SECONDS = 5.0
+MAX_PROBES_AT_ONCE = 16
+# A worker silent this long and on no route is forgotten. Its quarantine is remembered.
+FORGET_SECONDS = 600.0
+MAX_FORGOTTEN_QUARANTINES = 1024
+# The event loop wakes this often to see how late it woke, and a wake this late is logged.
+LOOP_TICK_SECONDS = 0.1
+LOOP_LAG_LOG_SECONDS = 0.25
 # Noise must not move a live link, and the ring has to redial for it.
 HOP_SWITCH_RATIO = 0.9
 # Replanning around a worker that is alive but failed may move this much at most.
@@ -888,6 +898,17 @@ class Orchestrator:
         self.reply_checker: TicketChecker | None = None
         self.maintenance_task: asyncio.Task[None] | None = None
         self.gossip_task: asyncio.Task[None] | None = None
+        self.health_task: asyncio.Task[None] | None = None
+        self.loop_watch_task: asyncio.Task[None] | None = None
+        # When the last health check of every live worker finished, as wall time. Status shows it.
+        self.health_checked_at: float | None = None
+        self.probe_slots = asyncio.Semaphore(MAX_PROBES_AT_ONCE)
+        # Quarantine outlives a forgotten record: going quiet for long is no way out of it.
+        self.forgotten_quarantine: dict[str, tuple[bool, str | None, int]] = {}
+        # How late the event loop woke, last and worst in the last minute, and how often it was held long.
+        self.loop_lag_seconds = 0.0
+        self.loop_lag_worst: deque[tuple[float, float]] = deque()
+        self.loop_stalls = 0
         self.mesh: ControlMesh | None = None
         seen_as = os.getenv("ISHARDED_NODE_URL")
         if seen_as:
@@ -955,7 +976,7 @@ class Orchestrator:
         return make_statement(key, self.mesh.node_id, target, method, path, body)
 
     async def close(self) -> None:
-        for task in (self.maintenance_task, self.gossip_task):
+        for task in (self.maintenance_task, self.gossip_task, self.health_task, self.loop_watch_task):
             if task is not None:
                 task.cancel()
         if self.beacon is not None:
@@ -1197,6 +1218,8 @@ class Orchestrator:
     def start_maintenance(self) -> None:
         self.load_saved_state()
         self.maintenance_task = asyncio.create_task(self._maintain())
+        self.health_task = asyncio.create_task(self._watch_health())
+        self.loop_watch_task = asyncio.create_task(self._watch_loop())
         if self.mesh is not None:
             self.gossip_task = asyncio.create_task(self._gossip())
         if self.lanes.active:
@@ -1222,6 +1245,46 @@ class Orchestrator:
                 self.add_event("failure", "Automatic repair failed", str(exc.detail)[:200])
             except Exception as exc:  # this loop is what keeps the pool healthy, so it must outlive any one failure
                 self.add_event("failure", "Maintenance error", f"{type(exc).__name__}: {exc}"[:200])
+
+    async def _watch_health(self) -> None:
+        """Keep worker health current in the background, so status never waits on a worker.
+
+        This runs apart from maintenance, because a repair can hold a maintenance pass for minutes.
+        """
+        while True:
+            try:
+                await self.refresh_worker_metrics()
+            except Exception as exc:  # status reads what this keeps, so it must outlive any one failure
+                self.add_event("failure", "Health check error", f"{type(exc).__name__}: {exc}"[:200])
+            await asyncio.sleep(HEALTH_SECONDS)
+
+    async def _watch_loop(self) -> None:
+        """Measure how late the event loop wakes. Everything this node answers waits that long too."""
+        loop = asyncio.get_running_loop()
+        while True:
+            planned = loop.time() + LOOP_TICK_SECONDS
+            await asyncio.sleep(LOOP_TICK_SECONDS)
+            self.note_loop_lag(max(loop.time() - planned, 0.0))
+
+    def note_loop_lag(self, lag: float) -> None:
+        now = time.monotonic()
+        self.loop_lag_seconds = lag
+        worst = self.loop_lag_worst  # falling lags, oldest first: the worst of the minute is in front
+        while worst and worst[-1][1] <= lag:
+            worst.pop()
+        worst.append((now, lag))
+        self.worst_loop_lag()  # drops what is older than the minute
+        if lag > LOOP_LAG_LOG_SECONDS:
+            self.loop_stalls += 1
+            with suppress(OSError, ValueError):  # a full disk or an odd console must not fail what is being logged
+                print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} loop: the event loop was held {lag * 1000:.0f} ms; replies and status waited as long", flush=True)
+
+    def worst_loop_lag(self) -> float:
+        """The latest wake in the last minute, in seconds."""
+        worst = self.loop_lag_worst
+        while worst and worst[0][0] < time.monotonic() - 60.0:
+            worst.popleft()
+        return worst[0][1] if worst else 0.0
 
     async def maintenance_pass(self) -> None:
         await self.refresh_worker_metrics()
@@ -1364,6 +1427,9 @@ class Orchestrator:
                 # Going quiet and coming back is no way out of quarantine.
                 record.quarantined, record.quarantine_reason = previous.quarantined, previous.quarantine_reason
                 record.quarantine_count = previous.quarantine_count
+            elif registration.worker_id in self.forgotten_quarantine:
+                # Nor is going quiet for long enough to be forgotten.
+                record.quarantined, record.quarantine_reason, record.quarantine_count = self.forgotten_quarantine.pop(registration.worker_id)
             self.workers[registration.worker_id] = record
         if previous is None:
             hardware = registration.hardware
@@ -3136,6 +3202,11 @@ class Orchestrator:
         add("epoch", self.epoch, "Current pipeline epoch")
         add("serving", 1 if self.route else 0, "Whether this node can serve replies")
         add("replies_in_flight", self.replies_in_flight, "Replies this node is running now")
+        add("event_loop_lag_seconds", round(self.loop_lag_seconds, 4), "How late the control plane's event loop last woke; replies and status wait as long")
+        add("event_loop_lag_worst_seconds", round(self.worst_loop_lag(), 4), "The latest the event loop woke in the last minute")
+        add("event_loop_stalls_total", self.loop_stalls, f"Times the event loop was held over {LOOP_LAG_LOG_SECONDS * 1000:.0f} ms", "counter")
+        if self.health_checked_at is not None:
+            add("health_age_seconds", round(max(time.time() - self.health_checked_at, 0.0), 2), "Age of the worker health status shows")
         add("coordinator", 1 if self.mesh and self.mesh.is_leader else 0, "Whether this node coordinates the pool")
         if self.mesh is not None:
             add("mesh_term", self.mesh.term, "Leadership term")
@@ -3455,6 +3526,10 @@ class Orchestrator:
             ),
             "epoch": self.epoch,
             "uptime_seconds": int(time.time() - self.started_at),
+            # Worker health comes from the last background check. Status never waits for one.
+            "health_checked_at": self.health_checked_at,
+            "health_age_seconds": None if self.health_checked_at is None else round(max(time.time() - self.health_checked_at, 0.0), 2),
+            "loop_lag_ms": {"last": round(self.loop_lag_seconds * 1000, 1), "worst_minute": round(self.worst_loop_lag() * 1000, 1), "held_over_250ms": self.loop_stalls},
             "route": [stage.model_dump() for stage in self.route],
             "links": [{"source": source, "target": target, **reading} for (source, target), reading in sorted(self.link_readings.items())],
             "cache_url": self.active_cache_url,
@@ -3481,6 +3556,10 @@ class Orchestrator:
         return exactness_of(self.active.exact, reports)
 
     async def probe(self, record: WorkerRecord) -> None:
+        async with self.probe_slots:
+            await self._probe(record)
+
+    async def _probe(self, record: WorkerRecord) -> None:
         started = time.perf_counter()
         try:
             # The bound is on the whole probe. The client tries a refused connection again, and
@@ -3500,7 +3579,47 @@ class Orchestrator:
             record.health = {"status": "unreachable", "error": str(exc)}
 
     async def refresh_worker_metrics(self) -> None:
-        await asyncio.gather(*map(self.probe, self.workers.values()))
+        """Check the health of every worker still checking in.
+
+        A worker that stopped checking in is not asked: it is already shown offline, and each
+        call to it would wait out PROBE_SECONDS. One gone ten minutes, and on no route, is forgotten.
+        """
+        self.forget_silent_workers()
+        await asyncio.gather(*(self.probe(record) for record in list(self.workers.values()) if record.live))
+        self.health_checked_at = time.time()
+
+    def _kept_workers(self) -> set[str]:
+        """Workers a route names, running, loading or saved, which are never forgotten."""
+        kept = {stage.worker_id for stage in self.route}
+        if self.job is not None and self.job.finished_at is None:
+            kept |= {stage.worker_id for stage in self.job.route}
+        if self.saved_state is not None:
+            kept |= {str(item.get("worker_id")) for item in self.saved_state.get("route", []) if isinstance(item, dict)}
+        return kept
+
+    def forget_silent_workers(self) -> list[str]:
+        """Drop records of workers silent for FORGET_SECONDS that no route names.
+
+        A pool where nodes come and go would otherwise keep every one it ever saw, in status,
+        in metrics, and in each check. A forgotten worker that returns registers as new.
+        """
+        now = time.monotonic()
+        kept = self._kept_workers()
+        gone = [name for name, record in self.workers.items() if name not in kept and now - record.last_seen >= FORGET_SECONDS]
+        for name in gone:
+            record = self.workers.pop(name)
+            if record.quarantined or record.quarantine_count:
+                self.forgotten_quarantine[name] = (record.quarantined, record.quarantine_reason, record.quarantine_count)
+                while len(self.forgotten_quarantine) > MAX_FORGOTTEN_QUARANTINES:
+                    del self.forgotten_quarantine[next(iter(self.forgotten_quarantine))]
+            self.absent_since.pop(name, None)
+            self.lost_from_route.discard(name)
+            self.need_reconfigure.discard(name)
+            for table in (self.links, self.links_checked, self.link_readings, self.ring_samples, self.ring_links, self.ring_passes, self.hops):
+                for pair in [pair for pair in table if name in pair]:
+                    del table[pair]
+            self.add_event("pool", f"{name} forgotten", f"Silent for {FORGET_SECONDS / 60:.0f} minutes and on no route")
+        return gone
 
 
 runtime = Orchestrator()
@@ -4194,7 +4313,8 @@ async def lane_access(body: dict[str, Any], authorization: str | None = Header(d
 @app.get("/admin/status")
 async def status(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     verify_user(authorization)
-    await runtime.refresh_worker_metrics()
+    # Health comes from the background check. Asking every worker here held status for as long as
+    # the slowest one, PROBE_SECONDS for a dead one, and on every call.
     return runtime.status()
 
 
