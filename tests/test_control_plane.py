@@ -334,7 +334,7 @@ def test_a_held_loop_says_where_it_was_held(pool, capsys):
     """A lag number alone does not say what to fix, so the log line names the code that held the loop."""
 
     def hold_the_loop_here():
-        time.sleep(0.5)
+        time.sleep(1.0)  # well past the limit, so a busy machine still gives the watcher a turn
 
     async def scenario():
         watcher = asyncio.ensure_future(pool._watch_loop())
