@@ -571,6 +571,31 @@ class LlamaLibrary:
         if level == GGML_LOG_ERROR and text:
             print("llama.cpp:", text.decode("utf-8", "replace").rstrip(), flush=True)
 
+    def wake_devices(self) -> int:
+        """Asks each GPU how much memory it has free, which brings its context up. Says how many.
+
+        A process that has done this pays no device start-up at its first load. Nothing else is
+        allocated, so a spare that never loads holds only the context.
+        """
+        size = C.c_size_t
+        try:
+            count, get = self.ggml.ggml_backend_dev_count, self.ggml.ggml_backend_dev_get
+            kind, memory = self.ggml_base.ggml_backend_dev_type, self.ggml_base.ggml_backend_dev_memory
+        except AttributeError:
+            return 0
+        count.restype, count.argtypes = size, []
+        get.restype, get.argtypes = C.c_void_p, [size]
+        kind.restype, kind.argtypes = C.c_int, [C.c_void_p]
+        memory.restype, memory.argtypes = None, [C.c_void_p, C.POINTER(size), C.POINTER(size)]
+        woken = 0
+        for index in range(count()):
+            device = get(index)
+            if device and kind(device) in (1, 2):  # a discrete or an integrated GPU
+                free, total = size(), size()
+                memory(device, C.byref(free), C.byref(total))
+                woken += 1
+        return woken
+
     def cpu_buffer_type(self) -> int:
         device = self.ggml.ggml_backend_dev_by_type(0)  # GGML_BACKEND_DEVICE_TYPE_CPU
         if not device:
