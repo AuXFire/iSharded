@@ -1371,6 +1371,8 @@ class WorkerRuntime:
             merge_passes=self.merge_passes,
             merge_most=self.merge_most,
         )
+        # Opening zeroes the engine's totals, not its pass counts, so the next look starts afresh.
+        self.ring_counted = self.ring_busy = None
         if not answer.get("engine"):
             return {"engine": False}
         self.ring_door = answer

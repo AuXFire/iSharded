@@ -363,6 +363,18 @@ def test_a_replaced_coordinator_cannot_open_dial_or_start_a_ring() -> None:
     assert refused(item.ring_open({**opening, "term": 5})) == 409
 
 
+def test_a_reopened_ring_starts_the_stage_count_afresh() -> None:
+    """Opening a ring zeroes the engine's totals but not its pass counts, so a window
+    across the reopen would share one ring's time out over another's passes."""
+    item, asked, _ = ring_worker(ring_counted=(100, 4, 16), ring_busy=(40, 400_000, 1.0), row_ms_ema=None, batch_ms={}, busy_share=None)
+    asyncio.run(item.ring_open({"epoch": 3, "term": 5, "index": 0, "count": 2, "keys": RING_KEYS}))
+    assert asked == ["ring_open"]
+    assert item.ring_counted is None and item.ring_busy is None
+    # The new ring has done 60 batches since; the old one's last 10 are not counted with them.
+    item.note_ring({"passes": 170, "merged_passes": 4, "merged_rows": 16, "compute_us": 1, "batches_total": 60, "compute_us_total": 600_000})
+    assert item.row_ms_ema is None and item.batch_ms == {}, "a first look after a reopen has nothing to compare"
+
+
 def test_a_ring_needs_keys_for_its_own_links_only() -> None:
     item, asked, _ = ring_worker()
     for keys in (None, "00", {"route": "00"}, {"next": 7}):
