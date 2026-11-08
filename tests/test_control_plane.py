@@ -319,3 +319,12 @@ def test_the_worst_lag_forgets_after_a_minute(pool, monkeypatch):
     clock[0] += 61.0
     pool.note_loop_lag(0.02)
     assert pool.worst_loop_lag() == 0.02
+
+
+def test_the_probe_limit_works_on_a_later_event_loop(pool):
+    """A semaphore binds to the first loop that waits on it, and a node's tests and restarts use several."""
+    pool.workers = {f"w{index}": record(f"w{index}") for index in range(2 * orchestrator_module.MAX_PROBES_AT_ONCE)}
+    for _ in range(2):
+        pool.client = Recorder(delay=0.02)
+        asyncio.run(pool.refresh_worker_metrics())
+        assert pool.client.most == orchestrator_module.MAX_PROBES_AT_ONCE

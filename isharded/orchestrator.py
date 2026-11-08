@@ -908,7 +908,8 @@ class Orchestrator:
         self.loop_watch_task: asyncio.Task[None] | None = None
         # When the last health check of every live worker finished, as wall time. Status shows it.
         self.health_checked_at: float | None = None
-        self.probe_slots = asyncio.Semaphore(MAX_PROBES_AT_ONCE)
+        # One limit per event loop: a semaphore binds to the first loop that waits on it.
+        self.probe_slots: tuple[asyncio.AbstractEventLoop, asyncio.Semaphore] | None = None
         # Quarantine outlives a forgotten record: going quiet for long is no way out of it.
         self.forgotten_quarantine: dict[str, tuple[bool, str | None, int]] = {}
         # How late the event loop woke, last and worst in the last minute, and how often it was held long.
@@ -3646,7 +3647,10 @@ class Orchestrator:
         return exactness_of(self.active.exact, reports)
 
     async def probe(self, record: WorkerRecord) -> None:
-        async with self.probe_slots:
+        loop = asyncio.get_running_loop()
+        if self.probe_slots is None or self.probe_slots[0] is not loop:
+            self.probe_slots = (loop, asyncio.Semaphore(MAX_PROBES_AT_ONCE))
+        async with self.probe_slots[1]:
             await self._probe(record)
 
     async def _probe(self, record: WorkerRecord) -> None:
