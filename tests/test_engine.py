@@ -890,7 +890,7 @@ needs_real_stage = pytest.mark.skipif(not (BUILD and MODEL and find_library()), 
 PROMPT = [151644, 872, 198, 9707, 1879, 11, 3838, 374, 279, 6722, 315, 9625, 30]
 
 
-def real_stage(slots=2, threads=4):
+def real_stage(slots=2, threads=4, exact=False):
     from isharded.gguf import read_file_header
     from isharded.llama_host import StageHost
 
@@ -900,7 +900,7 @@ def real_stage(slots=2, threads=4):
     host = StageHost()
     host.call(
         "load", folder=BUILD, extra_paths=[], path=MODEL, last=True, context_tokens=256, gpu_layers=0, threads=threads,
-        table=embed, cpu_tensors=[], rollback_tokens=4, slots=slots,
+        table=embed, cpu_tensors=[], rollback_tokens=4, slots=slots, exact=exact,
     )  # fmt: skip
     return host, bool(header.arch_key("ssm.state_size"))
 
@@ -939,7 +939,7 @@ def test_a_real_stage_probes_at_load_and_leaves_every_slot_as_it_found_it() -> N
         finally:
             client.close()
 
-    host, _ = real_stage(slots=4)
+    host, _ = real_stage(slots=4, exact=True)
     try:
         found = host.call("exactness")[0]["found"]
         assert set(found) == {"exact_merge_limit", "verify_exact"}
@@ -948,6 +948,16 @@ def test_a_real_stage_probes_at_load_and_leaves_every_slot_as_it_found_it() -> N
         host.call("ring_close")
         host.call("clear")
         assert asyncio.run(replies(host)) == after_probe
+    finally:
+        host.close()
+
+
+@needs_real_stage
+def test_a_stage_probes_nothing_unless_exact_replies_are_asked_for() -> None:
+    """The probe can add seconds to a load, and a load without --exact never reads it."""
+    host, _ = real_stage(slots=4)
+    try:
+        assert host.call("exactness")[0]["found"] is None
     finally:
         host.close()
 

@@ -125,7 +125,8 @@ class _Host:
                 C.cast(found.to_float, C.c_void_p).value if found and found.to_float else None,
                 meta.get("rollback_tokens", 0) + 2,
             )
-            self.found = self._probe(meta.get("slots", 1))
+            # Only exact replies use what it finds, and on a CPU stage with many slots it takes seconds.
+            self.found = self._probe(meta.get("slots", 1)) if meta.get("exact") else None
         return {"hidden_size": self.stage.hidden_size, "vocab_size": self.stage.vocab_size, "engine": self.stage.engine is not None}, b""
 
     def _probe(self, slots: int) -> dict[str, Any]:

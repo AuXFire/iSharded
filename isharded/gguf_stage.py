@@ -195,6 +195,7 @@ class GgufStage:
             "table": table,
             "rollback_tokens": request.speculate_tokens,
             "slots": request.slots,
+            "exact": request.exact,
             "map_file": needs_mapping(placements, pools),
             "embedding": request.embedding,
             "kv_type": request.kv_type,
