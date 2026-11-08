@@ -1549,3 +1549,27 @@ fn closing_one_epoch_leaves_the_other_serving() {
     assert!(dial(&next_keys(1, 2).back.unwrap(), NEXT).is_err());
     assert!(dial(&hop_key(0), 7).is_ok());
 }
+
+#[test]
+fn a_pass_dropped_further_along_does_not_hold_the_old_ring_open() {
+    // Limits long enough that the retiring ring's own deadline cannot be what ends it.
+    let mut ring = ring(2, true, Duration::ZERO, 3000);
+    patient_client(&ring);
+    let slow = Adder { stage: 2, last: true, delay: Duration::from_millis(80), seen: ring.seen[1].clone() };
+    ring.nodes[1].set_compute(Box::new(slow));
+    for id in 1..=3 {
+        ring.client.send(&pass(id, 1, id as u32).encode()).unwrap();
+    }
+    wait_until("the first pass running at the last stage", || ring.seen[1].load(Ordering::SeqCst) >= 1);
+    // A new reply on the slot: the last stage drops passes 2 and 3, which are never answered.
+    ring.client.send(&Pass { generation: 2, ..pass(4, 1, 0) }.encode()).unwrap();
+    while answer(&mut ring).id != 4 {}
+    assert!(ring.nodes[1].stats().dropped >= 1, "nothing was dropped, so this proves nothing");
+    stage_next(&ring, NEXT, 3000, &[], None);
+    for node in &ring.nodes {
+        node.promote(NEXT).unwrap();
+    }
+    let began = Instant::now();
+    wait_until("the old route draining", || ring.nodes.iter().all(|node| node.stats().retiring_epochs.is_empty()));
+    assert!(began.elapsed() < Duration::from_millis(1500), "the old ring waited out its limits: {:?}", began.elapsed());
+}

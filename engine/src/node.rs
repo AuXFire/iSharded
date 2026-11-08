@@ -1283,7 +1283,10 @@ fn receive_answer(inner: &Inner, ring: &Ring, link: &Link, frame: &[u8]) {
         return;
     }
     let _ = link.beat(&Ack { id: answer.id }.encode());
-    ring.in_flight.lock().remove(&(answer.slot, answer.id));
+    // Passes of a slot run in order everywhere, and a client numbers them in order, so an
+    // answer also settles every older pass of its slot: one a later stage dropped for a rewind
+    // or a new reply never answers, and must not hold a retiring ring open or stay here.
+    ring.in_flight.lock().retain(|&(slot, id)| slot != answer.slot || id > answer.id);
     let fresh = inner.lines.lock().get_mut(&answer.slot).is_some_and(|line| line.takes(&answer));
     let counter = if fresh { &inner.counters.answers } else { &inner.counters.dropped };
     counter.fetch_add(1, Ordering::Relaxed);
