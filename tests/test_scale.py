@@ -61,6 +61,9 @@ def test_growth_table_reads_results():
     table = report.growth_table([result(50, 16.3), result(10, 3.0)])
     row = next(line for line in table.splitlines() if line.startswith("|   gossip"))
     assert "| 3.00 | 16.30 | O(N)" in row
+    sized = {"nodes": 10, "phases": {"steady": {"per_node": {"out:gossip:calls": {"mean": 3.0}, "out:gossip:bytes": {"mean": 4500.0}}}}}
+    assert report.pick(sized, ("ratio", "out:gossip")) == 1500.0
+    assert report.pick(sized, ("ratio", "out:health")) is None
     assert any(line.startswith("|   model") for line in table.splitlines())
 
 

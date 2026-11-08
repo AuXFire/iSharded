@@ -35,6 +35,9 @@ METRICS: list[tuple[str, tuple[str, ...]]] = [
     ("  check-in", ("phases", "steady", "per_node", "out:checkin:bytes", "mean")),
     ("  health probe", ("phases", "steady", "per_node", "out:health:bytes", "mean")),
     ("bytes received /s per node", ("phases", "steady", "per_node", "total:in:bytes", "mean")),
+    ("bytes per gossip call (both ways)", ("ratio", "out:gossip")),
+    ("bytes per check-in call (both ways)", ("ratio", "out:checkin")),
+    ("bytes per health probe (both ways)", ("ratio", "out:health")),
     ("failed calls /s per node", ("phases", "steady", "per_node", "total:out:failures", "mean")),
     ("live peers falsely dropped in the window", ("phases", "steady", "live_peers_dropped")),
     ("live workers falsely dropped in the window", ("phases", "steady", "live_workers_dropped")),
@@ -48,6 +51,7 @@ METRICS: list[tuple[str, tuple[str, ...]]] = [
     ("after a silent leave too: gossip calls /s per node", ("phases", "steady-3", "per_node", "out:gossip:calls", "mean")),
     ("after a silent leave too: failed calls /s per node", ("phases", "steady-3", "per_node", "total:out:failures", "mean")),
     ("after a silent leave too: live peers falsely dropped", ("phases", "steady-3", "live_peers_dropped")),
+    ("machine CPU % (every node shares it)", ("phases", "steady", "machine_cpu_percent")),
     ("CPU cores per node", ("phases", "steady", "cpu_cores_per_node")),
     ("RSS MB per node", ("phases", "steady", "rss_mb_per_node")),
     ("loop lag p99 ms (worst process)", ("phases", "steady", "loop_lag_p99_ms")),
@@ -87,6 +91,12 @@ def pick(result: dict[str, Any], path: tuple[str, ...]) -> float | None:
     if path == ("model",):
         n = result["nodes"]
         return (n - 1) / GOSSIP_SECONDS + n / CHECK_IN_SECONDS + n / PROBE_SECONDS
+    if path[0] == "ratio":
+        # Bytes per call, from the steady window's rates: what one call costs, however
+        # many calls a loaded machine managed to make.
+        rates = result.get("phases", {}).get("steady", {}).get("per_node", {})
+        calls, size = (rates.get(f"{path[1]}:{what}", {}).get("mean") for what in ("calls", "bytes"))
+        return size / calls if calls and size is not None else None
     value: Any = result
     for key in path:
         if not isinstance(value, dict) or key not in value:
