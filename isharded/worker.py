@@ -98,7 +98,7 @@ from .gguf_stage import (
     plan_prompt,
 )
 from .pipeline import Pipeline, RowClock
-from . import __version__
+from . import __version__, source_commit
 from .llamacpp import PINNED_BUILD, LlamaError, StageLost, ensure_build, pick_build, rocm_library_paths, speculative_choice, step_draws, step_random
 from .pool import check_exposure, load_token
 from .serving import MAX_STAGE_BYTES, MAX_STATE_BYTES, BodyLimit, serve, where_everything_is
@@ -2342,6 +2342,8 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
         "status": "ok",
         "worker_id": runtime.worker_id,
         "code_version": __version__,
+        "code_commit": source_commit(),
+        "dtype": runtime.dtype_name,
         "term": runtime.term,
         "model": runtime.model_id,
         "epoch": runtime.epoch,

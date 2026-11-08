@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
 import json
 import math
 import os
@@ -730,6 +731,39 @@ def exactness_of(setting: bool, reports: list[tuple[str, dict[str, Any] | None]]
     return {"exact": not reasons, "setting": setting, "reasons": reasons}
 
 
+# How a worker names its precision, and how a fingerprint does.
+PRECISION_NAMES = {"bfloat16": "bf16", "float32": "fp32", "float16": "fp16"}
+# Fingerprints a control plane remembers, so one on an older reply can still be read in status.
+FINGERPRINTS_KEPT = 32
+FINGERPRINT_HEADER = "X-iSharded-Fingerprint"
+
+
+def fingerprint_of(model: str, revision: str, layers: list[tuple[int, int]], precisions: list[str], kv_type: str, exact: bool, build: str) -> dict[str, Any]:
+    """What made a reply, as OpenAI's ``system_fingerprint`` is: two replies that differ under the
+    same fingerprint differ for the request's own reasons, and under BF16 a new split can change
+    a greedy reply. The id is short and the parts are in status."""
+    parts = {
+        "model": model,
+        "revision": revision,
+        "split": "/".join(f"{start}-{end}" for start, end in layers),
+        "precision": "/".join(precisions),
+        "kv": kv_type,
+        "exact": exact,
+        "build": build,
+    }
+    digest = hashlib.sha256(json.dumps(parts, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    return {"id": f"fp_{digest}", **parts}
+
+
+def stage_precision(record: WorkerRecord | None) -> str:
+    """The precision a stage runs at, from its own report, or from its memory pools on an older worker."""
+    health = (record.health if record else None) or {}
+    dtype = health.get("dtype")
+    if dtype is None and record is not None:
+        dtype = next((pool.get("dtype") for pool in reported_pools(record).values() if pool.get("kind") != "disk" and pool.get("dtype")), None)
+    return PRECISION_NAMES.get(str(dtype), str(dtype)) if dtype else "unknown"
+
+
 def row_key(target: ModelTarget, stage: StageAssignment, device: str, last: bool) -> tuple[str, str, str, str, bool]:
     """What a stage's measured row is kept under, per layer. The last stage also runs the output
     head, which on a small model weighs as much as many layers, so it is kept apart."""
@@ -908,6 +942,8 @@ class Orchestrator:
         self.beacon: Any = None
         self.lane_name = os.getenv("ISHARDED_LANE") or None
         self.started_at = time.time()
+        # Fingerprints replies have carried, newest last. See fingerprint_of.
+        self.fingerprints: dict[str, dict[str, Any]] = {}
         self.requests_total = 0
         self.tokens_generated = 0
         self.embedding_tokens = 0
@@ -3455,6 +3491,8 @@ class Orchestrator:
             ),
             "proposal": self.latest_proposal(),
             "exact": self.route_exactness(),
+            "fingerprint": self.fingerprint(),
+            "fingerprints": list(self.fingerprints.values()),
             "model_profile": (
                 "protocol-test"
                 if self.model_id and Path(self.model_id).name.lower() == ".smoke-model"
@@ -3481,6 +3519,28 @@ class Orchestrator:
             "workers": {worker_id: self._worker_view(record, worker_id in on_route) for worker_id, record in self.workers.items()},
             "events": list(self.events),
         }
+
+    def fingerprint(self) -> dict[str, Any] | None:
+        """The running route's fingerprint, also kept for status. None with no route."""
+        if self.active is None or not self.route or not self.model_id:
+            return None
+        records = [self.workers.get(stage.worker_id) for stage in self.route]
+        precisions = [stage_precision(record) for record in records]
+        commits = sorted({commit for commit in [source_commit(), *(((record.health or {}).get("code_commit") if record else None) for record in records)] if commit})
+        build = f"isharded {__version__}" + (f" {'+'.join(commits)}" if commits else "") + f", llama.cpp {PINNED_BUILD}"
+        kv_type = self.active.request.kv_type if self.active.request else "f16"
+        layers = [(stage.start_layer, stage.end_layer) for stage in self.route]
+        found = fingerprint_of(self.model_id, self.active.manifest.revision, layers, precisions, kv_type, bool(self.active.exact), build)
+        seen = self.fingerprints.pop(found["id"], None)
+        self.fingerprints[found["id"]] = {**found, "first_seen": seen["first_seen"] if seen else int(time.time())}
+        while len(self.fingerprints) > FINGERPRINTS_KEPT:
+            self.fingerprints.pop(next(iter(self.fingerprints)))
+        return found
+
+    def fingerprint_headers(self) -> tuple[str | None, dict[str, str]]:
+        """A reply's fingerprint id, and the header that carries it on every API's replies."""
+        found = self.fingerprint()
+        return (found["id"], {FINGERPRINT_HEADER: found["id"]}) if found else (None, {})
 
     def route_exactness(self) -> dict[str, Any] | None:
         """Whether the running route's replies are the same as plain decoding, and if not, why."""
@@ -4336,6 +4396,7 @@ async def embeddings(
 async def completions(
     body: CompletionRequest,
     authorization: str | None = Header(default=None),
+    response: Response = None,  # type: ignore[assignment]  # FastAPI's; the other APIs call this directly
 ) -> Any:
     caller = verify_user(authorization)
     lane = await runtime.lanes.locate(body.model)
@@ -4351,8 +4412,9 @@ async def completions(
     options = (body.max_tokens, body.temperature, body.top_p, body.top_k, body.seed, body.stop)
     identifier = f"cmpl-{uuid.uuid4().hex}"
     created = int(time.time())
+    fingerprint, headers = runtime.fingerprint_headers()
     if body.stream:
-        envelope = {"id": identifier, "object": "text_completion", "created": created, "model": runtime.model_id}
+        envelope = {"id": identifier, "object": "text_completion", "created": created, "model": runtime.model_id, "system_fingerprint": fingerprint}
         return StreamingResponse(
             event_stream(
                 runtime.stream_tokens(prompt, *options),
@@ -4361,13 +4423,17 @@ async def completions(
                 route_now,
             ),
             media_type="text/event-stream",
+            headers=headers,
         )
     message, summary = await whole_reply(runtime.stream_tokens(prompt, *options))
+    if response is not None:
+        response.headers.update(headers)
     return {
         "id": identifier,
         "object": "text_completion",
         "created": created,
         "model": runtime.model_id,
+        "system_fingerprint": fingerprint,
         "choices": [{"index": 0, "text": message["content"], "finish_reason": summary["finish_reason"]}],
         "usage": usage_of(summary),
     }
@@ -4377,6 +4443,7 @@ async def completions(
 async def chat_completions(
     body: ChatCompletionRequest,
     authorization: str | None = Header(default=None),
+    response: Response = None,  # type: ignore[assignment]  # FastAPI's; the other APIs call this directly
 ) -> Any:
     caller = verify_user(authorization)
     lane = await runtime.lanes.locate(body.model)
@@ -4414,8 +4481,10 @@ async def chat_completions(
         items = scanned(items, scanner)
     identifier = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
+    # Taken as the reply starts. One that moves to another route partway keeps the first one's.
+    fingerprint, headers = runtime.fingerprint_headers()
     if body.stream:
-        envelope = {"id": identifier, "object": "chat.completion.chunk", "created": created, "model": runtime.model_id}
+        envelope = {"id": identifier, "object": "chat.completion.chunk", "created": created, "model": runtime.model_id, "system_fingerprint": fingerprint}
         return StreamingResponse(
             event_stream(
                 items,
@@ -4430,13 +4499,17 @@ async def chat_completions(
                 {"role": "assistant", **({"isharded": {"in_thought": True}} if in_thought else {})},
             ),
             media_type="text/event-stream",
+            headers=headers,
         )
     message, summary = await whole_reply(items)
+    if response is not None:
+        response.headers.update(headers)
     return {
         "id": identifier,
         "object": "chat.completion",
         "created": created,
         "model": runtime.model_id,
+        "system_fingerprint": fingerprint,
         "choices": [
             {
                 "index": 0,
