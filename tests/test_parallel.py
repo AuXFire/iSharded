@@ -297,13 +297,25 @@ def test_status_says_whether_replies_are_exact_and_why_not():
     assert found["exact"] is False and found["setting"] is False
     assert found["reasons"] == [
         "a merges up to 64 replies in a pass, and only 1 came out as one row alone",
-        "b checks a draft's guesses several rows to a pass, which rounds differently",
+        "a runs a draft's guesses several rows to a pass, checked by b, which rounds differently",
+        "b runs a draft's guesses several rows to a pass, checked by it, which rounds differently",
         "c has not said how its passes round",
     ]
     unprobed = {"exact_merge_limit": None, "verify_exact": None, "merge_most": 64, "guesses_in_one_pass": False}
     assert exactness_of(False, [("a", unprobed)])["reasons"] == ["a merges up to 64 replies in a pass, and nothing was probed"]
     # A stage whose probe saw every merge come out exact keeps exact replies with merging on.
     assert exactness_of(False, [("a", {**probed, "exact_merge_limit": 63, "merge_most": 64})])["exact"] is True
+
+
+def test_status_asks_every_stage_whether_a_checked_pass_rounds_as_one_row():
+    """Before, only the entry's own probe was read, though every stage runs the checked pass."""
+    entry = {"exact_merge_limit": 0, "verify_exact": True, "merge_most": 1, "guesses_in_one_pass": True}
+    later = {"exact_merge_limit": 0, "verify_exact": False, "merge_most": 1, "guesses_in_one_pass": False}
+    found = exactness_of(True, [("entry", entry), ("later", later)])
+    assert found["exact"] is False
+    assert found["reasons"] == ["later runs a draft's guesses several rows to a pass, checked by entry, which rounds differently"]
+    assert exactness_of(True, [("entry", entry), ("later", {**later, "verify_exact": True})])["exact"] is True
+    assert exactness_of(True, [("entry", {**entry, "guesses_in_one_pass": False}), ("later", later)])["exact"] is True, "nothing checks guesses"
 
 
 def test_a_measured_row_is_kept_per_layer_for_a_route_planned_a_little_differently(pool):
@@ -663,11 +675,12 @@ def test_the_engines_totals_give_exact_pass_times_and_how_busy_the_stage_was(mon
     assert runtime.batch_ms[4] == pytest.approx(30.0 * 0.8 + 8.0 * 0.2)
 
 
-def exact_runtime(exact=True, limit=0, verify=False, stages=2, merge=True):
+def exact_runtime(exact=True, limit=0, verify=False, stages=2, merge=True, route_verifies=None):
     runtime = worker_module.WorkerRuntime.__new__(worker_module.WorkerRuntime)
     runtime.exact, runtime.merge_passes = exact, merge
     runtime.exactness = None if limit is None else {"exact_merge_limit": limit, "verify_exact": verify}
     runtime.route = [object()] * stages
+    runtime.epoch, runtime.route_verifies = 5, route_verifies
     return runtime
 
 
@@ -679,20 +692,35 @@ def test_exact_replies_merge_no_more_than_the_probe_allowed():
     assert exact_runtime(exact=False, merge=False).merge_most == 1
 
 
-def test_exact_replies_check_guesses_in_one_pass_only_on_one_stage_that_rounds_the_same():
-    assert exact_runtime(exact=False).guesses_in_one_pass()
-    assert not exact_runtime(stages=1, verify=False).guesses_in_one_pass()
-    assert exact_runtime(stages=1, verify=True).guesses_in_one_pass()
-    assert not exact_runtime(stages=2, verify=True).guesses_in_one_pass(), "other stages' probes are not known here"
-    assert not exact_runtime(stages=1, limit=None).guesses_in_one_pass()
+def test_exact_replies_check_guesses_in_one_pass_only_where_every_stage_rounds_the_same():
+    sampled = 0.7
+    assert exact_runtime(exact=False).guesses_in_one_pass(sampled)
+    assert not exact_runtime(stages=1, verify=False).guesses_in_one_pass(sampled)
+    assert exact_runtime(stages=1, verify=True).guesses_in_one_pass(sampled)
+    assert not exact_runtime(stages=2, verify=True).guesses_in_one_pass(sampled), "the other stages have not been heard from"
+    assert not exact_runtime(stages=2, verify=True, route_verifies=4).guesses_in_one_pass(sampled), "that was another route"
+    assert exact_runtime(stages=2, verify=True, route_verifies=5).guesses_in_one_pass(sampled)
+    assert not exact_runtime(stages=1, limit=None).guesses_in_one_pass(sampled)
 
 
-def test_exact_replies_check_no_seeded_sampled_guesses_in_one_pass():
+def test_no_seeded_sampled_reply_checks_guesses_in_one_pass():
     """A checked pass accepts or rejects each guess with its own draws, so a seeded reply at a
     temperature comes out other than plain decoding even where the rounding is the same."""
-    assert exact_runtime(stages=1, verify=True).guesses_in_one_pass(seeded_draw=False)
-    assert not exact_runtime(stages=1, verify=True).guesses_in_one_pass(seeded_draw=True)
-    assert exact_runtime(exact=False).guesses_in_one_pass(seeded_draw=True), "without --exact the draft may guess"
+    assert not exact_runtime(stages=1, verify=True).guesses_in_one_pass(0.8, seeded=True)
+    assert not exact_runtime(exact=False, stages=1, verify=True).guesses_in_one_pass(0.8, seeded=True), "nor without --exact"
+    assert exact_runtime(exact=False).guesses_in_one_pass(0.8, seeded=False), "an unseeded sampled reply may"
+
+
+@pytest.mark.parametrize("exact", [False, True])
+def test_a_reply_that_must_repeat_checks_guesses_in_one_pass_only_where_the_probe_proved_it(exact):
+    """Temperature 0, or a seed at temperature 0, without --exact too: the way is chosen by timing,
+    so a checked pass that rounds differently gave two texts for one request."""
+    for seeded in (False, True):
+        assert not exact_runtime(exact=exact, limit=None, stages=1).guesses_in_one_pass(0.0, seeded), "nothing was probed"
+        assert not exact_runtime(exact=exact, stages=1, verify=False).guesses_in_one_pass(0.0, seeded)
+        assert exact_runtime(exact=exact, stages=1, verify=True).guesses_in_one_pass(0.0, seeded)
+        assert not exact_runtime(exact=exact, stages=3, verify=True).guesses_in_one_pass(0.0, seeded)
+        assert exact_runtime(exact=exact, stages=3, verify=True, route_verifies=5).guesses_in_one_pass(0.0, seeded)
 
 
 def test_a_merge_queue_hands_out_no_more_than_one_pass_may_hold():
@@ -708,3 +736,21 @@ def test_a_merge_queue_hands_out_no_more_than_one_pass_may_hold():
         assert runtime._take_merge_queue() == steps[2:]
     finally:
         loop.close()
+
+
+def test_the_entry_keeps_what_it_hears_about_the_route_only_for_its_own_epoch(monkeypatch):
+    runtime = worker_module.runtime
+    monkeypatch.setattr(worker_module, "verify_token", lambda authorization: None)
+    monkeypatch.setattr(runtime, "epoch", 7)
+    monkeypatch.setattr(runtime, "route_verifies", None)
+    monkeypatch.setattr(runtime, "route", [object(), object()])
+    monkeypatch.setattr(runtime, "exactness", {"exact_merge_limit": 0, "verify_exact": True})
+    client = TestClient(worker_module.app)
+    assert client.post("/internal/route/exact", json={"epoch": 6, "verify_exact": True}).status_code == 409
+    assert runtime.route_verifies is None and not runtime.route_verifies_exactly()
+    assert client.post("/internal/route/exact", json={"epoch": 7, "verify_exact": True}).status_code == 200
+    assert runtime.route_verifies == 7 and runtime.route_verifies_exactly()
+    monkeypatch.setattr(runtime, "exactness", {"exact_merge_limit": 0, "verify_exact": False})
+    assert not runtime.route_verifies_exactly(), "its own stage must have proved it too"
+    assert client.post("/internal/route/exact", json={"epoch": 7, "verify_exact": False}).status_code == 200
+    assert runtime.route_verifies is None

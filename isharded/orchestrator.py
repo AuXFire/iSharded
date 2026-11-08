@@ -713,6 +713,9 @@ def wanted_slots(
 def exactness_of(setting: bool, reports: list[tuple[str, dict[str, Any] | None]]) -> dict[str, Any]:
     """Whether replies match plain decoding, from what each stage reported, and every reason they may not."""
     reasons = []
+    # Only the entry checks a draft's guesses, but every stage of the route runs those passes,
+    # so each one's probe has to have seen them round as one row alone.
+    guessing = [worker_id for worker_id, report in reports if report and report.get("guesses_in_one_pass")]
     for worker_id, report in reports:
         if not report:
             reasons.append(f"{worker_id} has not said how its passes round")
@@ -721,8 +724,9 @@ def exactness_of(setting: bool, reports: list[tuple[str, dict[str, Any] | None]]
         if most > (limit or 0) + 1:
             seen = "nothing was probed" if limit is None else f"only {limit + 1} came out as one row alone"
             reasons.append(f"{worker_id} merges up to {most} replies in a pass, and {seen}")
-        if report.get("guesses_in_one_pass") and not report.get("verify_exact"):
-            reasons.append(f"{worker_id} checks a draft's guesses several rows to a pass, which rounds differently")
+        if guessing and not report.get("verify_exact"):
+            checker = "it" if guessing == [worker_id] else ", ".join(guessing)
+            reasons.append(f"{worker_id} runs a draft's guesses several rows to a pass, checked by {checker}, which rounds differently")
     return {"exact": not reasons, "setting": setting, "reasons": reasons}
 
 
@@ -2340,7 +2344,7 @@ class Orchestrator:
         await self._drain_entries(route)
         self.route = []  # nothing may run while weights are moving
 
-        async def configure(stage: StageAssignment) -> None:
+        async def configure(stage: StageAssignment) -> dict[str, Any]:
             request = ConfigureRequest(
                 model_id=target.model_id,
                 revision=target.manifest.revision,
@@ -2377,6 +2381,7 @@ class Orchestrator:
             )
             if response.status_code >= 400:
                 raise RuntimeError(response.text[:400])
+            return response.json()
 
         results = await asyncio.gather(*(configure(stage) for stage in route), return_exceptions=True)
         await self._release_entries()
@@ -2410,6 +2415,10 @@ class Orchestrator:
             self.spawn(self._gossip_round())  # peers should not wait for the next tick
         self.spawn(self._start_ring())
         self.spawn(self._warm_route(new_epoch))
+        if len(route) > 1 and all(isinstance(result, dict) and result.get("verify_exact") is True for result in results):
+            # Only the entry checks guesses, and only it cannot see the other stages' probes. If
+            # this never arrives, it runs as if they rounded differently, which is never wrong.
+            self.spawn(self._tell(route[0].url.rstrip("/") + "/internal/route/exact", json={"epoch": new_epoch, "verify_exact": True}, timeout=5.0))
         summary = " → ".join(f"{stage.worker_id} L{stage.start_layer}–{stage.end_layer - 1}" for stage in route)
         self.add_event("rebalance", f"Pipeline epoch {new_epoch}", summary)
         return {}
