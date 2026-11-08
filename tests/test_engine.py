@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import itertools
 import json
 import os
 from pathlib import Path
@@ -853,17 +854,30 @@ def test_a_slow_guessing_way_costs_a_glance_from_the_start() -> None:
     assert runs[:2] == [(PLAIN, PIPELINE_STRETCH), (PIPELINED, TRIAL_GLANCE)]
 
 
-def test_a_way_that_keeps_losing_waits_twice_as_long_for_each_trial() -> None:
-    """On 3 A40s the pipelined way lost every trial and still cost 6 of 44 ms a token."""
+def test_a_way_that_keeps_losing_closely_waits_twice_as_long_for_each_trial() -> None:
+    choice = DraftChoice()
+    runs = drive(choice, [PIPELINED, PLAIN], {PIPELINED: 25.0, PLAIN: 28.0}, 20000)
+    gaps = [tokens for way, tokens in runs if way == PLAIN][1:]
+    assert gaps[:6] == [192, 384, 768, 1536, 3072, 4096], "the first is the trial of plain itself, then each gap doubles"
+    assert set(gaps[6:-1]) == {DRAFT_TRIAL_MOST}, "it stops growing at the most"
+    assert set(tokens for way, tokens in runs if way == PIPELINED) == {PIPELINE_STRETCH} and choice.trials_cut == 0
+
+
+def test_a_way_far_behind_waits_four_times_as_long_for_each_trial() -> None:
+    """On 3 A40s the pipelined way lost every trial and still cost 6 of 44 ms a token, and on the
+    laptop RTX 3060 doubling alone still left default 2.9% slower than plain over 906 tokens."""
     choice = DraftChoice()
     runs = drive(choice, [PIPELINED, PLAIN], {PIPELINED: 14.4, PLAIN: 27.6}, 20000)
     gaps = [tokens for way, tokens in runs if way == PLAIN][1:]
-    assert gaps[:6] == [192, 384, 768, 1536, 3072, 4096], "the first is the trial of plain itself, then each gap doubles"
-    assert set(gaps[6:-1]) == {DRAFT_TRIAL_MOST}, "it stops doubling at the most"
+    assert gaps[:3] == [384, 1536, 4096], "the first is the trial of plain itself, then each cut trial's gap grows four times"
+    assert set(gaps[3:-1]) == {DRAFT_TRIAL_MOST}, "it stops growing at the most"
     trials = [tokens for way, tokens in runs if way == PIPELINED][1:]
     assert set(trials) == {TRIAL_GLANCE}, "each trial that far behind stops after a glance"
+    starts = itertools.accumulate([0] + [tokens for _, tokens in runs])
+    early = [way for (way, _), start in zip(runs, starts) if start < 906]
+    assert early.count(PIPELINED) == 2, "two glances in the first 906 tokens, where doubling took four"
     trial_tokens = sum(tokens for way, tokens in runs[2:] if way == PIPELINED)
-    assert trial_tokens / sum(tokens for _, tokens in runs[2:]) < 0.006
+    assert trial_tokens / sum(tokens for _, tokens in runs[2:]) < 0.004
 
 
 def test_a_trial_close_behind_runs_its_whole_length() -> None:

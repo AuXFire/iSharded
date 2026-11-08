@@ -29,9 +29,12 @@ PIPELINED, GUESSED, PLAIN = "pipelined", "guessed", "plain"
 PIPELINE_STRETCH = 24
 # How many tokens go by between trials of a slower way at first, and how fast its rate adapts.
 # Each trial it loses doubles the gap, up to the most, so a way that keeps losing costs next to
-# nothing: on 3 A40s a 24-token pipelined trial every 96 tokens cost 6 of 44 ms a token.
+# nothing: on 3 A40s a 24-token pipelined trial every 96 tokens cost 6 of 44 ms a token. A trial
+# cut short was far behind, so its gap grows four times: on the laptop RTX 3060, doubling alone
+# left a pipeline at half plain's speed 4 trials in the first 906 tokens, 2.9% slower than plain.
 DRAFT_TRIAL_TOKENS = 96
 DRAFT_TRIAL_MOST = 4096
+DRAFT_TRIAL_GROWTH, DRAFT_TRIAL_CUT_GROWTH = 2, 4
 DRAFT_MEMORY = 0.9
 # A trial this far in that is already this many times slower than the way it is up against
 # stops there, and one halfway through that is still this far behind stops then. Ways closer
@@ -414,8 +417,8 @@ class DraftChoice:
 
     A trial runs ``PIPELINE_STRETCH`` tokens, or stops after ``TRIAL_GLANCE`` if it is already
     ``TRIAL_CUT`` times slower, or halfway if it is still ``TRIAL_HALF_CUT`` times slower. Each
-    way keeps its own gap. A way that loses waits twice as long for its next trial, up to
-    ``DRAFT_TRIAL_MOST`` tokens, and one that wins halves its gap: on a GPU a lucky stretch of
+    way keeps its own gap. A way that loses waits twice as long for its next trial, or four times
+    as long if its trial was cut short, up to ``DRAFT_TRIAL_MOST`` tokens, and one that wins halves its gap: on a GPU a lucky stretch of
     text could win a pipeline one trial, and a full reset gave it a trial every 96 tokens again.
     A new route starts a new choice. A way nothing has measured yet gets a trial first, plain decoding before the rest.
     """
@@ -498,7 +501,7 @@ class DraftChoice:
         self.trials_cut += cut
         if own < rival:
             self.trials_lost += 1
-            self.gaps[way] = min(self.gap(way) * 2, DRAFT_TRIAL_MOST)
+            self.gaps[way] = min(self.gap(way) * (DRAFT_TRIAL_CUT_GROWTH if cut else DRAFT_TRIAL_GROWTH), DRAFT_TRIAL_MOST)
         else:
             self.trials_won += 1
             self.gaps[way] = max(self.gap(way) // 2, DRAFT_TRIAL_TOKENS)
