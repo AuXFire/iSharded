@@ -25,6 +25,22 @@ class SlotGate:
             self.free.discard(slot)
             return slot
 
+    async def take(self, slot: int, seconds: float) -> bool:
+        """Waits for this one slot to be free and takes it. False if it was not free in time.
+
+        A route change lends a slot this way, to prove the next route on while no reply holds it.
+        A hold does not stop this: the slot is not for a reply.
+        """
+        if not 0 <= slot < self.size:
+            return False
+        async with self.changed:
+            try:
+                await asyncio.wait_for(self.changed.wait_for(lambda: slot in self.free), seconds)
+            except asyncio.TimeoutError:
+                return False
+            self.free.discard(slot)
+            return True
+
     async def release(self, slot: int) -> None:
         async with self.changed:
             if slot < self.size:

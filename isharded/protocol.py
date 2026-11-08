@@ -285,6 +285,10 @@ class ConfigureRequest(BaseModel):
     # ask when taking over layers from a stage that was lost. See statecopy.py.
     copy_url: str | None = None
     state_peers: list[str] = Field(default_factory=list)
+    # The flip of a staged route change: this stage keeps its model and KV, and the ring it
+    # staged for this epoch takes over from the one it serves. Only for a stage that stays as
+    # it is; anything else is refused. See ISHARDED_STAGED in docs/OPERATIONS.md.
+    staged: bool = False
 
 
 class CacheRestoreRequest(BaseModel):
