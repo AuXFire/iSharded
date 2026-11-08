@@ -388,3 +388,14 @@ def test_planning_that_changed_nothing_undoes_nothing(pool, monkeypatch):
 
     assert asyncio.run(scenario()) == 5
     assert pool.active.slots == 4 and pool.active.parallel == {"auto": True}
+
+
+def test_a_node_lost_from_the_route_is_taken_back_even_after_being_forgotten(pool):
+    """A repair takes back a node that was lost from the route when it returns; ten minutes away changed that."""
+    pool.workers = {"lost": record("lost", silent_for=orchestrator_module.FORGET_SECONDS + 1), "idle": record("idle", silent_for=orchestrator_module.FORGET_SECONDS + 1)}
+    pool.lost_from_route = {"lost"}
+    assert sorted(pool.forget_silent_workers()) == ["idle", "lost"]
+    assert not pool.lost_from_route
+    pool.register(registration("lost"))
+    pool.register(registration("idle"))
+    assert pool.lost_from_route == {"lost"}

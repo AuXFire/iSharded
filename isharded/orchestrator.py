@@ -915,6 +915,8 @@ class Orchestrator:
         self.probe_slots: tuple[asyncio.AbstractEventLoop, asyncio.Semaphore] | None = None
         # Quarantine outlives a forgotten record: going quiet for long is no way out of it.
         self.forgotten_quarantine: dict[str, tuple[bool, str | None, int]] = {}
+        # Nor does being forgotten stop a node lost from the route being taken back when it returns.
+        self.forgotten_from_route: dict[str, None] = {}
         # How late the event loop woke, last and worst in the last minute, and how often it was held long.
         self.loop_lag_seconds = 0.0
         self.loop_lag_worst: deque[tuple[float, float]] = deque()
@@ -1477,6 +1479,9 @@ class Orchestrator:
             elif registration.worker_id in self.forgotten_quarantine:
                 # Nor is going quiet for long enough to be forgotten.
                 record.quarantined, record.quarantine_reason, record.quarantine_count = self.forgotten_quarantine.pop(registration.worker_id)
+            if previous is None and registration.worker_id in self.forgotten_from_route:
+                del self.forgotten_from_route[registration.worker_id]
+                self.lost_from_route.add(registration.worker_id)  # the next repair takes it back, as if never forgotten
             self.workers[registration.worker_id] = record
         if previous is None:
             hardware = registration.hardware
@@ -3749,7 +3754,11 @@ class Orchestrator:
                 while len(self.forgotten_quarantine) > MAX_FORGOTTEN_QUARANTINES:
                     del self.forgotten_quarantine[next(iter(self.forgotten_quarantine))]
             self.absent_since.pop(name, None)
-            self.lost_from_route.discard(name)
+            if name in self.lost_from_route:
+                self.lost_from_route.discard(name)
+                self.forgotten_from_route[name] = None
+                while len(self.forgotten_from_route) > MAX_FORGOTTEN_QUARANTINES:
+                    del self.forgotten_from_route[next(iter(self.forgotten_from_route))]
             self.need_reconfigure.discard(name)
             for table in (self.links, self.links_checked, self.link_readings, self.ring_samples, self.ring_links, self.ring_passes, self.hops):
                 for pair in [pair for pair in table if name in pair]:
