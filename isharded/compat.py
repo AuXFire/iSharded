@@ -38,7 +38,7 @@ from .parameters import (
     refusal,
 )
 from .protocol import ChatCompletionRequest, ChatMessage, CompletionRequest, EmbeddingRequest
-from .replies import render_prompts, whole_reply
+from .replies import CLIENT_GONE, ClientGone, render_prompts, unless_client_leaves, whole_reply
 from .toolcalls import THINK_CLOSE, ThoughtSplitter, ToolRequestError, plan_tools, template_messages, tool_format
 from .vision import ImageRefused, chat_images
 
@@ -1009,7 +1009,13 @@ def answering(node: Node, route: Any, shape: Callable[[int, str], dict[str, Any]
         try:
             # First, so a stranger learns nothing about a body from how it is refused.
             node.guard(authorization)
-            answer = await route(node, request, authorization)
+            # Read now and kept, so the watch below cannot take any of it from the route.
+            await request.body()
+            # A reply sent whole stops if its client goes first. A stream is returned at once,
+            # and stops when the stream is closed, so the watch is over before it starts.
+            answer = await unless_client_leaves(request.receive, route(node, request, authorization))
+        except ClientGone:
+            return Response(status_code=CLIENT_GONE)
         except HTTPException as exc:
             return JSONResponse(status_code=exc.status_code, content=shape(exc.status_code, str(exc.detail)), headers=exc.headers)
         return answer if isinstance(answer, Response) else JSONResponse(answer)

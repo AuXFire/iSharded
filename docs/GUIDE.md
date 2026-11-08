@@ -1289,6 +1289,8 @@ Routes under `/internal` are for nodes only. `GET /internal/mesh` shows a node's
 
 Prompts longer than the loaded context are refused with a 400. A reply that would overrun it is cut short.
 
+A reply stops as soon as its client closes the connection, whether it streams or not: the generation ends on the entry worker and its slot is free for the next reply. This holds on every route that replies, the Claude, Responses, and Ollama ones too.
+
 A field OpenAI defines that would change the reply here, and that iSharded does not do, is refused with a 400 that names it, such as `not supported: n (a reply here is one choice; send 1 or leave it out)`, rather than ignored. The answer has OpenAI's `error` object, with the field in `param` and `code: "unsupported_parameter"`, beside `detail`, so OpenAI's libraries show the reason. A name that no API here defines is refused the same way, as OpenAI refuses one. Each is taken at the value that asks for nothing, which is what clients send by default:
 
 | Field | Taken at |

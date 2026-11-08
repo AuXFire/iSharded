@@ -73,7 +73,7 @@ from .protocol import (
 )
 from .pool import LOOPBACK, check_exposure, home as pool_home, load_token, read_membership_request
 from .parameters import CHAT_LIMITS, COMPLETION_LIMITS, EMBEDDING_LIMITS, Limit, refused_field
-from .replies import event_stream, first_stop, render_prompts, scanned, usage_of, whole_reply
+from .replies import CLIENT_GONE, ClientGone, event_stream, first_stop, render_prompts, scanned, unless_client_leaves, usage_of, whole_reply
 from .serving import MAX_STRANGER_BYTES, AddressLimit, BodyLimit, ChunkedResponses, client_address, serve, where_everything_is
 from .mesh import clean_url
 from .statements import Refused, Statements, make_statement
@@ -4345,6 +4345,7 @@ async def embeddings(
 async def completions(
     body: CompletionRequest,
     authorization: str | None = Header(default=None),
+    request: Request = None,  # type: ignore[assignment]  # FastAPI gives it; a direct call has none
 ) -> Any:
     caller = verify_user(authorization)
     if refused := unhonoured(body, COMPLETION_LIMITS):
@@ -4373,7 +4374,10 @@ async def completions(
             ),
             media_type="text/event-stream",
         )
-    message, summary = await whole_reply(runtime.stream_tokens(prompt, *options))
+    try:
+        message, summary = await unless_client_leaves(request and request.receive, whole_reply(runtime.stream_tokens(prompt, *options)))
+    except ClientGone:
+        return Response(status_code=CLIENT_GONE)
     return {
         "id": identifier,
         "object": "text_completion",
@@ -4388,6 +4392,7 @@ async def completions(
 async def chat_completions(
     body: ChatCompletionRequest,
     authorization: str | None = Header(default=None),
+    request: Request = None,  # type: ignore[assignment]  # FastAPI gives it; a direct call has none
 ) -> Any:
     caller = verify_user(authorization)
     if refused := unhonoured(body, CHAT_LIMITS):
@@ -4444,7 +4449,10 @@ async def chat_completions(
             ),
             media_type="text/event-stream",
         )
-    message, summary = await whole_reply(items)
+    try:
+        message, summary = await unless_client_leaves(request and request.receive, whole_reply(items))
+    except ClientGone:
+        return Response(status_code=CLIENT_GONE)
     return {
         "id": identifier,
         "object": "chat.completion",

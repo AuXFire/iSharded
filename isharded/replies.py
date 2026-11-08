@@ -1,15 +1,58 @@
 """The OpenAI shape of a reply: its prompt on the way in, its events and message on the way out."""
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import aclosing
-from typing import Any
+from typing import Any, TypeVar
 
 from fastapi import HTTPException
 from jinja2.exceptions import TemplateError
 
 from .toolcalls import ReplyScanner, ToolRequestError, tool_deltas
+
+
+T = TypeVar("T")
+Receive = Callable[[], Awaitable[dict[str, Any]]]
+# Not a status anyone reads, since nobody is left to: it is how a log says the client went.
+CLIENT_GONE = 499
+
+
+class ClientGone(Exception):
+    """The client closed its connection before its reply was ready."""
+
+
+async def client_left(receive: Receive) -> None:
+    """Returns once the client has gone. The body has been read by now, so nothing else arrives."""
+    while (await receive())["type"] != "http.disconnect":
+        pass
+
+
+async def unless_client_leaves(receive: Receive | None, work: Awaitable[T]) -> T:
+    """Waits for a reply that is sent whole, and stops it if its client goes first.
+
+    A streamed reply stops when its stream is closed. A whole one has nothing to close
+    until it is done, so without this it runs to the end and holds its place on the route
+    for a reply nobody will read. Cancelling closes the token stream, which closes the
+    entry worker's stream, which ends the generation there and frees its slot.
+    """
+    if receive is None:
+        return await work
+    task = asyncio.ensure_future(work)
+    watch = asyncio.ensure_future(client_left(receive))
+    try:
+        await asyncio.wait({task, watch}, return_when=asyncio.FIRST_COMPLETED)
+        if not task.done():
+            task.cancel()
+            await asyncio.wait({task})  # let the stream close before anything else runs
+            raise ClientGone
+    except asyncio.CancelledError:  # the server is stopping, and this reply stops with it
+        task.cancel()
+        raise
+    finally:
+        watch.cancel()
+    return task.result()
 
 
 def usage_of(summary: dict[str, Any]) -> dict[str, int]:
