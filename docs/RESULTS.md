@@ -132,6 +132,19 @@ Every stage of a route is fed rows of hidden state, the entry included, while ll
 
 On the laptop, being fed rows is not what costs a boundary its time. The size of what losing graphs costs, 2.5 to 3.3 ms a pass here, is close to the unexplained part on the A40s, so the fleet should check whether its stages run with graphs at all: each worker now reports `cuda_graphs`, and `isharded bench --stage` on an A40 answers the same question there. That measurement has not run.
 
+### Kept state, the draft's pace, and what a token costs
+
+Three numbers the fleet needs that nothing measured before: the time a stage spends copying its recurrent state to host for a pipelined pass (`keep_us`), the draft's own time per guess as a real reply waits for it on the entry (`g`), and cost and energy per token. [What a token costs](GUIDE.md#what-a-token-costs) explains each. These are laptop runs, to show the hooks report what they should; the A40 numbers are still to be taken.
+
+| What | Setup | Result | Kind | Date | Source |
+|---|---|---|---|---|---|
+| Kept state on GPU stages, Qwen3.5-0.8B Q8_0 | Laptop RTX 3060, Windows, real orchestrator and two workers on the one GPU, native engine, ring on, no draft, layers 10/14, `isharded bench --prompt-tokens 128 --tokens 256 --text counting`, 3 rounds, other lanes using the laptop between holds of the timing lock. The replies ended after a few tokens, so the speed columns of that run say little | 48 pipelined tokens. First stage: 53 copies of 8.6 MiB, 2.965 ms each, 30% of its compute over the run. Second stage: 51 copies of 10.7 MiB, 7.284 ms each, 54% of its compute | Measured | 2026-11-08 | Round 7 measure lane |
+| Kept state on CPU stages, Qwen3.5-0.8B Q8_0 | As above on CPU workers, layers 4/20, `--text prose --tokens 128`, 3 rounds | 493 pipelined tokens, 12 misses. First stage: 519 copies of 3.2 MiB, 0.689 ms each, 4% of compute. Second stage: 512 copies of 16.1 MiB, 3.158 ms each, 4% of compute. 10 tokens/s a reply (8.8-13.9) | Measured | 2026-11-08 | Round 7 measure lane |
+| The draft's time per guess on the entry | Laptop, real orchestrator and two CPU workers, Qwen3-0.6B Q8_0 with a copy of itself as the draft, context 1024, layers 1/27, `isharded bench --pace --tokens 128 --text prose`, 3 rounds. The GPU had too little VRAM free beside other lanes for the draft | 133 guesses at 16.44 ms on average: 125 steady guesses of one row at 13.59 ms, and 8 after a miss at 60.85 ms. 144 pipelined tokens, 5 misses, depth 2; 12.5 tokens/s a reply (8.1-13.9) | Measured | 2026-11-08 | Round 7 measure lane |
+| Cost and energy per token | Price set to 0.59 an hour a machine. GPU power read by `nvidia-smi` on the laptop RTX 3060, whole board. Bench rows: the runs above. Stage rows: [CUDA graphs for a stage fed rows](#cuda-graphs-for-a-stage-fed-rows) | GPU route of two stages (the kept-state run): 1.4848 per million tokens, 0.542 J a token at 59.9 W, idle gaps and short replies included, the machine counted once for both stages. CPU routes: 17.4959 (draft) and 16.2912 (kept state) per million tokens; no power, as Windows gives no CPU energy counter. One GPU pass alone: 0.229 to 0.378 J a token with graphs on, 0.456 to 0.744 off; 0.49 to 0.73 per million tokens on, 0.89 to 1.27 off | Measured | 2026-11-08 | Round 7 measure lane |
+
+On GPU stages that share one laptop card, copying kept state took 30 to 54% of a stage's compute, against 4% on CPU stages, where compute itself is slow. That copy sits on every pipelined pass's way along the ring, so it is a measured part of why pipelining a hybrid model has lost on GPUs. The guess on the entry took 13.6 ms steady on CPU; a draft timed alone on the laptop's GPU took 3.3 to 4.4 ms, a different device, so the two do not compare. Both still need the fleet's A40s.
+
 ## First token and long prompts
 
 | What | Setup | Result | Kind | Date | Source |
@@ -623,7 +636,8 @@ Scale and hardware:
 - Llama, Mistral and Hermes tool calls have never run on a mesh. No model larger than the 27B tried for tool calling.
 - The chat page has been used only in Chrome.
 - Handover prototypes: the loader rate on the laptop's RTX 3060 and the RX 7900 XT, the second CUDA context and segment chains on the 7900 XT, state slicing on Qwen3.5-0.8B, device-cold disk reads (only page-cache cold was reached), and any end-to-end switch.
-- `isharded bench` has no GPU numbers and no full default run (prompts of 128 and 3400, `--parallel 1,4,8`, 200 tokens).
+- `isharded bench` has no full default run (prompts of 128 and 3400, `--parallel 1,4,8`, 200 tokens), and on GPUs only the laptop's RTX 3060.
+- The measuring hooks on an A40: `isharded bench --stage` with CUDA graphs on and off, the hop trace on an A40 pair, `keep_us` on hybrid GPU stages on separate cards, the draft's real `g` on an A40 entry under `--pace`, and cost and joules per token from `--price-per-hour` and `--measure-power`. ROCm power through `rocm-smi` and Linux CPU power through RAPL have run only in tests with stand-in tools.
 - One load failure at `--parallel 2` on the test pool was transient, and its cause was never found.
 - Whether a draft takes its time from the entry stage's GPU. `ISHARDED_DRAFT_SHARES_DEVICE` counts it that way, and stays off until a GPU run shows it. A shorter loop applied on real GPUs or across a real mesh, and the ring's link prices on a real WAN, have not run either: only the emulator above
 
