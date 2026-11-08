@@ -1,8 +1,10 @@
 name: scale
 
-# The control plane of 50 emulated nodes, every night, so a change that makes it cost
+# The control plane of 20 emulated nodes, every night, so a change that makes it cost
 # more per node shows up as a number rather than as a slow pool. See "Scale harness"
-# in docs/OPERATIONS.md. A run can also be started by hand with another size.
+# in docs/OPERATIONS.md. Twenty is what a 4-core runner holds without the nodes slowing
+# each other (about 0.08 cores a node at N=20, more per node as N grows); N=50 needs
+# about four times the cores, so start it by hand on a larger runner.
 on:
   schedule:
     - cron: "17 6 * * *"
@@ -10,7 +12,7 @@ on:
     inputs:
       nodes:
         description: "How many emulated nodes"
-        default: "50"
+        default: "20"
       phases:
         description: "Phases (all, or a comma separated list)"
         default: "all"
@@ -18,7 +20,7 @@ on:
 jobs:
   scale:
     runs-on: ubuntu-latest
-    # N=50 with every phase takes about 25 minutes on a 4-core runner.
+    # N=20 with every phase took 7 minutes on a laptop.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +34,7 @@ jobs:
           python -m pip install -e .
       - name: Run
         env:
-          NODES: ${{ inputs.nodes || '50' }}
+          NODES: ${{ inputs.nodes || '20' }}
           PHASES: ${{ inputs.phases || 'all' }}
         run: |
           mkdir -p scale-results
