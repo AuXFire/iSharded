@@ -423,6 +423,9 @@ class GenerateRequest(InferRequest):
 
 
 class CompletionRequest(BaseModel):
+    # Fields beyond these are kept, so the route can say which one it will not honour. See parameters.py.
+    model_config = ConfigDict(extra="allow")
+
     model: str | None = None
     prompt: str | list[str]
     max_tokens: int = Field(default=32, ge=1, le=32768)
@@ -435,6 +438,9 @@ class CompletionRequest(BaseModel):
 
 
 class EmbeddingRequest(BaseModel):
+    # Fields beyond these are kept, so the route can say which one it will not honour. See parameters.py.
+    model_config = ConfigDict(extra="allow")
+
     model: str | None = None
     input: str | list[str]
     encoding_format: Literal["float", "base64"] = "float"
@@ -468,6 +474,9 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
+    # Fields beyond these are kept, so the route can say which one it will not honour. See parameters.py.
+    model_config = ConfigDict(extra="allow")
+
     model: str | None = None
     messages: list[ChatMessage]
     # Left unset, the limit depends on whether tools are in play: see toolcalls.reply_limit.

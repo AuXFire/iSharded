@@ -25,6 +25,7 @@ import httpx
 import numpy as np
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from pydantic import BaseModel
 
 from starlette.background import BackgroundTask
 
@@ -71,6 +72,7 @@ from .protocol import (
     auth_headers,
 )
 from .pool import LOOPBACK, check_exposure, home as pool_home, load_token, read_membership_request
+from .parameters import CHAT_LIMITS, COMPLETION_LIMITS, EMBEDDING_LIMITS, Limit, refused_field
 from .replies import event_stream, first_stop, render_prompts, scanned, usage_of, whole_reply
 from .serving import MAX_STRANGER_BYTES, AddressLimit, BodyLimit, ChunkedResponses, client_address, serve, where_everything_is
 from .mesh import clean_url
@@ -4293,12 +4295,28 @@ def reply_detail(response: httpx.Response) -> Any:
         return f"HTTP {response.status_code}"
 
 
+def unhonoured(body: BaseModel, limits: dict[str, Limit]) -> JSONResponse | None:
+    """A field the route would not honour is refused by name, rather than ignored. See parameters.py.
+
+    The answer carries OpenAI's error object beside this API's own detail, so OpenAI's
+    libraries show the reason and name the field, where a bare detail shows only the status.
+    """
+    found = refused_field(body.model_extra or {}, limits)
+    if found is None:
+        return None
+    name, problem = found
+    error = {"message": problem, "type": "invalid_request_error", "param": name, "code": "unsupported_parameter"}
+    return JSONResponse(status_code=400, content={"detail": problem, "error": error})
+
+
 @app.post("/v1/embeddings")
 async def embeddings(
     body: EmbeddingRequest,
     authorization: str | None = Header(default=None),
 ) -> Any:
     caller = verify_user(authorization)
+    if refused := unhonoured(body, EMBEDDING_LIMITS):
+        return refused
     lane = await runtime.lanes.locate(body.model)
     if lane:
         return await runtime.lanes.forward(lane, "/v1/embeddings", body.model_dump(exclude_none=True), caller)
@@ -4329,6 +4347,8 @@ async def completions(
     authorization: str | None = Header(default=None),
 ) -> Any:
     caller = verify_user(authorization)
+    if refused := unhonoured(body, COMPLETION_LIMITS):
+        return refused
     lane = await runtime.lanes.locate(body.model)
     if lane:
         return await runtime.lanes.forward(lane, "/v1/completions", body.model_dump(exclude_none=True), caller)
@@ -4370,6 +4390,8 @@ async def chat_completions(
     authorization: str | None = Header(default=None),
 ) -> Any:
     caller = verify_user(authorization)
+    if refused := unhonoured(body, CHAT_LIMITS):
+        return refused
     lane = await runtime.lanes.locate(body.model)
     if lane:
         return await runtime.lanes.forward(lane, "/v1/chat/completions", body.model_dump(exclude_none=True), caller)

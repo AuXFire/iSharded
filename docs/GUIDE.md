@@ -1289,6 +1289,25 @@ Routes under `/internal` are for nodes only. `GET /internal/mesh` shows a node's
 
 Prompts longer than the loaded context are refused with a 400. A reply that would overrun it is cut short.
 
+A field OpenAI defines that would change the reply here, and that iSharded does not do, is refused with a 400 that names it, such as `not supported: n (a reply here is one choice; send 1 or leave it out)`, rather than ignored. The answer has OpenAI's `error` object, with the field in `param` and `code: "unsupported_parameter"`, beside `detail`, so OpenAI's libraries show the reason. A name that no API here defines is refused the same way, as OpenAI refuses one. Each is taken at the value that asks for nothing, which is what clients send by default:
+
+| Field | Taken at |
+|---|---|
+| `n`, and `best_of` on completions | 1 |
+| `frequency_penalty`, `presence_penalty` | 0 |
+| `logit_bias` | Empty |
+| `logprobs` | `false` on chat, 0 on completions. `top_logprobs` at 0 |
+| `response_format` | `{"type": "text"}`. JSON and schemas are refused, because the chat path cannot hold a reply to one |
+| `stream_options` | `include_usage` and `include_obfuscation`. Usage always comes with the last chunk |
+| `modalities` | `["text"]`. `audio`, `prediction`, and `web_search_options` only when null |
+| `reasoning_effort`, `chat_template_kwargs` | Null or empty. Use `enable_thinking` |
+| `verbosity` | `medium` |
+| `functions`, `function_call` | Empty, and `none` or `auto`. Use `tools` and `tool_choice` |
+| `echo`, `suffix` | Completions only: `false`, and empty |
+| `min_p`, `repetition_penalty`, `repeat_penalty` | 0, 1, and 1 |
+
+`metadata`, `user`, `store`, `service_tier`, `safety_identifier`, `prompt_cache_key`, and `prompt_cache_retention` are taken at any value and do nothing, since none of them changes a reply. `/v1/embeddings` takes `model`, `input`, `encoding_format`, `dimensions`, and `user`, and refuses any other name.
+
 ### Tool calling
 
 `/v1/chat/completions` takes OpenAI's tool fields and answers in OpenAI's shape, so existing clients work unchanged. A reply with calls has `tool_calls` with ids, and `finish_reason: "tool_calls"`. Send the result back as a `tool` message with the call's `tool_call_id`.
@@ -1460,6 +1479,12 @@ Other tools usually read `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`. The key m
 | `tools` | Your own tools, with `input_schema`. Tools Anthropic runs for you, such as web search, are refused with a 400 |
 | `tool_choice` | `auto`, `any`, `none`, or `tool` with a `name`. `disable_parallel_tool_use` keeps only the first call |
 | `thinking` | `type: "disabled"` turns reasoning off on models with a switch, and any other type turns it on. `display: "omitted"` keeps the block and leaves out its words. `budget_tokens` is not used |
+| `metadata`, `service_tier` | Taken, and do nothing |
+| `context_management` | Taken, and does nothing: nothing is cleared, and a conversation past the context is refused as on every route |
+| `output_config` | `effort` is taken and not used, like `budget_tokens`. A `format` is refused |
+| `output_format`, `container`, `mcp_servers` | Refused with a 400 when set, since the chat path cannot hold a reply to a schema, and nothing here runs code or connects to MCP servers for you. An empty `mcp_servers` is taken |
+
+Any other field is refused with a 400 that names it, `not supported: NAME`, as Anthropic refuses one.
 
 A reply that starts with reasoning gives it as a `thinking` block before its text, whatever `thinking` asked for, because a model with no switch reasons anyway. Reasoning found later in a reply stays in the text. A block's `signature` is a hash of its words, there for clients that expect one. It proves nothing, since nobody here can sign for Anthropic, and it is not checked when it comes back. Cache counts in `usage` are always 0, because this usage counts every prompt token as `input_tokens`. Errors have Anthropic's shape, with `type: "error"`, an `error` holding `type` and `message`, and a `request_id`. A failure during a stream is an `error` event. `POST /v1/messages/count_tokens` takes the same fields without `max_tokens` and runs the model's template, and an image counts only as its marker.
 
@@ -1482,6 +1507,8 @@ print(client.responses.create(model=MODEL, input="Say hello.", max_output_tokens
 | `tools`, `tool_choice`, `parallel_tool_calls` | Function tools only. Calls come back as `function_call` items |
 
 Nothing is stored here, so `previous_response_id`, `conversation`, and `background` are refused with a 400. Send the whole conversation in `input` each time. `text.format` is refused too, because the chat path cannot hold a reply to a format. Errors have OpenAI's `{"error": {...}}` shape.
+
+`store`, `metadata`, `user`, `service_tier`, `safety_identifier`, `prompt_cache_key`, and `prompt_cache_retention` are taken and do nothing. So is `reasoning` with `effort` and `summary`, since reasoning stays in the reply's text, and `include` holding only `reasoning.encrypted_content`, as Codex sends. These are refused with a 400 that names them unless they ask for nothing: `truncation` other than `disabled`, `text.verbosity` other than `medium`, `top_logprobs` above 0, `max_tool_calls`, `prompt`, and any other `include`. A name the Responses API does not define is refused too.
 
 #### Ollama
 
@@ -1506,7 +1533,8 @@ A tool with no way to set a header cannot reach a mesh with keys.
 |---|---|
 | `messages` | Roles and `content`, with `images` as base64, `tool_calls`, `thinking`, and `tool` results by `tool_name` |
 | `prompt`, `system`, `images` | On `/api/generate`, they go through the model's template. With `raw: true`, `prompt` goes in as it is, and `images` are refused |
-| `options` | `temperature`, `top_p`, `top_k`, `seed`, `num_predict`, and `stop`. A `seed` of -1 means no seed. Others, such as `num_ctx`, do nothing, since a route's context is set when it loads |
+| `options` | `temperature`, `top_p`, `top_k`, `seed`, `num_predict`, and `stop`. A `seed` of -1 means no seed. Others, such as `num_ctx`, do nothing, since a route's context is set when it loads. Sampling that is not applied here is refused with a 400 that names it, `not supported: NAME`, unless it asks for nothing: `repeat_penalty` other than 1 or Ollama's own 1.1, `presence_penalty` and `frequency_penalty` other than 0, `min_p` other than 0, `typical_p` and `tfs_z` other than 1, and `mirostat` other than 0. An option Ollama does not know is ignored, as Ollama ignores it |
+| `logprobs`, `context` | `logprobs: true` and a non-empty `context` on `/api/generate` are refused with a 400 |
 | `tools` | As on the [chat route](#tool-calling) |
 | `think` | Switches reasoning on models that support it. A level such as `"high"` counts as on. A reply that starts with reasoning gives it in `thinking`, on `message` or beside `response`. With `raw: true` it stays in the text |
 | `format` | Refused with a 400. The chat path cannot hold a reply to JSON or a schema, and asking the model nicely would only look as if it worked |
