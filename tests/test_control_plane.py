@@ -1,7 +1,9 @@
-"""The control plane stays responsive: status never waits on a worker, and a held loop is noticed."""
+"""The control plane stays responsive: status never waits on a worker, and planning runs off the loop."""
 
 import asyncio
+import threading
 import time
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 import httpx
@@ -10,6 +12,9 @@ import pytest
 from isharded import orchestrator as orchestrator_module
 from isharded.orchestrator import Orchestrator, WorkerRecord
 from isharded.protocol import PROTOCOL_VERSION, HardwareInfo, StageAssignment, WorkerRegistration
+
+from test_parallel import target as slotted_target
+from test_parallel import worker as candidate
 
 
 def registration(worker_id):
@@ -146,6 +151,143 @@ def test_being_forgotten_is_no_way_out_of_quarantine(pool):
     pool.register(registration("bad"))
     back = pool.workers["bad"]
     assert back.quarantined and back.quarantine_reason == "out of memory" and back.quarantine_count == 2
+
+
+class Ticks:
+    """A 10 Hz coroutine, as a heartbeat or a status call would be, noting how late each tick ran."""
+
+    def __init__(self):
+        self.late = []
+
+    async def run(self, stop):
+        loop = asyncio.get_running_loop()
+        while not stop.is_set():
+            planned = loop.time() + 0.1
+            await asyncio.sleep(0.1)
+            self.late.append(loop.time() - planned)
+
+
+def slow_plan(seconds):
+    """A planner that holds the interpreter for ``seconds``, as a plan on a big pool does."""
+
+    def plan(self, target, **options):
+        ended = time.perf_counter() + seconds
+        while time.perf_counter() < ended:
+            sum(range(200))  # pure Python, holding the GIL as planning does
+        return [stage("a")]
+
+    return plan
+
+
+def while_ticking(work):
+    async def scenario():
+        ticks, stop = Ticks(), asyncio.Event()
+        ticker = asyncio.ensure_future(ticks.run(stop))
+        await asyncio.sleep(0.25)
+        began = time.perf_counter()
+        result = await work()
+        took = time.perf_counter() - began
+        stop.set()
+        await ticker
+        return ticks, took, result
+
+    return asyncio.run(scenario())
+
+
+def test_the_loop_keeps_ticking_while_a_plan_runs(pool, monkeypatch):
+    monkeypatch.setattr(Orchestrator, "plan", slow_plan(1.5))
+    target = SimpleNamespace(draft=None, request=None)
+    ticks, took, route = while_ticking(lambda: pool.planned(target))
+    assert took >= 1.5 and [item.worker_id for item in route] == ["a"]
+    assert len(ticks.late) >= 15
+    assert max(ticks.late) < 0.1, f"a tick ran {max(ticks.late) * 1000:.0f} ms late"
+
+
+def test_the_loop_keeps_ticking_while_a_cordon_is_priced(pool, monkeypatch):
+    monkeypatch.setattr(Orchestrator, "plan", slow_plan(1.0))
+    monkeypatch.setattr(orchestrator_module, "describe_plan", lambda target, route, links=None: {"download_bytes": 5})
+    pool.workers = {"a": record("a")}
+    pool.active = SimpleNamespace(draft=None, request=None)
+    pool.route = [stage("a")]
+    ticks, took, cost = while_ticking(lambda: pool.cost_of_losing("a"))
+    assert cost == 5 and took >= 1.0
+    assert max(ticks.late) < 0.1, f"a tick ran {max(ticks.late) * 1000:.0f} ms late"
+
+
+def test_the_loop_keeps_ticking_through_the_slot_search(pool, monkeypatch):
+    """The slot search plans once a step, and each plan held the loop."""
+    pool.offered = [candidate("a"), candidate("b")]
+    pool.candidate_groups = lambda: (pool.offered, [])
+    pool.links = {("a", "b"): 200.0, ("b", "a"): 200.0}
+    real_plan = Orchestrator.plan
+    plans = []
+
+    def plan(self, target, **options):
+        plans.append(threading.current_thread() is threading.main_thread())
+        ended = time.perf_counter() + 0.3
+        while time.perf_counter() < ended:
+            sum(range(200))
+        return real_plan(self, target, **options)
+
+    monkeypatch.setattr(Orchestrator, "plan", plan)
+    item = slotted_target()
+    ticks, took, _ = while_ticking(lambda: pool.choose_slots(item))
+    assert len(plans) >= 3 and not any(plans), "every plan of the search ran off the loop"
+    assert item.parallel["auto"] and item.slots > 1, "what the search settled reached the target"
+    assert max(ticks.late) < 0.1, f"a tick ran {max(ticks.late) * 1000:.0f} ms late"
+
+
+def test_a_plan_overtaken_by_a_cordon_is_made_again(pool, monkeypatch):
+    pool.workers = {"a": record("a"), "b": record("b")}
+    seen = []
+
+    def plan(self, target, **options):
+        seen.append(sorted(self.access.cordoned))
+        self.add_event("rebalance", "Planned", f"attempt {len(seen)}")
+        time.sleep(0.2)
+        return [stage(name) for name in sorted(self.workers) if not self._cordoned(name)]
+
+    monkeypatch.setattr(Orchestrator, "plan", plan)
+
+    async def scenario():
+        planning = asyncio.ensure_future(pool.planned(SimpleNamespace(draft=None, request=None)))
+        await asyncio.sleep(0.05)
+        pool.access.cordon("b")  # lands while the first plan is in its thread
+        return await planning
+
+    route = asyncio.run(scenario())
+    assert seen == [[], ["b"]]
+    assert [item.worker_id for item in route] == ["a"]
+    told = [event["detail"] for event in pool.events if event["title"] == "Planned"]
+    assert told == ["attempt 2"], "only the plan that was used tells what it did"
+
+
+def test_a_plan_never_touches_the_pool_it_reads(pool, monkeypatch):
+    pool.workers = {"a": record("a"), "b": record("b")}
+    pool.route = [stage("a")]
+    pool.links = {("a", "b"): 1.0}
+
+    def plan(self, target, **options):
+        self.workers["a"].quarantined = True
+        self.access.cordoned.add("b")
+        self.route.clear()
+        self.links.clear()
+        return []
+
+    monkeypatch.setattr(Orchestrator, "plan", plan)
+    asyncio.run(pool.planned(SimpleNamespace(draft=None, request=None)))
+    assert not pool.workers["a"].quarantined and not pool.access.cordoned
+    assert [item.worker_id for item in pool.route] == ["a"] and pool.links == {("a", "b"): 1.0}
+
+
+def test_a_refused_plan_still_tells_why(pool, monkeypatch):
+    def plan(self, target, **options):
+        raise orchestrator_module.PlacementError("no room anywhere")
+
+    monkeypatch.setattr(Orchestrator, "plan", plan)
+    with pytest.raises(orchestrator_module.HTTPException) as refused:
+        asyncio.run(pool.planned(SimpleNamespace(draft=None, request=None)))
+    assert refused.value.status_code == 507 and "no room anywhere" in refused.value.detail
 
 
 def test_a_held_loop_is_measured_logged_and_exported(pool, capsys):

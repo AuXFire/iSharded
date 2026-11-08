@@ -820,19 +820,21 @@ def test_a_cordon_says_what_it_would_cost(monkeypatch):
     orchestrator.route = [stage("w1")]
     monkeypatch.setattr(orchestrator_module, "describe_plan", lambda target, route: {"download_bytes": 7})
 
-    def plan(target):
-        assert "w1" in orchestrator.access.cordoned
+    def plan(view, target):
+        # Planning sees the node cordoned on its own copy, and the pool itself is never touched.
+        assert "w1" in view.access.cordoned and view is not orchestrator
+        assert not orchestrator.access.cordoned
         return []
 
-    orchestrator.plan = plan
-    assert orchestrator.cost_of_losing("w1") == 7
+    monkeypatch.setattr(orchestrator_module.Orchestrator, "plan", plan)
+    assert asyncio.run(orchestrator.cost_of_losing("w1")) == 7
     assert not orchestrator.access.cordoned
 
-    def no_room(target):
+    def no_room(view, target):
         raise orchestrator_module.PlacementError("no room")
 
-    orchestrator.plan = no_room
-    assert orchestrator.cost_of_losing("w1") is None
+    monkeypatch.setattr(orchestrator_module.Orchestrator, "plan", no_room)
+    assert asyncio.run(orchestrator.cost_of_losing("w1")) is None
     done(orchestrator)
 
 
@@ -842,7 +844,10 @@ def test_a_cordon_that_moves_the_whole_model_needs_force(monkeypatch):
     orchestrator = pool(w1=record("w1"))
     orchestrator.active = None
     monkeypatch.setattr(orchestrator_module, "runtime", orchestrator)
-    monkeypatch.setattr(orchestrator, "cost_of_losing", lambda name: 3 * orchestrator_module.REPLAN_MOVE_LIMIT_BYTES)
+    async def costly(name):
+        return 3 * orchestrator_module.REPLAN_MOVE_LIMIT_BYTES
+
+    monkeypatch.setattr(orchestrator, "cost_of_losing", costly)
     client = TestClient(orchestrator_module.app)
     refused = client.post("/admin/nodes/w1/cordon")
     assert refused.status_code == 409 and "GiB" in refused.json()["detail"]
@@ -1025,7 +1030,7 @@ def test_a_node_holding_nothing_costs_nothing_to_cordon():
     orchestrator = pool(w1=record("w1"))
     orchestrator.active = object()
     orchestrator.route = [stage("other")]
-    assert orchestrator.cost_of_losing("w1") == 0
+    assert asyncio.run(orchestrator.cost_of_losing("w1")) == 0
     done(orchestrator)
 
 
@@ -1524,7 +1529,7 @@ def waiting_pool(monkeypatch, moved):
     from isharded import orchestrator as module
 
     orchestrator = pool(one=record("one"), two=record("two", quarantined=True))
-    orchestrator.route = [SimpleNamespace(worker_id="one"), SimpleNamespace(worker_id="two")]
+    orchestrator.route = [SimpleNamespace(worker_id="one", start_layer=0, end_layer=1), SimpleNamespace(worker_id="two", start_layer=1, end_layer=2)]
     orchestrator.active = object()
     monkeypatch.setattr(module, "WORKER_RETURN_CHECK_SECONDS", 0.01)
     monkeypatch.setattr(module, "describe_plan", lambda target, route: {"download_bytes": moved})

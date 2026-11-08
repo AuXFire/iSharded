@@ -242,7 +242,7 @@ def running(pool, item, rows, epoch=5, model=None):
     for placed, row in zip(pool.route, rows):
         telemetry = {"row_ms_ema": row}
         health = {"status": "ok", "model": model or item.model_id, "epoch": epoch, "assignment": placed.model_dump(), "telemetry": telemetry}
-        pool.workers[placed.worker_id] = SimpleNamespace(health=health)
+        pool.workers[placed.worker_id] = SimpleNamespace(health=health, live=True, quarantined=False)
     pool.note_rows()
     return pool.route
 
@@ -272,7 +272,7 @@ def test_a_later_load_counts_merged_passes_only_where_its_replies_may_merge(pool
     for placed, row in zip(pool.route, [40.0, 60.0]):
         telemetry = {"row_ms_ema": row, "batch_ms": {"1": row, "8": row * 1.5}, "exact": {"exact_merge_limit": 1, "merge_most": 64}}
         health = {"status": "ok", "model": first.model_id, "epoch": 5, "assignment": placed.model_dump(), "telemetry": telemetry}
-        pool.workers[placed.worker_id] = SimpleNamespace(health=health)
+        pool.workers[placed.worker_id] = SimpleNamespace(health=health, live=True, quarantined=False)
     pool.note_rows()
     devices = stage_devices(pool.route, pool.offered)
     assert pool.measured_passes(first, pool.route, devices) == [{1: 40.0, 8: 60.0}, {1: 60.0, 8: 90.0}]
