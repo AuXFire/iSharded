@@ -1340,6 +1340,9 @@ def test_one_request_gives_one_text_with_the_draft_on(tmp_path, workers, exact) 
             assert trials["won"] + trials["lost"] >= 2, trials
         elif not exact:
             assert route.entry()["draft_passes"] == 0, "nothing proved a checked pass exact, so none ran"
+        elif route.entry()["exact"]["verify_exact"]:
+            # Without this, a probed stage that never checked a guess would pass and prove nothing.
+            assert route.entry()["draft_passes"], "the probe proved checked passes exact, yet none ran"
         status = route.status()
         assert status["fingerprint"]["split"] == "/".join(f"{stage['start_layer']}-{stage['end_layer']}" for stage in status["route"])
     finally:
