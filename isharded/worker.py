@@ -1304,6 +1304,7 @@ class WorkerRuntime:
             await asyncio.to_thread(self._materialize, request, adapter)
             if request.load_id is not None and request.load_id in self.given_up:
                 # Its coordinator stopped waiting, so another worker has these layers by now.
+                print("The coordinator gave up on this load while it ran, so its weights were let go.", flush=True)
                 raise ValueError("the coordinator gave up on this load, so its weights were let go")
         except Exception:
             self._release_weights()
