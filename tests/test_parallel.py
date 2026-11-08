@@ -687,6 +687,14 @@ def test_exact_replies_check_guesses_in_one_pass_only_on_one_stage_that_rounds_t
     assert not exact_runtime(stages=1, limit=None).guesses_in_one_pass()
 
 
+def test_exact_replies_check_no_seeded_sampled_guesses_in_one_pass():
+    """A checked pass accepts or rejects each guess with its own draws, so a seeded reply at a
+    temperature comes out other than plain decoding even where the rounding is the same."""
+    assert exact_runtime(stages=1, verify=True).guesses_in_one_pass(seeded_draw=False)
+    assert not exact_runtime(stages=1, verify=True).guesses_in_one_pass(seeded_draw=True)
+    assert exact_runtime(exact=False).guesses_in_one_pass(seeded_draw=True), "without --exact the draft may guess"
+
+
 def test_a_merge_queue_hands_out_no_more_than_one_pass_may_hold():
     runtime = exact_runtime(limit=1)
     runtime.epoch, runtime.gguf = 1, object()

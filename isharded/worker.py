@@ -660,14 +660,17 @@ class WorkerRuntime:
             return MAX_PARALLEL
         return int((self.exactness or {}).get("exact_merge_limit") or 0) + 1
 
-    def guesses_in_one_pass(self) -> bool:
+    def guesses_in_one_pass(self, seeded_draw: bool = False) -> bool:
         """Whether guesses may be checked several rows to a pass.
 
         That rounds differently from one row at a time on most hardware. Exact replies allow it
         only on a route of one stage whose probe saw no difference, because other stages' probes
-        are not known here.
+        are not known here. A checked pass also draws a sampled token another way than plain
+        decoding does, so exact replies never allow it for a seeded draw at a temperature.
         """
-        return not self.exact or (len(self.route) == 1 and bool((self.exactness or {}).get("verify_exact")))
+        if not self.exact:
+            return True
+        return not seeded_draw and len(self.route) == 1 and bool((self.exactness or {}).get("verify_exact"))
 
     def exact_report(self) -> dict[str, Any]:
         found = self.exactness or {}
@@ -2989,7 +2992,7 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             # differently. A pipeline and plain decoding run one row, so they agree exactly.
             # So a guess from the text only ever goes out on a pipeline, and exact replies check
             # a draft's guesses in one pass only where the probe saw that round the same.
-            ways = [PIPELINED, PLAIN] if runtime.ring_pipelines(following) else [GUESSED, PLAIN] if draft and runtime.guesses_in_one_pass() else [PLAIN]
+            ways = [PIPELINED, PLAIN] if runtime.ring_pipelines(following) else [GUESSED, PLAIN] if draft and runtime.guesses_in_one_pass(bool(following.temperature) and following.seed is not None) else [PLAIN]
             way = runtime.draft_choice.pick(ways)
             if way == PIPELINED:
                 if pipe is None:
