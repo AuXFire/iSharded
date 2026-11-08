@@ -60,8 +60,11 @@ sys.path.insert(0, str(HERE))
 from report import growth_table  # noqa: E402
 
 # The second steady window runs with a dead member, which every node keeps calling.
-DEFAULT_PHASES = ("steady", "status", "links", "join", "leave", "steady", "kill-leader")
-ALL_PHASES = (*DEFAULT_PHASES, "silent-leave", "steady", "freeze-leader", "partition")
+# The link pass comes last: it loads every node at once, and on one shared machine that can
+# disturb whatever is measured after it.
+CORE_PHASES = ("steady", "status", "join", "leave", "steady", "kill-leader")
+DEFAULT_PHASES = (*CORE_PHASES, "links")
+ALL_PHASES = (*CORE_PHASES, "silent-leave", "steady", "freeze-leader", "partition", "links")
 POLL_SECONDS = 0.5
 # Phases that still mean something when the mesh never agreed: the rest wait for it to.
 UNSETTLED_PHASES = {"steady", "status", "links"}
@@ -648,7 +651,9 @@ PHASES = {
 }
 
 
-async def run(args: argparse.Namespace, nodes: int) -> dict[str, Any]:
+async def run(args: argparse.Namespace, nodes: int, save: Any = None) -> dict[str, Any]:
+    """One size, every phase asked for. ``save`` gets the results so far after each phase,
+    so a run stopped from outside still leaves what it measured."""
     pool = Pool(args, nodes)
     result: dict[str, Any] = {
         "nodes": nodes,
@@ -673,6 +678,8 @@ async def run(args: argparse.Namespace, nodes: int) -> dict[str, Any]:
             print(f"[N={nodes}] {key} ...", flush=True)
             result["phases"][key] = await PHASES[phase](pool)
             print(f"[N={nodes}] {key}: {json.dumps(result['phases'][key])[:400]}", flush=True)
+            if save is not None:
+                save(result)
     except Exception as exc:  # a failed phase still leaves the results so far, and no processes
         result["error"] = f"{type(exc).__name__}: {exc}"
         print(f"[N={nodes}] {result['error']}", flush=True)
@@ -719,16 +726,20 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("a run needs at least 3 nodes: one to lead, one to leave, one to stay")
     results = []
     for nodes in sizes:
-        result = asyncio.run(run(args, nodes))
+
+        def save(result: dict[str, Any], nodes: int = nodes) -> None:
+            text = json.dumps(result, indent=2)
+            if args.out and len(sizes) == 1:
+                Path(args.out).write_text(text, encoding="utf-8")
+            if args.out_dir:
+                Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+                (Path(args.out_dir) / f"scale-{nodes}.json").write_text(text, encoding="utf-8")
+
+        result = asyncio.run(run(args, nodes, save))
         results.append(result)
-        text = json.dumps(result, indent=2)
-        if args.out and len(sizes) == 1:
-            Path(args.out).write_text(text, encoding="utf-8")
-        if args.out_dir:
-            Path(args.out_dir).mkdir(parents=True, exist_ok=True)
-            (Path(args.out_dir) / f"scale-{nodes}.json").write_text(text, encoding="utf-8")
+        save(result)
         if not args.out and not args.out_dir:
-            print(text)
+            print(json.dumps(result, indent=2))
     if len(results) > 1:
         print(growth_table(results))
     return 1 if any("error" in result or not result.get("startup", {}).get("settled") for result in results) else 0
