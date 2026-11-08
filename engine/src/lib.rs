@@ -37,6 +37,8 @@ pub struct Engine {
     node: Node,
     /// What `attach` was given, which the probe runs a compute of its own on.
     api: Mutex<Option<StageApi>>,
+    /// The staged route's pass limits, which the watchdog takes at the flip.
+    staged_limits: Mutex<Option<Limits>>,
 }
 
 /// Folds a sample into a running average that leans on recent ones, so a figure follows the
@@ -93,7 +95,7 @@ pub unsafe extern "C" fn isharded_engine_new(target: *const c_char, tensors: *co
     };
     let capture = Arc::new(Capture::new(CStr::from_ptr(target).to_owned(), *tensors));
     let watchdog = Arc::new(Watchdog::new(node.refuser(), || std::process::abort()));
-    Box::into_raw(Box::new(Engine { capture, snapshots: Arc::default(), watchdog, node, api: Mutex::new(None) }))
+    Box::into_raw(Box::new(Engine { capture, snapshots: Arc::default(), watchdog, node, api: Mutex::new(None), staged_limits: Mutex::new(None) }))
 }
 
 /// The eval callback, with the engine as its user data.
@@ -238,6 +240,84 @@ pub unsafe extern "C" fn isharded_engine_connect(engine: *mut Engine, links: *co
 #[no_mangle]
 pub unsafe extern "C" fn isharded_engine_close_ring(engine: *mut Engine) {
     (*engine).node.close_ring();
+}
+
+// The calls below hold the next route beside the current one. They were added without a new
+// ABI version: nothing above changed, and Python looks each of them up before it uses them.
+
+/// Opens the next route's ring beside the current one, which goes on carrying replies.
+///
+/// # Safety
+/// `plan` must be a NUL-terminated JSON string.
+#[no_mangle]
+pub unsafe extern "C" fn isharded_engine_stage(engine: *mut Engine, plan: *const c_char) -> i32 {
+    let (Some(limits), Some(plan)) = (read_json::<Limits>(plan), read_json::<Plan>(plan)) else {
+        return -1;
+    };
+    if (*engine).node.stage(plan).is_err() {
+        return -1;
+    }
+    *(*engine).staged_limits.lock() = Some(limits);
+    0
+}
+
+/// Starts dialling the staged ring's neighbours, and returns at once. The stats say how it went.
+///
+/// # Safety
+/// `links` must be a NUL-terminated JSON string.
+#[no_mangle]
+pub unsafe extern "C" fn isharded_engine_connect_staged(engine: *mut Engine, links: *const c_char) -> i32 {
+    let Some(links) = read_json::<Links>(links) else {
+        return -1;
+    };
+    (*engine).node.connect_staged_in_background(links);
+    0
+}
+
+/// Gives slots, a JSON list, to one of the routes held here while two overlap.
+///
+/// # Safety
+/// `slots` must be a NUL-terminated JSON string.
+#[no_mangle]
+pub unsafe extern "C" fn isharded_engine_give_slots(engine: *mut Engine, epoch: u64, slots: *const c_char) -> i32 {
+    let Some(slots) = read_json::<Vec<u32>>(slots) else {
+        return -1;
+    };
+    match (*engine).node.give_slots(epoch, &slots) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// The flip: the staged route takes every slot listed and becomes the current one. One if
+/// nothing of the old route is left queued or running here within `wait_ms`, zero if
+/// something is, and negative if that route is not staged here.
+///
+/// # Safety
+/// `slots` must be a NUL-terminated JSON string.
+#[no_mangle]
+pub unsafe extern "C" fn isharded_engine_flip(engine: *mut Engine, epoch: u64, slots: *const c_char, wait_ms: u32) -> i32 {
+    let Some(slots) = read_json::<Vec<u32>>(slots) else {
+        return -1;
+    };
+    match (*engine).node.flip(epoch, &slots, std::time::Duration::from_millis(u64::from(wait_ms))) {
+        Ok(quiet) => {
+            if let Some(limits) = (*engine).staged_limits.lock().take() {
+                (*engine).watchdog.set_limits(limits);
+            }
+            i32::from(quiet)
+        }
+        Err(_) => -1,
+    }
+}
+
+/// Closes one route's ring and leaves any other alone. One if it was held here.
+///
+/// # Safety
+/// `engine` must come from `isharded_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn isharded_engine_close_epoch(engine: *mut Engine, epoch: u64) -> i32 {
+    i32::from((*engine).node.close_epoch(epoch))
 }
 
 /// # Safety

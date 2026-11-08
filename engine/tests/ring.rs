@@ -1142,3 +1142,410 @@ fn padding_is_dropped_by_whoever_gets_it_and_what_follows_still_arrives() {
     assert_eq!(answer(&mut ring).id, 2);
     voice.close();
 }
+
+// ---- Two epochs on one node (spike P3) ----
+
+const NEXT: u64 = 8;
+const NEXT_CLOSING: &[u8] = &[200; 32];
+
+/// The next route's keys: other keys for the same links, as a coordinator gives each epoch.
+fn next_keys(index: u16, count: u16) -> Keys {
+    let ends = count > 1 && (index == 0 || index + 1 == count);
+    let hop = |edge: u16| vec![edge as u8 + 101; 32];
+    Keys { back: (index > 0).then(|| hop(index - 1)), next: (index + 1 < count).then(|| hop(index)), closing: ends.then(|| NEXT_CLOSING.to_vec()) }
+}
+
+fn next_plan(index: u16, count: u16, epoch: u64, limit_ms: u64) -> Plan {
+    Plan { epoch, index, count, keys: next_keys(index, count), ack_timeout_ms: limit_ms, silence_timeout_ms: limit_ms, merge_passes: true, merge_most: None }
+}
+
+/// Opens the next route beside the current one on the same nodes, dials its links, and gives
+/// it `slots`. With `relayed`, the staged hop into that stage goes through a relay.
+fn stage_next(ring: &Ring, epoch: u64, limit_ms: u64, slots: &[u32], relayed: Option<usize>) -> Option<Relay> {
+    let count = ring.nodes.len() as u16;
+    for (index, node) in ring.nodes.iter().enumerate() {
+        node.stage(next_plan(index as u16, count, epoch, limit_ms)).unwrap();
+    }
+    let relay = relayed.map(|door| Relay::to(ring.doors[door].port));
+    let address = |at: usize| {
+        let port = relay.as_ref().filter(|_| relayed == Some(at)).map_or(ring.doors[at].port, |item| item.port);
+        Address { address: format!("127.0.0.1:{port}"), fingerprint: ring.doors[at].fingerprint.clone() }
+    };
+    for (index, node) in ring.nodes.iter().enumerate().rev() {
+        let next = (index + 1 < ring.nodes.len()).then(|| address(index + 1));
+        let entry = (index + 1 == ring.nodes.len() && count > 1).then(|| address(0));
+        node.connect_staged(Links { next, entry, timeout_ms: 3000 }).unwrap();
+        node.give_slots(epoch, slots).unwrap();
+    }
+    relay
+}
+
+fn on(epoch: u64, slot: u32, id: u64, token: u32) -> Pass {
+    Pass { epoch, slot, ..pass(id, token, id as u32) }
+}
+
+/// What two stages make of a token.
+fn through_two(token: u32) -> u32 {
+    (token * 10 + 1) * 10 + 2
+}
+
+fn refusal(ring: &mut Ring) -> Nack {
+    let (kind, body) = ring.frames.next().unwrap();
+    assert_eq!(kind, Kind::Nack, "expected a refusal");
+    Nack::decode(&body).unwrap()
+}
+
+#[test]
+fn two_epochs_share_one_node_each_on_its_own_ring_and_keys() {
+    let mut ring = ring(2, true, Duration::ZERO, 2000);
+    patient_client(&ring);
+    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+    assert_eq!(answer(&mut ring).tokens, vec![through_two(5), 9]);
+    stage_next(&ring, NEXT, 2000, &[1], None);
+    let stats = ring.nodes[0].stats();
+    assert_eq!((stats.epoch, stats.staged_epoch), (Some(7), Some(NEXT)));
+    // Ring 7 goes on carrying replies, ring 8 carries its own, interleaved one by one.
+    for id in 2..=61 {
+        let (epoch, slot) = if id % 2 == 0 { (7, 0) } else { (NEXT, 1) };
+        ring.client.send(&on(epoch, slot, id, id as u32 % 9 + 1).encode()).unwrap();
+    }
+    let mut last = [1, 0];
+    for _ in 2..=61 {
+        let got = answer(&mut ring);
+        let (epoch, key) = if got.slot == 0 { (7, CLOSING) } else { (NEXT, NEXT_CLOSING) };
+        assert_eq!(got.epoch, epoch, "{got:?}");
+        assert!(got.is_sealed_by(key), "answer {} not sealed by its own route's key", got.id);
+        assert_eq!(got.tokens, vec![through_two(got.id as u32 % 9 + 1), got.id as u32]);
+        assert!(got.id > last[got.slot as usize], "slot {} out of order", got.slot);
+        last[got.slot as usize] = got.id;
+    }
+    assert!(ring.nodes.iter().all(|node| node.stats().refusals == 0));
+    assert!(ring.nodes[1].stats().closing_up);
+}
+
+#[test]
+fn after_promotion_the_old_epoch_is_refused_and_what_it_had_in_flight_still_lands() {
+    let mut ring = ring(2, true, Duration::from_millis(40), 2000);
+    patient_client(&ring);
+    stage_next(&ring, NEXT, 2000, &[1], None);
+    ring.client.send(&on(NEXT, 1, 1, 3).encode()).unwrap();
+    assert_eq!(answer(&mut ring).epoch, NEXT);
+    // Five passes of the old route in flight when every stage flips.
+    for id in 2..=6 {
+        ring.client.send(&on(7, 0, id, 4).encode()).unwrap();
+    }
+    // The entry is the gate: a pass it has not taken yet is refused after its flip. So flip
+    // once the first has reached the second stage and the rest wait at the entry or between.
+    wait_until("the old route's first pass reaching the second stage", || ring.seen[1].load(Ordering::SeqCst) >= 2); // the first was route 8's
+    for node in &ring.nodes {
+        node.promote(NEXT).unwrap();
+    }
+    assert!(ring.nodes[0].promote(NEXT).is_err(), "nothing is staged any more");
+    let stats = ring.nodes[0].stats();
+    assert_eq!((stats.epoch, stats.staged_epoch), (Some(NEXT), None));
+    for id in 2..=6 {
+        let (kind, body) = ring.frames.next().unwrap();
+        assert_eq!(kind, Kind::Result, "pass {id}: {:?}", Nack::decode(body).ok());
+        let got = Answer::decode(body).unwrap();
+        assert_eq!((got.id, got.epoch, got.tokens[0]), (id, 7, through_two(4)));
+    }
+    ring.client.send(&on(7, 0, 7, 4).encode()).unwrap();
+    let nack = refusal(&mut ring);
+    assert_eq!((nack.id, nack.refusal, nack.epoch), (7, Refusal::Epoch, 7));
+    // Once the old route has drained everywhere, every slot belongs to the new route.
+    wait_until("the old route draining", || ring.nodes.iter().all(|node| node.stats().retiring_epochs.is_empty()));
+    for (id, slot) in [(8, 0), (9, 1)] {
+        ring.client.send(&on(NEXT, slot, id, 2).encode()).unwrap();
+        let got = answer(&mut ring);
+        assert_eq!((got.id, got.epoch, got.tokens[0]), (id, NEXT, through_two(2)));
+    }
+    // Drained, the old ring is shut: its hop key no longer opens a link.
+    let door = &ring.doors[1];
+    let dial = |key: &[u8], epoch: u64| link::dial(&format!("127.0.0.1:{}", door.port), Some(&door.fingerprint), key, Role::Hop, epoch, Duration::from_secs(1));
+    wait_until("the old ring shutting", || dial(&hop_key(0), 7).is_err());
+    assert!(dial(&next_keys(1, 2).back.unwrap(), NEXT).is_ok());
+}
+
+#[test]
+fn a_silent_link_on_the_staged_ring_leaves_the_current_rings_replies_alone() {
+    let mut ring = ring(2, true, Duration::ZERO, 2000);
+    patient_client(&ring);
+    let relay = stage_next(&ring, NEXT, 400, &[1], Some(1)).unwrap();
+    ring.client.send(&on(NEXT, 1, 1, 3).encode()).unwrap();
+    assert_eq!(answer(&mut ring).epoch, NEXT);
+    thread::sleep(Duration::from_millis(300)); // heartbeats prove the staged hop
+    relay.refuse(true);
+    relay.hold();
+    let began = Instant::now();
+    let (mut worst, mut staged_loss) = (Duration::ZERO, None);
+    let mut id = 1;
+    while began.elapsed() < Duration::from_millis(2500) {
+        id += 1;
+        let sent = Instant::now();
+        ring.client.send(&on(7, 0, id, 5).encode()).unwrap();
+        loop {
+            let (kind, body) = ring.frames.next().unwrap();
+            if kind == Kind::Nack {
+                let nack = Nack::decode(body).unwrap();
+                assert_eq!((nack.epoch, nack.refusal, nack.stage), (NEXT, Refusal::FailedStage, 1), "{nack:?}");
+                staged_loss.get_or_insert(began.elapsed());
+                continue;
+            }
+            let got = Answer::decode(body).unwrap();
+            assert_eq!((got.id, got.epoch, got.tokens[0]), (id, 7, through_two(5)));
+            break;
+        }
+        worst = worst.max(sent.elapsed());
+        thread::sleep(Duration::from_millis(20));
+    }
+    let staged_loss = staged_loss.expect("the staged ring never said its hop was lost");
+    println!("P3SILENT {{\"passes\": {}, \"worst_ms\": {:.2}, \"staged_loss_ms\": {}}}", id - 1, worst.as_secs_f64() * 1000.0, staged_loss.as_millis());
+    assert!(worst < Duration::from_millis(250), "the current ring was held up: {worst:?}");
+    assert!(ring.nodes[0].stats().next_up);
+    assert_eq!(ring.nodes[0].stats().staged_epoch, Some(NEXT));
+}
+
+#[test]
+fn a_pass_on_a_slot_the_other_epoch_owns_is_refused_and_touches_nothing() {
+    let mut ring = ring(2, true, Duration::from_millis(30), 2000);
+    patient_client(&ring); // a regression fails here instead of hanging
+    stage_next(&ring, NEXT, 2000, &[1], None);
+    // Slot 0 is busy on route 7, with passes queued behind the one running.
+    for id in 1..=4 {
+        ring.client.send(&on(7, 0, id, 1).encode()).unwrap();
+    }
+    // Route 8 tries slot 0 as a new reply, which on one KV would wipe route 7's.
+    ring.client.send(&Pass { generation: 2, ..on(NEXT, 0, 5, 1) }.encode()).unwrap();
+    ring.client.send(&on(7, 1, 6, 1).encode()).unwrap();
+    let (mut answered, mut refused) = (vec![], vec![]);
+    for _ in 0..6 {
+        let (kind, body) = ring.frames.next().unwrap();
+        match kind {
+            Kind::Result => answered.push(Answer::decode(body).unwrap().id),
+            Kind::Nack => refused.push(Nack::decode(body).unwrap()),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(answered, vec![1, 2, 3, 4]);
+    let refused: Vec<_> = refused.iter().map(|nack| (nack.id, nack.refusal, nack.message.clone())).collect();
+    assert_eq!(refused, vec![(5, Refusal::Epoch, "slot 0 belongs to route 7".to_string()), (6, Refusal::Epoch, "slot 1 belongs to route 8".to_string())]);
+    assert_eq!(ring.nodes[0].stats().dropped, 0, "a refused pass cleared another route's queue");
+    assert_eq!(ring.seen[0].load(Ordering::SeqCst), 4);
+    // The slot handed over later is the new route's.
+    for node in &ring.nodes {
+        node.give_slots(NEXT, &[0]).unwrap();
+    }
+    ring.client.send(&Pass { generation: 2, ..on(NEXT, 0, 7, 1) }.encode()).unwrap();
+    assert_eq!(answer(&mut ring).epoch, NEXT);
+}
+
+#[test]
+fn a_flood_on_one_epoch_does_not_starve_the_other() {
+    let mut ring = ring(2, true, Duration::from_millis(15), 4000);
+    patient_client(&ring);
+    stage_next(&ring, NEXT, 4000, &[1], None);
+    // One slot, so nothing merges and each pass costs a full trip.
+    for id in 1..=40 {
+        ring.client.send(&on(7, 0, id, 1).encode()).unwrap();
+    }
+    ring.client.send(&on(NEXT, 1, 41, 1).encode()).unwrap();
+    let order: Vec<u64> = (0..41).map(|_| answer(&mut ring).id).collect();
+    let at = order.iter().position(|id| *id == 41).unwrap();
+    println!("P3FAIR {{\"queued_ahead\": 40, \"answered_at\": {at}}}");
+    assert!(at <= 5, "route 8 waited behind route 7's flood: answered {at}th");
+}
+
+fn percentile(sorted: &[f64], share: f64) -> f64 {
+    sorted[((sorted.len() - 1) as f64 * share).round() as usize]
+}
+
+#[test]
+fn time_a_plain_reopen_and_a_staged_promotion() {
+    let repetitions = 20;
+    let mut ring = ring(2, true, Duration::ZERO, 2000);
+    patient_client(&ring);
+    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+    answer(&mut ring);
+    let mut id = 1;
+    let count = ring.nodes.len() as u16;
+    let doors: Vec<Address> = ring.doors.iter().map(|door| Address { address: format!("127.0.0.1:{}", door.port), fingerprint: door.fingerprint.clone() }).collect();
+    // The fallback: every stage opens the new route while idle, dials it, and the first pass runs.
+    let mut reopen = vec![];
+    for rep in 0..repetitions {
+        let epoch = 100 + rep as u64;
+        let began = Instant::now();
+        for (index, node) in ring.nodes.iter().enumerate() {
+            node.open(next_plan(index as u16, count, epoch, 2000)).unwrap();
+        }
+        for (index, node) in ring.nodes.iter().enumerate().rev() {
+            let next = (index + 1 < ring.nodes.len()).then(|| doors[index + 1].clone());
+            let entry = (index + 1 == ring.nodes.len()).then(|| doors[0].clone());
+            node.connect(Links { next, entry, timeout_ms: 3000 }).unwrap();
+        }
+        id += 1;
+        ring.client.send(&on(epoch, 0, id, 5).encode()).unwrap();
+        let got = answer(&mut ring);
+        assert_eq!((got.id, got.epoch), (id, epoch));
+        reopen.push(began.elapsed().as_secs_f64() * 1000.0);
+    }
+    // Dual epoch: the next route is staged and dialled beforehand; only the flip is timed.
+    let mut promote = vec![];
+    for rep in 0..repetitions {
+        let epoch = 200 + rep as u64;
+        stage_next(&ring, epoch, 2000, &[], None);
+        thread::sleep(Duration::from_millis(50));
+        let began = Instant::now();
+        // As a worker flips: every slot to the new route, which then takes over.
+        for node in &ring.nodes {
+            assert!(node.flip(epoch, &[0], Duration::from_secs(1)).unwrap());
+        }
+        id += 1;
+        ring.client.send(&on(epoch, 0, id, 5).encode()).unwrap();
+        let got = answer(&mut ring);
+        assert_eq!((got.id, got.epoch), (id, epoch));
+        promote.push(began.elapsed().as_secs_f64() * 1000.0);
+    }
+    for (what, times) in [("reopen", &mut reopen), ("promote", &mut promote)] {
+        let raw = times.iter().map(|ms| format!("{ms:.3}")).collect::<Vec<_>>().join(", ");
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "P3TIME {{\"what\": \"{what}\", \"n\": {}, \"p50_ms\": {:.3}, \"max_ms\": {:.3}, \"min_ms\": {:.3}, \"raw_ms\": [{raw}]}}",
+            times.len(),
+            percentile(times, 0.5),
+            times[times.len() - 1],
+            times[0]
+        );
+    }
+}
+
+/// What two stages make of a frame that is either an answer or a refusal.
+fn landed(ring: &mut Ring) -> Result<Answer, Nack> {
+    let (kind, body) = ring.frames.next().unwrap();
+    match kind {
+        Kind::Result => Ok(Answer::decode(&body).unwrap()),
+        Kind::Nack => Err(Nack::decode(&body).unwrap()),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn after_promotion_a_slot_stays_the_old_routes_until_it_has_drained() {
+    let mut ring = ring(2, true, Duration::from_millis(60), 2000);
+    patient_client(&ring); // a regression fails instead of hanging
+    stage_next(&ring, NEXT, 2000, &[1], None);
+    // Route 7 has three passes of one reply on slot 0, spread along the route.
+    for id in 1..=3 {
+        ring.client.send(&on(7, 0, id, 1).encode()).unwrap();
+    }
+    wait_until("route 7's first pass reaching the second stage", || ring.seen[1].load(Ordering::SeqCst) >= 1);
+    for node in &ring.nodes {
+        node.promote(NEXT).unwrap();
+    }
+    // A new reply of route 8 on slot 0 now would wipe route 7's passes still on that slot.
+    ring.client.send(&Pass { generation: 2, ..on(NEXT, 0, 4, 1) }.encode()).unwrap();
+    let (mut answered, mut refused) = (vec![], vec![]);
+    for _ in 0..4 {
+        match landed(&mut ring) {
+            Ok(got) => answered.push((got.id, got.epoch)),
+            Err(nack) => refused.push((nack.id, nack.refusal, nack.message)),
+        }
+    }
+    assert_eq!(answered, vec![(1, 7), (2, 7), (3, 7)], "route 7 lost passes to route 8's new reply");
+    assert_eq!(refused, vec![(4, Refusal::Epoch, "slot 0 belongs to route 7".to_string())]);
+    assert_eq!(ring.nodes[0].stats().dropped, 0);
+    // Drained, the slot is the new route's, as every other slot is.
+    wait_until("the old route draining", || ring.nodes.iter().all(|node| node.stats().retiring_epochs.is_empty()));
+    ring.client.send(&Pass { generation: 2, ..on(NEXT, 0, 5, 1) }.encode()).unwrap();
+    let got = answer(&mut ring);
+    assert_eq!((got.id, got.epoch, got.tokens[0]), (5, NEXT, through_two(1)));
+}
+
+#[test]
+fn a_refusal_waits_behind_the_older_passes_of_its_slot() {
+    let mut ring = ring(2, true, Duration::ZERO, 2000);
+    patient_client(&ring);
+    // A slow last stage, so passes queue there.
+    let slow = Adder { stage: 2, last: true, delay: Duration::from_millis(80), seen: ring.seen[1].clone() };
+    ring.nodes[1].set_compute(Box::new(slow));
+    stage_next(&ring, NEXT, 2000, &[], None);
+    for id in 1..=3 {
+        ring.client.send(&on(7, 0, id, 1).encode()).unwrap();
+    }
+    wait_until("the first pass running at the last stage", || ring.seen[1].load(Ordering::SeqCst) >= 1);
+    // The slot goes to route 8 there while passes 2 and 3 still wait; a later one is refused.
+    ring.nodes[1].give_slots(NEXT, &[0]).unwrap();
+    ring.client.send(&on(7, 0, 4, 1).encode()).unwrap();
+    // Answers come by the closing link and refusals walk back, so they may cross on the way.
+    // What matters is when the refusal left: sent at once, it would free the slot at the entry
+    // while 2 and 3 were still to run on it there, and a new reply would share the slot.
+    let mut answered = vec![];
+    for _ in 0..4 {
+        match landed(&mut ring) {
+            Ok(got) => answered.push(got.id),
+            Err(nack) => {
+                assert_eq!((nack.id, nack.refusal), (4, Refusal::Epoch));
+                assert_eq!(ring.nodes[1].stats().passes, 3, "refused before the slot's older passes had run");
+            }
+        }
+    }
+    assert_eq!(answered, vec![1, 2, 3]);
+}
+
+#[test]
+fn a_flip_hands_every_slot_over_once_the_old_routes_queue_here_has_run() {
+    let mut ring = ring(2, true, Duration::from_millis(40), 2000);
+    patient_client(&ring);
+    stage_next(&ring, NEXT, 2000, &[], None);
+    assert!(ring.nodes[0].flip(NEXT + 1, &[0], Duration::ZERO).is_err(), "only a staged route can take over");
+    for id in 1..=3 {
+        ring.client.send(&on(7, 0, id, 1).encode()).unwrap();
+    }
+    wait_until("route 7's first pass running at the entry", || ring.seen[0].load(Ordering::SeqCst) >= 1);
+    // The entry flips first and returns once its own queue of route 7 has run, then the next.
+    let began = Instant::now();
+    assert!(ring.nodes[0].flip(NEXT, &[0, 1], Duration::from_secs(2)).unwrap());
+    assert!(began.elapsed() >= Duration::from_millis(60), "the flip came back with route 7 still queued");
+    // A pass still on its way here when this stage flips would be refused, as its slot is
+    // route 8's by then. The orchestrator flips every stage at once and replays what that
+    // cuts; here the last stage flips once all three have reached it.
+    wait_until("route 7's last pass running at the last stage", || ring.seen[1].load(Ordering::SeqCst) >= 3);
+    assert!(ring.nodes[1].flip(NEXT, &[0, 1], Duration::from_secs(2)).unwrap());
+    for id in 1..=3 {
+        let got = answer(&mut ring);
+        assert_eq!((got.id, got.epoch, got.tokens[0]), (id, 7, through_two(1)));
+    }
+    // From now on route 7 is refused, and route 8 has every slot at once.
+    ring.client.send(&on(7, 0, 4, 1).encode()).unwrap();
+    assert_eq!(refusal(&mut ring).refusal, Refusal::Epoch);
+    for (id, slot) in [(5, 0), (6, 1)] {
+        ring.client.send(&Pass { generation: 2, ..on(NEXT, slot, id, 2) }.encode()).unwrap();
+        let got = answer(&mut ring);
+        assert_eq!((got.id, got.epoch, got.tokens[0]), (id, NEXT, through_two(2)));
+    }
+    let stats = ring.nodes[0].stats();
+    assert_eq!((stats.epoch, stats.staged_epoch), (Some(NEXT), None));
+}
+
+#[test]
+fn closing_one_epoch_leaves_the_other_serving() {
+    let mut ring = ring(2, true, Duration::ZERO, 2000);
+    patient_client(&ring);
+    stage_next(&ring, NEXT, 2000, &[1], None);
+    // A staged route given up: route 7 goes on, and slot 1 is route 7's again.
+    for node in &ring.nodes {
+        assert!(node.close_epoch(NEXT));
+        assert!(!node.close_epoch(NEXT), "closed twice");
+    }
+    let stats = ring.nodes[0].stats();
+    assert_eq!((stats.epoch, stats.staged_epoch), (Some(7), None));
+    ring.client.send(&on(7, 1, 1, 3).encode()).unwrap();
+    let got = answer(&mut ring);
+    assert_eq!((got.id, got.epoch, got.tokens[0]), (1, 7, through_two(3)));
+    ring.client.send(&on(NEXT, 1, 2, 3).encode()).unwrap();
+    assert_eq!(refusal(&mut ring).message, "this stage is on route 7");
+    // The staged ring's keys open nothing any more.
+    let door = &ring.doors[1];
+    let dial = |key: &[u8], epoch: u64| link::dial(&format!("127.0.0.1:{}", door.port), Some(&door.fingerprint), key, Role::Hop, epoch, Duration::from_secs(1));
+    assert!(dial(&next_keys(1, 2).back.unwrap(), NEXT).is_err());
+    assert!(dial(&hop_key(0), 7).is_ok());
+}
