@@ -36,7 +36,9 @@ SIZING_TRIES = 5
 SIZING_FIRST_TOKENS_PER_UNIT = 64  # above any text here, so the first try cannot overrun a size that fits
 CACHED_REPLY_TOKENS = 8  # only the first token is being timed
 LONGEST_ERROR = 200
-REPORT_FORMAT = 2
+REPORT_FORMAT = 3
+# The engine's averages for one stage, each taken on that stage's own clock, in microseconds.
+TRACE_FIELDS = ("compute_us", "keep_us", "queue_us", "write_us", "enqueue_us", "wait_us", "hop_us", "link_rtt_us", "sample_us", "turnaround_us")
 
 PROSE = (
     "The ferry left the harbour an hour late because the tide had turned early.",
@@ -135,6 +137,16 @@ def positive(text: str) -> int:
     return number
 
 
+def price(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        value = -1.0
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a price of zero or more")
+    return value
+
+
 def comma_list(text: str) -> list[int]:
     return [positive(part) for part in text.split(",")]
 
@@ -227,7 +239,31 @@ def stage_precision(hardware: dict[str, Any]) -> str | None:
     return ", ".join(kinds) or None
 
 
-def route_facts(status: dict[str, Any]) -> list[dict[str, Any]]:
+def stage_trace(before: dict[str, Any], after: dict[str, Any], worker_id: str) -> dict[str, Any] | None:
+    """Where a stage's time went, from its engine, and what keeping state cost it during this run.
+
+    The averages lean on recent passes. The totals run from when the stage loaded, so this
+    run's share is the difference, and a copy of kept state is part of the compute around it.
+    """
+    new = telemetry_of(after, worker_id).get("ring") or {}
+    if not new:
+        return None
+    old = telemetry_of(before, worker_id).get("ring") or {}
+
+    def grew(name: str) -> int:
+        return max((new.get(name) or 0) - (old.get(name) or 0), 0)
+
+    trace: dict[str, Any] = {name: new.get(name) for name in TRACE_FIELDS if name in new}
+    keeps, kept_us, compute_us = grew("keeps_total"), grew("keep_us_total"), grew("compute_us_total")
+    trace["keeps"] = keeps
+    trace["keep_bytes"] = new.get("keep_bytes") if keeps else None
+    trace["keep_ms_per_copy"] = round(kept_us / keeps / 1000, 3) if keeps else None
+    # A ring opened again during the run counts its compute afresh, and then this says nothing.
+    trace["keep_share_of_compute"] = round(min(kept_us / compute_us, 1.0), 3) if keeps and compute_us else None
+    return trace
+
+
+def route_facts(status: dict[str, Any], before: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """One row per stage, numbered. A worker's id is often its machine's name."""
     rows = []
     route = status.get("route") or []
@@ -250,6 +286,9 @@ def route_facts(status: dict[str, Any]) -> list[dict[str, Any]]:
             "next_stage_ms": rounded(telemetry.get("downstream_ms_ema")),
             "compute_ms": rounded(telemetry.get("compute_ms_ema")),
             "control_ms": worker.get("control_latency_ms"),
+            "cuda_graphs": telemetry.get("cuda_graphs"),
+            "price_per_hour": telemetry.get("price_per_hour"),
+            "trace": stage_trace(before or status, status, stage["worker_id"]),
         })  # fmt: skip
     return rows
 
@@ -266,7 +305,105 @@ def decoding_facts(before: dict[str, Any], after: dict[str, Any]) -> dict[str, A
         depth = max(depth, new_pipe.get("depth", 0))
         passes += max(new.get("draft_passes", 0) - old.get("draft_passes", 0), 0)
         per_pass = new.get("draft_tokens_per_pass") or per_pass
-    return {"pipeline_tokens": made, "pipeline_misses": misses, "pipeline_depth": depth, "draft_passes": passes, "draft_tokens_per_pass": per_pass}
+    return {
+        "pipeline_tokens": made, "pipeline_misses": misses, "pipeline_depth": depth, "draft_passes": passes, "draft_tokens_per_pass": per_pass,
+        "draft_guess": guess_facts(before, after),
+    }  # fmt: skip
+
+
+def guess_facts(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any] | None:
+    """The draft's real time per guess during this run, as a pipelined pass waited for it.
+
+    This is the law's g, on the entry, sharing its device with the entry stage, and not a
+    draft timed on its own. A steady guess ran one row. The rest read text again after a miss.
+    """
+    totals = dict.fromkeys(("guesses", "ms_total", "steady", "steady_ms_total"), 0.0)
+    for worker_id in route_ids(after):
+        old, new = telemetry_of(before, worker_id).get("draft_guess") or {}, telemetry_of(after, worker_id).get("draft_guess") or {}
+        for name in totals:
+            totals[name] += max((new.get(name) or 0) - (old.get(name) or 0), 0)
+    if not totals["guesses"]:
+        return None
+    catch_up = totals["guesses"] - totals["steady"]
+
+    def mean(ms: float, count: float) -> float | None:
+        return round(ms / count, 2) if count else None
+
+    return {
+        "guesses": int(totals["guesses"]),
+        "ms_per_guess": mean(totals["ms_total"], totals["guesses"]),
+        "steady_guesses": int(totals["steady"]),
+        "steady_ms_per_guess": mean(totals["steady_ms_total"], totals["steady"]),
+        "catch_up_ms_per_guess": mean(totals["ms_total"] - totals["steady_ms_total"], catch_up),
+    }
+
+
+def route_hosts(status: dict[str, Any]) -> dict[str, list[str]]:
+    """The route's workers by machine. Only ever used inside this run, never written out."""
+    workers = status.get("workers") or {}
+    hosts: dict[str, list[str]] = {}
+    for worker_id in route_ids(status):
+        host = ((workers.get(worker_id) or {}).get("hardware") or {}).get("host_id") or worker_id
+        hosts.setdefault(host, []).append(worker_id)
+    return hosts
+
+
+def route_price(status: dict[str, Any], fallback: float | None) -> tuple[float | None, int]:
+    """What the route's machines cost an hour together, and how many had no price.
+
+    A price is a machine's, so stages sharing one count it once. A machine whose node set no
+    price takes --price-per-hour. With any machine unpriced there is no total, as part of a
+    cost passes too easily for all of it.
+    """
+    total, missing = 0.0, 0
+    for workers in route_hosts(status).values():
+        prices = [telemetry_of(status, worker_id).get("price_per_hour") for worker_id in workers]
+        known = [item for item in prices if isinstance(item, (int, float))]
+        found = max(known) if known else fallback
+        if found is None:
+            missing += 1
+        else:
+            total += found
+    return (None if missing or not route_hosts(status) else total), missing
+
+
+def power_readings(status: dict[str, Any]) -> dict[tuple[str, str, str], float]:
+    """Each measured device's energy so far, in joules. Two workers on one card count it once."""
+    readings: dict[tuple[str, str, str], float] = {}
+    for host, workers in route_hosts(status).items():
+        for worker_id in workers:
+            power = telemetry_of(status, worker_id).get("power") or {}
+            if power.get("source") and isinstance(power.get("joules"), (int, float)):
+                key = (host, str(power["source"]), str(power.get("device")))
+                readings[key] = max(readings.get(key, 0.0), float(power["joules"]))
+    return readings
+
+
+def energy_between(start: dict[tuple[str, str, str], float], end: dict[tuple[str, str, str], float]) -> tuple[float, int] | None:
+    """Joules the measured devices used between two readings, and how many devices that is."""
+    both = start.keys() & end.keys()
+    if not both:
+        return None
+    return sum(max(end[key] - start[key], 0.0) for key in both), len(both)
+
+
+def add_costs(level: dict[str, Any], rounds: list[tuple[list[Reply], float]], price: float | None, energy: tuple[float, int] | None) -> None:
+    """Money and energy per token at one level, over all its rounds.
+
+    Both count the whole time the rounds ran, so a route that sits idle between tokens pays for
+    the wait, as a rented machine does.
+    """
+    tokens = sum(reply.tokens for group, _ in rounds for reply in group if not reply.error)
+    seconds = sum(wall for _, wall in rounds)
+    if not tokens or seconds <= 0:
+        return
+    if price is not None:
+        level["cost_per_million_tokens"] = round(price / 3600 * seconds / tokens * 1e6, 4)
+    if energy is not None:
+        joules, devices = energy
+        level["joules_per_token"] = round(joules / tokens, 3)
+        level["watts"] = round(joules / seconds, 1)
+        level["power_devices"] = devices
 
 
 def native_engine(before: dict[str, Any], after: dict[str, Any]) -> bool:
@@ -297,6 +434,7 @@ class Bench:
         self.client, self.url, self.headers, self.options, self.clock = client, url, headers, options, clock
         self.rng = random.Random(options.seed)
         self.names: re.Pattern[str] | None = None
+        self.before: dict[str, Any] = {}
 
     def status(self) -> dict[str, Any]:
         try:
@@ -397,20 +535,35 @@ class Bench:
             self.ask(prompt, options.tokens)
         cached: list[Reply] = []
         levels = []
-        # One at a time always runs, as the numbers for a single reply come from it.
-        for parallel in sorted({1, *options.parallel}):
+        # One at a time always runs, as the numbers for a single reply come from it. The pace
+        # is a single reply's, so that is all --pace runs.
+        price, _ = route_price(self.before, options.price_per_hour)
+        for parallel in [1] if options.pace else sorted({1, *options.parallel}):
             rounds = []
+            # Energy is read around a level only where a node measures it, as each look is a status call.
+            start = self.power_now()
             for _ in range(options.repeat):
                 batch = prompts(parallel)
                 rounds.append(self.round_of(batch))
                 if options.cached and parallel == 1:
                     cached.append(self.ask(batch[0], CACHED_REPLY_TOKENS))
-            levels.append(level_result(parallel, rounds, options.tokens))
+            end = self.power_now() if start else {}
+            level = level_result(parallel, rounds, options.tokens)
+            add_costs(level, rounds, price, energy_between(start, end))
+            levels.append(level)
         result = {"wanted_prompt_tokens": wanted, "units": units, "levels": levels}
         if options.cached:
             result["cached_first_token_ms"] = milliseconds([reply for reply in cached if not reply.error])
             result["cached_failed"] = sum(1 for reply in cached if reply.error)
         return result
+
+    def power_now(self) -> dict[tuple[str, str, str], float]:
+        if not power_readings(self.before):
+            return {}
+        try:
+            return power_readings(self.status())
+        except BenchError:
+            return {}  # a level is still worth its times
 
     def repeat_check(self, units: int) -> dict[str, Any]:
         """Whether the same seeded request gives the same reply twice."""
@@ -429,6 +582,7 @@ class Bench:
         if before.get("status") != "ready":
             raise BenchError(f"no model is ready here; the node says {clean(str(before.get('status')))}")
         self.names = machine_names(before)
+        self.before = before
         results = [self.measure(wanted) for wanted in options.prompt_tokens]
         lost = None
         try:
@@ -483,6 +637,13 @@ def build_report(options: argparse.Namespace, before: dict[str, Any], after: dic
             notes.append(f"{result['cached_failed']} cached replies failed at {result['wanted_prompt_tokens']} tokens.")
     if repeat and repeat.get("error"):
         notes.append(f"The repeat of a seeded reply could not be checked: {repeat['error']}")
+    decoding = decoding_facts(before, after)
+    if getattr(options, "pace", False) and not decoding["draft_guess"]:
+        notes.append("--pace found no guesses to time: the route has no draft, or its replies never pipelined.")
+    fallback = getattr(options, "price_per_hour", None)
+    total, unpriced = route_price(after, fallback)
+    if total is None and unpriced < len(route_hosts(after)):
+        notes.append(f"{unpriced} of the route's machines have no price, so no cost per token is given. Set --price-per-hour on their nodes, or here.")
     return {
         "format": REPORT_FORMAT,
         "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -501,9 +662,9 @@ def build_report(options: argparse.Namespace, before: dict[str, Any], after: dic
         },
         "machines": machine_count(after),
         "asked_from": "on the node's own machine" if own_url else "over the network",
-        "route": route_facts(after),
+        "route": route_facts(after, before),
         "native_engine": native_engine(before, after),
-        "decoding": decoding_facts(before, after),
+        "decoding": decoding,
         "prompt_cache": {"tokens_reused": reused},
         "options": {
             "tokens": options.tokens,
@@ -513,6 +674,8 @@ def build_report(options: argparse.Namespace, before: dict[str, Any], after: dic
             "temperature": options.temperature,
             "text": options.text,
             "cached": options.cached,
+            "pace": getattr(options, "pace", False),
+            "price_per_hour": fallback,
         },
         "results": results,
         "repeat_check": repeat,
@@ -529,6 +692,9 @@ def table(report: dict[str, Any]) -> tuple[list[str], list[list[str]]]:
     cached = report["options"]["cached"]
     if cached:
         headers.insert(3, "Cached first token ms")
+    every = [level for result in report["results"] for level in result.get("levels", [])]
+    extras = [(label, field) for label, field in COST_COLUMNS if any(field in level for level in every)]
+    headers += [label for label, _ in extras]
     rows = []
     for result in report["results"]:
         for level in result.get("levels", []):
@@ -541,8 +707,12 @@ def table(report: dict[str, Any]) -> tuple[list[str], list[list[str]]]:
             ]
             if cached:
                 row.insert(3, spread(result.get("cached_first_token_ms")) if level["parallel"] == 1 else "")
+            row += ["-" if level.get(field) is None else f"{level[field]:g}" for _, field in extras]
             rows.append(row)
     return headers, rows
+
+
+COST_COLUMNS = (("Cost per M tokens", "cost_per_million_tokens"), ("J/token", "joules_per_token"), ("Watts", "watts"))
 
 
 def stage_line(stage: dict[str, Any]) -> str:
@@ -567,7 +737,7 @@ def facts(report: dict[str, Any]) -> list[tuple[str, str]]:
         way += f"; draft {decoding['draft_passes']} passes, {decoding['draft_tokens_per_pass']} tokens per pass since the stage started"
     options = report["options"]
     same = "not checked" if repeat is None else "failed to run" if repeat["identical"] is None else "yes" if repeat["identical"] else "NO"
-    rows = [
+    rows: list[tuple[str, str]] = [
         ("Model", model["name"] or "unknown"),
         ("Quantization", model["quantization"] or "not known"),
         ("Slots", str(model.get("slots") or "not reported")),
@@ -581,7 +751,33 @@ def facts(report: dict[str, Any]) -> list[tuple[str, str]]:
     ]
     if model["draft_model"]:
         rows.insert(2, ("Draft model", model["draft_model"]))
+    guess = decoding.get("draft_guess")
+    if guess:
+        steady = f"{guess['steady_ms_per_guess']:g} ms steady over {guess['steady_guesses']}" if guess.get("steady_ms_per_guess") is not None else "none steady"
+        catch_up = f", {guess['catch_up_ms_per_guess']:g} ms after a miss" if guess.get("catch_up_ms_per_guess") is not None else ""
+        rows.append(("Draft guess (g)", f"{guess['ms_per_guess']:g} ms over {guess['guesses']} guesses; {steady}{catch_up}"))
+    graphs = graphs_text(report)
+    if graphs != "not reported":
+        rows.append(("CUDA graphs", graphs))
+    traces = [(stage["stage"], stage.get("trace")) for stage in report["route"] if stage.get("trace")]
+    if traces:
+        rows.append(("Stage times, us", "; ".join(f"{number}: " + ", ".join(f"{name[:-3]} {trace[name]}" for name in TRACE_FIELDS if trace.get(name)) for number, trace in traces)))
+    kept = [(number, trace) for number, trace in traces if trace.get("keeps")]
+    if kept:
+        rows.append(("Kept state", "; ".join(kept_text(number, trace) for number, trace in kept)))
     return rows
+
+
+def kept_text(number: int, trace: dict[str, Any]) -> str:
+    share = f", {trace['keep_share_of_compute'] * 100:.0f}% of compute" if trace.get("keep_share_of_compute") is not None else ""
+    size = f" of {trace['keep_bytes'] / 2**20:.1f} MiB" if trace.get("keep_bytes") else ""
+    return f"stage {number}: {trace['keeps']} copies{size}, {trace['keep_ms_per_copy']:g} ms each{share}"
+
+
+def graphs_text(report: dict[str, Any]) -> str:
+    """Whether the route's stages ran with CUDA graphs. A stage that does not say is left out."""
+    seen = {stage.get("cuda_graphs") for stage in report.get("route") or [] if stage.get("cuda_graphs") is not None}
+    return "not reported" if not seen else "mixed" if len(seen) > 1 else "on" if seen.pop() else "off"
 
 
 def method(report: dict[str, Any]) -> list[str]:
@@ -593,6 +789,11 @@ def method(report: dict[str, Any]) -> list[str]:
         "First token is the time from sending a request to its first text. Tokens/s per reply leaves that out: tokens after the first, over the time from the first text to the last. Total tokens/s is every token of a round, over the whole of that round.",
         f"Each case ran {rounds}. Replies thrown away first, for each prompt size: {options['warmup']}. Every prompt starts differently, so none is read from the cache unless the table says cached.",
         "A link is the direct link's own round trip to the next stage, where one was up. A probe is the same trip over HTTP, measured when the route was planned. Each number is the median, with the lowest and highest in brackets.",
+        *(
+            ["Cost per M tokens is the route's machines' price an hour, over every token of a level and the whole time its rounds ran. J/token and watts are the measured devices' energy over the same tokens and time, idle gaps included."]
+            if any(label in table(report)[0] for label, _ in COST_COLUMNS)
+            else []
+        ),
     ]
 
 
@@ -633,6 +834,7 @@ SETUP: tuple[tuple[str, Callable[[dict[str, Any]], Any]], ...] = (
     ("Machines", lambda report: report.get("machines")),
     ("Stages", lambda report: [(stage["start_layer"], stage["end_layer"], stage["gpu"], stage.get("precision")) for stage in report["route"]]),
     ("Native engine", lambda report: report["native_engine"]),
+    ("CUDA graphs", graphs_text),
     ("Reply tokens", lambda report: report["options"]["tokens"]),
     ("Temperature", lambda report: report["options"]["temperature"]),
     ("Text", lambda report: report["options"]["text"]),
@@ -808,4 +1010,6 @@ def add_arguments(subparsers: Any) -> None:
     bench.add_argument("--url", default=None, help="any node's address; default is this machine's node")
     bench.add_argument("--key", default=None, help="an API key; default is this machine's own, for its own node only")
     bench.add_argument("--compare", nargs=2, metavar=("OLD", "NEW"), default=None, help="set two runs saved with --json side by side, and measure nothing")
+    bench.add_argument("--pace", action="store_true", help="one reply at a time only, and time the draft's real guesses on the entry")
+    bench.add_argument("--price-per-hour", type=price, default=None, help="what each machine costs an hour, for those whose node set no price")
     bench.set_defaults(handler=run_bench)
