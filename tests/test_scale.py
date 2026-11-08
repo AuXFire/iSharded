@@ -138,6 +138,42 @@ def test_a_mesh_that_never_settles_is_still_measured(tmp_path, monkeypatch):
     }
 
 
+def test_a_host_that_misses_a_post_is_tried_again(tmp_path, monkeypatch):
+    pool = harness.Pool(harness.parse_args(["--nodes", "3", "--run-dir", str(tmp_path)]), 3)
+
+    class Running:
+        def poll(self):
+            return None
+
+    calls = []
+
+    async def post(url, json=None):
+        calls.append(url)
+        if len(calls) == 1:
+            raise httpx.ConnectError("busy", request=httpx.Request("POST", url))
+        return httpx.Response(200, request=httpx.Request("POST", url))
+
+    async def no_wait(_):
+        return None
+
+    try:
+        pool.processes = {"h0": {"process": Running(), "port": 1}}
+        monkeypatch.setattr(pool.client, "post", post)
+        monkeypatch.setattr(harness.asyncio, "sleep", no_wait)
+        assert asyncio.run(pool.mark()) == 0 and len(calls) == 2
+
+        async def down(url, json=None):
+            raise httpx.ConnectError("down", request=httpx.Request("POST", url))
+
+        monkeypatch.setattr(pool.client, "post", down)
+        assert asyncio.run(pool.mark()) == 1  # a missed mark is counted, not fatal
+        with pytest.raises(RuntimeError):
+            asyncio.run(pool.set_sides({"n000": 1}))  # a missed network change is fatal
+    finally:
+        pool.processes = {}
+        asyncio.run(pool.close())
+
+
 def test_a_repeated_phase_is_recorded_again():
     args = harness.parse_args(["--nodes", "5"])
     assert args.phases.count("steady") == 2

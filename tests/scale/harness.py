@@ -257,7 +257,32 @@ class Pool:
     async def set_sides(self, sides: dict[str, int]) -> None:
         """Tell every process who can hear whom. A node cut off stays cut off."""
         sides = {**sides, **{name: -1 for name in self.cut_off}}
-        await asyncio.gather(*(self.client.post(f"http://127.0.0.1:{entry['port']}/network", json={"sides": sides}) for entry in self.live_hosts().values()))
+        await self.tell_hosts("/network", {"sides": sides}, required=True)
+
+    async def tell_hosts(self, path: str, body: dict[str, Any] | None = None, required: bool = False) -> int:
+        """Post to every live host's observer, each tried three times, and return how many missed it.
+
+        A loaded machine can leave an observer unreachable for a moment. A missed mark
+        only leaves that host's fan-out and loop-lag figures counting from earlier; a
+        missed network change would make the phase wrong, so that one must reach them all.
+        """
+
+        async def one(entry: dict[str, Any]) -> bool:
+            for attempt in range(3):
+                try:
+                    response = await self.client.post(f"http://127.0.0.1:{entry['port']}{path}", json=body or {})
+                    response.raise_for_status()
+                    return True
+                except httpx.HTTPError:
+                    if entry["process"].poll() is not None:
+                        return True  # gone: nothing to tell
+                    await asyncio.sleep(1.0 + attempt)
+            return False
+
+        missed = (await asyncio.gather(*(one(entry) for entry in self.live_hosts().values()))).count(False)
+        if missed and required:
+            raise RuntimeError(f"{missed} host processes did not take {path}")
+        return missed
 
     def settled(self, expected: list[str]) -> bool:
         """Every expected node is up, sees the rest, agrees on one leader, and every worker is everywhere."""
@@ -341,8 +366,9 @@ class Pool:
                 pass
         return total
 
-    async def mark(self) -> None:
-        await asyncio.gather(*(self.client.post(f"http://127.0.0.1:{entry['port']}/mark") for entry in self.live_hosts().values()))
+    async def mark(self) -> int:
+        """Start a new window on every host; returns how many hosts missed it."""
+        return await self.tell_hosts("/mark")
 
     def counts(self) -> dict[str, dict[str, list[int]]]:
         """A copy of every node's counters as last polled."""
@@ -390,7 +416,7 @@ class Pool:
 
     async def steady_window(self) -> dict[str, Any]:
         await asyncio.sleep(self.args.settle_seconds)
-        await self.mark()
+        missed = await self.mark()
         await self.poll()
         before = self.counts()
         psutil.cpu_percent(None)
@@ -421,6 +447,7 @@ class Pool:
             "rss_mb_per_node": round(self.memory_bytes() / nodes / 2**20, 1),
             # Every node shares this machine: near 100%, the nodes slow each other down.
             "machine_cpu_percent": machine,
+            "hosts_missed_mark": missed,
             "view": self.view(members),
             "loop_lag_p99_ms": max((lag.get("p99_ms", 0.0) for lag in lags), default=None),
             "loop_lag_max_ms": max((lag.get("max_ms", 0.0) for lag in lags), default=None),
