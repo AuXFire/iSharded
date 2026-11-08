@@ -34,9 +34,11 @@ DRAFT_TRIAL_TOKENS = 96
 DRAFT_TRIAL_MOST = 4096
 DRAFT_MEMORY = 0.9
 # A trial this far in that is already this many times slower than the way it is up against
-# stops there. Ways that close are worth the whole trial, since a few tokens cannot tell them apart.
+# stops there, and one halfway through that is still this far behind stops then. Ways closer
+# than that are worth the whole trial, since a few tokens cannot tell them apart.
 TRIAL_GLANCE = 6
 TRIAL_CUT = 1.5
+TRIAL_HALF_CUT = 1.2
 FEWEST_GUESSES = 2
 
 
@@ -411,9 +413,11 @@ class DraftChoice:
     a route or a reply can change which one wins.
 
     A trial runs ``PIPELINE_STRETCH`` tokens, or stops after ``TRIAL_GLANCE`` if it is already
-    ``TRIAL_CUT`` times slower. A way that loses waits twice as long for its next trial, up to
-    ``DRAFT_TRIAL_MOST`` tokens, and one that wins brings the gap back to the start. A new route
-    starts a new choice. A way nothing has measured yet gets a trial first, plain decoding before the rest.
+    ``TRIAL_CUT`` times slower, or halfway if it is still ``TRIAL_HALF_CUT`` times slower. Each
+    way keeps its own gap. A way that loses waits twice as long for its next trial, up to
+    ``DRAFT_TRIAL_MOST`` tokens, and one that wins halves its gap: on a GPU a lucky stretch of
+    text could win a pipeline one trial, and a full reset gave it a trial every 96 tokens again.
+    A new route starts a new choice. A way nothing has measured yet gets a trial first, plain decoding before the rest.
     """
 
     # Recent tokens and seconds, kept apart. Averaging each pass's rate would overrate
@@ -423,8 +427,8 @@ class DraftChoice:
     # When each way last had a turn, so trials go round.
     turns: dict[str, int] = field(default_factory=dict)
     since_trial: int = 0
-    # Tokens between trials, doubled by each trial lost.
-    gap: int = DRAFT_TRIAL_TOKENS
+    # Tokens between each way's trials, doubled by each trial it loses and halved by each it wins.
+    gaps: dict[str, int] = field(default_factory=dict)
     # The way on trial, and what it has made and taken so far.
     trial: str | None = None
     # The ways it is up against: those that could run when it started.
@@ -453,10 +457,13 @@ class DraftChoice:
                 if not self.seconds.get(way):
                     return self._start_trial(way, ways)
         best = self.best(ways)
-        others = [way for way in ways if way != best]
-        if self.since_trial < self.gap or not others:
+        due = [way for way in ways if way != best and self.since_trial >= self.gap(way)]
+        if not due:
             return best
-        return self._start_trial(min(others, key=lambda way: self.turns.get(way, 0)), ways)
+        return self._start_trial(min(due, key=lambda way: self.turns.get(way, 0)), ways)
+
+    def gap(self, way: str) -> int:
+        return self.gaps.get(way, DRAFT_TRIAL_TOKENS)
 
     def _start_trial(self, way: str, ways: Sequence[str]) -> str:
         self.trial, self.trial_tokens, self.trial_seconds = way, 0, 0.0
@@ -467,7 +474,9 @@ class DraftChoice:
         """How many tokens ``way`` should run before it is looked at again, if it is on trial."""
         if way != self.trial:
             return None
-        return (TRIAL_GLANCE if self.trial_tokens < TRIAL_GLANCE else PIPELINE_STRETCH) - self.trial_tokens
+        half = PIPELINE_STRETCH // 2
+        checks = [TRIAL_GLANCE, half, PIPELINE_STRETCH] if TRIAL_GLANCE < half else [TRIAL_GLANCE, PIPELINE_STRETCH]
+        return next(check for check in checks if check > self.trial_tokens) - self.trial_tokens
 
     def note(self, way: str, tokens: int, seconds: float) -> None:
         self.tokens[way] = self.tokens.get(way, 0.0) * DRAFT_MEMORY + tokens
@@ -480,7 +489,7 @@ class DraftChoice:
         self.trial_seconds += max(seconds, 1e-6)
         rival = max(map(self.rate, self.rivals), default=0.0)
         own = self.trial_tokens / self.trial_seconds
-        cut = self.trial_tokens >= TRIAL_GLANCE and own * TRIAL_CUT < rival
+        cut = (self.trial_tokens >= TRIAL_GLANCE and own * TRIAL_CUT < rival) or (self.trial_tokens >= PIPELINE_STRETCH // 2 and own * TRIAL_HALF_CUT < rival)
         if self.trial_tokens < PIPELINE_STRETCH and not cut:
             return
         # The trial is this way's rate now. What it measured before the gap may be long out of date.
@@ -489,17 +498,17 @@ class DraftChoice:
         self.trials_cut += cut
         if own < rival:
             self.trials_lost += 1
-            self.gap = min(self.gap * 2, DRAFT_TRIAL_MOST)
+            self.gaps[way] = min(self.gap(way) * 2, DRAFT_TRIAL_MOST)
         else:
             self.trials_won += 1
-            self.gap = DRAFT_TRIAL_TOKENS
+            self.gaps[way] = max(self.gap(way) // 2, DRAFT_TRIAL_TOKENS)
 
     def report(self) -> dict[str, Any]:
         """Each way's rate in tokens a second, and how trials have gone."""
         return {
             "rates": {way: round(self.rate(way), 2) for way in self.seconds},
             "trial": self.trial,
-            "gap": self.gap,
+            "gaps": dict(self.gaps),
             "won": self.trials_won,
             "lost": self.trials_lost,
             "cut": self.trials_cut,

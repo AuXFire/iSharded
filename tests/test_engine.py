@@ -840,11 +840,11 @@ def drive(choice: DraftChoice, ways: list[str], speeds: dict[str, float], tokens
 def test_each_way_gets_a_whole_trial_before_the_choice_settles_plain_first() -> None:
     """Plain decoding costs nothing against a load with no draft, so it is measured first."""
     choice = DraftChoice()
-    runs = drive(choice, [GUESSED, PLAIN], {GUESSED: 20.0, PLAIN: 28.0}, 60, {GUESSED: 3})
+    runs = drive(choice, [GUESSED, PLAIN], {GUESSED: 24.0, PLAIN: 28.0}, 60, {GUESSED: 3})
     assert runs[0] == (PLAIN, PIPELINE_STRETCH), "a first trial is not cut, since nothing is there to compare"
     assert runs[1] == (GUESSED, PIPELINE_STRETCH), "close enough behind for the whole trial"
     assert choice.best([GUESSED, PLAIN]) == PLAIN
-    assert choice.trials_won == 1 and choice.trials_lost == 1 and choice.gap == 2 * DRAFT_TRIAL_TOKENS
+    assert choice.trials_won == 1 and choice.trials_lost == 1 and choice.gap(GUESSED) == 2 * DRAFT_TRIAL_TOKENS
 
 
 def test_a_slow_guessing_way_costs_a_glance_from_the_start() -> None:
@@ -877,7 +877,7 @@ def test_a_trial_far_behind_is_cut_after_its_first_few_tokens() -> None:
     choice = DraftChoice()
     drive(choice, [PIPELINED, PLAIN], {PIPELINED: 30.0, PLAIN: 30.0}, 48)  # both measured, plain a hair ahead
     choice.note(PLAIN, 10, 10 / 30.0)
-    choice.since_trial = choice.gap
+    choice.since_trial = choice.gap(PIPELINED)
     assert choice.pick([PIPELINED, PLAIN]) == PIPELINED
     assert choice.trial_left(PIPELINED) == TRIAL_GLANCE
     choice.note(PIPELINED, TRIAL_GLANCE, TRIAL_GLANCE / 19.0)  # more than 1.5 times slower
@@ -885,13 +885,32 @@ def test_a_trial_far_behind_is_cut_after_its_first_few_tokens() -> None:
     assert choice.pick([PIPELINED, PLAIN]) == PLAIN
 
 
-def test_a_trial_that_wins_brings_the_gap_back_to_the_start() -> None:
+def test_a_trial_that_wins_takes_over_and_the_old_way_is_tried_after_its_own_gap() -> None:
     choice = DraftChoice()
     drive(choice, [PIPELINED, PLAIN], {PIPELINED: 14.0, PLAIN: 28.0}, 3000)
-    assert choice.gap > 4 * DRAFT_TRIAL_TOKENS
+    assert choice.gap(PIPELINED) > 4 * DRAFT_TRIAL_TOKENS
     runs = drive(choice, [PIPELINED, PLAIN], {PIPELINED: 40.0, PLAIN: 28.0}, 5000)  # the route changed under it
     assert runs[0][0] == PLAIN and runs[1] == (PIPELINED, PIPELINE_STRETCH + DRAFT_TRIAL_TOKENS), "plain is tried again after the first gap"
     assert runs[-1][0] == PIPELINED
+
+
+def test_a_lucky_win_halves_a_long_gap_and_does_not_start_it_again() -> None:
+    """On the laptop GPU a lucky stretch of text won a slow pipeline a trial now and then, and a
+    gap set back to 96 each time put 505 of 906 tokens on the slow way."""
+    choice = DraftChoice()
+    drive(choice, [PIPELINED, PLAIN], {PIPELINED: 14.0, PLAIN: 28.0}, 4000)
+    long = choice.gap(PIPELINED)
+    assert long >= 8 * DRAFT_TRIAL_TOKENS
+    choice.since_trial = long
+    drive(choice, [PIPELINED, PLAIN], {PIPELINED: 30.0, PLAIN: 28.0}, PIPELINE_STRETCH)  # one lucky trial
+    assert choice.trials_won >= 2 and choice.gap(PIPELINED) == long // 2
+
+
+def test_a_trial_still_behind_halfway_stops_there() -> None:
+    choice = DraftChoice()
+    runs = drive(choice, [PIPELINED, PLAIN], {PIPELINED: 22.0, PLAIN: 28.0}, 60)  # 1.27 times slower
+    assert runs[:2] == [(PLAIN, PIPELINE_STRETCH), (PIPELINED, PIPELINE_STRETCH // 2)]
+    assert choice.trials_cut == 1
 
 
 def test_a_trial_is_judged_on_what_it_measures_now() -> None:
@@ -900,7 +919,7 @@ def test_a_trial_is_judged_on_what_it_measures_now() -> None:
     for _ in range(30):
         choice.note(PIPELINED, 24, 24 / 10.0)
     choice.note(PLAIN, 24, 24 / 28.0)
-    choice.since_trial = choice.gap
+    choice.since_trial = DRAFT_TRIAL_MOST
     drive(choice, [PIPELINED, PLAIN], {PIPELINED: 32.0, PLAIN: 28.0}, PIPELINE_STRETCH)
     assert choice.best([PIPELINED, PLAIN]) == PIPELINED
     assert choice.rate(PIPELINED) == pytest.approx(32.0)
@@ -909,7 +928,7 @@ def test_a_trial_is_judged_on_what_it_measures_now() -> None:
 def test_a_trial_waits_while_its_way_cannot_run() -> None:
     choice = DraftChoice()
     drive(choice, [GUESSED, PLAIN], {GUESSED: 20.0, PLAIN: 28.0}, 200, {GUESSED: 3})
-    choice.since_trial = choice.gap
+    choice.since_trial = DRAFT_TRIAL_MOST
     assert choice.pick([GUESSED, PLAIN]) == GUESSED
     assert choice.pick([PLAIN]) == PLAIN, "a temperature-0 reply may not check guesses in one pass"
     choice.note(PLAIN, 1, 1 / 28.0)
