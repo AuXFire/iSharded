@@ -126,6 +126,19 @@ LOGGED_EVENTS = {"failure", "recovery", "mesh", "rebalance", "security"}
 # A live worker that failed to activate gets this many more tries, this far apart.
 ACTIVATE_RETRIES = 2
 ACTIVATE_RETRY_SECONDS = 5.0
+# A stage's load gets this long, plus its bytes at the worker's load rate, and longer for
+# as long as it shows progress. Past that it has stalled: it is let go, the worker is
+# quarantined, and the route is planned without it. The pool has no route meanwhile, and
+# replies wait ROUTE_WAIT_SECONDS for one, so these stay well under that.
+CONFIGURE_FLOOR_SECONDS = float(os.getenv("ISHARDED_CONFIGURE_FLOOR_SECONDS", "30"))
+CONFIGURE_STALL_SECONDS = float(os.getenv("ISHARDED_CONFIGURE_STALL_SECONDS", "30"))
+# A slow disk, for a worker that has not loaded anything big yet. One that has goes at half
+# the rate it showed, since the next load may find nothing in the system's cache.
+LOAD_BYTES_PER_SECOND = 50e6
+CONFIGURE_LOOK_SECONDS = 2.0
+CONFIGURE_SIGNS_SECONDS = 5.0
+GIVE_UP_TELL_SECONDS = 600.0
+STALLED = "stopped loading"
 # How long a measured link is believed, how many tries make one measurement, and the
 # most a load waits for measuring.
 RING_RETRY_SECONDS = 30.0
@@ -230,6 +243,20 @@ class WorkerSilent(Exception):
     """A worker stopped answering without any error, as a lost link does."""
 
 
+class ConfigureStalled(RuntimeError):
+    """A stage's load showed no progress past its deadline."""
+
+
+def configure_seconds(stage_bytes: int, measured_rate: float = 0.0) -> float:
+    """How long a stage's load may take before progress has to show, from its size."""
+    rate = measured_rate / 2 if measured_rate > 0 else LOAD_BYTES_PER_SECOND
+    return CONFIGURE_FLOOR_SECONDS + stage_bytes / rate
+
+
+def stalled(reason: str) -> bool:
+    return reason.startswith(STALLED)
+
+
 @dataclass(slots=True)
 class WorkerRecord:
     registration: WorkerRegistration
@@ -244,6 +271,8 @@ class WorkerRecord:
     health: dict[str, Any] | None = None
     # Measured download speed from the model host, once a load has shown it.
     fetch_bytes_per_second: float = 0.0
+    # How fast a load into memory went here, once a big one has shown it.
+    load_bytes_per_second: float = 0.0
 
     @property
     def live(self) -> bool:
@@ -2371,12 +2400,9 @@ class Orchestrator:
                     for item in stage.placements
                     if item.unit in (target.request.model_hashes or {})
                 },
+                load_id=uuid.uuid4().hex,
             )
-            response = await self.client.post(
-                stage.url.rstrip("/") + "/internal/configure",
-                json=request.model_dump(),
-                headers=auth_headers(self.pool_token),
-            )
+            response = await self._configure_in_time(stage, request)
             if response.status_code >= 400:
                 raise RuntimeError(response.text[:400])
 
@@ -2415,6 +2441,77 @@ class Orchestrator:
         summary = " → ".join(f"{stage.worker_id} L{stage.start_layer}–{stage.end_layer - 1}" for stage in route)
         self.add_event("rebalance", f"Pipeline epoch {new_epoch}", summary)
         return {}
+
+    async def _configure_in_time(self, stage: StageAssignment, request: ConfigureRequest) -> httpx.Response:
+        """Configure one stage, giving up if its load stalls.
+
+        The deadline comes from the stage's bytes, and moves on for as long as the worker
+        shows its load moving: units done, bytes read, or its stage process working. A
+        worker that is suspended, or whose load hangs, shows none of that, and is given up
+        on when the deadline passes. The pool has no route meanwhile, so an hour's wait, as
+        the client's own timeout would allow, holds every reply.
+        """
+        url = stage.url.rstrip("/")
+        size = sum(item.bytes for item in stage.placements)
+        record = self.workers.get(stage.worker_id)
+        allowed = configure_seconds(size, record.load_bytes_per_second if record else 0.0)
+        began = time.monotonic()
+        give_up_at = began + allowed
+        moved_at = began
+        sending = asyncio.ensure_future(
+            self.client.post(url + "/internal/configure", json=request.model_dump(), headers=auth_headers(self.pool_token), timeout=httpx.Timeout(None, connect=10.0))
+        )
+        seen: dict[str, Any] | None = None
+        try:
+            while not sending.done():
+                await asyncio.wait({sending}, timeout=CONFIGURE_LOOK_SECONDS)
+                if sending.done():
+                    break
+                signs = await self._configure_signs(url)
+                now = time.monotonic()
+                if signs is not None and signs.get("load_id") == request.load_id:
+                    if seen is not None and signs != seen:
+                        moved_at = now
+                        give_up_at = max(give_up_at, now + CONFIGURE_STALL_SECONDS)
+                    seen = signs
+                if now >= give_up_at:
+                    raise ConfigureStalled(
+                        f"{STALLED}: nothing moved for {now - moved_at:.0f} s, {now - began:.0f} s into a load"
+                        f" given {allowed:.0f} s for {size / 1024**3:.2f} GiB"
+                    )
+        except BaseException:
+            sending.cancel()
+            if request.load_id:
+                self.spawn(self._tell_given_up(url, request.load_id))
+            raise
+        response = sending.result()
+        took = time.monotonic() - began
+        if response.status_code < 400 and record is not None and size >= 256 * 1024**2 and took >= 1.0:
+            record.load_bytes_per_second = size / took
+        return response
+
+    async def _configure_signs(self, url: str) -> dict[str, Any] | None:
+        """A load's signs of progress, or None from a worker that did not say. See worker.configure_signs."""
+        try:
+            response = await self.client.get(url + "/internal/configure/progress", headers=auth_headers(self.pool_token), timeout=CONFIGURE_SIGNS_SECONDS)
+            return response.json() if response.status_code == 200 else None
+        except (httpx.HTTPError, ValueError):
+            return None
+
+    async def _tell_given_up(self, url: str, load_id: str) -> None:
+        """Tells a worker its load was given up on, so it lets the weights go if it ever finishes.
+
+        A suspended worker hears nothing until it wakes, so this keeps trying for a while.
+        """
+        stop_at = time.monotonic() + GIVE_UP_TELL_SECONDS
+        while time.monotonic() < stop_at:
+            try:
+                response = await self.client.post(f"{url}/internal/configure/{load_id}/give-up", headers=auth_headers(self.pool_token), timeout=10.0)
+                if response.status_code < 500:
+                    return
+            except httpx.HTTPError:
+                pass
+            await asyncio.sleep(10.0)
 
     async def _warm_route(self, epoch: int) -> None:
         """Run a 64-row reply with one token out, so that a new route's first real reply does not pay for first use.
@@ -2530,8 +2627,9 @@ class Orchestrator:
                 async with gate:
                     failed = await self._activate(target, route)
                     for _ in range(ACTIVATE_RETRIES):
-                        # Often a passing shortage, such as memory not yet returned.
-                        if not failed or job.cancelled:
+                        # Often a passing shortage, such as memory not yet returned. A stall
+                        # is not, and trying it again would hold the pool for another deadline.
+                        if not failed or job.cancelled or any(stalled(reason) for reason in failed.values()):
                             break
                         self.add_event("failure", "Activation failed, retrying", str(failed)[:300])
                         await asyncio.sleep(ACTIVATE_RETRY_SECONDS)
@@ -2552,10 +2650,11 @@ class Orchestrator:
         it, and can land the model somewhere slow. So that takes a person.
         """
         await self.refresh_worker_metrics()
+        # A stalled load counts as a lost worker: it would hold the pool with no route.
         alive = [
             worker_id
-            for worker_id in failed
-            if (record := self.workers.get(worker_id)) and record.live and (record.health or {}).get("status") == "ok"
+            for worker_id, reason in failed.items()
+            if not stalled(reason) and (record := self.workers.get(worker_id)) and record.live and (record.health or {}).get("status") == "ok"
         ]
         if not alive:
             return

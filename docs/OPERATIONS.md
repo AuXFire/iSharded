@@ -64,6 +64,7 @@ The rule is that a failure or a pool change must not drop a reply, and that weig
 | A node blips for under 30 s | Nothing moves | Waits, or replays if a request failed | Not measured on real hardware |
 | A quarantined node recovers | It returns after three healthy checks, more if it keeps failing, and the coordinator takes it back while idle | None | Not measured on real hardware |
 | A model loads or the layout changes | Nodes fetch in the background while the old layout serves. Entry workers let replies finish first. Stages whose job did not change stay loaded | Finishes first, up to 45 s | An unchanged layout re-applies in 3 s |
+| A worker stalls while loading its stage, suspended or hung | Its load has a deadline from its size, kept for as long as it shows progress. Past it the worker is quarantined, told to let the weights go, and the route is planned without it, with no retries. [A stuck load](GUIDE.md#what-happens-when-something-fails) has the figures | Replies wait for the new route | See RESULTS.md, "Configure deadline" |
 | A live node fails to load its stage | Two retries. If it still fails, a replan may go ahead only if it moves under 2 GiB. Otherwise the load stops and says why | Depends on the failure | Tested with simulated failures only |
 | Every node restarts | Each node saved the route, so the coordinator loads the model again by itself | Reply lost; new requests wait | Observed; about a minute with cached shards |
 

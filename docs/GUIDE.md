@@ -427,11 +427,12 @@ The rule is that a failure must not drop a reply, and weights move only when the
 
 Times are measured on the test pool, except the stage crash, measured on a small model. In the last soak test, 405 replies finished and none were lost while processes were killed on both machines for 21 minutes. [Operating iSharded](OPERATIONS.md) has the details.
 
-A stage that hangs without dying keeps its links open, so it is watched in three ways:
+A stage that hangs without dying keeps its links open, so it is watched in four ways:
 
 - **A frozen process.** The worker asks a thread in the stage process for a pulse every 2 s, and 10 quiet seconds stop the process. This starts once the model has loaded.
-- **A stuck call.** Each call to a stage has a deadline of 30 s plus 1 s a row, and past it the process is stopped. Saved states and images get the time of 600 rows, and a load has no deadline.
+- **A stuck call.** Each call to a stage has a deadline of 30 s plus 1 s a row, and past it the process is stopped. Saved states and images get the time of 600 rows. A load has no deadline inside the stage process, and the coordinator gives it one instead, below.
 - **A stuck pass on the engine.** The engine holds its own passes to the same limit, counted only while a pass holds the model. Past it, the engine refuses what is in flight and ends the process.
+- **A stuck load.** The pool has no route while stages load, so the coordinator gives each stage's load 30 s plus its size at 50 MB/s, or at half the rate that worker last loaded at, and longer for as long as the load shows progress: units done, bytes read, or the stage process working. A load that shows none for 30 s past that, such as on a suspended worker, is given up on. The worker is quarantined and told to let the weights go if the load ever finishes, and the route is planned without it, without the retries a passing failure gets. `ISHARDED_CONFIGURE_FLOOR_SECONDS` and `ISHARDED_CONFIGURE_STALL_SECONDS` change the two 30 s figures. Both stay well under the 120 s a reply waits for a route.
 
 Whichever finds it, the worker sees a lost stage, as if it had been killed: it starts another, and the reply replays. A process that will not exit is killed, killed harder, and left behind, so no reply waits on it. It keeps its memory until the system lets it go. If the new stage then cannot load, the node's stage will not restart: its `/health` answers 503, the node is quarantined, and the reply goes on without it.
 
@@ -1197,6 +1198,8 @@ A flag takes priority over its variable.
 | `ISHARDED_RING` | Set to `0` on the coordinator to keep replies off the direct links between stages |
 | `ISHARDED_APPLY_LOOP` | Set to `1` on the coordinator to let it apply a [shorter loop](#a-shorter-loop) by itself, between replies. Off by default, because it moves weights |
 | `ISHARDED_APPLY_LOOP_TOKENS` | The most tokens an applied loop may take to pay back its move. Default 20000 |
+| `ISHARDED_CONFIGURE_FLOOR_SECONDS` | On the coordinator: the time every stage's load gets before its size is counted. See [a stuck load](#what-happens-when-something-fails). Default 30 |
+| `ISHARDED_CONFIGURE_STALL_SECONDS` | On the coordinator: how long a load past its first deadline may show no progress before it is given up on. Default 30 |
 | `ISHARDED_DRAFT_SHARES_DEVICE` | Set to `1` on the coordinator to count each guess of the draft on the entry stage's device when planning. Off by default; see [Speculative decoding](#speculative-decoding) |
 | `ISHARDED_PROMPT_PARTS` | Set to `0` on the entry worker to send each prompt whole instead of in parts |
 | `ISHARDED_DATA_PORT` | The port for direct links between stages. It must be reachable from the other stages. Default: any free port |

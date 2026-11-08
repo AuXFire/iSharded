@@ -285,6 +285,9 @@ class ConfigureRequest(BaseModel):
     # ask when taking over layers from a stage that was lost. See statecopy.py.
     copy_url: str | None = None
     state_peers: list[str] = Field(default_factory=list)
+    # Names this one load, so a coordinator that gave up on it can say so and be sure
+    # it reaches that load and no later one. An older coordinator sends none.
+    load_id: str | None = None
 
 
 class CacheRestoreRequest(BaseModel):
