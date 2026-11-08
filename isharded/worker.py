@@ -2241,6 +2241,8 @@ runtime = WorkerRuntime()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # Read once now, off the loop: /health gives it, and a git call there would stall replies.
+    await asyncio.to_thread(source_commit)
     runtime.setup()
     runtime.registration_task = asyncio.create_task(runtime.registration_loop())
     try:
