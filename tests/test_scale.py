@@ -98,6 +98,22 @@ def test_a_window_a_process_stalled_through_is_measured_again(tmp_path, monkeypa
         asyncio.run(pool.close())
 
 
+def test_a_live_member_dropped_counts_as_a_false_alarm(tmp_path):
+    pool = harness.Pool(harness.parse_args(["--nodes", "3", "--run-dir", str(tmp_path)]), 3)
+    try:
+        pool.events["n000"] = [
+            [10.0, "peers-", "n001"],  # live, inside the window: false
+            [11.0, "peers+", "n001"],
+            [12.0, "peers-", "n003"],  # n003 is not a member: a real departure
+            [13.0, "workers-", "n002-cpu"],  # a live worker: false
+            [30.0, "peers-", "n002"],  # after the window
+        ]
+        pool.events["n001"] = [[9.0, "peers-", "n000"]]  # before the window
+        assert pool.false_drops(["n000", "n001", "n002"], 10.0, 20.0) == (1, 1)
+    finally:
+        asyncio.run(pool.close())
+
+
 def test_a_repeated_phase_is_recorded_again():
     args = harness.parse_args(["--nodes", "5"])
     assert args.phases.count("steady") == 2
@@ -132,6 +148,7 @@ def test_five_nodes_settle_join_leave_and_elect(tmp_path):
     rates = {key: value["mean"] for key, value in steady["per_node"].items()}
     assert steady["nodes"] == 5
     assert not steady["stalled"], f"every window stalled: {steady['loop_lag_max_ms']} ms"
+    assert steady["live_peers_dropped"] == 0 and steady["live_workers_dropped"] == 0
     # Three gossip rounds in 9 s, to four peers, give 1.33 calls a second; rounds also take time.
     assert 0.8 <= rates["out:gossip:calls"] <= 1.8
     assert 0.7 <= rates["out:checkin:calls"] <= 1.3  # five control planes every 5 s
@@ -162,6 +179,7 @@ def test_five_nodes_settle_join_leave_and_elect(tmp_path):
     assert 10 <= leave["mesh_s"] < 60
     assert 13 <= leave["worker_dropped_everywhere_s"] < 60
     assert leave["elections"] == 0
+    assert leave["had_dropped_it_already"] == 0
 
     kill = result["phases"]["kill-leader"]
     assert kill["old"] == "n000" and kill["new"] == "n001"

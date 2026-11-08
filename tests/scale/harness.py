@@ -383,18 +383,34 @@ class Pool:
                 fanout.setdefault(kind, []).append(count)
         cpu = {host: (cpu_after[host] - cpu_before[host]) / seconds for host in cpu_after if host in cpu_before}
         nodes = len(members)
+        peer_flaps, worker_flaps = self.false_drops(members, began, began + seconds)
         lags = [entry.get("lag", {}) for entry in self.live_hosts().values()]
         return {
             "seconds": round(seconds, 1),
             "nodes": nodes,
             "per_node": {key: spread(values) for key, values in sorted(rates.items())},
             "fanout": {kind: spread(values) for kind, values in sorted(fanout.items())},
+            "live_peers_dropped": peer_flaps,
+            "live_workers_dropped": worker_flaps,
             "cpu_cores_per_node": round(sum(cpu.values()) / nodes, 4),
             "cpu_busiest_process_cores": round(max(cpu.values()), 3) if cpu else None,
             "rss_mb_per_node": round(self.memory_bytes() / nodes / 2**20, 1),
             "loop_lag_p99_ms": max((lag.get("p99_ms", 0.0) for lag in lags), default=None),
             "loop_lag_max_ms": max((lag.get("max_ms", 0.0) for lag in lags), default=None),
         }
+
+    def false_drops(self, members: list[str], began: float, ended: float) -> tuple[int, int]:
+        """How many times, between two moments, a node dropped a live member or its worker.
+
+        Every such drop is a false alarm. It happens when a gossip round or a health pass
+        takes longer than the silence after which a member counts as gone.
+        """
+        live, live_workers = set(members), {self.worker_of(name) for name in members}
+
+        def count(kind: str, alive: set[str]) -> int:
+            return sum(1 for name in members for event in self.events[name] if event[1] == kind and event[2] in alive and began <= event[0] <= ended)
+
+        return count("peers-", live), count("workers-", live_workers)
 
     async def status(self) -> dict[str, Any]:
         """The dashboard's call. It probes every worker before it answers, so its time grows with N."""
@@ -472,11 +488,15 @@ class Pool:
         worker = [self.last_event(name, {"workers+"}, {self.worker_of(new)}, ready) for name in expected]
         controls = [self.last_event(name, {"controls+"}, {self.control_url(new)}, ready) for name in others]
         controls.append(self.last_event(new, {"controls+"}, None, ready))
+        def since_ready(times: list[float | None]) -> float | None:
+            known = [at for at in times if at is not None]
+            return round(max(known) - ready, 2) if known else None
+
         return {
             "start_s": round(ready - launched, 2),
-            "mesh_s": round(max([*seen, sees]) - ready, 2),
-            "worker_live_everywhere_s": round(max(worker) - ready, 2),
-            "controls_everywhere_s": round(max(controls) - ready, 2),
+            "mesh_s": since_ready([*seen, sees]),
+            "worker_live_everywhere_s": since_ready(worker),
+            "controls_everywhere_s": since_ready(controls),
             "elections": sum(1 for name in expected for at in self.reports[name]["takeovers"] if at >= launched),
         }
 
@@ -503,11 +523,13 @@ class Pool:
             return all(self.reports[name]["peers"] == len(survivors) - 1 and self.reports[name]["workers_live"] == len(survivors) for name in survivors)
 
         await self.until(dropped, self.args.settle_timeout, f"everyone dropping {gone}", {gone})
-        mesh = [self.last_event(name, {"peers-"}, {gone}, killed) for name in survivors]
-        workers = [self.last_event(name, {"workers-"}, {worker}, killed) for name in survivors]
+        # A survivor that had already dropped it, falsely, before it left has no drop to time.
+        mesh = [at for name in survivors if (at := self.last_event(name, {"peers-"}, {gone}, killed)) is not None]
+        workers = [at for name in survivors if (at := self.last_event(name, {"workers-"}, {worker}, killed)) is not None]
         return {
-            "mesh_s": round(max(mesh) - killed, 2),
-            "worker_dropped_everywhere_s": round(max(workers) - killed, 2),
+            "mesh_s": round(max(mesh) - killed, 2) if mesh else None,
+            "worker_dropped_everywhere_s": round(max(workers) - killed, 2) if workers else None,
+            "had_dropped_it_already": len(survivors) - len(mesh),
             "elections": sum(1 for name in survivors for at in self.reports[name]["takeovers"] if at >= killed),
         }
 
