@@ -582,6 +582,7 @@ Each lane ran its own files before merging, builder then verifier. A count of ne
 | Warm links (round 5) | cargo 73 and 45; 650 passed, 1 skipped, 1 failed under load (passed alone twice), then 255 passed | 73/45; 401 passed, 1 skipped in 144 s | 2026-11-07 |
 | Fixes (round 5) | 8 files 1087 passed, 1 skipped; cargo 74 unit and 43 ring | Seven files 837 passed, 1 skipped; 74/43 | 2026-11-07 |
 | Chat page and dashboard (round 5, real Chrome) | 793 passed, 1 failed, 3 skipped; after the fix the UI file 110 of 110 | After its last fix: 795 passed, 3 skipped in 152 s | 2026-11-07 |
+| Rejoin and slot safety (round 7) | 15 unit and docs files 1273 passed; real-model files on Qwen3-0.6B 1473 passed, 11 skipped; on Qwen3.5-0.8B 1001 passed, 9 skipped, 1 failed: the entry-stage restart test, which waits for the pipeline to win a trial, failed under the batch's load and passed 2 of 2 alone, as on the base commit (2 of 2). The held-restore fault test passed on both models and failed with the fix turned off. cargo 98 unit and 49 ring; one unit run failed `picking_a_token_is_timed_for_the_trace`, a shared timing average other tests pull to zero, in code this lane did not touch, and it passed alone and in the next full run. On the base commit the rejoin file does not even import (14 of 14 fail), and the new fault test gave another reply's text with the checks off | | 2026-11-08 |
 
 ## Handover prototypes
 
