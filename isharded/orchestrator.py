@@ -31,7 +31,7 @@ from starlette.background import BackgroundTask
 
 from . import __version__, source_commit
 from .addresses import host_port
-from .access import INVITE_FIELDS, load_authority, NeedsAuthority, node_of, ROLE_ADMIN, ROLE_MEMBER, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, Caller
+from .access import INVITE_FIELDS, load_authority, NeedsAuthority, node_of, ROLE_ADMIN, ROLE_MEMBER, ROLE_NODE, ROLE_PEER, ROLE_USER, AccessControl, AuditLog, Caller
 from .embedding import POOLED_TYPES, dimensions_problem, encoded, inputs_problem, length_problem, passes, shaped, smallest_dimensions
 from .engine import find_library
 from .gguf import GgufHeader, parse_source, quantization_name, split_parts
@@ -3645,6 +3645,23 @@ def network_caller(authorization: str | None) -> Caller:
     return caller
 
 
+def node_itself(authorization: str | None, name: str) -> Caller | None:
+    """The node ``name``, proven by its own certificate or ticket, asking for itself.
+
+    An invited machine's operator holds only a user key, yet `isharded stop` there must
+    take the route off the node before it ends it. The node's certificate proves the
+    machine, and what it may do with it is limited to stepping out of service and back.
+    """
+    peer = PEER.get()
+    if peer is None or peer != name or BEHALF.get():
+        return None
+    caller = runtime.access.identify(authorization, peer)
+    if caller is None or caller.role != ROLE_PEER:
+        return None
+    node_proven()
+    return caller
+
+
 def require_own_node(authorization: str | None, name: str) -> Caller:
     """An admin, or a member acting on their own node."""
     caller = network_caller(authorization)
@@ -4207,24 +4224,30 @@ async def cordon_node(
     authorization: str | None = Header(default=None),
 ) -> dict[str, str]:
     """Take a node out of service for maintenance, without dropping a reply."""
-    caller = require_own_node(authorization, name)
+    itself = node_itself(authorization, name)
+    caller = itself or require_own_node(authorization, name)
     cost = runtime.cost_of_losing(name)
     if cost is None:
         raise HTTPException(status_code=409, detail=f"the rest of the pool cannot hold this model without {name}")
     if cost > REPLAN_MOVE_LIMIT_BYTES and not force:
         detail = f"cordoning {name} would transfer {cost / 1024**3:.1f} GiB between nodes; use force if that is what you want"
         raise HTTPException(status_code=409, detail=detail)
-    runtime.access.cordon(name)
-    runtime.add_event("recovery", "Node cordoned", f"Moving {name}'s share elsewhere")
+    runtime.access.cordon(name, by_itself=itself is not None)
+    runtime.add_event("recovery", "Node cordoned", f"Moving {name}'s share elsewhere" + (", as it is stopping" if itself else ""))
     if runtime.active is not None:
         runtime.spawn(runtime.move_off())
-    runtime.spawn(runtime.lanes.tell_all(f"/admin/nodes/{name}/cordon?force=true", caller))
+    if itself is None:  # a node's own word is for this coordinator; a lane's needs a person's statement
+        runtime.spawn(runtime.lanes.tell_all(f"/admin/nodes/{name}/cordon?force=true", caller))
     return {"status": "cordoned"}
 
 
 @app.post("/admin/nodes/{name}/uncordon")
 async def uncordon_node(name: str, authorization: str | None = Header(default=None)) -> dict[str, str]:
-    require_own_node(authorization, name)
+    if node_itself(authorization, name) is not None:
+        if name in runtime.access.cordoned and name not in runtime.access.leaving:
+            raise HTTPException(status_code=403, detail=f"{name} was cordoned by someone else, who has to lift it")
+    else:
+        require_own_node(authorization, name)
     if name not in runtime.access.cordoned:
         return {"status": "uncordoned"}  # nothing changed, so nothing should move
     runtime.access.uncordon(name)

@@ -277,3 +277,136 @@ def test_ctrl_c_on_a_node_stops_every_service_together(monkeypatch):
     assert node_module.run_node(args) == 0
     assert all(process.poll() == 0 for process in processes)
     assert time.monotonic() - began < 0.55
+
+
+# An invited machine holds only a user key, which may not cordon anything. Its stop then
+# asks as the node itself, with a ticket from its own certificate, straight to the coordinator.
+
+
+def node_certificate(home: Path, name: str = NAME) -> None:
+    pytest.importorskip("cryptography")
+    from isharded.pool import add_node, init_pool
+
+    folder = init_pool(str(home / "authority"))
+    add_node(str(folder), name, ["127.0.0.1"])
+    for suffix in (".pem", ".key"):
+        (home / f"{name}{suffix}").write_bytes((folder / f"{name}{suffix}").read_bytes())
+
+
+class InvitedNode:
+    """A joined node's control plane, which refuses its operator's user key a cordon, and the coordinator."""
+
+    LEADER = "http://desk:8300"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        asked = request.headers.get("authorization", "")
+        where = f"{request.url.scheme}://{request.url.netloc.decode()}"
+        self.calls.append((request.method, where + request.url.path, asked[:11]))
+        ticket = asked.startswith("Bearer smn-")
+        if request.url.path == "/admin/status":
+            return httpx.Response(200, json={"route": OFF_ME if self.moved else ON_ME, "cordoned_nodes": []})
+        if request.url.path == "/internal/lane":
+            return httpx.Response(200, json={"leader_url": self.LEADER}) if ticket else httpx.Response(401)
+        if request.url.path.endswith(("/cordon", "/uncordon")):
+            if where == self.LEADER and ticket:
+                self.moved = request.url.path.endswith("/cordon")
+                return httpx.Response(200, json={"status": "done"})
+            return httpx.Response(403, json={"detail": "this needs the member role"})
+        return httpx.Response(404)
+
+    moved = False
+
+
+def test_an_invited_node_moves_the_route_off_as_itself_when_its_key_cannot(home, monkeypatch):
+    (home / "admin.key").unlink()
+    (home / "user.key").write_text("isk-user", encoding="utf-8")
+    node_certificate(home)
+    node = InvitedNode()
+    serve(monkeypatch, node)
+    clock = Clock()
+    said = up.move_route_off(SETTINGS, home, 30, clock, clock.sleep)
+    assert said.startswith("the route moved off this node"), said
+    posted = [(where, asked) for method, where, asked in node.calls if method == "POST"]
+    assert posted == [
+        ("http://127.0.0.1:8209/admin/nodes/laptop/cordon", "Bearer isk-"),
+        ("http://desk:8300/admin/nodes/laptop/cordon", "Bearer smn-"),
+    ], "the key first, then the node's own ticket, to the coordinator"
+    up.back_in_service(SETTINGS, home, up.client_for(SETTINGS, home))
+    assert not node.moved and not (home / up.STOPPED_CORDON).exists()
+
+
+def test_without_its_certificate_a_refused_node_stops_as_before(home, monkeypatch):
+    (home / "admin.key").unlink()
+    (home / "user.key").write_text("isk-user", encoding="utf-8")
+    serve(monkeypatch, InvitedNode())
+    said = up.move_route_off(SETTINGS, home, 30)
+    assert said.startswith("the cordon was refused (this needs the member role)")
+
+
+@pytest.fixture
+def coordinator_seen_by(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from isharded import orchestrator as orchestrator_module
+    from isharded.access import AccessControl
+    from isharded.tls import PEER
+
+    runtime = orchestrator_module.Orchestrator()
+    runtime.access = AccessControl(identities=True)
+    monkeypatch.setattr(orchestrator_module, "runtime", runtime)
+
+    def seen_by(peer: str) -> TestClient:
+        async def with_identity(scope, receive, send):
+            PEER.set(peer)  # what the TLS layer or a good ticket does
+            await orchestrator_module.app(scope, receive, send)
+
+        return TestClient(with_identity)
+
+    return runtime, seen_by
+
+
+def test_a_node_takes_only_itself_out_and_back(coordinator_seen_by):
+    runtime, seen_by = coordinator_seen_by
+    laptop = seen_by(NAME)
+    assert laptop.post("/admin/nodes/desk/cordon").status_code == 403
+    assert laptop.post(f"/admin/nodes/{NAME}/cordon", params={"force": "true"}).status_code == 200
+    assert runtime.access.cordoned == {NAME} and runtime.access.leaving == {NAME}
+    assert seen_by("desk").post(f"/admin/nodes/{NAME}/uncordon").status_code == 403
+    assert laptop.post(f"/admin/nodes/{NAME}/uncordon").status_code == 200
+    assert not runtime.access.cordoned and not runtime.access.leaving
+
+
+def test_a_node_cannot_lift_a_cordon_someone_else_set(coordinator_seen_by):
+    runtime, seen_by = coordinator_seen_by
+    runtime.access.cordon(NAME)
+    laptop = seen_by(NAME)
+    assert laptop.post(f"/admin/nodes/{NAME}/cordon").status_code == 200, "taking itself out again is fine"
+    refused = laptop.post(f"/admin/nodes/{NAME}/uncordon")
+    assert refused.status_code == 403 and "someone else" in refused.json()["detail"]
+    assert runtime.access.cordoned == {NAME}
+
+
+def test_a_cordon_set_over_a_nodes_own_becomes_the_setters():
+    from isharded.access import AccessControl
+
+    access = AccessControl()
+    access.cordon(NAME, by_itself=True)
+    assert access.document()["leaving_nodes"] == [NAME]
+    access.cordon(NAME)
+    assert access.leaving == set() and access.cordoned == {NAME}
+    assert "leaving_nodes" not in access.document(), "documents stay as they were for pools that never use it"
+
+
+def test_a_nodes_own_cordon_travels_with_the_newer_document():
+    from isharded.access import AccessControl
+
+    left, right = AccessControl(), AccessControl()
+    left.cordon(NAME, by_itself=True)
+    assert right.merge(left.document())
+    assert right.cordoned == {NAME} and right.leaving == {NAME}
+    right.uncordon(NAME)
+    assert left.merge(right.document())
+    assert not left.cordoned and not left.leaving

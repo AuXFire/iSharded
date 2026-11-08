@@ -31,6 +31,7 @@ import sys
 import threading
 import time
 from typing import Any, Callable
+from urllib.parse import urlsplit
 import webbrowser
 
 import httpx
@@ -47,7 +48,7 @@ from .optional import has_torch
 from .tls import OWN_ADDRESS, stay_on_this_machine
 from .pool import _private_link, _write_private, add_node, approve_membership, bearer_headers, home as pool_home, init_pool, request_membership, sign_entry
 from .statements import VERIFIER_LENGTH, key_verifier
-from .tickets import _decode, _encode
+from .tickets import TicketMaker, _decode, _encode
 
 DEFAULT_PORT = 8209
 INVITE_PREFIX = "isi-"
@@ -745,15 +746,11 @@ def move_route_off(settings: dict[str, Any], home: Path, wait: float, clock: Cal
         held = name in (status.get("cordoned_nodes") or [])
         if not held:
             try:
-                answer = client.post(f"{base}/admin/nodes/{name}/cordon", params={"force": "true"}, headers=headers, timeout=30.0)
+                answer = ask_for_self(settings, home, client, f"/admin/nodes/{name}/cordon?force=true")
             except httpx.HTTPError as exc:
                 return f"the cordon did not go through ({exc}), so nothing was moved first"
             if answer.status_code != 200:
-                try:
-                    detail = answer.json().get("detail", answer.text)
-                except ValueError:
-                    detail = answer.text
-                return f"the cordon was refused ({str(detail)[:200]}), so nothing was moved first"
+                return f"the cordon was refused ({detail_of(answer)}), so nothing was moved first"
             (home / STOPPED_CORDON).write_text(name, encoding="utf-8")
         print(f"Moving the route off {name} first, for up to {wait:g} s.", flush=True)
         began = clock()
@@ -769,6 +766,44 @@ def move_route_off(settings: dict[str, Any], home: Path, wait: float, clock: Cal
     return f"the route was still on this node after {wait:g} s, so it stops anyway"
 
 
+def detail_of(answer: httpx.Response) -> str:
+    try:
+        detail = answer.json().get("detail", answer.text)
+    except (ValueError, AttributeError):
+        detail = answer.text
+    return str(detail)[:200]
+
+
+def node_ticket(home: Path, name: str, url: str) -> dict[str, str] | None:
+    """Headers that prove this machine is node ``name`` to whoever serves ``url``, or None without its certificate."""
+    certificate, key = home / f"{name}.pem", home / f"{name}.key"
+    if not (certificate.is_file() and key.is_file()):
+        return None
+    return bearer_headers(TicketMaker(str(certificate), str(key)).fresh(urlsplit(url).netloc))
+
+
+def ask_for_self(settings: dict[str, Any], home: Path, client: httpx.Client, path: str) -> httpx.Response:
+    """POST a node's request about itself, a cordon or its lifting, to the coordinator.
+
+    The operator's key goes first. An invited machine holds only a user key, so on a refusal
+    the node asks as itself, with a ticket made from its own certificate, straight to the
+    coordinator, which lets a node step out of service and back in, and nothing more.
+    """
+    name, base = settings["name"], local_url(settings)
+    answer = client.post(base + path, headers=bearer_headers(sign_in_key(home)), timeout=30.0)
+    if answer.status_code not in (401, 403) or settings.get("ownerless"):
+        return answer
+    asking = node_ticket(home, name, base)
+    if asking is None:
+        return answer
+    lane = client.get(base + "/internal/lane", headers=asking, timeout=10.0)
+    leader = lane.json().get("leader_url") if lane.status_code == 200 else None
+    if not leader:
+        return answer
+    leader = str(leader).rstrip("/")
+    return client.post(leader + path, headers=node_ticket(home, name, leader), timeout=30.0)
+
+
 def back_in_service(settings: dict[str, Any], home: Path, client: httpx.Client) -> None:
     """Undoes the cordon a planned stop put on this node. A cordon someone set by hand stays."""
     marker = home / STOPPED_CORDON
@@ -776,7 +811,7 @@ def back_in_service(settings: dict[str, Any], home: Path, client: httpx.Client) 
         return
     name = settings["name"]
     try:
-        answer = client.post(f"{local_url(settings)}/admin/nodes/{name}/uncordon", headers=bearer_headers(sign_in_key(home)), timeout=30.0)
+        answer = ask_for_self(settings, home, client, f"/admin/nodes/{name}/uncordon")
     except httpx.HTTPError as exc:
         print(f"Could not put {name} back in service: {exc}. Run: isharded uncordon {name}", flush=True)
         return
@@ -784,7 +819,7 @@ def back_in_service(settings: dict[str, Any], home: Path, client: httpx.Client) 
         marker.unlink(missing_ok=True)
         print(f"{name} is back in service.", flush=True)
     else:
-        print(f"Could not put {name} back in service: {answer.text[:200]}. Run: isharded uncordon {name}", flush=True)
+        print(f"Could not put {name} back in service: {detail_of(answer)}. Run: isharded uncordon {name}", flush=True)
 
 
 def run_stop(args: argparse.Namespace) -> int:

@@ -152,6 +152,9 @@ class AccessControl:
     removed: set[str] = field(default_factory=set)
     # Nodes taken out of service on purpose, for maintenance.
     cordoned: set[str] = field(default_factory=set)
+    # The cordoned nodes that took themselves out, with their own certificate, to stop.
+    # Such a node may put itself back; a cordon anyone else set stays until they lift it.
+    leaving: set[str] = field(default_factory=set)
     path: Path | None = None
     # Nodes prove themselves with certificates, so nothing is open even with no token.
     identities: bool = False
@@ -217,6 +220,7 @@ class AccessControl:
         self.revoked = set(document.get("revoked_nodes", []))
         self.removed = set(document.get("removed_keys", []))
         self.cordoned = set(document.get("cordoned_nodes", []))
+        self.leaving = set(document.get("leaving_nodes", [])) & self.cordoned
         self.version = int(document.get("version", 0))
 
     def document(self) -> dict[str, Any]:
@@ -231,6 +235,7 @@ class AccessControl:
             "revoked_nodes": sorted(self.revoked),
             "removed_keys": sorted(self.removed),
             "cordoned_nodes": sorted(self.cordoned),
+            **({"leaving_nodes": sorted(self.leaving)} if self.leaving else {}),
             "signed": [self.signed[held] for held in sorted(self.signed)],
             "join_requests": [self.join_requests[name] for name in sorted(self.join_requests)],
         }
@@ -366,8 +371,9 @@ class AccessControl:
             self._take_join_requests(document)
             if self._outranks(document, mine):
                 cordoned = set(document.get("cordoned_nodes", []))
-                changed = changed or cordoned != self.cordoned
-                self.cordoned = cordoned
+                leaving = set(document.get("leaving_nodes", [])) & cordoned
+                changed = changed or cordoned != self.cordoned or leaving != self.leaving
+                self.cordoned, self.leaving = cordoned, leaving
                 self.version = max(self.version, int(document.get("version", 0)))
         if changed:
             self._save()
@@ -411,6 +417,7 @@ class AccessControl:
             "revoked_nodes": sorted(self.revoked | set(document.get("revoked_nodes", []))),
             "removed_keys": sorted(removed),
             "cordoned_nodes": sorted(newest.get("cordoned_nodes", [])),
+            **({"leaving_nodes": newest["leaving_nodes"]} if newest.get("leaving_nodes") else {}),
             "signed": mine["signed"],
             "join_requests": mine["join_requests"],
         }
@@ -476,12 +483,22 @@ class AccessControl:
         self.revoked.discard(name)
         self._changed()
 
-    def cordon(self, name: str) -> None:
+    def cordon(self, name: str, by_itself: bool = False) -> None:
+        """Take a node out of service. ``by_itself`` is the node's own stop, which it may undo.
+
+        A cordon someone else set is theirs: the node cannot lift it, and taking itself out
+        again does not make it the node's own.
+        """
+        if by_itself and name not in self.cordoned:
+            self.leaving.add(name)
+        elif not by_itself:
+            self.leaving.discard(name)
         self.cordoned.add(name)
         self._changed()
 
     def uncordon(self, name: str) -> None:
         self.cordoned.discard(name)
+        self.leaving.discard(name)
         self._changed()
 
     @property
