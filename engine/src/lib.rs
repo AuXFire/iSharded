@@ -27,7 +27,7 @@ use watchdog::{Limits, Watchdog};
 /// Bumped when the functions below change, so a stale library is refused and not misused.
 /// Three: a plan carries a key for each link, and answers carry a seal.
 /// Four: a stage can probe at load whether merged passes round as rows run alone.
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 5;
 
 /// One stage's engine, as Python holds it.
 pub struct Engine {
