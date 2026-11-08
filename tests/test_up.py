@@ -314,6 +314,22 @@ def test_a_machine_in_a_mesh_refuses_to_join_another(tmp_path: Path, monkeypatch
     assert "already belongs" in capsys.readouterr().err
 
 
+def test_a_container_started_again_with_its_invite_starts_as_the_same_node(tmp_path: Path, monkeypatch, capsys) -> None:
+    """A container runs the same command each time; its folder on a volume already holds its place."""
+    monkeypatch.setenv("ISHARDED_UP_HOME", str(tmp_path))
+    (tmp_path / "ca.pem").write_text("MESH", encoding="utf-8")
+    up.write_settings(tmp_path, settings())
+    code = up.INVITE_PREFIX + up._encode(json.dumps({"urls": ["http://100.64.0.2:8209"], "authority": up.authority_hash("MESH"), "secret": "s"}).encode())
+    other = up.INVITE_PREFIX + up._encode(json.dumps({"urls": ["http://100.64.0.2:8209"], "authority": up.authority_hash("ELSE"), "secret": "s"}).encode())
+    assert up.same_mesh(tmp_path, code)
+    assert not up.same_mesh(tmp_path, other) and not up.same_mesh(tmp_path, "isi-x")
+    started: list[object] = []
+    monkeypatch.setattr(up, "become_member", lambda *a: started.append("joined again"))
+    args = type("Args", (), {"invite": other})()
+    assert up.run_up(args) == 1  # an invite to another mesh is still refused
+    assert "already belongs" in capsys.readouterr().err and not started
+
+
 def test_only_the_owners_machine_can_invite(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.setenv("ISHARDED_UP_HOME", str(tmp_path))
     up.write_settings(tmp_path, settings())

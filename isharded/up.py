@@ -134,6 +134,14 @@ def authority_hash(pem: str) -> str:
     return hashlib.sha256(pem.replace("\r\n", "\n").strip().encode()).hexdigest()
 
 
+def same_mesh(home: Path, code: str) -> bool:
+    """Whether an invite is for the mesh this folder already belongs to."""
+    try:
+        return authority_hash((home / "ca.pem").read_text(encoding="utf-8")) == read_invite(code).get("authority")
+    except (OSError, ValueError):
+        return False
+
+
 def read_invites(home: Path) -> list[dict[str, Any]]:
     try:
         return json.loads((home / "invites.json").read_text(encoding="utf-8"))
@@ -666,7 +674,11 @@ def run_up(args: argparse.Namespace) -> int:
     settings = read_settings(home)
     is_new = settings is None
     try:
-        if args.invite:
+        if args.invite and settings and same_mesh(home, args.invite):
+            # A container started with the same command each time: its folder on a volume
+            # already holds its place, so the invite is not used again.
+            print(f"This machine already belongs to this mesh, kept in {home}, so the invite is not needed.")
+        elif args.invite:
             if settings:
                 print(f"This machine already belongs to a mesh, kept in {home}. Remove that folder to join another.", file=sys.stderr)
                 return 1
