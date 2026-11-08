@@ -5,6 +5,7 @@ way the owner sees it happen and the old key stops proving the name anywhere.
 """
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 from pathlib import Path
 import shutil
@@ -276,3 +277,60 @@ def test_a_joiner_on_the_command_line_waits_for_a_certificate_for_its_own_key(tm
     assert cli.run_membership(args) == 0
     assert len(looked) == 2, "the name's old certificate was not taken for its own"
     assert up.certificate_matches_key((tmp_path / "joiner" / "first.pem").read_text(encoding="utf-8"), tmp_path / "joiner" / "first.key")
+
+
+@contextlib.contextmanager
+def serving_at(app, **options):
+    """A real server with the node's own protocol, where a connection's name is read."""
+    import asyncio
+    import socket
+    import threading
+    import time
+
+    import uvicorn
+
+    from isharded.serving import NoDelayHTTPProtocol
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", lifespan="off", http=NoDelayHTTPProtocol, **options))
+    thread = threading.Thread(target=lambda: asyncio.run(server.serve()), daemon=True)
+    thread.start()
+    try:
+        deadline = time.time() + 10
+        while not server.started and time.time() < deadline:
+            time.sleep(0.02)
+        yield port
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+
+
+def test_a_tls_connection_stops_proving_its_name_once_its_key_is_retired(tmp_path: Path) -> None:
+    """Over real mutual TLS, on one kept-alive connection, as nodes hold theirs for an hour."""
+    import ssl
+
+    import httpx
+
+    from isharded.pool import add_node
+
+    home = tmp_path / "owner"
+    up.make_owner(home, "first", "100.64.0.1")
+    certificate, key = add_node(str(home), "second", ["127.0.0.1"])
+
+    async def who(scope, receive, send):
+        name = (tls.PEER.get() or "nobody").encode()
+        await send({"type": "http.response.start", "status": 200, "headers": [(b"content-length", str(len(name)).encode())]})
+        await send({"type": "http.response.body", "body": name})
+
+    options = {"ssl_certfile": str(home / "first.pem"), "ssl_keyfile": str(home / "first.key"), "ssl_ca_certs": str(home / "ca.pem"), "ssl_cert_reqs": ssl.CERT_OPTIONAL}
+    context = ssl.create_default_context(cafile=str(home / "ca.pem"))
+    context.load_cert_chain(str(certificate), str(key))
+    try:
+        with serving_at(who, **options) as port, httpx.Client(verify=context, trust_env=False) as client:
+            assert client.get(f"https://127.0.0.1:{port}/").text == "second"
+            tls.retire_keys([str(certificate_fingerprint(Path(certificate).read_text(encoding="utf-8")))])
+            assert client.get(f"https://127.0.0.1:{port}/").text == "nobody"
+    finally:
+        tls.RETIRED_KEYS.clear()

@@ -159,10 +159,20 @@ def retire_keys(fingerprints: Any) -> None:
     RETIRED_KEYS.update(str(item) for item in fingerprints)
 
 
+def key_of_certificate(certificate: bytes | None) -> str | None:
+    """The fingerprint of the key in a verified certificate, in DER, if it can be read."""
+    if not certificate:
+        return None
+    try:
+        from .pool import certificate_fingerprint
+    except ImportError:
+        return None
+    try:
+        return certificate_fingerprint(certificate)
+    except ImportError:  # no cryptography here, so no authority, so nothing can be retired
+        return None
+
+
 def retired_certificate(certificate: bytes | None) -> bool:
     """Whether a verified certificate, in DER, is for a key the owner retired."""
-    if not RETIRED_KEYS or not certificate:
-        return False
-    from .pool import certificate_fingerprint
-
-    return certificate_fingerprint(certificate) in RETIRED_KEYS
+    return bool(RETIRED_KEYS) and key_of_certificate(certificate) in RETIRED_KEYS

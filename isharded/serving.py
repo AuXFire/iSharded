@@ -13,7 +13,7 @@ from typing import Any
 import uvicorn
 from uvicorn.protocols.http.auto import AutoHTTPProtocol
 
-from .tls import CONNECTION, NODE_KEEP_ALIVE_SECONDS, PEER, peer_name, probe_options, retired_certificate, server_options
+from .tls import CONNECTION, NODE_KEEP_ALIVE_SECONDS, PEER, peer_name, probe_options, RETIRED_KEYS, key_of_certificate, server_options
 
 # Over the five seconds clients hold an idle connection, so that a client always closes
 # first, and never sends on a connection the server is dropping that same moment.
@@ -70,13 +70,14 @@ class NoDelayHTTPProtocol(AutoHTTPProtocol):  # type: ignore[misc, valid-type]
         self.stall_watch = self.loop.call_later(STALL_SECONDS, self._check_stalled)
         peer = peer_name(transport.get_extra_info("peercert"))
         held = transport.get_extra_info("ssl_object") if peer else None
-        certificate = held.getpeercert(binary_form=True) if held is not None else None
+        # Worked out once for the connection, and looked up on every request, as a connection
+        # can outlast its key's retirement.
+        key = key_of_certificate(held.getpeercert(binary_form=True)) if held is not None else None
         inner = self.app
 
         async def with_identity(scope: Any, receive: Any, send: Any) -> None:
             CONNECTION.set(self)
-            # Looked at on every request, as a connection can outlast the key's retirement.
-            if peer and not retired_certificate(certificate):
+            if peer and key not in RETIRED_KEYS:
                 PEER.set(peer)
             await inner(scope, receive, send)
 
