@@ -11,6 +11,8 @@ runs these phases and records what it saw:
   join          a new node joins: time until every node sees it, and its worker is live
                 at every control plane and has every control plane
   leave         a node is killed: time until every node has dropped it and its worker
+  silent-leave  a node is unplugged (every call to it goes silent): the same times as for
+                leave; a steady window after it shows what a silent dead member costs
   kill-leader   the coordinator is killed: time until the rest agree on a new one, and
                 how many elections and step-downs that took
   freeze-leader the coordinator is suspended (silent, the worst kind of failure), then
@@ -57,7 +59,7 @@ from report import growth_table  # noqa: E402
 
 # The second steady window runs with a dead member, which every node keeps calling.
 DEFAULT_PHASES = ("steady", "status", "join", "leave", "steady", "kill-leader")
-ALL_PHASES = (*DEFAULT_PHASES, "freeze-leader", "partition")
+ALL_PHASES = (*DEFAULT_PHASES, "silent-leave", "steady", "freeze-leader", "partition")
 POLL_SECONDS = 0.5
 
 
@@ -120,6 +122,9 @@ class Pool:
         self.client = httpx.AsyncClient(timeout=30.0, trust_env=False)
         self.status_client = httpx.AsyncClient(timeout=120.0, trust_env=False, headers={"Authorization": f"Bearer {self.token}"})
         self.down: set[str] = set()
+        # Nodes cut off from everyone, as if unplugged. They run on, unheard.
+        self.cut_off: set[str] = set()
+        self.unplugged = self.names[-3]
 
     # Layout and processes
 
@@ -238,7 +243,12 @@ class Pool:
         return "; ".join(rows[:12]) + (" ..." if len(rows) > 12 else "")
 
     def members(self) -> list[str]:
-        return [name for name in self.reports if name not in self.down]
+        return [name for name in self.reports if name not in self.down and name not in self.cut_off]
+
+    async def set_sides(self, sides: dict[str, int]) -> None:
+        """Tell every process who can hear whom. A node cut off stays cut off."""
+        sides = {**sides, **{name: -1 for name in self.cut_off}}
+        await asyncio.gather(*(self.client.post(f"http://127.0.0.1:{entry['port']}/network", json={"sides": sides}) for entry in self.live_hosts().values()))
 
     def settled(self, expected: list[str]) -> bool:
         """Every expected node is up, sees the rest, agrees on one leader, and every worker is everywhere."""
@@ -397,8 +407,21 @@ class Pool:
         }
 
     async def leave(self) -> dict[str, Any]:
+        """A node's process is killed. Its port then refuses, which the system says at once."""
         gone = self.leaver
         killed = self.kill(gone)
+        return await self.dropped(gone, killed)
+
+    async def silent_leave(self) -> dict[str, Any]:
+        """A node is unplugged: every call to it goes silent, as to a machine switched off."""
+        gone = self.unplugged
+        unplugged = time.time()
+        self.cut_off.add(gone)
+        await self.set_sides({})
+        return await self.dropped(gone, unplugged)
+
+    async def dropped(self, gone: str, killed: float) -> dict[str, Any]:
+        """How long the rest took to drop a node that left, and its worker."""
         survivors = [name for name in self.members() if name != gone]
         worker = self.worker_of(gone)
 
@@ -471,7 +494,7 @@ class Pool:
         half = everyone[len(everyone) // 2 :]
         sides = {name: (1 if name in half else 0) for name in everyone}
         cut = time.time()
-        await asyncio.gather(*(self.client.post(f"http://127.0.0.1:{entry['port']}/network", json={"sides": sides}) for entry in self.live_hosts().values()))
+        await self.set_sides(sides)
 
         def split() -> bool:
             leaders = {self.reports[name]["leader"] for name in half}
@@ -481,7 +504,7 @@ class Pool:
         far_leader = max(self.last_event(name, {"leader"}, None, cut) or cut for name in half)
         await asyncio.sleep(max(self.args.partition_seconds - (time.time() - cut), 0.0))
         healed = time.time()
-        await asyncio.gather(*(self.client.post(f"http://127.0.0.1:{entry['port']}/network", json={"sides": {}}) for entry in self.live_hosts().values()))
+        await self.set_sides({})
         await self.until(lambda: self.settled(everyone), self.args.settle_timeout, "one leader after healing")
         back = max(self.last_event(name, {"leader", "peers+", "workers+", "controls+"}, None, healed) or healed for name in everyone)
         return {
@@ -497,6 +520,7 @@ PHASES = {
     "status": Pool.status,
     "join": Pool.join,
     "leave": Pool.leave,
+    "silent-leave": Pool.silent_leave,
     "kill-leader": Pool.kill_leader,
     "freeze-leader": Pool.freeze_leader,
     "partition": Pool.partition,
@@ -523,9 +547,9 @@ async def run(args: argparse.Namespace, nodes: int) -> dict[str, Any]:
             print(f"[N={nodes}] {key} ...", flush=True)
             result["phases"][key] = await PHASES[phase](pool)
             print(f"[N={nodes}] {key}: {json.dumps(result['phases'][key])[:400]}", flush=True)
-    except TimeoutError as exc:
-        result["error"] = str(exc)
-        print(f"[N={nodes}] {exc}", flush=True)
+    except Exception as exc:  # a failed phase still leaves the results so far, and no processes
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        print(f"[N={nodes}] {result['error']}", flush=True)
     finally:
         await pool.close()
     result["run_dir"] = str(pool.run_dir)
@@ -545,7 +569,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--status-seconds", type=float, default=20.0, help="time spent asking for status, half on the leader")
     parser.add_argument("--freeze-seconds", type=float, default=30.0, help="how long the leader stays suspended")
     parser.add_argument("--partition-seconds", type=float, default=30.0, help="how long the halves stay apart")
-    parser.add_argument("--settle-timeout", type=float, default=180.0, help="longest wait for any phase to settle")
+    parser.add_argument("--settle-timeout", type=float, default=300.0, help="longest wait for any phase to settle")
     parser.add_argument("--delay-ms", type=float, default=0.0, help="emulated one-way delay on every call")
     parser.add_argument("--jitter-ms", type=float, default=0.0, help="emulated jitter on that delay")
     parser.add_argument("--loss", type=float, default=0.0, help="share of calls that go silent, 0 to 1")
