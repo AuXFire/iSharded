@@ -169,6 +169,25 @@ def test_a_workers_health_carries_the_measuring_fields(monkeypatch) -> None:
     assert telemetry["draft_guess"].keys() == {"guesses", "ms_total", "steady", "steady_ms_total"}
 
 
+def test_cuda_graphs_are_reported_only_by_a_worker_that_computes_on_cuda(monkeypatch) -> None:
+    """A CPU stage has no CUDA graphs to keep, so it must not say they are on."""
+    from isharded import worker
+    from isharded.protocol import HardwareInfo
+
+    def on(device: str) -> HardwareInfo:
+        return HardwareInfo(device=device, backend=device.split(":")[0], cpu_cores=1, ram_total_bytes=1)
+
+    monkeypatch.setattr(worker, "authorized", lambda authorization: True)
+    monkeypatch.setattr(worker.runtime, "gguf", None)
+    monkeypatch.delenv("GGML_CUDA_DISABLE_GRAPHS", raising=False)
+    monkeypatch.setattr(worker.runtime, "hardware", on("cpu"))
+    assert asyncio.run(worker.health(None))["telemetry"]["cuda_graphs"] is None
+    monkeypatch.setattr(worker.runtime, "hardware", on("cuda:0"))
+    assert asyncio.run(worker.health(None))["telemetry"]["cuda_graphs"] is True
+    monkeypatch.setenv("GGML_CUDA_DISABLE_GRAPHS", "0")
+    assert asyncio.run(worker.health(None))["telemetry"]["cuda_graphs"] is False
+
+
 def test_a_node_hands_its_price_and_power_setting_to_its_workers(monkeypatch) -> None:
     import argparse
 

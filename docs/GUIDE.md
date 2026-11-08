@@ -1044,7 +1044,7 @@ A node's operator can set what the machine costs, in any currency an hour, with 
 
 `draft_guess` on the entry worker counts every guess a pipelined pass waited for, with `guesses` and `ms_total`, and `steady` and `steady_ms_total` for those that ran one row. This is the `g` of [the law](#what-a-route-costs) as a real reply pays it: on the entry, sharing the device with the entry stage, and through the worker's own threads. A draft timed by itself is faster. On the 235B mesh the real runs fitted 18.6 ms where a draft alone measured 3.6 to 4.2 ms. `isharded bench --pace` runs one reply at a time, which is when the draft sets the pace, and says so in a note if nothing was guessed. Use a long `--tokens`, so there are enough guesses to count.
 
-`cuda_graphs` is false where the worker's environment has `GGML_CUDA_DISABLE_GRAPHS`. llama.cpp turns CUDA graphs off for any value of it, `0` included. To compare a route with graphs on and off, start its nodes with the variable and without it, bench each, and `--compare` the two: a change of CUDA graphs shows as a change in what ran.
+`cuda_graphs` is false where the worker's environment has `GGML_CUDA_DISABLE_GRAPHS`, and null on a worker that does not compute on CUDA, which has no graphs to keep. llama.cpp turns CUDA graphs off for any value of it, `0` included. To compare a route with graphs on and off, start its nodes with the variable and without it, bench each, and `--compare` the two: a change of CUDA graphs shows as a change in what ran.
 
 #### Timing a pass on this machine
 

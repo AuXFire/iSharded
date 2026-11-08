@@ -706,6 +706,12 @@ class WorkerRuntime:
                 self.power = found
         return self.power.report() if self.power is not None else {"source": None, "error": self.power_problem}
 
+    def cuda_graphs(self) -> bool | None:
+        """Whether llama.cpp may use CUDA graphs here, or None on a device that has none."""
+        if self.hardware is not None and not self.hardware.device.startswith("cuda"):
+            return None
+        return cuda_graphs_on()
+
     async def close(self) -> None:
         if self.power is not None:
             self.power.close()
@@ -2387,7 +2393,7 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
             "draft_guess": runtime.guess_clock.report(),
             "power": runtime.power_report(),
             "price_per_hour": price_per_hour(),
-            "cuda_graphs": cuda_graphs_on(),
+            "cuda_graphs": runtime.cuda_graphs(),
         },
     }
 
