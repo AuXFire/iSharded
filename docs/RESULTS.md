@@ -583,7 +583,7 @@ Each lane ran its own files before merging, builder then verifier. A count of ne
 | Warm links (round 5) | cargo 73 and 45; 650 passed, 1 skipped, 1 failed under load (passed alone twice), then 255 passed | 73/45; 401 passed, 1 skipped in 144 s | 2026-11-07 |
 | Fixes (round 5) | 8 files 1087 passed, 1 skipped; cargo 74 unit and 43 ring | Seven files 837 passed, 1 skipped; 74/43 | 2026-11-07 |
 | Chat page and dashboard (round 5, real Chrome) | 793 passed, 1 failed, 3 skipped; after the fix the UI file 110 of 110 | After its last fix: 795 passed, 3 skipped in 152 s | 2026-11-07 |
-| Operations fixes (round 7) | Python: 4443 passed, 44 skipped over the non-model files in four runs; the real-model files 1459 passed, 11 skipped; readme 253. Cargo: 99 library and 54 ring tests. New tests that failed on the old code: the self-cordon tests 5 of 5, the fetch name, the probe bound and the closing-link refusal (with either half of its fix taken out) | | 2026-11-08 |
+| Operations fixes (round 7) | Python: 4443 passed, 44 skipped over the non-model files in four runs; the real-model files 1459 passed, 11 skipped, and on the hybrid 1460 passed, 10 skipped; readme 253. Cargo: 99 library and 54 ring tests. New tests that failed on the old code: the self-cordon tests 5 of 5, the fetch name, the probe bound and the closing-link refusal (with either half of its fix taken out) | | 2026-11-08 |
 
 ## Handover prototypes
 
