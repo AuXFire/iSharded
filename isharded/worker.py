@@ -2658,6 +2658,7 @@ async def configure_given_up(load_id: str, authorization: str | None = Header(de
             if runtime.holding_load == load_id:
                 runtime._release_weights()
                 runtime.holding_load = None
+                print("The coordinator gave up on this load after it finished, so its weights were let go.", flush=True)
     return {"status": "given up"}
 
 
