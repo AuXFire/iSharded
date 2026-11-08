@@ -961,6 +961,8 @@ class WorkerRuntime:
             request.projector.file if request.projector and stage.start_layer == 0 else None,
             request.prompt_cache,
             request.kv_type,
+            # The stage probes how it rounds at load, and only for exact replies.
+            request.exact,
         )
 
     async def hold_gate(self, seconds: float) -> bool:

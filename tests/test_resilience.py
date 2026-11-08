@@ -524,6 +524,16 @@ def test_a_moved_stage_reloads():
     assert signature(request(4)) == signature(request(4))
 
 
+def test_asking_for_exact_replies_loads_the_stage_again_so_it_probes():
+    from isharded import worker
+    from isharded.protocol import ConfigureRequest
+
+    assignment = stage("w", 0, 4)
+    plain = ConfigureRequest(model_id="m", revision="r", architecture={}, epoch=2, assignment=assignment, route=[assignment])
+    signature = worker.WorkerRuntime._stage_signature
+    assert signature(plain) != signature(plain.model_copy(update={"exact": True})), "a kept stage never probed"
+
+
 def test_a_drain_waits_for_the_reply_and_gives_up_on_time():
     from isharded.slots import SlotGate
 
