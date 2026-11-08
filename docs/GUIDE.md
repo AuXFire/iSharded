@@ -2228,7 +2228,7 @@ A node started with `isharded up` keeps its route state, keys, and audit log in 
 | `workers_quarantined` | Workers held out of the route. Alert above 0 |
 | `workers_live`, `worker_live` | Workers heard from recently, overall and per worker |
 | `event_loop_lag_seconds`, `event_loop_lag_worst_seconds` | How late the control plane's event loop last woke, and the latest in the last minute. Replies, heartbeats and status all wait that long. Alert above 0.25 |
-| `event_loop_stalls_total` | Times the event loop was held over 250 ms. Each also writes a `loop:` line to the node's log |
+| `event_loop_stalls_total` | Times the event loop was held over 250 ms. Each also writes a `loop:` line to the node's log, with how long and the code that held it |
 | `health_age_seconds` | Age of the worker health that status shows. It is checked every 5 s, so alert above 30 |
 | `mesh_members` | Control planes reachable from here. Alert below the node count |
 | `mesh_term`, `coordinator`, `epoch` | Leadership term, whether this node coordinates, and the pipeline epoch |

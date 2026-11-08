@@ -185,7 +185,7 @@ Metrics worth alerting on:
 | `isharded_worker_draft_tokens_per_pass` near 1 | The draft is not helping. |
 | `isharded_stage_errors_total` rising | Stages are refusing requests. Nobody is quarantined for this, so a real fault in a stage shows up here and in failed replies. |
 | `isharded_worker_state_misses_total` rising | Stages are evicting states the entry worker still counts on. Each one costs a reread and nothing else, so raise `--state-ram-gb` or `--state-disk-gb` if it keeps climbing. |
-| `isharded_event_loop_lag_worst_seconds` above 0.25, or `isharded_event_loop_stalls_total` rising | Something held the control plane, and replies, heartbeats and status waited for it. Each stall writes a `loop:` line to the node's log with how long. |
+| `isharded_event_loop_lag_worst_seconds` above 0.25, or `isharded_event_loop_stalls_total` rising | Something held the control plane, and replies, heartbeats and status waited for it. Each stall writes a `loop:` line to the node's log with how long and the code that held it, innermost first. |
 | `isharded_health_age_seconds` above 30 | The background health check is stuck, so status shows old worker health. |
 | `isharded_worker_state_copies_failed_total` rising | Copies of saved states are not arriving. Replies are fine, but a lost node would cost a full reread. |
 

@@ -11,7 +11,10 @@ import secrets
 import re
 import socket
 import statistics
+import sys
+import threading
 import time
+import traceback
 import uuid
 from collections import Counter, deque
 from collections.abc import AsyncIterator
@@ -916,6 +919,8 @@ class Orchestrator:
         self.loop_lag_seconds = 0.0
         self.loop_lag_worst: deque[tuple[float, float]] = deque()
         self.loop_stalls = 0
+        # Where the loop was while it was held, caught by a thread, told with the stall's log line.
+        self.loop_stall_where: str | None = None
         self.mesh: ControlMesh | None = None
         seen_as = os.getenv("ISHARDED_NODE_URL")
         if seen_as:
@@ -1266,12 +1271,40 @@ class Orchestrator:
             await asyncio.sleep(HEALTH_SECONDS)
 
     async def _watch_loop(self) -> None:
-        """Measure how late the event loop wakes. Everything this node answers waits that long too."""
+        """Measure how late the event loop wakes. Everything this node answers waits that long too.
+
+        A thread watches the same ticks, and when one is overdue it notes the code the loop is
+        running, so the log line for a stall says what held it and not only for how long.
+        """
         loop = asyncio.get_running_loop()
-        while True:
-            planned = loop.time() + LOOP_TICK_SECONDS
-            await asyncio.sleep(LOOP_TICK_SECONDS)
-            self.note_loop_lag(max(loop.time() - planned, 0.0))
+        beat = [time.monotonic()]
+        stop = threading.Event()
+        watcher = threading.Thread(target=self._catch_stalls, args=(threading.get_ident(), beat, stop), name="isharded-loop-watch", daemon=True)
+        watcher.start()
+        try:
+            while True:
+                planned = loop.time() + LOOP_TICK_SECONDS
+                await asyncio.sleep(LOOP_TICK_SECONDS)
+                self.note_loop_lag(max(loop.time() - planned, 0.0))
+                beat[0] = time.monotonic()
+        finally:
+            stop.set()
+            watcher.join(1.0)
+
+    def _catch_stalls(self, loop_thread: int, beat: list[float], stop: threading.Event) -> None:
+        """Note where the loop's thread is once a tick is overdue past the logging limit."""
+        caught = None
+        while not stop.wait(LOOP_TICK_SECONDS / 2):
+            last = beat[0]
+            if last == caught or time.monotonic() - last <= LOOP_TICK_SECONDS + LOOP_LAG_LOG_SECONDS:
+                continue
+            frame = sys._current_frames().get(loop_thread)
+            if frame is None:
+                continue
+            asyncio_dir = os.sep + "asyncio" + os.sep  # the loop's own frames say nothing about what held it
+            stack = [item for item in traceback.extract_stack(frame) if asyncio_dir not in item.filename]
+            self.loop_stall_where = " < ".join(f"{Path(item.filename).name}:{item.lineno} {item.name}" for item in reversed(stack[-6:]))
+            caught = last
 
     def note_loop_lag(self, lag: float) -> None:
         now = time.monotonic()
@@ -1283,8 +1316,10 @@ class Orchestrator:
         self.worst_loop_lag()  # drops what is older than the minute
         if lag > LOOP_LAG_LOG_SECONDS:
             self.loop_stalls += 1
+            where, self.loop_stall_where = self.loop_stall_where, None
+            held_in = f", in {where}" if where else ""
             with suppress(OSError, ValueError):  # a full disk or an odd console must not fail what is being logged
-                print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} loop: the event loop was held {lag * 1000:.0f} ms; replies and status waited as long", flush=True)
+                print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} loop: the event loop was held {lag * 1000:.0f} ms; replies and status waited as long{held_in}", flush=True)
 
     def worst_loop_lag(self) -> float:
         """The latest wake in the last minute, in seconds."""

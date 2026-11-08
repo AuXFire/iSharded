@@ -328,3 +328,25 @@ def test_the_probe_limit_works_on_a_later_event_loop(pool):
         pool.client = Recorder(delay=0.02)
         asyncio.run(pool.refresh_worker_metrics())
         assert pool.client.most == orchestrator_module.MAX_PROBES_AT_ONCE
+
+
+def test_a_held_loop_says_where_it_was_held(pool, capsys):
+    """A lag number alone does not say what to fix, so the log line names the code that held the loop."""
+
+    def hold_the_loop_here():
+        time.sleep(0.5)
+
+    async def scenario():
+        watcher = asyncio.ensure_future(pool._watch_loop())
+        await asyncio.sleep(0.25)
+        hold_the_loop_here()
+        await asyncio.sleep(0.25)
+        watcher.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await watcher
+
+    asyncio.run(scenario())
+    line = next(line for line in capsys.readouterr().out.splitlines() if "event loop was held" in line)
+    assert "hold_the_loop_here" in line and "test_control_plane.py" in line
+    assert pool.loop_stall_where is None, "a place is told once, with the stall it belongs to"
+    assert not any(thread.name == "isharded-loop-watch" for thread in threading.enumerate()), "the watcher's thread ends with it"
