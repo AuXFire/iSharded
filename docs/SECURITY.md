@@ -21,6 +21,7 @@ This suits a pool whose members trust each other. It is not a public mesh. A pub
 - It proves it holds the secret with an HMAC over its exact request and key hash. The proof travels by gossip, so a member who sees it pass cannot reuse it on another request.
 - The owner's machine checks the proof, signs a certificate, and signs a user key for the new machine. Nothing else in the mesh can admit anyone, so if that machine is off, an invite waits.
 - Anyone holding a live code can join until it is used. Treat it like a password, and keep the time short.
+- A code also lets its holder take over a member's name, which is how a machine that lost its folder comes back. See [A name that comes back with a new key](#a-name-that-comes-back-with-a-new-key).
 - `invites.json` on the owner's machine holds live secrets beside `ca.key`, and has the same protection.
 
 ## Finding a mesh
@@ -184,6 +185,19 @@ Without a pool authority, an admin key or the pool token changes these through a
 Revocation stops every node accepting that certificate, takes its workers out of the route, and stops gossip with it. A revoked name cannot register new workers.
 
 Revocation is permanent for that name, and so is removing a key. Both are kept for good and merged entry by entry, so neither a network split nor a forged document can undo them. To bring a machine back, issue it a certificate under a new name. A removed key's name cannot be used again in a pool with an authority.
+
+### A name that comes back with a new key
+
+A machine that lost its folder asks to join under its old name with a new key. So could a different machine after that name. The mesh cannot tell these apart, so both are treated the same way:
+
+- The request waits like any other. Nothing hands it the name's old certificate, and the joiner waits for one issued for its own key.
+- Only an invite's proof, checked on the owner's machine, or a person approving that exact key lets it in. An approval names the key it approved, so approving one machine never approves the next to ask for the same name.
+- The owner's machine signs a `retire_key` entry before the new certificate. It names the old key's fingerprint, which the owner's own node works out from what it signed before: a request cannot choose what gets retired.
+- Every node then refuses the old key: a TLS connection with that certificate proves no name, a ticket made with it is refused, even one checked before, and workers take the signed retirement from their control plane. The old folder's chat key is removed with it. A retired key cannot ask to join again.
+- Each node settles on the newest certificate whose key is not retired, whatever order the signed entries reach it in.
+- The dashboard shows the request as a rejoin, with the key it would retire, and both the request and the retirement are security events in the log and on the dashboard.
+
+A revoked name stays revoked: this is for names in good standing. A node running older code ignores `retire_key` entries, so until every node is updated, an old node may keep trusting the old key.
 
 ## Encryption
 

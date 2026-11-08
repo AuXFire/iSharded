@@ -219,6 +219,20 @@ The new machine gets its own key for the chat page, with the user role. The owne
 
 Or skip the code. A new machine running `isharded up` looks for a mesh on its LAN and its tailnet, and offers to join what it finds. The machine then waits for someone to approve it, on the dashboard or with `isharded approve NAME`, and both sides show the same key fingerprint to check. If a firewall blocks the search, which uses UDP port 8208 on a LAN, use an invite.
 
+### A machine that lost its folder
+
+A node's key lives in its folder, `up` inside `%LOCALAPPDATA%\iSharded` on Windows or `~/.cache/iSharded` elsewhere, or wherever `ISHARDED_UP_HOME` points. A machine whose folder was wiped makes a new key, and the mesh still knows its name by the old one. Give it a new invite and run `isharded up --invite CODE` with the same `--name`. It says the name is already a member and which key it held, and joining with the new key retires that one. Without an invite it waits for the owner, as any new machine does.
+
+The dashboard shows such a request as "NAME wants to rejoin with a new key", with the key it would replace. Approving it retires the old key: from then on that key proves nothing on any node, over TLS or with tickets, and the old folder's chat key stops working too. The recent events list "A node rejoined with a new key". A different machine asking for a member's name looks exactly the same, so approve it only if you know the machine. [iSharded security](SECURITY.md#a-name-that-comes-back-with-a-new-key) has the details.
+
+A container loses its folder each time it is recreated. Keep it on a volume, and point `ISHARDED_UP_HOME` at it:
+
+```bash
+docker run -v isharded-home:/data -e ISHARDED_UP_HOME=/data/up IMAGE isharded up --invite CODE --name gpu-1
+```
+
+`IMAGE` is whatever image you run iSharded from. The first run joins. Later runs find the folder and start as the same node: the invite is not used again, so the same command works every time. An invite for a different mesh is still refused. On a rented GPU, put the folder on the network volume that holds the weights, not on the container disk.
+
 ### What it works out
 
 | Setting | How `isharded up` decides |
@@ -445,6 +459,8 @@ Qwen3-0.6B Q8_0 over two CPU stages on one machine, frozen 12 chunks into a repl
 | One llama.cpp thread, so a pass hangs | Exit | 37.4 s | |
 | The whole process, and no kill works | Exit | 26.1 s | 29.1 s |
 | The whole process, and no kill works | Entry | 24.0 s | |
+
+Something a frozen stage or a stalled link held up can arrive after its reply has ended, when the slot it names belongs to another reply. The entry numbers every attempt at a reply, newer each time, and the number travels with the reply's restores and passes, over HTTP and on the native ring. A stage refuses anything older than the reply its slot now holds: a late restore does nothing, and a late pass asks for a replay. When a new reply takes a slot, the engine drops the old reply's passes still queued there. So a reply is either right or replayed, and never runs on another conversation's state. Each stage counts these as `stale_refused` in its cache telemetry.
 
 ### Joining an owned network
 
@@ -772,7 +788,7 @@ Starts a node with everything worked out, and is the easy way in. See [Quick sta
 | Option | Default | What it does |
 |---|---|---|
 | `--invite` | None | Join a mesh, with a code from `isharded invite` |
-| `--name` | This machine's name | This node's name |
+| `--name` | This machine's name | This node's name. A machine that lost its folder rejoins under its old name with a new invite, which retires its old key |
 | `--port` | 8209 | Port for the chat page and API |
 | `--worker-port` | Nine below `--port` | This node's worker port, for clouds that hand out ports |
 | `--address` | Found for you | The address other nodes reach this one on |
