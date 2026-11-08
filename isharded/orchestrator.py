@@ -4442,6 +4442,15 @@ def unhonoured(body: BaseModel, limits: dict[str, Limit]) -> JSONResponse | None
     return JSONResponse(status_code=400, content={"detail": problem, "error": error})
 
 
+async def from_lane(request: Request | None, relay: Any) -> Any:
+    """Another lane's reply. A whole one only answers once it is done, so it stops if its
+    client goes first: the call to the lane is closed, and that lane stops it in turn."""
+    try:
+        return await unless_client_leaves(request and request.receive, relay)
+    except ClientGone:
+        return Response(status_code=CLIENT_GONE)
+
+
 @app.post("/v1/embeddings")
 async def embeddings(
     body: EmbeddingRequest,
@@ -4485,7 +4494,7 @@ async def completions(
         return refused
     lane = await runtime.lanes.locate(body.model)
     if lane:
-        return await runtime.lanes.forward(lane, "/v1/completions", body.model_dump(exclude_none=True), caller)
+        return await from_lane(request, runtime.lanes.forward(lane, "/v1/completions", body.model_dump(exclude_none=True), caller))
     await check_request(body.model)
     if isinstance(body.prompt, list):
         if len(body.prompt) != 1:
@@ -4532,7 +4541,7 @@ async def chat_completions(
         return refused
     lane = await runtime.lanes.locate(body.model)
     if lane:
-        return await runtime.lanes.forward(lane, "/v1/chat/completions", body.model_dump(exclude_none=True), caller)
+        return await from_lane(request, runtime.lanes.forward(lane, "/v1/chat/completions", body.model_dump(exclude_none=True), caller))
     await check_request(body.model)
     assert runtime.tokenizer is not None
     try:

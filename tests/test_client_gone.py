@@ -86,6 +86,29 @@ def test_a_whole_reply_stops_when_its_client_goes(live, path, body):
     assert stopped < 2
 
 
+@pytest.mark.parametrize("path, body", WHOLE[:2])
+def test_a_whole_reply_from_another_lane_stops_when_its_client_goes(live, monkeypatch, path, body):
+    """The call to the lane is closed, which is what makes that lane stop the reply."""
+    entered, closed = threading.Event(), threading.Event()
+
+    async def locate(model):
+        return "other"
+
+    async def forward(name, route, payload, caller):
+        entered.set()
+        try:
+            await asyncio.sleep(60)
+        finally:
+            closed.set()
+
+    monkeypatch.setattr(orchestrator.runtime.lanes, "locate", locate)
+    monkeypatch.setattr(orchestrator.runtime.lanes, "forward", forward)
+    connection = send(live, path, body)
+    assert entered.wait(15), "the lane should have been asked"
+    connection.close()
+    assert closed.wait(5), "the call to the lane went on after its client went"
+
+
 @pytest.mark.parametrize("path, body", WHOLE)
 def test_a_client_that_stays_gets_its_whole_reply(live, path, body):
     live.state.silent = False
