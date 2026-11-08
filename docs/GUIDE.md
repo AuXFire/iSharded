@@ -1237,7 +1237,7 @@ Send `Authorization: Bearer KEY`, except where it says none. Requests are limite
 | `POST` | `/api/pull`, `/api/push`, `/api/create`, `/api/copy`, `/api/blobs/{digest}` | User key | Refused with a 400 that says to load models through iSharded |
 | `DELETE` | `/api/delete` | User key | The same |
 | `POST` | `/mcp` | User key | [MCP](#mcp) over Streamable HTTP. `GET` and `DELETE` answer 405, since there is no stream or session |
-| `GET` | `/admin/status` | User key | Workers and their `country`, memory pools, route, measured [`links`](#what-a-route-costs), epoch, mesh, lanes, load progress, the last answer check, how many [replies run at once](#several-conversations-at-once) and why, and the running route's [shorter loop](#a-shorter-loop), if there is one. It asks every worker for its health and waits up to 3 s for each, so it answers within about that. A worker that still checks in but did not answer shows `state` `unreachable` |
+| `GET` | `/admin/status` | User key | Workers and their `country`, memory pools, route, measured [`links`](#what-a-route-costs), epoch, mesh, lanes, load progress, the last answer check, how many [replies run at once](#several-conversations-at-once) and why, and the running route's [shorter loop](#a-shorter-loop), if there is one. Worker health comes from a check the node runs in the background every 5 s, so status never waits on a worker; `health_age_seconds` says how old it is, and `loop_lag_ms` how late the control plane's event loop has woken. A worker that still checks in but did not answer the last check shows `state` `unreachable`, and one that stopped checking in shows `offline` and is not asked. One silent for 10 minutes that no route names is forgotten |
 | `GET` | `/admin/catalog` | User key | Suggested models and supported architectures |
 | `POST` | `/admin/plan` | Admin key | Show where a model would run, and any [shorter loop](#a-shorter-loop) for the route already running, without moving anything |
 | `POST` | `/admin/load` | Admin key | Load a model |
@@ -2227,6 +2227,9 @@ A node started with `isharded up` keeps its route state, keys, and audit log in 
 | `serving` | Whether this node can serve replies. Alert at 0 |
 | `workers_quarantined` | Workers held out of the route. Alert above 0 |
 | `workers_live`, `worker_live` | Workers heard from recently, overall and per worker |
+| `event_loop_lag_seconds`, `event_loop_lag_worst_seconds` | How late the control plane's event loop last woke, and the latest in the last minute. Replies, heartbeats and status all wait that long. Alert above 0.25 |
+| `event_loop_stalls_total` | Times the event loop was held over 250 ms. Each also writes a `loop:` line to the node's log |
+| `health_age_seconds` | Age of the worker health that status shows. It is checked every 5 s, so alert above 30 |
 | `mesh_members` | Control planes reachable from here. Alert below the node count |
 | `mesh_term`, `coordinator`, `epoch` | Leadership term, whether this node coordinates, and the pipeline epoch |
 | `stream_fallbacks_total` | Replies whose stream failed, and that resumed or fell back to replay. Should stay near zero, because fallbacks hide trouble |
