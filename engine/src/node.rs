@@ -62,6 +62,8 @@ pub(crate) const MAX_MERGED: usize = 64;
 /// from a reply is close behind it, and a repeated answer is close behind the first.
 const GENERATIONS_KEPT: usize = 16;
 const ANSWERS_KEPT: usize = 1024;
+/// How long a hung stage's refusal gets to leave, inside the second the watchdog gives it.
+const LAST_WORDS: Duration = Duration::from_millis(800);
 
 /// What a stage does with a pass. `Rows` go on to the next stage, and `Tokens` are the answer.
 pub enum Output {
@@ -560,13 +562,34 @@ impl Node {
 
     /// Tells the route that nothing here will finish. Id zero covers every pass at once, so
     /// this needs no word from the compute thread, which may be the thing that hung.
+    ///
+    /// The process ends straight after, so the refusal is not just queued: it goes towards the
+    /// entry on every link that leads there, back along the route and, from the last stage,
+    /// over the closing link too, and each link gets until `LAST_WORDS` to write it out and
+    /// for the far end to read it. Queued alone, it died with the process more often than not.
     pub fn refuser(&self) -> impl FnOnce(String) + Send + 'static {
         let inner = self.inner.clone();
         move |message| {
             if let Some(ring) = inner.ring.read().clone() {
                 let nack = Nack { id: 0, generation: 0, epoch: ring.epoch, refusal: Refusal::FailedStage, stage: ring.index, message };
                 inner.counters.refusals.fetch_add(1, Ordering::Relaxed);
-                send_back(&inner, &ring, &nack.encode());
+                let frame = nack.encode();
+                let towards_entry = if ring.is_entry() { inner.local.lock().clone() } else { ring.back.lock().clone() };
+                let closing = (ring.is_last() && !ring.is_entry()).then(|| ring.closing.lock().clone().map(|peer| peer.link.clone())).flatten();
+                // The closing link first: it is the way round a stuck walk back.
+                let links: Vec<Arc<Link>> = [closing, towards_entry].into_iter().flatten().collect();
+                for link in &links {
+                    let _ = link.send(&frame); // a dead link is seen by its far end, which says so itself
+                }
+                // Every link writes before any waits on its far end, so a far end that never
+                // closes cannot use up the time another link had to write.
+                let deadline = Instant::now() + LAST_WORDS;
+                for link in &links {
+                    link.stop_writing(deadline);
+                }
+                for link in &links {
+                    link.await_close(deadline);
+                }
             }
         }
     }
@@ -927,6 +950,10 @@ fn serve_answers(inner: &Inner, ring: &Ring, link: &Link, mut frames: Frames) {
     while let Ok((kind, body)) = frames.next() {
         match kind {
             Kind::Result => receive_answer(inner, ring, link, frames.whole()),
+            // A last stage that hung says so here too, in case the way back is what is stuck.
+            // Only the holder of the closing key can be on this link, and a refusal it repeats
+            // along the route is a refusal the worker has already acted on.
+            Kind::Nack => to_local(inner, frames.whole()),
             Kind::Ping if answer_ping(link, body) => {}
             Kind::Pad => {}
             _ => return,

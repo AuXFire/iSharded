@@ -186,6 +186,12 @@ struct Outbox {
     queued: VecDeque<Instant>,
     /// When the frame `take` last gave out was queued, if it was a real one.
     taken: Option<Instant>,
+    /// Frames queued so far, and frames the writer has finished with, padding that was
+    /// dropped included. Equal means nothing sent is still waiting, which `flush` waits for.
+    accepted: u64,
+    written: u64,
+    /// Whether the writer holds something it took and has not finished writing.
+    writing: bool,
 }
 
 impl Outbox {
@@ -193,27 +199,29 @@ impl Outbox {
         self.frames.is_empty() || (self.frames.len() < QUEUE_FRAMES && self.bytes + length <= QUEUE_BYTES)
     }
 
-    fn take(&mut self) -> Option<Vec<u8>> {
-        let beat = self.beats.pop_front();
-        if beat.is_some() {
+    /// The next thing to write, and whether it is a frame, which counts towards `written`.
+    fn take(&mut self) -> Option<(Vec<u8>, bool)> {
+        if let Some(beat) = self.beats.pop_front() {
             self.taken = None;
-            return beat;
+            return Some((beat, false));
         }
         // Padding only warms a link nothing uses yet. A real frame queued behind it warms the
         // link itself, and on a slow link padding would hold it back past its acknowledgement.
         if self.frames.front().is_some_and(|frame| wire::is_pad(frame)) && self.frames.iter().any(|frame| !wire::is_pad(frame)) {
             let mut dropped = 0;
+            let before = self.frames.len();
             self.frames.retain(|frame| {
                 let pad = wire::is_pad(frame);
                 dropped += if pad { frame.len() } else { 0 };
                 !pad
             });
             self.bytes -= dropped;
+            self.written += (before - self.frames.len()) as u64;
         }
         let frame = self.frames.pop_front()?;
         self.bytes -= frame.len();
         self.taken = if wire::is_pad(&frame) { None } else { self.queued.pop_front() };
-        Some(frame)
+        Some((frame, true))
     }
 }
 
@@ -227,7 +235,12 @@ pub struct Link {
     outbox: Mutex<Outbox>,
     work: Condvar,
     room: Condvar,
+    /// Told each time the writer finishes a frame, for `flush`.
+    flushed: Condvar,
     closed: AtomicBool,
+    /// Set by `finish`: nothing more is queued, so the writer never touches the socket after
+    /// its write side is shut, which would fail the link before the far end has read it.
+    quiet: AtomicBool,
     /// Why the writer stopped, for every sender after it to hear. It stays, so a beat that
     /// hears it first cannot hide it from the watcher that would report the link lost.
     failure: Mutex<Option<io::ErrorKind>>,
@@ -243,7 +256,9 @@ impl Link {
             outbox: Mutex::default(),
             work: Condvar::new(),
             room: Condvar::new(),
+            flushed: Condvar::new(),
             closed: AtomicBool::new(false),
+            quiet: AtomicBool::new(false),
             failure: Mutex::new(None),
             write_us: AtomicU64::new(0),
         })
@@ -261,6 +276,7 @@ impl Link {
         let _outbox = self.outbox.lock();
         self.work.notify_all();
         self.room.notify_all();
+        self.flushed.notify_all();
     }
 
     /// The average from a real frame being queued to its last byte reaching the socket.
@@ -316,13 +332,66 @@ impl Link {
             drop(outbox);
             return Err(self.closed_error());
         }
+        if self.quiet.load(Ordering::Acquire) {
+            return Err(LinkError::Refused("the link is saying its last words"));
+        }
         outbox.bytes += frame.len();
+        outbox.accepted += 1;
         if !wire::is_pad(frame) {
             outbox.queued.push_back(Instant::now());
         }
         outbox.frames.push_back(frame.to_vec());
         self.work.notify_one();
         Ok(())
+    }
+
+    /// Waits, up to `limit`, until every frame queued before this call has reached the
+    /// socket. False if the time ran out or the link closed first.
+    pub fn flush(&self, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        let mut outbox = self.outbox.lock();
+        let target = outbox.accepted;
+        while outbox.written < target {
+            if self.is_closed() || self.flushed.wait_until(&mut outbox, deadline).timed_out() {
+                return outbox.written >= target;
+            }
+        }
+        true
+    }
+
+    /// The last words on a link whose process is about to end: waits for what was queued to
+    /// reach the socket, says nothing more, and gives the far end until `deadline` to read it
+    /// and close. Ending a process with unread bytes on a socket can reset the connection,
+    /// and a reset can take with it what the far end had not read yet.
+    pub fn finish(&self, deadline: Instant) -> bool {
+        let written = self.stop_writing(deadline);
+        self.await_close(deadline);
+        written
+    }
+
+    /// The first half of `finish`: says nothing more, waits until `deadline` for what was
+    /// queued to reach the socket, then shuts the write side. Several links can each be
+    /// given this first and `await_close` after, so one slow far end does not use up the
+    /// time the others had to write.
+    pub fn stop_writing(&self, deadline: Instant) -> bool {
+        self.quiet.store(true, Ordering::Release);
+        let written = self.flush(deadline.saturating_duration_since(Instant::now()));
+        let mut outbox = self.outbox.lock();
+        // A beat taken just before the link went quiet may still be on its way out.
+        while !self.is_closed() && (outbox.writing || !outbox.beats.is_empty() || outbox.written < outbox.accepted) {
+            if self.flushed.wait_until(&mut outbox, deadline).timed_out() {
+                break;
+            }
+        }
+        let _ = self.socket.shutdown(Shutdown::Write);
+        written
+    }
+
+    /// The second half of `finish`: gives the far end until `deadline` to read what came
+    /// and close its side.
+    pub fn await_close(&self, deadline: Instant) {
+        let mut outbox = self.outbox.lock();
+        while !self.is_closed() && !self.flushed.wait_until(&mut outbox, deadline).timed_out() {}
     }
 
     /// Queues a heartbeat or an acknowledgement, and never waits, so a reader or a watcher
@@ -332,6 +401,9 @@ impl Link {
         if self.is_closed() {
             drop(outbox);
             return Err(self.closed_error());
+        }
+        if self.quiet.load(Ordering::Acquire) {
+            return Err(LinkError::Refused("the link is saying its last words"));
         }
         if outbox.beats.len() >= QUEUE_BEATS {
             return Err(LinkError::Refused("too many beats are waiting"));
@@ -348,21 +420,27 @@ impl Link {
 
     fn write_out(&self) {
         let mut sealed = Vec::new();
-        while let Some((frame, queued)) = self.next_frame() {
+        while let Some((frame, queued, counted)) = self.next_frame() {
             match self.write_frame(&frame, &mut sealed) {
                 // Part of the frame may have gone, and nothing after it could be read.
                 Err(error) => self.fail(error.kind()),
                 Ok(()) => queued.into_iter().for_each(|at| crate::average(&self.write_us, at.elapsed().as_micros() as u64)),
             }
+            let mut outbox = self.outbox.lock();
+            outbox.writing = false;
+            outbox.written += u64::from(counted);
+            drop(outbox);
+            self.flushed.notify_all();
         }
     }
 
-    fn next_frame(&self) -> Option<(Vec<u8>, Option<Instant>)> {
+    fn next_frame(&self) -> Option<(Vec<u8>, Option<Instant>, bool)> {
         let mut outbox = self.outbox.lock();
         while !self.is_closed() {
-            if let Some(frame) = outbox.take() {
+            if let Some((frame, counted)) = outbox.take() {
+                outbox.writing = true;
                 self.room.notify_all();
-                return Some((frame, outbox.taken.take()));
+                return Some((frame, outbox.taken.take(), counted));
             }
             self.work.wait(&mut outbox);
         }
@@ -837,6 +915,81 @@ mod tests {
         far.join().unwrap();
     }
 
+    fn taken(outbox: &mut Outbox) -> Option<Vec<u8>> {
+        outbox.take().map(|(frame, _)| frame)
+    }
+
+    #[test]
+    fn dropped_padding_counts_as_written_so_a_flush_never_waits_on_it() {
+        let mut outbox = Outbox::default();
+        for frame in [wire::pad(100), wire::pad(100), Ack { id: 1 }.encode()] {
+            outbox.bytes += frame.len();
+            outbox.accepted += 1;
+            outbox.frames.push_back(frame);
+        }
+        outbox.beats.push_back(vec![3]);
+        assert_eq!(outbox.take(), Some((vec![3], false)), "a beat is no frame");
+        assert_eq!(outbox.take(), Some((Ack { id: 1 }.encode(), true)));
+        assert_eq!(outbox.written, 2, "the two pads stepped aside, and the writer counts the ack");
+    }
+
+    /// A link to a far end that reads everything and keeps it, and says when it saw the end.
+    fn link_to_reader() -> (Arc<Link>, thread::JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut far, _) = listener.accept().unwrap();
+        let link = Link::new(socket, None);
+        link.start_writer().unwrap();
+        let reader = thread::spawn(move || {
+            let mut all = Vec::new();
+            let _ = far.read_to_end(&mut all);
+            all
+        });
+        (link, reader)
+    }
+
+    #[test]
+    fn a_flush_waits_until_what_was_queued_is_on_the_socket() {
+        let (link, reader) = link_to_reader();
+        for _ in 0..8 {
+            link.send(&vec![7; 256 << 10]).unwrap();
+        }
+        assert!(link.flush(Duration::from_secs(5)));
+        let outbox = link.outbox.lock();
+        assert_eq!((outbox.written, outbox.accepted, outbox.frames.len()), (8, 8, 0));
+        drop(outbox);
+        link.close();
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn last_words_reach_the_far_end_before_the_link_is_ended() {
+        let (link, reader) = link_to_reader();
+        link.send(&[1, 2, 3]).unwrap();
+        link.send(&vec![9; 1 << 20]).unwrap();
+        assert!(link.finish(Instant::now() + Duration::from_secs(5)));
+        // Quiet now: nothing more goes out, so the writer cannot fail the link early.
+        assert!(matches!(link.send(&[4]), Err(LinkError::Refused(_))));
+        assert!(matches!(link.beat(&[4]), Err(LinkError::Refused(_))));
+        link.close(); // as the process ending would
+        let heard = reader.join().unwrap();
+        assert_eq!(heard.len(), 3 + (1 << 20), "everything sent arrived, then the end");
+    }
+
+    #[test]
+    fn last_words_give_up_at_their_deadline_on_a_far_end_that_never_closes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_far, _) = listener.accept().unwrap();
+        let link = Link::new(socket, None);
+        link.start_writer().unwrap();
+        link.send(&[1]).unwrap();
+        let began = Instant::now();
+        assert!(link.finish(began + Duration::from_millis(300)));
+        assert!(began.elapsed() < Duration::from_secs(2));
+        link.close();
+    }
+
     #[test]
     fn beats_go_ahead_of_frames_and_frames_keep_their_order() {
         let mut outbox = Outbox::default();
@@ -845,10 +998,10 @@ mod tests {
             outbox.frames.push_back(frame);
         }
         outbox.beats.push_back(vec![3]);
-        assert_eq!(outbox.take(), Some(vec![3]));
-        assert_eq!(outbox.take(), Some(vec![1; 10]));
-        assert_eq!(outbox.take(), Some(vec![2; 10]));
-        assert_eq!((outbox.take(), outbox.bytes), (None, 0));
+        assert_eq!(taken(&mut outbox), Some(vec![3]));
+        assert_eq!(taken(&mut outbox), Some(vec![1; 10]));
+        assert_eq!(taken(&mut outbox), Some(vec![2; 10]));
+        assert_eq!((taken(&mut outbox), outbox.bytes), (None, 0));
     }
 
     #[test]
@@ -860,12 +1013,12 @@ mod tests {
         };
         queue(&mut outbox, wire::pad(100));
         queue(&mut outbox, wire::pad(100));
-        assert_eq!(outbox.take(), Some(wire::pad(100)));
+        assert_eq!(taken(&mut outbox), Some(wire::pad(100)));
         let ack = Ack { id: 7 }.encode();
         queue(&mut outbox, ack.clone());
         queue(&mut outbox, wire::pad(100));
-        assert_eq!(outbox.take(), Some(ack));
-        assert_eq!((outbox.take(), outbox.bytes), (None, 0));
+        assert_eq!(taken(&mut outbox), Some(ack));
+        assert_eq!((taken(&mut outbox), outbox.bytes), (None, 0));
         assert!(!wire::is_pad(&[10; 10]));
     }
 
