@@ -977,6 +977,13 @@ def entry(monkeypatch):
     return passes
 
 
+def trying(way: str) -> worker_module.DraftChoice:
+    """A choice that has just started a trial of ``way``. A fresh one measures plain decoding first."""
+    choice = worker_module.DraftChoice()
+    choice._start_trial(way, [way, "plain"])
+    return choice
+
+
 def test_a_resumed_reply_reads_the_prompt_as_usual_and_streams_only_new_tokens(entry) -> None:
     body = GenerateRequest(session_id="s", epoch=1, input_ids=[1, 2, 3], written=[7, 8], max_tokens=2, reset=True)
     assert asyncio.run(stream_of(body)) == [303, 304]
@@ -1015,7 +1022,7 @@ def test_a_draft_goes_on_from_the_whole_reply_after_a_resume(entry, monkeypatch)
     runtime = worker_module.runtime
     monkeypatch.setattr(runtime, "draft", draft)
     monkeypatch.setattr(runtime, "speculate_tokens", 2)
-    monkeypatch.setattr(runtime, "draft_choice", worker_module.DraftChoice())
+    monkeypatch.setattr(runtime, "draft_choice", trying("guessed"))
     # One stage whose probe saw a checked pass round as one row, so a greedy reply may guess.
     monkeypatch.setattr(runtime, "route", [1])
     monkeypatch.setattr(runtime, "exactness", {"exact_merge_limit": 0, "verify_exact": True})
@@ -1066,7 +1073,7 @@ def test_a_reply_that_must_repeat_checks_guesses_in_one_pass_only_where_the_prob
     draft = CountingDraft()
     monkeypatch.setattr(runtime, "draft", draft)
     monkeypatch.setattr(runtime, "speculate_tokens", 3)
-    monkeypatch.setattr(runtime, "draft_choice", worker_module.DraftChoice())
+    monkeypatch.setattr(runtime, "draft_choice", trying("guessed"))
     monkeypatch.setattr(runtime, "route", [1])
     monkeypatch.setattr(runtime, "exact", False)
     monkeypatch.setattr(runtime, "exactness", {"exact_merge_limit": 0, "verify_exact": True} if probed else None)
@@ -1091,7 +1098,9 @@ def test_the_first_pass_after_another_way_is_not_counted_against_either(entry, m
 
     monkeypatch.setattr(runtime, "draft", CountingDraft())
     monkeypatch.setattr(runtime, "speculate_tokens", 3)
-    monkeypatch.setattr(runtime, "draft_choice", Noted())
+    choice = Noted()
+    choice._start_trial("guessed", ["guessed", "plain"])
+    monkeypatch.setattr(runtime, "draft_choice", choice)
     monkeypatch.setattr(runtime, "route", [1])
     monkeypatch.setattr(runtime, "exact", False)
     monkeypatch.setattr(gguf_stage_module, "PIPELINE_STRETCH", 3)
@@ -1112,7 +1121,7 @@ def lookup_only(entry, monkeypatch):
     monkeypatch.setattr(runtime, "route", [1, 2])
     monkeypatch.setattr(runtime, "speculate_tokens", 4)
     monkeypatch.setattr(runtime, "prompt_lookup", True)
-    monkeypatch.setattr(runtime, "draft_choice", worker_module.DraftChoice())
+    monkeypatch.setattr(runtime, "draft_choice", trying("pipelined"))
     monkeypatch.setattr(worker_module, "PIPELINE_STRETCH", 4)
     # A trial as long as a stretch here, so one stretch measures the pipeline.
     monkeypatch.setattr(gguf_stage_module, "PIPELINE_STRETCH", 4)
@@ -1161,7 +1170,9 @@ def test_the_first_pass_off_a_pipeline_does_not_count_against_the_way_it_went_to
             notes.append((way, tokens))
             super().note(way, tokens, seconds)
 
-    monkeypatch.setattr(worker_module.runtime, "draft_choice", Noted())
+    choice = Noted()
+    choice._start_trial("pipelined", ["pipelined", "plain"])
+    monkeypatch.setattr(worker_module.runtime, "draft_choice", choice)
     body = GenerateRequest(session_id="s", epoch=1, input_ids=QUOTING_PROMPT, max_tokens=7, reset=True)
     assert len(asyncio.run(stream_of(body))) == 7
     assert notes == [("pipelined", 4), ("plain", 1)], "the pass that landed the pipeline went unmeasured"
@@ -1173,7 +1184,7 @@ def test_the_choice_can_leave_a_lookup_pipeline_and_come_back(lookup_only, monke
     choice = worker_module.runtime.draft_choice
     choice.note("plain", 100, 1.0)
     choice.note("pipelined", 10, 1.0)
-    choice.since_trial = 0  # a trial of the pipeline has just been lost
+    choice.trial, choice.since_trial = None, 0  # a trial of the pipeline has just been lost
     body = GenerateRequest(session_id="s", epoch=1, input_ids=QUOTING_PROMPT, max_tokens=4, reset=True)
     assert len(asyncio.run(stream_of(body))) == 4
     assert ring.sent == [], "plain was faster, so nothing guessed"
@@ -1192,9 +1203,9 @@ def free_port() -> int:
 
 
 class RealRoute:
-    """A real control plane and two CPU workers, each with its own stage process."""
+    """A real control plane and CPU workers, two unless asked, each with its own stage process."""
 
-    def __init__(self, folder: Path) -> None:
+    def __init__(self, folder: Path, workers: int = 2) -> None:
         models = folder / "models"
         models.mkdir()
         self.model, self.draft = models / "model.gguf", models / "draft.gguf"
@@ -1203,7 +1214,7 @@ class RealRoute:
         self.folder = folder
         self.processes: list[subprocess.Popen] = []
         self.client = httpx.Client(timeout=300, trust_env=False)
-        self.control, self.ports = free_port(), [free_port(), free_port()]
+        self.control, self.ports = free_port(), [free_port() for _ in range(workers)]
         self.env = {
             **{key: value for key, value in os.environ.items() if not key.startswith("ISHARDED_") or key == "ISHARDED_ENGINE_LIB"},
             "ISHARDED_LLAMA_DIR": BUILD, "ISHARDED_POOL_TOKEN_FILE": str(folder / "no-token"), "ISHARDED_HOST": "127.0.0.1",
@@ -1225,7 +1236,7 @@ class RealRoute:
             time.sleep(0.25)
         raise AssertionError("that never happened")
 
-    def start(self) -> None:
+    def start(self, exact: bool = False) -> None:
         url = f"http://127.0.0.1:{self.control}"
         files = [f"--{name}-file={self.folder / name}" for name in ("keys", "state", "audit")]
         self.launch("isharded.orchestrator", "--host", "127.0.0.1", "--port", str(self.control), *files, url=url)
@@ -1236,8 +1247,8 @@ class RealRoute:
                 "--advertise-url", own, "--device", "cpu", "--gguf-dir", str(self.model.parent), "--cache-dir", str(self.folder / f"cache{index}"),
                 "--llama-dir", BUILD, "--state-disk-gb", "0", "--state-ram-gb", "0", "--weights-ram-gb", "4", url=own,
             )  # fmt: skip
-        self.wait_for(lambda: len(self.status()["workers"]) == 2, 30)
-        body = {"model_id": str(self.model), "wait": False, "placement": "spread", "context_tokens": 512, "parallel": 1, "draft_model": str(self.draft), "prompt_cache": False}
+        self.wait_for(lambda: len(self.status()["workers"]) == len(self.ports), 30)
+        body = {"model_id": str(self.model), "wait": False, "placement": "spread", "context_tokens": 512, "parallel": 1, "draft_model": str(self.draft), "prompt_cache": False, "exact": exact}
         assert self.client.post(url + "/admin/load", json=body).status_code < 300
         self.wait_for(self.loaded, 240)
 
@@ -1247,7 +1258,7 @@ class RealRoute:
         if refused and "the pool offers" in refused:
             pytest.skip(f"this machine has too little memory free: {refused}")
         assert not refused, refused
-        return status["status"] == "ready" and bool(self.entry()["ring_live"])
+        return status["status"] == "ready" and (len(self.ports) == 1 or bool(self.entry()["ring_live"]))
 
     def status(self) -> dict:
         return self.client.get(f"http://127.0.0.1:{self.control}/admin/status").json()
@@ -1258,8 +1269,8 @@ class RealRoute:
     def entry(self) -> dict:
         return self.client.get(f"http://127.0.0.1:{self.entry_port()}/health").json()["telemetry"]
 
-    def ask(self, prompt: str) -> str:
-        body = {"messages": [{"role": "user", "content": prompt}], "max_tokens": 32, "temperature": 0, "enable_thinking": False}
+    def ask(self, prompt: str, tokens: int = 32, **sampling: float) -> str:
+        body = {"messages": [{"role": "user", "content": prompt}], "max_tokens": tokens, "temperature": 0, "enable_thinking": False, **sampling}
         answer = self.client.post(f"http://127.0.0.1:{self.control}/v1/chat/completions", json=body)
         answer.raise_for_status()
         return answer.json()["choices"][0]["message"]["content"]
@@ -1300,5 +1311,36 @@ def test_a_reply_goes_back_to_the_pipeline_after_the_entry_stage_restarts(tmp_pa
             if route.entry()["pipeline"]["tokens"] > made:
                 break
         assert route.entry()["pipeline"]["tokens"] > made, route.entry()["draft_ways"]
+    finally:
+        route.stop()
+
+
+IDENTICAL_RUNS = 5
+
+
+@needs_real_route
+@pytest.mark.parametrize("workers, exact", [(1, False), (1, True), (2, False)], ids=["one stage", "one stage, probed", "two stages"])
+def test_one_request_gives_one_text_with_the_draft_on(tmp_path, workers, exact) -> None:
+    """Five greedy runs at one stage on an A40 gave two texts: the way was chosen by timing, and
+    a checked pass of several rows rounds differently. Probed, a stage whose checked passes
+    round as one row may use them, and the text still may not change."""
+    if psutil.virtual_memory().available < (2 + 2 * workers) * 1024**3:
+        pytest.skip("this machine has too little memory free for the stages and a draft")
+    route = RealRoute(tmp_path, workers)
+    try:
+        route.start(exact=exact)
+        prompts = ["List five facts about the moon.", "Write a short paragraph about how rivers shape the land."]
+        for prompt in prompts:
+            for sampling in ({"temperature": 0}, {"temperature": 0.8, "seed": 11}):
+                texts = {route.ask(prompt, 48, **sampling) for _ in range(IDENTICAL_RUNS)}
+                assert len(texts) == 1, (prompt, sampling, texts, route.entry()["draft_trials"])
+        trials = route.entry()["draft_trials"]
+        if workers > 1:
+            assert route.entry()["pipeline"]["tokens"], "the draft never ran, so this would prove little"
+            assert trials["won"] + trials["lost"] >= 2, trials
+        elif not exact:
+            assert route.entry()["draft_passes"] == 0, "nothing proved a checked pass exact, so none ran"
+        status = route.status()
+        assert status["fingerprint"]["split"] == "/".join(f"{stage['start_layer']}-{stage['end_layer']}" for stage in status["route"])
     finally:
         route.stop()

@@ -413,7 +413,7 @@ class DraftChoice:
     A trial runs ``PIPELINE_STRETCH`` tokens, or stops after ``TRIAL_GLANCE`` if it is already
     ``TRIAL_CUT`` times slower. A way that loses waits twice as long for its next trial, up to
     ``DRAFT_TRIAL_MOST`` tokens, and one that wins brings the gap back to the start. A new route
-    starts a new choice. A way nothing has measured yet gets a trial first.
+    starts a new choice. A way nothing has measured yet gets a trial first, plain decoding before the rest.
     """
 
     # Recent tokens and seconds, kept apart. Averaging each pass's rate would overrate
@@ -447,7 +447,9 @@ class DraftChoice:
         if self.trial in ways:
             return self.trial
         if len(ways) > 1:
-            for way in ways:
+            # Plain decoding first, the last of the ways: it costs nothing against a load with no
+            # draft, and once it is measured a slow guessing way's first trial can stop at a glance.
+            for way in reversed(ways):
                 if not self.seconds.get(way):
                     return self._start_trial(way, ways)
         best = self.best(ways)

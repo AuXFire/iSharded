@@ -837,15 +837,20 @@ def drive(choice: DraftChoice, ways: list[str], speeds: dict[str, float], tokens
     return runs
 
 
-def test_each_way_gets_a_whole_trial_before_the_choice_settles() -> None:
+def test_each_way_gets_a_whole_trial_before_the_choice_settles_plain_first() -> None:
+    """Plain decoding costs nothing against a load with no draft, so it is measured first."""
     choice = DraftChoice()
     runs = drive(choice, [GUESSED, PLAIN], {GUESSED: 20.0, PLAIN: 28.0}, 60, {GUESSED: 3})
-    assert runs[0] == (GUESSED, 24), "a first trial is not cut, since nothing is there to compare"
-    assert runs[1][0] == PLAIN and choice.best([GUESSED, PLAIN]) == PLAIN
-    assert choice.trials_won == 2 and choice.gap == DRAFT_TRIAL_TOKENS, "plain won its first trial"
-    runs = drive(choice, [GUESSED, PLAIN], {GUESSED: 20.0, PLAIN: 28.0}, 300, {GUESSED: 3})
-    assert [way for way, _ in runs[:3]] == [PLAIN, GUESSED, PLAIN]
-    assert runs[0][1] >= DRAFT_TRIAL_TOKENS - runs[1][1] and choice.trials_lost == 1 and choice.gap == 2 * DRAFT_TRIAL_TOKENS
+    assert runs[0] == (PLAIN, PIPELINE_STRETCH), "a first trial is not cut, since nothing is there to compare"
+    assert runs[1] == (GUESSED, PIPELINE_STRETCH), "close enough behind for the whole trial"
+    assert choice.best([GUESSED, PLAIN]) == PLAIN
+    assert choice.trials_won == 1 and choice.trials_lost == 1 and choice.gap == 2 * DRAFT_TRIAL_TOKENS
+
+
+def test_a_slow_guessing_way_costs_a_glance_from_the_start() -> None:
+    choice = DraftChoice()
+    runs = drive(choice, [PIPELINED, PLAIN], {PIPELINED: 14.4, PLAIN: 27.6}, 60)
+    assert runs[:2] == [(PLAIN, PIPELINE_STRETCH), (PIPELINED, TRIAL_GLANCE)]
 
 
 def test_a_way_that_keeps_losing_waits_twice_as_long_for_each_trial() -> None:
@@ -853,7 +858,7 @@ def test_a_way_that_keeps_losing_waits_twice_as_long_for_each_trial() -> None:
     choice = DraftChoice()
     runs = drive(choice, [PIPELINED, PLAIN], {PIPELINED: 14.4, PLAIN: 27.6}, 20000)
     gaps = [tokens for way, tokens in runs if way == PLAIN][1:]
-    assert gaps[:6] == [192, 384, 768, 1536, 3072, 4096]
+    assert gaps[:6] == [192, 384, 768, 1536, 3072, 4096], "the first is the trial of plain itself, then each gap doubles"
     assert set(gaps[6:-1]) == {DRAFT_TRIAL_MOST}, "it stops doubling at the most"
     trials = [tokens for way, tokens in runs if way == PIPELINED][1:]
     assert set(trials) == {TRIAL_GLANCE}, "each trial that far behind stops after a glance"
