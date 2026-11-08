@@ -1609,8 +1609,10 @@ class Orchestrator:
             moved = self._planning_state(target) != before or any(now is not then for now, then in zip(self._asked(target), asked))
             if moved and attempt < PLAN_ATTEMPTS:
                 continue
-            for name in PLANNED_FIELDS:
-                if hasattr(copied, name):
+            for name, then in zip(PLANNED_FIELDS, asked):
+                # Only what the work changed lands. Writing back the rest would undo a change the
+                # loop made meanwhile, such as slots a load settled while a cordon was priced.
+                if hasattr(copied, name) and getattr(copied, name) is not then:
                     setattr(target, name, getattr(copied, name))
             for kind, title, detail in notes:
                 self.add_event(kind, title, detail)

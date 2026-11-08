@@ -364,3 +364,27 @@ def test_a_place_caught_after_a_stall_is_not_told_with_the_next(pool, capsys):
     assert len(lines) == 2
     assert "plan.py:9 held_here" in lines[0]
     assert "caught_after_the_line" not in lines[1] and ", in " not in lines[1]
+
+
+def test_planning_that_changed_nothing_undoes_nothing(pool, monkeypatch):
+    """A cordon priced while a load settles slots must not put the old slots back when it ends."""
+    monkeypatch.setattr(orchestrator_module, "PLAN_ATTEMPTS", 1)
+    monkeypatch.setattr(orchestrator_module, "describe_plan", lambda target, route, links=None: {"download_bytes": 5})
+
+    def plan(self, target, **options):
+        time.sleep(0.2)
+        return [stage("a")]
+
+    monkeypatch.setattr(Orchestrator, "plan", plan)
+    pool.workers = {"a": record("a"), "b": record("b")}
+    pool.active = SimpleNamespace(draft=None, request=None, slots=1, parallel={})
+    pool.route = [stage("a")]
+
+    async def scenario():
+        pricing = asyncio.ensure_future(pool.cost_of_losing("a"))
+        await asyncio.sleep(0.05)
+        pool.active.slots, pool.active.parallel = 4, {"auto": True}  # settled on the loop meanwhile
+        return await pricing
+
+    assert asyncio.run(scenario()) == 5
+    assert pool.active.slots == 4 and pool.active.parallel == {"auto": True}
