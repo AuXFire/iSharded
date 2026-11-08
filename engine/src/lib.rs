@@ -27,7 +27,8 @@ use watchdog::{Limits, Watchdog};
 /// Bumped when the functions below change, so a stale library is refused and not misused.
 /// Three: a plan carries a key for each link, and answers carry a seal.
 /// Four: a stage can probe at load whether merged passes round as rows run alone.
-pub const ABI_VERSION: u32 = 4;
+/// Five: Python says when a slot begins a new reply, so passes of the one before are dropped.
+pub const ABI_VERSION: u32 = 5;
 
 /// One stage's engine, as Python holds it.
 pub struct Engine {
@@ -171,6 +172,17 @@ pub unsafe extern "C" fn isharded_engine_probe(engine: *mut Engine, slots: u32, 
 #[no_mangle]
 pub unsafe extern "C" fn isharded_engine_forget(engine: *mut Engine, slot: i32) {
     (*engine).snapshots.forget(slot);
+}
+
+/// Says a slot now holds a new reply, which Python began with a restore or a clear. Passes
+/// of the reply before it that are still queued, or still on their way, are dropped rather
+/// than run on the new reply's state. The caller holds the lock from `isharded_engine_lock`.
+///
+/// # Safety
+/// `engine` must come from `isharded_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn isharded_engine_begin(engine: *mut Engine, slot: u32, generation: u64) {
+    (*engine).node.begin(slot, generation);
 }
 
 /// # Safety

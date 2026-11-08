@@ -275,6 +275,12 @@ impl Line {
         self.answered.clear();
     }
 
+    /// Whether a pass taken off the queue is still the slot's reply's. One that was queued
+    /// before a newer reply began, by a pass or by Python, belongs to a reply that has ended.
+    fn current(&self, pass: &Pass) -> bool {
+        pass.generation == self.generation
+    }
+
     /// Whether an answer belongs to this slot's reply and is the first with its id.
     fn takes(&mut self, answer: &Answer) -> bool {
         if answer.generation != self.generation || self.answered.contains(&answer.id) {
@@ -464,6 +470,25 @@ impl Node {
 
     pub fn set_compute(&self, compute: Box<dyn Compute>) {
         *self.inner.compute.lock() = Some(compute);
+    }
+
+    /// A slot holds a new reply, which Python began with a restore or a clear. What is queued
+    /// for the reply before it is dropped, and so is whatever of that reply comes later. The
+    /// same generation again changes nothing, so a restore that comes late for the slot's own
+    /// reply cannot throw away its passes.
+    pub fn begin(&self, slot: u32, generation: u64) {
+        let mut jobs = self.inner.jobs.lock();
+        let before = jobs.len();
+        let mut lines = self.inner.lines.lock();
+        let line = lines.entry(slot).or_default();
+        if line.generation == generation {
+            return;
+        }
+        line.begin(generation);
+        line.newest_pass = 0;
+        drop(lines);
+        jobs.retain(|job| job.pass.slot != slot);
+        self.inner.counters.dropped.fetch_add((before - jobs.len()) as u64, Ordering::Relaxed);
     }
 
     /// Holds the model for Python until `unlock`. Blocks while a pass is running.
@@ -1224,6 +1249,14 @@ fn handle(inner: &Arc<Inner>, jobs: Vec<Job>) {
     average(&inner.counters.wait_us, jobs[0].arrived.elapsed().as_micros() as u64);
     let passes: Vec<Pass> = jobs.into_iter().map(|job| job.pass).collect();
     inner.gate.lock();
+    // Python may have begun a new reply on a slot between this batch leaving the queue and the
+    // gate, and these would run on its state. Their own reply has ended, so nobody waits.
+    let passes = current_passes(inner, passes);
+    if passes.is_empty() {
+        // Safety: taken just above, on this thread.
+        unsafe { inner.gate.unlock() };
+        return;
+    }
     let started = Instant::now();
     let results = match inner.compute.lock().as_mut() {
         Some(compute) if passes.len() > 1 => compute.run_merged(&passes),
@@ -1250,6 +1283,16 @@ fn handle(inner: &Arc<Inner>, jobs: Vec<Job>) {
     for (pass, result) in passes.into_iter().zip(results) {
         finish(inner, &ring, pass, result, done);
     }
+}
+
+/// The passes of a batch whose slot still holds their reply. The rest are dropped and counted.
+fn current_passes(inner: &Inner, passes: Vec<Pass>) -> Vec<Pass> {
+    let lines = inner.lines.lock();
+    let before = passes.len();
+    let kept: Vec<Pass> = passes.into_iter().filter(|pass| lines.get(&pass.slot).is_none_or(|line| line.current(pass))).collect();
+    drop(lines);
+    inner.counters.dropped.fetch_add((before - kept.len()) as u64, Ordering::Relaxed);
+    kept
 }
 
 /// `done` is when compute ended, for the hop trace.
@@ -1375,6 +1418,57 @@ mod tests {
         let first = queue.pop_front().unwrap();
         let slots = |jobs: &mut dyn Iterator<Item = &Job>| jobs.map(|job| job.pass.slot).collect();
         (slots(&mut take_batch(first, &mut queue, MAX_MERGED).iter()), slots(&mut queue.iter()))
+    }
+
+    /// A node whose compute thread has gone, so whatever is queued stays there to be looked at.
+    fn idle_node() -> Node {
+        let node = Node::new().unwrap();
+        node.inner.stopping.store(true, Ordering::Release);
+        node.inner.ready.notify_all();
+        node
+    }
+
+    fn pass_of(slot: u32, generation: u64, id: u64) -> Pass {
+        Pass { id, generation, ..job(slot, 1, 1, 0).pass }
+    }
+
+    #[test]
+    fn a_new_reply_begun_by_python_drops_what_the_old_one_queued_and_refuses_the_rest() {
+        let node = idle_node();
+        enqueue(&node.inner, pass_of(0, 7, 1));
+        enqueue(&node.inner, pass_of(1, 9, 2));
+        let dropped = node.inner.counters.dropped.load(Ordering::Relaxed);
+        node.begin(0, 8);
+        let jobs: Vec<(u32, u64)> = node.inner.jobs.lock().iter().map(|job| (job.pass.slot, job.pass.generation)).collect();
+        assert!(!jobs.contains(&(0, 7)), "the old reply's queued pass is gone");
+        assert_eq!(node.inner.counters.dropped.load(Ordering::Relaxed), dropped + 1);
+        // One of the old reply's that was still on its way is turned away when it comes.
+        let line = |slot| node.inner.lines.lock().get(&slot).map(|line| line.refuses(&pass_of(slot, 7, 3)));
+        assert_eq!(line(0), Some(true));
+        // The new reply's own passes go in, whatever their numbers.
+        assert!(!node.inner.lines.lock()[&0].refuses(&pass_of(0, 8, 1)));
+    }
+
+    #[test]
+    fn the_same_reply_beginning_again_drops_nothing() {
+        let node = idle_node();
+        enqueue(&node.inner, pass_of(0, 7, 1));
+        node.begin(0, 7);
+        assert_eq!(node.inner.jobs.lock().len(), 1);
+        assert!(!node.inner.lines.lock()[&0].refuses(&pass_of(0, 7, 2)));
+    }
+
+    #[test]
+    fn a_pass_taken_off_the_queue_before_a_new_reply_began_is_not_run() {
+        let node = idle_node();
+        enqueue(&node.inner, pass_of(0, 7, 1));
+        enqueue(&node.inner, pass_of(1, 9, 2));
+        // As if the compute thread had taken both, and Python began a new reply on slot 0
+        // before the compute thread got the gate.
+        let taken: Vec<Pass> = node.inner.jobs.lock().drain(..).map(|job| job.pass).collect();
+        node.begin(0, 8);
+        let kept: Vec<(u32, u64)> = current_passes(&node.inner, taken).iter().map(|pass| (pass.slot, pass.generation)).collect();
+        assert_eq!(kept, vec![(1, 9)]);
     }
 
     #[test]
