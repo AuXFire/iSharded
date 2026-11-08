@@ -2999,20 +2999,21 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             following = following.model_copy(update={"seed": secrets.randbelow(2**63)})
         sampling = {"temperature": following.temperature, "top_p": following.top_p, "top_k": following.top_k, "seed": following.seed}
 
-        async def draft_guesses(fresh: list[int], count: int, sampling: dict[str, Any] | None = None) -> list[int]:
+        async def draft_guesses(fresh: list[int], count: int, sampling: dict[str, Any] | None = None, pipelined: bool = False) -> list[int]:
             started = time.perf_counter()
             try:
                 guesses = await asyncio.to_thread(draft.guess, fresh, count, request.slot, sampling)
             except LlamaError as exc:
                 raise await runtime.draft_failed(exc, draft) from exc
             runtime._record("draft", started)
-            if count == 1:  # what a pipelined pass waits on, which is the law's g
+            if pipelined:  # what a pipelined pass waits on, which is the law's g
                 runtime.guess_clock.note((time.perf_counter() - started) * 1000, getattr(draft, "last_rows", {}).get(request.slot))
             return guesses
 
         async def next_guess(fresh: list[int]) -> int:
             # Only a pipelined pass draws as plain decoding does. A checked pass draws another way.
-            return (await draft_guesses(fresh, 1, sampling))[0]
+            # A checked pass can ask for one guess too, at a reply's last token, and is not g.
+            return (await draft_guesses(fresh, 1, sampling, pipelined=True))[0]
 
         async def rewind_draft(keep: int) -> None:
             draft.rewind(keep, request.slot)

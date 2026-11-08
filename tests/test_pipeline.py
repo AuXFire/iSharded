@@ -1251,3 +1251,36 @@ def test_the_entry_times_each_guess_a_pipelined_pass_waits_on(lookup_only, monke
     clock = runtime.guess_clock.report()
     assert clock["guesses"] >= 1 and clock["ms_total"] >= 2 * clock["guesses"]
     assert 0 < clock["steady"] <= clock["guesses"] and clock["steady_ms_total"] <= clock["ms_total"]
+
+
+def test_a_checked_pass_asking_for_one_guess_is_not_counted_as_a_pipelined_guess(entry, monkeypatch) -> None:
+    """At a reply's last token a checked pass asks the draft for one guess. That is not g."""
+
+    class Draft:
+        counts: list[int] = []
+
+        def prepare(self, prompt, plan, slot) -> None:
+            self.read = len(prompt)
+
+        def seen(self, slot) -> int:
+            return self.read
+
+        def rewind(self, keep, slot) -> None:
+            self.read = keep
+
+        def guess(self, fresh, count, slot, sampling=None) -> list[int]:
+            self.counts.append(count)
+            self.read += len(fresh)
+            return [5] * count
+
+    draft = Draft()
+    runtime = worker_module.runtime
+    monkeypatch.setattr(runtime, "draft", draft)
+    monkeypatch.setattr(runtime, "speculate_tokens", 2)
+    monkeypatch.setattr(runtime, "draft_choice", worker_module.DraftChoice())
+    monkeypatch.setattr(runtime, "guess_clock", worker_module.GuessClock())
+    body = GenerateRequest(session_id="s", epoch=1, input_ids=[1, 2], max_tokens=2, reset=True)
+    assert len(asyncio.run(stream_of(body))) == 2
+    assert draft.counts == [1], "the checked pass for the last token asked for one guess"
+    assert runtime.guess_clock.report()["guesses"] == 0
+
