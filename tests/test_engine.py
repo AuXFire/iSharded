@@ -157,6 +157,68 @@ def test_a_stage_forgets_snapshots_only_when_a_slot_changes_history(monkeypatch,
     assert calls == ["lock", *forgotten, "unlock"]  # under the lock, so no pass can land between
 
 
+@pytest.mark.parametrize(
+    ("operation", "meta", "begun"),
+    [
+        ("clear", {"slot": 2, "generation": 7}, [(2, 7)]),
+        ("restore", {"slot": 1, "key": "k", "generation": 9}, [(1, 9)]),
+        ("restore", {"slot": 1, "key": "k", "generation": 0}, []),
+        ("clear", {"slot": 2}, []),
+        ("truncate", {"slot": 3, "keep": 9, "generation": 7}, [(3, 7)]),
+        ("forward", {"slot": 1, "generation": 7}, []),
+    ],
+)
+def test_a_slot_given_to_a_new_reply_tells_the_engine_under_the_lock(monkeypatch, operation, meta, begun) -> None:
+    """Otherwise passes of the reply before, still queued at this stage, run on the new one's state."""
+    calls = []
+
+    class Engine:
+        def lock(self) -> None:
+            calls.append("lock")
+
+        def unlock(self) -> None:
+            calls.append("unlock")
+
+        def forget(self, slot) -> None:
+            pass
+
+        def begin(self, slot, generation) -> None:
+            calls.append((slot, generation))
+
+    class Host:
+        engine = Engine()
+
+        def __getattr__(self, name):
+            return lambda meta, payload: ({}, b"")
+
+    class Connection:
+        def __init__(self) -> None:
+            self.incoming = [json.dumps({"op": operation, **meta}).encode(), b""]
+            self.sent = []
+
+        def recv_bytes(self) -> bytes:
+            if not self.incoming:
+                raise EOFError
+            return self.incoming.pop(0)
+
+        def send_bytes(self, data: bytes) -> None:
+            self.sent.append(data)
+
+    monkeypatch.setattr(llama_host, "Client", lambda address, authkey: Connection())
+    monkeypatch.setattr(llama_host, "_Host", Host)
+    llama_host.run(None, b"")
+    assert calls == ["lock", *begun, "unlock"]
+
+
+def test_beginning_a_reply_reaches_the_library_with_its_slot_and_generation() -> None:
+    told = []
+    item = native.Engine.__new__(native.Engine)
+    item.handle = 5
+    item.lib = SimpleNamespace(isharded_engine_begin=lambda handle, slot, generation: told.append((handle, slot, generation)))
+    item.begin(3, 2**64 + 7)
+    assert told == [(5, 3, 7)]
+
+
 def test_forgetting_every_slot_reaches_the_library_as_a_negative_slot() -> None:
     told = []
     item = native.Engine.__new__(native.Engine)
@@ -651,6 +713,18 @@ def test_a_reply_keeps_one_generation_and_the_next_on_its_slot_gets_another() ->
     assert got[0] == got[1]
     assert len(set(got[1:])) == 3
     assert all(0 < item < 2**64 for item in got)
+
+
+def test_a_reply_numbered_by_its_entry_keeps_that_number_on_the_ring() -> None:
+    """One number for a reply everywhere: its restores, its first pass, and its ring passes."""
+
+    async def use(client):
+        await client.run(5, **FIELDS, generation=41)
+        await client.run(5, **FIELDS, generation=41)
+        await client.run(5, **FIELDS, generation=42)  # the next attempt on the slot
+
+    asyncio.run(with_door(lambda identity: answer(identity, [1]), use))
+    assert [HEARD[identity] for identity in range(1, 4)] == [41, 41, 42]
 
 
 def test_a_result_from_another_generation_is_dropped_and_the_real_one_still_lands() -> None:

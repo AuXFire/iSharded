@@ -541,6 +541,12 @@ class WorkerRuntime:
         self.materialize_total = 0
         self.materialize_done = 0
         self.caches: dict[str, CacheEntry] = {}
+        # Each slot's newest reply on this stage, as (epoch, generation). See ``claims``.
+        self.slot_owners: dict[int, tuple[int, int]] = {}
+        # The newest generation this worker gave out as an entry. See ``new_generation``.
+        self.last_generation = 0
+        # Passes and restores refused for coming from a reply older than their slot's.
+        self.stale_refused = 0
         self.lock = asyncio.Lock()
         # A disk-tier prompt can take minutes, and a slow hop is not a failure.
         self.client = httpx.AsyncClient(transport=node_transport(), event_hooks={"request": [stay_on_this_machine_async]}, timeout=httpx.Timeout(1800.0, connect=10.0), verify=client_verify(), auth=client_auth())
@@ -1017,6 +1023,7 @@ class WorkerRuntime:
             "prompt_tokens_computed": self.prompt_tokens_computed,
             "tokens_reused": dict(self.tokens_reused),
             "state_misses": self.state_misses,
+            "stale_refused": self.stale_refused,
             "states": held.get("states", 0),
             "ram_bytes": held.get("ram_bytes", 0),
             "disk_bytes": held.get("disk_bytes", 0),
@@ -1142,7 +1149,7 @@ class WorkerRuntime:
         that cannot restore it answers no, and the pass restores there as it always did,
         so a state it does not hold still comes back as missing.
         """
-        body = {"session_id": request.session_id, "epoch": request.epoch, "slot": request.slot, "key": request.checkpoint_key, "length": request.restore_length}
+        body = {"session_id": request.session_id, "epoch": request.epoch, "slot": request.slot, "key": request.checkpoint_key, "length": request.restore_length, "generation": request.slot_generation}
 
         async def ahead(stage: StageAssignment) -> None:
             with suppress(httpx.HTTPError):
@@ -1155,20 +1162,52 @@ class WorkerRuntime:
 
         await asyncio.gather(*(ahead(stage) for stage in self.route if stage.worker_id != self.worker_id))
 
-    async def take_restore(self, session_id: str, epoch: int, slot: int, key: str, length: int) -> bool:
+    def new_generation(self) -> int:
+        """A number for one attempt at a reply, newer than any this worker gave before.
+
+        It counts in nanoseconds of the wall clock, so a worker that restarts still gives
+        newer ones, and stays a counter if the clock steps back.
+        """
+        self.last_generation = max(getattr(self, "last_generation", 0) + 1, time.time_ns())
+        return self.last_generation
+
+    def claims(self, slot: int, generation: int, epoch: int) -> bool:
+        """Whether a pass or restore of this generation may touch the slot, which it then holds.
+
+        Anything older than the slot's newest reply was held up somewhere, by a frozen stage or
+        a slow link, and its reply has ended. On the native ring a stage cannot see whose state
+        a pass runs on, so the only safe thing is to refuse it here. Only the route that gave a
+        number can compare it, so a new route starts afresh. Zero comes from a sender that gives
+        no numbers, and is taken as before.
+        """
+        if not generation:
+            return True
+        owners = self.__dict__.setdefault("slot_owners", {})
+        held = owners.get(slot)
+        if held is not None and held[0] == epoch and generation < held[1]:
+            self.stale_refused = getattr(self, "stale_refused", 0) + 1
+            return False
+        owners[slot] = (epoch, generation)
+        return True
+
+    async def take_restore(self, session_id: str, epoch: int, slot: int, key: str, length: int, generation: int = 0) -> bool:
         """Restores a state on a slot before the pass that wants it comes.
 
         A restore that comes after its pass does nothing, since the pass restored it already.
-        One that comes for any other reply takes the slot as a first pass would, so a pass
-        that went on from what the slot held is refused and replayed, never run on this.
+        One for an older reply than the slot now holds is refused: that reply has ended, and
+        the reply after it would run on its state. One that comes for any other reply takes
+        the slot as a first pass would, so a pass that went on from what the slot held is
+        refused and replayed, never run on this.
         """
         async with self.lock:
             held = self.caches.get(session_id)
             if self.gguf is None or epoch != self.epoch or (held is not None and (held.epoch, held.slot, held.began) == (epoch, slot, (key, length))):
                 return False
+            if not self.claims(slot, generation, epoch):
+                return False
             self.caches = {name: item for name, item in self.caches.items() if item.slot != slot}
             try:
-                tier = await asyncio.to_thread(self.gguf.restore, key, slot)
+                tier = await asyncio.to_thread(self.gguf.restore, key, slot, generation)
             except StageLost:
                 raise
             except LlamaError:
@@ -1459,6 +1498,7 @@ class WorkerRuntime:
         return {
             "epoch": request.epoch,
             "slot": request.slot,
+            "generation": request.slot_generation,
             "position": position,
             "rollback_to": rollback_to,
             "tokens": tokens,
@@ -1682,6 +1722,8 @@ class WorkerRuntime:
             return {"proved": False}
 
     def _session(self, request: InferRequest) -> CacheEntry:
+        if not self.claims(request.slot, request.slot_generation, request.epoch):
+            raise retry_error("this pass is from a reply that has ended; its slot holds a newer one")
         entry = self.caches.get(request.session_id)
         restoring = request.restore_length is not None
         began = (request.checkpoint_key, request.restore_length) if restoring else None
@@ -1698,7 +1740,7 @@ class WorkerRuntime:
             if self.gguf is not None:
                 if restoring:
                     try:
-                        tier = ahead or self.gguf.restore(request.checkpoint_key, request.slot)
+                        tier = ahead or self.gguf.restore(request.checkpoint_key, request.slot, request.slot_generation)
                     except StageLost:
                         raise
                     except LlamaError as exc:
@@ -1711,7 +1753,7 @@ class WorkerRuntime:
                     source = f"{request.restore_kind or HISTORY}_{tier}"
                     self.tokens_reused[source] = self.tokens_reused.get(source, 0) + request.reused_rows
                 else:
-                    self.gguf.clear(request.slot)
+                    self.gguf.clear(request.slot, request.slot_generation)
                 # A new session takes over its sequence from whoever had it.
                 self.caches = {key: item for key, item in self.caches.items() if item.slot != request.slot}
             self.caches[request.session_id] = entry
@@ -2706,12 +2748,13 @@ async def take_restore(body: dict[str, Any], authorization: str | None = Header(
     try:
         key, session_id = str(body["key"]), str(body["session_id"])
         slot, epoch, length = int(body["slot"]), int(body["epoch"]), int(body["length"])
+        generation = int(body.get("generation") or 0)
     except (KeyError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="a restore needs a key, session, slot, epoch and length") from exc
     if not NAME.fullmatch(key) or not 0 <= slot < runtime.gate.size or length <= 0:
         raise HTTPException(status_code=400, detail="no such state or slot")
     try:
-        return {"restored": await runtime.take_restore(session_id, epoch, slot, key, length)}
+        return {"restored": await runtime.take_restore(session_id, epoch, slot, key, length, generation)}
     except StageLost as exc:
         raise await stage_failure(exc) from exc
 
@@ -3079,6 +3122,9 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             answered = False
             failure: Any = None
             for attempt in range(PLAN_ATTEMPTS):
+                # Each attempt is a new reply on the slot, so whatever an earlier one left on its
+                # way, a restore held up at a frozen stage say, is refused wherever it lands.
+                request = request.model_copy(update={"slot_generation": runtime.new_generation()})
                 # The last attempt reads the whole prompt, which depends on no state at all.
                 plan = plan_prompt(runtime.prefix, body.input_ids, body.cut_token, body.checkpoint_at, caching and attempt < PLAN_ATTEMPTS - 1)
                 if plan.key in runtime.prefix.elsewhere and not await state_in_reach(plan.key):
