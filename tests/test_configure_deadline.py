@@ -58,6 +58,11 @@ class Worker:
             self.looks += 1
             if self.signs == "silent":
                 raise httpx.ReadTimeout("nothing came back", request=request)
+            if self.signs == "suspended":
+                # A suspended process takes the connection and never answers: the asker's
+                # own timeout is all that ends the wait, as on a real socket.
+                await asyncio.sleep(request.extensions["timeout"]["read"])
+                raise httpx.ReadTimeout("nothing came back", request=request)
             moved = self.looks if self.signs in {"moving", "other"} else 0
             return httpx.Response(200, json={"load_id": "load-9" if self.signs == "other" else "load-1", "done": 0, "total": 1, "read_mib": moved, "children_cpu_s": 0.0})
         if path.endswith("/give-up"):
@@ -118,6 +123,17 @@ def test_a_worker_that_answers_nothing_is_given_up_on_at_its_deadline(quick):
     took, outcome, _ = configure(Worker(loads_for=30, signs="silent"))
     assert isinstance(outcome, ConfigureStalled)
     assert took < 1.0
+
+
+def test_a_suspended_worker_is_let_go_at_its_deadline_and_not_a_question_later(quick, monkeypatch):
+    # Measured on a real pool: a load given 35 s was let go 42 s in, the last question to
+    # the suspended worker running its full 5 s past the deadline.
+    monkeypatch.setattr(orchestrator_module, "CONFIGURE_FLOOR_SECONDS", 1.0)
+    monkeypatch.setattr(orchestrator_module, "CONFIGURE_LOOK_SECONDS", 0.6)
+    monkeypatch.setattr(orchestrator_module, "CONFIGURE_SIGNS_SECONDS", 3.0)
+    took, outcome, _ = configure(Worker(loads_for=30, signs="suspended"))
+    assert isinstance(outcome, ConfigureStalled)
+    assert took < 1.9, f"let go {took:.2f} s into a 1 s deadline"
 
 
 def test_another_loads_signs_are_no_progress_for_this_one(quick):

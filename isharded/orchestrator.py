@@ -2472,10 +2472,12 @@ class Orchestrator:
         seen: dict[str, Any] | None = None
         try:
             while not sending.done():
-                await asyncio.wait({sending}, timeout=CONFIGURE_LOOK_SECONDS)
+                # Each look and each question ends by the deadline, so a suspended worker,
+                # which answers nothing, is let go at the deadline and not a question later.
+                await asyncio.wait({sending}, timeout=max(0.1, min(CONFIGURE_LOOK_SECONDS, give_up_at - time.monotonic())))
                 if sending.done():
                     break
-                signs = await self._configure_signs(url)
+                signs = await self._configure_signs(url, max(0.5, min(CONFIGURE_SIGNS_SECONDS, give_up_at - time.monotonic())))
                 now = time.monotonic()
                 if signs is not None and signs.get("load_id") == request.load_id:
                     if seen is not None and signs != seen:
@@ -2498,10 +2500,10 @@ class Orchestrator:
             record.load_bytes_per_second = size / took
         return response
 
-    async def _configure_signs(self, url: str) -> dict[str, Any] | None:
+    async def _configure_signs(self, url: str, timeout: float = CONFIGURE_SIGNS_SECONDS) -> dict[str, Any] | None:
         """A load's signs of progress, or None from a worker that did not say. See worker.configure_signs."""
         try:
-            response = await self.client.get(url + "/internal/configure/progress", headers=auth_headers(self.pool_token), timeout=CONFIGURE_SIGNS_SECONDS)
+            response = await self.client.get(url + "/internal/configure/progress", headers=auth_headers(self.pool_token), timeout=timeout)
             return response.json() if response.status_code == 200 else None
         except (httpx.HTTPError, ValueError):
             return None
