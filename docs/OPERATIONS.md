@@ -115,6 +115,18 @@ A cordon is refused if the pool could not hold the model without that node, and 
 
 On the test pool, cordoning the laptop during a reply with Qwen3.6-27B: the reply finished with a longest pause of 0.67 s, the model was on the desktop alone 26 s later, and uncordoning restored the split in 21 s.
 
+### Staged switching
+
+With `ISHARDED_STAGED=1` on the coordinator, a cordon switches routes without taking the old one down first. The cordoned node's route keeps serving while the next one gets ready:
+
+1. Nodes new to the route load their layers. A node that keeps the same layers stays loaded and opens the new route's links beside the ones it serves, on the same model and memory.
+2. The old route's entry lends one slot, and the new route runs a 64-token warm-up pass on it over every link, exit back to entry included.
+3. Only then does the route flip: every slot goes to the new route, and the old links close once their last passes have run. New replies start on the new route. A reply running at the flip carries on there with what it has written, which costs it one replay.
+
+Anything that fails before the flip leaves the old route as it was, and the switch goes the usual way. So does a change this step cannot stage yet, such as a node that stays on the route with other layers; the coordinator's events say why. It is off by default, and with it off a cordon behaves as described above.
+
+On the laptop, cordoning a stage of Qwen3-0.6B on three workers while replies streamed: the coordinator never lost its route and its status stayed `ready`, against 1-3.7 s with no route and first tokens waiting 1.6-4.7 s with staging off. The reply running at the flip paused 0.21-0.71 s while it replayed; no reply failed. See [Results](RESULTS.md#staged-switching).
+
 ### Split networks
 
 If the network splits, each side elects a coordinator and carries on with the workers it can reach. With two nodes there is no majority to tell which side should stop, so this favors staying up. It cannot corrupt anything: a worker obeys only the highest leadership term it has seen, and stale requests fail its epoch check. When the sides reconnect, the higher term wins and the other coordinator steps down. Keys and revocations made on either side are merged, so neither side loses its changes.
