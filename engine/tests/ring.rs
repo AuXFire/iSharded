@@ -1502,9 +1502,9 @@ fn a_flip_hands_every_slot_over_once_the_old_routes_queue_here_has_run() {
     }
     wait_until("route 7's first pass running at the entry", || ring.seen[0].load(Ordering::SeqCst) >= 1);
     // The entry flips first and returns once its own queue of route 7 has run, then the next.
-    let began = Instant::now();
     assert!(ring.nodes[0].flip(NEXT, &[0, 1], Duration::from_secs(2)).unwrap());
-    assert!(began.elapsed() >= Duration::from_millis(60), "the flip came back with route 7 still queued");
+    // Counted, not timed: when the first pass was seen running is up to the scheduler.
+    assert_eq!(ring.seen[0].load(Ordering::SeqCst), 3, "the flip came back with route 7 still queued");
     // A pass still on its way here when this stage flips would be refused, as its slot is
     // route 8's by then. The orchestrator flips every stage at once and replays what that
     // cuts; here the last stage flips once all three have reached it.
