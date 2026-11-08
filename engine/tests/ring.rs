@@ -361,6 +361,18 @@ fn stages_count_their_compute_and_the_entry_times_the_workers_turnaround() {
 }
 
 #[test]
+fn a_batch_of_the_old_route_that_ends_after_a_reopen_is_not_counted_on_the_new_one() {
+    let ring = ring(1, false, Duration::from_millis(300), 2000);
+    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+    wait_until("the pass to start", || ring.seen[0].load(Ordering::SeqCst) == 1);
+    // A repair reopens the stage at the same epoch while the old route's pass still runs.
+    ring.nodes[0].open(Plan { epoch: 7, index: 0, count: 1, keys: keys_for(0, 1), ack_timeout_ms: 2000, silence_timeout_ms: 2000, merge_passes: true, merge_most: None }).unwrap();
+    wait_until("the pass to end", || ring.nodes[0].stats().passes == 1);
+    let stats = ring.nodes[0].stats();
+    assert_eq!((stats.batches_total, stats.compute_us_total), (0, 0));
+}
+
+#[test]
 fn without_a_closing_link_the_answer_walks_back() {
     let mut ring = ring(3, false, Duration::ZERO, 2000);
     ring.client.send(&pass(1, 5, 9).encode()).unwrap();

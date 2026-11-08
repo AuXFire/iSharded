@@ -509,8 +509,6 @@ impl Node {
             return Err("these keys do not fit this place in the route".to_string());
         }
         self.inner.merge_most.store(plan.trip_most(), Ordering::Release);
-        self.inner.counters.compute_us_total.store(0, Ordering::Relaxed);
-        self.inner.counters.batches_total.store(0, Ordering::Relaxed);
         let ring = Arc::new(Ring {
             epoch: plan.epoch,
             index: plan.index,
@@ -529,7 +527,11 @@ impl Node {
             next_dialling: AtomicBool::new(false),
             shut: AtomicBool::new(false),
         });
-        if let Some(old) = self.inner.ring.write().replace(ring) {
+        let mut current = self.inner.ring.write();
+        // With the route held, so a batch of the old one that ends now is not counted here.
+        self.inner.counters.compute_us_total.store(0, Ordering::Relaxed);
+        self.inner.counters.batches_total.store(0, Ordering::Relaxed);
+        if let Some(old) = current.replace(ring) {
             old.shut();
         }
         Ok(())
@@ -1234,8 +1236,11 @@ fn handle(inner: &Arc<Inner>, jobs: Vec<Job>) {
     unsafe { inner.gate.unlock() };
     let counters = &inner.counters;
     average(&counters.compute_us, spent);
-    counters.compute_us_total.fetch_add(spent, Ordering::Relaxed);
-    counters.batches_total.fetch_add(1, Ordering::Relaxed);
+    // The totals are the current route's, and a reopen while this ran started them again.
+    if inner.ring.read().as_ref().is_some_and(|now| Arc::ptr_eq(now, &ring)) {
+        counters.compute_us_total.fetch_add(spent, Ordering::Relaxed);
+        counters.batches_total.fetch_add(1, Ordering::Relaxed);
+    }
     counters.passes.fetch_add(passes.len() as u64, Ordering::Relaxed);
     counters.rows.fetch_add(passes.iter().map(|pass| pass.row_count() as u64).sum(), Ordering::Relaxed);
     if passes.len() > 1 {
