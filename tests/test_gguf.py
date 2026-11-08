@@ -737,7 +737,7 @@ def recording_draft(slots=1):
     from isharded.gguf_stage import DraftModel, PromptPlan
 
     draft = DraftModel.__new__(DraftModel)
-    draft.slots, draft.text, draft.host = slots, {}, RecordingHost()
+    draft.slots, draft.text, draft.host, draft.last_rows = slots, {}, RecordingHost(), {}
     for slot in range(slots):
         draft.prepare([1, 2, 3], PromptPlan(), slot)
     draft.host.calls.clear()
@@ -1520,7 +1520,7 @@ def test_a_stage_call_says_how_many_rows_it_carries():
     assert stage.host.rows["forward"][-1] > 7 + 100, "saving a state on the way takes as long as saving one"
 
     draft = DraftModel.__new__(DraftModel)
-    draft.host, draft.slots, draft.text = Host(), 1, {0: DraftText()}
+    draft.host, draft.slots, draft.text, draft.last_rows = Host(), 1, {0: DraftText()}, {}
     draft.prepare([1, 2, 3, 4], PromptPlan())
     draft.guess([5, 6], 4)
     assert draft.host.rows["commit"] == [4]

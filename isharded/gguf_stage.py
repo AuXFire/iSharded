@@ -486,6 +486,8 @@ class DraftModel:
     ) -> None:
         self.slots = slots
         self.text: dict[int, DraftText] = {}
+        # Rows each slot's last guess ran, so a bench can tell a steady guess from a catch-up.
+        self.last_rows: dict[int, int] = {}
         self.host: Channel = StageHost() if beside is None else beside.channel()
         self.rewinds = load_on(
             self.host,
@@ -553,6 +555,10 @@ class DraftModel:
 
         ``sampling`` is the reply's, for guesses at what a pipelined pass draws. See ``coupled_choice``.
         """
+        self.last_rows[slot] = 0
+        return self._guess(fresh, count, slot, sampling)
+
+    def _guess(self, fresh: list[int], count: int, slot: int, sampling: dict[str, Any] | None) -> list[int]:
         text = self.text[slot]
         if text.cut and not fresh:
             # A cut leaves no logits for where the text now ends, as after a pipeline lands, so
@@ -574,7 +580,7 @@ class DraftModel:
             )
             if answer["tokens"] is None:
                 text.cut, text.stale = False, True  # scratch was not what the text said: start again
-                return self.guess(fresh, count, slot, sampling)
+                return self._guess(fresh, count, slot, sampling)
             if text.cut:
                 text.committed += len(text.chain)
                 text.chain = []
@@ -587,6 +593,7 @@ class DraftModel:
         answer, _ = self.host.call("guess", **meta)
         self.decodes += answer.get("decodes", 0)
         self.decoded_rows += answer.get("decoded_rows", 0)
+        self.last_rows[meta["slot"]] = self.last_rows.get(meta["slot"], 0) + answer.get("decoded_rows", 0)
         return answer
 
     def close(self) -> None:
