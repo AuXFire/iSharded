@@ -1195,6 +1195,73 @@ def test_a_real_stage_reports_its_compute_totals_and_hop_trace() -> None:
 
 
 @needs_real_stage
+def test_a_stage_fed_hidden_states_on_its_gpu_reports_the_whole_hop_trace(tmp_path) -> None:
+    """Two stages on one device, as on an A40 pair: the second is fed rows over a real link.
+
+    The trace is what attributes a boundary's time, so every step of it must read from a
+    stage that runs on a GPU and is fed hidden states, and not only from a stage fed tokens.
+    """
+    from isharded.gguf import file_reader, plan_stage, read_file_header, write_stage
+    from isharded.llama_host import StageHost
+
+    header = read_file_header(MODEL)
+    reader = file_reader(MODEL)
+    cut = header.layer_count // 2
+    paths = []
+    for index, (start, end, last) in enumerate(((0, cut, False), (cut, header.layer_count, True))):
+        path = tmp_path / f"stage{index}.gguf"
+        with path.open("wb") as out:
+            write_stage(header, plan_stage(header, start, end, last=last), out, reader)
+        paths.append(str(path))
+    table = header.tensors["token_embd.weight"]
+    embed = {"path": MODEL, "offset": header.data_start + table.offset, "length": table.nbytes, "ggml_type": table.ggml_type}
+    common = {"folder": BUILD, "extra_paths": [], "context_tokens": 256, "gpu_layers": -1, "threads": 4, "cpu_tensors": [], "rollback_tokens": 4, "slots": 1}
+    hop, closing = "11" * 32, "22" * 32
+    keys = [{"back": None, "next": hop, "closing": closing}, {"back": hop, "next": None, "closing": closing}]
+
+    async def run(hosts) -> list[dict]:
+        doors = [
+            host.call("ring_open", host="127.0.0.1", port=0, epoch=1, index=index, count=2, keys=keys[index], ack_timeout_ms=30000, silence_timeout_ms=30000)[0]
+            for index, host in enumerate(hosts)
+        ]  # fmt: skip
+
+        def link(index: int) -> dict:
+            return {"address": f"127.0.0.1:{doors[index]['port']}", "fingerprint": doors[index]["fingerprint"]}
+
+        hosts[0].call("ring_connect", links={"next": link(1), "entry": None, "timeout_ms": 5000})
+        hosts[1].call("ring_connect", links={"next": None, "entry": link(0), "timeout_ms": 5000})
+        for host in hosts:
+            while (state := host.call("ring_stats")[0].get("connect")) == "dialling":
+                await asyncio.sleep(0.02)
+            assert state == "up"
+        client = await EngineClient.open(doors[0]["local_port"], bytes(doors[0]["local_key"]))
+        try:
+            made = [(await real_pass(client, PROMPT, 0))[0]]
+            for position in range(len(PROMPT), len(PROMPT) + 6):
+                made += (await real_pass(client, made[-1:], position))[:1]
+            return [host.call("ring_stats")[0] for host in hosts]
+        finally:
+            client.close()
+
+    hosts = [StageHost(), StageHost()]
+    try:
+        hosts[0].call("load", path=paths[0], last=False, table=embed, **common)
+        hosts[1].call("load", path=paths[1], last=True, table=None, **common)
+        first, second = asyncio.run(run(hosts))
+    finally:
+        for host in hosts:
+            host.close()
+    assert first["batches_total"] == second["batches_total"] == 7
+    # The first stage sends rows on and hears them acknowledged: its side of the boundary.
+    assert first["compute_us"] > 0 and first["hop_us"] > 0 and first["link_rtt_us"] > 0
+    assert {"queue_us", "write_us"} <= first.keys()
+    # The second is fed those rows: it reads them, queues them, computes, and picks a token.
+    assert second["compute_us"] > 0 and second["sample_us"] > 0
+    assert {"enqueue_us", "wait_us", "queue_us", "write_us"} <= second.keys()
+    assert first["turnaround_us"] > 0, "the entry times its worker's turnaround"
+
+
+@needs_real_stage
 def test_a_real_stage_counts_the_state_it_keeps_for_pipelined_passes() -> None:
     """keep_us is the copy of a slot's state to host that a pipelined pass asks for."""
 
