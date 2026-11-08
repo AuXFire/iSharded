@@ -325,6 +325,12 @@ def test_a_container_started_again_with_its_invite_starts_as_the_same_node(tmp_p
     assert not up.same_mesh(tmp_path, other) and not up.same_mesh(tmp_path, "isi-x")
     started: list[object] = []
     monkeypatch.setattr(up, "become_member", lambda *a: started.append("joined again"))
+    monkeypatch.setattr(up, "start_in_background", lambda home, held, args: started.append(held["name"]) or 0)
+    again = type("Args", (), {"invite": code, "location": None, "reach_hosts": None, "background": True})()
+    assert up.run_up(again) == 0  # the same command as the first time starts the same node
+    assert started == ["first"]
+    capsys.readouterr()
+    started.clear()
     args = type("Args", (), {"invite": other})()
     assert up.run_up(args) == 1  # an invite to another mesh is still refused
     assert "already belongs" in capsys.readouterr().err and not started
