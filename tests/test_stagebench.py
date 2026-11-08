@@ -109,7 +109,9 @@ def test_the_command_says_what_it_is_missing(tmp_path, capsys, monkeypatch):
 
 @needs_real_model
 def test_a_real_model_is_timed_fed_tokens_and_rows_in_both_roles():
-    result = stagebench.child({"llama_dir": BUILD, "path": MODEL, "roles": ["last", "middle"], "feeds": ["tokens", "rows"], "passes": 6, "gpu_layers": -1, "threads": 4, "power_ms": None, "device": "cuda:0"})
+    # In a process of its own, as the bench runs it. Loading llama.cpp into the test process
+    # after many other real-model tests aborted the whole run.
+    result = stagebench.run_child({"llama_dir": BUILD, "path": MODEL, "roles": ["last", "middle"], "feeds": ["tokens", "rows"], "passes": 6, "gpu_layers": -1, "threads": 4, "power_ms": None, "device": "cuda:0"}, True)
     assert [(item["role"], item["feed"]) for item in result["cases"]] == [("last", "tokens"), ("last", "rows"), ("middle", "tokens"), ("middle", "rows")]
     assert all(len(item["ms"]) == 6 and min(item["ms"]) > 0 for item in result["cases"])
 
