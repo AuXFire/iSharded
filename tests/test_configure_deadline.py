@@ -190,7 +190,7 @@ def test_a_worker_shows_its_load_moving_without_counting_its_own_answers():
 
 @pytest.fixture
 def node(monkeypatch):
-    runtime = SimpleNamespace(pool_token="secret", requires_identity=False, revoked_nodes=set(), authorized=None, configuring=None, materialize_done=0, materialize_total=0, given_up={})
+    runtime = SimpleNamespace(pool_token="secret", requires_identity=False, revoked_nodes=set(), authorized=None, configuring=None, materialize_done=0, materialize_total=0, given_up={}, holding_load=None, lock=asyncio.Lock())
     runtime.configure_signs = lambda: worker.WorkerRuntime.configure_signs(runtime)
     monkeypatch.setattr(worker, "runtime", runtime)
     return runtime
@@ -209,6 +209,19 @@ def test_a_given_up_load_is_remembered_and_only_the_newest_kept(node):
     for index in range(70):
         assert client.post(f"/internal/configure/load-{index}/give-up", headers={"authorization": "Bearer secret"}).status_code == 200
     assert len(node.given_up) == 64 and "load-69" in node.given_up and "load-0" not in node.given_up
+
+
+def test_a_give_up_heard_after_the_load_finished_lets_its_weights_go(node):
+    """A suspended worker wakes, finishes its load, and only then hears it was given up on."""
+    released = []
+    node._release_weights = lambda: released.append(True)
+    node.holding_load = "load-1"
+    client = TestClient(worker.app)
+    headers = {"authorization": "Bearer secret"}
+    assert client.post("/internal/configure/load-0/give-up", headers=headers).status_code == 200
+    assert released == [] and node.holding_load == "load-1", "an older load's give-up leaves a newer one alone"
+    assert client.post("/internal/configure/load-1/give-up", headers=headers).status_code == 200
+    assert released == [True] and node.holding_load is None
 
 
 def test_a_load_finishing_after_it_was_given_up_on_lets_its_weights_go(monkeypatch):

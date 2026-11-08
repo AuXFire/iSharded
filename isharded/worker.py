@@ -542,6 +542,9 @@ class WorkerRuntime:
         self.materialize_done = 0
         # The load under way, and loads a coordinator gave up on. See configure_signs.
         self.configuring: str | None = None
+        # The load whose weights this worker holds, so a give-up that comes after it finished,
+        # as one does to a worker that was suspended and woke, still lets them go.
+        self.holding_load: str | None = None
         self.given_up: dict[str, None] = {}  # oldest first, and only the newest kept
         self.caches: dict[str, CacheEntry] = {}
         self.lock = asyncio.Lock()
@@ -1304,9 +1307,11 @@ class WorkerRuntime:
                 raise ValueError("the coordinator gave up on this load, so its weights were let go")
         except Exception:
             self._release_weights()
+            self.holding_load = None
             raise
         finally:
             self.configuring = None
+        self.holding_load = request.load_id
         self.adapter = adapter
         if request.model_id != self.model_id:
             # The planner trusts these counts to say how this model's guesses go.
@@ -2638,11 +2643,21 @@ async def configure_progress(authorization: str | None = Header(default=None)) -
 
 @app.post("/internal/configure/{load_id}/give-up")
 async def configure_given_up(load_id: str, authorization: str | None = Header(default=None)) -> dict[str, str]:
-    """The coordinator stopped waiting for this load. If it ever finishes, its weights are let go."""
+    """The coordinator stopped waiting for this load. If it ever finishes, its weights are let go.
+
+    Heard during the load, the load lets them go itself when it ends. Heard after it ended,
+    as a worker that was suspended and woke hears it, they go here, unless a later load has
+    taken this one's place since.
+    """
     verify_token(authorization)
-    runtime.given_up[load_id] = None
+    runtime.given_up[load_id] = None  # before waiting, so a load still running hears it
     while len(runtime.given_up) > 64:
         del runtime.given_up[next(iter(runtime.given_up))]
+    if runtime.holding_load == load_id:
+        async with runtime.lock:  # a load still running finishes first
+            if runtime.holding_load == load_id:
+                runtime._release_weights()
+                runtime.holding_load = None
     return {"status": "given up"}
 
 
