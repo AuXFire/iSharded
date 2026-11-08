@@ -334,3 +334,22 @@ def test_a_tls_connection_stops_proving_its_name_once_its_key_is_retired(tmp_pat
             assert client.get(f"https://127.0.0.1:{port}/").text == "nobody"
     finally:
         tls.RETIRED_KEYS.clear()
+
+
+@pytest.mark.parametrize("retire_first", [False, True])
+def test_an_api_key_retired_with_its_node_key_stays_gone_whatever_order_entries_come_in(tmp_path: Path, retire_first: bool) -> None:
+    """Gossip brings signed entries in any order, and a reload replays them in another."""
+    home = tmp_path / "owner"
+    up.make_owner(home, "first", "100.64.0.1")
+    hashed = digest("smn-the-lost-folders-key")
+    key = sign_entry(str(home), {"type": "key", "name": "second-user", "role": "user", "sha256": hashed, "requests_per_minute": 0})
+    retire = sign_entry(str(home), {"type": "retire_key", "name": "second", "fingerprint": "a" * 16, "keys": [hashed]})
+    path = tmp_path / "access.json"
+    access = AccessControl.load(None, str(path), identities=True, authority=Authority(str(home / "ca.pem")))
+    for signed in (retire, key) if retire_first else (key, retire):
+        assert access.add_signed(signed)
+    assert hashed not in access.keys
+    reloaded = AccessControl.load(None, str(path), identities=True, authority=Authority(str(home / "ca.pem")))
+    assert hashed not in reloaded.keys
+    reloaded.take_node_keys({"keys": [{"sha256": hashed, "name": "second-user", "role": "user"}]})
+    assert hashed not in reloaded.keys

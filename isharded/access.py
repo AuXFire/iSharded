@@ -177,6 +177,9 @@ class AccessControl:
     # Fingerprints of node keys the owner retired, when a machine rejoined under its name
     # with a new key. A certificate for one of these proves nothing any more.
     retired_keys: set[str] = field(default_factory=set)
+    # Hashes of API keys retired with a node key. Their own signed entries can arrive later,
+    # or be replayed after the retirement when the file is read again, and must not count.
+    retired_api_keys: set[str] = field(default_factory=set)
     denied: set[str] = field(default_factory=set)
     # Join requests travel between machines, so their age has to mean the same on each.
     wall_clock: Callable[[], float] = time.time
@@ -282,7 +285,7 @@ class AccessControl:
     def _apply_entry(self, entry: dict[str, Any]) -> bool:
         kind, name = entry.get("type"), str(entry.get("name", ""))
         if kind == "key" and entry.get("role") in {ROLE_USER, ROLE_ADMIN} and isinstance(entry.get("sha256"), str):
-            if name not in self.removed_names:
+            if name not in self.removed_names and entry["sha256"] not in self.retired_api_keys:
                 # Entries come back in no fixed order, so a key never loses its verifier.
                 held = self.keys.get(entry["sha256"])
                 verifier = str(entry.get("verifier") or (held.verifier if held else ""))
@@ -311,8 +314,10 @@ class AccessControl:
             # word. The old key is done with everywhere, as are its owner's API keys.
             self.retired_keys.add(entry["fingerprint"])
             for hashed in entry.get("keys", []) if isinstance(entry.get("keys"), list) else []:
-                if isinstance(hashed, str) and hashed in self.keys:
-                    del self.keys[hashed]
+                if isinstance(hashed, str):
+                    # Whether or not its own entry is here yet: it may come after this one.
+                    self.retired_api_keys.add(hashed)
+                    self.keys.pop(hashed, None)
                     self.removed.add(hashed)
             self._choose_certificate(name)
             held = self.join_requests.get(name)
