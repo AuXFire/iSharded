@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from collections import deque
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -12,6 +14,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
@@ -1214,5 +1217,185 @@ def test_a_reply_goes_back_to_the_pipeline_after_the_entry_stage_restarts(tmp_pa
             if route.entry()["pipeline"]["tokens"] > made:
                 break
         assert route.entry()["pipeline"]["tokens"] > made, route.entry()["draft_ways"]
+    finally:
+        route.stop()
+
+
+class HoldingLink:
+    """A link to one worker that can stall a restore on its way, as a frozen stage holds one.
+
+    Requests pass one at a time on each connection, as HTTP/1.1 clients send them, and answers
+    flow back untouched. Once armed, the next restore is held. The first pass after it is
+    refused with a plain replay, so its reply fails and gives up its slot. The held restore
+    goes on only after a pass of another conversation has reached the worker, so it lands
+    while that reply runs, on the slot it now holds.
+    """
+
+    def __init__(self, upstream: int, delay: float) -> None:
+        self.upstream, self.delay = upstream, delay
+        self.port = free_port()
+        self.armed = False
+        self.held_restores = 0
+        self.failed_session: str | None = None
+        self.released_after: str | None = None
+        self.loop = asyncio.new_event_loop()
+        self.ready = threading.Event()
+        threading.Thread(target=self._run, daemon=True).start()
+        assert self.ready.wait(10)
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self.loop)
+        self.release = asyncio.Event()
+
+        async def start() -> None:
+            await asyncio.start_server(self._serve, "127.0.0.1", self.port)
+            self.ready.set()
+
+        self.loop.run_until_complete(start())
+        self.loop.run_forever()
+
+    async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            up_reader, up_writer = await asyncio.open_connection("127.0.0.1", self.upstream)
+        except OSError:  # the worker is not listening yet
+            writer.close()
+            return
+
+        async def answers() -> None:
+            with contextlib.suppress(Exception):
+                while chunk := await up_reader.read(65536):
+                    writer.write(chunk)
+                    await writer.drain()
+            writer.close()
+
+        pump = asyncio.ensure_future(answers())
+        try:
+            while True:
+                head = await reader.readuntil(b"\r\n\r\n")
+                lines = head.decode("latin-1").split("\r\n")
+                path = lines[0].split(" ")[1]
+                fields = {line.split(":", 1)[0].strip().lower(): line.split(":", 1)[1].strip() for line in lines[1:] if ":" in line}
+                body = await reader.readexactly(int(fields.get("content-length", "0")))
+                if path == "/internal/state/restore" and self.armed and not self.held_restores:
+                    self.held_restores += 1
+                    asyncio.ensure_future(self._hold(head + body))
+                    continue  # no answer comes back on this connection, and the sender gives up
+                if path == "/internal/forward" and self.held_restores:
+                    session = json.loads(base64.urlsafe_b64decode(fields["x-isharded-meta"]))["session_id"]
+                    if self.failed_session is None:
+                        self.failed_session = session
+                        refusal = json.dumps({"detail": {"retry": True, "message": "a stalled link"}}).encode()
+                        writer.write(b"HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: %d\r\n\r\n" % len(refusal) + refusal)
+                        await writer.drain()
+                        continue
+                    if session != self.failed_session and self.released_after is None:
+                        self.released_after = session
+                        self.loop.call_later(self.delay, self.release.set)
+                up_writer.write(head + body)
+                await up_writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionError, IndexError, ValueError):
+            pass
+        finally:
+            up_writer.close()
+            pump.cancel()
+
+    async def _hold(self, request: bytes) -> None:
+        await self.release.wait()
+        # It reaches the worker as a frozen stage's queued request would, whoever still waits.
+        _, sender = await asyncio.open_connection("127.0.0.1", self.upstream)
+        sender.write(request)
+        await sender.drain()
+        await asyncio.sleep(5)
+        sender.close()
+
+    def stop(self) -> None:
+        self.loop.call_soon_threadsafe(self.loop.stop)
+
+
+class CachingRoute(RealRoute):
+    """A real route with saved prompt states, each worker reached only through a HoldingLink."""
+
+    def start(self, delay: float = 0.5) -> None:
+        url = f"http://127.0.0.1:{self.control}"
+        files = [f"--{name}-file={self.folder / name}" for name in ("keys", "state", "audit")]
+        self.launch("isharded.orchestrator", "--host", "127.0.0.1", "--port", str(self.control), *files, url=url)
+        self.links = [HoldingLink(port, delay) for port in self.ports]
+        for index, (port, link) in enumerate(zip(self.ports, self.links)):
+            own = f"http://127.0.0.1:{link.port}"
+            self.launch(
+                "isharded.worker", "--host", "127.0.0.1", "--port", str(port), "--worker-id", f"w{index}", "--orchestrator-url", url,
+                "--advertise-url", own, "--reach-hosts", "none", "--device", "cpu", "--gguf-dir", str(self.model.parent),
+                "--cache-dir", str(self.folder / f"cache{index}"), "--llama-dir", BUILD, "--state-disk-gb", "0", "--state-ram-gb", "1",
+                "--weights-ram-gb", "4", url=own,
+            )  # fmt: skip
+        self.wait_for(lambda: len(self.status()["workers"]) == 2, 30)
+        body = {"model_id": str(self.model), "wait": False, "placement": "spread", "context_tokens": 1024, "parallel": 1, "draft_model": str(self.draft), "prompt_cache": True}
+        assert self.client.post(url + "/admin/load", json=body).status_code < 300
+        self.wait_for(self.loaded, 240)
+
+    def chat(self, messages: list[dict[str, str]], max_tokens: int = 32) -> str:
+        body = {"messages": messages, "max_tokens": max_tokens, "temperature": 0, "enable_thinking": False}
+        answer = self.client.post(f"http://127.0.0.1:{self.control}/v1/chat/completions", json=body)
+        answer.raise_for_status()
+        return answer.json()["choices"][0]["message"]["content"]
+
+    def later_stage(self) -> dict:
+        index = int(self.status()["route"][-1]["worker_id"][1:])
+        return self.client.get(f"http://127.0.0.1:{self.ports[index]}/health").json()["telemetry"]
+
+    def stop(self) -> None:
+        super().stop()
+        for link in getattr(self, "links", []):
+            link.stop()
+
+
+@needs_real_route
+def test_a_restore_held_up_past_its_reply_never_lands_on_the_next_reply(tmp_path) -> None:
+    """The fault behind a wrong reply with no error: a late restore on another reply's slot.
+
+    Reply A restores a saved state on the later stage, and that restore stalls on its way.
+    A's first pass is refused, so A gives up its only slot. Reply B, another conversation,
+    takes the slot and goes on along the native ring. Then A's restore reaches the stage. It
+    used to replace B's state there, and B went on from A's conversation. Now the stage sees
+    that the slot holds a newer reply and refuses it, so B says what it says alone, and A,
+    replayed, says what it says alone.
+    """
+    if psutil.virtual_memory().available < 4 * 1024**3:
+        pytest.skip("this machine has too little memory free for two stages and a draft")
+    route = CachingRoute(tmp_path)
+    try:
+        route.start()
+        # A system prompt is saved where it ends, so the second time A is asked it is restored.
+        # It must run past the 64 tokens a cut needs, or nothing is saved there.
+        rules = (
+            "You are a patient geography tutor for a class of twelve-year-olds. Answer every question in one short sentence. "
+            "Name the country each place you mention is in, and its continent. Use plain words, no lists and no headings. "
+            "If a question has more than one fair answer, give the one most atlases give and say that others exist. "
+            "Never make up a number: if you are not sure of a length, a height or a population, say roughly. "
+            "Do not ask the student questions back, and do not add greetings or sign-offs to your answers."
+        )
+        system = {"role": "system", "content": rules}
+        conversation = [system, {"role": "user", "content": "Which river is the longest in Europe?"}]
+        other = [{"role": "user", "content": "Count from one to forty in words, separated by commas."}]
+        route.chat(conversation)
+        alone_b = route.chat(other, max_tokens=160)
+        alone_a = route.chat(conversation)
+        reused = route.later_stage()["cache"]["tokens_reused"]
+        assert sum(reused.values()), "the later stage never restored a state, so this would prove nothing"
+        for link in route.links:
+            link.armed = True
+        replies: dict[str, str] = {}
+        a = threading.Thread(target=lambda: replies.__setitem__("a", route.chat(conversation)))
+        a.start()
+        route.wait_for(lambda: any(link.failed_session for link in route.links), 60)
+        b = threading.Thread(target=lambda: replies.__setitem__("b", route.chat(other, max_tokens=160)))
+        b.start()
+        a.join(300)
+        b.join(300)
+        assert any(link.released_after for link in route.links), "the held restore was never let go"
+        assert replies["b"] == alone_b, "another reply's state reached this one"
+        assert replies["a"] == alone_a
+        # The restore did land, and was turned away.
+        route.wait_for(lambda: route.later_stage()["cache"].get("stale_refused", 0) >= 1, 30)
     finally:
         route.stop()
