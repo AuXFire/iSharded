@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .geo import country_code
+from .meter import POWER_VARIABLE, PRICE_VARIABLE
 from .lanes import lane_port, lane_url, read_lanes
 from .optional import has_torch
 from .tls import OWN_ADDRESS
@@ -123,6 +124,21 @@ def add_node_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="folder to search for GGUF files already on this machine, such as LM Studio's. Repeatable",
     )
+    parser.add_argument("--price-per-hour", type=non_negative, default=None, help="what this machine costs an hour, for isharded bench's cost per token")
+    parser.add_argument(
+        "--measure-power", type=int, nargs="?", const=1000, default=None, metavar="MS",
+        help="read each GPU's power with nvidia-smi or rocm-smi every MS milliseconds (default 1000), for isharded bench's energy per token",
+    )  # fmt: skip
+
+
+def non_negative(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        value = -1.0
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number of zero or more")
+    return value
 
 
 def detect_address() -> str:
@@ -458,6 +474,10 @@ def _publish_settings(args: argparse.Namespace) -> None:
     if getattr(args, "identity_cert", None) and getattr(args, "identity_key", None):
         os.environ["ISHARDED_IDENTITY_CERT"] = str(Path(args.identity_cert).resolve())
         os.environ["ISHARDED_IDENTITY_KEY"] = str(Path(args.identity_key).resolve())
+    if getattr(args, "price_per_hour", None) is not None:
+        os.environ[PRICE_VARIABLE] = str(args.price_per_hour)
+    if getattr(args, "measure_power", None) is not None:
+        os.environ[POWER_VARIABLE] = str(args.measure_power)
     if getattr(args, "model_dir", None):
         os.environ["ISHARDED_MODEL_DIRS"] = os.pathsep.join(str(Path(item).resolve()) for item in args.model_dir)
     if getattr(args, "advertise_host", "auto") == "auto":

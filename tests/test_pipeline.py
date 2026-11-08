@@ -1216,3 +1216,38 @@ def test_a_reply_goes_back_to_the_pipeline_after_the_entry_stage_restarts(tmp_pa
         assert route.entry()["pipeline"]["tokens"] > made, route.entry()["draft_ways"]
     finally:
         route.stop()
+
+
+def test_the_entry_times_each_guess_a_pipelined_pass_waits_on(lookup_only, monkeypatch) -> None:
+    """The law's g: a bench reads these to see what a guess really costs on the entry."""
+
+    class Draft:
+        def __init__(self) -> None:
+            self.read, self.last_rows, self.made = 0, {}, 0
+
+        def prepare(self, prompt, plan, slot) -> None:
+            self.read = len(prompt)
+
+        def seen(self, slot) -> int:
+            return self.read
+
+        def rewind(self, keep, slot) -> None:
+            self.read = keep
+
+        def guess(self, fresh, count, slot, sampling=None) -> list[int]:
+            time.sleep(0.002)
+            self.read += len(fresh)
+            self.last_rows[slot] = max(len(fresh), 1) + count - 1
+            self.made += 1
+            return [1000 + self.made]  # what the ring will answer, so every guess lands
+
+    runtime = worker_module.runtime
+    monkeypatch.setattr(runtime, "draft", Draft())
+    monkeypatch.setattr(runtime, "prompt_lookup", False)
+    monkeypatch.setattr(runtime, "guess_clock", worker_module.GuessClock())
+    on_ring(monkeypatch, Ring())
+    body = GenerateRequest(session_id="s", epoch=1, input_ids=[1, 2, 3], max_tokens=8, reset=True)
+    assert len(asyncio.run(stream_of(body))) == 8
+    clock = runtime.guess_clock.report()
+    assert clock["guesses"] >= 1 and clock["ms_total"] >= 2 * clock["guesses"]
+    assert 0 < clock["steady"] <= clock["guesses"] and clock["steady_ms_total"] <= clock["ms_total"]
