@@ -21,6 +21,8 @@ def test_calls_are_sorted_by_what_they_are():
     assert host.kind_of("/internal/register") == host.kind_of("/internal/heartbeat") == "checkin"
     assert host.kind_of("/health") == "health"
     assert host.kind_of("/admin/status") == "status"
+    assert host.kind_of("/internal/diag/probe") == "link_probe"
+    assert host.kind_of("/internal/diag/echo") == "link_echo"
     assert host.kind_of("/v1/chat/completions") == "other"
 
 
@@ -77,6 +79,25 @@ def test_whatever_a_phase_kills_or_freezes_runs_alone(tmp_path):
         asyncio.run(pool.close())
 
 
+def test_a_window_a_process_stalled_through_is_measured_again(tmp_path, monkeypatch):
+    windows = iter([{"loop_lag_max_ms": 19994.0}, {"loop_lag_max_ms": 31.0}, {"loop_lag_max_ms": 25.0}])
+
+    async def window(self):
+        return dict(next(windows))
+
+    monkeypatch.setattr(harness.Pool, "steady_window", window)
+    pool = harness.Pool(harness.parse_args(["--nodes", "5", "--run-dir", str(tmp_path)]), 5)
+    try:
+        result = asyncio.run(pool.steady())
+        assert result == {"loop_lag_max_ms": 31.0, "stalled": False, "windows_thrown_away": 1}
+        # Past the retries allowed, the last window stands, marked as stalled.
+        pool.args.stall_retries = 0
+        windows = iter([{"loop_lag_max_ms": 5000.0}])
+        assert asyncio.run(pool.steady())["stalled"] is True
+    finally:
+        asyncio.run(pool.close())
+
+
 def test_a_repeated_phase_is_recorded_again():
     args = harness.parse_args(["--nodes", "5"])
     assert args.phases.count("steady") == 2
@@ -89,15 +110,16 @@ def test_five_nodes_settle_join_leave_and_elect(tmp_path):
 
     It checks the harness measures what the code says should happen: gossip to every
     peer every 3 s, a check-in with every control plane every 5 s, a health probe of every
-    worker every 10 s, and one election when the coordinator dies.
+    worker every 10 s, a link pass of N(N-1) probes, and one election when the coordinator dies.
     """
     out = tmp_path / "scale-5.json"
     args = harness.parse_args([
         "--nodes", "5",
-        "--phases", "steady,join,leave,kill-leader",
+        "--phases", "steady,links,join,leave,kill-leader",
         "--steady-seconds", "9",
         "--settle-seconds", "1",
         "--settle-timeout", "120",
+        "--stall-retries", "3",  # a shared laptop can stop every process for seconds at a time
         "--run-dir", str(tmp_path),
         "--out", str(out),
     ])  # fmt: skip
@@ -109,6 +131,7 @@ def test_five_nodes_settle_join_leave_and_elect(tmp_path):
     steady = result["phases"]["steady"]
     rates = {key: value["mean"] for key, value in steady["per_node"].items()}
     assert steady["nodes"] == 5
+    assert not steady["stalled"], f"every window stalled: {steady['loop_lag_max_ms']} ms"
     # Three gossip rounds in 9 s, to four peers, give 1.33 calls a second; rounds also take time.
     assert 0.8 <= rates["out:gossip:calls"] <= 1.8
     assert 0.7 <= rates["out:checkin:calls"] <= 1.3  # five control planes every 5 s
@@ -119,6 +142,16 @@ def test_five_nodes_settle_join_leave_and_elect(tmp_path):
     assert steady["fanout"]["checkin"]["max"] == 5
     assert steady["fanout"]["health"]["max"] == 5
     assert steady["cpu_cores_per_node"] > 0
+
+    links = result["phases"]["links"]
+    # Before planning, the coordinator has each of five workers time its link to the other four,
+    # five echoes each (orchestrator.LINK_PROBE_ROUNDS), all inside the time limit.
+    assert links["workers"] == 5 and links["pairs_expected"] == 20
+    assert links["pairs_measured"] == 20 and links["pairs_unreachable"] == 0 and not links["cut_short"]
+    assert links["probe_calls"] == 20
+    assert links["echo_calls"] == 100
+    assert links["echo_calls_per_worker"]["max"] == 20
+    assert links["fanout"]["link_echo"]["max"] == 4
 
     join = result["phases"]["join"]
     assert 0 <= join["mesh_s"] < 30 and join["elections"] == 0

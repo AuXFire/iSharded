@@ -8,6 +8,8 @@ runs these phases and records what it saw:
                 calling a dead member) calls and bytes per node per second by kind (gossip, check-in, health
                 probe), the fan-out of each, CPU and memory per node, loop lag
   status        latency of GET /admin/status on the leader and on a follower
+  links         the coordinator times every link between workers, as before planning a
+                route: N(N-1) probes and their echoes, how long, and whether it ran out of time
   join          a new node joins: time until every node sees it, and its worker is live
                 at every control plane and has every control plane
   leave         a node is killed: time until every node has dropped it and its worker
@@ -58,9 +60,11 @@ sys.path.insert(0, str(HERE))
 from report import growth_table  # noqa: E402
 
 # The second steady window runs with a dead member, which every node keeps calling.
-DEFAULT_PHASES = ("steady", "status", "join", "leave", "steady", "kill-leader")
+DEFAULT_PHASES = ("steady", "status", "links", "join", "leave", "steady", "kill-leader")
 ALL_PHASES = (*DEFAULT_PHASES, "silent-leave", "steady", "freeze-leader", "partition")
 POLL_SECONDS = 0.5
+# A steady window in which some host's event loop stopped this long is measured again.
+STALL_MS = 2000.0
 
 
 def free_ports(count: int) -> list[int]:
@@ -98,7 +102,7 @@ class Pool:
         self.count = nodes
         self.phases = args.phases
         self.token = secrets.token_hex(16)
-        self.run_dir = Path(args.run_dir or tempfile.mkdtemp(prefix="isharded-scale-")) / f"n{nodes}-{int(time.time())}"
+        self.run_dir = Path(args.run_dir or tempfile.mkdtemp(prefix="isharded-scale-")).resolve() / f"n{nodes}-{int(time.time())}"
         self.run_dir.mkdir(parents=True, exist_ok=True)
         width = max(3, len(str(nodes)))
         self.names = [f"n{index:0{width}d}" for index in range(nodes + 1)]  # the last one joins later
@@ -290,6 +294,10 @@ class Pool:
             "start_s": round(ready - launched, 2),
             "settle_s": round(settled_at - ready, 2),
             "leader": self.reports[self.leader]["leader"],
+            # A node that hears no leader within the join grace elects itself, so a slow start
+            # shows here as extra elections and step-downs before the mesh agrees.
+            "elections": sum(len(self.reports[name]["takeovers"]) for name in expected),
+            "stepdowns": sum(len(self.reports[name]["stepdowns"]) for name in expected),
         }
 
     def cpu_seconds(self) -> dict[str, float]:
@@ -314,16 +322,12 @@ class Pool:
     async def mark(self) -> None:
         await asyncio.gather(*(self.client.post(f"http://127.0.0.1:{entry['port']}/mark") for entry in self.live_hosts().values()))
 
-    async def steady(self) -> dict[str, Any]:
-        await asyncio.sleep(self.args.settle_seconds)
-        await self.mark()
-        await self.poll()
-        before = {name: json.loads(json.dumps(report["meter"]["counts"])) for name, report in self.reports.items()}
-        cpu_before, began = self.cpu_seconds(), time.time()
-        await asyncio.sleep(self.args.steady_seconds)
-        await self.poll()
-        cpu_after, seconds = self.cpu_seconds(), time.time() - began
-        members = [name for name in self.members() if name in before]
+    def counts(self) -> dict[str, dict[str, list[int]]]:
+        """A copy of every node's counters as last polled."""
+        return {name: {key: list(value) for key, value in report["meter"]["counts"].items()} for name, report in self.reports.items()}
+
+    def rates(self, before: dict[str, dict[str, list[int]]], seconds: float, members: list[str]) -> dict[str, list[float]]:
+        """Each node's calls, bytes and failures per second by kind since ``before``, and totals."""
         rates: dict[str, list[float]] = {}
         for name in members:
             after = self.reports[name]["meter"]["counts"]
@@ -340,6 +344,39 @@ class Pool:
                     totals["out:failures"] += (failures - start[2]) / seconds
             for key, value in totals.items():
                 rates.setdefault(f"total:{key}", []).append(value)
+        return rates
+
+    async def steady(self) -> dict[str, Any]:
+        """Measure a steady window, and again if a process stalled through it.
+
+        A host whose event loop stops for seconds (paging, or a machine that suspends
+        background processes) sends a third of its calls and says nothing about the code.
+        Such a window is measured again, up to ``--stall-retries`` times, and the count of
+        windows thrown away is kept with the result.
+        """
+        thrown: list[float] = []
+        while True:
+            window = await self.steady_window()
+            worst = window["loop_lag_max_ms"] or 0.0
+            if worst < STALL_MS or len(thrown) >= self.args.stall_retries:
+                break
+            print(f"[N={self.count}] a process stalled {worst:.0f} ms in that window; measuring again", flush=True)
+            thrown.append(worst)
+        window["stalled"] = (window["loop_lag_max_ms"] or 0.0) >= STALL_MS
+        window["windows_thrown_away"] = len(thrown)
+        return window
+
+    async def steady_window(self) -> dict[str, Any]:
+        await asyncio.sleep(self.args.settle_seconds)
+        await self.mark()
+        await self.poll()
+        before = self.counts()
+        cpu_before, began = self.cpu_seconds(), time.time()
+        await asyncio.sleep(self.args.steady_seconds)
+        await self.poll()
+        cpu_after, seconds = self.cpu_seconds(), time.time() - began
+        members = [name for name in self.members() if name in before]
+        rates = self.rates(before, seconds, members)
         fanout: dict[str, list[float]] = {}
         for name in members:
             for kind, count in self.reports[name]["meter"]["fanout"].items():
@@ -384,6 +421,43 @@ class Pool:
                 "bytes": int(statistics.fmean(sizes)) if sizes else None,
             }
         return results
+
+    async def links(self) -> dict[str, Any]:
+        """The coordinator times every link between live workers, as it does before planning a route.
+
+        It asks each worker to time its link to every other one (``preview_links``, which
+        leaves the running model's costs alone), so a full pass is N(N-1) probes, each a few
+        echoes, inside a time limit; a pass that runs out of time plans with what it measured.
+        """
+        coordinator = self.reports[self.members()[0]]["leader"] or self.leader
+        await self.mark()
+        await self.poll()
+        before, cpu_before, began = self.counts(), self.cpu_seconds(), time.time()
+        entry = self.processes[self.host_of[coordinator]]
+        response = await self.client.post(f"http://127.0.0.1:{entry['port']}/links", json={"node": coordinator}, timeout=self.args.settle_timeout)
+        response.raise_for_status()
+        body = response.json()
+        seconds, workers = time.time() - began, int(body["workers"])
+        await self.poll()
+        cpu_after = self.cpu_seconds()
+        members = [name for name in self.members() if name in before]
+        sent = {name: {key: self.reports[name]["meter"]["counts"].get(key, [0, 0, 0])[0] - before[name].get(key, [0, 0, 0])[0] for key in ("out:link_probe", "out:link_echo")} for name in members}
+        echoes = [sent[name]["out:link_echo"] for name in members]
+        cpu = sum(cpu_after[host] - cpu_before[host] for host in cpu_after if host in cpu_before)
+        return {
+            "workers": workers,
+            "pairs_expected": workers * (workers - 1),
+            "pairs_measured": body["pairs"],
+            "pairs_unreachable": body["unreachable"],
+            "cut_short": body["pairs"] < workers * (workers - 1),
+            "seconds": round(body["seconds"], 2),
+            "probe_calls": sent[coordinator]["out:link_probe"],
+            "echo_calls": sum(echoes),
+            "echo_calls_per_worker": spread([float(value) for value in echoes]),
+            "fanout": {kind: spread([float(value) for name in members if (value := self.reports[name]["meter"]["fanout"].get(kind)) is not None]) for kind in ("link_probe", "link_echo")},
+            "cpu_core_seconds": round(cpu, 2),
+            "cpu_cores_while_measuring": round(cpu / seconds, 3) if seconds else None,
+        }
 
     async def join(self) -> dict[str, Any]:
         new = self.newcomer
@@ -518,6 +592,7 @@ class Pool:
 PHASES = {
     "steady": Pool.steady,
     "status": Pool.status,
+    "links": Pool.links,
     "join": Pool.join,
     "leave": Pool.leave,
     "silent-leave": Pool.silent_leave,
@@ -569,6 +644,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--status-seconds", type=float, default=20.0, help="time spent asking for status, half on the leader")
     parser.add_argument("--freeze-seconds", type=float, default=30.0, help="how long the leader stays suspended")
     parser.add_argument("--partition-seconds", type=float, default=30.0, help="how long the halves stay apart")
+    parser.add_argument("--stall-retries", type=int, default=1, help="steady windows measured again when a process stalls through one")
     parser.add_argument("--settle-timeout", type=float, default=300.0, help="longest wait for any phase to settle")
     parser.add_argument("--delay-ms", type=float, default=0.0, help="emulated one-way delay on every call")
     parser.add_argument("--jitter-ms", type=float, default=0.0, help="emulated jitter on that delay")

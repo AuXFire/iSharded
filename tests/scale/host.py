@@ -63,6 +63,8 @@ def kind_of(path: str) -> str:
         return "status"
     if path == "/internal/diag/probe":
         return "link_probe"
+    if path == "/internal/diag/echo":
+        return "link_echo"
     return "other"
 
 
@@ -457,8 +459,26 @@ def observer_app(nodes: list[Node], lag: Lag) -> Any:
             FAULTS.sides = {str(name): int(side) for name, side in (body["sides"] or {}).items()}
         return JSONResponse({"ok": True})
 
+    async def links(request: Request) -> JSONResponse:
+        """Have one node's control plane time every link between live workers, as it does
+        before planning a route. ``preview_links`` keeps the costs apart from a running model's."""
+        from isharded.planner import UNREACHABLE_LINK_MS
+
+        body = await request.json()
+        node = next(node for node in nodes if node.name == body["node"])
+        workers = len(node.orchestrator._link_urls())  # the workers this pass times
+        began = time.perf_counter()
+        table = await node.orchestrator.preview_links(int(body.get("row", 0)))
+        return JSONResponse({
+            "workers": workers,
+            "seconds": time.perf_counter() - began,
+            "pairs": len(table),
+            "unreachable": sum(1 for cost in table.values() if cost >= UNREACHABLE_LINK_MS),
+        })
+
     return Starlette(routes=[
         Route("/snapshot", snapshot),
+        Route("/links", links, methods=["POST"]),
         Route("/mark", mark, methods=["POST"]),
         Route("/network", network, methods=["POST"]),
     ])
