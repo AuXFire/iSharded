@@ -144,7 +144,9 @@ def test_another_loads_signs_are_no_progress_for_this_one(quick):
 def test_a_big_load_that_finishes_sets_the_workers_load_rate(quick):
     took, outcome, plane = configure(Worker(loads_for=1.0), size=512 * 1024**2)
     rate = plane.workers["w1"].load_bytes_per_second
-    assert rate == pytest.approx(512 * 1024**2 / took, rel=0.05)
+    # The load took its 1 s at least, and no longer than the call around it, which a busy
+    # machine can stretch by more than a few per cent.
+    assert 512 * 1024**2 / took <= rate <= 512 * 1024**2 / 1.0
 
 
 def test_the_route_is_planned_again_without_a_stalled_worker_and_not_retried(monkeypatch):
