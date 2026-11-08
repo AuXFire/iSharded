@@ -1308,7 +1308,17 @@ class Orchestrator:
         return health.get("status") == "ok" and health.get("epoch") != self.epoch
 
     def _route_whole(self) -> bool:
-        return bool(self.route) and all(self._usable(stage.worker_id) and not self._lost_its_stage(stage.worker_id) for stage in self.route)
+        return bool(self.route) and all(self._serves(stage.worker_id) and not self._lost_its_stage(stage.worker_id) for stage in self.route)
+
+    def _serves(self, worker_id: str) -> bool:
+        """Whether a stage of the running route can carry replies. A cordoned node still does
+        when switches are staged: its route serves until the next one is proven. Otherwise a
+        cordon stops replies until its share has moved, as it always has.
+        """
+        if self._usable(worker_id):
+            return True
+        record = self.workers.get(worker_id)
+        return staged_transitions() and record is not None and record.live and not record.quarantined and self._cordoned(worker_id)
 
     def serving(self) -> bool:
         """Whether a reply can run now.

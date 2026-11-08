@@ -536,3 +536,16 @@ def test_only_a_stage_load_takes_the_spare(monkeypatch, tmp_path):
     assert taken == []
     gguf_stage.start_host("load", {"folder": str(tmp_path)})
     assert taken == [str(tmp_path)]
+
+
+def test_a_cordoned_node_keeps_serving_its_route_only_when_switches_are_staged(monkeypatch):
+    old = [stage("a", 0, 1), stage("b", 1, 2)]
+    orchestrator, _ = serving(monkeypatch, old)
+    orchestrator._lost_its_stage = lambda worker_id: False
+    orchestrator.access.cordon("b")
+    monkeypatch.delenv("ISHARDED_STAGED", raising=False)
+    assert not orchestrator._route_whole(), "with staging off a cordon still holds replies, as before"
+    monkeypatch.setenv("ISHARDED_STAGED", "1")
+    assert orchestrator._route_whole()
+    orchestrator.workers["b"].quarantined = True
+    assert not orchestrator._route_whole()
