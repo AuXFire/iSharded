@@ -218,6 +218,14 @@ pub struct Stats {
     /// At the entry: from an answer reaching the worker to the worker's next pass for that
     /// reply arriving, which is the worker's own turnaround and the local link both ways.
     pub turnaround_us: u64,
+    /// Copying recurrent state to host for a pass that asked to keep it, after the decode and
+    /// before the output goes out: a recent average of one copy, its size, and every copy
+    /// since the model loaded with the time they took. Filled in by the engine, which owns
+    /// the snapshots.
+    pub keep_us: u64,
+    pub keep_bytes: u64,
+    pub keeps_total: u64,
+    pub keep_us_total: u64,
     pub next_up: bool,
     pub closing_up: bool,
     pub epoch: Option<u64>,
@@ -602,6 +610,11 @@ impl Node {
             hop_us: counters.hop_us.load(Ordering::Relaxed),
             sample_us: crate::sample::average_us(),
             turnaround_us: counters.turnaround_us.load(Ordering::Relaxed),
+            // The engine owns the snapshots, and adds these.
+            keep_us: 0,
+            keep_bytes: 0,
+            keeps_total: 0,
+            keep_us_total: 0,
             next_up: ring.as_ref().is_some_and(|item| item.next.lock().is_some() || item.next_dialling.load(Ordering::Acquire)),
             closing_up: ring.as_ref().is_some_and(|item| item.closing.lock().is_some() || item.entry_closing.lock().is_some()),
             epoch: ring.as_ref().map(|item| item.epoch),

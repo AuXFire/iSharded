@@ -1194,6 +1194,32 @@ def test_a_real_stage_reports_its_compute_totals_and_hop_trace() -> None:
     assert {"queue_us", "write_us", "enqueue_us", "wait_us"} <= stats.keys()
 
 
+@needs_real_stage
+def test_a_real_stage_counts_the_state_it_keeps_for_pipelined_passes() -> None:
+    """keep_us is the copy of a slot's state to host that a pipelined pass asks for."""
+
+    async def run(host) -> tuple[dict, dict]:
+        client = await real_ring(host)
+        try:
+            made = [(await real_pass(client, PROMPT, 0))[0]]
+            plain = host.call("ring_stats")[0]
+            for position in range(len(PROMPT), len(PROMPT) + 4):
+                made += (await real_pass(client, made[-1:], position, keep=True))[:1]
+            return plain, host.call("ring_stats")[0]
+        finally:
+            client.close()
+
+    host, _ = real_stage()
+    try:
+        plain, kept = asyncio.run(run(host))
+    finally:
+        host.close()
+    # The load's probe keeps snapshots of its own, so only the difference belongs to the passes.
+    assert kept["keeps_total"] - plain["keeps_total"] == 4
+    assert kept["keep_us_total"] > plain["keep_us_total"] and kept["keep_us"] > 0
+    assert kept["keep_bytes"] > 0
+
+
 def test_a_load_of_another_model_starts_its_pipeline_counts_again(monkeypatch) -> None:
     """A stage that restarts reloads the same model, and its counts still describe it."""
     from isharded.protocol import ConfigureRequest

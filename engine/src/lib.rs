@@ -20,7 +20,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use llama::{Capture, LlamaCompute, Snapshots, StageApi, TensorApi};
-use node::{Links, Node, Plan};
+use node::{Links, Node, Plan, Stats};
 use serde::de::DeserializeOwned;
 use watchdog::{Limits, Watchdog};
 
@@ -244,7 +244,16 @@ pub unsafe extern "C" fn isharded_engine_close_ring(engine: *mut Engine) {
 /// `out` must have room for `capacity` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn isharded_engine_stats(engine: *mut Engine, out: *mut c_char, capacity: usize) -> i32 {
-    match serde_json::to_vec(&(*engine).node.stats()) {
+    let engine = &*engine;
+    let keeps = engine.snapshots.keep_stats();
+    let stats = Stats {
+        keep_us: keeps.keep_us,
+        keep_bytes: keeps.keep_bytes,
+        keeps_total: keeps.keeps_total,
+        keep_us_total: keeps.keep_us_total,
+        ..engine.node.stats()
+    };
+    match serde_json::to_vec(&stats) {
         Ok(text) => write_text(&text, out, capacity),
         Err(_) => -1,
     }
