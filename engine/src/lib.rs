@@ -154,6 +154,33 @@ pub unsafe extern "C" fn isharded_engine_probe(engine: *mut Engine, slots: u32, 
     engine.node.lock();
     let found = compute.probe(slots, node::MAX_MERGED - 1);
     engine.node.unlock();
+    write_found(found, out, capacity)
+}
+
+/// Times passes of several rows on empty slots: one row a slot up to `slots`, then the same
+/// rows in every slot up to `most` rows, for as long as `budget_ms` allows. Writes the rows
+/// and the ms each took as JSON. Every slot it touched is empty again afterwards. Negative
+/// on failure, with the reason written instead.
+///
+/// # Safety
+/// `engine` must come from `isharded_engine_new`, after `attach`, and `out` must have room
+/// for `capacity` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn isharded_engine_time_passes(engine: *mut Engine, slots: u32, most: u32, budget_ms: u32, out: *mut c_char, capacity: usize) -> i32 {
+    let engine = &*engine;
+    let Some(api) = *engine.api.lock() else {
+        write_text(b"this stage has nothing loaded", out, capacity);
+        return -1;
+    };
+    let mut compute = LlamaCompute::new(api, engine.capture.clone(), engine.snapshots.clone(), engine.watchdog.clone());
+    engine.node.lock();
+    let times = compute.time_passes(slots, most, std::time::Duration::from_millis(u64::from(budget_ms)));
+    engine.node.unlock();
+    write_found(times, out, capacity)
+}
+
+/// Writes what a probe found as JSON, or the reason it failed, which is negative.
+unsafe fn write_found<T: serde::Serialize>(found: Result<T, node::Failure>, out: *mut c_char, capacity: usize) -> i32 {
     match found.map(|found| serde_json::to_vec(&found)) {
         Ok(Ok(text)) => write_text(&text, out, capacity),
         Ok(Err(error)) => {

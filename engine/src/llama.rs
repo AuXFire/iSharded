@@ -8,7 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -628,6 +628,79 @@ impl LlamaCompute {
     }
 }
 
+/// What passes of several rows cost a stage, timed at load on empty slots.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct PassTimes {
+    /// Rows in each pass timed.
+    pub rows: Vec<u32>,
+    /// The quickest of a few runs of each, in ms, beside the rows above.
+    pub ms: Vec<f64>,
+}
+
+/// Runs of each size of pass. The first also pays for whatever that size sets up once.
+const TIMED_RUNS: u32 = 3;
+
+impl LlamaCompute {
+    /// Times passes of 1, 2, 4... rows up to `most`, and stops early once the next size would
+    /// run past `budget`. A pass has one row a slot while the slots last, as replies merge.
+    /// Past that every slot gets the same number of rows, which says what more slots would
+    /// cost without loading them. Every slot is emptied afterwards, snapshots included, so
+    /// this must run before any reply is admitted.
+    pub fn time_passes(&mut self, slots: u32, most: u32, budget: Duration) -> Result<PassTimes, Failure> {
+        let slots = slots.max(1);
+        let found = self.timed_sizes(slots, most.max(1), budget);
+        for slot in 0..slots {
+            self.empty(slot as i32);
+        }
+        found
+    }
+
+    fn timed_sizes(&mut self, slots: u32, most: u32, budget: Duration) -> Result<PassTimes, Failure> {
+        let mut noise = Noise(0xD1B5_4A32_D192_ED03);
+        let began = Instant::now();
+        let mut times = PassTimes::default();
+        for size in pass_sizes(slots, most) {
+            // A pass of twice the rows takes at most about twice as long.
+            let next = times.ms.last().map_or(Duration::ZERO, |ms| Duration::from_secs_f64(ms * 2.0 * f64::from(TIMED_RUNS) / 1000.0));
+            if times.rows.len() >= 2 && began.elapsed() + next > budget {
+                break;
+            }
+            times.ms.push(self.timed(slots, size, &mut noise)?);
+            times.rows.push(size);
+        }
+        Ok(times)
+    }
+
+    /// The quickest of a few passes of `size` rows over empty slots, in ms.
+    fn timed(&mut self, slots: u32, size: u32, noise: &mut Noise) -> Result<f64, Failure> {
+        let used = size.min(slots);
+        let rows = self.probe_rows(size, noise)?;
+        let mut best = f64::INFINITY;
+        for _ in 0..TIMED_RUNS {
+            self.hidden.clear();
+            rows.iter().for_each(|row| self.hidden.extend_from_slice(row));
+            let started = Instant::now();
+            self.decode((0..size).map(move |row| ((row / used) as i32, (row % used) as i32)), true)?;
+            if let Some(synchronize) = self.api.synchronize {
+                // Safety: the context outlives this pass, and the caller holds the gate.
+                unsafe { synchronize(self.api.context) };
+            }
+            best = best.min(started.elapsed().as_secs_f64() * 1000.0);
+            (0..used).for_each(|slot| self.empty(slot as i32));
+        }
+        Ok(best)
+    }
+}
+
+/// Sizes of pass to time: doubling up to the slots, the slots themselves, then doubling again.
+/// Each size past the slots divides evenly among them, as llama.cpp runs a batch of several
+/// replies in rounds of one row from each.
+fn pass_sizes(slots: u32, most: u32) -> Vec<u32> {
+    let below = std::iter::successors(Some(1u32), |size| size.checked_mul(2)).take_while(|size| *size < slots);
+    let above = std::iter::successors(Some(slots), |size| size.checked_mul(2));
+    below.chain(above).take_while(|size| *size <= most).collect()
+}
+
 impl Compute for LlamaCompute {
     fn run_merged(&mut self, passes: &[Pass]) -> Vec<Result<Output, Failure>> {
         let watchdog = self.watchdog.clone();
@@ -692,7 +765,6 @@ mod tests {
     use crate::watchdog::Limits;
     use crate::wire::{Sampling, FLAG_KEEP, FLAG_TOKENS};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
 
     const WIDTH: usize = 2;
 
@@ -1323,6 +1395,51 @@ mod tests {
         let (found, _) = probed(&mut fake, false, 6);
         assert_eq!(found.map_err(|failure| failure.message), Ok(Exactness { exact_merge_limit: 3, verify_exact: true }));
         assert!(emptied(&fake, 6));
+    }
+
+    #[test]
+    fn pass_sizes_double_to_the_slots_and_then_give_every_slot_the_same_rows() {
+        assert_eq!(pass_sizes(1, 16), [1, 2, 4, 8, 16]);
+        assert_eq!(pass_sizes(6, 64), [1, 2, 4, 6, 12, 24, 48]);
+        assert_eq!(pass_sizes(16, 64), [1, 2, 4, 8, 16, 32, 64]);
+        assert_eq!(pass_sizes(16, 8), [1, 2, 4, 8]);
+        assert_eq!(pass_sizes(4, 1), [1]);
+    }
+
+    #[test]
+    fn timed_passes_run_one_row_a_slot_and_then_the_same_rows_in_every_slot() {
+        let mut fake = Fake { strict: true, stall: Duration::from_millis(2), queue_stall: Duration::from_millis(3), ..Fake::default() };
+        let mut compute = stage(&mut fake, false, &[]);
+        let times = compute.time_passes(3, 12, Duration::from_secs(10)).ok().unwrap();
+        assert_eq!(times.rows, [1, 2, 3, 6, 12]);
+        // The work a pass leaves queued on the device is waited for and counted.
+        assert!(times.ms.iter().all(|ms| *ms >= 5.0), "{:?}", times.ms);
+        assert!(emptied(&fake, 3));
+        assert!(compute.snapshots.slots.lock().is_empty());
+        let timed: Vec<_> = fake.batches.iter().collect();
+        assert_eq!(timed.len(), 5 * TIMED_RUNS as usize);
+        let twelve = timed.last().unwrap();
+        assert_eq!(twelve.slots, [0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2]);
+        assert_eq!(twelve.positions[..12], [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3]);
+        assert!(twelve.outputs.iter().all(|output| *output == 1));
+    }
+
+    #[test]
+    fn timing_stops_before_a_size_that_would_run_past_its_budget() {
+        let mut fake = Fake { stall: Duration::from_millis(10), ..Fake::default() };
+        let mut compute = stage(&mut fake, false, &[]);
+        // Two sizes always run, so the line has a slope. A third would take about 60 ms more.
+        let times = compute.time_passes(8, 64, Duration::from_millis(70)).ok().unwrap();
+        assert_eq!(times.rows, [1, 2]);
+        assert!(emptied(&fake, 8));
+    }
+
+    #[test]
+    fn a_timed_pass_the_stage_refuses_fails_and_leaves_the_slots_empty() {
+        let mut fake = Fake { refused_slot: Some(1), ..Fake::default() };
+        let mut compute = stage(&mut fake, false, &[]);
+        assert!(compute.time_passes(4, 64, Duration::from_secs(1)).is_err());
+        assert!(emptied(&fake, 4));
     }
 
     #[test]
