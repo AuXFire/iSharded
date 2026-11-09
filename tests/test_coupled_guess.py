@@ -91,7 +91,7 @@ def test_a_draft_passes_the_reply_sampling_to_its_process():
             return {"tokens": [1]}, b""
 
     draft = DraftModel.__new__(DraftModel)
-    draft.host, draft.slots, draft.text = Host(), 1, {0: DraftText(committed=3)}
+    draft.host, draft.slots, draft.text, draft.last_rows = Host(), 1, {0: DraftText(committed=3)}, {}
     sampling = {"temperature": 0.8, "top_p": 1.0, "top_k": 0, "seed": 9}
     draft.guess([4], 1, 0, sampling)
     draft.guess([1], 1, 0)

@@ -36,7 +36,7 @@ class Host:
 
 def draft_on(host, rewinds=True):
     draft = DraftModel.__new__(DraftModel)
-    draft.slots, draft.text, draft.host, draft.rewinds = 1, {}, host, rewinds
+    draft.slots, draft.text, draft.host, draft.rewinds, draft.last_rows = 1, {}, host, rewinds, {}
     draft.prepare([1, 2, 3], PromptPlan(), 0)
     host.calls.clear()
     return draft
@@ -186,3 +186,13 @@ def test_a_draft_knows_whether_its_model_can_go_back():
         assert draft.rewinds == (architecture in ("qwen3", "qwen3moe", "llama")), architecture
     finally:
         draft.close()
+
+
+def test_each_guess_says_how_many_rows_it_ran_so_a_bench_can_tell_steady_guesses_from_catching_up():
+    host = Host()
+    draft = draft_on(host)
+    draft.guess([4], 1)
+    assert draft.last_rows == {0: 1}
+    host.rows = 3  # as a guess after a miss reads the confirmed text again
+    draft.guess([5], 1)
+    assert draft.last_rows == {0: 3}

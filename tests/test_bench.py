@@ -347,12 +347,14 @@ def test_the_report_explains_the_numbers():
     assert result["route"][0] == {
         "stage": 1, "start_layer": 0, "end_layer": 20, "country": "DE", "gpu": "RTX 3060", "precision": "bfloat16",
         "link_ms": 1.5, "probe_ms": 3.25, "next_stage_ms": 22.0, "compute_ms": 11.0, "control_ms": 2.5,
+        "cuda_graphs": None, "price_per_hour": None,
+        "trace": {"link_rtt_us": 1500, "keeps": 0, "keep_bytes": None, "keep_ms_per_copy": None, "keep_share_of_compute": None},
     }  # fmt: skip
     assert result["route"][1]["gpu"] == "RX 7900 XT" and result["route"][1]["link_ms"] is None
     assert result["native_engine"] is True
     assert result["version"] == "0.3.0"
     # This run's share, since these counters run from when a worker started.
-    assert result["decoding"] == {"pipeline_tokens": 250, "pipeline_misses": 25, "pipeline_depth": 3, "draft_passes": 125, "draft_tokens_per_pass": 2.5}
+    assert result["decoding"] == {"pipeline_tokens": 250, "pipeline_misses": 25, "pipeline_depth": 3, "draft_passes": 125, "draft_tokens_per_pass": 2.5, "draft_guess": None}
     assert not result["notes"]
 
 
@@ -467,7 +469,7 @@ def test_the_command_prints_a_table_and_writes_both_files(monkeypatch, tmp_path,
     shown = capsys.readouterr().out
     assert "Tokens/s per reply" in shown and "Model: Qwen3-8B-Q4_K_M.gguf" in shown and "|" not in shown
     saved = json.loads(data.read_text(encoding="utf-8"))
-    assert saved["format"] == 2 and saved["options"]["tokens"] == 11
+    assert saved["format"] == 3 and saved["options"]["tokens"] == 11
     lines = page.read_text(encoding="utf-8").splitlines()
     assert "- **Quantization:** Q4_K_M" in lines
     table = [line for line in lines if line.startswith("|")]
@@ -805,3 +807,146 @@ def test_this_meshs_authority_is_not_forced_on_a_node_elsewhere(up_folder, monke
 def test_the_guide_covers_the_command():
     guide = (Path(__file__).resolve().parents[1] / "docs" / "GUIDE.md").read_text(encoding="utf-8")
     assert "### isharded bench" in guide
+
+
+def with_telemetry(base: dict, worker: str, **fields) -> dict:
+    """A status in which one worker's telemetry says more."""
+    copied = json.loads(json.dumps(base))
+    copied["workers"][worker]["runtime"]["telemetry"].update(fields)
+    return copied
+
+
+ENTRY, EXIT = f"{MACHINE}-1", f"{MACHINE}-2"
+# Run one level of one round, so the clock gives exact walls: 0.25 s to the first token and
+# 0.01 s a token after it, 11 tokens.
+ONE_ROUND = ("--repeat", "1")
+ROUND_SECONDS = PREFILL_SECONDS + 10 * TOKEN_SECONDS
+
+
+def test_the_hop_trace_and_this_runs_kept_state_come_from_each_stages_engine():
+    node = FakeNode()
+    ring = {"compute_us": 9000, "queue_us": 12, "write_us": 30, "enqueue_us": 8, "wait_us": 5, "hop_us": 800, "link_rtt_us": 700, "keep_us": 4100, "keep_bytes": 52 * 2**20}
+    before = with_telemetry(status(100), EXIT, ring={**ring, "keeps_total": 50, "keep_us_total": 200_000, "compute_us_total": 1_000_000})
+    after = with_telemetry(status(350), EXIT, ring={**ring, "keeps_total": 150, "keep_us_total": 600_000, "compute_us_total": 2_000_000})
+    node.statuses = [before, after]
+    report = run(node)
+    trace = report["route"][1]["trace"]
+    assert {name: trace[name] for name in ("compute_us", "queue_us", "write_us", "enqueue_us", "wait_us", "hop_us", "keep_us")} == {
+        "compute_us": 9000, "queue_us": 12, "write_us": 30, "enqueue_us": 8, "wait_us": 5, "hop_us": 800, "keep_us": 4100,
+    }  # fmt: skip
+    # 100 copies this run took 400 ms of its 1000 ms of compute.
+    assert (trace["keeps"], trace["keep_ms_per_copy"], trace["keep_share_of_compute"], trace["keep_bytes"]) == (100, 4.0, 0.4, 52 * 2**20)
+    shown = dict(bench.facts(report))
+    assert shown["Kept state"] == "stage 2: 100 copies of 52.0 MiB, 4 ms each, 40% of compute"
+    assert "2: compute 9000, keep 4100, queue 12, write 30, enqueue 8, wait 5, hop 800, link_rtt 700" in shown["Stage times, us"]
+
+
+def test_the_drafts_real_guess_time_is_this_runs_share():
+    node = FakeNode()
+    guess = {"guesses": 10, "ms_total": 100.0, "steady": 8, "steady_ms_total": 60.0}
+    later = {"guesses": 110, "ms_total": 1300.0, "steady": 88, "steady_ms_total": 860.0}
+    node.statuses = [with_telemetry(status(100), ENTRY, draft_guess=guess), with_telemetry(status(350), ENTRY, draft_guess=later)]
+    report = run(node, "--pace")
+    # 100 guesses in 1200 ms; 80 steady in 800 ms; 20 after a miss in 400 ms.
+    assert report["decoding"]["draft_guess"] == {"guesses": 100, "ms_per_guess": 12.0, "steady_guesses": 80, "steady_ms_per_guess": 10.0, "catch_up_ms_per_guess": 20.0}
+    assert dict(bench.facts(report))["Draft guess (g)"] == "12 ms over 100 guesses; 10 ms steady over 80, 20 ms after a miss"
+    assert report["options"]["pace"] is True and not report["notes"]
+
+
+def test_pace_runs_one_reply_at_a_time_only_and_says_when_nothing_was_guessed():
+    node = FakeNode()
+    report = run(node, "--pace", "--parallel", "1,4,8")
+    assert [level["parallel"] for level in report["results"][0]["levels"]] == [1]
+    assert report["decoding"]["draft_guess"] is None
+    assert any("--pace found no guesses" in note for note in report["notes"])
+
+
+def test_cost_per_token_is_the_machines_price_over_the_levels_tokens_and_time():
+    node = FakeNode()
+    node.statuses = [with_telemetry(status(100), ENTRY, price_per_hour=0.59)]
+    level = run(node, *ONE_ROUND)["results"][0]["levels"][0]
+    # Both stages are on one machine, so its price counts once.
+    assert level["cost_per_million_tokens"] == round(0.59 / 3600 * ROUND_SECONDS / 11 * 1e6, 4)
+    assert "joules_per_token" not in level
+
+
+def test_a_machine_with_no_price_takes_the_benchs_and_otherwise_there_is_no_cost():
+    two_machines = status(100)
+    two_machines["workers"][EXIT]["hardware"]["host_id"] = "another"
+    priced = with_telemetry(two_machines, ENTRY, price_per_hour=0.59)
+    node = FakeNode()
+    node.statuses = [priced]
+    report = run(node, *ONE_ROUND)
+    assert "cost_per_million_tokens" not in report["results"][0]["levels"][0]
+    assert any("1 of the route's machines have no price" in note for note in report["notes"])
+    node = FakeNode()
+    node.statuses = [priced]
+    level = run(node, *ONE_ROUND, "--price-per-hour", "0.41")["results"][0]["levels"][0]
+    assert level["cost_per_million_tokens"] == round(1.0 / 3600 * ROUND_SECONDS / 11 * 1e6, 4)
+
+
+def test_energy_per_token_is_read_around_each_level_and_a_shared_card_counts_once():
+    def reading(joules: float, seconds: float, samples: int, older: float = 0.0) -> dict:
+        base = status(100)
+        # Two stages on one machine's one card. The second worker's meter started later and
+        # has counted less, and the oldest is the one read.
+        for worker, less in ((ENTRY, 0.0), (EXIT, older)):
+            base["workers"][worker]["runtime"]["telemetry"]["power"] = {
+                "source": "nvidia-smi", "device": "0", "joules": joules - less, "seconds": seconds - less / 100, "samples": samples, "watts": 100.0,
+            }  # fmt: skip
+        return base
+
+    node = FakeNode()
+    # Before the run, then around the one level, then after it. The readings around the level
+    # cover 1.5 s at 22 W on average, whatever the level's own wall.
+    node.statuses = [reading(1000.0, 10.0, 20), reading(1500.0, 15.0, 30, older=300.0), reading(1533.0, 16.5, 33, older=300.0), reading(9999.0, 99.0, 99)]
+    level = run(node, *ONE_ROUND)["results"][0]["levels"][0]
+    assert (level["watts"], level["power_devices"]) == (22.0, 1)
+    assert level["joules_per_token"] == round(22.0 * ROUND_SECONDS / 11, 3), "the level's own wall at the readings' power"
+    report = run(FakeNode(), *ONE_ROUND)
+    assert "joules_per_token" not in report["results"][0]["levels"][0], "no node measured power"
+
+
+def test_a_level_shorter_than_a_few_power_readings_gives_no_energy_and_says_so():
+    def reading(joules: float, seconds: float, samples: int) -> dict:
+        base = status(100)
+        base["workers"][ENTRY]["runtime"]["telemetry"]["power"] = {"source": "nvidia-smi", "device": "0", "joules": joules, "seconds": seconds, "samples": samples}
+        return base
+
+    node = FakeNode()
+    node.statuses = [reading(1000.0, 10.0, 20), reading(1500.0, 15.0, 30), reading(1550.0, 15.5, 31), reading(1600.0, 16.0, 32)]
+    report = run(node, *ONE_ROUND)
+    level = report["results"][0]["levels"][0]
+    assert "joules_per_token" not in level and level["power_too_short"] is True
+    assert any("too few power readings" in note for note in report["notes"])
+
+
+def test_cost_and_energy_columns_show_only_when_measured():
+    report = run(FakeNode(), *ONE_ROUND)
+    assert bench.table(report)[0][-1] == "Total tokens/s"
+    report["results"][0]["levels"][0] |= {"cost_per_million_tokens": 5.2, "joules_per_token": 3.0, "watts": 94.3}
+    headers, rows = bench.table(report)
+    assert headers[-3:] == ["Cost per M tokens", "J/token", "Watts"] and rows[0][-3:] == ["5.2", "3", "94.3"]
+    assert any("J/token is that power" in sentence for sentence in bench.method(report))
+
+
+def test_cuda_graphs_are_reported_and_a_change_is_a_change_in_setup(tmp_path, capsys):
+    node = FakeNode()
+    node.statuses = [with_telemetry(with_telemetry(status(100), ENTRY, cuda_graphs=False), EXIT, cuda_graphs=False)]
+    off = run(node)
+    assert dict(bench.facts(off))["CUDA graphs"] == "off"
+    on = run(FakeNode())
+    assert "CUDA graphs" not in dict(bench.facts(on)), "a node too old to say says nothing"
+    paths = []
+    for name, report in (("a", on), ("b", off)):
+        path = tmp_path / f"{name}.json"
+        path.write_text(json.dumps(report), encoding="utf-8")
+        paths.append(str(path))
+    assert compare(*paths) == 0
+    shown = capsys.readouterr().out
+    assert "CUDA graphs" in shown and "may come from that and not from the code" in shown
+
+
+def test_a_price_below_zero_is_refused(capsys):
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["bench", "--price-per-hour", "-2"])

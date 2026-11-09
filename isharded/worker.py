@@ -32,6 +32,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from starlette.requests import ClientDisconnect
 
 from .inventory import inventory, ram
+from .meter import GuessClock, PowerMeter, cuda_graphs_on, open_meter, price_per_hour, sample_ms
 from .memory import (
     AUTO_RAM_SHARE,
     Accelerator,
@@ -572,6 +573,11 @@ class WorkerRuntime:
         self.checkpoint_tail: asyncio.Task[None] | None = None
         self.checkpoints_pending = 0
         self.checkpoints_dropped = 0
+        # The draft's time for each guess a pipelined pass waits on, for a bench to read.
+        self.guess_clock = GuessClock()
+        # Only when the node asks: see meter.py.
+        self.power: PowerMeter | None = None
+        self.power_problem: str | None = None
 
     def setup(self) -> None:
         """Probe hardware. Separate from ``__init__`` so importing stays cheap."""
@@ -687,7 +693,28 @@ class WorkerRuntime:
         elapsed = (time.perf_counter() - started) * 1000
         self.phases[phase] = round(self._ema(self.phases.get(phase), elapsed), 2)
 
+    def power_report(self) -> dict[str, Any] | None:
+        """This worker's device's power since the worker started, if the node asked for it."""
+        interval = sample_ms()
+        if not interval or self.hardware is None:
+            return None
+        if self.power is None and self.power_problem is None:
+            found = open_meter(self.hardware.device, interval)
+            if isinstance(found, str):
+                self.power_problem = found
+            else:
+                self.power = found
+        return self.power.report() if self.power is not None else {"source": None, "error": self.power_problem}
+
+    def cuda_graphs(self) -> bool | None:
+        """Whether llama.cpp may use CUDA graphs here, or None on a device that has none."""
+        if self.hardware is not None and not self.hardware.device.startswith("cuda"):
+            return None
+        return cuda_graphs_on()
+
     async def close(self) -> None:
+        if self.power is not None:
+            self.power.close()
         if self.registration_task:
             self.registration_task.cancel()
         if self.hop is not None:
@@ -2363,6 +2390,10 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
             "ring_live": runtime.ring_live,
             "hop_direct": runtime.hop is not None,
             "hop_fallbacks": runtime.hop_fallbacks,
+            "draft_guess": runtime.guess_clock.report(),
+            "power": runtime.power_report(),
+            "price_per_hour": price_per_hour(),
+            "cuda_graphs": runtime.cuda_graphs(),
         },
     }
 
@@ -2968,18 +2999,21 @@ async def generate(body: GenerateRequest, authorization: str | None = Header(def
             following = following.model_copy(update={"seed": secrets.randbelow(2**63)})
         sampling = {"temperature": following.temperature, "top_p": following.top_p, "top_k": following.top_k, "seed": following.seed}
 
-        async def draft_guesses(fresh: list[int], count: int, sampling: dict[str, Any] | None = None) -> list[int]:
+        async def draft_guesses(fresh: list[int], count: int, sampling: dict[str, Any] | None = None, pipelined: bool = False) -> list[int]:
             started = time.perf_counter()
             try:
                 guesses = await asyncio.to_thread(draft.guess, fresh, count, request.slot, sampling)
             except LlamaError as exc:
                 raise await runtime.draft_failed(exc, draft) from exc
             runtime._record("draft", started)
+            if pipelined:  # what a pipelined pass waits on, which is the law's g
+                runtime.guess_clock.note((time.perf_counter() - started) * 1000, getattr(draft, "last_rows", {}).get(request.slot))
             return guesses
 
         async def next_guess(fresh: list[int]) -> int:
             # Only a pipelined pass draws as plain decoding does. A checked pass draws another way.
-            return (await draft_guesses(fresh, 1, sampling))[0]
+            # A checked pass can ask for one guess too, at a reply's last token, and is not g.
+            return (await draft_guesses(fresh, 1, sampling, pipelined=True))[0]
 
         async def rewind_draft(keep: int) -> None:
             draft.rewind(keep, request.slot)

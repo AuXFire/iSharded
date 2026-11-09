@@ -27,7 +27,7 @@ from typing import Any
 
 import numpy as np
 
-ABI_VERSION = 4
+ABI_VERSION = 5
 MAGIC = 0x5369
 WIRE_VERSION = 3
 HEADER = struct.Struct("<HBBI")
@@ -67,6 +67,7 @@ class StageApi(C.Structure):
         ("row_bytes", C.c_int64),
         ("to_float", C.c_void_p),
         ("keep_limit", C.c_uint32),
+        ("synchronize", C.c_void_p),
     ]
 
 
@@ -165,6 +166,7 @@ class Engine:
             row_bytes=row_bytes,
             to_float=to_float,
             keep_limit=keep_limit,
+            synchronize=_address(llama.llama_synchronize),
         )
         self.lib.isharded_engine_attach(self.handle, C.byref(self.api))
 

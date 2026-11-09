@@ -6,7 +6,9 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_char, c_void, CStr, CString};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -39,6 +41,7 @@ pub type TensorName = unsafe extern "C" fn(*const c_void) -> *const c_char;
 pub type TensorBytes = unsafe extern "C" fn(*const c_void) -> usize;
 pub type TensorGet = unsafe extern "C" fn(*const c_void, *mut c_void, usize, usize);
 pub type ToFloat = unsafe extern "C" fn(*const c_void, *mut f32, i64);
+pub type Synchronize = unsafe extern "C" fn(*mut c_void);
 
 /// `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`. Attention can rewind by itself, so a snapshot leaves
 /// it out, which keeps its size the same however long the reply gets.
@@ -76,6 +79,9 @@ pub struct StageApi {
     pub to_float: Option<ToFloat>,
     /// How many snapshots each slot holds, which must cover every pass a miss can undo.
     pub keep_limit: u32,
+    /// `llama_synchronize`. A decode can return with its work still queued on the GPU, and
+    /// the state copy would wait for it, so a snapshot's time starts after this.
+    pub synchronize: Option<Synchronize>,
 }
 
 /// Holds what the stage's last layer produced. llama.cpp calls `on_eval` for every node of
@@ -159,9 +165,53 @@ impl SlotStates {
 #[derive(Default)]
 pub struct Snapshots {
     slots: Mutex<HashMap<i32, SlotStates>>,
+    keeps: KeepCounters,
+}
+
+/// What keeping snapshots costs. A pass that keeps one copies its slot's recurrent state to
+/// host memory after its decode and before its output goes out, so this time sits on the
+/// pass's way along the ring.
+#[derive(Default)]
+struct KeepCounters {
+    /// A recent average of one snapshot's copy, and of its size.
+    us: AtomicU64,
+    bytes: AtomicU64,
+    /// Every snapshot tried since the model loaded, and the time they all took.
+    count: AtomicU64,
+    us_total: AtomicU64,
+}
+
+/// [`Snapshots`]' costs, for the engine's stats.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct KeepStats {
+    pub keep_us: u64,
+    pub keep_bytes: u64,
+    pub keeps_total: u64,
+    pub keep_us_total: u64,
 }
 
 impl Snapshots {
+    pub fn keep_stats(&self) -> KeepStats {
+        let keeps = &self.keeps;
+        KeepStats {
+            keep_us: keeps.us.load(Ordering::Relaxed),
+            keep_bytes: keeps.bytes.load(Ordering::Relaxed),
+            keeps_total: keeps.count.load(Ordering::Relaxed),
+            keep_us_total: keeps.us_total.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Counts a snapshot's copy, and its size if it was taken.
+    fn note_keep(&self, spent: u64, bytes: Option<usize>) {
+        let keeps = &self.keeps;
+        crate::average(&keeps.us, spent);
+        if let Some(bytes) = bytes {
+            crate::average(&keeps.bytes, bytes as u64);
+        }
+        keeps.count.fetch_add(1, Ordering::Relaxed);
+        keeps.us_total.fetch_add(spent, Ordering::Relaxed);
+    }
+
     /// A negative slot means all of them.
     pub fn forget(&self, slot: i32) {
         let mut slots = self.slots.lock();
@@ -295,6 +345,11 @@ impl LlamaCompute {
         if !pass.keeps_state() {
             return;
         }
+        if let Some(synchronize) = self.api.synchronize {
+            // Safety: the context outlives this pass, and the gate is held.
+            unsafe { synchronize(self.api.context) };
+        }
+        let started = Instant::now();
         let slot = pass.slot as i32;
         let end = pass.position + pass.row_count() as u32;
         let mut slots = self.snapshots.slots.lock();
@@ -309,10 +364,14 @@ impl LlamaCompute {
         };
         if wrote == 0 {
             states.spare.push(bytes);
+            drop(slots);
+            self.snapshots.note_keep(started.elapsed().as_micros() as u64, None);
             return;
         }
         bytes.truncate(wrote);
         states.saved.push_back(Snapshot { end, bytes });
+        drop(slots);
+        self.snapshots.note_keep(started.elapsed().as_micros() as u64, Some(wrote));
     }
 
     /// Does a pass's rewind, and adds its rows to the coming batch.
@@ -654,6 +713,12 @@ mod tests {
         refuse_restores: bool,
         /// How long a decode takes.
         stall: Duration,
+        /// How long copying a slot's state out takes.
+        save_stall: Duration,
+        /// GPU work a decode left queued, which a state copy or a synchronize waits for.
+        queued: Duration,
+        /// How long each decode leaves queued.
+        queue_stall: Duration,
         /// Refuses any batch with a row of this slot, as llama.cpp does a row it cannot place.
         refused_slot: Option<i32>,
         refusals: usize,
@@ -675,9 +740,15 @@ mod tests {
         outputs: Vec<i8>,
     }
 
+    unsafe extern "C" fn fake_synchronize(context: *mut c_void) {
+        let fake = &mut *context.cast::<Fake>();
+        std::thread::sleep(std::mem::take(&mut fake.queued));
+    }
+
     unsafe extern "C" fn fake_decode(context: *mut c_void, batch: Batch) -> i32 {
         std::thread::sleep((*context.cast::<Fake>()).stall);
         let fake = &mut *context.cast::<Fake>();
+        fake.queued = fake.queue_stall;
         let count = batch.n_tokens as usize;
         if (0..count).any(|row| Some(**batch.seq_id.add(row)) == fake.refused_slot) {
             fake.refusals += 1;
@@ -735,6 +806,7 @@ mod tests {
     unsafe extern "C" fn fake_state_get(context: *mut c_void, out: *mut u8, size: usize, slot: i32, flags: u32) -> usize {
         assert_eq!(flags, PARTIAL_ONLY);
         let fake = &mut *context.cast::<Fake>();
+        std::thread::sleep(std::mem::take(&mut fake.queued) + fake.save_stall);
         if fake.refuse_saves {
             return 0;
         }
@@ -798,6 +870,7 @@ mod tests {
             row_bytes: (WIDTH * 4) as i64,
             to_float: None,
             keep_limit: 3,
+            synchronize: Some(fake_synchronize),
         };
         LlamaCompute::new(api, capture, Arc::default(), watching())
     }
@@ -1070,6 +1143,53 @@ mod tests {
         assert!(refused(got.pop().unwrap()));
         assert!(got.pop().unwrap().is_ok());
         assert_eq!(fake.slots[&0], (11, vec![10]));
+    }
+
+    #[test]
+    fn a_kept_pass_counts_the_copy_of_its_state_and_a_plain_pass_counts_nothing() {
+        let mut fake = Fake::default();
+        let mut compute = recurrent(&mut fake, 10);
+        assert!(compute.run(&plain(0, 10)).is_ok());
+        assert_eq!(compute.snapshots.keep_stats(), KeepStats::default());
+        fake.save_stall = Duration::from_millis(3);
+        runs(&mut compute, 0, 11..14);
+        let stats = compute.snapshots.keep_stats();
+        assert_eq!(stats.keeps_total, 3);
+        // The copy is the time counted: each one here stalls for 3 ms.
+        assert!(stats.keep_us >= 3_000 && stats.keep_us_total >= 9_000, "{stats:?}");
+        // The fake's state is its next position and every position run, four bytes each: 12,
+        // 16 and 20 bytes for these three, and the average leans on the recent ones.
+        assert!((12..=20).contains(&stats.keep_bytes), "{stats:?}");
+    }
+
+    #[test]
+    fn a_kept_pass_counts_only_the_copy_and_not_the_gpu_work_its_decode_left_queued() {
+        let mut fake = Fake::default();
+        let mut compute = recurrent(&mut fake, 10);
+        fake.queue_stall = Duration::from_millis(30);
+        runs(&mut compute, 0, 10..13);
+        let stats = compute.snapshots.keep_stats();
+        assert_eq!(stats.keeps_total, 3);
+        assert!(stats.keep_us_total < 30_000, "the decode's queued work is not the copy's: {stats:?}");
+    }
+
+    #[test]
+    fn a_snapshot_that_could_not_be_saved_still_counts_its_time_but_no_bytes() {
+        let mut fake = Fake::default();
+        let mut compute = recurrent(&mut fake, 10);
+        fake.refuse_saves = true;
+        runs(&mut compute, 0, 10..12);
+        let stats = compute.snapshots.keep_stats();
+        assert_eq!((stats.keeps_total, stats.keep_bytes), (2, 0));
+    }
+
+    #[test]
+    fn merged_passes_count_a_copy_for_each_pass_that_keeps() {
+        let mut fake = Fake::default();
+        let mut compute = recurrent(&mut fake, 10);
+        let got = compute.run_merged(&[kept(0, 10), plain(1, 10)]);
+        assert!(got.iter().all(Result::is_ok));
+        assert_eq!(compute.snapshots.keep_stats().keeps_total, 1);
     }
 
     #[test]
