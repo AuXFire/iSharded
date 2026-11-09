@@ -88,8 +88,8 @@ SIGNATURES: dict[str, tuple[list[Any], Any]] = {
     "stats": ([C.c_void_p, C.c_char_p, C.c_size_t], C.c_int32),
     "probe": ([C.c_void_p, C.c_uint32, C.c_char_p, C.c_size_t], C.c_int32),
 }
-# Calls that hold the next route beside the current one. They came without a new ABI version,
-# so a library from before them still loads, and ``Engine.stages`` says whether they are there.
+# Calls that hold the next route beside the current one. Every library of this ABI version has
+# them; ``Engine.stages`` still checks, so a build without them says so instead of failing a call.
 STAGING_SIGNATURES: dict[str, tuple[list[Any], Any]] = {
     "stage": ([C.c_void_p, C.c_char_p], C.c_int32),
     "connect_staged": ([C.c_void_p, C.c_char_p], C.c_int32),

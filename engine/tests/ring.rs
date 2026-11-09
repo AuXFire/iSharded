@@ -1781,6 +1781,45 @@ fn a_flip_hands_every_slot_over_once_the_old_routes_queue_here_has_run() {
 }
 
 #[test]
+fn a_stage_that_hangs_after_a_flip_tells_the_old_route_too() {
+    within_deadline("a_stage_that_hangs_after_a_flip_tells_the_old_route_too", || {
+        let mut ring = ring(2, true, Duration::ZERO, 60_000);
+        patient_client(&ring);
+        // A slow last stage, so route 7's passes are still queued there after the flip.
+        let slow = Adder { stage: 2, last: true, delay: Duration::from_millis(400), seen: ring.seen[1].clone() };
+        ring.nodes[1].set_compute(Box::new(slow));
+        stage_next(&ring, NEXT, 60_000, &[], None);
+        for id in 1..=3 {
+            ring.client.send(&on(7, 0, id, 1).encode()).unwrap();
+        }
+        wait_until("route 7's first pass running at the last stage", || ring.seen[1].load(Ordering::SeqCst) >= 1);
+        for node in &ring.nodes {
+            node.promote(NEXT).unwrap();
+        }
+        assert_eq!(ring.nodes[1].stats().retiring_epochs, vec![7], "route 7 retired at once, so this proves nothing");
+        // Whichever route's pass hung, the refusal must reach that route's entry.
+        let hung = std::mem::replace(&mut ring.nodes[1], Arc::new(Node::new().unwrap()));
+        let watchdog = Watchdog::new(hung.refuser(), move || hung.stop());
+        watchdog.set_limits(Limits { pass_ms: 200, row_ms: 0 });
+        let _hung = watchdog.time(1);
+        ring.client.limit_reads(Duration::from_secs(3)).unwrap();
+        let mut told = vec![];
+        while let Ok((kind, body)) = ring.frames.next() {
+            if kind == Kind::Nack {
+                let nack = Nack::decode(&body).unwrap();
+                if nack.message.contains("hung") {
+                    told.push((nack.epoch, nack.refusal, nack.stage));
+                }
+            }
+            if told.iter().any(|&(epoch, _, _)| epoch == 7) {
+                break;
+            }
+        }
+        assert!(told.contains(&(7, Refusal::FailedStage, 1)), "the old route's entry heard only {told:?}");
+    });
+}
+
+#[test]
 fn closing_one_epoch_leaves_the_other_serving() {
     within_deadline("closing_one_epoch_leaves_the_other_serving", || {
         let mut ring = ring(2, true, Duration::ZERO, 2000);

@@ -788,27 +788,38 @@ impl Node {
     pub fn refuser(&self) -> impl FnOnce(String) + Send + 'static {
         let inner = self.inner.clone();
         move |message| {
-            let ring = inner.rings.read().current.clone();
-            if let Some(ring) = ring {
-                let nack = Nack { id: 0, generation: 0, epoch: ring.epoch, refusal: Refusal::FailedStage, stage: ring.index, message };
-                inner.counters.refusals.fetch_add(1, Ordering::Relaxed);
+            // The hung pass may be of any route this stage holds: after a flip, the old route's
+            // passes still run here, and its entry can be another node. Each route is told.
+            let rings: Vec<Arc<Ring>> = {
+                let rings = inner.rings.read();
+                rings.current.iter().chain(rings.retiring.iter()).chain(rings.staged.iter()).cloned().collect()
+            };
+            if rings.is_empty() {
+                return;
+            }
+            inner.counters.refusals.fetch_add(1, Ordering::Relaxed);
+            let mut links: Vec<Arc<Link>> = vec![];
+            for ring in &rings {
+                let nack = Nack { id: 0, generation: 0, epoch: ring.epoch, refusal: Refusal::FailedStage, stage: ring.index, message: message.clone() };
                 let frame = nack.encode();
                 let towards_entry = if ring.is_entry() { inner.local.lock().clone() } else { ring.back.lock().clone() };
                 let closing = (ring.is_last() && !ring.is_entry()).then(|| ring.closing.lock().clone().map(|peer| peer.link.clone())).flatten();
                 // The closing link first: it is the way round a stuck walk back.
-                let links: Vec<Arc<Link>> = [closing, towards_entry].into_iter().flatten().collect();
-                for link in &links {
+                for link in [closing, towards_entry].into_iter().flatten() {
                     let _ = link.send(&frame); // a dead link is seen by its far end, which says so itself
+                    if !links.iter().any(|known| Arc::ptr_eq(known, &link)) {
+                        links.push(link);
+                    }
                 }
-                // Every link writes before any waits on its far end, so a far end that never
-                // closes cannot use up the time another link had to write.
-                let deadline = Instant::now() + LAST_WORDS;
-                for link in &links {
-                    link.stop_writing(deadline);
-                }
-                for link in &links {
-                    link.await_close(deadline);
-                }
+            }
+            // Every link writes before any waits on its far end, so a far end that never
+            // closes cannot use up the time another link had to write.
+            let deadline = Instant::now() + LAST_WORDS;
+            for link in &links {
+                link.stop_writing(deadline);
+            }
+            for link in &links {
+                link.await_close(deadline);
             }
         }
     }
