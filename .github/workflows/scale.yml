@@ -1,0 +1,53 @@
+name: scale
+
+# The control plane of 20 emulated nodes, every night, so a change that makes it cost
+# more per node shows up as a number rather than as a slow pool. See "Scale harness"
+# in docs/OPERATIONS.md. Twenty is what a 4-core runner holds without the nodes slowing
+# each other (about 0.08 cores a node at N=20, more per node as N grows); N=50 needs
+# about four times the cores, so start it by hand on a larger runner.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      nodes:
+        description: "How many emulated nodes"
+        default: "20"
+      phases:
+        description: "Phases (all, or a comma separated list)"
+        default: "all"
+
+jobs:
+  scale:
+    runs-on: ubuntu-latest
+    # N=20 with every phase took 7 minutes on a laptop.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+      - name: Run
+        env:
+          NODES: ${{ inputs.nodes || '20' }}
+          PHASES: ${{ inputs.phases || 'all' }}
+        run: |
+          mkdir -p scale-results
+          python tests/scale/harness.py --nodes "$NODES" --phases "$PHASES" \
+            --run-dir scale-runs --out "scale-results/scale-$NODES.json"
+      - name: Table
+        if: always()
+        run: python tests/scale/report.py scale-results/scale-*.json >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scale-results
+          path: |
+            scale-results
+            scale-runs/**/*.log
+          if-no-files-found: ignore
