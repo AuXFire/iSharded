@@ -523,8 +523,13 @@ mod tests {
     #[test]
     fn picking_a_token_is_timed_for_the_trace() {
         let logits: Vec<f32> = (0..200_000).map(|index| (index % 977) as f32).collect();
-        choose(&logits, &WARM, &mut Draws::new(Some(3), 0));
-        assert!(average_us() > 0);
+        // Every test in this process shares the average, and one picking from a few logits
+        // in under a microsecond can pull it to zero between this pick and the look.
+        let timed = (0..50).any(|_| {
+            choose(&logits, &WARM, &mut Draws::new(Some(3), 0));
+            average_us() > 0
+        });
+        assert!(timed);
     }
 
     /// Times each kind of draw on a row the size of Qwen3's vocabulary. Run with

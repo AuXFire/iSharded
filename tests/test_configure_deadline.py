@@ -35,7 +35,7 @@ def stage_of(size: int = 0) -> StageAssignment:
 
 
 def request_for(stage: StageAssignment) -> MagicMock:
-    request = MagicMock(load_id="load-1")
+    request = MagicMock(load_id="load-1", staged=False)
     request.model_dump.return_value = {"load_id": "load-1"}
     return request
 
