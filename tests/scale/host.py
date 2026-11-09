@@ -78,6 +78,7 @@ class Meter:
     def __init__(self) -> None:
         self.counts: dict[str, list[int]] = {}  # "out:gossip" -> [calls, bytes, failures]
         self.fanout: dict[str, set[str]] = {}  # "gossip" -> destinations since the last mark
+        self.errors: dict[str, int] = {}  # "gossip:PoolTimeout" -> calls that failed that way
 
     def add(self, direction: str, kind: str, size: int, failed: bool = False) -> None:
         row = self.counts.setdefault(f"{direction}:{kind}", [0, 0, 0])
@@ -85,11 +86,19 @@ class Meter:
         row[1] += size
         row[2] += failed
 
+    def error(self, kind: str, exc: BaseException) -> None:
+        key = f"{kind}:{type(exc).__name__}"
+        self.errors[key] = self.errors.get(key, 0) + 1
+
     def reach(self, kind: str, destination: str) -> None:
         self.fanout.setdefault(kind, set()).add(destination)
 
     def snapshot(self) -> dict[str, Any]:
-        return {"counts": {key: list(value) for key, value in self.counts.items()}, "fanout": {key: len(value) for key, value in self.fanout.items()}}
+        return {
+            "counts": {key: list(value) for key, value in self.counts.items()},
+            "fanout": {key: len(value) for key, value in self.fanout.items()},
+            "errors": dict(self.errors),
+        }
 
 
 class Faults:
@@ -174,15 +183,19 @@ def counting_transport(inner: Any, node: str, meter: Meter, owners: dict[str, st
                 kept.discard(destination)  # a timed-out connection is closed
                 await asyncio.sleep(seconds)
                 meter.add("out", kind, sent, failed=True)
-                raise getattr(httpx, error)("emulated silent network", request=request)
+                failure = getattr(httpx, error)("emulated silent network", request=request)
+                meter.error(kind, failure)
+                raise failure
             delay = FAULTS.one_way()
             if delay:
                 await asyncio.sleep(delay)
             try:
                 response = await inner.handle_async_request(request)
-            except BaseException:
+            except BaseException as exc:
                 kept.discard(destination)
                 meter.add("out", kind, sent, failed=True)
+                # A PoolTimeout means the client's connection limit, not the network or the peer.
+                meter.error(kind, exc)
                 raise
             kept.add(destination)
             delay = FAULTS.one_way()

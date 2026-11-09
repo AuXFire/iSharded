@@ -424,6 +424,7 @@ class Pool:
         missed = await self.mark()
         await self.poll()
         before = self.counts()
+        errors_before = {name: dict(report["meter"].get("errors", {})) for name, report in self.reports.items()}
         psutil.cpu_percent(None)
         cpu_before, began = self.cpu_seconds(), time.time()
         await asyncio.sleep(self.args.steady_seconds)
@@ -439,6 +440,10 @@ class Pool:
         cpu = {host: (cpu_after[host] - cpu_before[host]) / seconds for host in cpu_after if host in cpu_before}
         nodes = len(members)
         peer_flaps, worker_flaps = self.false_drops(members, began, began + seconds)
+        errors: dict[str, int] = {}
+        for name in members:
+            for key, count in self.reports[name]["meter"].get("errors", {}).items():
+                errors[key] = errors.get(key, 0) + count - errors_before.get(name, {}).get(key, 0)
         lags = [entry.get("lag", {}) for entry in self.live_hosts().values()]
         return {
             "seconds": round(seconds, 1),
@@ -447,6 +452,9 @@ class Pool:
             "fanout": {kind: spread(values) for kind, values in sorted(fanout.items())},
             "live_peers_dropped": peer_flaps,
             "live_workers_dropped": worker_flaps,
+            # Failed calls by kind and cause, all nodes together: PoolTimeout is a node's own
+            # connection limit, ConnectError/ConnectTimeout/ReadTimeout the peer or the network.
+            "errors": {key: count for key, count in sorted(errors.items()) if count},
             "cpu_cores_per_node": round(sum(cpu.values()) / nodes, 4),
             "cpu_busiest_process_cores": round(max(cpu.values()), 3) if cpu else None,
             "rss_mb_per_node": round(self.memory_bytes() / nodes / 2**20, 1),

@@ -286,3 +286,26 @@ def test_five_nodes_settle_join_leave_and_elect(tmp_path):
     assert kill["old"] == "n000" and kill["new"] == "n001"
     assert kill["elections"] == 1
     assert 10 <= kill["agreed_s"] < 90
+
+
+def test_failed_calls_are_counted_by_cause():
+    meter = host.Meter()
+    request = httpx.Request("POST", "http://127.0.0.1:1/internal/gossip")
+
+    class Full(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            raise httpx.PoolTimeout("no free connection", request=request)
+
+    transport = host.counting_transport(Full(), "n000", meter, {})
+    with pytest.raises(httpx.PoolTimeout):
+        asyncio.run(transport.handle_async_request(request))
+    host.FAULTS.sides = {"n000": 0, "n001": 1}
+    try:
+        cut = host.counting_transport(Full(), "n000", meter, {"127.0.0.1:1": "n001"})
+        quick = httpx.Request("POST", "http://127.0.0.1:1/health", extensions={"timeout": {"connect": 0.01, "read": 0.01}})
+        with pytest.raises(httpx.ConnectTimeout):
+            asyncio.run(cut.handle_async_request(quick))
+    finally:
+        host.FAULTS.sides = {}
+    assert meter.snapshot()["errors"] == {"gossip:PoolTimeout": 1, "health:ConnectTimeout": 1}
+    assert meter.counts["out:gossip"][2] == 1
