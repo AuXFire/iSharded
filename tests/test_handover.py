@@ -18,7 +18,7 @@ from isharded import orchestrator as orchestrator_module
 from isharded import worker
 from isharded.models import GgufAdapter
 from isharded.orchestrator import Orchestrator, WorkerRecord
-from isharded.protocol import PROTOCOL_VERSION, ConfigureRequest, HardwareInfo, StageAssignment, WorkerRegistration
+from isharded.protocol import PROTOCOL_VERSION, ConfigureRequest, HardwareInfo, StageAssignment, UnitPlacement, WorkerRegistration
 from isharded.slots import SlotGate
 
 
@@ -264,6 +264,63 @@ def test_a_new_entry_goes_live_on_its_ring_and_the_old_one_gets_its_slot_back(mo
     assert ("c", "/internal/ring/go") in paths
     assert ("a", "/internal/ring/unlend") in paths
     assert ("b", "/internal/ring/stage") in paths and ("b", "/internal/ring/slots") in paths
+
+
+@pytest.mark.parametrize("new_entry", [False, True])
+def test_a_staged_switch_tells_the_entry_when_every_stage_checks_guesses_exactly(monkeypatch, new_entry):
+    """Every configure, a flip too, makes the entry forget the route is exact, as _activate knows."""
+    old = [stage("a", 0, 1), stage("b", 1, 2)]
+    new = [stage("c", 0, 1), stage("b", 1, 2)] if new_entry else [stage("a", 0, 1), stage("c", 1, 2)]
+    orchestrator, network = serving(monkeypatch, old)
+    original = network.post
+
+    async def post(url, json=None, headers=None, timeout=None):
+        answer = await original(url, json=json, headers=headers, timeout=timeout)
+        if url.endswith("/internal/configure"):
+            answer.body["verify_exact"] = True
+        return answer
+
+    network.post = post
+
+    async def switch():
+        switched = await orchestrator._activate_staged(orchestrator.active, new)
+        await asyncio.sleep(0)
+        return switched
+
+    assert run(switch())
+    told = [(who, body) for who, path, body, _ in network.calls if path == "/internal/route/exact"]
+    assert told == [(new[0].worker_id, {"epoch": 5, "verify_exact": True})]
+
+
+def test_a_staged_switch_says_nothing_of_exactness_when_a_stage_was_not_probed(monkeypatch):
+    old, new = [stage("a", 0, 1), stage("b", 1, 2)], [stage("a", 0, 1), stage("c", 1, 2)]
+    orchestrator, network = serving(monkeypatch, old)
+
+    async def switch():
+        switched = await orchestrator._activate_staged(orchestrator.active, new)
+        await asyncio.sleep(0)
+        return switched
+
+    assert run(switch())
+    assert ("a", "/internal/route/exact") not in network.paths()
+
+
+def test_a_slow_staged_flip_is_not_taken_for_the_speed_of_a_load(monkeypatch):
+    """A flip loads nothing and may wait seconds for old passes, so it must not set the load rate."""
+    orchestrator, network = serving(monkeypatch, [stage("a")])
+    big = stage("a")
+    big.placements = [UnitPlacement(unit="u", pool_id="p", bytes=4 * 1024**3)]
+    clock = iter(())
+    # The configure takes 2 s on this clock. Only the coordinator's clock: asyncio keeps the real one.
+    monkeypatch.setattr(orchestrator_module, "time", SimpleNamespace(monotonic=lambda: next(clock, 102.0), perf_counter=time.perf_counter, time=time.time))
+    for staged, expected in ((True, 0.0), (False, 4 * 1024**3 / 2.0)):
+        orchestrator.workers["a"].load_bytes_per_second = 0.0
+        loading = target()
+        loading.request = SimpleNamespace(model_hashes={}, prompt_cache=True, kv_type="f16")
+        request = orchestrator._configure_request(loading, big, [big], 5, None, {}, True, staged=staged)
+        clock = iter([100.0])  # the start of the configure; every later look says 102
+        run(orchestrator._configure_in_time(big, request))
+        assert orchestrator.workers["a"].load_bytes_per_second == expected
 
 
 def test_a_warm_pass_that_fails_calls_the_switch_off_and_leaves_the_old_route(monkeypatch):

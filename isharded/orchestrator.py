@@ -2760,7 +2760,8 @@ class Orchestrator:
             raise
         response = sending.result()
         took = time.monotonic() - began
-        if response.status_code < 400 and record is not None and size >= 256 * 1024**2 and took >= 1.0:
+        # A staged flip loads nothing and may wait for old passes, so its time says nothing of the disk.
+        if response.status_code < 400 and record is not None and not request.staged and size >= 256 * 1024**2 and took >= 1.0:
             record.load_bytes_per_second = size / took
         return response
 
@@ -2965,9 +2966,10 @@ class Orchestrator:
         holders = self.copy_holders(route)
         lender: StageAssignment | None = None
         timings: dict[str, float] = {}
+        loaded: list[Any] = []
         try:
-            results = await asyncio.gather(*(self._configure_stage(target, stage, route, epoch, None, holders, True) for stage in fresh), return_exceptions=True)
-            failed = {stage.worker_id: str(result) for stage, result in zip(fresh, results) if isinstance(result, BaseException)}
+            loaded = await asyncio.gather(*(self._configure_stage(target, stage, route, epoch, None, holders, True) for stage in fresh), return_exceptions=True)
+            failed = {stage.worker_id: str(result) for stage, result in zip(fresh, loaded) if isinstance(result, BaseException)}
             if failed:
                 self.staged_stalled = {worker_id: reason for worker_id, reason in failed.items() if stalled(reason)}
                 raise StagedAbort(f"a new stage did not load: {failed}")
@@ -3000,6 +3002,9 @@ class Orchestrator:
         timings["quiet"] = all(isinstance(result, dict) and result.get("flip_quiet") is not False for result in results)
         if route[0].worker_id not in old_ids:
             await self._tell(route[0].url.rstrip("/") + "/internal/ring/go", json={"epoch": epoch, "term": term}, timeout=RING_CALL_SECONDS)
+        if len(route) > 1 and all(isinstance(result, dict) and result.get("verify_exact") is True for result in [*loaded, *results]):
+            # As in _activate: every configure, a flip too, makes the entry forget it.
+            self.spawn(self._tell(route[0].url.rstrip("/") + "/internal/route/exact", json={"epoch": epoch, "verify_exact": True}, timeout=5.0))
         if lender is not None and lender.worker_id not in kept:
             self.spawn(self._tell(lender.url.rstrip("/") + "/internal/ring/unlend", json={"term": term}, timeout=RING_CALL_SECONDS))
         self.active = target
