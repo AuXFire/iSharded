@@ -98,6 +98,7 @@ from .gguf_stage import (
     next_guess_count,
     plan_prompt,
 )
+from .llama_host import SPARE
 from .pipeline import Pipeline, RowClock
 from . import __version__, source_commit
 from .llamacpp import PINNED_BUILD, LlamaError, StageLost, ensure_build, pick_build, rocm_library_paths, speculative_choice, step_draws, step_random
@@ -221,6 +222,16 @@ RING_DIAL_MS = 10_000
 # Which of a ring's links a stage holds keys for: the hop behind, the hop ahead, and at the
 # two ends the closing link. Each link has its own key.
 RING_KEYS = frozenset({"back", "next", "closing"})
+# How long a staged flip waits for the old route's passes already queued at this stage. They
+# are a pass or two; past this the flip goes ahead, and any left over are refused in turn.
+FLIP_WAIT_MS = 5000
+# A coordinator that lent itself a slot to prove the next route on, and then died, must not
+# keep that slot from replies for ever.
+LEND_LIMIT_SECONDS = 60.0
+# A spare stage process starts once the live stage has run no pass for this long, looked at
+# this often. See llama_host.Spare.
+SPARE_IDLE_SECONDS = 3.0
+SPARE_LOOK_SECONDS = 1.0
 # A silent link answers nothing, so a shorter address is checked while it is in use. It
 # gets as long without an answer as a ring link gets without an acknowledgement.
 HOP_WATCH_SECONDS = 1.0
@@ -446,6 +457,15 @@ class WorkerRuntime:
         self.ring_door: dict[str, Any] | None = None
         self.ring_client: EngineClient | None = None
         self.ring_guard: asyncio.Task[None] | None = None
+        # The next route's ring, staged beside the current one on this stage, and its term.
+        self.staged_epoch: int | None = None
+        self.staged_term = 0
+        # A slot lent to a coordinator to prove the next route on, and its time limit.
+        self.lent_slot: int | None = None
+        self.lend_timer: asyncio.TimerHandle | None = None
+        # Whether the last staged flip found the old route's passes here done in time.
+        self.flip_quiet: bool | None = None
+        self.spare_task: asyncio.Task[None] | None = None
         self.country = node_country(self.advertised_url, os.getenv("ISHARDED_LOCATION"))
         self.pool_token = load_token()
         self.requires_identity = bool(os.getenv("ISHARDED_CA_FILE"))
@@ -744,6 +764,9 @@ class WorkerRuntime:
             self.power.close()
         if self.registration_task:
             self.registration_task.cancel()
+        if self.spare_task:
+            self.spare_task.cancel()
+        await asyncio.to_thread(SPARE.close)
         if self.hop is not None:
             self._forget_hop(self.hop)
         await self.client.aclose()
@@ -1373,7 +1396,17 @@ class WorkerRuntime:
         if request.term < self.term:
             raise ValueError(f"order from term {request.term}, but term {self.term} already took over")
         self.term = request.term
-        self.ring_stop()
+        # Read so, an order built without the field, as unstaged callers and tests build it, is unstaged.
+        staged = bool(getattr(request, "staged", False))
+        if staged:
+            # The flip of a stage that serves both routes: same model, same KV, no reload, and
+            # the ring it staged takes over from the one it serves. See flip_staged.
+            if self.gguf is None or self._stage_signature(request) != self.gguf_signature:
+                raise ValueError("a staged flip keeps the stage as it is, and this one would change")
+            if self.staged_epoch != request.epoch:
+                raise ValueError(f"route {request.epoch} is not staged here")
+        else:
+            self.ring_stop()
         self.draft_choice = DraftChoice()  # a new route can change which way is faster
         self.route_verifies = None  # the coordinator says so again once every stage has loaded
         self.row_clock = RowClock()
@@ -1424,6 +1457,8 @@ class WorkerRuntime:
         self.exactness = None if self.gguf is None else (await asyncio.to_thread(self.gguf.ring_call, "exactness")).get("found")
         if self.gate.size != request.slots:
             self.gate.resize(request.slots)
+        if staged:
+            await self.flip_staged(request)
         await self.release_gate()
 
     def configure_signs(self) -> dict[str, Any]:
@@ -1450,6 +1485,21 @@ class WorkerRuntime:
             "read_mib": read // 2**20,
             "children_cpu_s": round(cpu, 1),
         }
+
+    async def flip_staged(self, request: ConfigureRequest) -> None:
+        """The staged ring becomes the one this stage serves, with every slot.
+
+        Passes of the old route already queued here run first; any that arrive later are refused
+        before they touch a slot, and their replies replay on the new route. The old ring then
+        finishes what it took and closes by itself.
+        """
+        assert self.gguf is not None
+        answer = await asyncio.to_thread(self.gguf.ring_call, "ring_flip", epoch=request.epoch, slots=list(range(request.slots)), wait_ms=FLIP_WAIT_MS)
+        self.flip_quiet = bool(answer.get("quiet"))
+        self.ring_epoch = request.epoch
+        self.ring_term = request.term
+        self.staged_epoch = None
+        await self.unlend_slot()
 
     def ring_stop(self) -> None:
         """Leave the ring. Replies go on over HTTP, or replay if one was using it."""
@@ -1536,6 +1586,184 @@ class WorkerRuntime:
         while client.alive and not stopped.is_set():
             await asyncio.sleep(SETTLE_LOOK_SECONDS)
         client.close()
+
+    def _staged_order(self, body: dict[str, Any], opening: bool = False) -> None:
+        """The same check for the next route's ring, which has its own term record so that an
+        order for it never passes for one of the ring this stage serves, or the other way round.
+        """
+        term = body.get("term")
+        if not isinstance(term, int) or term < self.term or not (opening or term == self.staged_term):
+            raise HTTPException(status_code=409, detail=f"a staged ring order from term {term}, but this worker follows term {self.term}")
+
+    async def ring_stage(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Takes this stage's place in the next route beside the route it serves.
+
+        Only for a stage that stays as it is: the same model and layers serve both routes from
+        one process, one model and one KV. The door is the one already open.
+        """
+        self._staged_order(body, opening=True)
+        if self.gguf is None or self.ring_door is None or body.get("current_epoch") != self.epoch or self.ring_epoch != self.epoch:
+            raise HTTPException(status_code=409, detail="this worker is not serving that route on a ring")
+        if self.assignment is None or [self.assignment.start_layer, self.assignment.end_layer] != body.get("layers") or body.get("model_id") != self.model_id:
+            raise HTTPException(status_code=409, detail="a staged ring needs the stage this worker already serves")
+        epoch = body.get("epoch")
+        if not isinstance(epoch, int) or epoch <= self.epoch:
+            raise HTTPException(status_code=409, detail="the next route must come after the one this worker serves")
+        if self._ring_reaches_revoked():
+            raise HTTPException(status_code=409, detail="that route has a revoked node on it")
+        keys = body.get("keys")
+        if not isinstance(keys, dict) or not keys.keys() <= RING_KEYS or not all(value is None or isinstance(value, str) for value in keys.values()):
+            raise HTTPException(status_code=400, detail="a ring needs a key for each of this stage's links")
+        self.term = self.staged_term = body["term"]
+        answer = await asyncio.to_thread(
+            self.gguf.ring_call,
+            "ring_stage",
+            epoch=epoch,
+            index=body["index"],
+            count=body["count"],
+            keys=keys,
+            ack_timeout_ms=body.get("ack_timeout_ms", RING_ACK_MS),
+            silence_timeout_ms=body.get("silence_timeout_ms", RING_ACK_MS),
+            merge_passes=self.merge_passes,
+            merge_most=self.merge_most,
+        )
+        if not answer.get("engine"):
+            return {"engine": False}
+        self.staged_epoch = epoch
+        door = self.ring_door
+        host = urlsplit(self.advertised_url).hostname or "127.0.0.1"
+        return {"engine": True, "address": host_port(host, door["port"]), "port": door["port"], "fingerprint": door["fingerprint"]}
+
+    async def ring_connect_staged(self, body: dict[str, Any]) -> dict[str, Any]:
+        self._staged_order(body)
+        if self.gguf is None or self.staged_epoch is None or body.get("epoch") != self.staged_epoch:
+            raise HTTPException(status_code=409, detail="this worker has not staged that ring")
+        links = {"next": body.get("next"), "entry": body.get("entry"), "timeout_ms": RING_DIAL_MS}
+        await asyncio.to_thread(self.gguf.ring_call, "ring_connect_staged", links=links)
+        give_up = time.monotonic() + RING_DIAL_MS / 500
+        state = "dialling"
+        while state == "dialling" and time.monotonic() < give_up:
+            await asyncio.sleep(0.02)
+            stats = await asyncio.to_thread(self.gguf.ring_stats)
+            state = (stats or {}).get("staged_connect", state)
+        if state != "up":
+            raise HTTPException(status_code=502, detail=f"could not reach the next route's next stage: {state}")
+        return {"connected": True}
+
+    async def ring_slots(self, body: dict[str, Any]) -> None:
+        """While two routes overlap here, these slots go to the next one."""
+        self._staged_order(body)
+        if self.gguf is None or self.staged_epoch is None or body.get("epoch") != self.staged_epoch:
+            raise HTTPException(status_code=409, detail="this worker has not staged that ring")
+        slots = body.get("slots")
+        if not isinstance(slots, list) or not all(isinstance(slot, int) and 0 <= slot < self.gate.size for slot in slots):
+            raise HTTPException(status_code=400, detail="slots are this stage's sequence numbers")
+        await asyncio.to_thread(self.gguf.ring_call, "ring_slots", epoch=self.staged_epoch, slots=slots)
+
+    async def ring_unstage(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Gives up the next route's ring, for a change that was called off. The route this
+        stage serves is left as it was.
+        """
+        term = body.get("term")
+        if not isinstance(term, int) or term < self.term:
+            raise HTTPException(status_code=409, detail=f"an order from term {term}, but this worker follows term {self.term}")
+        epoch, closed = body.get("epoch"), False
+        if self.gguf is not None and isinstance(epoch, int) and epoch != self.epoch:
+            closed = bool((await asyncio.to_thread(self.gguf.ring_call, "ring_close_epoch", epoch=epoch)).get("closed"))
+        if epoch == self.staged_epoch:
+            self.staged_epoch = None
+        await self.unlend_slot()
+        return {"closed": closed}
+
+    async def lend_slot(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Takes one slot away from replies, so the next route can be proven on it.
+
+        At the entry of the route being served, which hands out every slot of it: once it holds
+        the slot, nothing of this route runs on that slot anywhere. Given back by the flip, by
+        ``unlend``, or by the time limit if the coordinator that asked is gone.
+        """
+        term, slot = body.get("term"), body.get("slot")
+        if not isinstance(term, int) or term < self.term:
+            raise HTTPException(status_code=409, detail=f"an order from term {term}, but this worker follows term {self.term}")
+        if not isinstance(slot, int) or not 0 <= slot < self.gate.size:
+            raise HTTPException(status_code=400, detail="that is not one of this stage's slots")
+        if self.lent_slot == slot:
+            return {"slot": slot}
+        if self.lent_slot is not None:
+            raise HTTPException(status_code=409, detail=f"slot {self.lent_slot} is already lent")
+        seconds = min(float(body.get("seconds", LEND_LIMIT_SECONDS)), LEND_LIMIT_SECONDS)
+        if not await self.gate.take(slot, seconds):
+            raise HTTPException(status_code=409, detail=f"slot {slot} did not come free in {seconds:.0f} s")
+        if self.lent_slot is not None:  # another lend won the race while this one waited
+            await self.gate.release(slot)
+            raise HTTPException(status_code=409, detail=f"slot {self.lent_slot} is already lent")
+        self.lent_slot = slot
+        loop = asyncio.get_running_loop()
+        self.lend_timer = loop.call_later(LEND_LIMIT_SECONDS, lambda: loop.create_task(self.unlend_slot()))
+        return {"slot": slot}
+
+    async def unlend_slot(self) -> None:
+        slot, self.lent_slot = self.lent_slot, None
+        if self.lend_timer is not None:
+            self.lend_timer.cancel()
+            self.lend_timer = None
+        if slot is not None:
+            await self.gate.release(slot)
+
+    async def ring_warm(self, body: dict[str, Any]) -> dict[str, Any]:
+        """At the next route's entry: one pass of real rows over every link of that route,
+        exit to entry included, on a slot no reply holds. It proves the links carry data and
+        pays each stage's first use before any reply does.
+        """
+        term, epoch, slot, tokens = body.get("term"), body.get("epoch"), body.get("slot"), body.get("tokens")
+        if not isinstance(term, int) or term < self.term:
+            raise HTTPException(status_code=409, detail=f"an order from term {term}, but this worker follows term {self.term}")
+        if epoch not in (self.staged_epoch, self.ring_epoch) or self.ring_client is None or not self.ring_client.alive:
+            raise HTTPException(status_code=409, detail="this worker has no ring for that route")
+        if not isinstance(slot, int) or not 0 <= slot < self.gate.size:
+            raise HTTPException(status_code=400, detail="that is not one of this stage's slots")
+        if not isinstance(tokens, list) or not tokens or not all(isinstance(token, int) and token >= 0 for token in tokens):
+            raise HTTPException(status_code=400, detail="a warm pass needs tokens")
+        client, began = self.ring_client, time.perf_counter()
+        sampling = {"temperature": 0.0, "top_p": 1.0, "top_k": 0, "seed": None}
+        try:
+            answer = await client.run(
+                pass_seconds(len(tokens), int(body.get("stages", 1))),
+                epoch=epoch, slot=slot, position=0, rollback_to=0, tokens=tokens, guesses=[], verify=False, **sampling,
+            )  # fmt: skip
+        except EngineRefusal as refused:
+            raise HTTPException(status_code=502, detail=f"the warm pass was refused at stage {refused.stage}: {refused.message}") from refused
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(status_code=504, detail="the warm pass did not come back") from exc
+        finally:
+            await client.settled(slot, SETTLE_LOOK_SECONDS)
+        return {"ms": round((time.perf_counter() - began) * 1000, 2), "token": answer[0]}
+
+    async def spare_loop(self) -> None:
+        """Keeps one primed stage process ready, started only once the live stage is idle.
+
+        The spare is what a stage that changes, or a stage process that died, loads into. Its
+        start stalled a live stage in the prototypes, so it waits for a gap with no passes.
+        """
+        if os.getenv("ISHARDED_SPARE", "1") == "0":
+            return
+        seen: tuple[Any, ...] | None = None
+        quiet_since = time.monotonic()
+        while True:
+            await asyncio.sleep(SPARE_LOOK_SECONDS)
+            stage = self.gguf
+            if stage is None or SPARE.ready():
+                seen = None
+                continue
+            stats = await asyncio.to_thread(stage.ring_stats)
+            mark = None if stats is None else (self.inference_calls, stats.get("passes"), stats.get("answers"))
+            if mark is None or mark != seen:
+                seen, quiet_since = mark, time.monotonic()
+                continue
+            if time.monotonic() - quiet_since >= SPARE_IDLE_SECONDS:
+                folder, extra = stage.library_paths()
+                await asyncio.to_thread(SPARE.prime, folder, extra)
+                seen = None
 
     def ring_go(self, body: dict[str, Any]) -> None:
         self._ring_order(body)
@@ -2359,6 +2587,7 @@ async def lifespan(_: FastAPI):
     await asyncio.to_thread(source_commit)
     runtime.setup()
     runtime.registration_task = asyncio.create_task(runtime.registration_loop())
+    runtime.spare_task = asyncio.create_task(runtime.spare_loop())
     try:
         yield
     finally:
@@ -2467,6 +2696,9 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
         "hardware": runtime.hardware.model_dump() if runtime.hardware else None,
         "sessions": len(runtime.caches),
         "roles": sorted(runtime.roles),
+        # This worker can serve two routes at once for a route change. See ISHARDED_STAGED.
+        "staged": 1,
+        "spare": SPARE.report(),
         "memory_store": runtime.memory_store.stats(),
         "memory_pools": runtime.pool_status(),
         "materialize": {"done": runtime.materialize_done, "total": runtime.materialize_total},
@@ -2781,6 +3013,7 @@ async def configure(body: ConfigureRequest, authorization: str | None = Header(d
             raise HTTPException(status_code=400, detail=runtime.last_error) from exc
     return {
         "status": "configured",
+        "flip_quiet": runtime.flip_quiet if body.staged else None,
         "epoch": runtime.epoch,
         "assignment": body.assignment.model_dump(),
         "cache_url": runtime.cache_url,
@@ -3375,6 +3608,53 @@ async def route_exact(body: dict[str, Any], authorization: str | None = Header(d
         raise epoch_error(runtime.epoch)
     runtime.route_verifies = epoch if body.get("verify_exact") is True else None
     return {"status": "noted"}
+
+
+@app.post("/internal/ring/stage")
+async def ring_stage(body: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    verify_token(authorization)
+    return await runtime.ring_stage(body)
+
+
+@app.post("/internal/ring/stage/connect")
+async def ring_stage_connect(body: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    verify_token(authorization)
+    return await runtime.ring_connect_staged(body)
+
+
+@app.post("/internal/ring/slots")
+async def ring_slots(body: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, str]:
+    verify_token(authorization)
+    await runtime.ring_slots(body)
+    return {"status": "given"}
+
+
+@app.post("/internal/ring/unstage")
+async def ring_unstage(body: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    verify_token(authorization)
+    return await runtime.ring_unstage(body)
+
+
+@app.post("/internal/ring/lend")
+async def ring_lend(body: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    verify_token(authorization)
+    return await runtime.lend_slot(body)
+
+
+@app.post("/internal/ring/unlend")
+async def ring_unlend(body: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, str]:
+    verify_token(authorization)
+    term = body.get("term")
+    if not isinstance(term, int) or term < runtime.term:
+        raise HTTPException(status_code=409, detail=f"an order from term {term}, but this worker follows term {runtime.term}")
+    await runtime.unlend_slot()
+    return {"status": "returned"}
+
+
+@app.post("/internal/ring/warm")
+async def ring_warm(body: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    verify_token(authorization)
+    return await runtime.ring_warm(body)
 
 
 @app.post("/internal/forward")

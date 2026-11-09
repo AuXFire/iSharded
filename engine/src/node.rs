@@ -231,8 +231,14 @@ pub struct Stats {
     pub next_up: bool,
     pub closing_up: bool,
     pub epoch: Option<u64>,
+    /// The next route, opened beside the current one and not yet promoted.
+    pub staged_epoch: Option<u64>,
+    /// Former routes still finishing what they took.
+    pub retiring_epochs: Vec<u64>,
     /// "idle", "dialling", "up", or why it failed.
     pub connect: String,
+    /// The same for the staged ring.
+    pub staged_connect: String,
 }
 
 #[derive(Default)]
@@ -260,6 +266,10 @@ struct Counters {
 struct Job {
     pass: Pass,
     arrived: Instant,
+    /// Why this pass is refused, when it is. A refusal waits its turn behind its slot's older
+    /// passes, so it cannot reach the entry, free the slot there and let a new reply begin
+    /// while an older pass of the same slot is still to run here.
+    refused: Option<String>,
 }
 
 /// What a stage knows of the replies on one slot. Generations are random, so the only way to
@@ -384,6 +394,11 @@ struct Ring {
     next_door: Mutex<Option<Address>>,
     next_dialling: AtomicBool,
     shut: AtomicBool,
+    /// The most passes one of this ring's trips may hold, from its plan.
+    merge_most: usize,
+    /// At the entry: (slot, id) of passes sent on and not yet answered or refused, so a
+    /// retiring ring knows when nothing of it is still out on the route.
+    in_flight: Mutex<HashSet<(u32, u64)>>,
 }
 
 impl Ring {
@@ -423,12 +438,91 @@ impl Ring {
     }
 }
 
+/// The rings a node holds. `current` carries replies; `staged` is the next route, opened
+/// beside it so its links are up and proven before the flip; `retiring` are former current
+/// rings, refusing new passes and finishing what they already took.
+///
+/// While more than one epoch is held, every slot has one owner, and a pass whose epoch is not
+/// its slot's owner is refused, so two replies never share a slot of one KV. That holds from
+/// `stage` through `promote` until the retiring ring has drained or is closed: the old
+/// route's replies keep their slots while their last passes are still out on the route.
+#[derive(Default)]
+struct Rings {
+    current: Option<Arc<Ring>>,
+    staged: Option<Arc<Ring>>,
+    retiring: Vec<Arc<Ring>>,
+    /// Slots given to an epoch while epochs overlap.
+    owners: HashMap<u32, u64>,
+    /// Who owns a slot not in `owners`: the epoch that was current when the overlap began.
+    default_owner: Option<u64>,
+}
+
+impl Rings {
+    /// A ring that takes new passes for this epoch.
+    fn taking(&self, epoch: u64) -> Option<&Arc<Ring>> {
+        [&self.current, &self.staged].into_iter().flatten().find(|ring| ring.epoch == epoch)
+    }
+
+    /// Any ring with this epoch, a retiring one included, for what it already took.
+    fn any(&self, epoch: u64) -> Option<&Arc<Ring>> {
+        self.taking(epoch).or_else(|| self.retiring.iter().find(|ring| ring.epoch == epoch))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.current.is_none() && self.staged.is_none()
+    }
+
+    /// Whether more than one epoch is held, so slots have owners.
+    fn overlapping(&self) -> bool {
+        self.staged.is_some() || !self.retiring.is_empty()
+    }
+
+    /// The epoch a slot belongs to while epochs overlap.
+    fn owner(&self, slot: u32) -> Option<u64> {
+        self.owners.get(&slot).copied().or(self.default_owner).or(self.current.as_ref().map(|ring| ring.epoch))
+    }
+
+    /// After a ring leaves: slots of an epoch no longer held go back to the current one, and
+    /// with one epoch left nothing has an owner any more.
+    fn settle(&mut self) {
+        if !self.overlapping() {
+            self.owners.clear();
+            self.default_owner = None;
+            return;
+        }
+        let held: Vec<u64> = [&self.current, &self.staged].into_iter().flatten().chain(&self.retiring).map(|ring| ring.epoch).collect();
+        self.owners.retain(|_, epoch| held.contains(epoch));
+        if !self.default_owner.is_some_and(|epoch| held.contains(&epoch)) {
+            self.default_owner = self.current.as_ref().map(|ring| ring.epoch);
+        }
+    }
+
+    /// Takes a ring of this epoch out, wherever it is held.
+    fn remove(&mut self, epoch: u64) -> Option<Arc<Ring>> {
+        let ring = if self.current.as_ref().is_some_and(|ring| ring.epoch == epoch) {
+            self.current.take()
+        } else if self.staged.as_ref().is_some_and(|ring| ring.epoch == epoch) {
+            self.staged.take()
+        } else {
+            let at = self.retiring.iter().position(|ring| ring.epoch == epoch)?;
+            Some(self.retiring.remove(at))
+        };
+        self.settle();
+        ring
+    }
+}
+
+/// No batch is running.
+const IDLE: u64 = u64::MAX;
+
 struct Inner {
     identity: Identity,
     /// Whoever holds this may touch the model. Python takes it for what it does rarely.
     gate: RawMutex,
     compute: Mutex<Option<Box<dyn Compute>>>,
-    ring: RwLock<Option<Arc<Ring>>>,
+    rings: RwLock<Rings>,
+    /// The epoch of the batch the compute thread is running, or `IDLE`. Set inside `jobs`.
+    busy: AtomicU64,
     local: Mutex<Option<Arc<Link>>>,
     local_key: [u8; 32],
     jobs: Mutex<VecDeque<Job>>,
@@ -446,6 +540,7 @@ struct Inner {
     listening: Mutex<Option<Listening>>,
     accepting: Mutex<Vec<thread::JoinHandle<()>>>,
     connect: Mutex<String>,
+    staged_connect: Mutex<String>,
 }
 
 pub struct Node {
@@ -458,7 +553,8 @@ impl Node {
             identity: Identity::generate()?,
             gate: RawMutex::INIT,
             compute: Mutex::new(None),
-            ring: RwLock::new(None),
+            rings: RwLock::default(),
+            busy: AtomicU64::new(IDLE),
             local: Mutex::new(None),
             local_key: link::random_bytes(),
             jobs: Mutex::new(VecDeque::new()),
@@ -472,6 +568,7 @@ impl Node {
             listening: Mutex::new(None),
             accepting: Mutex::new(Vec::new()),
             connect: Mutex::new("idle".to_string()),
+            staged_connect: Mutex::new("idle".to_string()),
         });
         let worker = inner.clone();
         thread::Builder::new().name("isharded-compute".into()).spawn(move || compute_loop(&worker)).map_err(|error| error.to_string())?;
@@ -497,7 +594,8 @@ impl Node {
         line.begin(generation);
         line.newest_pass = 0;
         drop(lines);
-        jobs.retain(|job| job.pass.slot != slot);
+        // A refusal still owes its answer, whatever reply now has the slot.
+        jobs.retain(|job| job.pass.slot != slot || job.refused.is_some());
         self.inner.counters.dropped.fetch_add((before - jobs.len()) as u64, Ordering::Relaxed);
     }
 
@@ -538,59 +636,146 @@ impl Node {
         Ok(text)
     }
 
-    /// Takes a place in a route. Anything from an earlier route ends here.
+    /// Takes a place in a route. Anything from an earlier route ends here, a staged one too.
     pub fn open(&self, plan: Plan) -> Result<(), String> {
-        if !plan.keys.fit(plan.index, plan.count) {
-            return Err("these keys do not fit this place in the route".to_string());
-        }
-        self.inner.merge_most.store(plan.trip_most(), Ordering::Release);
-        let ring = Arc::new(Ring {
-            epoch: plan.epoch,
-            index: plan.index,
-            count: plan.count,
-            keys: plan.keys,
-            ack_timeout: Duration::from_millis(plan.ack_timeout_ms),
-            silence_timeout: Duration::from_millis(plan.silence_timeout_ms),
-            next: Mutex::new(None),
-            closing: Mutex::new(None),
-            back: Mutex::new(None),
-            entry_closing: Mutex::new(None),
-            answers: Mutex::new(VecDeque::new()),
-            sent: Mutex::new(VecDeque::new()),
-            forwarding: Mutex::new(()),
-            next_door: Mutex::new(None),
-            next_dialling: AtomicBool::new(false),
-            shut: AtomicBool::new(false),
-        });
-        let mut current = self.inner.ring.write();
+        let ring = new_ring(plan)?;
+        self.inner.merge_most.store(ring.merge_most, Ordering::Release);
+        let mut rings = self.inner.rings.write();
         // With the route held, so a batch of the old one that ends now is not counted here.
         self.inner.counters.compute_us_total.store(0, Ordering::Relaxed);
         self.inner.counters.batches_total.store(0, Ordering::Relaxed);
-        if let Some(old) = current.replace(ring) {
+        let old = std::mem::replace(&mut *rings, Rings { current: Some(ring), ..Rings::default() });
+        drop(rings);
+        shut_all(old);
+        Ok(())
+    }
+
+    /// Opens the next route's ring beside the current one, which goes on carrying replies.
+    /// Its links are dialled with `connect_staged`, under its own epoch's keys.
+    pub fn stage(&self, plan: Plan) -> Result<(), String> {
+        let ring = new_ring(plan)?;
+        let mut rings = self.inner.rings.write();
+        let restaging = rings.staged.as_ref().is_some_and(|staged| staged.epoch == ring.epoch);
+        if rings.any(ring.epoch).is_some() && !restaging {
+            return Err(format!("route {} is already held here", ring.epoch));
+        }
+        if rings.default_owner.is_none() {
+            rings.default_owner = rings.current.as_ref().map(|ring| ring.epoch);
+        }
+        *self.inner.staged_connect.lock() = "idle".to_string();
+        let old = rings.staged.replace(ring);
+        drop(rings);
+        if let Some(old) = old {
             old.shut();
         }
         Ok(())
     }
 
+    /// Makes the staged ring the current one. The old current ring takes no new passes and is
+    /// shut once what it already took has finished and been acknowledged, or after its limits.
+    pub fn promote(&self, epoch: u64) -> Result<(), String> {
+        let mut rings = self.inner.rings.write();
+        if !rings.staged.as_ref().is_some_and(|ring| ring.epoch == epoch) {
+            return Err(format!("route {epoch} is not staged here"));
+        }
+        let new = rings.staged.take();
+        let old = std::mem::replace(&mut rings.current, new);
+        if let Some(current) = &rings.current {
+            self.inner.merge_most.store(current.merge_most, Ordering::Release);
+        }
+        // The totals are the current route's, so they start again with it.
+        self.inner.counters.compute_us_total.store(0, Ordering::Relaxed);
+        self.inner.counters.batches_total.store(0, Ordering::Relaxed);
+        // Its links were dialled as the staged ring's, so their word goes with it.
+        let dialled = std::mem::replace(&mut *self.inner.staged_connect.lock(), "idle".to_string());
+        *self.inner.connect.lock() = dialled;
+        // Slots keep their owners: the old route's replies hold theirs until it has drained.
+        if let Some(old) = &old {
+            rings.retiring.push(old.clone());
+        }
+        rings.settle();
+        drop(rings);
+        if let Some(old) = old {
+            let inner = self.inner.clone();
+            let ring = old.clone();
+            if spawn("isharded-retire", move || retire(&inner, &ring)).is_err() {
+                // Nothing will wait for it, so it ends now.
+                take_retiring(&self.inner, &old);
+                old.shut();
+            }
+        }
+        Ok(())
+    }
+
+    /// While two epochs overlap: these slots now belong to this epoch. A pass on one of them
+    /// for the other epoch is refused, so two replies never share a slot of one KV.
+    /// With one epoch held there is nothing to give, and nothing is kept.
+    pub fn give_slots(&self, epoch: u64, slots: &[u32]) -> Result<(), String> {
+        let mut rings = self.inner.rings.write();
+        if rings.taking(epoch).is_none() {
+            return Err(format!("route {epoch} is not held here"));
+        }
+        if rings.overlapping() {
+            for slot in slots {
+                rings.owners.insert(*slot, epoch);
+            }
+        }
+        Ok(())
+    }
+
+    /// Closes one epoch's ring, staged, current or retiring, and leaves any other alone: a
+    /// staged route that is given up, or a retiring one that should not wait any longer.
+    pub fn close_epoch(&self, epoch: u64) -> bool {
+        let ring = self.inner.rings.write().remove(epoch);
+        let closed = ring.is_some();
+        if let Some(ring) = ring {
+            ring.shut();
+        }
+        closed
+    }
+
     /// Dials the next stage and, at the last stage, the entry. The closing link may fail.
     pub fn connect(&self, links: Links) -> Result<bool, String> {
-        connect(&self.inner, &links)
+        let ring = self.inner.rings.read().current.clone().ok_or("no route has been opened")?;
+        connect(&self.inner, &ring, &links)
+    }
+
+    /// The same for the staged ring. The current ring's links are left alone.
+    pub fn connect_staged(&self, links: Links) -> Result<bool, String> {
+        let ring = self.inner.rings.read().staged.clone().ok_or("no route has been staged")?;
+        connect(&self.inner, &ring, &links)
     }
 
     /// The same, off this thread, so the stage goes on serving meanwhile.
     pub fn connect_in_background(&self, links: Links) {
-        *self.inner.connect.lock() = "dialling".to_string();
-        let inner = self.inner.clone();
-        let spawned = thread::Builder::new().name("isharded-dial".into()).spawn(move || {
-            let outcome = connect(&inner, &links);
-            *inner.connect.lock() = match outcome {
-                Ok(_) => "up".to_string(),
-                Err(error) => error,
-            };
-        });
-        if spawned.is_err() {
-            *self.inner.connect.lock() = "could not start a thread".to_string();
+        dial_in_background(&self.inner, links, false);
+    }
+
+    /// The same for the staged ring; `staged_connect` in the stats says how it went.
+    pub fn connect_staged_in_background(&self, links: Links) {
+        dial_in_background(&self.inner, links, true);
+    }
+
+    /// The flip at a stage that serves both routes: every slot goes to the staged route, which
+    /// becomes the current one, and the old one retires. Returns once nothing of the old
+    /// route is queued or running here, or after `wait`, saying which. From then on a pass of
+    /// the old route is refused here before it touches a slot, so a reply of the new route can
+    /// begin on any slot.
+    pub fn flip(&self, epoch: u64, slots: &[u32], wait: Duration) -> Result<bool, String> {
+        let old = self.inner.rings.read().current.as_ref().map(|ring| ring.epoch);
+        self.give_slots(epoch, slots)?;
+        self.promote(epoch)?;
+        let Some(old) = old else {
+            return Ok(true);
+        };
+        let deadline = Instant::now() + wait;
+        while !quiet(&self.inner, old) {
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            thread::sleep(Duration::from_millis(1));
         }
+        Ok(true)
     }
 
     /// Tells the route that nothing here will finish. Id zero covers every pass at once, so
@@ -603,7 +788,8 @@ impl Node {
     pub fn refuser(&self) -> impl FnOnce(String) + Send + 'static {
         let inner = self.inner.clone();
         move |message| {
-            if let Some(ring) = inner.ring.read().clone() {
+            let ring = inner.rings.read().current.clone();
+            if let Some(ring) = ring {
                 let nack = Nack { id: 0, generation: 0, epoch: ring.epoch, refusal: Refusal::FailedStage, stage: ring.index, message };
                 inner.counters.refusals.fetch_add(1, Ordering::Relaxed);
                 let frame = nack.encode();
@@ -628,15 +814,20 @@ impl Node {
     }
 
     pub fn close_ring(&self) {
-        if let Some(old) = self.inner.ring.write().take() {
-            old.shut();
-        }
+        let old = std::mem::take(&mut *self.inner.rings.write());
+        shut_all(old);
     }
 
     pub fn stats(&self) -> Stats {
         let counters = &self.inner.counters;
-        let ring = self.inner.ring.read().clone();
+        let (ring, staged, retiring) = {
+            let rings = self.inner.rings.read();
+            (rings.current.clone(), rings.staged.as_ref().map(|ring| ring.epoch), rings.retiring.iter().map(|ring| ring.epoch).collect())
+        };
         Stats {
+            staged_epoch: staged,
+            retiring_epochs: retiring,
+            staged_connect: self.inner.staged_connect.lock().clone(),
             passes: counters.passes.load(Ordering::Relaxed),
             rows: counters.rows.load(Ordering::Relaxed),
             merged_passes: counters.merged_passes.load(Ordering::Relaxed),
@@ -690,20 +881,109 @@ impl Drop for Node {
     }
 }
 
+fn new_ring(plan: Plan) -> Result<Arc<Ring>, String> {
+    if !plan.keys.fit(plan.index, plan.count) {
+        return Err("these keys do not fit this place in the route".to_string());
+    }
+    let merge_most = plan.trip_most();
+    Ok(Arc::new(Ring {
+        epoch: plan.epoch,
+        index: plan.index,
+        count: plan.count,
+        keys: plan.keys,
+        ack_timeout: Duration::from_millis(plan.ack_timeout_ms),
+        silence_timeout: Duration::from_millis(plan.silence_timeout_ms),
+        next: Mutex::new(None),
+        closing: Mutex::new(None),
+        back: Mutex::new(None),
+        entry_closing: Mutex::new(None),
+        answers: Mutex::new(VecDeque::new()),
+        sent: Mutex::new(VecDeque::new()),
+        forwarding: Mutex::new(()),
+        next_door: Mutex::new(None),
+        next_dialling: AtomicBool::new(false),
+        shut: AtomicBool::new(false),
+        merge_most,
+        in_flight: Mutex::default(),
+    }))
+}
+
+fn shut_all(rings: Rings) {
+    for ring in [rings.current, rings.staged].into_iter().flatten().chain(rings.retiring) {
+        ring.shut();
+    }
+}
+
+fn dial_in_background(inner: &Arc<Inner>, links: Links, staged: bool) {
+    let state = if staged { &inner.staged_connect } else { &inner.connect };
+    *state.lock() = "dialling".to_string();
+    let ring = {
+        let rings = inner.rings.read();
+        if staged { rings.staged.clone() } else { rings.current.clone() }
+    };
+    let worker = inner.clone();
+    let spawned = thread::Builder::new().name("isharded-dial".into()).spawn(move || {
+        let what = if staged { "no route has been staged" } else { "no route has been opened" };
+        let outcome = ring.ok_or_else(|| what.to_string()).and_then(|ring| connect(&worker, &ring, &links));
+        let state = if staged { &worker.staged_connect } else { &worker.connect };
+        *state.lock() = match outcome {
+            Ok(_) => "up".to_string(),
+            Err(error) => error,
+        };
+    });
+    if spawned.is_err() {
+        *state.lock() = "could not start a thread".to_string();
+    }
+}
+
+/// Whether nothing of this epoch is queued or running here.
+fn quiet(inner: &Inner, epoch: u64) -> bool {
+    let jobs = inner.jobs.lock();
+    inner.busy.load(Ordering::Acquire) != epoch && !jobs.iter().any(|job| job.pass.epoch == epoch)
+}
+
+fn take_retiring(inner: &Inner, ring: &Arc<Ring>) {
+    let mut rings = inner.rings.write();
+    // By pointer: a ring closed and opened again under the same epoch is not this one.
+    if let Some(at) = rings.retiring.iter().position(|held| Arc::ptr_eq(held, ring)) {
+        rings.retiring.remove(at);
+        rings.settle();
+    }
+}
+
+/// Whether a retiring ring has nothing left: no job of its epoch queued or running, nothing
+/// waiting for the next stage's acknowledgement, and no answer waiting for the entry's.
+fn drained(inner: &Inner, ring: &Ring) -> bool {
+    let idle = quiet(inner, ring.epoch);
+    // The entry waits for every answer; a later stage also waits for the stage before it to
+    // let go of the hop, as only that stage knows nothing more of this epoch is coming.
+    let route_quiet = if ring.is_entry() { ring.in_flight.lock().is_empty() } else { ring.back.lock().is_none() };
+    idle && route_quiet && ring.sent.lock().is_empty() && ring.answers.lock().is_empty()
+}
+
+/// Waits for an old current ring to finish what it took, then shuts it.
+fn retire(inner: &Inner, ring: &Arc<Ring>) {
+    let deadline = Instant::now() + ring.ack_timeout + ring.silence_timeout;
+    while !ring.is_shut() && !drained(inner, ring) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    take_retiring(inner, ring);
+    ring.shut();
+}
+
 fn spawn(name: &str, work: impl FnOnce() + Send + 'static) -> io::Result<thread::JoinHandle<()>> {
     #[cfg(test)]
     tests::spend_a_spawn()?;
     thread::Builder::new().name(name.into()).spawn(work)
 }
 
-fn connect(inner: &Arc<Inner>, links: &Links) -> Result<bool, String> {
-    let ring = inner.ring.read().clone().ok_or("no route has been opened")?;
+fn connect(inner: &Arc<Inner>, ring: &Arc<Ring>, links: &Links) -> Result<bool, String> {
     if let Some(next) = &links.next {
         let key = ring.keys.next.as_deref().ok_or("this stage has no key for a next stage")?;
-        let link = dial_with_retry(next, key, &ring, Role::Hop, Duration::from_millis(links.timeout_ms)).map_err(|error| error.to_string())?;
+        let link = dial_with_retry(next, key, ring, Role::Hop, Duration::from_millis(links.timeout_ms)).map_err(|error| error.to_string())?;
         let peer = Peer::new(link, ring.index + 1, false);
         *ring.next.lock() = Some(peer.clone());
-        start_peer(inner, &ring, &peer);
+        start_peer(inner, ring, &peer);
         if peer.lost.load(Ordering::Acquire) {
             return Err("the link to the next stage could not start".to_string());
         }
@@ -713,8 +993,8 @@ fn connect(inner: &Arc<Inner>, links: &Links) -> Result<bool, String> {
     let mut closing = false;
     // Without the closing key there is no closing link, and answers walk back.
     if let (Some(entry), Some(key)) = (&links.entry, &ring.keys.closing) {
-        if let Ok(link) = dial_with_retry(entry, key, &ring, Role::Closing, Duration::from_millis(links.timeout_ms)) {
-            closing = start_closing(inner, &ring, link.clone());
+        if let Ok(link) = dial_with_retry(entry, key, ring, Role::Closing, Duration::from_millis(links.timeout_ms)) {
+            closing = start_closing(inner, ring, link.clone());
             if closing {
                 warm(&link);
             }
@@ -817,7 +1097,8 @@ fn admit(inner: &Arc<Inner>, socket: TcpStream, peer: IpAddr, encrypted: bool) {
 /// The key a link someone dials here must prove. Each link has its own, so holding one opens
 /// no other: only the stage before dials in as a hop, and only the last stage closes the ring.
 fn key_for(inner: &Inner, role: Role, epoch: u64, encrypted: bool) -> Option<Vec<u8>> {
-    let ring = || inner.ring.read().clone().filter(|ring| ring.epoch == epoch);
+    // Each epoch's ring has its own keys, so a link proves which ring it belongs to.
+    let ring = || inner.rings.read().any(epoch).cloned();
     match (role, encrypted) {
         (Role::Local, false) => Some(inner.local_key.to_vec()),
         (Role::Hop, true) => ring()?.keys.back.clone(),
@@ -839,12 +1120,12 @@ fn serve(inner: &Arc<Inner>, socket: TcpStream, peer: IpAddr, encrypted: bool) {
             if let Some(old) = inner.local.lock().replace(link.clone()) {
                 old.close();
             }
-            serve_passes(inner, &link, frames, false);
+            serve_passes(inner, None, &link, frames);
         }
         Role::Hop => {
             if let Some(ring) = attach(inner, &hello, |ring| ring.back.lock().replace(link.clone())) {
                 if keep_to_limits(&link, &ring) {
-                    serve_passes(inner, &link, frames, true);
+                    serve_passes(inner, Some(&ring), &link, frames);
                 }
                 forget(&ring.back, &link);
             }
@@ -862,7 +1143,7 @@ fn serve(inner: &Arc<Inner>, socket: TcpStream, peer: IpAddr, encrypted: bool) {
 }
 
 fn attach(inner: &Inner, hello: &Hello, put: impl Fn(&Ring) -> Option<Arc<Link>>) -> Option<Arc<Ring>> {
-    let ring = inner.ring.read().clone().filter(|ring| ring.epoch == hello.epoch)?;
+    let ring = inner.rings.read().any(hello.epoch).cloned()?;
     if let Some(old) = put(&ring) {
         old.close();
     }
@@ -891,7 +1172,9 @@ fn answer_ping(link: &Link, body: &[u8]) -> bool {
 
 /// Reads passes off a link. Taking one off is what the acknowledgement means, so a stage
 /// busy with a long pass still answers its link and is not taken for dead.
-fn serve_passes(inner: &Inner, link: &Link, mut frames: Frames, acknowledge: bool) {
+/// `ring` is the ring a hop belongs to; the worker's local link has none and is not acknowledged.
+fn serve_passes(inner: &Inner, ring: Option<&Arc<Ring>>, link: &Link, mut frames: Frames) {
+    let acknowledge = ring.is_some();
     while let Ok((kind, body)) = frames.next() {
         match kind {
             Kind::Pass => {
@@ -905,14 +1188,14 @@ fn serve_passes(inner: &Inner, link: &Link, mut frames: Frames, acknowledge: boo
                 if !acknowledge {
                     note_turnaround(inner, &pass, complete);
                 }
-                enqueue(inner, pass);
+                enqueue(inner, pass, ring);
                 average(&inner.counters.enqueue_us, complete.elapsed().as_micros() as u64);
             }
             Kind::Ack if acknowledge => {
-                let Ok(ack) = Ack::decode(body) else {
+                let (Ok(ack), Some(ring)) = (Ack::decode(body), ring) else {
                     return;
                 };
-                pass_on_acknowledgement(inner, ack);
+                pass_on_acknowledgement(ring, ack);
             }
             Kind::Ping if answer_ping(link, body) => {}
             Kind::Pad => {}
@@ -943,10 +1226,8 @@ impl Inner {
 }
 
 /// An answer that walked back has its acknowledgement walk forward, the way passes go.
-fn pass_on_acknowledgement(inner: &Inner, ack: Ack) {
-    let Some(ring) = inner.ring.read().clone() else {
-        return;
-    };
+/// An acknowledgement carries no epoch, so it goes by the ring of the link it came on.
+fn pass_on_acknowledgement(ring: &Ring, ack: Ack) {
     if ring.is_last() {
         ring.answer_acknowledged(ack.id);
     } else if let Some(peer) = ring.next.lock().clone() {
@@ -959,7 +1240,14 @@ fn pass_on_acknowledgement(inner: &Inner, ack: Ack) {
 /// so it goes now and the rewind does not sit behind it. Nobody expects an answer to those:
 /// passes run in order, so once the newest pass of a reply is back, nothing of it is left.
 /// A new generation says the same of all its slot's queue. The entry gave up on that reply.
-fn enqueue(inner: &Inner, pass: Pass) {
+/// `via` is the ring whose hop carried the pass; none for the worker's local link.
+fn enqueue(inner: &Inner, pass: Pass, via: Option<&Arc<Ring>>) {
+    if let Err(message) = admits(inner, &pass, via) {
+        // The slot's line is left alone: this pass may not touch another route's replies.
+        inner.jobs.lock().push_back(Job { pass, arrived: Instant::now(), refused: Some(message) });
+        inner.ready.notify_one();
+        return;
+    }
     let mut jobs = inner.jobs.lock();
     let before = jobs.len();
     let mut lines = inner.lines.lock();
@@ -970,17 +1258,65 @@ fn enqueue(inner: &Inner, pass: Pass) {
     }
     if pass.generation != line.generation {
         line.begin(pass.generation);
-        jobs.retain(|job| job.pass.slot != pass.slot);
+        // A refusal still owes its answer, whatever reply now has the slot.
+        jobs.retain(|job| job.pass.slot != pass.slot || job.refused.is_some());
     }
     line.newest_pass = pass.id;
     drop(lines);
     if let Some(keep) = pass.rollback_to {
-        jobs.retain(|job| job.pass.slot != pass.slot || job.pass.epoch != pass.epoch || job.pass.position < keep);
+        jobs.retain(|job| job.pass.slot != pass.slot || job.pass.epoch != pass.epoch || job.pass.position < keep || job.refused.is_some());
     }
     inner.counters.dropped.fetch_add((before - jobs.len()) as u64, Ordering::Relaxed);
-    jobs.push_back(Job { pass, arrived: Instant::now() });
+    jobs.push_back(Job { pass, arrived: Instant::now(), refused: None });
     drop(jobs);
     inner.ready.notify_one();
+}
+
+/// Whether a pass may join the queue: its epoch is one this node takes passes for, and while two
+/// epochs overlap, its slot belongs to that epoch. Checked before the slot's line is touched,
+/// so a pass that is refused cannot clear another epoch's queue on a shared slot.
+///
+/// A hop carries only its own ring's passes. A retiring ring still takes passes that arrive on
+/// its own hops: they were in flight when this stage was promoted, and only the entry decides
+/// which epoch new passes go to.
+fn admits(inner: &Inner, pass: &Pass, via: Option<&Arc<Ring>>) -> Result<(), String> {
+    if let Some(via) = via {
+        if via.epoch != pass.epoch {
+            return Err(format!("a pass for route {} came on a link of route {}", pass.epoch, via.epoch));
+        }
+    }
+    let rings = inner.rings.read();
+    if rings.is_empty() {
+        return Ok(()); // the compute thread says there is no route, as before
+    }
+    let retiring = via.is_some_and(|via| !via.is_shut() && rings.retiring.iter().any(|ring| Arc::ptr_eq(ring, via)));
+    if !retiring && rings.taking(pass.epoch).is_none() {
+        let held = rings.current.as_ref().map_or("no route".to_string(), |ring| format!("route {}", ring.epoch));
+        return Err(format!("this stage is on {held}"));
+    }
+    if rings.overlapping() {
+        let owner = rings.owner(pass.slot);
+        if owner != Some(pass.epoch) {
+            return Err(format!("slot {} belongs to route {}", pass.slot, owner.unwrap_or_default()));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a pass before it is queued, along the ring it came by, or the current one.
+fn refuse_early(inner: &Inner, pass: &Pass, message: String) {
+    let ring = {
+        let rings = inner.rings.read();
+        rings.any(pass.epoch).or(rings.current.as_ref()).cloned()
+    };
+    match ring {
+        Some(ring) => refuse(inner, &ring, pass, Refusal::Epoch, message),
+        None => {
+            let nack = Nack { id: pass.id, generation: pass.generation, epoch: pass.epoch, refusal: Refusal::Epoch, stage: 0, message };
+            inner.counters.refusals.fetch_add(1, Ordering::Relaxed);
+            to_local(inner, &nack.encode());
+        }
+    }
 }
 
 /// At the entry: what the last stage sends straight back.
@@ -1013,6 +1349,10 @@ fn receive_answer(inner: &Inner, ring: &Ring, link: &Link, frame: &[u8]) {
         return;
     }
     let _ = link.beat(&Ack { id: answer.id }.encode());
+    // Passes of a slot run in order everywhere, and a client numbers them in order, so an
+    // answer also settles every older pass of its slot: one a later stage dropped for a rewind
+    // or a new reply never answers, and must not hold a retiring ring open or stay here.
+    ring.in_flight.lock().retain(|&(slot, id)| slot != answer.slot || id > answer.id);
     let fresh = inner.lines.lock().get_mut(&answer.slot).is_some_and(|line| line.takes(&answer));
     let counter = if fresh { &inner.counters.answers } else { &inner.counters.dropped };
     counter.fetch_add(1, Ordering::Relaxed);
@@ -1106,6 +1446,16 @@ fn read_peer(inner: &Inner, ring: &Ring, peer: &Peer) {
             }
             Kind::Result if ring.is_entry() => receive_answer(inner, ring, &peer.link, frames.whole()),
             // Coming back along the route, towards the entry.
+            Kind::Nack if ring.is_entry() => {
+                if let Ok(nack) = Nack::decode(body) {
+                    let mut in_flight = ring.in_flight.lock();
+                    match nack.id {
+                        0 => in_flight.clear(),
+                        id => in_flight.retain(|(_, sent)| *sent != id),
+                    }
+                }
+                send_back(inner, ring, frames.whole());
+            }
             Kind::Result | Kind::Nack => send_back(inner, ring, frames.whole()),
             Kind::Pad => {}
             _ => return,
@@ -1220,23 +1570,61 @@ fn restamped(list: &Mutex<VecDeque<Held>>, inner: &Inner) -> Vec<Vec<u8>> {
 }
 
 fn compute_loop(inner: &Arc<Inner>) {
-    while let Some(batch) = next_batch(inner) {
+    let mut last = None;
+    while let Some(batch) = next_batch(inner, last) {
+        last = Some(batch[0].pass.epoch);
         handle(inner, batch);
+        inner.busy.store(IDLE, Ordering::Release);
     }
 }
 
-/// Waits for work. Nothing comes back once the node is stopping.
-fn next_batch(inner: &Inner) -> Option<Vec<Job>> {
+/// Waits for work. Nothing comes back once the node is stopping. Marks the batch's epoch busy
+/// before letting go of the queue, so a retiring ring never looks drained while it runs.
+fn next_batch(inner: &Inner, last: Option<u64>) -> Option<Vec<Job>> {
     let mut jobs = inner.jobs.lock();
     loop {
         if inner.stopping.load(Ordering::Acquire) {
             return None;
         }
-        if let Some(job) = jobs.pop_front() {
-            return Some(take_batch(job, &mut jobs, inner.merge_most.load(Ordering::Acquire)));
+        let at = pick(&jobs, last);
+        if let Some(job) = jobs.remove(at) {
+            let most = trip_most(inner, job.pass.epoch);
+            let batch = take_batch(job, &mut jobs, most);
+            inner.busy.store(batch[0].pass.epoch, Ordering::Release);
+            return Some(batch);
         }
         inner.ready.wait(&mut jobs);
     }
+}
+
+/// The most passes a trip of this epoch may hold: the current ring's from the node, a staged
+/// or retiring ring's from its own plan.
+fn trip_most(inner: &Inner, epoch: u64) -> usize {
+    let rings = inner.rings.read();
+    match rings.any(epoch) {
+        Some(ring) if !rings.current.as_ref().is_some_and(|current| Arc::ptr_eq(current, ring)) => ring.merge_most,
+        _ => inner.merge_most.load(Ordering::Acquire),
+    }
+}
+
+/// Which job goes next. Oldest first, except that when two epochs share the model, the one
+/// that did not run last goes, so a flood on one ring never starves the other. A job whose
+/// slot has an older job queued never jumps it, so a slot's passes keep their order.
+fn pick(jobs: &VecDeque<Job>, last: Option<u64>) -> usize {
+    let Some(first) = jobs.front() else {
+        return 0;
+    };
+    if last != Some(first.pass.epoch) {
+        return 0;
+    }
+    let mut slots = HashSet::new();
+    for (at, job) in jobs.iter().enumerate() {
+        if job.pass.epoch != first.pass.epoch && !slots.contains(&job.pass.slot) {
+            return at;
+        }
+        slots.insert(job.pass.slot);
+    }
+    0
 }
 
 /// A job, and whatever waiting anywhere behind it can share its trip. There is no window to
@@ -1245,7 +1633,7 @@ fn next_batch(inner: &Inner) -> Option<Vec<Job>> {
 /// exact replies no more together than were seen to round as they do alone.
 fn take_batch(first: Job, jobs: &mut VecDeque<Job>, most: usize) -> Vec<Job> {
     let mut batch = vec![first];
-    if most < 2 || !can_merge(&batch[0].pass) {
+    if most < 2 || batch[0].refused.is_some() || !can_merge(&batch[0].pass) {
         return batch;
     }
     let epoch = batch[0].pass.epoch;
@@ -1255,7 +1643,7 @@ fn take_batch(first: Job, jobs: &mut VecDeque<Job>, most: usize) -> Vec<Job> {
     let mut index = 0;
     while index < jobs.len() && batch.len() < most.min(MAX_MERGED) {
         let pass = &jobs[index].pass;
-        if seen.insert(pass.slot) && can_merge(pass) && pass.epoch == epoch {
+        if seen.insert(pass.slot) && can_merge(pass) && pass.epoch == epoch && jobs[index].refused.is_none() {
             batch.extend(jobs.remove(index));
         } else {
             index += 1;
@@ -1270,8 +1658,16 @@ fn refuse(inner: &Inner, ring: &Ring, pass: &Pass, refusal: Refusal, message: St
     send_back(inner, ring, &nack.encode());
 }
 
-fn handle(inner: &Arc<Inner>, jobs: Vec<Job>) {
-    let Some(ring) = inner.ring.read().clone() else {
+fn handle(inner: &Arc<Inner>, mut jobs: Vec<Job>) {
+    if let Some(message) = jobs[0].refused.take() {
+        refuse_early(inner, &jobs[0].pass, message);
+        return;
+    }
+    let (ring, current) = {
+        let rings = inner.rings.read();
+        (rings.any(jobs[0].pass.epoch).cloned(), rings.current.clone())
+    };
+    let Some(current) = current.or_else(|| ring.clone()) else {
         // No route: the link that carried this has nothing to do any more. Say so at the entry.
         for job in &jobs {
             let pass = &job.pass;
@@ -1280,12 +1676,13 @@ fn handle(inner: &Arc<Inner>, jobs: Vec<Job>) {
         }
         return;
     };
-    if jobs[0].pass.epoch != ring.epoch {
+    // A batch is one epoch's. One that lost its ring while it waited is refused as before.
+    let Some(ring) = ring else {
         for job in &jobs {
-            refuse(inner, &ring, &job.pass, Refusal::Epoch, format!("this stage is on route {}", ring.epoch));
+            refuse(inner, &current, &job.pass, Refusal::Epoch, format!("this stage is on route {}", current.epoch));
         }
         return;
-    }
+    };
     average(&inner.counters.wait_us, jobs[0].arrived.elapsed().as_micros() as u64);
     let passes: Vec<Pass> = jobs.into_iter().map(|job| job.pass).collect();
     inner.gate.lock();
@@ -1310,7 +1707,7 @@ fn handle(inner: &Arc<Inner>, jobs: Vec<Job>) {
     let counters = &inner.counters;
     average(&counters.compute_us, spent);
     // The totals are the current route's, and a reopen while this ran started them again.
-    if inner.ring.read().as_ref().is_some_and(|now| Arc::ptr_eq(now, &ring)) {
+    if inner.rings.read().current.as_ref().is_some_and(|now| Arc::ptr_eq(now, &ring)) {
         counters.compute_us_total.fetch_add(spent, Ordering::Relaxed);
         counters.batches_total.fetch_add(1, Ordering::Relaxed);
     }
@@ -1398,6 +1795,9 @@ fn forward(inner: &Arc<Inner>, ring: &Arc<Ring>, pass: &Pass, done: Instant) {
     }
     let frame = pass.encode();
     ring.sent.lock().push_back(Held { id: pass.id, frame: frame.clone(), sent: Instant::now() });
+    if ring.is_entry() {
+        ring.in_flight.lock().insert((pass.slot, pass.id));
+    }
     // With no link, this waits with the rest for the one being dialled.
     let sent = peer.map(|peer| (peer.link.send(&frame), peer));
     drop(order);
@@ -1450,7 +1850,7 @@ mod tests {
             width: 1,
             data: vec![0; rows as usize * 4],
         };
-        Job { pass, arrived: Instant::now() }
+        Job { pass, arrived: Instant::now(), refused: None }
     }
 
     fn batch_of(jobs: Vec<Job>) -> (Vec<u32>, Vec<u32>) {
@@ -1475,8 +1875,8 @@ mod tests {
     #[test]
     fn a_new_reply_begun_by_python_drops_what_the_old_one_queued_and_refuses_the_rest() {
         let node = idle_node();
-        enqueue(&node.inner, pass_of(0, 7, 1));
-        enqueue(&node.inner, pass_of(1, 9, 2));
+        enqueue(&node.inner, pass_of(0, 7, 1), None);
+        enqueue(&node.inner, pass_of(1, 9, 2), None);
         let dropped = node.inner.counters.dropped.load(Ordering::Relaxed);
         node.begin(0, 8);
         let jobs: Vec<(u32, u64)> = node.inner.jobs.lock().iter().map(|job| (job.pass.slot, job.pass.generation)).collect();
@@ -1492,7 +1892,7 @@ mod tests {
     #[test]
     fn the_same_reply_beginning_again_drops_nothing() {
         let node = idle_node();
-        enqueue(&node.inner, pass_of(0, 7, 1));
+        enqueue(&node.inner, pass_of(0, 7, 1), None);
         node.begin(0, 7);
         assert_eq!(node.inner.jobs.lock().len(), 1);
         assert!(!node.inner.lines.lock()[&0].refuses(&pass_of(0, 7, 2)));
@@ -1501,14 +1901,27 @@ mod tests {
     #[test]
     fn a_pass_taken_off_the_queue_before_a_new_reply_began_is_not_run() {
         let node = idle_node();
-        enqueue(&node.inner, pass_of(0, 7, 1));
-        enqueue(&node.inner, pass_of(1, 9, 2));
+        enqueue(&node.inner, pass_of(0, 7, 1), None);
+        enqueue(&node.inner, pass_of(1, 9, 2), None);
         // As if the compute thread had taken both, and Python began a new reply on slot 0
         // before the compute thread got the gate.
         let taken: Vec<Pass> = node.inner.jobs.lock().drain(..).map(|job| job.pass).collect();
         node.begin(0, 8);
         let kept: Vec<(u32, u64)> = current_passes(&node.inner, taken).iter().map(|pass| (pass.slot, pass.generation)).collect();
         assert_eq!(kept, vec![(1, 9)]);
+    }
+
+    #[test]
+    fn two_epochs_take_turns_and_a_slot_never_jumps_its_own_older_pass() {
+        let queue: VecDeque<Job> = vec![job(0, 1, 1, 0), job(1, 1, 1, 0), job(2, 2, 1, 0), job(3, 2, 1, 0)].into();
+        assert_eq!(pick(&queue, None), 0);
+        assert_eq!(pick(&queue, Some(2)), 0);
+        assert_eq!(pick(&queue, Some(1)), 2, "epoch 2 waited behind epoch 1, which ran last");
+        // Slot 0 has an epoch 1 pass ahead of its epoch 2 pass, so the turn goes to slot 3.
+        let queue: VecDeque<Job> = vec![job(0, 1, 1, 0), job(0, 2, 1, 0), job(3, 2, 1, 0)].into();
+        assert_eq!(pick(&queue, Some(1)), 2);
+        let queue: VecDeque<Job> = vec![job(0, 1, 1, 0), job(0, 2, 1, 0)].into();
+        assert_eq!(pick(&queue, Some(1)), 0);
     }
 
     #[test]

@@ -1253,6 +1253,8 @@ A flag takes priority over its variable.
 | `ISHARDED_DRAFT_APART` | Set to `1` on the entry worker to run the draft in a process of its own, not beside the entry stage. Use it to compare the two on a real mesh |
 | `ISHARDED_ENTRY_SEED` | Set to `0` on the entry worker so a sampled reply with no seed gets none of its own. Its draws then come from the system, and the draft guesses its best token. See [Speculative decoding](#speculative-decoding) |
 | `ISHARDED_RING` | Set to `0` on the coordinator to keep replies off the direct links between stages |
+| `ISHARDED_STAGED` | Set to `1` on the coordinator to switch routes for a cordon with the old route serving until the new one is proven. Off by default. See [Staged switching](OPERATIONS.md#staged-switching) |
+| `ISHARDED_SPARE` | Set to `0` on a worker to keep no spare stage process. See [A spare stage process](#a-spare-stage-process) |
 | `ISHARDED_APPLY_LOOP` | Set to `1` on the coordinator to let it apply a [shorter loop](#a-shorter-loop) by itself, between replies. Off by default, because it moves weights |
 | `ISHARDED_APPLY_LOOP_TOKENS` | The most tokens an applied loop may take to pay back its move. Default 20000 |
 | `ISHARDED_PRICE_PER_HOUR` | `--price-per-hour` on a node, read by its workers |
@@ -1915,6 +1917,12 @@ Two behaviors keep transfers down, both on by default. Shards in place count, be
 | Serving shards to peers | | | `--no-peer-serve` |
 
 To check every byte against a list you trust, see [Models in the security guide](SECURITY.md#models).
+
+### A spare stage process
+
+A worker running a GGUF stage keeps one more stage process ready beside it, with Python, llama.cpp and the GPU context up and no model in it. When its stage changes, or its stage process dies, the new stage loads into the spare and skips that start. The spare comes up only after the live stage has run no pass for 3 seconds, and on Windows below normal priority, so starting it does not hold up replies. It holds no weights; on CUDA its context takes about 100 MiB of VRAM. `ISHARDED_SPARE=0` on a worker turns it off. `GET /health` reports it under `spare`.
+
+On the laptop's RTX 3060 with Qwen3-0.6B, a stage loaded into the spare in 0.46-0.53 s, against 1.35-1.68 s into a new process. Starting the spare beside a stage that was decoding never paused it for more than 13 ms. See [Results](RESULTS.md#staged-switching).
 
 ## Embeddings
 

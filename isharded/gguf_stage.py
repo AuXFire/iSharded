@@ -13,7 +13,7 @@ from typing import Any, Iterable, Sequence
 import numpy as np
 
 from .gguf import GgufHeader, TensorInfo, plan_stage, write_stage
-from .llama_host import SLOW_ROWS, Channel, StageHost
+from .llama_host import SLOW_ROWS, SPARE, Channel, StageHost
 from .llamacpp import LlamaError, StageLost
 from .models.gguf import GgufAdapter
 from .protocol import ConfigureRequest, MemoryPool, SavePoint, UnitPlacement
@@ -67,8 +67,8 @@ def load_on(host: Channel, operation: str, settings: dict[str, Any]) -> dict[str
 
 
 def start_host(operation: str, settings: dict[str, Any]) -> StageHost:
-    """A stage process that has done this load."""
-    host = StageHost()
+    """A stage process that has done this load: the worker's primed spare when it has one."""
+    host = (SPARE.take(settings["folder"]) if operation == "load" else None) or StageHost()
     load_on(host, operation, settings)
     return host
 
@@ -219,6 +219,10 @@ class GgufStage:
         # The store's last report. Asking would wait behind whatever the stage is running.
         self.states: dict[str, int] = {}
         self.host = start_host("load", self._settings)
+
+    def library_paths(self) -> tuple[str, list[str]]:
+        """Where this stage's llama.cpp is, for a spare process to bring up the same one."""
+        return self._settings["folder"], list(self._settings["extra_paths"])
 
     def respawn(self) -> None:
         """Replace a dead stage process. Its sequence and checkpoint are gone."""

@@ -13,6 +13,7 @@ This module must not import torch, directly or through other iSharded modules.
 from __future__ import annotations
 
 from collections import OrderedDict
+import contextlib
 import ctypes as C
 import json
 from multiprocessing.connection import Client, Connection, Listener
@@ -23,6 +24,7 @@ import secrets
 import subprocess
 import sys
 import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -55,15 +57,20 @@ ENCODED_IMAGE_BYTES = 128 * 1024 * 1024
 # States a draft model keeps. It is small, and a draft that loses one just reads more.
 DRAFT_STATE_BYTES = 256 * 1024 * 1024
 # Operations that touch only the engine's links, and so need not wait for a running pass.
-UNGATED = {"load", "ring_open", "ring_connect", "ring_close", "ring_stats", "exactness"}
+# A flip waits for the old route's passes, which need the gate, so it must not hold it.
+UNGATED = {
+    "load", "prime", "ring_open", "ring_connect", "ring_close", "ring_stats", "exactness",
+    "ring_stage", "ring_connect_staged", "ring_slots", "ring_flip", "ring_close_epoch",
+}  # fmt: skip
 # These put a sequence on another history, which the engine's snapshots cannot follow.
 NEW_HISTORY = {"clear", "restore", "truncate"}
 # A load takes as long as the disk takes, so nothing here can say it has hung.
-LOADS = {"load", "load_draft", "load_projector"}
+LOADS = {"load", "load_draft", "load_projector", "prime"}
 # These have no rows to go by and can be slow when healthy: a state can be gigabytes on a
 # slow disk, and an image a long encode on a CPU. They get the time of a long prompt.
 SLOW = {"save", "restore", "state_adopt", "state_list", "measure_image", "encode_image"}
 SLOW_ROWS = 600
+BELOW_NORMAL = 0x00004000  # BELOW_NORMAL_PRIORITY_CLASS, for a spare's start on Windows
 PASS_MS, ROW_MS = round(PASS_SECONDS * 1000), round(PASS_SECONDS_PER_TOKEN * 1000)
 
 
@@ -90,7 +97,18 @@ class _Host:
         # What the load's probe found about merged passes. None means nothing was probed.
         self.found: dict[str, Any] | None = None
 
+    def prime(self, meta: dict[str, Any], _: bytes) -> Reply:
+        """Brings the library and its devices up with no model, so a load later skips that.
+
+        A primed process waits as a spare: its start, its imports and its device contexts are
+        paid in an idle moment, not in the middle of a change. See ``SpareHost``.
+        """
+        self.library = LlamaLibrary.load(meta["folder"], tuple(meta["extra_paths"]))
+        devices = self.library.wake_devices()
+        return {"folder": self.library.folder, "devices": devices}, b""
+
     def load(self, meta: dict[str, Any], _: bytes) -> Reply:
+        # A primed process already has the library. It is one per process, so it is that one.
         self.library = LlamaLibrary.load(meta["folder"], tuple(meta["extra_paths"]))
         self.stage = LlamaStage(
             self.library,
@@ -307,6 +325,33 @@ class _Host:
         self.engine.connect(meta["links"])
         return {}, b""
 
+    def ring_stage(self, meta: dict[str, Any], _: bytes) -> Reply:
+        """Takes this stage's place in the next route, beside the one it serves. Same door."""
+        if self.engine is None or not self.engine.stages:
+            return {"engine": False}, b""
+        limits = (meta.get("pass_ms", PASS_MS), meta.get("row_ms", ROW_MS))
+        keys = {name: bytes.fromhex(key) for name, key in meta["keys"].items() if key is not None}
+        self.engine.stage(meta["epoch"], meta["index"], meta["count"], keys, meta["ack_timeout_ms"], meta["silence_timeout_ms"], *limits, merge_passes=meta.get("merge_passes", True), merge_most=meta.get("merge_most"))
+        return {"engine": True}, b""
+
+    def ring_connect_staged(self, meta: dict[str, Any], _: bytes) -> Reply:
+        assert self.engine is not None
+        self.engine.connect_staged(meta["links"])
+        return {}, b""
+
+    def ring_slots(self, meta: dict[str, Any], _: bytes) -> Reply:
+        assert self.engine is not None
+        self.engine.give_slots(meta["epoch"], meta["slots"])
+        return {}, b""
+
+    def ring_flip(self, meta: dict[str, Any], _: bytes) -> Reply:
+        assert self.engine is not None
+        return {"quiet": self.engine.flip(meta["epoch"], meta["slots"], meta.get("wait_ms", 0))}, b""
+
+    def ring_close_epoch(self, meta: dict[str, Any], _: bytes) -> Reply:
+        closed = self.engine is not None and self.engine.stages and self.engine.close_epoch(meta["epoch"])
+        return {"closed": bool(closed)}, b""
+
     def ring_close(self, _: dict[str, Any], __: bytes) -> Reply:
         if self.engine is not None:
             self.engine.close_ring()
@@ -487,25 +532,41 @@ class Channel:
 
 
 class StageHost(Channel):
-    """The worker's handle on a stage process."""
+    """The worker's handle on a stage process.
 
-    def __init__(self) -> None:
+    ``low_priority`` starts it below normal, for a spare started beside a stage that serves:
+    its start and imports then give way to the live stage's passes. ``serve_normally`` puts it
+    back once it is to serve. Only Windows can do both; elsewhere a process cannot take back
+    a priority it gave up, so a spare there starts at normal priority in an idle moment.
+    """
+
+    def __init__(self, low_priority: bool = False) -> None:
         key = secrets.token_bytes(32)
         self.quiet = threading.Event()
         self.listener = Listener(authkey=key)
         environment = {**os.environ, KEY_VARIABLE: key.hex()}
         package_root = str(Path(__file__).resolve().parents[1])
         environment["PYTHONPATH"] = os.pathsep.join(filter(None, [package_root, environment.get("PYTHONPATH")]))
+        lowered = low_priority and sys.platform == "win32"
         self.process = subprocess.Popen(
             [sys.executable, "-m", "isharded.llama_host", json.dumps(self.listener.address)],
             env=environment,
             stdin=subprocess.DEVNULL,
+            creationflags=BELOW_NORMAL if lowered else 0,
         )
+        self.lowered = lowered
         try:
             super().__init__(self.process, self._accept(), threading.Event())
         except LlamaError:
             self.process.kill()
             raise
+
+    def serve_normally(self) -> None:
+        """Back to normal priority, for a spare that is about to serve."""
+        if self.lowered:
+            with contextlib.suppress(psutil.Error, OSError):
+                psutil.Process(self.process.pid).nice(psutil.NORMAL_PRIORITY_CLASS)
+            self.lowered = False
 
     def channel(self) -> Channel:
         """Another connection to this process, with a thread and a handler of its own.
@@ -572,6 +633,86 @@ class StageHost(Channel):
             self._end_process()
         self.connection.close()
         self.listener.close()
+
+
+class Spare:
+    """One primed stage process a worker keeps ready, with its library and devices up and no model.
+
+    Starting a stage process costs a Python start, imports, the library and a device context:
+    0.65-1.5 s measured in the handover prototypes, and a live stage beside it stalled about
+    100 ms while the child imported. A spare pays that once, in an idle moment and below normal
+    priority, so a stage that changes or a stage process that died loads straight away.
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.host: StageHost | None = None
+        self.folder: str | None = None
+        self.starting = False
+        self.started = 0
+        self.taken = 0
+        # How long the last spare took to come up, start to primed.
+        self.prime_seconds: float | None = None
+
+    def ready(self) -> bool:
+        with self.lock:
+            return self.host is not None and self.host.process.poll() is None
+
+    def prime(self, folder: str, extra_paths: list[str]) -> bool:
+        """Starts a spare and brings it up. Blocks; a worker runs this off its loop. Says whether
+        a new one came up: one already there, or one already starting, is left alone.
+        """
+        with self.lock:
+            if self.starting or (self.host is not None and self.host.process.poll() is None):
+                return False
+            self.starting = True
+        began = time.perf_counter()
+        host: StageHost | None = None
+        try:
+            host = StageHost(low_priority=True)
+            answer, _ = host.call("prime", folder=folder, extra_paths=list(extra_paths))
+        except LlamaError:
+            if host is not None:
+                host.close()
+            with self.lock:
+                self.starting = False
+            return False
+        with self.lock:
+            self.starting = False
+            old, self.host, self.folder = self.host, host, answer.get("folder", folder)
+            self.started += 1
+            self.prime_seconds = round(time.perf_counter() - began, 3)
+        if old is not None:
+            old.close()
+        return True
+
+    def take(self, folder: str) -> StageHost | None:
+        """The spare, if it is alive and has this folder's library, now at normal priority."""
+        with self.lock:
+            host, self.host = self.host, None
+            same = self.folder is not None and Path(self.folder).resolve() == Path(folder).resolve()
+        if host is None:
+            return None
+        if host.process.poll() is not None or not same:
+            host.close()
+            return None
+        host.serve_normally()
+        with self.lock:
+            self.taken += 1
+        return host
+
+    def report(self) -> dict[str, Any]:
+        with self.lock:
+            return {"ready": self.host is not None and self.host.process.poll() is None, "started": self.started, "taken": self.taken, "prime_seconds": self.prime_seconds}
+
+    def close(self) -> None:
+        with self.lock:
+            host, self.host = self.host, None
+        if host is not None:
+            host.close()
+
+
+SPARE = Spare()
 
 
 if __name__ == "__main__":

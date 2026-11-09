@@ -158,6 +158,9 @@ WARM_PROMPT = "Hello"
 # setting it up. One row did not cover it.
 WARM_ROWS = 64
 WARM_SECONDS = 120.0
+# A staged switch proves the next route on one slot the running route's entry lends it. A
+# reply already on that slot finishes first, for at most this long.
+LEND_SECONDS = 30.0
 LINK_TTL_SECONDS = 600.0
 LINK_PROBE_ROUNDS = 5
 LINK_PROBE_BYTES = 100
@@ -301,6 +304,19 @@ class WorkerRecord:
 
 def worker_url(record: WorkerRecord) -> str:
     return str(record.registration.advertised_url).rstrip("/")
+
+
+def staged_transitions() -> bool:
+    """Whether a cordon switches routes with the old one serving until the new one is proven.
+
+    Off by default: with ``ISHARDED_STAGED=0`` every change goes through ``_activate`` exactly
+    as before. See docs/OPERATIONS.md.
+    """
+    return os.getenv("ISHARDED_STAGED", "0") == "1"
+
+
+class StagedAbort(Exception):
+    """A staged switch was called off before its flip; the running route was never touched."""
 
 
 def telemetry_of(record: WorkerRecord | None) -> dict[str, Any]:
@@ -973,6 +989,10 @@ class Orchestrator:
         self.need_reconfigure: set[str] = set()
         # The route this node has installed, which followers keep up to date.
         self.installed_epoch: int | None = None
+        # How the last staged switch went: its epoch and phase times. See _activate_staged.
+        self.last_staged: dict[str, Any] | None = None
+        # Stages new to a staged route whose load stalled: the usual way would only stall again.
+        self.staged_stalled: dict[str, str] = {}
         self.following = False
         self.follow_retry_at = 0.0
         self.last_repair_at = float("-inf")  # monotonic time starts near zero after a reboot
@@ -1485,7 +1505,17 @@ class Orchestrator:
         return health.get("status") == "ok" and health.get("epoch") != self.epoch
 
     def _route_whole(self) -> bool:
-        return bool(self.route) and all(self._usable(stage.worker_id) and not self._lost_its_stage(stage.worker_id) for stage in self.route)
+        return bool(self.route) and all(self._serves(stage.worker_id) and not self._lost_its_stage(stage.worker_id) for stage in self.route)
+
+    def _serves(self, worker_id: str) -> bool:
+        """Whether a stage of the running route can carry replies. A cordoned node still does
+        when switches are staged: its route serves until the next one is proven. Otherwise a
+        cordon stops replies until its share has moved, as it always has.
+        """
+        if self._usable(worker_id):
+            return True
+        record = self.workers.get(worker_id)
+        return staged_transitions() and record is not None and record.live and not record.quarantined and self._cordoned(worker_id)
 
     def serving(self) -> bool:
         """Whether a reply can run now.
@@ -1710,9 +1740,12 @@ class Orchestrator:
         raise AssertionError("unreachable")
 
     async def move_off(self) -> None:
-        """Carry out a cordon: replies finish first, and only that node's share moves."""
+        """Carry out a cordon: replies finish first, and only that node's share moves.
+
+        Staged, the old route serves until the new one has run a warm pass over every link.
+        """
         async with self.control_lock:
-            await self.rebalance(generation_lock_held=False)
+            await self.rebalance(generation_lock_held=False, staged=staged_transitions())
 
     def candidate_groups(self) -> tuple[list[Candidate], list[Candidate]]:
         """Healthy inference workers, split into preferred and standby."""
@@ -2635,40 +2668,7 @@ class Orchestrator:
         self.route = []  # nothing may run while weights are moving
 
         async def configure(stage: StageAssignment) -> dict[str, Any]:
-            request = ConfigureRequest(
-                model_id=target.model_id,
-                revision=target.manifest.revision,
-                architecture=target.manifest.config,
-                epoch=new_epoch,
-                assignment=stage,
-                route=route,
-                cache_url=cache_url,
-                context_tokens=target.profile.context_tokens,
-                speculate_tokens=target.speculate_tokens,
-                rewinds=target.rewinds,
-                prompt_lookup=target.prompt_lookup,
-                draft=target.draft,
-                term=self.mesh.term if self.mesh else 0,
-                slots=target.slots,
-                merge_passes=target.merge_passes,
-                exact=target.exact,
-                prompt_cache=target.request is None or target.request.prompt_cache,
-                kv_type=target.request.kv_type if target.request else "f16",
-                copy_url=holders.get(stage.worker_id),
-                state_peers=self.state_peers(stage.worker_id) if saved_states else [],
-                embedding=target.embedding,
-                projector=target.projector,
-                unit_hashes={
-                    item.unit: target.request.model_hashes[item.unit]
-                    for item in stage.placements
-                    if item.unit in (target.request.model_hashes or {})
-                },
-                load_id=uuid.uuid4().hex,
-            )
-            response = await self._configure_in_time(stage, request)
-            if response.status_code >= 400:
-                raise RuntimeError(response.text[:400])
-            return response.json()
+            return await self._configure_stage(target, stage, route, new_epoch, cache_url, holders, saved_states)
 
         results = await asyncio.gather(*(configure(stage) for stage in route), return_exceptions=True)
         await self._release_entries()
@@ -2783,6 +2783,252 @@ class Orchestrator:
                 pass
             await asyncio.sleep(10.0)
 
+    def _configure_request(
+        self,
+        target: ModelTarget,
+        stage: StageAssignment,
+        route: list[StageAssignment],
+        epoch: int,
+        cache_url: str | None,
+        holders: dict[str, str],
+        saved_states: bool,
+        staged: bool = False,
+    ) -> ConfigureRequest:
+        return ConfigureRequest(
+            model_id=target.model_id,
+            revision=target.manifest.revision,
+            architecture=target.manifest.config,
+            epoch=epoch,
+            assignment=stage,
+            route=route,
+            cache_url=cache_url,
+            context_tokens=target.profile.context_tokens,
+            speculate_tokens=target.speculate_tokens,
+            rewinds=target.rewinds,
+            prompt_lookup=target.prompt_lookup,
+            draft=target.draft,
+            term=self.mesh.term if self.mesh else 0,
+            slots=target.slots,
+            merge_passes=target.merge_passes,
+            exact=target.exact,
+            prompt_cache=target.request is None or target.request.prompt_cache,
+            kv_type=target.request.kv_type if target.request else "f16",
+            copy_url=holders.get(stage.worker_id),
+            state_peers=self.state_peers(stage.worker_id) if saved_states else [],
+            embedding=target.embedding,
+            projector=target.projector,
+            unit_hashes={
+                item.unit: target.request.model_hashes[item.unit]
+                for item in stage.placements
+                if item.unit in (target.request.model_hashes or {})
+            },
+            staged=staged,
+            # A flip loads nothing, so there is no load to give up on and let go.
+            load_id=None if staged else uuid.uuid4().hex,
+        )
+
+    async def _configure_stage(
+        self,
+        target: ModelTarget,
+        stage: StageAssignment,
+        route: list[StageAssignment],
+        epoch: int,
+        cache_url: str | None,
+        holders: dict[str, str],
+        saved_states: bool,
+        staged: bool = False,
+    ) -> dict[str, Any]:
+        request = self._configure_request(target, stage, route, epoch, cache_url, holders, saved_states, staged)
+        # A staged stage new to the route loads under the same deadline as any other load.
+        response = await self._configure_in_time(stage, request)
+        if response.status_code >= 400:
+            raise RuntimeError(response.text[:400])
+        return response.json()
+
+    def _staged_refusal(self, target: ModelTarget, route: list[StageAssignment], old: list[StageAssignment]) -> str | None:
+        """Why this change cannot be staged yet, or None if it can.
+
+        Staged here: a stage that stays as it is serves both routes through its engine, and a
+        node new to the route loads its stage while the old route serves. A node that is on
+        both routes with other layers needs a second stage process beside its live one, which
+        is the next step of handover; such changes go the usual way.
+        """
+        if os.getenv("ISHARDED_RING", "1") == "0":
+            return "the native path is off"
+        if not isinstance(target.adapter, GgufAdapter) or target.embedding:
+            return "only GGUF text models are staged"
+        if not old or self.active is None or target.model_id != self.active.model_id:
+            return "no route of this model is serving"
+        if self.ring_epoch is None or self.ring_epoch != self.epoch:
+            return "the serving route has no native links up"
+        if not route:
+            return "the new route is empty"
+        if target.lookup_guesses and (target.lookup_guesses if len(route) > 1 else 0) != target.speculate_tokens:
+            return "the number of guesses changes with the number of stages"
+        layout = {stage.worker_id: stage for stage in old}
+
+        def shape(stage: StageAssignment) -> tuple[Any, ...]:
+            return stage.start_layer, stage.end_layer, sorted((item.unit, item.pool_id, item.bytes) for item in stage.placements)
+
+        for stage in route:
+            before = layout.get(stage.worker_id)
+            if before is not None and shape(before) != shape(stage):
+                return f"{stage.worker_id} would serve other layers, which needs a second stage process"
+        for worker_id in {stage.worker_id for stage in route} | {old[0].worker_id}:
+            record = self.workers.get(worker_id)
+            if record is None or not record.live or not (record.health or {}).get("staged"):
+                return f"{worker_id} cannot stage a route"
+        if route == old:
+            return "nothing changes"
+        return None
+
+    async def _staged_call(self, stage: StageAssignment, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        response = await self.client.post(stage.url.rstrip("/") + path, json=body, headers=auth_headers(self.pool_token), timeout=RING_CALL_SECONDS)
+        if response.status_code >= 400:
+            raise StagedAbort(f"{stage.worker_id} {path}: HTTP {response.status_code} {response.text[:200]}")
+        return response.json()
+
+    async def _stage_ring(self, route: list[StageAssignment], epoch: int, term: int, kept: set[str]) -> None:
+        """Opens the next route's ring with the running one untouched. Kept stages stage it beside
+        the ring they serve; stages new to the route open it as their only ring.
+        """
+        last = len(route) - 1
+        hop_keys = [secrets.token_hex(32) for _ in range(last)]
+        closing_key = secrets.token_hex(32) if last > 0 else None
+
+        def keys(index: int) -> dict[str, str | None]:
+            return {
+                "back": hop_keys[index - 1] if index > 0 else None,
+                "next": hop_keys[index] if index < last else None,
+                "closing": closing_key if index in (0, last) else None,
+            }
+
+        def opening(index: int, stage: StageAssignment) -> tuple[str, dict[str, Any]]:
+            body = {"epoch": epoch, "term": term, "index": index, "count": len(route), "keys": keys(index)}
+            if stage.worker_id in kept:
+                layers = [stage.start_layer, stage.end_layer]
+                return "/internal/ring/stage", {**body, "current_epoch": self.epoch, "layers": layers, "model_id": self.model_id}
+            return "/internal/ring/open", body
+
+        doors = await asyncio.gather(*(self._staged_call(stage, *opening(index, stage)) for index, stage in enumerate(route)))
+        if not all(door.get("engine") for door in doors):
+            raise StagedAbort("a stage has no engine that can hold two routes")
+        hops = dict(self.hops)
+
+        def link(source: int, target: int) -> dict[str, Any]:
+            door = doors[target]
+            url = hops.get((route[source].worker_id, route[target].worker_id))
+            return {"address": host_port(urlsplit(url).hostname or "", door["port"]) if url else door["address"], "fingerprint": door["fingerprint"]}
+
+        def connecting(index: int, stage: StageAssignment) -> tuple[str, dict[str, Any]]:
+            entry = link(index, 0) if index == last and last > 0 else None
+            body = {"epoch": epoch, "term": term, "next": link(index, index + 1) if index < last else None, "entry": entry}
+            return ("/internal/ring/stage/connect" if stage.worker_id in kept else "/internal/ring/connect"), body
+
+        await asyncio.gather(*(self._staged_call(stage, *connecting(index, stage)) for index, stage in enumerate(route)))
+
+    async def _call_off_staged(self, route: list[StageAssignment], epoch: int, term: int, kept: set[str], lender: StageAssignment | None) -> None:
+        """Undoes a staged switch that will not flip. Kept stages close only the staged ring."""
+        body = {"term": term, "epoch": epoch}
+        calls = [self._tell(stage.url.rstrip("/") + "/internal/ring/unstage", json=body, timeout=RING_CALL_SECONDS) for stage in route if stage.worker_id in kept]
+        if lender is not None:
+            calls.append(self._tell(lender.url.rstrip("/") + "/internal/ring/unlend", json={"term": term}, timeout=RING_CALL_SECONDS))
+        await asyncio.gather(*calls)
+
+    async def _activate_staged(self, target: ModelTarget, route: list[StageAssignment]) -> bool:
+        """Switch routes with the old one serving until the new one is proven. False if this
+        change cannot be staged, or was called off before its flip: then the caller switches
+        the usual way, and the old route served throughout.
+
+        READY: stages new to the route load at the new epoch, while nothing drains and the route
+        stays up. Kept stages stage the new ring beside the one they serve, on one model and KV.
+        PROVE: the old route's entry lends one slot, which no reply then holds anywhere, and the
+        new entry runs a 64-row pass on it over every link of the new route.
+        SWITCH: kept stages flip at once: every slot to the new route, which takes over from
+        the old ring. Then the route and epoch switch here. Running replies replay on the new
+        route with what they had written, as after any route change; new ones start on it.
+        """
+        old = list(self.route)
+        why = self._staged_refusal(target, route, old)
+        if why is not None:
+            self.add_event("rebalance", "Staged switch not used", why)
+            return False
+        began = time.monotonic()
+        epoch, term = self.epoch + 1, (self.mesh.term if self.mesh else 0)
+        old_ids = {stage.worker_id for stage in old}
+        kept = {stage.worker_id for stage in route if stage.worker_id in old_ids}
+        fresh = [stage for stage in route if stage.worker_id not in old_ids]
+        holders = self.copy_holders(route)
+        lender: StageAssignment | None = None
+        timings: dict[str, float] = {}
+        try:
+            results = await asyncio.gather(*(self._configure_stage(target, stage, route, epoch, None, holders, True) for stage in fresh), return_exceptions=True)
+            failed = {stage.worker_id: str(result) for stage, result in zip(fresh, results) if isinstance(result, BaseException)}
+            if failed:
+                self.staged_stalled = {worker_id: reason for worker_id, reason in failed.items() if stalled(reason)}
+                raise StagedAbort(f"a new stage did not load: {failed}")
+            timings["ready_s"] = round(time.monotonic() - began, 2)
+            await self._stage_ring(route, epoch, term, kept)
+            timings["links_s"] = round(time.monotonic() - began, 2)
+            slot = max(target.slots, 1) - 1
+            await self._staged_call(old[0], "/internal/ring/lend", {"term": term, "slot": slot, "seconds": LEND_SECONDS})
+            lender = old[0]
+            await asyncio.gather(*(self._staged_call(stage, "/internal/ring/slots", {"term": term, "epoch": epoch, "slots": [slot]}) for stage in route if stage.worker_id in kept))
+            assert self.tokenizer is not None
+            word = await asyncio.to_thread(self.tokenizer.encode, WARM_PROMPT)
+            tokens = (word * (WARM_ROWS // max(len(word), 1) + 1))[:WARM_ROWS]
+            warm = await self._staged_call(route[0], "/internal/ring/warm", {"term": term, "epoch": epoch, "slot": slot, "tokens": tokens, "stages": len(route)})
+            timings["warm_ms"] = warm["ms"]
+        except (StagedAbort, httpx.HTTPError, AssertionError, KeyError, TypeError, ValueError) as exc:
+            await self._call_off_staged(route, epoch, term, kept, lender)
+            self.add_event("rebalance", "Staged switch called off", f"{str(exc) or type(exc).__name__}"[:300] + "; switching the usual way")
+            return False
+        flipping = time.perf_counter()  # monotonic ticks every 15.6 ms on Windows
+        staged_stages = [stage for stage in route if stage.worker_id in kept]
+        results = await asyncio.gather(*(self._configure_stage(target, stage, route, epoch, None, holders, True, staged=True) for stage in staged_stages), return_exceptions=True)
+        failed = {stage.worker_id: str(result) for stage, result in zip(staged_stages, results) if isinstance(result, BaseException)}
+        if failed:
+            # Some stages may have flipped. The usual path reopens every stage at a new epoch.
+            await self._call_off_staged(route, epoch, term, kept, lender)
+            self.add_event("failure", "Staged flip failed", f"{failed}"[:300] + "; switching the usual way")
+            return False
+        timings["flip_ms"] = round((time.perf_counter() - flipping) * 1000, 1)
+        timings["quiet"] = all(isinstance(result, dict) and result.get("flip_quiet") is not False for result in results)
+        if route[0].worker_id not in old_ids:
+            await self._tell(route[0].url.rstrip("/") + "/internal/ring/go", json={"epoch": epoch, "term": term}, timeout=RING_CALL_SECONDS)
+        if lender is not None and lender.worker_id not in kept:
+            self.spawn(self._tell(lender.url.rstrip("/") + "/internal/ring/unlend", json={"term": term}, timeout=RING_CALL_SECONDS))
+        self.active = target
+        self.model_id = target.model_id
+        if target.tokenizer is not None:
+            self.tokenizer = target.tokenizer
+        for stage in route:
+            record = self.workers.get(stage.worker_id)
+            if record is not None and record.health:
+                # Each has just flipped or opened this ring, and its last report is from before.
+                telemetry = record.health.get("telemetry") or {}
+                ring = telemetry.get("ring")
+                if isinstance(ring, dict):
+                    telemetry = {**telemetry, "ring": {**ring, "epoch": epoch, "next_up": True}}
+                record.health = {**record.health, "epoch": epoch, "telemetry": telemetry}
+        self.route = route
+        self.active_cache_url = None
+        self.epoch = epoch
+        self.installed_epoch = epoch
+        self.ring_epoch = epoch  # its links are up: the warm pass crossed every one
+        self.ring_closing_down = None
+        self.saved_state = None
+        self.save_state(target)
+        self.hops_checked_at = float("-inf")
+        self.spawn(self._clear_old_copies(target, route))
+        if self.mesh is not None:
+            self.spawn(self._gossip_round())
+        summary = " → ".join(f"{stage.worker_id} L{stage.start_layer}–{stage.end_layer - 1}" for stage in route)
+        detail = ", ".join(f"{name} {value}" for name, value in timings.items())
+        self.add_event("rebalance", f"Pipeline epoch {epoch}, staged", f"{summary} ({detail})")
+        self.last_staged = {"epoch": epoch, **timings, "total_s": round(time.monotonic() - began, 2)}
+        return True
+
     async def _warm_route(self, epoch: int) -> None:
         """Run a 64-row reply with one token out, so that a new route's first real reply does not pay for first use.
 
@@ -2862,13 +3108,14 @@ class Orchestrator:
         job: LoadJob,
         *,
         generation_lock_held: bool,
+        staged: bool = False,
     ) -> list[StageAssignment]:
         """Plan, fetch, and activate, replanning around workers that fail."""
         job.total_bytes = target.profile.total_bytes
         tables = (self.links, self.links_checked, self.link_readings)
         kept = self.link_row_bytes, [dict(table) for table in tables]
         try:
-            return await self._deploy(target, job, generation_lock_held=generation_lock_held)
+            return await self._deploy(target, job, generation_lock_held=generation_lock_held, staged=staged)
         except BaseException:
             # Those costs were measured at this load's row size. The route still running plans by its own.
             self.link_row_bytes = kept[0]
@@ -2877,7 +3124,7 @@ class Orchestrator:
                 table.update(before)
             raise
 
-    async def _deploy(self, target: ModelTarget, job: LoadJob, *, generation_lock_held: bool) -> list[StageAssignment]:
+    async def _deploy(self, target: ModelTarget, job: LoadJob, *, generation_lock_held: bool, staged: bool = False) -> list[StageAssignment]:
         for attempt in range(MAX_DEPLOY_ATTEMPTS):
             job.attempt = attempt
             await self.refresh_worker_metrics()
@@ -2891,7 +3138,15 @@ class Orchestrator:
             failed = await self._prefetch(target, route, job)
             if job.cancelled:
                 raise HTTPException(status_code=409, detail="load cancelled")
-            if not failed:
+            switched = False
+            if not failed and staged:
+                self.staged_stalled = {}
+                switched = await self._activate_staged(target, route)  # the old route serves until the new one is proven
+                if not switched and self.staged_stalled:
+                    # A new stage stalled past its deadline. The usual way would drain the route
+                    # and hold every reply for another deadline on the same stage, so replan now.
+                    failed = dict(self.staged_stalled)
+            if not failed and not switched:
                 job.phase = "loading"
                 # Waiting here puts the switch at a request boundary.
                 gate = nullcontext() if generation_lock_held else self.generation_lock
@@ -2979,7 +3234,10 @@ class Orchestrator:
         self,
         include_quarantined: bool = False,
         generation_lock_held: bool = True,
+        staged: bool = False,
     ) -> list[StageAssignment]:
+        """``staged`` is for a cordon: the cordoned node still serves and is known not to come
+        back, so there is nobody to wait for, and the switch keeps the old route up."""
         if self.active is None:
             raise HTTPException(status_code=409, detail="load a model before rebalancing")
         if include_quarantined:
@@ -2987,12 +3245,12 @@ class Orchestrator:
                 if record.live:
                     record.quarantined = False
                     record.quarantine_reason = None
-        else:
+        elif not staged:
             await self._await_lost_workers()
         self.job = LoadJob(job_id=uuid.uuid4().hex, model_id=self.active.model_id)
         return await self.run_job(
             self.job,
-            self.deploy(self.active, self.job, generation_lock_held=generation_lock_held),
+            self.deploy(self.active, self.job, generation_lock_held=generation_lock_held, staged=staged),
         )
 
     async def _await_lost_workers(self) -> None:
@@ -3803,6 +4061,7 @@ class Orchestrator:
                 else None
             ),
             "cordoned_nodes": sorted(self.access.cordoned),
+            "staged_switch": self.last_staged,
             "lanes": self.lanes.status(),
             "ownerless": self.network_view(),
             "last_audit": self.last_audit,

@@ -288,6 +288,10 @@ class ConfigureRequest(BaseModel):
     # Names this one load, so a coordinator that gave up on it can say so and be sure
     # it reaches that load and no later one. An older coordinator sends none.
     load_id: str | None = None
+    # The flip of a staged route change: this stage keeps its model and KV, and the ring it
+    # staged for this epoch takes over from the one it serves. Only for a stage that stays as
+    # it is; anything else is refused. See ISHARDED_STAGED in docs/OPERATIONS.md.
+    staged: bool = False
 
 
 class CacheRestoreRequest(BaseModel):

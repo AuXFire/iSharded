@@ -88,6 +88,15 @@ SIGNATURES: dict[str, tuple[list[Any], Any]] = {
     "stats": ([C.c_void_p, C.c_char_p, C.c_size_t], C.c_int32),
     "probe": ([C.c_void_p, C.c_uint32, C.c_char_p, C.c_size_t], C.c_int32),
 }
+# Calls that hold the next route beside the current one. They came without a new ABI version,
+# so a library from before them still loads, and ``Engine.stages`` says whether they are there.
+STAGING_SIGNATURES: dict[str, tuple[list[Any], Any]] = {
+    "stage": ([C.c_void_p, C.c_char_p], C.c_int32),
+    "connect_staged": ([C.c_void_p, C.c_char_p], C.c_int32),
+    "give_slots": ([C.c_void_p, C.c_uint64, C.c_char_p], C.c_int32),
+    "flip": ([C.c_void_p, C.c_uint64, C.c_char_p, C.c_uint32], C.c_int32),
+    "close_epoch": ([C.c_void_p, C.c_uint64], C.c_int32),
+}
 
 
 def library_name() -> str:
@@ -123,6 +132,12 @@ class Engine:
             function = getattr(lib, f"isharded_engine_{name}")
             function.argtypes = arguments
             function.restype = answer
+        self.stages = all(hasattr(lib, f"isharded_engine_{name}") for name in STAGING_SIGNATURES)
+        if self.stages:
+            for name, (arguments, answer) in STAGING_SIGNATURES.items():
+                function = getattr(lib, f"isharded_engine_{name}")
+                function.argtypes = arguments
+                function.restype = answer
         base = library.ggml_base
         tensors = TensorApi(_address(base.ggml_get_name), _address(base.ggml_nbytes), _address(base.ggml_backend_tensor_get))
         self.handle = lib.isharded_engine_new(target, C.byref(tensors))
@@ -226,7 +241,56 @@ class Engine:
 
         ``merge_most`` is the most passes one trip may hold. None leaves it to the engine.
         """
-        plan = {
+        plan = self._plan(epoch, index, count, keys, ack_timeout_ms, silence_timeout_ms, pass_ms, row_ms, merge_passes, merge_most)
+        if self.lib.isharded_engine_open(self.handle, json.dumps(plan).encode()) != 0:
+            raise OSError("the engine refused its place in the route")
+
+    def stage(
+        self, epoch: int, index: int, count: int, keys: dict[str, bytes], ack_timeout_ms: int, silence_timeout_ms: int, pass_ms: int = 0, row_ms: int = 0, merge_passes: bool = True,
+        merge_most: int | None = None,
+    ) -> None:
+        """Takes a place in the next route beside the current one, which goes on serving."""
+        self._staging()
+        plan = self._plan(epoch, index, count, keys, ack_timeout_ms, silence_timeout_ms, pass_ms, row_ms, merge_passes, merge_most)
+        if self.lib.isharded_engine_stage(self.handle, json.dumps(plan).encode()) != 0:
+            raise OSError("the engine refused its place in the next route")
+
+    def connect_staged(self, links: dict[str, Any]) -> None:
+        """Starts dialling the next route's links. ``stats``' ``staged_connect`` says how it went."""
+        self._staging()
+        if self.lib.isharded_engine_connect_staged(self.handle, json.dumps(links).encode()) != 0:
+            raise OSError("the engine could not read its links")
+
+    def give_slots(self, epoch: int, slots: list[int]) -> None:
+        """While two routes overlap, these slots belong to this one."""
+        self._staging()
+        if self.lib.isharded_engine_give_slots(self.handle, epoch, json.dumps(slots).encode()) != 0:
+            raise OSError(f"route {epoch} is not held here")
+
+    def flip(self, epoch: int, slots: list[int], wait_ms: int) -> bool:
+        """The staged route takes these slots and becomes the current one. Says whether nothing of
+        the old route was left queued or running here within ``wait_ms``.
+        """
+        self._staging()
+        answer = self.lib.isharded_engine_flip(self.handle, epoch, json.dumps(slots).encode(), wait_ms)
+        if answer < 0:
+            raise OSError(f"route {epoch} is not staged here")
+        return answer == 1
+
+    def close_epoch(self, epoch: int) -> bool:
+        """Closes one route's ring and leaves any other alone."""
+        self._staging()
+        return self.lib.isharded_engine_close_epoch(self.handle, epoch) == 1
+
+    def _staging(self) -> None:
+        if not self.stages:
+            raise OSError("this engine cannot hold two routes; rebuild it")
+
+    @staticmethod
+    def _plan(
+        epoch: int, index: int, count: int, keys: dict[str, bytes], ack_timeout_ms: int, silence_timeout_ms: int, pass_ms: int, row_ms: int, merge_passes: bool, merge_most: int | None
+    ) -> dict[str, Any]:
+        return {
             "merge_passes": merge_passes,
             "merge_most": merge_most,
             "epoch": epoch,
@@ -238,8 +302,6 @@ class Engine:
             "pass_ms": pass_ms,
             "row_ms": row_ms,
         }
-        if self.lib.isharded_engine_open(self.handle, json.dumps(plan).encode()) != 0:
-            raise OSError("the engine refused its place in the route")
 
     def connect(self, links: dict[str, Any]) -> None:
         """Starts dialling, and returns at once. ``stats`` says how it went."""
