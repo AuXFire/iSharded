@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import copy
 import json
 import math
 import os
@@ -10,7 +11,10 @@ import secrets
 import re
 import socket
 import statistics
+import sys
+import threading
 import time
+import traceback
 import uuid
 from collections import Counter, deque
 from collections.abc import AsyncIterator
@@ -155,8 +159,23 @@ APPLY_QUIET_SECONDS = 120.0
 # How often a route's links try their other addresses, and how long one try may take.
 HOP_CHECK_SECONDS = 60.0
 HOP_PROBE_SECONDS = 10.0
-# How long a worker's health may take to answer, retries and all. Status waits for it.
+# How long a worker's health may take to answer, retries and all.
 PROBE_SECONDS = 3.0
+# Status shows worker health from the last check and never waits for one. Checks run this
+# often, and ask at most this many workers at once, so a big pool does not open hundreds.
+HEALTH_SECONDS = 5.0
+MAX_PROBES_AT_ONCE = 16
+# A worker silent this long and on no route is forgotten. Its quarantine is remembered.
+FORGET_SECONDS = 600.0
+MAX_FORGOTTEN_QUARANTINES = 1024
+# The event loop wakes this often to see how late it woke, and a wake this late is logged.
+LOOP_TICK_SECONDS = 0.1
+LOOP_LAG_LOG_SECONDS = 0.25
+# Planning runs off the loop on a copy of the pool. If the pool changed while it ran, it
+# plans again, this many times at most, and then goes ahead with the latest plan.
+PLAN_ATTEMPTS = 3
+# What planning may change on a target: slots, and a draft it had no room for.
+PLANNED_FIELDS = ("slots", "profile", "parallel", "draft", "speculate_tokens")
 # Noise must not move a live link, and the ring has to redial for it.
 HOP_SWITCH_RATIO = 0.9
 # Replanning around a worker that is alive but failed may move this much at most.
@@ -889,6 +908,23 @@ class Orchestrator:
         self.reply_checker: TicketChecker | None = None
         self.maintenance_task: asyncio.Task[None] | None = None
         self.gossip_task: asyncio.Task[None] | None = None
+        self.health_task: asyncio.Task[None] | None = None
+        self.loop_watch_task: asyncio.Task[None] | None = None
+        # When the last health check of every live worker finished, as wall time. Status shows it.
+        self.health_checked_at: float | None = None
+        # One limit per event loop: a semaphore binds to the first loop that waits on it.
+        self.probe_slots: tuple[asyncio.AbstractEventLoop, asyncio.Semaphore] | None = None
+        # Quarantine outlives a forgotten record: going quiet for long is no way out of it.
+        self.forgotten_quarantine: dict[str, tuple[bool, str | None, int]] = {}
+        # Nor does being forgotten stop a node lost from the route being taken back when it returns.
+        self.forgotten_from_route: dict[str, None] = {}
+        # How late the event loop woke, last and worst in the last minute, and how often it was held long.
+        self.loop_lag_seconds = 0.0
+        self.loop_lag_worst: deque[tuple[float, float]] = deque()
+        self.loop_stalls = 0
+        # Where the loop was while it was held, caught by a thread, told with the stall's log line.
+        # It carries the tick it was caught after, so a place caught late never names another stall.
+        self.loop_stall_where: tuple[float, str] | None = None
         self.mesh: ControlMesh | None = None
         seen_as = os.getenv("ISHARDED_NODE_URL")
         if seen_as:
@@ -958,7 +994,7 @@ class Orchestrator:
         return make_statement(key, self.mesh.node_id, target, method, path, body)
 
     async def close(self) -> None:
-        for task in (self.maintenance_task, self.gossip_task):
+        for task in (self.maintenance_task, self.gossip_task, self.health_task, self.loop_watch_task):
             if task is not None:
                 task.cancel()
         if self.beacon is not None:
@@ -1201,6 +1237,8 @@ class Orchestrator:
     def start_maintenance(self) -> None:
         self.load_saved_state()
         self.maintenance_task = asyncio.create_task(self._maintain())
+        self.health_task = asyncio.create_task(self._watch_health())
+        self.loop_watch_task = asyncio.create_task(self._watch_loop())
         if self.mesh is not None:
             self.gossip_task = asyncio.create_task(self._gossip())
         if self.lanes.active:
@@ -1226,6 +1264,80 @@ class Orchestrator:
                 self.add_event("failure", "Automatic repair failed", str(exc.detail)[:200])
             except Exception as exc:  # this loop is what keeps the pool healthy, so it must outlive any one failure
                 self.add_event("failure", "Maintenance error", f"{type(exc).__name__}: {exc}"[:200])
+
+    async def _watch_health(self) -> None:
+        """Keep worker health current in the background, so status never waits on a worker.
+
+        This runs apart from maintenance, because a repair can hold a maintenance pass for minutes.
+        """
+        while True:
+            try:
+                await self.refresh_worker_metrics()
+            except Exception as exc:  # status reads what this keeps, so it must outlive any one failure
+                self.add_event("failure", "Health check error", f"{type(exc).__name__}: {exc}"[:200])
+            await asyncio.sleep(HEALTH_SECONDS)
+
+    async def _watch_loop(self) -> None:
+        """Measure how late the event loop wakes. Everything this node answers waits that long too.
+
+        A thread watches the same ticks, and when one is overdue it notes the code the loop is
+        running, so the log line for a stall says what held it and not only for how long.
+        """
+        loop = asyncio.get_running_loop()
+        beat = [time.monotonic()]
+        stop = threading.Event()
+        watcher = threading.Thread(target=self._catch_stalls, args=(threading.get_ident(), beat, stop), name="isharded-loop-watch", daemon=True)
+        watcher.start()
+        try:
+            while True:
+                planned = loop.time() + LOOP_TICK_SECONDS
+                await asyncio.sleep(LOOP_TICK_SECONDS)
+                self.note_loop_lag(max(loop.time() - planned, 0.0), since=beat[0])
+                beat[0] = time.monotonic()
+        finally:
+            stop.set()
+            watcher.join(1.0)
+
+    def _catch_stalls(self, loop_thread: int, beat: list[float], stop: threading.Event) -> None:
+        """Note where the loop's thread is once a tick is overdue past the logging limit."""
+        caught = None
+        while not stop.wait(LOOP_TICK_SECONDS / 2):
+            last = beat[0]
+            if last == caught or time.monotonic() - last <= LOOP_TICK_SECONDS + LOOP_LAG_LOG_SECONDS:
+                continue
+            frame = sys._current_frames().get(loop_thread)
+            if frame is None:
+                continue
+            asyncio_dir = os.sep + "asyncio" + os.sep  # the loop's own frames say nothing about what held it
+            stack = [item for item in traceback.extract_stack(frame) if asyncio_dir not in item.filename]
+            self.loop_stall_where = (last, " < ".join(f"{Path(item.filename).name}:{item.lineno} {item.name}" for item in reversed(stack[-6:])))
+            caught = last
+
+    def note_loop_lag(self, lag: float, *, since: float | None = None) -> None:
+        """Keep one wake's lag. ``since`` is the tick it followed, which a caught place must match."""
+        now = time.monotonic()
+        self.loop_lag_seconds = lag
+        worst = self.loop_lag_worst  # falling lags, oldest first: the worst of the minute is in front
+        while worst and worst[-1][1] <= lag:
+            worst.pop()
+        worst.append((now, lag))
+        self.worst_loop_lag()  # drops what is older than the minute
+        caught, self.loop_stall_where = self.loop_stall_where, None
+        # The thread may catch the loop just after a stall ended and this line was written; that
+        # place then carries the old tick and is dropped here, not told with the next stall.
+        where = caught[1] if caught is not None and (since is None or caught[0] == since) else None
+        if lag > LOOP_LAG_LOG_SECONDS:
+            self.loop_stalls += 1
+            held_in = f", in {where}" if where else ""
+            with suppress(OSError, ValueError):  # a full disk or an odd console must not fail what is being logged
+                print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} loop: the event loop was held {lag * 1000:.0f} ms; replies and status waited as long{held_in}", flush=True)
+
+    def worst_loop_lag(self) -> float:
+        """The latest wake in the last minute, in seconds."""
+        worst = self.loop_lag_worst
+        while worst and worst[0][0] < time.monotonic() - 60.0:
+            worst.popleft()
+        return worst[0][1] if worst else 0.0
 
     async def maintenance_pass(self) -> None:
         await self.refresh_worker_metrics()
@@ -1368,6 +1480,12 @@ class Orchestrator:
                 # Going quiet and coming back is no way out of quarantine.
                 record.quarantined, record.quarantine_reason = previous.quarantined, previous.quarantine_reason
                 record.quarantine_count = previous.quarantine_count
+            elif registration.worker_id in self.forgotten_quarantine:
+                # Nor is going quiet for long enough to be forgotten.
+                record.quarantined, record.quarantine_reason, record.quarantine_count = self.forgotten_quarantine.pop(registration.worker_id)
+            if previous is None and registration.worker_id in self.forgotten_from_route:
+                del self.forgotten_from_route[registration.worker_id]
+                self.lost_from_route.add(registration.worker_id)  # the next repair takes it back, as if never forgotten
             self.workers[registration.worker_id] = record
         if previous is None:
             hardware = registration.hardware
@@ -1411,16 +1529,11 @@ class Orchestrator:
         record = self.workers.get(worker_id)
         return record is not None and record.live and not record.quarantined and not self._cordoned(worker_id)
 
-    def cost_of_losing(self, name: str) -> int | None:
+    async def cost_of_losing(self, name: str) -> int | None:
         """Bytes the pool must transfer if this node leaves, or None if it cannot cope."""
         if self.active is None or not any(node_of(stage.worker_id) == name for stage in self.route):
             return 0
-        held = self.access.cordoned
-        self.access.cordoned = held | {name}
-        try:
-            return self._move_cost(self.active)
-        finally:
-            self.access.cordoned = held
+        return await self.move_cost(self.active, cordon={name})
 
     def _move_cost(self, target: ModelTarget) -> int | None:
         """Bytes a fresh plan would transfer, or None if nothing could hold the model."""
@@ -1428,6 +1541,94 @@ class Orchestrator:
             return int(describe_plan(target, self.plan(target))["download_bytes"])
         except PlacementError:
             return None
+
+    async def move_cost(self, target: ModelTarget, *, cordon: set[str] | frozenset[str] = frozenset(), out: set[str] | frozenset[str] = frozenset()) -> int | None:
+        """``_move_cost`` off the event loop, as if ``cordon`` were cordoned and ``out`` quarantined."""
+        return await self.off_loop(target, lambda view, copied: view._move_cost(copied), cordon=cordon, out=out)
+
+    def _planning_state(self, target: ModelTarget) -> tuple[Any, ...]:
+        """What a plan depends on that can change while it runs. A change means planning again.
+
+        Free memory and link prices move all the time, and a plan a little behind them is still
+        a good plan. Who can take a stage, and what the target asks for, are not like that.
+        """
+        usable = frozenset(name for name in self.workers if self._usable(name))
+        route = tuple((stage.worker_id, stage.start_layer, stage.end_layer) for stage in self.route)
+        return usable, frozenset(self.access.cordoned), route, id(self.active), self.planning_model, self.model_id
+
+    @staticmethod
+    def _asked(target: ModelTarget) -> tuple[Any, ...]:
+        """What planning may change on a target, held by identity: another change to it means planning again."""
+        return tuple(getattr(target, name, None) for name in PLANNED_FIELDS)
+
+    def _planning_copy(
+        self, target: ModelTarget, cordon: set[str] | frozenset[str], out: set[str] | frozenset[str]
+    ) -> tuple[Orchestrator, ModelTarget, list[tuple[str, str, str]]]:
+        """A copy of this orchestrator, and of the target, that planning can read in a thread.
+
+        Everything planning reads that the loop changes in place is copied: the worker records,
+        the cordons, the route, the link prices and the measured rows. What the loop only ever
+        replaces whole, such as a worker's health or a target's holdings, is shared. Events the
+        plan raises are kept, to be told on the loop if its plan is used.
+        """
+        view = copy.copy(self)
+        view.workers = {name: copy.copy(record) for name, record in self.workers.items()}
+        for name in out:
+            if name in view.workers:
+                view.workers[name].quarantined = True
+        view.access = copy.copy(self.access)
+        view.access.cordoned = set(self.access.cordoned) | set(cordon)
+        view.access.revoked = set(self.access.revoked)
+        view.route = list(self.route)
+        view.links = dict(self.links)
+        view.row_readings = dict(self.row_readings)
+        view.pass_readings = {key: dict(value) for key, value in self.pass_readings.items()}
+        view.merge_limits = dict(self.merge_limits)
+        copied = copy.copy(target)
+        if target is self.active:
+            view.active = copied  # planning tells the running model apart by identity
+        notes: list[tuple[str, str, str]] = []
+        view.add_event = lambda kind, title, detail: notes.append((kind, title, detail))  # type: ignore[method-assign]
+        return view, copied, notes
+
+    async def off_loop(
+        self,
+        target: ModelTarget,
+        work: Callable[[Orchestrator, ModelTarget], Any],
+        *,
+        cordon: set[str] | frozenset[str] = frozenset(),
+        out: set[str] | frozenset[str] = frozenset(),
+    ) -> Any:
+        """Run planning work in a thread, on a copy of the pool and of the target.
+
+        A plan on a big pool takes seconds, and on the loop every reply, heartbeat and status
+        call waited for it. What the work changed on its copy of the target (slots, a dropped
+        draft) lands on the target only if the pool is as it was when the work began; if not,
+        it is planned again, PLAN_ATTEMPTS times at most, and then the latest plan goes ahead,
+        as any plan can be overtaken by a worker that leaves while it loads.
+        """
+        for attempt in range(1, PLAN_ATTEMPTS + 1):
+            before, asked = self._planning_state(target), self._asked(target)
+            view, copied, notes = self._planning_copy(target, cordon, out)
+            failure: BaseException | None = None
+            try:
+                result = await asyncio.to_thread(work, view, copied)
+            except Exception as exc:  # a refusal is a result too, and is checked like one
+                failure = exc
+            moved = self._planning_state(target) != before or any(now is not then for now, then in zip(self._asked(target), asked))
+            if moved and attempt < PLAN_ATTEMPTS:
+                continue
+            for name, then in zip(PLANNED_FIELDS, asked):
+                # Only what the work changed lands. Writing back the rest would undo a change the
+                # loop made meanwhile, such as slots a load settled while a cordon was priced.
+                if hasattr(copied, name) and getattr(copied, name) is not then:
+                    setattr(target, name, getattr(copied, name))
+            for kind, title, detail in notes:
+                self.add_event(kind, title, detail)
+            if failure is not None:
+                raise failure
+            return result
+        raise AssertionError("unreachable")
 
     async def move_off(self) -> None:
         """Carry out a cordon: replies finish first, and only that node's share moves."""
@@ -2067,8 +2268,13 @@ class Orchestrator:
 
         Slots are in every stage's signature, so changing them restarts stages. This
         decides once, and looks again only if the pool lost so much that nothing else
-        would hold the model.
+        would hold the model. The search plans many times, so it runs off the event loop.
         """
+        links = None if links is None else dict(links)
+        await self.off_loop(target, lambda view, copied: view.settle_slots(copied, preview=preview, links=links))
+
+    def settle_slots(self, target: ModelTarget, *, preview: bool = False, links: dict[tuple[str, str], float] | None = None) -> None:
+        """``choose_slots`` itself, which plans in a loop: run it on a planning copy, off the event loop."""
         if target.parallel.get("auto") and target.slots > 1 and self._route_or_none(target, links) is None:
             slots = target.slots
             with_slots(target, 1)
@@ -2088,7 +2294,7 @@ class Orchestrator:
         route = self._route_or_none(target, links)
         if route is None:
             return  # the plan that follows says why
-        target.parallel = await self._fit_slots(target, route, self.links if links is None else links)
+        target.parallel = self._fit_slots(target, route, self.links if links is None else links)
         if not preview:
             self.add_event("model", f"{target.slots} at once", target.parallel["reason"])
 
@@ -2146,7 +2352,7 @@ class Orchestrator:
             return MAX_PARALLEL
         return min(self.merge_limits.get((target.model_id, stage.worker_id), 0) for stage in route) + 1
 
-    async def _fit_slots(self, target: ModelTarget, route: list[StageAssignment], links: dict[tuple[str, str], float]) -> dict[str, Any]:
+    def _fit_slots(self, target: ModelTarget, route: list[StageAssignment], links: dict[tuple[str, str], float]) -> dict[str, Any]:
         """As many slots as the route wants and can hold, on the same workers, with no more spilled.
 
         Each slot's cache can push layers onto a slower device of the same workers, which spills
@@ -2172,9 +2378,8 @@ class Orchestrator:
         spilled = self.plan_memory(target, route)["spilled_bytes"]
         crowded: set[int] = set()  # counts that would fit, but on a route that wants fewer
 
-        async def judged(slots: int) -> dict[str, Any] | None:
+        def judged(slots: int) -> dict[str, Any] | None:
             """What the route at this many slots wants, if it holds them as it should."""
-            await asyncio.sleep(0)  # a plan on a big pool takes seconds, and heartbeats must not wait for several
             with_slots(target, slots)
             plan = self._route_or_none(target, links)
             if plan is None or {stage.worker_id for stage in plan} != workers or self.plan_memory(target, plan)["spilled_bytes"] > spilled:
@@ -2188,7 +2393,7 @@ class Orchestrator:
         low, high = 1, goal(chosen) + 1
         while high - low > 1:
             middle = (low + high) // 2
-            choice = await judged(middle)
+            choice = judged(middle)
             low, high, chosen = (middle, high, choice) if choice is not None else (low, middle, chosen)
         with_slots(target, low)
         trip = f"a {chosen['round_trip_ms']:.1f} ms round trip at {chosen['row_ms']:.1f} ms a row"
@@ -2202,6 +2407,12 @@ class Orchestrator:
         if low < goal(chosen):
             trip += f", and {low + 1} would put layers on slower devices" if low + 1 in crowded else f", and {low} fit in memory"
         return {"auto": True, "slots": low, **chosen, "reason": trip}
+
+    async def planned(self, target: ModelTarget, **options: Any) -> list[StageAssignment]:
+        """``plan_or_refuse`` off the event loop, on a copy of the pool."""
+        if "links" in options and options["links"] is not None:
+            options["links"] = dict(options["links"])
+        return await self.off_loop(target, lambda view, copied: view.plan_or_refuse(copied, **options))
 
     def plan_or_refuse(self, target: ModelTarget, **options: Any) -> list[StageAssignment]:
         try:
@@ -2518,7 +2729,7 @@ class Orchestrator:
             await self.refresh_holdings(target)
             await self.measure_links(row_bytes(target))
             await self.choose_slots(target)
-            route = self.plan_or_refuse(target)
+            route = await self.planned(target)
             job.route = route
             job.workers = {}
             job.phase = "fetching"
@@ -2561,14 +2772,7 @@ class Orchestrator:
         ]
         if not alive:
             return
-        held = {worker_id: self.workers[worker_id].quarantined for worker_id in alive}
-        for worker_id in alive:
-            self.workers[worker_id].quarantined = True
-        try:
-            moved = self._move_cost(target)
-        finally:
-            for worker_id, state in held.items():
-                self.workers[worker_id].quarantined = state
+        moved = await self.move_cost(target, out=set(alive))
         if moved is None or moved > REPLAN_MOVE_LIMIT_BYTES:
             size = "the model could not fit elsewhere" if moved is None else f"replanning would move {moved / 1024**3:.1f} GiB"
             raise HTTPException(status_code=503, detail=f"{', '.join(alive)} failed to load, and {size}: {failed}")
@@ -2609,7 +2813,7 @@ class Orchestrator:
             raise HTTPException(status_code=400, detail=f"could not load model: {exc}") from exc
         await self.refresh_worker_metrics()
         await self.refresh_holdings(target)
-        self.plan_or_refuse(target, honor_pins_strictly=True)  # a bad pin should fail now, loudly
+        await self.planned(target, honor_pins_strictly=True)  # a bad pin should fail now, loudly
         route = await self.deploy(target, job, generation_lock_held=False)
         self.add_event("model", "Model loaded", f"{request.model_id} across {len(route)} stage(s)")
         return route
@@ -2644,7 +2848,7 @@ class Orchestrator:
         assert self.active is not None
         while self._absent_from_route() and time.monotonic() < deadline:
             await self.refresh_holdings(self.active)
-            moved = self._move_cost(self.active)
+            moved = await self.move_cost(self.active)
             if moved is not None and moved <= REPLAN_MOVE_LIMIT_BYTES:
                 return
             await asyncio.sleep(WORKER_RETURN_CHECK_SECONDS)
@@ -3140,6 +3344,11 @@ class Orchestrator:
         add("epoch", self.epoch, "Current pipeline epoch")
         add("serving", 1 if self.route else 0, "Whether this node can serve replies")
         add("replies_in_flight", self.replies_in_flight, "Replies this node is running now")
+        add("event_loop_lag_seconds", round(self.loop_lag_seconds, 4), "How late the control plane's event loop last woke; replies and status wait as long")
+        add("event_loop_lag_worst_seconds", round(self.worst_loop_lag(), 4), "The latest the event loop woke in the last minute")
+        add("event_loop_stalls_total", self.loop_stalls, f"Times the event loop was held over {LOOP_LAG_LOG_SECONDS * 1000:.0f} ms", "counter")
+        if self.health_checked_at is not None:
+            add("health_age_seconds", round(max(time.time() - self.health_checked_at, 0.0), 2), "Age of the worker health status shows")
         add("coordinator", 1 if self.mesh and self.mesh.is_leader else 0, "Whether this node coordinates the pool")
         if self.mesh is not None:
             add("mesh_term", self.mesh.term, "Leadership term")
@@ -3459,6 +3668,10 @@ class Orchestrator:
             ),
             "epoch": self.epoch,
             "uptime_seconds": int(time.time() - self.started_at),
+            # Worker health comes from the last background check. Status never waits for one.
+            "health_checked_at": self.health_checked_at,
+            "health_age_seconds": None if self.health_checked_at is None else round(max(time.time() - self.health_checked_at, 0.0), 2),
+            "loop_lag_ms": {"last": round(self.loop_lag_seconds * 1000, 1), "worst_minute": round(self.worst_loop_lag() * 1000, 1), "held_over_250ms": self.loop_stalls},
             "route": [stage.model_dump() for stage in self.route],
             "links": [{"source": source, "target": target, **reading} for (source, target), reading in sorted(self.link_readings.items())],
             "cache_url": self.active_cache_url,
@@ -3485,6 +3698,13 @@ class Orchestrator:
         return exactness_of(self.active.exact, reports)
 
     async def probe(self, record: WorkerRecord) -> None:
+        loop = asyncio.get_running_loop()
+        if self.probe_slots is None or self.probe_slots[0] is not loop:
+            self.probe_slots = (loop, asyncio.Semaphore(MAX_PROBES_AT_ONCE))
+        async with self.probe_slots[1]:
+            await self._probe(record)
+
+    async def _probe(self, record: WorkerRecord) -> None:
         started = time.perf_counter()
         try:
             # The bound is on the whole probe. The client tries a refused connection again, and
@@ -3504,7 +3724,51 @@ class Orchestrator:
             record.health = {"status": "unreachable", "error": str(exc)}
 
     async def refresh_worker_metrics(self) -> None:
-        await asyncio.gather(*map(self.probe, self.workers.values()))
+        """Check the health of every worker still checking in.
+
+        A worker that stopped checking in is not asked: it is already shown offline, and each
+        call to it would wait out PROBE_SECONDS. One gone ten minutes, and on no route, is forgotten.
+        """
+        self.forget_silent_workers()
+        await asyncio.gather(*(self.probe(record) for record in list(self.workers.values()) if record.live))
+        self.health_checked_at = time.time()
+
+    def _kept_workers(self) -> set[str]:
+        """Workers a route names, running, loading or saved, which are never forgotten."""
+        kept = {stage.worker_id for stage in self.route}
+        if self.job is not None and self.job.finished_at is None:
+            kept |= {stage.worker_id for stage in self.job.route}
+        if self.saved_state is not None:
+            kept |= {str(item.get("worker_id")) for item in self.saved_state.get("route", []) if isinstance(item, dict)}
+        return kept
+
+    def forget_silent_workers(self) -> list[str]:
+        """Drop records of workers silent for FORGET_SECONDS that no route names.
+
+        A pool where nodes come and go would otherwise keep every one it ever saw, in status,
+        in metrics, and in each check. A forgotten worker that returns registers as new.
+        """
+        now = time.monotonic()
+        kept = self._kept_workers()
+        gone = [name for name, record in self.workers.items() if name not in kept and now - record.last_seen >= FORGET_SECONDS]
+        for name in gone:
+            record = self.workers.pop(name)
+            if record.quarantined or record.quarantine_count:
+                self.forgotten_quarantine[name] = (record.quarantined, record.quarantine_reason, record.quarantine_count)
+                while len(self.forgotten_quarantine) > MAX_FORGOTTEN_QUARANTINES:
+                    del self.forgotten_quarantine[next(iter(self.forgotten_quarantine))]
+            self.absent_since.pop(name, None)
+            if name in self.lost_from_route:
+                self.lost_from_route.discard(name)
+                self.forgotten_from_route[name] = None
+                while len(self.forgotten_from_route) > MAX_FORGOTTEN_QUARANTINES:
+                    del self.forgotten_from_route[next(iter(self.forgotten_from_route))]
+            self.need_reconfigure.discard(name)
+            for table in (self.links, self.links_checked, self.link_readings, self.ring_samples, self.ring_links, self.ring_passes, self.hops):
+                for pair in [pair for pair in table if name in pair]:
+                    del table[pair]
+            self.add_event("pool", f"{name} forgotten", f"Silent for {FORGET_SECONDS / 60:.0f} minutes and on no route")
+        return gone
 
 
 runtime = Orchestrator()
@@ -3930,7 +4194,7 @@ async def preview_plan(body: LoadModelRequest, authorization: str | None = Heade
     # running route's next repair, which would plan by another model's rows.
     links = await runtime.preview_links(row_bytes(target))
     await runtime.choose_slots(target, preview=True, links=links)
-    route = runtime.plan_or_refuse(target, honor_pins_strictly=True, links=links)
+    route = await runtime.planned(target, honor_pins_strictly=True, links=links)
     return {**describe_plan(target, route, links), "memory": runtime.plan_memory(target, route), "proposal": await runtime.propose_order(target)}
 
 
@@ -4143,7 +4407,7 @@ async def cordon_node(
 ) -> dict[str, str]:
     """Take a node out of service for maintenance, without dropping a reply."""
     caller = require_own_node(authorization, name)
-    cost = runtime.cost_of_losing(name)
+    cost = await runtime.cost_of_losing(name)
     if cost is None:
         raise HTTPException(status_code=409, detail=f"the rest of the pool cannot hold this model without {name}")
     if cost > REPLAN_MOVE_LIMIT_BYTES and not force:
@@ -4230,7 +4494,8 @@ async def lane_access(body: dict[str, Any], authorization: str | None = Header(d
 @app.get("/admin/status")
 async def status(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     verify_user(authorization)
-    await runtime.refresh_worker_metrics()
+    # Health comes from the background check. Asking every worker here held status for as long as
+    # the slowest one, PROBE_SECONDS for a dead one, and on every call.
     return runtime.status()
 
 
