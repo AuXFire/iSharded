@@ -227,7 +227,7 @@ def test_five_nodes_settle_join_leave_and_elect(tmp_path):
 
     It checks the harness measures what the code says should happen: gossip to every
     peer every 3 s, a check-in with every control plane every 5 s, a health probe of every
-    worker every 10 s, a link pass of N(N-1) probes, and one election when the coordinator dies.
+    worker every 5 s, a link pass of N(N-1) probes, and one election when the coordinator dies.
     """
     out = tmp_path / "scale-5.json"
     args = harness.parse_args([
@@ -253,7 +253,7 @@ def test_five_nodes_settle_join_leave_and_elect(tmp_path):
     # Three gossip rounds in 9 s, to four peers, give 1.33 calls a second; rounds also take time.
     assert 0.8 <= rates["out:gossip:calls"] <= 1.8
     assert 0.7 <= rates["out:checkin:calls"] <= 1.3  # five control planes every 5 s
-    assert 0.25 <= rates["out:health:calls"] <= 0.75  # five workers every 10 s
+    assert 0.6 <= rates["out:health:calls"] <= 1.3  # five workers every 5 s, from the background health check
     assert rates["total:out:failures"] == 0
     assert rates["total:out:bytes"] > 1000 and rates["total:in:bytes"] > 1000
     assert steady["fanout"]["gossip"]["max"] == 4

@@ -459,7 +459,7 @@ The [scale harness](OPERATIONS.md#scale-harness) runs N emulated nodes on one ma
 |---|---|---|---|---|---|---|
 | Machine CPU in the steady window | not recorded | 63% | 94% | 97% | Timed beside other lanes' runs (timing-lock fault on 2026-11-08). | 2026-11-08 |
 | Nodes per process | 1 | 2 | 2 | 4 | | 2026-11-08 |
-| Calls sent per node per second (the code's periods give (N-1)/3 + N/5 + N/10) | 5.83 (model 6.00) | 11.40 (12.33) | 11.70 (18.67) | 18.02 (31.33) | O(N) while the machine keeps up: slope 0.97 from 10 to 20. Timed beside other lanes' runs (timing-lock fault on 2026-11-08). | 2026-11-08 |
+| Calls sent per node per second (the code's periods then gave (N-1)/3 + N/5 + N/10; round seven's 5 s background health check makes it N/5 for probes) | 5.83 (model 6.00) | 11.40 (12.33) | 11.70 (18.67) | 18.02 (31.33) | O(N) while the machine keeps up: slope 0.97 from 10 to 20. Timed beside other lanes' runs (timing-lock fault on 2026-11-08). | 2026-11-08 |
 | Of those, gossip, check-in and health probe | 3.00, 2.00, 0.83 | 5.58, 4.00, 1.81 | 4.53, 4.89, 2.29 | 5.61, 9.12, 3.30 | Each O(N) by its fan-out. Timed beside other lanes' runs (timing-lock fault on 2026-11-08). | 2026-11-08 |
 | Fan-out: peers each node gossips to, control planes each worker checks in with, workers each control plane probes | 9, 10, 10 | 19, 20, 20 | 29, 30, 30 | 49, 50, 50 | O(N) each, so O(N^2) calls across the mesh | 2026-11-08 |
 | Bytes per call, both ways: gossip, check-in, health probe | 1,476, 735, 2,441 | 1,986, 985, 2,440 | 2,348, 1,229, 2,057 | 2,291, 1,520, 885 (many failed) | Gossip and check-in add about 45 and 25 bytes per node (each carries the member list); health stays flat | 2026-11-08 |

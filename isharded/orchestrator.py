@@ -1439,7 +1439,11 @@ class Orchestrator:
         return worst[0][1] if worst else 0.0
 
     async def maintenance_pass(self) -> None:
-        await self.refresh_worker_metrics()
+        # The background health check already asks every worker each HEALTH_SECONDS. Asking
+        # again here would double every worker's probes, so only a check that has fallen
+        # behind is made up for.
+        if self.health_checked_at is None or time.time() - self.health_checked_at >= HEALTH_SECONDS:
+            await self.refresh_worker_metrics()
         self.note_rows()
         if not self.coordinating:
             return

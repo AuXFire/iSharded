@@ -90,6 +90,18 @@ def test_status_shows_how_old_its_health_is(pool):
     assert 11.5 < pool.status()["health_age_seconds"] < 13.0
 
 
+def test_maintenance_asks_no_worker_the_background_check_just_asked(pool):
+    """Maintenance probed every worker too, so each was asked three times in ten seconds, not two."""
+    pool.workers = {"live": record("live")}
+    pool.client = Recorder()
+    pool.health_checked_at = time.time()
+    asyncio.run(pool.maintenance_pass())
+    assert pool.client.urls == []
+    pool.health_checked_at = time.time() - orchestrator_module.HEALTH_SECONDS - 1.0
+    asyncio.run(pool.maintenance_pass())
+    assert pool.client.urls == ["http://live:1/health"], "a check that fell behind is made up for"
+
+
 def test_a_health_check_asks_a_few_workers_at_a_time(pool):
     pool.workers = {f"w{index}": record(f"w{index}") for index in range(3 * orchestrator_module.MAX_PROBES_AT_ONCE)}
     pool.client = Recorder(delay=0.02)

@@ -17,18 +17,19 @@ from typing import Any
 
 # The code's own periods, for the model row: gossip to every peer every 3 s
 # (mesh.GOSSIP_SECONDS), a check-in from the worker to every control plane every
-# 5 s (worker.CHECK_IN_SECONDS), and a health probe of every worker every 10 s
-# (orchestrator.MAINTENANCE_SECONDS).
+# 5 s (worker.CHECK_IN_SECONDS), and a health probe of every worker every 5 s
+# (orchestrator.HEALTH_SECONDS; it was every 10 s, from maintenance, before round seven's
+# background health check, which is what the N=10 to 50 runs in docs/RESULTS.md ran).
 GOSSIP_SECONDS = 3.0
 CHECK_IN_SECONDS = 5.0
-PROBE_SECONDS = 10.0
+PROBE_SECONDS = 5.0
 
 METRICS: list[tuple[str, tuple[str, ...]]] = [
     ("calls sent /s per node", ("phases", "steady", "per_node", "total:out:calls", "mean")),
     ("  gossip", ("phases", "steady", "per_node", "out:gossip:calls", "mean")),
     ("  check-in", ("phases", "steady", "per_node", "out:checkin:calls", "mean")),
     ("  health probe", ("phases", "steady", "per_node", "out:health:calls", "mean")),
-    ("  model: (N-1)/3 + N/5 + N/10", ("model",)),
+    ("  model: (N-1)/3 + N/5 + N/5", ("model",)),
     ("calls received /s per node", ("phases", "steady", "per_node", "total:in:calls", "mean")),
     ("bytes sent /s per node", ("phases", "steady", "per_node", "total:out:bytes", "mean")),
     ("  gossip", ("phases", "steady", "per_node", "out:gossip:bytes", "mean")),
