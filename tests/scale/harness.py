@@ -179,6 +179,11 @@ class Pool:
     def live_hosts(self) -> dict[str, dict[str, Any]]:
         return {host: entry for host, entry in self.processes.items() if entry["process"].poll() is None}
 
+    def alone(self, name: str | None) -> bool:
+        """Whether a node runs in a process of its own, so it can be killed or frozen alone."""
+        host = self.host_of.get(name or "")
+        return host is not None and self.processes[host]["nodes"] == [name]
+
     def kill(self, name: str) -> float:
         entry = self.processes[self.host_of[name]]
         assert entry["nodes"] == [name], f"{name} shares a process and cannot be killed alone"
@@ -589,6 +594,10 @@ class Pool:
 
     async def kill_leader(self) -> dict[str, Any]:
         old = self.reports[self.leader]["leader"]
+        if not self.alone(old):
+            # Flapping views can elect a node that shares a process; killing that process
+            # would kill others too, so the phase says so instead of measuring something else.
+            return {"skipped": f"the coordinator ({old}) shares a process and cannot be killed alone"}
         old_term = self.reports[old]["term"]
         killed = self.kill(old)
         survivors = [name for name in self.members() if name != old]
@@ -610,6 +619,8 @@ class Pool:
     async def freeze_leader(self) -> dict[str, Any]:
         """Suspend the leader: it says nothing and answers nothing, then comes back unaware."""
         frozen_name = self.reports[self.members()[0]]["leader"]
+        if not self.alone(frozen_name):
+            return {"skipped": f"the coordinator ({frozen_name}) shares a process and cannot be frozen alone"}
         old_term = self.reports[frozen_name]["term"]
         frozen = self.suspend(frozen_name)
         others = [name for name in self.members() if name != frozen_name]
@@ -711,6 +722,10 @@ async def run(args: argparse.Namespace, nodes: int, save: Any = None) -> dict[st
         result["error"] = f"{type(exc).__name__}: {exc}"
         print(f"[N={nodes}] {result['error']}", flush=True)
     finally:
+        # Each phase counts the elections it caused; flapping views can also cause some
+        # between phases, which only the whole run's count shows.
+        result["elections_total"] = sum(len(report.get("takeovers", [])) for report in pool.reports.values())
+        result["stepdowns_total"] = sum(len(report.get("stepdowns", [])) for report in pool.reports.values())
         await pool.close()
     result["run_dir"] = str(pool.run_dir)
     return result

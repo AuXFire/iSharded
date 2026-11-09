@@ -417,7 +417,7 @@ The [scale harness](OPERATIONS.md#scale-harness) runs N emulated nodes on one ma
 | Join: every node sees the new one; its worker is live everywhere; every worker has its control plane | 3.0, 5.1, 7.2 s | 3.2, 5.3, 9.0 s | 3.8, 5.8, 11.4 s | Did not finish: the link pass just before it had split the mesh, so that pass now runs last | O(1), except check-ins, which grow slowly | 2026-11-08 |
 | Leave, process killed: every node drops it; its worker is dropped everywhere | 11.4, 14.4 s | 11.4, 11.9 s | 12.0, 10.9 s | | O(1): the 12 s peer and 15 s worker silences | 2026-11-08 |
 | Unplugged node, every call to it silent: every node drops it | 11.8 s (5 of 8 survivors had already dropped it falsely) | 12.1 s | 12.4 s | | O(1) | 2026-11-08 |
-| Coordinator killed: the rest agree on a new one | 18.0 s | 20.7 s | 20.9 s | | O(1) | 2026-11-08 |
+| Coordinator killed: the rest agree on a new one | 18.0 s | 20.7 s | 20.9 s, on n008 rather than n001: views had flapped, so n001 was missing from the list the lowest name is taken from, and by the freeze phase n001 led again through an election no phase counted | | O(1) | 2026-11-08 |
 | Coordinator suspended for 30 s: a new coordinator; one coordinator again after it resumed | 16.4 s, 1.3 s | 16.4 s, 15.9 s | 15.5 s, 5.2 s | | O(1) | 2026-11-08 |
 | Two halves cut apart for 30 s: the far half elects; one coordinator after healing | 28.5 s, 19.2 s | 28.2 s, 19.9 s | 28.5 s, 28.0 s (2 elections) | | O(1) | 2026-11-08 |
 

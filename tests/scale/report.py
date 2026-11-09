@@ -84,6 +84,7 @@ METRICS: list[tuple[str, tuple[str, ...]]] = [
     ("partition: far side leader s", ("phases", "partition", "far_side_leader_s")),
     ("partition: one leader after heal s", ("phases", "partition", "one_leader_after_heal_s")),
     ("partition: elections", ("phases", "partition", "elections")),
+    ("elections in the whole run, phases and between", ("elections_total",)),
 ]
 
 

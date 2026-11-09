@@ -174,6 +174,47 @@ def test_a_host_that_misses_a_post_is_tried_again(tmp_path, monkeypatch):
         asyncio.run(pool.close())
 
 
+def test_a_coordinator_sharing_a_process_is_skipped_not_killed_with_others(tmp_path):
+    pool = harness.Pool(harness.parse_args(["--nodes", "5", "--per-process", "2", "--run-dir", str(tmp_path)]), 5)
+
+    class Running:
+        def poll(self):
+            return None
+
+        def kill(self):
+            raise AssertionError("a shared process must not be killed")
+
+    try:
+        # Flapping views elected n002, which shares a process with n003.
+        pool.processes = {"h0": {"process": Running(), "nodes": ["n000"]}, "h1": {"process": Running(), "nodes": ["n002", "n003"]}}
+        pool.host_of = {"n000": "h0", "n002": "h1", "n003": "h1"}
+        pool.reports = {name: {"leader": "n002", "term": 2} for name in ("n000", "n002", "n003")}
+        assert pool.alone("n000") and not pool.alone("n002") and not pool.alone(None)
+        assert "skipped" in asyncio.run(pool.kill_leader())
+        assert "skipped" in asyncio.run(pool.freeze_leader())
+        assert not pool.down
+    finally:
+        pool.processes = {}
+        asyncio.run(pool.close())
+
+
+def test_elections_between_phases_are_counted(tmp_path, monkeypatch):
+    async def start(self):
+        # Two takeovers in all, though no phase claims either.
+        self.reports = {"n000": {"takeovers": [1.0], "stepdowns": []}, "n001": {"takeovers": [2.0], "stepdowns": [3.0]}}
+        return {"settled": True}
+
+    async def steady(self):
+        return {"measured": True}
+
+    monkeypatch.setattr(harness.Pool, "start", start)
+    monkeypatch.setitem(harness.PHASES, "steady", steady)
+    args = harness.parse_args(["--nodes", "5", "--phases", "steady", "--run-dir", str(tmp_path)])
+    result = asyncio.run(harness.run(args, 5))
+    assert result["elections_total"] == 2 and result["stepdowns_total"] == 1
+    assert report.pick(result, ("elections_total",)) == 2.0
+
+
 def test_a_repeated_phase_is_recorded_again():
     args = harness.parse_args(["--nodes", "5"])
     assert args.phases.count("steady") == 2
