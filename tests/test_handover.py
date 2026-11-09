@@ -179,6 +179,24 @@ def test_a_staged_switch_that_is_called_off_falls_back_to_the_usual_way(monkeypa
     assert calls == ["staged", "activate"]
 
 
+def test_a_staged_load_that_stalls_is_planned_around_and_not_tried_the_usual_way(monkeypatch):
+    """The usual way would take the old route down and wait out the same stall a second time."""
+    monkeypatch.setenv("ISHARDED_STAGED", "1")
+    orchestrator, calls = deploying(monkeypatch)
+    outcomes = [False, True]
+
+    async def activate_staged(target, route):
+        calls.append("staged")
+        if outcomes[0] is False:
+            orchestrator.staged_stalled = {"c": f"{orchestrator_module.STALLED}: nothing moved for 30 s"}
+        return outcomes.pop(0)
+
+    orchestrator._activate_staged = activate_staged
+    run(orchestrator.move_off())
+    assert calls == ["staged", "staged"]
+    assert orchestrator.workers["c"].quarantined
+
+
 def test_only_a_cordon_is_staged(monkeypatch):
     monkeypatch.setenv("ISHARDED_STAGED", "1")
     orchestrator, calls = deploying(monkeypatch, staged_result=True)
