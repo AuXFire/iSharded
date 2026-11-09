@@ -25,11 +25,23 @@ FAST_POOLS = {"vram", "unified"}
 INITIAL_GUESSES = 3
 # Ways of making tokens once a draft is loaded. See DraftChoice.
 PIPELINED, GUESSED, PLAIN = "pipelined", "guessed", "plain"
-# How many tokens a pipeline runs before the choice is looked at again.
+# How many tokens a pipeline runs before the choice is looked at again, and how long a trial runs.
 PIPELINE_STRETCH = 24
-# How many tokens go by between trials of the slower way, and how fast its rate adapts.
+# How many tokens go by between trials of a slower way at first, and how fast its rate adapts.
+# Each trial it loses doubles the gap, up to the most, so a way that keeps losing costs next to
+# nothing: on 3 A40s a 24-token pipelined trial every 96 tokens cost 6 of 44 ms a token. A trial
+# cut short was far behind, so its gap grows four times: on the laptop RTX 3060, doubling alone
+# left a pipeline at half plain's speed 4 trials in the first 906 tokens, 2.9% slower than plain.
 DRAFT_TRIAL_TOKENS = 96
+DRAFT_TRIAL_MOST = 4096
+DRAFT_TRIAL_GROWTH, DRAFT_TRIAL_CUT_GROWTH = 2, 4
 DRAFT_MEMORY = 0.9
+# A trial this far in that is already this many times slower than the way it is up against
+# stops there, and one halfway through that is still this far behind stops then. Ways closer
+# than that are worth the whole trial, since a few tokens cannot tell them apart.
+TRIAL_GLANCE = 6
+TRIAL_CUT = 1.5
+TRIAL_HALF_CUT = 1.2
 FEWEST_GUESSES = 2
 
 
@@ -404,8 +416,15 @@ class DraftChoice:
     Guessing is not always a win. On a mixture of experts each extra row reads more experts,
     so inside one site 4 rows cost about 3.4 times one row, and a draft ran at 70% of plain
     decoding. Across countries the network dominates, and the same draft ran 26% faster. So
-    this is measured and not configured, and the other ways get a short trial now and then,
-    because a route or a reply can change which one wins.
+    this is measured and not configured, and the other ways get a trial now and then, because
+    a route or a reply can change which one wins.
+
+    A trial runs ``PIPELINE_STRETCH`` tokens, or stops after ``TRIAL_GLANCE`` if it is already
+    ``TRIAL_CUT`` times slower, or halfway if it is still ``TRIAL_HALF_CUT`` times slower. Each
+    way keeps its own gap. A way that loses waits twice as long for its next trial, or four times
+    as long if its trial was cut short, up to ``DRAFT_TRIAL_MOST`` tokens, and one that wins halves its gap: on a GPU a lucky stretch of
+    text could win a pipeline one trial, and a full reset gave it a trial every 96 tokens again.
+    A new route starts a new choice. A way nothing has measured yet gets a trial first, plain decoding before the rest.
     """
 
     # Recent tokens and seconds, kept apart. Averaging each pass's rate would overrate
@@ -415,6 +434,18 @@ class DraftChoice:
     # When each way last had a turn, so trials go round.
     turns: dict[str, int] = field(default_factory=dict)
     since_trial: int = 0
+    # Tokens between each way's trials, doubled by each trial it loses and halved by each it wins.
+    gaps: dict[str, int] = field(default_factory=dict)
+    # The way on trial, and what it has made and taken so far.
+    trial: str | None = None
+    # The ways it is up against: those that could run when it started.
+    rivals: tuple[str, ...] = ()
+    trial_tokens: int = 0
+    trial_seconds: float = 0.0
+    # Trials won and lost, for status.
+    trials_won: int = 0
+    trials_lost: int = 0
+    trials_cut: int = 0
 
     def rate(self, way: str) -> float:
         return self.tokens[way] / self.seconds[way] if self.seconds.get(way) else 0.0
@@ -424,20 +455,71 @@ class DraftChoice:
 
     def pick(self, ways: Sequence[str]) -> str:
         """The way to make the next tokens. ``ways`` are what can run now, the likeliest first."""
-        for way in ways:
-            if not self.seconds.get(way):
-                return way
+        if self.trial in ways:
+            return self.trial
+        if len(ways) > 1:
+            # Plain decoding first, the last of the ways: it costs nothing against a load with no
+            # draft, and once it is measured a slow guessing way's first trial can stop at a glance.
+            for way in reversed(ways):
+                if not self.seconds.get(way):
+                    return self._start_trial(way, ways)
         best = self.best(ways)
-        others = [way for way in ways if way != best]
-        if self.since_trial < DRAFT_TRIAL_TOKENS or not others:
+        due = [way for way in ways if way != best and self.since_trial >= self.gap(way)]
+        if not due:
             return best
-        return min(others, key=lambda way: self.turns.get(way, 0))
+        return self._start_trial(min(due, key=lambda way: self.turns.get(way, 0)), ways)
+
+    def gap(self, way: str) -> int:
+        return self.gaps.get(way, DRAFT_TRIAL_TOKENS)
+
+    def _start_trial(self, way: str, ways: Sequence[str]) -> str:
+        self.trial, self.trial_tokens, self.trial_seconds = way, 0, 0.0
+        self.rivals = tuple(other for other in ways if other != way)
+        return way
+
+    def trial_left(self, way: str) -> int | None:
+        """How many tokens ``way`` should run before it is looked at again, if it is on trial."""
+        if way != self.trial:
+            return None
+        half = PIPELINE_STRETCH // 2
+        checks = [TRIAL_GLANCE, half, PIPELINE_STRETCH] if TRIAL_GLANCE < half else [TRIAL_GLANCE, PIPELINE_STRETCH]
+        return next(check for check in checks if check > self.trial_tokens) - self.trial_tokens
 
     def note(self, way: str, tokens: int, seconds: float) -> None:
         self.tokens[way] = self.tokens.get(way, 0.0) * DRAFT_MEMORY + tokens
         self.seconds[way] = self.seconds.get(way, 0.0) * DRAFT_MEMORY + max(seconds, 1e-6)
         self.turns[way] = max(self.turns.values(), default=0) + 1
-        self.since_trial = 0 if way != self.best(list(self.seconds)) else self.since_trial + tokens
+        if way != self.trial:
+            self.since_trial += tokens
+            return
+        self.trial_tokens += tokens
+        self.trial_seconds += max(seconds, 1e-6)
+        rival = max(map(self.rate, self.rivals), default=0.0)
+        own = self.trial_tokens / self.trial_seconds
+        cut = (self.trial_tokens >= TRIAL_GLANCE and own * TRIAL_CUT < rival) or (self.trial_tokens >= PIPELINE_STRETCH // 2 and own * TRIAL_HALF_CUT < rival)
+        if self.trial_tokens < PIPELINE_STRETCH and not cut:
+            return
+        # The trial is this way's rate now. What it measured before the gap may be long out of date.
+        self.tokens[way], self.seconds[way] = float(self.trial_tokens), self.trial_seconds
+        self.trial, self.since_trial = None, 0
+        self.trials_cut += cut
+        if own < rival:
+            self.trials_lost += 1
+            self.gaps[way] = min(self.gap(way) * (DRAFT_TRIAL_CUT_GROWTH if cut else DRAFT_TRIAL_GROWTH), DRAFT_TRIAL_MOST)
+        else:
+            self.trials_won += 1
+            self.gaps[way] = max(self.gap(way) // 2, DRAFT_TRIAL_TOKENS)
+
+    def report(self) -> dict[str, Any]:
+        """Each way's rate in tokens a second, and how trials have gone."""
+        return {
+            "rates": {way: round(self.rate(way), 2) for way in self.seconds},
+            "trial": self.trial,
+            "gaps": dict(self.gaps),
+            "won": self.trials_won,
+            "lost": self.trials_lost,
+            "cut": self.trials_cut,
+        }
 
 
 def next_guess_count(current: int, right: int, limit: int) -> int:

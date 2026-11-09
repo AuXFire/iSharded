@@ -1358,3 +1358,59 @@ def test_the_real_ollama_client_embeds(serving):
     client = ollama_library.Client(host="http://testserver")
     client._client = serving[0]
     assert len(client.embed(model="embed.gguf", input="hello").embeddings) == 1
+
+
+# --- What made a reply
+
+
+@pytest.fixture
+def fingerprinted(plain):
+    plain.node.active = SimpleNamespace(exact=False, request=None, manifest=SimpleNamespace(revision="r1"), embedding=False, projector=None, adapter=None)
+    return plain
+
+
+def test_every_api_says_what_made_a_reply(fingerprinted):
+    """OpenAI's replies have a field for it, and every API's replies carry the same in a header."""
+    node = fingerprinted.node
+    wanted = node.fingerprint()["id"]
+    assert re.fullmatch(r"fp_[0-9a-f]{12}", wanted)
+    chat = fingerprinted.client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]})
+    assert chat.json()["system_fingerprint"] == wanted and chat.headers["x-isharded-fingerprint"] == wanted
+    streamed = fingerprinted.client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}], "stream": True})
+    chunks = [json.loads(line[6:]) for line in streamed.text.split("\n") if line.startswith("data: {")]
+    assert chunks and all(chunk["system_fingerprint"] == wanted for chunk in chunks)
+    assert streamed.headers["x-isharded-fingerprint"] == wanted
+    for stream in (False, True):
+        completion = fingerprinted.client.post("/v1/completions", json={"prompt": "hi", "max_tokens": 4, "stream": stream})
+        assert completion.headers["x-isharded-fingerprint"] == wanted
+        if not stream:
+            assert completion.json()["system_fingerprint"] == wanted
+        answers = [
+            claude(fingerprinted, stream=stream),
+            fingerprinted.client.post("/v1/responses", json={"model": "scripted", "input": "hi", "stream": stream}),
+            fingerprinted.client.post("/api/chat", json={"model": "scripted", "messages": [{"role": "user", "content": "hi"}], "stream": stream}),
+            fingerprinted.client.post("/api/generate", json={"model": "scripted", "prompt": "hi", "stream": stream}),
+        ]
+        for answer in answers:
+            assert answer.status_code == 200, answer.text
+            assert answer.headers["x-isharded-fingerprint"] == wanted, answer.request.url
+
+
+def test_a_new_split_or_precision_gives_a_new_fingerprint_and_status_can_still_read_the_old(fingerprinted):
+    node = fingerprinted.node
+    first = node.fingerprint()
+    assert first["split"] == "0-1" and first["precision"] == "unknown" and first["exact"] is False
+    assert "llama.cpp" in first["build"]
+    node.route = [orchestrator.StageAssignment(worker_id="w", url="http://worker", start_layer=0, end_layer=1), orchestrator.StageAssignment(worker_id="v", url="http://other", start_layer=1, end_layer=2)]
+    node.workers = {"w": SimpleNamespace(health={"dtype": "bfloat16"}), "v": SimpleNamespace(health={"dtype": "float32"})}
+    second = node.fingerprint()
+    assert second["split"] == "0-1/1-2" and second["precision"] == "bf16/fp32" and second["id"] != first["id"]
+    assert node.fingerprint()["id"] == second["id"], "the same layout gives the same fingerprint"
+    assert [item["id"] for item in node.fingerprints.values()] == [first["id"], second["id"]]
+    assert "w" not in json.dumps(second["split"]), "a fingerprint names layers, not nodes"
+
+
+def test_no_route_means_no_fingerprint(plain):
+    assert plain.node.fingerprint() is None
+    answer = plain.client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]})
+    assert answer.json()["system_fingerprint"] is None and "x-isharded-fingerprint" not in answer.headers

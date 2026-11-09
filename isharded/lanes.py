@@ -305,6 +305,8 @@ class LaneDoor:
             response.aiter_raw(),
             status_code=response.status_code,
             media_type=response.headers.get("content-type"),
+            # What made the reply, which the other APIs' replies carry only here.
+            headers={name: response.headers[name] for name in ("x-isharded-fingerprint",) if name in response.headers},
             background=BackgroundTask(response.aclose),
         )
 

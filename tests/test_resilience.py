@@ -1993,6 +1993,41 @@ def test_lookup_alone_asks_for_guess_room_only_where_a_pipeline_can_run(monkeypa
     done(orchestrator)
 
 
+@pytest.mark.parametrize("found, told", [((True, True), True), ((True, False), False), ((False, True), False), ((True,), False)])
+def test_the_entry_hears_whether_every_stage_checks_guesses_in_one_pass_exactly(monkeypatch, found, told):
+    """Only the entry checks a draft's guesses, and it cannot see the other stages' probes."""
+    workers = {f"w{index + 1}": record(f"w{index + 1}") for index in range(len(found))}
+    orchestrator = pool(**workers)
+    orchestrator.tokenizer = object()
+    sent: list[tuple[str, dict]] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/internal/configure":
+            index = int(request.url.host[1:]) - 1
+            return httpx.Response(200, json={"status": "configured", "verify_exact": found[index]})
+        sent.append((request.url.host, json.loads(request.content or b"{}")))
+        return httpx.Response(200, json={})
+
+    orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(answer))
+    monkeypatch.setattr(orchestrator_module, "ConfigureRequest", MagicMock(return_value=MagicMock(model_dump=dict)))
+    orchestrator.save_state = lambda target: None
+    target = MagicMock()
+    target.adapter.supports_kv_snapshots = False
+    route = [StageAssignment(worker_id=name, url=f"http://{name}", start_layer=index, end_layer=index + 1) for index, name in enumerate(workers)]
+
+    async def scenario():
+        assert await orchestrator._activate(target, route) == {}
+        await asyncio.gather(*orchestrator.background, return_exceptions=True)
+        await orchestrator.client.aclose()
+
+    asyncio.run(scenario())
+    told_entry = [body for host, body in sent if host == "w1" and body.get("verify_exact") is True]
+    assert bool(told_entry) == told
+    if told:
+        assert told_entry == [{"epoch": orchestrator.epoch, "verify_exact": True}]
+    done(orchestrator)
+
+
 def test_a_new_route_is_ready_at_once_and_not_after_the_next_health_check(monkeypatch):
     """Each worker's last report is about the old epoch until the next check, ten seconds off."""
     orchestrator = pool(w1=record("w1", health={"status": "ok", "epoch": 3}))

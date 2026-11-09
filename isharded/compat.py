@@ -245,15 +245,22 @@ async def reply_items(response: Any, thoughts: ThoughtSplitter) -> AsyncIterator
         raise refuse("the reply stopped before it was finished", 503)
 
 
-async def reply(call: Callable[..., Any], request: Any, authorization: str | None, thoughts: bool = False) -> AsyncIterator[dict[str, Any]]:
-    """Run a request through its /v1 handler. A refusal is raised here, before any reply starts.
+# Headers a /v1 reply carries that every other API's reply carries too: what made the reply,
+# for APIs whose replies have no field for it.
+PASSED_HEADERS = ("x-isharded-fingerprint",)
+
+
+async def reply(call: Callable[..., Any], request: Any, authorization: str | None, thoughts: bool = False) -> tuple[AsyncIterator[dict[str, Any]], dict[str, str]]:
+    """Run a request through its /v1 handler, giving its items and the headers to pass on.
+    A refusal is raised here, before any reply starts.
 
     With ``thoughts``, a reply's reasoning arrives as ``thinking`` items, for APIs with a place for it.
     """
     response = await call(request.model_copy(update={"stream": True}), authorization)
     if response.status_code != 200:
         await whole_answer(response)
-    return reply_items(response, ThoughtSplitter(thoughts))
+    headers = {name: response.headers[name] for name in PASSED_HEADERS if name in response.headers}
+    return reply_items(response, ThoughtSplitter(thoughts)), headers
 
 
 def answering_model(node: Node, request: Any) -> str:
@@ -427,12 +434,12 @@ async def anthropic_reply(node: Node, request: Request, authorization: str | Non
     if not a_count(body.get("max_tokens")):
         raise refuse("max_tokens: a whole number above 0 is required")
     chat = translate(anthropic_chat, body)
-    items = await reply(node.chat, chat, authorization, thoughts=True)
+    items, headers = await reply(node.chat, chat, authorization, thoughts=True)
     show_thinking = (body.get("thinking") or {}).get("display") != "omitted"
     frame = {"id": f"msg_{uuid.uuid4().hex}", "type": "message", "role": "assistant", "model": answering_model(node, chat), "container": None, "diagnostics": None, "stop_details": None}
     if body.get("stream"):
         opening = {**frame, "content": [], "stop_reason": None, "stop_sequence": None, "usage": claude_usage({"prompt_tokens": 0, "completion_tokens": 0})}
-        return StreamingResponse(anthropic_stream(items, opening, show_thinking), media_type="text/event-stream")
+        return StreamingResponse(anthropic_stream(items, opening, show_thinking), media_type="text/event-stream", headers=headers)
     message, summary = await whole_reply(items)
     content: list[dict[str, Any]] = []
     if "thinking" in message:
@@ -442,7 +449,7 @@ async def anthropic_reply(node: Node, request: Request, authorization: str | Non
         content.append({"type": "text", "text": message["content"]})
     for call in message.get("tool_calls", []):
         content.append({"type": "tool_use", "id": call["id"], "name": call["function"]["name"], "input": json.loads(call["function"]["arguments"])})
-    return {**frame, "content": content, **stop_fields(summary), "usage": claude_usage(summary)}
+    return JSONResponse({**frame, "content": content, **stop_fields(summary), "usage": claude_usage(summary)}, headers=headers)
 
 
 async def anthropic_count(node: Node, request: Request, authorization: str | None) -> Any:
@@ -630,7 +637,7 @@ async def responses_stream(items: AsyncIterator[dict[str, Any]], frame: dict[str
 async def responses_reply(node: Node, request: Request, authorization: str | None) -> Any:
     body = await json_body(request)
     chat = translate(responses_chat, body)
-    items = await reply(node.chat, chat, authorization)
+    items, headers = await reply(node.chat, chat, authorization)
     frame = {
         "id": f"resp_{uuid.uuid4().hex}",
         "object": "response",
@@ -655,11 +662,11 @@ async def responses_reply(node: Node, request: Request, authorization: str | Non
         "usage": None,
     }
     if body.get("stream"):
-        return StreamingResponse(responses_stream(items, frame), media_type="text/event-stream")
+        return StreamingResponse(responses_stream(items, frame), media_type="text/event-stream", headers=headers)
     message, summary = await whole_reply(items)
     status = "incomplete" if summary["finish_reason"] == "length" else "completed"
     output = [message_item(f"msg_{uuid.uuid4().hex}", status, [output_text(message["content"])])] if message["content"] else []
-    return finished_response(frame, output + [call_item(call) for call in message.get("tool_calls", [])], summary)
+    return JSONResponse(finished_response(frame, output + [call_item(call) for call in message.get("tool_calls", [])], summary), headers=headers)
 
 
 # --- Ollama
@@ -799,12 +806,13 @@ async def ollama_stream(items: AsyncIterator[dict[str, Any]], frame: dict[str, A
 
 async def ollama_answer(node: Node, call: Any, request: Any, body: dict[str, Any], shape: Callable[..., dict[str, Any]], authorization: str | None) -> Any:
     started = time.perf_counter()
-    items = await reply(call, request, authorization, thoughts=isinstance(request, ChatCompletionRequest))
+    items, headers = await reply(call, request, authorization, thoughts=isinstance(request, ChatCompletionRequest))
     frame = {"model": answering_model(node, request)}
     if body.get("stream") is not False:  # Ollama streams unless told not to, and null tells it nothing
-        return StreamingResponse(ollama_stream(items, frame, shape, started), media_type="application/x-ndjson")
+        return StreamingResponse(ollama_stream(items, frame, shape, started), media_type="application/x-ndjson", headers=headers)
     message, summary = await whole_reply(items)
-    return {**frame, "created_at": ollama_time(), **shape(message["content"] or "", message.get("tool_calls", []), message.get("thinking", "")), **ollama_timing(summary, started)}
+    whole = {**frame, "created_at": ollama_time(), **shape(message["content"] or "", message.get("tool_calls", []), message.get("thinking", "")), **ollama_timing(summary, started)}
+    return JSONResponse(whole, headers=headers)
 
 
 async def ollama_load(node: Node, body: dict[str, Any], shape: Callable[..., dict[str, Any]], authorization: str | None) -> dict[str, Any]:

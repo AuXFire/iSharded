@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import itertools
 import json
 import os
 from pathlib import Path
@@ -21,7 +22,7 @@ from isharded import llama_host
 from isharded import orchestrator as orchestrator_module
 from isharded import worker as worker_module
 from isharded.engine import EngineClient, EngineRefusal, find_library, library_name, pass_frame
-from isharded.gguf_stage import DRAFT_TRIAL_TOKENS, GUESSED, PIPELINED, PLAIN, DraftChoice
+from isharded.gguf_stage import DRAFT_TRIAL_MOST, DRAFT_TRIAL_TOKENS, GUESSED, PIPELINE_STRETCH, PIPELINED, PLAIN, TRIAL_GLANCE, DraftChoice
 from isharded.orchestrator import Orchestrator
 from isharded.protocol import InferRequest, StageAssignment
 
@@ -891,20 +892,135 @@ def test_a_real_engine_refuses_a_stale_library_version_check(monkeypatch) -> Non
     assert library.isharded_engine_abi() == native.ABI_VERSION
 
 
-def test_a_draft_that_loses_is_set_aside_and_tried_again_later() -> None:
+def drive(choice: DraftChoice, ways: list[str], speeds: dict[str, float], tokens: int, per_pass: dict[str, int] | None = None) -> list[tuple[str, int]]:
+    """Runs ``tokens`` tokens through the choice as the worker does, each way at its speed in
+    tokens a second, and gives the runs of each way in order, as (way, tokens)."""
+    runs: list[tuple[str, int]] = []
+    made = 0
+    while made < tokens:
+        way = choice.pick(ways)
+        left = choice.trial_left(way)
+        step = (per_pass or {}).get(way, 1)
+        if way == PIPELINED:
+            step = PIPELINE_STRETCH if left is None else min(left, PIPELINE_STRETCH)
+        choice.note(way, step, step / speeds[way])
+        made += step
+        if runs and runs[-1][0] == way:
+            runs[-1] = (way, runs[-1][1] + step)
+        else:
+            runs.append((way, step))
+    return runs
+
+
+def test_each_way_gets_a_whole_trial_before_the_choice_settles_plain_first() -> None:
+    """Plain decoding costs nothing against a load with no draft, so it is measured first."""
     choice = DraftChoice()
-    ways = [GUESSED, PLAIN]
-    assert choice.pick(ways) == GUESSED  # each way gets a turn first
-    choice.note(GUESSED, 3, 0.15)  # 20 tokens/s
-    assert choice.pick(ways) == PLAIN
-    choice.note(PLAIN, 1, 0.036)  # 28 tokens/s
-    tokens = 0
-    while choice.pick(ways) == PLAIN:
-        choice.note(PLAIN, 1, 0.036)
-        tokens += 1
-    assert DRAFT_TRIAL_TOKENS - 8 <= tokens <= DRAFT_TRIAL_TOKENS  # time for a trial
-    choice.note(GUESSED, 3, 0.15)
-    assert choice.pick(ways) == PLAIN  # it lost again, so back to the faster way
+    runs = drive(choice, [GUESSED, PLAIN], {GUESSED: 24.0, PLAIN: 28.0}, 60, {GUESSED: 3})
+    assert runs[0] == (PLAIN, PIPELINE_STRETCH), "a first trial is not cut, since nothing is there to compare"
+    assert runs[1] == (GUESSED, PIPELINE_STRETCH), "close enough behind for the whole trial"
+    assert choice.best([GUESSED, PLAIN]) == PLAIN
+    assert choice.trials_won == 1 and choice.trials_lost == 1 and choice.gap(GUESSED) == 2 * DRAFT_TRIAL_TOKENS
+
+
+def test_a_slow_guessing_way_costs_a_glance_from_the_start() -> None:
+    choice = DraftChoice()
+    runs = drive(choice, [PIPELINED, PLAIN], {PIPELINED: 14.4, PLAIN: 27.6}, 60)
+    assert runs[:2] == [(PLAIN, PIPELINE_STRETCH), (PIPELINED, TRIAL_GLANCE)]
+
+
+def test_a_way_that_keeps_losing_closely_waits_twice_as_long_for_each_trial() -> None:
+    choice = DraftChoice()
+    runs = drive(choice, [PIPELINED, PLAIN], {PIPELINED: 25.0, PLAIN: 28.0}, 20000)
+    gaps = [tokens for way, tokens in runs if way == PLAIN][1:]
+    assert gaps[:6] == [192, 384, 768, 1536, 3072, 4096], "the first is the trial of plain itself, then each gap doubles"
+    assert set(gaps[6:-1]) == {DRAFT_TRIAL_MOST}, "it stops growing at the most"
+    assert set(tokens for way, tokens in runs if way == PIPELINED) == {PIPELINE_STRETCH} and choice.trials_cut == 0
+
+
+def test_a_way_far_behind_waits_four_times_as_long_for_each_trial() -> None:
+    """On 3 A40s the pipelined way lost every trial and still cost 6 of 44 ms a token, and on the
+    laptop RTX 3060 doubling alone still left default 2.9% slower than plain over 906 tokens."""
+    choice = DraftChoice()
+    runs = drive(choice, [PIPELINED, PLAIN], {PIPELINED: 14.4, PLAIN: 27.6}, 20000)
+    gaps = [tokens for way, tokens in runs if way == PLAIN][1:]
+    assert gaps[:3] == [384, 1536, 4096], "the first is the trial of plain itself, then each cut trial's gap grows four times"
+    assert set(gaps[3:-1]) == {DRAFT_TRIAL_MOST}, "it stops growing at the most"
+    trials = [tokens for way, tokens in runs if way == PIPELINED][1:]
+    assert set(trials) == {TRIAL_GLANCE}, "each trial that far behind stops after a glance"
+    starts = itertools.accumulate([0] + [tokens for _, tokens in runs])
+    early = [way for (way, _), start in zip(runs, starts) if start < 906]
+    assert early.count(PIPELINED) == 2, "two glances in the first 906 tokens, where doubling took four"
+    trial_tokens = sum(tokens for way, tokens in runs[2:] if way == PIPELINED)
+    assert trial_tokens / sum(tokens for _, tokens in runs[2:]) < 0.004
+
+
+def test_a_trial_close_behind_runs_its_whole_length() -> None:
+    choice = DraftChoice()
+    runs = drive(choice, [PIPELINED, PLAIN], {PIPELINED: 25.0, PLAIN: 28.0}, 400)
+    assert [tokens for way, tokens in runs if way == PIPELINED][1:2] == [PIPELINE_STRETCH]
+    assert choice.trials_cut == 0
+
+
+def test_a_trial_far_behind_is_cut_after_its_first_few_tokens() -> None:
+    choice = DraftChoice()
+    drive(choice, [PIPELINED, PLAIN], {PIPELINED: 30.0, PLAIN: 30.0}, 48)  # both measured, plain a hair ahead
+    choice.note(PLAIN, 10, 10 / 30.0)
+    choice.since_trial = choice.gap(PIPELINED)
+    assert choice.pick([PIPELINED, PLAIN]) == PIPELINED
+    assert choice.trial_left(PIPELINED) == TRIAL_GLANCE
+    choice.note(PIPELINED, TRIAL_GLANCE, TRIAL_GLANCE / 19.0)  # more than 1.5 times slower
+    assert choice.trial is None and choice.trials_cut == 1
+    assert choice.pick([PIPELINED, PLAIN]) == PLAIN
+
+
+def test_a_trial_that_wins_takes_over_and_the_old_way_is_tried_after_its_own_gap() -> None:
+    choice = DraftChoice()
+    drive(choice, [PIPELINED, PLAIN], {PIPELINED: 14.0, PLAIN: 28.0}, 3000)
+    assert choice.gap(PIPELINED) > 4 * DRAFT_TRIAL_TOKENS
+    runs = drive(choice, [PIPELINED, PLAIN], {PIPELINED: 40.0, PLAIN: 28.0}, 5000)  # the route changed under it
+    assert runs[0][0] == PLAIN and runs[1] == (PIPELINED, PIPELINE_STRETCH + DRAFT_TRIAL_TOKENS), "plain is tried again after the first gap"
+    assert runs[-1][0] == PIPELINED
+
+
+def test_a_lucky_win_halves_a_long_gap_and_does_not_start_it_again() -> None:
+    """On the laptop GPU a lucky stretch of text won a slow pipeline a trial now and then, and a
+    gap set back to 96 each time put 505 of 906 tokens on the slow way."""
+    choice = DraftChoice()
+    drive(choice, [PIPELINED, PLAIN], {PIPELINED: 14.0, PLAIN: 28.0}, 4000)
+    long = choice.gap(PIPELINED)
+    assert long >= 8 * DRAFT_TRIAL_TOKENS
+    choice.since_trial = long
+    drive(choice, [PIPELINED, PLAIN], {PIPELINED: 30.0, PLAIN: 28.0}, PIPELINE_STRETCH)  # one lucky trial
+    assert choice.trials_won >= 2 and choice.gap(PIPELINED) == long // 2
+
+
+def test_a_trial_still_behind_halfway_stops_there() -> None:
+    choice = DraftChoice()
+    runs = drive(choice, [PIPELINED, PLAIN], {PIPELINED: 22.0, PLAIN: 28.0}, 60)  # 1.27 times slower
+    assert runs[:2] == [(PLAIN, PIPELINE_STRETCH), (PIPELINED, PIPELINE_STRETCH // 2)]
+    assert choice.trials_cut == 1
+
+
+def test_a_trial_is_judged_on_what_it_measures_now() -> None:
+    """A way measured as slow long ago is not held back by those old figures once it is fast."""
+    choice = DraftChoice()
+    for _ in range(30):
+        choice.note(PIPELINED, 24, 24 / 10.0)
+    choice.note(PLAIN, 24, 24 / 28.0)
+    choice.since_trial = DRAFT_TRIAL_MOST
+    drive(choice, [PIPELINED, PLAIN], {PIPELINED: 32.0, PLAIN: 28.0}, PIPELINE_STRETCH)
+    assert choice.best([PIPELINED, PLAIN]) == PIPELINED
+    assert choice.rate(PIPELINED) == pytest.approx(32.0)
+
+
+def test_a_trial_waits_while_its_way_cannot_run() -> None:
+    choice = DraftChoice()
+    drive(choice, [GUESSED, PLAIN], {GUESSED: 20.0, PLAIN: 28.0}, 200, {GUESSED: 3})
+    choice.since_trial = DRAFT_TRIAL_MOST
+    assert choice.pick([GUESSED, PLAIN]) == GUESSED
+    assert choice.pick([PLAIN]) == PLAIN, "a temperature-0 reply may not check guesses in one pass"
+    choice.note(PLAIN, 1, 1 / 28.0)
+    assert choice.pick([GUESSED, PLAIN]) == GUESSED, "the trial goes on when it can"
 
 
 def test_a_draft_that_wins_is_kept_and_a_change_in_the_route_can_turn_it_around() -> None:
@@ -939,7 +1055,8 @@ def test_trials_go_round_every_way_that_is_losing() -> None:
         while (way := choice.pick(ways)) == PIPELINED:
             choice.note(PIPELINED, 24, 0.5)
         tried.append(way)
-        choice.note(way, 1, 0.1)
+        while choice.trial == way:
+            choice.note(way, 1, 0.1)
     assert sorted(tried) == sorted([GUESSED, PLAIN])
 
 
