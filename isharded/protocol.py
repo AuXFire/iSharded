@@ -22,7 +22,7 @@ from .deadlines import PASS_SECONDS, PASS_SECONDS_PER_TOKEN, pass_seconds  # noq
 META_HEADER = "x-isharded-meta"
 # Raised whenever workers and the orchestrator stop being able to talk safely.
 # A node on another version is refused at the door, not found out mid-request.
-PROTOCOL_VERSION = 8
+PROTOCOL_VERSION = 9
 # A NaN in BF16. PyTorch writes this one on x86 and 0x7FC0 on Apple chips. Either is a NaN,
 # and a row that holds one is broken whichever it is.
 BFLOAT16_NAN = np.uint16(0xFFFF)
@@ -383,6 +383,11 @@ class InferRequest(BaseModel):
     restore_kind: str | None = None
     # Which of a stage's sequences this reply uses, given out by the entry worker.
     slot: int = 0
+    # Which reply on that slot this pass belongs to: the entry gives each attempt at a reply
+    # a newer number than the last on its route, and every stage refuses anything older than
+    # what its slot holds, so a pass or restore held up somewhere can never land on the reply
+    # that came after it. Zero is from a sender that gives none.
+    slot_generation: int = 0
     # This pass is rows of a prompt, which cross between stages the same way however
     # many of them a restored state left to run.
     prompt_rows: bool = False

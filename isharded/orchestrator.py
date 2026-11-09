@@ -76,7 +76,7 @@ from .serving import MAX_STRANGER_BYTES, AddressLimit, BodyLimit, ChunkedRespons
 from .mesh import clean_url
 from .statements import Refused, Statements, make_statement
 from .tickets import PREFIX as TICKET_PREFIX, NodeTickets, TicketChecker, TicketIdentity, client_auth, make_checker, reply_audience
-from .tls import BEHALF, BEHALF_HEADER, FORWARD_MARK, INTERCEPTED, KEY_HELD, STATEMENT, intercepted, PEER, client_verify, node_proven, node_transport, stay_on_this_machine_async
+from .tls import BEHALF, BEHALF_HEADER, FORWARD_MARK, INTERCEPTED, KEY_HELD, STATEMENT, intercepted, PEER, client_verify, node_proven, node_transport, retire_keys, stay_on_this_machine_async
 from .tokenizer import ChatTokenizer, IncrementalText, load_tokenizer
 from .toolcalls import (
     MARKER_TOKENS,
@@ -862,6 +862,7 @@ class Orchestrator:
             identities=authority is not None,
             authority=authority,
         )
+        retire_keys(self.access.retired_keys)
         node_name = os.getenv("ISHARDED_NODE_ID") or socket.gethostname()
         self.audit = AuditLog(os.getenv("ISHARDED_AUDIT_FILE"), node_name)
         self.control_lock = asyncio.Lock()
@@ -899,7 +900,9 @@ class Orchestrator:
         self.join_limit = AddressLimit(JOIN_BURST, JOINS_PER_MINUTE)
         self.entry_limit = AddressLimit(WASTED_ENTRY_BURST, WASTED_ENTRIES_PER_MINUTE)
         self.round_trip_ms: dict[str, float] = {}
-        self.join_answers: dict[str, set[str]] = {}
+        # A person's answers, by name and key: approving one machine says nothing of another
+        # that later asks for the same name.
+        self.join_answers: dict[str, set[tuple[str, str]]] = {}
         self.last_audit: dict[str, Any] | None = None
         self.beacon: Any = None
         self.lane_name = os.getenv("ISHARDED_LANE") or None
@@ -1035,7 +1038,8 @@ class Orchestrator:
         return proof.startswith(TICKET_PREFIX) and self.reply_checker.name(proof) == reply.get("node_id")
 
     def apply_revocations(self) -> None:
-        """Act on revoked nodes, wherever the news came from."""
+        """Act on revoked nodes and retired keys, wherever the news came from."""
+        retire_keys(self.access.retired_keys)
         if self.mesh:
             self.mesh.forget(self.access.revoked)
         for worker_id, record in self.workers.items():
@@ -3818,6 +3822,7 @@ def pool_news() -> dict[str, Any]:
         "controls": sorted(runtime.mesh.alive().values()) if runtime.mesh else [],
         "revoked_nodes": sorted(runtime.access.revoked),
         "signed_revocations": runtime.access.signed_revocations(),
+        "signed_retirements": runtime.access.signed_retirements(),
     }
 
 
@@ -4025,9 +4030,26 @@ async def request_to_join(request: Request, body: dict[str, Any]) -> dict[str, s
         raise HTTPException(status_code=400, detail="node names are letters, digits, dots, dashes, and underscores")
     invite = {key: str(body[key])[:128] for key in INVITE_FIELDS if key in body}
     state = runtime.access.add_join_request(details, str(body["request"]), invite)
-    if state == "waiting":
+    replaces = runtime.access.replaced_by(details["name"], details["fingerprint"])
+    if state == "waiting" and replaces:
+        # The machine that lost its folder, or another one after its name. Only an invite or a
+        # person lets it in, and the owner sees which key it would retire.
+        runtime.add_event("security", "A member's name was asked for with a new key", f"{details['name']} from {details['addresses'][:2]}, new key {details['fingerprint']}, which would retire key {replaces}")
+    elif state == "waiting":
         runtime.add_event("security", "A node asked to join", f"{details['name']} from {details['addresses'][:2]}, key {details['fingerprint']}")
-    return {"status": state, "fingerprint": details["fingerprint"]}
+    return {"status": state, "fingerprint": details["fingerprint"], **({"replaces": replaces} if replaces and state == "waiting" else {})}
+
+
+def retiring(name: str, fingerprint: str) -> dict[str, Any]:
+    """What letting a request in would retire: the key a member of that name holds, and its API keys.
+
+    This node works it out from what the owner signed, so a request cannot name another's key.
+    """
+    replaces = runtime.access.replaced_by(name, fingerprint)
+    if replaces is None:
+        return {}
+    keys = sorted(hashed for hashed, caller in runtime.access.keys.items() if caller.name == f"{name}-user")
+    return {"retires": {"fingerprint": replaces, "keys": keys}}
 
 
 @app.get("/join/requests")
@@ -4035,7 +4057,17 @@ async def join_requests(authorization: str | None = Header(default=None)) -> dic
     verify_admin(authorization)
     runtime.access.expire_join_requests()
     # What a person decided stays on this machine, for the signer beside it to act on.
-    return {"requests": [{**held, "approved": name in runtime.join_answers.get("approve", ()), "denied": name in runtime.join_answers.get("deny", ())} for name, held in runtime.access.join_requests.items()]}
+    return {
+        "requests": [
+            {
+                **held,
+                **retiring(name, str(held.get("fingerprint"))),
+                "approved": (name, held.get("fingerprint")) in runtime.join_answers.get("approve", ()),
+                "denied": (name, held.get("fingerprint")) in runtime.join_answers.get("deny", ()),
+            }
+            for name, held in runtime.access.join_requests.items()
+        ]
+    }
 
 
 @app.post("/admin/join/{name}/{answer}")
@@ -4047,7 +4079,7 @@ async def answer_join(name: str, answer: str, authorization: str | None = Header
     authority_home("answer")
     if name not in runtime.access.join_requests:
         raise HTTPException(status_code=404, detail=f"{name} is not asking to join")
-    runtime.join_answers.setdefault(answer, set()).add(name)
+    runtime.join_answers.setdefault(answer, set()).add((name, str(runtime.access.join_requests[name].get("fingerprint"))))
     return {"status": answer}
 
 
@@ -4094,7 +4126,11 @@ async def add_access_entry(request: Request, body: dict[str, Any]) -> dict[str, 
     if len(runtime.access.signed) == held:
         runtime.entry_limit.charge(address)  # a repeat costs the same to check and changes nothing
         return {"status": "accepted"}
-    runtime.add_event("security", "Access list changed", str(body["entry"].get("type")))
+    entry = body["entry"]
+    if entry.get("type") == "retire_key":
+        runtime.add_event("security", "A node rejoined with a new key", f"{entry.get('name')}: key {entry.get('fingerprint')} is retired and proves nothing from now on")
+    else:
+        runtime.add_event("security", "Access list changed", str(entry.get("type")))
     runtime.apply_revocations()
     return {"status": "accepted"}
 

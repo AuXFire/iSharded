@@ -228,18 +228,25 @@ def test_asking_to_join_gives_up_at_the_deadline(monkeypatch: pytest.MonkeyPatch
 def test_waiting_for_an_answer_keeps_the_request_from_expiring(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from isharded import cli
 
+    from isharded.pool import approve_membership
+
+    authority = owner(tmp_path)
     asked: list[dict[str, str]] = []
-    looks = iter([httpx.Response(404), httpx.Response(200, json={"certificate": "c", "authority": "a"})])
+
+    def certificate() -> httpx.Response:
+        return httpx.Response(200, json={"certificate": approve_membership(str(authority), asked[0]["request"]), "authority": "a"})
+
+    looks = iter([lambda: httpx.Response(404), certificate])
 
     def post(url: str, **options: object) -> httpx.Response:
         asked.append(options["json"])  # type: ignore[arg-type]
-        return httpx.Response(200, json={"status": "waiting", "fingerprint": "f"})
+        return httpx.Response(200, json={"status": "waiting", "fingerprint": read_membership_request(asked[0]["request"])["fingerprint"]})
 
     monkeypatch.setattr(cli, "ASK_AGAIN_SECONDS", -1.0)
     monkeypatch.setattr(cli.time, "sleep", lambda _: None)
     monkeypatch.setattr(cli.httpx, "post", post)
-    monkeypatch.setattr(cli.httpx, "get", lambda *_, **__: next(looks))
-    args = argparse.Namespace(url="http://a:1", pool_command="request-join", dir=str(tmp_path), name="joiner", address=["100.64.0.2"], wait=True)
+    monkeypatch.setattr(cli.httpx, "get", lambda *_, **__: next(looks)())
+    args = argparse.Namespace(url="http://a:1", pool_command="request-join", dir=str(tmp_path / "joiner"), name="joiner", address=["100.64.0.2"], wait=True)
     assert cli.run_membership(args) == 0
     assert len(asked) == 2 and asked[0] == asked[1]
 
@@ -305,6 +312,28 @@ def test_a_machine_in_a_mesh_refuses_to_join_another(tmp_path: Path, monkeypatch
     args = type("Args", (), {"invite": "isi-x"})()
     assert up.run_up(args) == 1
     assert "already belongs" in capsys.readouterr().err
+
+
+def test_a_container_started_again_with_its_invite_starts_as_the_same_node(tmp_path: Path, monkeypatch, capsys) -> None:
+    """A container runs the same command each time; its folder on a volume already holds its place."""
+    monkeypatch.setenv("ISHARDED_UP_HOME", str(tmp_path))
+    (tmp_path / "ca.pem").write_text("MESH", encoding="utf-8")
+    up.write_settings(tmp_path, settings())
+    code = up.INVITE_PREFIX + up._encode(json.dumps({"urls": ["http://100.64.0.2:8209"], "authority": up.authority_hash("MESH"), "secret": "s"}).encode())
+    other = up.INVITE_PREFIX + up._encode(json.dumps({"urls": ["http://100.64.0.2:8209"], "authority": up.authority_hash("ELSE"), "secret": "s"}).encode())
+    assert up.same_mesh(tmp_path, code)
+    assert not up.same_mesh(tmp_path, other) and not up.same_mesh(tmp_path, "isi-x")
+    started: list[object] = []
+    monkeypatch.setattr(up, "become_member", lambda *a: started.append("joined again"))
+    monkeypatch.setattr(up, "start_in_background", lambda home, held, args: started.append(held["name"]) or 0)
+    again = type("Args", (), {"invite": code, "location": None, "reach_hosts": None, "background": True})()
+    assert up.run_up(again) == 0  # the same command as the first time starts the same node
+    assert started == ["first"]
+    capsys.readouterr()
+    started.clear()
+    args = type("Args", (), {"invite": other})()
+    assert up.run_up(args) == 1  # an invite to another mesh is still refused
+    assert "already belongs" in capsys.readouterr().err and not started
 
 
 def test_only_the_owners_machine_can_invite(tmp_path: Path, monkeypatch, capsys) -> None:

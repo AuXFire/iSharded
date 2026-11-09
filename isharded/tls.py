@@ -28,6 +28,9 @@ KEY_HELD: ContextVar[str | None] = ContextVar("isharded_key_held", default=None)
 STATEMENT: ContextVar[str | None] = ContextVar("isharded_statement", default=None)
 # The connection serving this request, for marking it as one a node holds.
 CONNECTION: ContextVar[Any] = ContextVar("isharded_connection", default=None)
+# Fingerprints of node keys the owner retired, in this process. A certificate for one still
+# checks out against the authority, so every place that takes a node's name looks here too.
+RETIRED_KEYS: set[str] = set()
 FORWARD_MARK = "x-isharded-forwarded"
 BEHALF_HEADER = "x-isharded-on-behalf"
 
@@ -149,3 +152,27 @@ def peer_name(certificate: dict[str, Any] | None) -> str | None:
             if key == "commonName":
                 return str(value)
     return None
+
+
+def retire_keys(fingerprints: Any) -> None:
+    """Add to this process's retired keys. Only ever more: a retirement is for good."""
+    RETIRED_KEYS.update(str(item) for item in fingerprints)
+
+
+def key_of_certificate(certificate: bytes | None) -> str | None:
+    """The fingerprint of the key in a verified certificate, in DER, if it can be read."""
+    if not certificate:
+        return None
+    try:
+        from .pool import certificate_fingerprint
+    except ImportError:
+        return None
+    try:
+        return certificate_fingerprint(certificate)
+    except ImportError:  # no cryptography here, so no authority, so nothing can be retired
+        return None
+
+
+def retired_certificate(certificate: bytes | None) -> bool:
+    """Whether a verified certificate, in DER, is for a key the owner retired."""
+    return bool(RETIRED_KEYS) and key_of_certificate(certificate) in RETIRED_KEYS

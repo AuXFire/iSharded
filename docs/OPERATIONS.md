@@ -224,6 +224,7 @@ Metrics worth alerting on:
 | Fetched shards | `--cache-dir` | Evicted by age past `--cache-budget-gb`. |
 | Stage files | Inside the cache | Rebuilt from shards when a stage moves. Count double the node's share. |
 | Saved prompt states | `states` inside the cache | People's conversations, unencrypted, readable only by the node's own user. Evicted past `--state-disk-gb`, and deleted when the model or the stage's layers change. |
+| Identity | `up` in the same folder, or `ISHARDED_UP_HOME` | The node's key and certificate, its chat key, and its settings. Lose it and the machine needs a new invite to rejoin under its name, which retires the old key. In a container, keep it on a volume. |
 
 The dashboard's "Memory for weights" counts weights only. Real use is higher: KV cache, compute buffers, a draft model, and each worker's own GPU context.
 

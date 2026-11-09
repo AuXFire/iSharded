@@ -27,7 +27,7 @@ from typing import Any
 
 import numpy as np
 
-ABI_VERSION = 5
+ABI_VERSION = 6
 MAGIC = 0x5369
 WIRE_VERSION = 3
 HEADER = struct.Struct("<HBBI")
@@ -79,6 +79,7 @@ SIGNATURES: dict[str, tuple[list[Any], Any]] = {
     "unlock": ([C.c_void_p], None),
     "close_ring": ([C.c_void_p], None),
     "forget": ([C.c_void_p, C.c_int32], None),
+    "begin": ([C.c_void_p, C.c_uint32, C.c_uint64], None),
     "capture_read": ([C.c_void_p, C.c_void_p, C.c_size_t], C.c_size_t),
     "attach": ([C.c_void_p, C.POINTER(StageApi)], None),
     "listen": ([C.c_void_p, C.c_char_p, C.c_uint16, C.c_char_p, C.c_size_t], C.c_int32),
@@ -186,6 +187,13 @@ class Engine:
     def forget(self, slot: int | None) -> None:
         """A slot's history changed, so what its rewinds could go back to is wrong. None means every slot."""
         self.lib.isharded_engine_forget(self.handle, -1 if slot is None else slot)
+
+    def begin(self, slot: int, generation: int) -> None:
+        """A slot now holds this reply. Passes of any other still on their way to it are dropped.
+
+        The caller holds the engine's lock, so no pass is running while this changes.
+        """
+        self.lib.isharded_engine_begin(self.handle, slot, generation & (2**64 - 1))
 
     def capture_begin(self) -> None:
         self.lib.isharded_engine_capture_begin(self.handle)
@@ -402,8 +410,12 @@ class EngineClient:
         self.next_id += 1
         future: asyncio.Future[list[int]] = asyncio.get_running_loop().create_future()
         slot = fields["slot"]
+        given = fields.pop("generation", 0)
         generation = self.generations.get(slot)
-        if generation is None:
+        if given and given != generation:
+            # The entry's own number for this reply, the one its restores and first pass carried.
+            generation = self.generations[slot] = given
+        elif generation is None:
             generation = self.generations[slot] = secrets.randbits(64) or 1  # zero means every pass
         self.waiting[identity] = Flight(future, slot, generation, time.perf_counter())
         self.newest[slot] = future

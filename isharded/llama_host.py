@@ -368,6 +368,10 @@ def serve(connection: Connection, host: _Host, address: Any, key: bytes) -> None
             try:
                 if engine is not None and operation in NEW_HISTORY:
                     engine.forget(meta.get("slot"))
+                    if meta.get("generation") and meta.get("slot") is not None:
+                        # The slot is a new reply's now. Passes of the one before it that are
+                        # still on their way here are dropped, not run on this reply's state.
+                        engine.begin(int(meta["slot"]), int(meta["generation"]))
                 answer, data = getattr(host, operation)(meta, payload)
             finally:
                 if engine is not None:

@@ -211,7 +211,9 @@ def test_a_stage_asked_to_restore_ahead_answers(node):
     node.gate, node.take_restore = SimpleNamespace(size=2), take_restore
     body = {"key": "abc", "session_id": "s", "slot": 1, "epoch": 3, "length": 10}
     assert client().post("/internal/state/restore", json=body, headers=token()).json() == {"restored": True}
-    assert asked == [("s", 3, 1, "abc", 10)]
+    # A sender that gives no generation is taken as before, with zero.
+    assert client().post("/internal/state/restore", json={**body, "generation": 42}, headers=token()).json() == {"restored": True}
+    assert asked == [("s", 3, 1, "abc", 10, 0), ("s", 3, 1, "abc", 10, 42)]
 
 
 def test_the_index_says_what_this_stage_can_restore(node):

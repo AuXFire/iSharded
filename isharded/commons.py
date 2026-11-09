@@ -216,7 +216,7 @@ class CommonsChecker(TicketChecker):
         self.commons = Commons(folder)
         self.audiences = audiences
         self.clock = clock
-        self.known: dict[str, tuple[float, str]] = {}
+        self.known: dict[str, tuple[float, str, str]] = {}
 
     def check_issuer(self, certificate: Any) -> None:
         _self_made(certificate)

@@ -254,14 +254,18 @@ class GgufStage:
     def truncate(self, keep: int, slot: int = 0) -> None:
         self.host.call("truncate", keep=keep, slot=slot)
 
-    def restore(self, key: str, slot: int = 0) -> str:
-        """Put a saved state on a sequence, and say which tier it came from."""
-        answer, _ = self.host.call("restore", key=key, slot=slot)
+    def restore(self, key: str, slot: int = 0, generation: int = 0) -> str:
+        """Put a saved state on a sequence, and say which tier it came from.
+
+        A generation says which reply the sequence now belongs to, so the engine drops
+        anything of an older reply's still on its way to it.
+        """
+        answer, _ = self.host.call("restore", key=key, slot=slot, generation=generation)
         self.states = answer.get("states", self.states)
         return answer["tier"]
 
-    def clear(self, slot: int = 0) -> None:
-        self.host.call("clear", slot=slot)
+    def clear(self, slot: int = 0, generation: int = 0) -> None:
+        self.host.call("clear", slot=slot, generation=generation)
 
     def ring_call(self, operation: str, **meta: Any) -> dict[str, Any]:
         return self.host.call(operation, **meta)[0]

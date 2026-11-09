@@ -1,6 +1,7 @@
 """Reusing prompts: where they are cut, what is saved, and what happens when a state is gone."""
 
 import asyncio
+import itertools
 import json
 import os
 import threading
@@ -202,7 +203,7 @@ def fake_entry(monkeypatch, results):
     runtime = SimpleNamespace(
         assignment=SimpleNamespace(start_layer=0), waiting=0, gate=Gate(), epoch=1, gguf=object(), draft=None, speculate_tokens=0,
         prompt_cache=True, prefix=PrefixIndex(), slot_used_at={}, state_misses=0, last_error=None, lock=asyncio.Lock(),
-        choose_slot=min, _record=lambda *args: None, ring_ready=lambda request: False, caches={}, _prepare_entry=lambda request, part: request, passes=[], prepared=[], can_fetch=True, pipes={}, route=[],
+        choose_slot=min, new_generation=itertools.count(1).__next__, _record=lambda *args: None, ring_ready=lambda request: False, caches={}, _prepare_entry=lambda request, part: request, passes=[], prepared=[], can_fetch=True, pipes={}, route=[],
     )
 
     async def sync_index():
@@ -295,7 +296,7 @@ def test_other_failures_still_reach_the_control_plane(monkeypatch):
 
 def test_a_stage_that_lost_a_state_says_which_one(monkeypatch):
     class Stage:
-        def restore(self, key, slot):
+        def restore(self, key, slot, generation=0):
             raise LlamaError("no saved state")
 
     runtime = worker.WorkerRuntime.__new__(worker.WorkerRuntime)
@@ -309,7 +310,7 @@ def test_a_stage_that_lost_a_state_says_which_one(monkeypatch):
 
 def test_restored_tokens_are_counted_by_where_they_came_from():
     class Stage:
-        def restore(self, key, slot):
+        def restore(self, key, slot, generation=0):
             return "disk"
 
     runtime = worker.WorkerRuntime.__new__(worker.WorkerRuntime)
@@ -923,16 +924,18 @@ class Slots:
     """A stage's llama.cpp sequences, as far as restoring goes."""
 
     def __init__(self, held=("k",)):
-        self.held, self.calls = set(held), []
+        self.held, self.calls, self.generations = set(held), [], []
 
-    def restore(self, key, slot):
+    def restore(self, key, slot, generation=0):
         self.calls.append(("restore", key, slot))
+        self.generations.append(generation)
         if key not in self.held:
             raise LlamaError(f"no saved state {key} here")
         return "ram"
 
-    def clear(self, slot):
+    def clear(self, slot, generation=0):
         self.calls.append(("clear", slot))
+        self.generations.append(generation)
 
 
 def later_stage(slots=None):
@@ -1000,12 +1003,65 @@ def test_a_restore_for_another_route_or_a_lost_stage_is_refused():
     assert runtime.gguf.calls == []
 
     class Lost(Slots):
-        def restore(self, key, slot):
+        def restore(self, key, slot, generation=0):
             raise StageLost("the stage process is gone")
 
     runtime = later_stage(Lost())
     with pytest.raises(StageLost):
         asyncio.run(runtime.take_restore("s", 1, 0, "k", 10))
+
+
+def test_a_restore_held_up_until_the_slot_has_a_newer_reply_is_refused():
+    """The late restore that once overwrote another reply's slot on the native ring.
+
+    A frozen stage held reply A's restore while A failed and gave up its slot. Reply B took
+    the slot and its first pass ran here. Then A's restore landed: before slot generations it
+    replaced B's state, and B's next passes, on the ring where no stage looks at sessions,
+    ran on A's conversation.
+    """
+    runtime = later_stage(Slots(held=("a-state", "b-state")))
+    b = first_pass("b", "b-state", 20).model_copy(update={"slot_generation": 200})
+    runtime._session(b)
+    assert not asyncio.run(runtime.take_restore("a", 1, 0, "a-state", 10, generation=100))
+    assert runtime.gguf.calls == [("restore", "b-state", 0)], "B's state was never touched"
+    assert runtime.caches["b"].began == ("b-state", 20)
+    assert runtime.stale_refused == 1
+
+
+def test_a_pass_held_up_until_the_slot_has_a_newer_reply_is_refused():
+    runtime = later_stage(Slots(held=("a-state", "b-state")))
+    runtime._session(first_pass("b", "b-state", 20).model_copy(update={"slot_generation": 200}))
+    late = first_pass("a", "a-state", 10).model_copy(update={"slot_generation": 100, "reset": True, "restore_length": None, "checkpoint_key": None})
+    with pytest.raises(HTTPException) as caught:
+        runtime._session(late)
+    assert caught.value.detail["retry"]
+    assert runtime.gguf.calls == [("restore", "b-state", 0)]
+
+
+def test_a_reply_tells_the_stage_its_generation_when_it_takes_the_slot():
+    runtime = later_stage(Slots(held=("k",)))
+    assert asyncio.run(runtime.take_restore("s", 1, 0, "k", 10, generation=300))
+    runtime._session(first_pass().model_copy(update={"slot_generation": 300}))
+    runtime._session(first_pass("t", "k", 10, slot=1).model_copy(update={"slot_generation": 301, "reset": True, "restore_length": None, "checkpoint_key": None}))
+    assert runtime.gguf.generations == [300, 301]
+
+
+def test_a_newer_reply_and_a_new_route_both_take_the_slot():
+    runtime = later_stage(Slots(held=("k",)))
+    assert runtime.claims(0, 100, 1) and runtime.claims(0, 100, 1), "the same reply again"
+    assert runtime.claims(0, 200, 1)
+    assert not runtime.claims(0, 150, 1)
+    assert runtime.claims(0, 5, 2), "numbers from another route are not compared"
+    assert runtime.claims(0, 0, 2), "a sender that gives none is taken as before"
+    assert runtime.claims(1, 1, 2), "each slot keeps its own"
+
+
+def test_every_attempt_at_a_reply_gets_a_newer_number():
+    runtime = later_stage()
+    numbers = [runtime.new_generation() for _ in range(1000)]
+    assert numbers == sorted(set(numbers))
+    runtime.last_generation = numbers[-1] + 10**15  # as after the clock stepped back
+    assert runtime.new_generation() > numbers[-1] + 10**15
 
 
 def test_a_reply_has_every_later_stage_restore_at_once_and_waits_for_them(monkeypatch):
@@ -1059,9 +1115,9 @@ def test_restore_ahead_goes_to_every_stage_but_this_one():
 
     async def run():
         runtime.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        await runtime.restore_ahead(first_pass(length=300))
+        await runtime.restore_ahead(first_pass(length=300).model_copy(update={"slot_generation": 7}))
         await runtime.client.aclose()
 
     asyncio.run(run())
     assert sorted(host for host, _ in seen) == ["w2", "w3"]
-    assert seen[0][1] == {"session_id": "s", "epoch": 1, "slot": 0, "key": "k", "length": 300}
+    assert seen[0][1] == {"session_id": "s", "epoch": 1, "slot": 0, "key": "k", "length": 300, "generation": 7}

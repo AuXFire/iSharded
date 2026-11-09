@@ -26,7 +26,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from .tls import PEER
+from .tls import PEER, RETIRED_KEYS
 
 PREFIX = "smn-"
 # On a request: who it is for, when that is not who the URL names.
@@ -92,16 +92,17 @@ class TicketChecker:
         self.authority = x509.load_pem_x509_certificate(Path(authority_path).read_bytes())
         self.audiences = audiences
         self.clock = clock
-        self.known: dict[str, tuple[float, str]] = {}
+        self.known: dict[str, tuple[float, str, str]] = {}
 
     def name(self, ticket: str) -> str | None:
         """The verified node name in a ticket, if it is good for this node right now."""
         now = self.clock()
         known = self.known.get(ticket)
         if known:
-            return known[1] if known[0] > now else None
+            # A key retired after its ticket was checked counts for nothing from then on.
+            return known[1] if known[0] > now and known[2] not in RETIRED_KEYS else None
         verified = self._verify(ticket, now)
-        if verified is None:
+        if verified is None or verified[2] in RETIRED_KEYS:
             return None
         if len(self.known) >= MAX_REMEMBERED:
             self.known = {key: value for key, value in self.known.items() if value[0] > now}
@@ -111,12 +112,14 @@ class TicketChecker:
     def check_issuer(self, certificate: Any) -> None:
         certificate.verify_directly_issued_by(self.authority)
 
-    def _verify(self, ticket: str, now: float) -> tuple[float, str] | None:
+    def _verify(self, ticket: str, now: float) -> tuple[float, str, str] | None:
         from cryptography import x509
         from cryptography.exceptions import InvalidSignature
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import ec
         from cryptography.x509.oid import NameOID
+
+        from .pool import key_fingerprint
 
         try:
             body_text, signature_text = ticket[len(PREFIX) :].split(".")
@@ -134,7 +137,7 @@ class TicketChecker:
                 return None
             certificate.public_key().verify(_decode(signature_text), body, ec.ECDSA(hashes.SHA256()))
             names = certificate.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
-            return expires, str(names[0].value)
+            return expires, str(names[0].value), key_fingerprint(certificate.public_key())
         except (InvalidSignature, KeyError, IndexError, TypeError, ValueError):
             return None
 

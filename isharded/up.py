@@ -45,7 +45,7 @@ from .inventory import ram
 from .node import add_node_arguments, detect_address, run_node
 from .optional import has_torch
 from .tls import OWN_ADDRESS, stay_on_this_machine
-from .pool import _private_link, _write_private, add_node, approve_membership, bearer_headers, home as pool_home, init_pool, request_membership, sign_entry
+from .pool import _private_link, _write_private, add_node, admission_entries, bearer_headers, home as pool_home, init_pool, request_membership, sign_entry
 from .statements import VERIFIER_LENGTH, key_verifier
 from .tickets import _decode, _encode
 
@@ -134,6 +134,14 @@ def authority_hash(pem: str) -> str:
     return hashlib.sha256(pem.replace("\r\n", "\n").strip().encode()).hexdigest()
 
 
+def same_mesh(home: Path, code: str) -> bool:
+    """Whether an invite is for the mesh this folder already belongs to."""
+    try:
+        return authority_hash((home / "ca.pem").read_text(encoding="utf-8")) == read_invite(code).get("authority")
+    except (OSError, ValueError):
+        return False
+
+
 def read_invites(home: Path) -> list[dict[str, Any]]:
     try:
         return json.loads((home / "invites.json").read_text(encoding="utf-8"))
@@ -215,8 +223,8 @@ def approve_invited(home: Path, client: httpx.Client, base: str, key: str, clock
         if invite is None and not item.get("approved"):
             announce_waiting(name, item)
             continue
-        certificate = approve_membership(str(home), str(item["request"]))
-        client.post(base + "/access/entries", json=sign_entry(str(home), {"type": "member", "name": name, "certificate": certificate}))
+        for entry in admission_entries(str(home), item):
+            client.post(base + "/access/entries", json=sign_entry(str(home), entry))
         key_hash = str(item.get("key_sha256", ""))
         if re.fullmatch(r"[0-9a-f]{64}", key_hash):
             entry = {"type": "key", "name": f"{name}-user", "role": "user", "sha256": key_hash, "requests_per_minute": 0}
@@ -301,21 +309,29 @@ def join_mesh(home: Path, invite: dict[str, Any], name: str, address: str) -> st
         state = answer.json().get("status")
         if state in {"refused", "busy"}:
             raise ValueError("this mesh refused this machine" if state == "refused" else "too many machines are waiting; try again soon")
+        replaces = answer.json().get("replaces")
+        if replaces:
+            # A machine that lost its folder comes back under its name like this. So would a
+            # different machine taking the name, which is why it needs an invite or a person.
+            print(f"{name} is already a member, with key {replaces}. Joining with this new key retires that one.", flush=True)
         if secret:
             print(f"Asked to join as {name}. Waiting for the owner's machine to sign.", flush=True)
         else:
             print(f"Asked to join as {name}. Approve it on the mesh's dashboard, checking the key shown there is {answer.json().get('fingerprint')}.", flush=True)
         deadline = time.monotonic() + (APPROVAL_WAIT_SECONDS if secret else PERSON_WAIT_SECONDS)
+        old = False
         while time.monotonic() < deadline:
             found = client.get(f"{url}/join/certificate/{name}")
             if found.status_code == 200:
                 certificate = found.json()["certificate"]
-                if not certificate_matches_key(certificate, home / f"{name}.key"):
-                    raise ValueError(f"another machine already uses the name {name}; run again with --name")
-                (home / f"{name}.pem").write_text(certificate, encoding="utf-8")
-                _write_private(home / "user.key", key.encode())
-                return url
+                if certificate_matches_key(certificate, home / f"{name}.key"):
+                    (home / f"{name}.pem").write_text(certificate, encoding="utf-8")
+                    _write_private(home / "user.key", key.encode())
+                    return url
+                old = True  # the name's certificate before the owner answers, for the key it had
             time.sleep(2.0)
+    if old:
+        raise ValueError(f"another machine holds the name {name} and nobody let this one take it over. Use an invite, have the owner approve it, or run again with --name")
     raise ValueError("nobody signed this request. The owner's machine must be running, and an invite only works while it lasts")
 
 
@@ -658,7 +674,11 @@ def run_up(args: argparse.Namespace) -> int:
     settings = read_settings(home)
     is_new = settings is None
     try:
-        if args.invite:
+        if args.invite and settings and same_mesh(home, args.invite):
+            # A container started with the same command each time: its folder on a volume
+            # already holds its place, so the invite is not used again.
+            print(f"This machine already belongs to this mesh, kept in {home}, so the invite is not needed.")
+        elif args.invite:
             if settings:
                 print(f"This machine already belongs to a mesh, kept in {home}. Remove that folder to join another.", file=sys.stderr)
                 return 1
