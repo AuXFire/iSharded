@@ -562,7 +562,7 @@ def control(monkeypatch):
 
     monkeypatch.setattr(runtime, "model_id", "see.gguf")
     monkeypatch.setattr(runtime, "tokenizer", Words())
-    monkeypatch.setattr(runtime, "route", [SimpleNamespace(url="http://entry:1", worker_id="w")])
+    monkeypatch.setattr(runtime, "route", [SimpleNamespace(url="http://entry:1", worker_id="w", start_layer=0, end_layer=2)])
     monkeypatch.setitem(runtime.workers, "w", SimpleNamespace(live=True, quarantined=False, health=None))
     monkeypatch.setattr(runtime, "epoch", 4)
     active = SimpleNamespace(
@@ -573,6 +573,9 @@ def control(monkeypatch):
         profile=SimpleNamespace(context_tokens=24),
         speculate_tokens=0,
         lookup_guesses=0,
+        request=None,
+        manifest=SimpleNamespace(revision="r1"),
+        exact=False,
     )
     monkeypatch.setattr(runtime, "active", active)
     monkeypatch.setattr(runtime, "client", httpx.AsyncClient(transport=httpx.MockTransport(entry)))
