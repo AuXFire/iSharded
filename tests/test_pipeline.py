@@ -1377,8 +1377,12 @@ def test_a_checked_pass_asking_for_one_guess_is_not_counted_as_a_pipelined_guess
     runtime = worker_module.runtime
     monkeypatch.setattr(runtime, "draft", draft)
     monkeypatch.setattr(runtime, "speculate_tokens", 2)
-    monkeypatch.setattr(runtime, "draft_choice", worker_module.DraftChoice())
+    # A fresh choice measures plain decoding first, and two tokens would never reach a guess.
+    monkeypatch.setattr(runtime, "draft_choice", trying("guessed"))
     monkeypatch.setattr(runtime, "guess_clock", worker_module.GuessClock())
+    # One stage whose probe saw a checked pass round as one row, so a greedy reply may check guesses.
+    monkeypatch.setattr(runtime, "route", [1])
+    monkeypatch.setattr(runtime, "exactness", {"exact_merge_limit": 0, "verify_exact": True})
     body = GenerateRequest(session_id="s", epoch=1, input_ids=[1, 2], max_tokens=2, reset=True)
     assert len(asyncio.run(stream_of(body))) == 2
     assert draft.counts == [1], "the checked pass for the last token asked for one guess"
