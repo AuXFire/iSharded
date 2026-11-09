@@ -441,11 +441,12 @@ The rule is that a failure must not drop a reply, and weights move only when the
 
 Times are measured on the test pool, except the stage crash, measured on a small model. In the last soak test, 405 replies finished and none were lost while processes were killed on both machines for 21 minutes. [Operating iSharded](OPERATIONS.md) has the details.
 
-A stage that hangs without dying keeps its links open, so it is watched in three ways:
+A stage that hangs without dying keeps its links open, so it is watched in four ways:
 
 - **A frozen process.** The worker asks a thread in the stage process for a pulse every 2 s, and 10 quiet seconds stop the process. This starts once the model has loaded.
-- **A stuck call.** Each call to a stage has a deadline of 30 s plus 1 s a row, and past it the process is stopped. Saved states and images get the time of 600 rows, and a load has no deadline.
-- **A stuck pass on the engine.** The engine holds its own passes to the same limit, counted only while a pass holds the model. Past it, the engine refuses what is in flight and ends the process.
+- **A stuck call.** Each call to a stage has a deadline of 30 s plus 1 s a row, and past it the process is stopped. Saved states and images get the time of 600 rows. A load has no deadline inside the stage process, and the coordinator gives it one instead, below.
+- **A stuck pass on the engine.** The engine holds its own passes to the same limit, counted only while a pass holds the model. Past it, the engine refuses what is in flight and ends the process. The refusal goes towards the entry on every link that leads there, back along the route and, from the last stage, over the closing link too, and the process waits up to 0.8 s for it to be written and read before it ends, so the entry hears which stage hung.
+- **A stuck load.** The pool has no route while stages load, so the coordinator gives each stage's load 30 s plus its size at 50 MB/s, or at half the rate that worker last loaded at, and longer for as long as the load shows progress: units done, bytes read, or the stage process working. A load that shows none for 30 s past that, such as on a suspended worker, is given up on. The worker is quarantined and told to let the weights go if the load ever finishes, and the route is planned without it, without the retries a passing failure gets. `ISHARDED_CONFIGURE_FLOOR_SECONDS` and `ISHARDED_CONFIGURE_STALL_SECONDS` change the two 30 s figures. Both stay well under the 120 s a reply waits for a route.
 
 Whichever finds it, the worker sees a lost stage, as if it had been killed: it starts another, and the reply replays. A process that will not exit is killed, killed harder, and left behind, so no reply waits on it. It keeps its memory until the system lets it go. If the new stage then cannot load, the node's stage will not restart: its `/health` answers 503, the node is quarantined, and the reply goes on without it.
 
@@ -816,7 +817,9 @@ A folder runs one node. Running `isharded up` again while it is up points you at
 
 ### isharded stop
 
-Stops the node `isharded up` started on this machine, in the foreground or the background, as Ctrl+C would. It waits up to a minute, then kills the node's processes. A start-at-login task stays in place, so the node comes back at the next login.
+Stops the node `isharded up` started on this machine, in the foreground or the background. If the running route uses this node, it first [cordons](#running-a-pool) it and waits for the route to move off, so a reply running at the time pauses only for the move, and not for a route that lost a stage. It waits up to 30 seconds for that, or as long as `--wait SECONDS` says, and `--wait 0` skips it. Then the node's processes stop together, as Ctrl+C would, each given 10 seconds before it is killed.
+
+If no coordinator answers, the cordon is refused because the rest of the pool cannot hold the model, or the route has not moved in time, the node stops anyway and the pool repairs itself as it would after any lost node. The command says which of these happened. On a machine that joined with an invite, whose key is only a user's, the node asks as itself, with its own certificate, and the coordinator lets a node take itself out of service and back, and nothing more. A cordon the stop made is undone when the node next starts, so it goes back into service by itself. A cordon you or the pool's owner set stays until whoever set it lifts it; the node cannot lift it. A start-at-login task stays in place, so the node comes back at the next login.
 
 ### isharded invite
 
@@ -1241,6 +1244,7 @@ A flag takes priority over its variable.
 | `ISHARDED_OWNERLESS` | `--ownerless` |
 | `ISHARDED_UP_HOME` | Where `isharded up` keeps its settings and keys |
 | `ISHARDED_DISCOVERABLE` | Set by `isharded up`: answer machines looking for a mesh |
+| `ISHARDED_STOP_DRAIN_SECONDS` | How long [`isharded stop`](#isharded-stop) waits for the route to move off the node, when `--wait` is not given. Default 30 |
 | `ISHARDED_HOST_MODELS` | `--host-models` |
 | `ISHARDED_MODEL_DIRS` | `--model-dir`, separated by the system's path separator |
 | `ISHARDED_REUSE_CACHED`, `ISHARDED_PEER_FETCH` | Set to `0` for the control plane's `--no-reuse-cached`, `--no-peer-fetch` |
@@ -1254,6 +1258,8 @@ A flag takes priority over its variable.
 | `ISHARDED_PRICE_PER_HOUR` | `--price-per-hour` on a node, read by its workers |
 | `ISHARDED_POWER_SAMPLE_MS` | `--measure-power` on a node, read by its workers. `0` or unset is off |
 | `GGML_CUDA_DISABLE_GRAPHS` | llama.cpp's own: present with any value, `0` included, it turns CUDA graphs off in every stage process of that worker. Workers report it as `cuda_graphs` |
+| `ISHARDED_CONFIGURE_FLOOR_SECONDS` | On the coordinator: the time every stage's load gets before its size is counted. See [a stuck load](#what-happens-when-something-fails). Default 30 |
+| `ISHARDED_CONFIGURE_STALL_SECONDS` | On the coordinator: how long a load past its first deadline may show no progress before it is given up on. Default 30 |
 | `ISHARDED_DRAFT_SHARES_DEVICE` | Set to `1` on the coordinator to count each guess of the draft on the entry stage's device when planning. Off by default; see [Speculative decoding](#speculative-decoding) |
 | `ISHARDED_PROMPT_PARTS` | Set to `0` on the entry worker to send each prompt whole instead of in parts |
 | `ISHARDED_DATA_PORT` | The port for direct links between stages. It must be reachable from the other stages. Default: any free port |
@@ -1348,6 +1354,27 @@ Routes under `/internal` are for nodes only. `GET /internal/mesh` shows a node's
 | `parallel_tool_calls` | `true` | Chat only: `false` keeps only the first call in a reply |
 
 Prompts longer than the loaded context are refused with a 400. A reply that would overrun it is cut short.
+
+A reply stops as soon as its client closes the connection, whether it streams or not: the generation ends on the entry worker and its slot is free for the next reply. This holds on every route that replies, the Claude, Responses, and Ollama ones too.
+
+A field OpenAI defines that would change the reply here, and that iSharded does not do, is refused with a 400 that names it, such as `not supported: n (a reply here is one choice; send 1 or leave it out)`, rather than ignored. The answer has OpenAI's `error` object, with the field in `param` and `code: "unsupported_parameter"`, beside `detail`, so OpenAI's libraries show the reason. A name that no API here defines is refused the same way, as OpenAI refuses one. Each is taken at the value that asks for nothing, which is what clients send by default:
+
+| Field | Taken at |
+|---|---|
+| `n`, and `best_of` on completions | 1 |
+| `frequency_penalty`, `presence_penalty` | 0 |
+| `logit_bias` | Empty |
+| `logprobs` | `false` on chat, 0 on completions. `top_logprobs` at 0 |
+| `response_format` | `{"type": "text"}`. JSON and schemas are refused, because the chat path cannot hold a reply to one |
+| `stream_options` | `include_usage` and `include_obfuscation`. Usage always comes with the last chunk |
+| `modalities` | `["text"]`. `audio`, `prediction`, and `web_search_options` only when null |
+| `reasoning_effort`, `chat_template_kwargs` | Null or empty. Use `enable_thinking` |
+| `verbosity` | `medium` |
+| `functions`, `function_call` | Empty, and `none` or `auto`. Use `tools` and `tool_choice` |
+| `echo`, `suffix` | Completions only: `false`, and empty |
+| `min_p`, `repetition_penalty`, `repeat_penalty` | 0, 1, and 1 |
+
+`metadata`, `user`, `store`, `service_tier`, `safety_identifier`, `prompt_cache_key`, and `prompt_cache_retention` are taken at any value and do nothing, since none of them changes a reply. `/v1/embeddings` takes `model`, `input`, `encoding_format`, `dimensions`, and `user`, and refuses any other name.
 
 ### Tool calling
 
@@ -1520,6 +1547,12 @@ Other tools usually read `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`. The key m
 | `tools` | Your own tools, with `input_schema`. Tools Anthropic runs for you, such as web search, are refused with a 400 |
 | `tool_choice` | `auto`, `any`, `none`, or `tool` with a `name`. `disable_parallel_tool_use` keeps only the first call |
 | `thinking` | `type: "disabled"` turns reasoning off on models with a switch, and any other type turns it on. `display: "omitted"` keeps the block and leaves out its words. `budget_tokens` is not used |
+| `metadata`, `service_tier` | Taken, and do nothing |
+| `context_management` | Taken, and does nothing: nothing is cleared, and a conversation past the context is refused as on every route |
+| `output_config` | `effort` is taken and not used, like `budget_tokens`. A `format` is refused |
+| `output_format`, `container`, `mcp_servers` | Refused with a 400 when set, since the chat path cannot hold a reply to a schema, and nothing here runs code or connects to MCP servers for you. An empty `mcp_servers` is taken |
+
+Any other field is refused with a 400 that names it, `not supported: NAME`, as Anthropic refuses one.
 
 A reply that starts with reasoning gives it as a `thinking` block before its text, whatever `thinking` asked for, because a model with no switch reasons anyway. Reasoning found later in a reply stays in the text. A block's `signature` is a hash of its words, there for clients that expect one. It proves nothing, since nobody here can sign for Anthropic, and it is not checked when it comes back. Cache counts in `usage` are always 0, because this usage counts every prompt token as `input_tokens`. Errors have Anthropic's shape, with `type: "error"`, an `error` holding `type` and `message`, and a `request_id`. A failure during a stream is an `error` event. `POST /v1/messages/count_tokens` takes the same fields without `max_tokens` and runs the model's template, and an image counts only as its marker.
 
@@ -1542,6 +1575,8 @@ print(client.responses.create(model=MODEL, input="Say hello.", max_output_tokens
 | `tools`, `tool_choice`, `parallel_tool_calls` | Function tools only. Calls come back as `function_call` items |
 
 Nothing is stored here, so `previous_response_id`, `conversation`, and `background` are refused with a 400. Send the whole conversation in `input` each time. `text.format` is refused too, because the chat path cannot hold a reply to a format. Errors have OpenAI's `{"error": {...}}` shape.
+
+`store`, `metadata`, `user`, `service_tier`, `safety_identifier`, `prompt_cache_key`, and `prompt_cache_retention` are taken and do nothing. So is `reasoning` with `effort` and `summary`, since reasoning stays in the reply's text, and `include` holding only `reasoning.encrypted_content`, as Codex sends. These are refused with a 400 that names them unless they ask for nothing: `truncation` other than `disabled`, `text.verbosity` other than `medium`, `top_logprobs` above 0, `max_tool_calls`, `prompt`, and any other `include`. A name the Responses API does not define is refused too.
 
 #### Ollama
 
@@ -1566,7 +1601,8 @@ A tool with no way to set a header cannot reach a mesh with keys.
 |---|---|
 | `messages` | Roles and `content`, with `images` as base64, `tool_calls`, `thinking`, and `tool` results by `tool_name` |
 | `prompt`, `system`, `images` | On `/api/generate`, they go through the model's template. With `raw: true`, `prompt` goes in as it is, and `images` are refused |
-| `options` | `temperature`, `top_p`, `top_k`, `seed`, `num_predict`, and `stop`. A `seed` of -1 means no seed. Others, such as `num_ctx`, do nothing, since a route's context is set when it loads |
+| `options` | `temperature`, `top_p`, `top_k`, `seed`, `num_predict`, and `stop`. A `seed` of -1 means no seed. Others, such as `num_ctx`, do nothing, since a route's context is set when it loads. Sampling that is not applied here is refused with a 400 that names it, `not supported: NAME`, unless it asks for nothing: `repeat_penalty` other than 1 or Ollama's own 1.1, `presence_penalty` and `frequency_penalty` other than 0, `min_p` other than 0, `typical_p` and `tfs_z` other than 1, and `mirostat` other than 0. An option Ollama does not know is ignored, as Ollama ignores it |
+| `logprobs`, `context` | `logprobs: true` and a non-empty `context` on `/api/generate` are refused with a 400 |
 | `tools` | As on the [chat route](#tool-calling) |
 | `think` | Switches reasoning on models that support it. A level such as `"high"` counts as on. A reply that starts with reasoning gives it in `thinking`, on `message` or beside `response`. With `raw: true` it stays in the text |
 | `format` | Refused with a 400. The chat path cannot hold a reply to JSON or a schema, and asking the model nicely would only look as if it worked |

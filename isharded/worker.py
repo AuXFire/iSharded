@@ -541,6 +541,12 @@ class WorkerRuntime:
         self.background: set[asyncio.Task[None]] = set()
         self.materialize_total = 0
         self.materialize_done = 0
+        # The load under way, and loads a coordinator gave up on. See configure_signs.
+        self.configuring: str | None = None
+        # The load whose weights this worker holds, so a give-up that comes after it finished,
+        # as one does to a worker that was suspended and woke, still lets them go.
+        self.holding_load: str | None = None
+        self.given_up: dict[str, None] = {}  # oldest first, and only the newest kept
         self.caches: dict[str, CacheEntry] = {}
         # Each slot's newest reply on this stage, as (epoch, generation). See ``claims``.
         self.slot_owners: dict[int, tuple[int, int]] = {}
@@ -1364,11 +1370,20 @@ class WorkerRuntime:
             raise ValueError(NO_TORCH)
         if not (0 <= request.assignment.start_layer < request.assignment.end_layer <= adapter.num_layers):
             raise ValueError("invalid layer interval")
+        self.configuring = request.load_id
         try:
             await asyncio.to_thread(self._materialize, request, adapter)
+            if request.load_id is not None and request.load_id in self.given_up:
+                # Its coordinator stopped waiting, so another worker has these layers by now.
+                print("The coordinator gave up on this load while it ran, so its weights were let go.", flush=True)
+                raise ValueError("the coordinator gave up on this load, so its weights were let go")
         except Exception:
             self._release_weights()
+            self.holding_load = None
             raise
+        finally:
+            self.configuring = None
+        self.holding_load = request.load_id
         self.adapter = adapter
         if request.model_id != self.model_id:
             # The planner trusts these counts to say how this model's guesses go.
@@ -1394,6 +1409,31 @@ class WorkerRuntime:
         if self.gate.size != request.slots:
             self.gate.resize(request.slots)
         await self.release_gate()
+
+    def configure_signs(self) -> dict[str, Any]:
+        """What shows a load is still moving, for a coordinator deciding whether to keep waiting.
+
+        Units done, bytes this process and its children have read, and the CPU time of the
+        children, where a stage's own process loads the model. Not this process's own CPU,
+        which answering this question would move. A process that is suspended answers
+        nothing, and one that hangs moves none of these.
+        """
+        me = psutil.Process()
+        read, cpu = 0, 0.0
+        for process in [me, *me.children(recursive=True)]:
+            with suppress(psutil.Error, AttributeError, NotImplementedError):  # macOS keeps no I/O counts
+                read += process.io_counters().read_bytes
+            if process is not me:
+                with suppress(psutil.Error):
+                    times = process.cpu_times()
+                    cpu += times.user + times.system
+        return {
+            "load_id": self.configuring,
+            "done": self.materialize_done,
+            "total": self.materialize_total,
+            "read_mib": read // 2**20,
+            "children_cpu_s": round(cpu, 1),
+        }
 
     def ring_stop(self) -> None:
         """Leave the ring. Replies go on over HTTP, or replay if one was using it."""
@@ -2671,6 +2711,34 @@ async def release(authorization: str | None = Header(default=None)) -> dict[str,
     verify_token(authorization)
     await runtime.release_gate()
     return {"status": "released"}
+
+
+@app.get("/internal/configure/progress")
+async def configure_progress(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """Answers while a load holds the lock, so a coordinator can tell a slow load from a stuck one."""
+    verify_token(authorization)
+    return await asyncio.to_thread(runtime.configure_signs)
+
+
+@app.post("/internal/configure/{load_id}/give-up")
+async def configure_given_up(load_id: str, authorization: str | None = Header(default=None)) -> dict[str, str]:
+    """The coordinator stopped waiting for this load. If it ever finishes, its weights are let go.
+
+    Heard during the load, the load lets them go itself when it ends. Heard after it ended,
+    as a worker that was suspended and woke hears it, they go here, unless a later load has
+    taken this one's place since.
+    """
+    verify_token(authorization)
+    runtime.given_up[load_id] = None  # before waiting, so a load still running hears it
+    while len(runtime.given_up) > 64:
+        del runtime.given_up[next(iter(runtime.given_up))]
+    if runtime.holding_load == load_id:
+        async with runtime.lock:  # a load still running finishes first
+            if runtime.holding_load == load_id:
+                runtime._release_weights()
+                runtime.holding_load = None
+                print("The coordinator gave up on this load after it finished, so its weights were let go.", flush=True)
+    return {"status": "given up"}
 
 
 @app.post("/internal/configure")

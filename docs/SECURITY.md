@@ -51,7 +51,7 @@ What this does not give you:
 
 | Caller | Credential | Can do |
 |---|---|---|
-| Node, with a pool authority | Certificate, over TLS or as a ticket | Node routes only: gossip, registration, stage traffic |
+| Node, with a pool authority | Certificate, over TLS or as a ticket | Node routes only: gossip, registration, stage traffic. It may also cordon itself, as `isharded stop` does, and lift a cordon it set on itself, but not one anyone else set |
 | Node, without one | Pool token | Everything, including the node protocol |
 | Admin | API key, role `admin` | Load models, rebalance, cordon, read metrics, and all user actions. Manage keys and revoke nodes in a pool without an authority |
 | User | API key, role `user` | Chat, completions, read status |

@@ -3,7 +3,8 @@
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,6 +15,63 @@ use isharded_engine::wire::{self, Ack, Answer, Kind, Nack, Pass, Refusal, Role, 
 
 const CLOSING: &[u8] = &[9; 32];
 const WIDTH: u32 = 4;
+/// How long one test may run. Every wait inside a test has its own limit, so this is only
+/// reached by a hang, which used to hold the whole run under a busy machine until CI gave up.
+const TEST_SECONDS: u64 = 120;
+
+/// The nodes each running test made, by the name of the thread it runs on, so a deadline
+/// can say what they were doing.
+static WATCHED: Mutex<Vec<(String, Weak<Node>)>> = Mutex::new(Vec::new());
+
+fn watch(node: &Arc<Node>) {
+    let name = thread::current().name().unwrap_or_default().to_string();
+    let mut watched = WATCHED.lock().unwrap();
+    watched.retain(|(_, node)| node.strong_count() > 0);
+    watched.push((name, Arc::downgrade(node)));
+}
+
+/// Runs a test on a thread of its own and fails it, instead of hanging, if it runs past
+/// `TEST_SECONDS` (or ISHARDED_TEST_SECONDS). On the way out it prints every node the test
+/// made, with its counters and link state, which is where a hung ring shows what it was
+/// waiting for. Rust cannot print another thread's stack, so this is the state instead.
+fn within_deadline(name: &'static str, body: impl FnOnce() + Send + 'static) {
+    let seconds = std::env::var("ISHARDED_TEST_SECONDS").ok().and_then(|text| text.parse().ok()).unwrap_or(TEST_SECONDS);
+    within(name, seconds, body);
+}
+
+fn within(name: &'static str, seconds: u64, body: impl FnOnce() + Send + 'static) {
+    let (done, finished) = mpsc::channel();
+    let runner = thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            body();
+            let _ = done.send(());
+        })
+        .unwrap();
+    match finished.recv_timeout(Duration::from_secs(seconds)) {
+        Ok(()) => runner.join().unwrap(),
+        // The body panicked: that is the test's own failure, with its own message.
+        Err(RecvTimeoutError::Disconnected) => {
+            if let Err(panic) = runner.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            let nodes: Vec<String> = WATCHED
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(owner, _)| owner == name)
+                .filter_map(|(_, node)| node.upgrade())
+                .enumerate()
+                .map(|(index, node)| format!("  node {index}: {}", serde_json::to_string(&node.stats()).unwrap_or_default()))
+                .collect();
+            eprintln!("{name} ran past {seconds} s. Its nodes, in the order it made them:\n{}", nodes.join("\n"));
+            // Its thread is left behind: the process ends with the run, and nothing waits on it.
+            panic!("{name} ran past {seconds} s and was stopped; the nodes it made are printed above");
+        }
+    }
+}
 
 /// The key of the link from stage `edge` to the next.
 fn hop_key(edge: u16) -> Vec<u8> {
@@ -209,7 +267,7 @@ fn carry(mut from: TcpStream, mut to: TcpStream, held: &AtomicBool) {
 }
 
 struct Ring {
-    nodes: Vec<Node>,
+    nodes: Vec<Arc<Node>>,
     seen: Vec<Arc<AtomicU64>>,
     client: Arc<Link>,
     frames: Frames,
@@ -239,7 +297,8 @@ fn build_ring(count: u16, closing: bool, delay: Duration, (ack_timeout_ms, silen
     let mut seen = vec![];
     let mut doors = vec![];
     for stage in 0..count {
-        let node = Node::new().unwrap();
+        let node = Arc::new(Node::new().unwrap());
+        watch(&node);
         let counter = Arc::new(AtomicU64::new(0));
         node.set_compute(Box::new(Adder { stage: stage + 1, last: stage + 1 == count, delay, seen: counter.clone() }));
         doors.push(listening(&node));
@@ -325,212 +384,323 @@ fn answer(ring: &mut Ring) -> Answer {
 
 #[test]
 fn a_pass_runs_every_stage_in_order_and_the_answer_reaches_the_entry() {
-    let mut ring = ring(3, true, Duration::ZERO, 2000);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    let got = answer(&mut ring);
-    // ((5 * 10 + 1) * 10 + 2) * 10 + 3
-    assert_eq!(got, sealed(1, vec![5123, 9]));
-    assert!(ring.nodes[2].stats().closing_up);
+    within_deadline("a_pass_runs_every_stage_in_order_and_the_answer_reaches_the_entry", || {
+        let mut ring = ring(3, true, Duration::ZERO, 2000);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        let got = answer(&mut ring);
+        // ((5 * 10 + 1) * 10 + 2) * 10 + 3
+        assert_eq!(got, sealed(1, vec![5123, 9]));
+        assert!(ring.nodes[2].stats().closing_up);
+    });
 }
 
 #[test]
 fn stages_count_their_compute_and_the_entry_times_the_workers_turnaround() {
-    let mut ring = ring(3, true, Duration::from_millis(2), 2000);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    answer(&mut ring);
-    // The worker thinks for a while before its next pass.
-    thread::sleep(Duration::from_millis(40));
-    ring.client.send(&pass(2, 5, 10).encode()).unwrap();
-    answer(&mut ring);
-    for node in &ring.nodes {
-        let stats = node.stats();
-        assert_eq!(stats.batches_total, 2);
-        assert!(stats.compute_us_total >= 4000, "{}", stats.compute_us_total);
-    }
-    let turnaround = ring.nodes[0].stats().turnaround_us;
-    assert!((40_000..2_000_000).contains(&turnaround), "{turnaround}");
-    // The next reply on the slot starts long after, and that wait is no turnaround.
-    thread::sleep(Duration::from_millis(300));
-    ring.client.send(&Pass { generation: 2, ..pass(3, 5, 0) }.encode()).unwrap();
-    answer(&mut ring);
-    assert_eq!(ring.nodes[0].stats().turnaround_us, turnaround);
-    // A new route starts the totals again, so a reader can tell busy time on this one.
-    ring.nodes[1].open(Plan { epoch: 8, index: 1, count: 3, keys: keys_for(1, 3), ack_timeout_ms: 2000, silence_timeout_ms: 2000, merge_passes: true, merge_most: None }).unwrap();
-    let stats = ring.nodes[1].stats();
-    assert_eq!((stats.batches_total, stats.compute_us_total), (0, 0));
+    within_deadline("stages_count_their_compute_and_the_entry_times_the_workers_turnaround", || {
+        let mut ring = ring(3, true, Duration::from_millis(2), 2000);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        answer(&mut ring);
+        // The worker thinks for a while before its next pass.
+        thread::sleep(Duration::from_millis(40));
+        ring.client.send(&pass(2, 5, 10).encode()).unwrap();
+        answer(&mut ring);
+        for node in &ring.nodes {
+            let stats = node.stats();
+            assert_eq!(stats.batches_total, 2);
+            assert!(stats.compute_us_total >= 4000, "{}", stats.compute_us_total);
+        }
+        let turnaround = ring.nodes[0].stats().turnaround_us;
+        assert!((40_000..2_000_000).contains(&turnaround), "{turnaround}");
+        // The next reply on the slot starts long after, and that wait is no turnaround.
+        thread::sleep(Duration::from_millis(300));
+        ring.client.send(&Pass { generation: 2, ..pass(3, 5, 0) }.encode()).unwrap();
+        answer(&mut ring);
+        assert_eq!(ring.nodes[0].stats().turnaround_us, turnaround);
+        // A new route starts the totals again, so a reader can tell busy time on this one.
+        ring.nodes[1].open(Plan { epoch: 8, index: 1, count: 3, keys: keys_for(1, 3), ack_timeout_ms: 2000, silence_timeout_ms: 2000, merge_passes: true, merge_most: None }).unwrap();
+        let stats = ring.nodes[1].stats();
+        assert_eq!((stats.batches_total, stats.compute_us_total), (0, 0));
+    });
 }
 
 #[test]
 fn a_batch_of_the_old_route_that_ends_after_a_reopen_is_not_counted_on_the_new_one() {
-    let ring = ring(1, false, Duration::from_millis(300), 2000);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    wait_until("the pass to start", || ring.seen[0].load(Ordering::SeqCst) == 1);
-    // A repair reopens the stage at the same epoch while the old route's pass still runs.
-    ring.nodes[0].open(Plan { epoch: 7, index: 0, count: 1, keys: keys_for(0, 1), ack_timeout_ms: 2000, silence_timeout_ms: 2000, merge_passes: true, merge_most: None }).unwrap();
-    wait_until("the pass to end", || ring.nodes[0].stats().passes == 1);
-    let stats = ring.nodes[0].stats();
-    assert_eq!((stats.batches_total, stats.compute_us_total), (0, 0));
+    within_deadline("a_batch_of_the_old_route_that_ends_after_a_reopen_is_not_counted_on_the_new_one", || {
+        let ring = ring(1, false, Duration::from_millis(300), 2000);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        wait_until("the pass to start", || ring.seen[0].load(Ordering::SeqCst) == 1);
+        // A repair reopens the stage at the same epoch while the old route's pass still runs.
+        ring.nodes[0].open(Plan { epoch: 7, index: 0, count: 1, keys: keys_for(0, 1), ack_timeout_ms: 2000, silence_timeout_ms: 2000, merge_passes: true, merge_most: None }).unwrap();
+        wait_until("the pass to end", || ring.nodes[0].stats().passes == 1);
+        let stats = ring.nodes[0].stats();
+        assert_eq!((stats.batches_total, stats.compute_us_total), (0, 0));
+    });
 }
 
 #[test]
 fn without_a_closing_link_the_answer_walks_back() {
-    let mut ring = ring(3, false, Duration::ZERO, 2000);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    assert_eq!(answer(&mut ring).tokens, vec![5123, 9]);
-    assert!(!ring.nodes[2].stats().closing_up);
+    within_deadline("without_a_closing_link_the_answer_walks_back", || {
+        let mut ring = ring(3, false, Duration::ZERO, 2000);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        assert_eq!(answer(&mut ring).tokens, vec![5123, 9]);
+        assert!(!ring.nodes[2].stats().closing_up);
+    });
 }
 
 #[test]
 fn one_stage_answers_by_itself() {
-    let mut ring = ring(1, false, Duration::ZERO, 2000);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    assert_eq!(answer(&mut ring).tokens, vec![51, 9]);
+    within_deadline("one_stage_answers_by_itself", || {
+        let mut ring = ring(1, false, Duration::ZERO, 2000);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        assert_eq!(answer(&mut ring).tokens, vec![51, 9]);
+    });
 }
 
 #[test]
 fn many_passes_in_flight_all_arrive_in_order() {
-    let mut ring = ring(4, true, Duration::ZERO, 2000);
-    for id in 1..=500 {
-        ring.client.send(&pass(id, 1, id as u32).encode()).unwrap();
-    }
-    for id in 1..=500 {
-        assert_eq!(answer(&mut ring).id, id);
-    }
+    within_deadline("many_passes_in_flight_all_arrive_in_order", || {
+        let mut ring = ring(4, true, Duration::ZERO, 2000);
+        for id in 1..=500 {
+            ring.client.send(&pass(id, 1, id as u32).encode()).unwrap();
+        }
+        for id in 1..=500 {
+            assert_eq!(answer(&mut ring).id, id);
+        }
+    });
 }
 
 #[test]
 fn a_stage_that_refuses_is_named_and_later_passes_still_run() {
-    let mut ring = ring(3, true, Duration::ZERO, 2000);
-    ring.client.send(&pass(1, 5, 666).encode()).unwrap();
-    let (kind, body) = ring.frames.next().unwrap();
-    assert_eq!(kind, Kind::Nack);
-    let nack = Nack::decode(&body).unwrap();
-    assert_eq!((nack.id, nack.refusal, nack.stage), (1, Refusal::StageError, 0));
-    ring.client.send(&pass(2, 5, 9).encode()).unwrap();
-    assert_eq!(answer(&mut ring).id, 2);
+    within_deadline("a_stage_that_refuses_is_named_and_later_passes_still_run", || {
+        let mut ring = ring(3, true, Duration::ZERO, 2000);
+        ring.client.send(&pass(1, 5, 666).encode()).unwrap();
+        let (kind, body) = ring.frames.next().unwrap();
+        assert_eq!(kind, Kind::Nack);
+        let nack = Nack::decode(&body).unwrap();
+        assert_eq!((nack.id, nack.refusal, nack.stage), (1, Refusal::StageError, 0));
+        ring.client.send(&pass(2, 5, 9).encode()).unwrap();
+        assert_eq!(answer(&mut ring).id, 2);
+    });
 }
 
 #[test]
 fn a_pass_from_another_route_is_refused_and_nothing_runs() {
-    let mut ring = ring(2, true, Duration::ZERO, 2000);
-    let mut stale = pass(1, 5, 9);
-    stale.epoch = 6;
-    ring.client.send(&stale.encode()).unwrap();
-    let (kind, body) = ring.frames.next().unwrap();
-    assert_eq!(kind, Kind::Nack);
-    assert_eq!(Nack::decode(&body).unwrap().refusal, Refusal::Epoch);
-    assert_eq!(ring.seen[0].load(Ordering::SeqCst), 0);
+    within_deadline("a_pass_from_another_route_is_refused_and_nothing_runs", || {
+        let mut ring = ring(2, true, Duration::ZERO, 2000);
+        let mut stale = pass(1, 5, 9);
+        stale.epoch = 6;
+        ring.client.send(&stale.encode()).unwrap();
+        let (kind, body) = ring.frames.next().unwrap();
+        assert_eq!(kind, Kind::Nack);
+        assert_eq!(Nack::decode(&body).unwrap().refusal, Refusal::Epoch);
+        assert_eq!(ring.seen[0].load(Ordering::SeqCst), 0);
+    });
 }
 
 #[test]
 fn losing_a_stage_is_reported_to_the_entry_naming_it() {
-    let mut ring = ring(3, true, Duration::ZERO, 2000);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    answer(&mut ring);
-    // A process dying closes its sockets, and this does the same.
-    ring.nodes[2].stop();
-    let began = Instant::now();
-    let (kind, body) = ring.frames.next().unwrap();
-    assert_eq!(kind, Kind::Nack);
-    let nack = Nack::decode(&body).unwrap();
-    assert_eq!((nack.id, nack.refusal, nack.stage), (0, Refusal::FailedStage, 2));
-    assert!(began.elapsed() < Duration::from_secs(1));
+    within_deadline("losing_a_stage_is_reported_to_the_entry_naming_it", || {
+        let mut ring = ring(3, true, Duration::ZERO, 2000);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        answer(&mut ring);
+        // A process dying closes its sockets, and this does the same.
+        ring.nodes[2].stop();
+        let began = Instant::now();
+        let (kind, body) = ring.frames.next().unwrap();
+        assert_eq!(kind, Kind::Nack);
+        let nack = Nack::decode(&body).unwrap();
+        assert_eq!((nack.id, nack.refusal, nack.stage), (0, Refusal::FailedStage, 2));
+        assert!(began.elapsed() < Duration::from_secs(1));
+    });
 }
 
 #[test]
 fn a_stage_that_hangs_says_so_before_it_ends() {
-    let mut ring = ring(3, true, Duration::ZERO, 60_000);
-    let ended = Arc::new(AtomicBool::new(false));
-    let end = ended.clone();
-    let watchdog = Watchdog::new(ring.nodes[1].refuser(), move || end.store(true, Ordering::Release));
+    within_deadline("a_stage_that_hangs_says_so_before_it_ends", || {
+        let mut ring = ring(3, true, Duration::ZERO, 60_000);
+        let ended = Arc::new(AtomicBool::new(false));
+        let end = ended.clone();
+        let watchdog = Watchdog::new(ring.nodes[1].refuser(), move || end.store(true, Ordering::Release));
+        watchdog.set_limits(Limits { pass_ms: 200, row_ms: 0 });
+        let _hung = watchdog.time(1);
+        let (kind, body) = ring.frames.next().unwrap();
+        assert_eq!(kind, Kind::Nack);
+        let nack = Nack::decode(&body).unwrap();
+        assert_eq!((nack.id, nack.refusal, nack.stage), (0, Refusal::FailedStage, 1));
+        assert!(nack.message.contains("hung"), "{}", nack.message);
+        wait_until("the process to end", || ended.load(Ordering::Acquire));
+        assert_eq!(ring.nodes[1].stats().refusals, 1);
+    });
+}
+
+/// A stage that hangs, under a watchdog whose end is the real thing: the node stops, its
+/// sockets close, as when the process ends. Returns the refusals that reached the entry.
+fn hang_and_end(ring: &mut Ring, stage: usize) -> Vec<Nack> {
+    let hung = std::mem::replace(&mut ring.nodes[stage], Arc::new(Node::new().unwrap()));
+    let refuse = hung.refuser();
+    let watchdog = Watchdog::new(refuse, move || hung.stop());
     watchdog.set_limits(Limits { pass_ms: 200, row_ms: 0 });
     let _hung = watchdog.time(1);
-    let (kind, body) = ring.frames.next().unwrap();
-    assert_eq!(kind, Kind::Nack);
-    let nack = Nack::decode(&body).unwrap();
-    assert_eq!((nack.id, nack.refusal, nack.stage), (0, Refusal::FailedStage, 1));
-    assert!(nack.message.contains("hung"), "{}", nack.message);
-    wait_until("the process to end", || ended.load(Ordering::Acquire));
-    assert_eq!(ring.nodes[1].stats().refusals, 1);
+    let mut heard = vec![];
+    // Read until the link ends, or until a second has passed with nothing more.
+    ring.client.limit_reads(Duration::from_secs(3)).unwrap();
+    while let Ok((kind, body)) = ring.frames.next() {
+        assert_eq!(kind, Kind::Nack);
+        let nack = Nack::decode(&body).unwrap();
+        let hung_said_so = nack.message.contains("hung");
+        heard.push(nack);
+        if hung_said_so {
+            break;
+        }
+    }
+    heard
+}
+
+#[test]
+fn a_middle_stage_that_hangs_is_heard_saying_so_though_its_process_ends_at_once() {
+    within_deadline("a_middle_stage_that_hangs_is_heard_saying_so_though_its_process_ends_at_once", || {
+        for _ in 0..5 {
+            let mut ring = ring(3, true, Duration::ZERO, 60_000);
+            let heard = hang_and_end(&mut ring, 1);
+            let said = heard.iter().find(|nack| nack.message.contains("hung"));
+            assert!(said.is_some(), "only these reached the entry: {:?}", heard.iter().map(|nack| &nack.message).collect::<Vec<_>>());
+            assert_eq!((said.unwrap().id, said.unwrap().refusal, said.unwrap().stage), (0, Refusal::FailedStage, 1));
+        }
+    });
+}
+
+#[test]
+fn a_single_stage_that_hangs_tells_its_own_worker_before_its_process_ends() {
+    within_deadline("a_single_stage_that_hangs_tells_its_own_worker_before_its_process_ends", || {
+        for _ in 0..5 {
+            let mut ring = ring(1, false, Duration::ZERO, 60_000);
+            let heard = hang_and_end(&mut ring, 0);
+            assert!(heard.iter().any(|nack| nack.message.contains("hung") && nack.stage == 0), "{:?}", heard.iter().map(|nack| &nack.message).collect::<Vec<_>>());
+        }
+    });
+}
+
+#[test]
+fn a_last_stage_that_hangs_is_heard_over_the_closing_link_when_the_way_back_is_stuck() {
+    within_deadline("a_last_stage_that_hangs_is_heard_over_the_closing_link_when_the_way_back_is_stuck", || {
+        for _ in 0..3 {
+            // The hop into the last stage goes through a relay that passes nothing back, so the
+            // walk back along the route cannot carry the refusal. Only the closing link can.
+            let (mut ring, relay) = ring_through(2, 3, true, Duration::ZERO, 60_000);
+            ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+            answer(&mut ring);
+            relay.hold_back();
+            let heard = hang_and_end(&mut ring, 2);
+            assert!(heard.iter().any(|nack| nack.message.contains("hung") && nack.stage == 2), "{:?}", heard.iter().map(|nack| &nack.message).collect::<Vec<_>>());
+        }
+    });
+}
+
+#[test]
+#[should_panic(expected = "a_test_that_hangs ran past 1 s and was stopped")]
+fn a_test_that_hangs_is_stopped_at_its_deadline_and_shows_its_nodes() {
+    within("a_test_that_hangs", 1, || {
+        let _ring = ring(2, true, Duration::ZERO, 2000);
+        thread::sleep(Duration::from_secs(600));
+    });
+}
+
+#[test]
+fn a_test_that_fails_inside_its_deadline_fails_with_its_own_message() {
+    let failed = std::panic::catch_unwind(|| within("fails_by_itself", 60, || panic!("its own words")));
+    let message = failed.unwrap_err();
+    assert_eq!(message.downcast_ref::<&str>(), Some(&"its own words"));
 }
 
 #[test]
 fn a_stage_with_no_route_has_nobody_to_tell() {
-    Node::new().unwrap().refuser()("nothing was in flight".into());
+    within_deadline("a_stage_with_no_route_has_nobody_to_tell", || {
+        Node::new().unwrap().refuser()("nothing was in flight".into());
+    });
 }
 
 #[test]
 fn a_stage_that_goes_silent_is_noticed_without_any_traffic() {
-    // The middle stage's links stop answering when its whole process freezes. Stopping its
-    // heartbeat answers is what a frozen process looks like from outside.
-    let mut ring = ring(2, false, Duration::ZERO, 300);
-    ring.nodes[1].close_ring();
-    let began = Instant::now();
-    let (kind, body) = ring.frames.next().unwrap();
-    assert_eq!(kind, Kind::Nack);
-    assert_eq!(Nack::decode(&body).unwrap().stage, 1);
-    assert!(began.elapsed() < Duration::from_secs(2));
+    within_deadline("a_stage_that_goes_silent_is_noticed_without_any_traffic", || {
+        // The middle stage's links stop answering when its whole process freezes. Stopping its
+        // heartbeat answers is what a frozen process looks like from outside.
+        let mut ring = ring(2, false, Duration::ZERO, 300);
+        ring.nodes[1].close_ring();
+        let began = Instant::now();
+        let (kind, body) = ring.frames.next().unwrap();
+        assert_eq!(kind, Kind::Nack);
+        assert_eq!(Nack::decode(&body).unwrap().stage, 1);
+        assert!(began.elapsed() < Duration::from_secs(2));
+    });
 }
 
 #[test]
 fn a_peer_that_stops_reading_is_lost_within_the_silence_limit() {
-    let silence = Duration::from_millis(1000);
-    let (mut ring, relay) = ring_through(1, 2, false, Duration::ZERO, silence.as_millis() as u64);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    answer(&mut ring);
-    relay.refuse(true);
-    relay.hold();
-    let began = Instant::now();
-    // More than the sockets on the way can hold, so a write stops partway through a frame.
-    for id in 2..514 {
-        ring.client.send(&rows(id, 2048).encode()).unwrap();
-    }
-    wait_for_loss(&mut ring, 1);
-    // The margin is for a busy machine: one turn of the watcher and some scheduling.
-    let took = began.elapsed();
-    assert!(took < silence + Duration::from_millis(500), "took {took:?}");
-    assert!(!ring.nodes[0].stats().next_up);
+    within_deadline("a_peer_that_stops_reading_is_lost_within_the_silence_limit", || {
+        let silence = Duration::from_millis(1000);
+        let (mut ring, relay) = ring_through(1, 2, false, Duration::ZERO, silence.as_millis() as u64);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        answer(&mut ring);
+        relay.refuse(true);
+        relay.hold();
+        let began = Instant::now();
+        // More than the sockets on the way can hold, so a write stops partway through a frame.
+        for id in 2..514 {
+            ring.client.send(&rows(id, 2048).encode()).unwrap();
+        }
+        wait_for_loss(&mut ring, 1);
+        // The margin is for a busy machine: one turn of the watcher and some scheduling.
+        let took = began.elapsed();
+        assert!(took < silence + Duration::from_millis(500), "took {took:?}");
+        assert!(!ring.nodes[0].stats().next_up);
+    });
 }
 
 #[test]
 fn a_write_stuck_on_a_long_frame_does_not_hold_up_the_acknowledgement_check() {
-    // Only the acknowledgement limit can say the link is lost in time. It is longer than the
-    // gap between heartbeats, so a watcher that waits on the socket gets stuck on a heartbeat
-    // first, and sees nothing until the write limit of half the silence limit.
-    let ack = Duration::from_millis(1500);
-    let (mut ring, relay) = ring_with_limits(1, 2, false, Duration::ZERO, (ack.as_millis() as u64, 8000));
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    answer(&mut ring);
-    relay.refuse(true);
-    relay.hold();
-    let began = Instant::now();
-    for id in 2..514 {
-        ring.client.send(&rows(id, 2048).encode()).unwrap();
-    }
-    wait_for_loss(&mut ring, 1);
-    let took = began.elapsed();
-    assert!(took < ack + Duration::from_millis(800), "took {took:?}");
+    within_deadline("a_write_stuck_on_a_long_frame_does_not_hold_up_the_acknowledgement_check", || {
+        // Only the acknowledgement limit can say the link is lost in time. It is longer than the
+        // gap between heartbeats, so a watcher that waits on the socket gets stuck on a heartbeat
+        // first, and sees nothing until the write limit of half the silence limit.
+        let ack = Duration::from_millis(1500);
+        let (mut ring, relay) = ring_with_limits(1, 2, false, Duration::ZERO, (ack.as_millis() as u64, 8000));
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        answer(&mut ring);
+        relay.refuse(true);
+        relay.hold();
+        let began = Instant::now();
+        for id in 2..514 {
+            ring.client.send(&rows(id, 2048).encode()).unwrap();
+        }
+        wait_for_loss(&mut ring, 1);
+        let took = began.elapsed();
+        assert!(took < ack + Duration::from_millis(800), "took {took:?}");
+    });
 }
 
 #[test]
 fn a_frame_too_big_for_one_tls_buffer_crosses_a_link() {
-    let mut ring = ring(3, true, Duration::ZERO, 2000);
-    ring.client.send(&rows(1, 1 << 16).encode()).unwrap();
-    assert_eq!(answer(&mut ring).tokens, vec![123, 9]);
+    within_deadline("a_frame_too_big_for_one_tls_buffer_crosses_a_link", || {
+        let mut ring = ring(3, true, Duration::ZERO, 2000);
+        ring.client.send(&rows(1, 1 << 16).encode()).unwrap();
+        assert_eq!(answer(&mut ring).tokens, vec![123, 9]);
+    });
 }
 
 #[test]
 fn losing_the_closing_link_costs_nothing_but_speed() {
-    let (mut ring, relay) = ring_through(0, 3, true, Duration::ZERO, 2000);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    answer(&mut ring);
-    assert!(ring.nodes[2].stats().closing_up);
-    relay.cut();
-    wait_until("the closing link's loss", || !ring.nodes[2].stats().closing_up);
-    ring.client.send(&pass(2, 5, 9).encode()).unwrap();
-    let got = answer(&mut ring);
-    assert_eq!(got, sealed(2, vec![5123, 9]));
-    assert_eq!(ring.nodes[2].stats().refusals, 0);
+    within_deadline("losing_the_closing_link_costs_nothing_but_speed", || {
+        let (mut ring, relay) = ring_through(0, 3, true, Duration::ZERO, 2000);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        answer(&mut ring);
+        assert!(ring.nodes[2].stats().closing_up);
+        relay.cut();
+        wait_until("the closing link's loss", || !ring.nodes[2].stats().closing_up);
+        ring.client.send(&pass(2, 5, 9).encode()).unwrap();
+        let got = answer(&mut ring);
+        assert_eq!(got, sealed(2, vec![5123, 9]));
+        assert_eq!(ring.nodes[2].stats().refusals, 0);
+    });
 }
 
 /// Keeps a test that loses an answer from waiting for ever.
@@ -545,119 +715,133 @@ fn wait_for_acknowledgements(ring: &Ring) {
 
 #[test]
 fn an_answer_held_by_a_closing_link_that_goes_silent_arrives_by_walking_back() {
-    let ack = Duration::from_millis(600);
-    let (mut ring, relay) = ring_through(0, 3, true, Duration::ZERO, ack.as_millis() as u64);
-    patient_client(&ring);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    answer(&mut ring);
-    wait_for_acknowledgements(&ring);
-    relay.refuse(true);
-    relay.hold();
-    let began = Instant::now();
-    ring.client.send(&pass(2, 5, 10).encode()).unwrap();
-    let got = answer(&mut ring);
-    assert_eq!(got.tokens, vec![5123, 10]);
-    assert!(began.elapsed() < ack + Duration::from_millis(400), "took {:?}", began.elapsed());
-    let last = ring.nodes[2].stats();
-    assert_eq!((last.resent, last.refusals), (1, 0));
-    wait_until("the answer's acknowledgement", || ring.nodes[2].stats().answers_held == 0);
+    within_deadline("an_answer_held_by_a_closing_link_that_goes_silent_arrives_by_walking_back", || {
+        let ack = Duration::from_millis(600);
+        let (mut ring, relay) = ring_through(0, 3, true, Duration::ZERO, ack.as_millis() as u64);
+        patient_client(&ring);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        answer(&mut ring);
+        wait_for_acknowledgements(&ring);
+        relay.refuse(true);
+        relay.hold();
+        let began = Instant::now();
+        ring.client.send(&pass(2, 5, 10).encode()).unwrap();
+        let got = answer(&mut ring);
+        assert_eq!(got.tokens, vec![5123, 10]);
+        assert!(began.elapsed() < ack + Duration::from_millis(400), "took {:?}", began.elapsed());
+        let last = ring.nodes[2].stats();
+        assert_eq!((last.resent, last.refusals), (1, 0));
+        wait_until("the answer's acknowledgement", || ring.nodes[2].stats().answers_held == 0);
+    });
 }
 
 #[test]
 fn an_answer_on_a_closing_link_that_is_cut_arrives_by_walking_back() {
-    let (mut ring, relay) = ring_through(0, 3, true, Duration::from_millis(100), 2000);
-    patient_client(&ring);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    answer(&mut ring);
-    relay.refuse(true);
-    relay.hold();
-    ring.client.send(&pass(2, 5, 10).encode()).unwrap();
-    wait_until("the answer leaving", || ring.nodes[2].stats().answers_held == 1);
-    relay.cut();
-    assert_eq!(answer(&mut ring).tokens, vec![5123, 10]);
+    within_deadline("an_answer_on_a_closing_link_that_is_cut_arrives_by_walking_back", || {
+        let (mut ring, relay) = ring_through(0, 3, true, Duration::from_millis(100), 2000);
+        patient_client(&ring);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        answer(&mut ring);
+        relay.refuse(true);
+        relay.hold();
+        ring.client.send(&pass(2, 5, 10).encode()).unwrap();
+        wait_until("the answer leaving", || ring.nodes[2].stats().answers_held == 1);
+        relay.cut();
+        assert_eq!(answer(&mut ring).tokens, vec![5123, 10]);
+    });
 }
 
 #[test]
 fn every_answer_is_acknowledged_by_the_way_it_came() {
-    for closing in [true, false] {
-        let mut ring = ring(3, closing, Duration::ZERO, 2000);
-        for id in 1..=20 {
-            ring.client.send(&pass(id, 5, id as u32).encode()).unwrap();
+    within_deadline("every_answer_is_acknowledged_by_the_way_it_came", || {
+        for closing in [true, false] {
+            let mut ring = ring(3, closing, Duration::ZERO, 2000);
+            for id in 1..=20 {
+                ring.client.send(&pass(id, 5, id as u32).encode()).unwrap();
+            }
+            for _ in 0..20 {
+                answer(&mut ring);
+            }
+            wait_for_acknowledgements(&ring);
+            assert_eq!(ring.nodes[2].stats().resent, 0);
         }
-        for _ in 0..20 {
-            answer(&mut ring);
-        }
-        wait_for_acknowledgements(&ring);
-        assert_eq!(ring.nodes[2].stats().resent, 0);
-    }
+    });
 }
 
 #[test]
 fn an_answer_whose_acknowledgement_is_lost_reaches_the_worker_once() {
-    let (mut ring, relay) = ring_through(0, 3, true, Duration::ZERO, 500);
-    patient_client(&ring);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    answer(&mut ring);
-    wait_for_acknowledgements(&ring);
-    relay.refuse(true);
-    relay.hold_back();
-    ring.client.send(&pass(2, 5, 10).encode()).unwrap();
-    assert_eq!(answer(&mut ring).id, 2);
-    wait_until("the repeat", || ring.nodes[0].stats().dropped == 1);
-    wait_until("its acknowledgement", || ring.nodes[2].stats().answers_held == 0);
-    ring.client.send(&pass(3, 5, 11).encode()).unwrap();
-    assert_eq!(answer(&mut ring).id, 3);
+    within_deadline("an_answer_whose_acknowledgement_is_lost_reaches_the_worker_once", || {
+        let (mut ring, relay) = ring_through(0, 3, true, Duration::ZERO, 500);
+        patient_client(&ring);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        answer(&mut ring);
+        wait_for_acknowledgements(&ring);
+        relay.refuse(true);
+        relay.hold_back();
+        ring.client.send(&pass(2, 5, 10).encode()).unwrap();
+        assert_eq!(answer(&mut ring).id, 2);
+        wait_until("the repeat", || ring.nodes[0].stats().dropped == 1);
+        wait_until("its acknowledgement", || ring.nodes[2].stats().answers_held == 0);
+        ring.client.send(&pass(3, 5, 11).encode()).unwrap();
+        assert_eq!(answer(&mut ring).id, 3);
+    });
 }
 
 #[test]
 fn a_lost_closing_link_comes_back_at_both_ends() {
-    let (mut ring, relay) = ring_through(0, 3, true, Duration::ZERO, 2000);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    answer(&mut ring);
-    wait_for_acknowledgements(&ring); // or the first answer is still held, and goes again
-    relay.cut();
-    wait_until("the closing link's loss", || relay.attempts() == 2);
-    wait_until("the closing link's return", || ring.nodes[2].stats().closing_up && ring.nodes[0].stats().closing_up);
-    ring.client.send(&pass(2, 5, 10).encode()).unwrap();
-    assert_eq!(answer(&mut ring).tokens, vec![5123, 10]);
-    assert_eq!(ring.nodes[2].stats().resent, 0);
+    within_deadline("a_lost_closing_link_comes_back_at_both_ends", || {
+        let (mut ring, relay) = ring_through(0, 3, true, Duration::ZERO, 2000);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        answer(&mut ring);
+        wait_for_acknowledgements(&ring); // or the first answer is still held, and goes again
+        relay.cut();
+        wait_until("the closing link's loss", || relay.attempts() == 2);
+        wait_until("the closing link's return", || ring.nodes[2].stats().closing_up && ring.nodes[0].stats().closing_up);
+        ring.client.send(&pass(2, 5, 10).encode()).unwrap();
+        assert_eq!(answer(&mut ring).tokens, vec![5123, 10]);
+        assert_eq!(ring.nodes[2].stats().resent, 0);
+    });
 }
 
 #[test]
 fn the_entry_forgets_a_closing_link_that_died_or_went_silent() {
-    for silent in [false, true] {
-        let (ring, relay) = ring_through(0, 2, true, Duration::ZERO, 400);
-        assert!(ring.nodes[0].stats().closing_up);
-        relay.refuse(true);
-        if silent {
-            relay.hold();
-        } else {
-            relay.cut();
+    within_deadline("the_entry_forgets_a_closing_link_that_died_or_went_silent", || {
+        for silent in [false, true] {
+            let (ring, relay) = ring_through(0, 2, true, Duration::ZERO, 400);
+            assert!(ring.nodes[0].stats().closing_up);
+            relay.refuse(true);
+            if silent {
+                relay.hold();
+            } else {
+                relay.cut();
+            }
+            wait_until("the entry noticing", || !ring.nodes[0].stats().closing_up);
+            wait_until("the last stage noticing", || !ring.nodes[1].stats().closing_up);
         }
-        wait_until("the entry noticing", || !ring.nodes[0].stats().closing_up);
-        wait_until("the last stage noticing", || !ring.nodes[1].stats().closing_up);
-    }
+    });
 }
 
 #[test]
 fn redialling_backs_off_and_stops_with_the_ring() {
-    let (ring, relay) = ring_through(0, 2, true, Duration::ZERO, 2000);
-    relay.refuse(true);
-    relay.cut();
-    wait_until("the first redial", || relay.attempts() >= 2);
-    thread::sleep(Duration::from_millis(1800));
-    // At 0.25 s apart that would be eight more. Doubling gives three.
-    assert!(relay.attempts() <= 5, "{} attempts", relay.attempts());
-    relay.refuse(false);
-    let began = Instant::now();
-    wait_until("the closing link's return", || ring.nodes[1].stats().closing_up);
-    assert!(began.elapsed() < Duration::from_secs(3));
-    relay.refuse(true);
-    relay.cut();
-    ring.nodes[1].close_ring();
-    let attempts = relay.attempts();
-    thread::sleep(Duration::from_millis(700));
-    assert_eq!(relay.attempts(), attempts);
+    within_deadline("redialling_backs_off_and_stops_with_the_ring", || {
+        let (ring, relay) = ring_through(0, 2, true, Duration::ZERO, 2000);
+        relay.refuse(true);
+        relay.cut();
+        wait_until("the first redial", || relay.attempts() >= 2);
+        thread::sleep(Duration::from_millis(1800));
+        // At 0.25 s apart that would be eight more. Doubling gives three.
+        assert!(relay.attempts() <= 5, "{} attempts", relay.attempts());
+        relay.refuse(false);
+        let began = Instant::now();
+        wait_until("the closing link's return", || ring.nodes[1].stats().closing_up);
+        assert!(began.elapsed() < Duration::from_secs(3));
+        relay.refuse(true);
+        relay.cut();
+        ring.nodes[1].close_ring();
+        let attempts = relay.attempts();
+        thread::sleep(Duration::from_millis(700));
+        assert_eq!(relay.attempts(), attempts);
+    });
 }
 
 /// Waits for a first heartbeat, which is what shows a link was ever worth redialling.
@@ -667,254 +851,284 @@ fn let_links_prove_themselves(ring: &Ring, stages: usize) {
 
 #[test]
 fn a_silent_hop_is_redialled_and_what_it_held_goes_again_in_order() {
-    for door in [1, 2] {
-        let ack = Duration::from_millis(600);
-        let (mut ring, relay) = ring_through(door, 3, true, Duration::ZERO, ack.as_millis() as u64);
-        patient_client(&ring);
-        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-        answer(&mut ring);
-        let_links_prove_themselves(&ring, 2);
-        relay.hold();
-        let began = Instant::now();
-        for id in 2..=20 {
-            ring.client.send(&pass(id, 5, id as u32).encode()).unwrap();
+    within_deadline("a_silent_hop_is_redialled_and_what_it_held_goes_again_in_order", || {
+        for door in [1, 2] {
+            let ack = Duration::from_millis(600);
+            let (mut ring, relay) = ring_through(door, 3, true, Duration::ZERO, ack.as_millis() as u64);
+            patient_client(&ring);
+            ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+            answer(&mut ring);
+            let_links_prove_themselves(&ring, 2);
+            relay.hold();
+            let began = Instant::now();
+            for id in 2..=20 {
+                ring.client.send(&pass(id, 5, id as u32).encode()).unwrap();
+            }
+            for id in 2..=20 {
+                let got = answer(&mut ring);
+                assert_eq!((got.id, got.tokens), (id, vec![5123, id as u32]));
+            }
+            assert!(began.elapsed() < ack + Duration::from_millis(500), "took {:?}", began.elapsed());
+            assert_eq!(relay.attempts(), 2);
+            assert!(ring.nodes[door - 1].stats().next_up);
+            assert_eq!(ring.nodes[door - 1].stats().refusals, 0);
         }
-        for id in 2..=20 {
-            let got = answer(&mut ring);
-            assert_eq!((got.id, got.tokens), (id, vec![5123, id as u32]));
-        }
-        assert!(began.elapsed() < ack + Duration::from_millis(500), "took {:?}", began.elapsed());
-        assert_eq!(relay.attempts(), 2);
-        assert!(ring.nodes[door - 1].stats().next_up);
-        assert_eq!(ring.nodes[door - 1].stats().refusals, 0);
-    }
+    });
 }
 
 #[test]
 fn a_hop_silent_one_way_is_redialled_even_when_the_far_end_gives_up_on_it_first() {
-    // The far end's read limit ends the link, and that close still gets through. It is not a
-    // stage dying, so the reply should not pay for a replay. Which side's limit fires first
-    // depends on the system, so the close is made here, just inside the near end's own limit.
-    let (mut ring, relay) = ring_through(1, 3, true, Duration::ZERO, 600);
-    patient_client(&ring);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    answer(&mut ring);
-    let_links_prove_themselves(&ring, 2);
-    relay.hold_forth();
-    for id in 2..=5 {
-        ring.client.send(&pass(id, 5, id as u32).encode()).unwrap();
-    }
-    thread::sleep(Duration::from_millis(450));
-    relay.cut();
-    for id in 2..=5 {
-        assert_eq!(answer(&mut ring).id, id);
-    }
-    assert_eq!(relay.attempts(), 2);
-    assert_eq!(ring.nodes[0].stats().refusals, 0);
+    within_deadline("a_hop_silent_one_way_is_redialled_even_when_the_far_end_gives_up_on_it_first", || {
+        // The far end's read limit ends the link, and that close still gets through. It is not a
+        // stage dying, so the reply should not pay for a replay. Which side's limit fires first
+        // depends on the system, so the close is made here, just inside the near end's own limit.
+        let (mut ring, relay) = ring_through(1, 3, true, Duration::ZERO, 600);
+        patient_client(&ring);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        answer(&mut ring);
+        let_links_prove_themselves(&ring, 2);
+        relay.hold_forth();
+        for id in 2..=5 {
+            ring.client.send(&pass(id, 5, id as u32).encode()).unwrap();
+        }
+        thread::sleep(Duration::from_millis(450));
+        relay.cut();
+        for id in 2..=5 {
+            assert_eq!(answer(&mut ring).id, id);
+        }
+        assert_eq!(relay.attempts(), 2);
+        assert_eq!(ring.nodes[0].stats().refusals, 0);
+    });
 }
 
 #[test]
 fn a_pass_that_arrived_but_whose_acknowledgement_was_lost_runs_once() {
-    let (mut ring, relay) = ring_through(1, 3, true, Duration::ZERO, 500);
-    patient_client(&ring);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    answer(&mut ring);
-    let_links_prove_themselves(&ring, 2);
-    relay.hold_back();
-    ring.client.send(&pass(2, 5, 10).encode()).unwrap();
-    assert_eq!(answer(&mut ring).id, 2);
-    wait_until("the repeat reaching the stage", || ring.nodes[1].stats().dropped == 1);
-    ring.client.send(&pass(3, 5, 11).encode()).unwrap();
-    assert_eq!(answer(&mut ring).id, 3);
-    assert_eq!(ring.seen[1].load(Ordering::SeqCst), 3);
-    assert_eq!(ring.seen[2].load(Ordering::SeqCst), 3);
+    within_deadline("a_pass_that_arrived_but_whose_acknowledgement_was_lost_runs_once", || {
+        let (mut ring, relay) = ring_through(1, 3, true, Duration::ZERO, 500);
+        patient_client(&ring);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        answer(&mut ring);
+        let_links_prove_themselves(&ring, 2);
+        relay.hold_back();
+        ring.client.send(&pass(2, 5, 10).encode()).unwrap();
+        assert_eq!(answer(&mut ring).id, 2);
+        wait_until("the repeat reaching the stage", || ring.nodes[1].stats().dropped == 1);
+        ring.client.send(&pass(3, 5, 11).encode()).unwrap();
+        assert_eq!(answer(&mut ring).id, 3);
+        assert_eq!(ring.seen[1].load(Ordering::SeqCst), 3);
+        assert_eq!(ring.seen[2].load(Ordering::SeqCst), 3);
+    });
 }
 
 #[test]
 fn a_hop_that_cannot_be_redialled_is_refused_soon_after_it_is_lost() {
-    let ack = Duration::from_millis(500);
-    let (mut ring, relay) = ring_through(1, 2, false, Duration::ZERO, ack.as_millis() as u64);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    answer(&mut ring);
-    let_links_prove_themselves(&ring, 1);
-    relay.swallow();
-    relay.hold();
-    let began = Instant::now();
-    ring.client.send(&pass(2, 5, 10).encode()).unwrap();
-    wait_for_loss(&mut ring, 1);
-    assert!(began.elapsed() < ack + Duration::from_millis(2500), "took {:?}", began.elapsed());
-    assert_eq!(relay.attempts(), 2);
-    assert!(!ring.nodes[0].stats().next_up);
+    within_deadline("a_hop_that_cannot_be_redialled_is_refused_soon_after_it_is_lost", || {
+        let ack = Duration::from_millis(500);
+        let (mut ring, relay) = ring_through(1, 2, false, Duration::ZERO, ack.as_millis() as u64);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        answer(&mut ring);
+        let_links_prove_themselves(&ring, 1);
+        relay.swallow();
+        relay.hold();
+        let began = Instant::now();
+        ring.client.send(&pass(2, 5, 10).encode()).unwrap();
+        wait_for_loss(&mut ring, 1);
+        assert!(began.elapsed() < ack + Duration::from_millis(2500), "took {:?}", began.elapsed());
+        assert_eq!(relay.attempts(), 2);
+        assert!(!ring.nodes[0].stats().next_up);
+    });
 }
 
 #[test]
 fn a_redialled_hop_that_says_nothing_is_not_redialled_again() {
-    let ack = 400;
-    let (mut ring, relay) = ring_through(1, 2, false, Duration::ZERO, ack);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    answer(&mut ring);
-    let_links_prove_themselves(&ring, 1);
-    relay.hold();
-    wait_until("the redial", || relay.attempts() == 2);
-    // The new link's first beat goes out a tenth of a second after it opens, and the answer
-    // to it would prove the link and earn a third dial. Hold it well before that. Holding it
-    // before its handshake ends is a dial that failed, which must not dial again either.
-    thread::sleep(Duration::from_millis(40));
-    relay.hold();
-    wait_for_loss(&mut ring, 1);
-    assert_eq!(relay.attempts(), 2);
+    within_deadline("a_redialled_hop_that_says_nothing_is_not_redialled_again", || {
+        let ack = 400;
+        let (mut ring, relay) = ring_through(1, 2, false, Duration::ZERO, ack);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        answer(&mut ring);
+        let_links_prove_themselves(&ring, 1);
+        relay.hold();
+        wait_until("the redial", || relay.attempts() == 2);
+        // The new link's first beat goes out a tenth of a second after it opens, and the answer
+        // to it would prove the link and earn a third dial. Hold it well before that. Holding it
+        // before its handshake ends is a dial that failed, which must not dial again either.
+        thread::sleep(Duration::from_millis(40));
+        relay.hold();
+        wait_for_loss(&mut ring, 1);
+        assert_eq!(relay.attempts(), 2);
+    });
 }
 
 #[test]
 fn a_busy_stage_is_not_taken_for_dead() {
-    // Each pass takes longer than the timeout, and the acknowledgement must not wait for it.
-    let mut ring = ring(2, true, Duration::from_millis(400), 300);
-    for id in 1..=3 {
-        ring.client.send(&pass(id, 1, 1).encode()).unwrap();
-    }
-    for id in 1..=3 {
-        assert_eq!(answer(&mut ring).id, id);
-    }
+    within_deadline("a_busy_stage_is_not_taken_for_dead", || {
+        // Each pass takes longer than the timeout, and the acknowledgement must not wait for it.
+        let mut ring = ring(2, true, Duration::from_millis(400), 300);
+        for id in 1..=3 {
+            ring.client.send(&pass(id, 1, 1).encode()).unwrap();
+        }
+        for id in 1..=3 {
+            assert_eq!(answer(&mut ring).id, id);
+        }
+    });
 }
 
 #[test]
 fn passes_that_wait_share_a_trip_and_each_still_gets_its_own_answer() {
-    let mut ring = ring(2, true, Duration::from_millis(30), 2000);
-    let total: u64 = 12;
-    for id in 1..=total {
-        let mut item = pass(id, id as u32, 3);
-        item.slot = id as u32;
-        ring.client.send(&item.encode()).unwrap();
-    }
-    let mut answers: Vec<_> = (0..total).map(|_| answer(&mut ring)).collect();
-    answers.sort_by_key(|item| item.id);
-    for (index, item) in answers.iter().enumerate() {
-        let id = index as u32 + 1;
-        assert_eq!(item.tokens[0], (id * 10 + 1) * 10 + 2, "reply {id} got another reply's result");
-    }
+    within_deadline("passes_that_wait_share_a_trip_and_each_still_gets_its_own_answer", || {
+        let mut ring = ring(2, true, Duration::from_millis(30), 2000);
+        let total: u64 = 12;
+        for id in 1..=total {
+            let mut item = pass(id, id as u32, 3);
+            item.slot = id as u32;
+            ring.client.send(&item.encode()).unwrap();
+        }
+        let mut answers: Vec<_> = (0..total).map(|_| answer(&mut ring)).collect();
+        answers.sort_by_key(|item| item.id);
+        for (index, item) in answers.iter().enumerate() {
+            let id = index as u32 + 1;
+            assert_eq!(item.tokens[0], (id * 10 + 1) * 10 + 2, "reply {id} got another reply's result");
+        }
+    });
 }
 
 #[test]
 fn a_merge_reaches_past_a_slots_second_pass_and_refuses_only_its_own_row() {
-    let mut ring = ring(2, true, Duration::from_millis(30), 2000);
-    // The first holds the stage while the rest queue up, slot 1's two passes side by side.
-    let queued = [(1, 9, 1), (2, 1, 7), (3, 1, 8), (4, 2, 9), (5, 3, 666), (6, 4, 10)];
-    for (id, slot, position) in queued {
-        ring.client.send(&Pass { slot, ..pass(id, 3, position) }.encode()).unwrap();
-    }
-    let (mut answered, mut refused) = (vec![], vec![]);
-    for _ in queued {
-        let (kind, body) = ring.frames.next().unwrap();
-        match kind {
-            Kind::Result => answered.push(Answer::decode(&body).unwrap().id),
-            Kind::Nack => refused.push(Nack::decode(&body).unwrap().id),
-            other => panic!("{other:?}"),
+    within_deadline("a_merge_reaches_past_a_slots_second_pass_and_refuses_only_its_own_row", || {
+        let mut ring = ring(2, true, Duration::from_millis(30), 2000);
+        // The first holds the stage while the rest queue up, slot 1's two passes side by side.
+        let queued = [(1, 9, 1), (2, 1, 7), (3, 1, 8), (4, 2, 9), (5, 3, 666), (6, 4, 10)];
+        for (id, slot, position) in queued {
+            ring.client.send(&Pass { slot, ..pass(id, 3, position) }.encode()).unwrap();
         }
-    }
-    answered.sort_unstable();
-    assert_eq!(answered, vec![1, 2, 3, 4, 6]);
-    assert_eq!(refused, vec![5]);
-    assert!(ring.nodes[0].stats().merged_rows >= 4, "{:?}", ring.nodes[0].stats());
+        let (mut answered, mut refused) = (vec![], vec![]);
+        for _ in queued {
+            let (kind, body) = ring.frames.next().unwrap();
+            match kind {
+                Kind::Result => answered.push(Answer::decode(&body).unwrap().id),
+                Kind::Nack => refused.push(Nack::decode(&body).unwrap().id),
+                other => panic!("{other:?}"),
+            }
+        }
+        answered.sort_unstable();
+        assert_eq!(answered, vec![1, 2, 3, 4, 6]);
+        assert_eq!(refused, vec![5]);
+        assert!(ring.nodes[0].stats().merged_rows >= 4, "{:?}", ring.nodes[0].stats());
+    });
 }
 
 #[test]
 fn passes_on_one_sequence_never_share_a_trip() {
-    let mut ring = ring(2, true, Duration::from_millis(5), 2000);
-    for id in 1..=20 {
-        ring.client.send(&pass(id, 1, id as u32).encode()).unwrap();
-    }
-    for id in 1..=20 {
-        assert_eq!(answer(&mut ring).tokens[1], id as u32);
-    }
-    assert_eq!(ring.nodes[0].stats().merged_passes, 0);
+    within_deadline("passes_on_one_sequence_never_share_a_trip", || {
+        let mut ring = ring(2, true, Duration::from_millis(5), 2000);
+        for id in 1..=20 {
+            ring.client.send(&pass(id, 1, id as u32).encode()).unwrap();
+        }
+        for id in 1..=20 {
+            assert_eq!(answer(&mut ring).tokens[1], id as u32);
+        }
+        assert_eq!(ring.nodes[0].stats().merged_passes, 0);
+    });
 }
 
 #[test]
 fn a_rewind_clears_what_is_queued_past_it() {
-    // Long passes, so waiting behind eight of them stands well clear of a slow machine's noise.
-    let mut ring = ring(2, true, Duration::from_millis(120), 4000);
-    for id in 1..=8 {
-        ring.client.send(&pass(id, 1, 100 + id as u32).encode()).unwrap();
-    }
-    // The answer to the first pass said the rest were built on a wrong guess.
-    let rewind = Pass { rollback_to: Some(102), ..pass(9, 2, 102) };
-    ring.client.send(&rewind.encode()).unwrap();
-    let began = Instant::now();
-    let mut seen = vec![];
-    while seen.last() != Some(&9) {
-        seen.push(answer(&mut ring).id);
-    }
-    assert!(seen.len() < 5, "{seen:?}");
-    let took = began.elapsed();
-    assert!(took < Duration::from_millis(840), "the rewind waited behind passes nobody wants: {took:?}");
-    assert!(ring.nodes[0].stats().dropped >= 5);
+    within_deadline("a_rewind_clears_what_is_queued_past_it", || {
+        // Long passes, so waiting behind eight of them stands well clear of a slow machine's noise.
+        let mut ring = ring(2, true, Duration::from_millis(120), 4000);
+        for id in 1..=8 {
+            ring.client.send(&pass(id, 1, 100 + id as u32).encode()).unwrap();
+        }
+        // The answer to the first pass said the rest were built on a wrong guess.
+        let rewind = Pass { rollback_to: Some(102), ..pass(9, 2, 102) };
+        ring.client.send(&rewind.encode()).unwrap();
+        let began = Instant::now();
+        let mut seen = vec![];
+        while seen.last() != Some(&9) {
+            seen.push(answer(&mut ring).id);
+        }
+        assert!(seen.len() < 5, "{seen:?}");
+        let took = began.elapsed();
+        assert!(took < Duration::from_millis(840), "the rewind waited behind passes nobody wants: {took:?}");
+        assert!(ring.nodes[0].stats().dropped >= 5);
+    });
 }
 
 #[test]
 fn a_rewind_leaves_other_replies_and_earlier_places_alone() {
-    let mut ring = ring(2, true, Duration::from_millis(20), 2000);
-    let other = Pass { slot: 1, ..pass(1, 1, 500) };
-    ring.client.send(&pass(2, 1, 10).encode()).unwrap();
-    ring.client.send(&other.encode()).unwrap();
-    ring.client.send(&pass(3, 1, 11).encode()).unwrap();
-    ring.client.send(&Pass { rollback_to: Some(12), ..pass(4, 2, 12) }.encode()).unwrap();
-    let mut seen: Vec<u64> = (0..4).map(|_| answer(&mut ring).id).collect();
-    seen.sort_unstable();
-    assert_eq!(seen, vec![1, 2, 3, 4]);
-    assert_eq!(ring.nodes[0].stats().dropped, 0);
+    within_deadline("a_rewind_leaves_other_replies_and_earlier_places_alone", || {
+        let mut ring = ring(2, true, Duration::from_millis(20), 2000);
+        let other = Pass { slot: 1, ..pass(1, 1, 500) };
+        ring.client.send(&pass(2, 1, 10).encode()).unwrap();
+        ring.client.send(&other.encode()).unwrap();
+        ring.client.send(&pass(3, 1, 11).encode()).unwrap();
+        ring.client.send(&Pass { rollback_to: Some(12), ..pass(4, 2, 12) }.encode()).unwrap();
+        let mut seen: Vec<u64> = (0..4).map(|_| answer(&mut ring).id).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, vec![1, 2, 3, 4]);
+        assert_eq!(ring.nodes[0].stats().dropped, 0);
+    });
 }
 
 #[test]
 fn a_new_reply_clears_what_an_older_one_left_queued_on_its_slot() {
-    let mut ring = ring(2, true, Duration::from_millis(30), 2000);
-    for id in 1..=8 {
-        ring.client.send(&pass(id, 1, id as u32).encode()).unwrap();
-    }
-    let other = Pass { slot: 1, ..pass(9, 1, 3) };
-    ring.client.send(&other.encode()).unwrap();
-    ring.client.send(&Pass { generation: 2, ..pass(10, 1, 0) }.encode()).unwrap();
-    let mut seen = vec![];
-    while !seen.contains(&10) || !seen.contains(&9) {
-        seen.push(answer(&mut ring).id);
-    }
-    assert!(seen.len() < 5, "{seen:?}");
-    assert!(ring.nodes[0].stats().dropped >= 5);
+    within_deadline("a_new_reply_clears_what_an_older_one_left_queued_on_its_slot", || {
+        let mut ring = ring(2, true, Duration::from_millis(30), 2000);
+        for id in 1..=8 {
+            ring.client.send(&pass(id, 1, id as u32).encode()).unwrap();
+        }
+        let other = Pass { slot: 1, ..pass(9, 1, 3) };
+        ring.client.send(&other.encode()).unwrap();
+        ring.client.send(&Pass { generation: 2, ..pass(10, 1, 0) }.encode()).unwrap();
+        let mut seen = vec![];
+        while !seen.contains(&10) || !seen.contains(&9) {
+            seen.push(answer(&mut ring).id);
+        }
+        assert!(seen.len() < 5, "{seen:?}");
+        assert!(ring.nodes[0].stats().dropped >= 5);
+    });
 }
 
 #[test]
 fn a_pass_from_a_generation_that_has_ended_never_runs() {
-    let mut ring = ring(2, true, Duration::ZERO, 2000);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    answer(&mut ring);
-    ring.client.send(&Pass { generation: 2, ..pass(2, 5, 0) }.encode()).unwrap();
-    answer(&mut ring);
-    let ran = ring.seen[0].load(Ordering::SeqCst);
-    // It reaches the stage after the reply that replaced it, as a pass orphaned by a lost link can.
-    ring.client.send(&pass(3, 5, 10).encode()).unwrap();
-    ring.client.send(&Pass { generation: 2, ..pass(4, 5, 1) }.encode()).unwrap();
-    assert_eq!(answer(&mut ring).id, 4);
-    assert_eq!(ring.seen[0].load(Ordering::SeqCst), ran + 1);
-    assert_eq!(ring.nodes[0].stats().dropped, 1);
+    within_deadline("a_pass_from_a_generation_that_has_ended_never_runs", || {
+        let mut ring = ring(2, true, Duration::ZERO, 2000);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        answer(&mut ring);
+        ring.client.send(&Pass { generation: 2, ..pass(2, 5, 0) }.encode()).unwrap();
+        answer(&mut ring);
+        let ran = ring.seen[0].load(Ordering::SeqCst);
+        // It reaches the stage after the reply that replaced it, as a pass orphaned by a lost link can.
+        ring.client.send(&pass(3, 5, 10).encode()).unwrap();
+        ring.client.send(&Pass { generation: 2, ..pass(4, 5, 1) }.encode()).unwrap();
+        assert_eq!(answer(&mut ring).id, 4);
+        assert_eq!(ring.seen[0].load(Ordering::SeqCst), ran + 1);
+        assert_eq!(ring.nodes[0].stats().dropped, 1);
+    });
 }
 
 #[test]
 fn a_pass_that_arrives_twice_runs_once() {
-    let mut ring = ring(2, true, Duration::ZERO, 2000);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    ring.client.send(&pass(2, 5, 10).encode()).unwrap();
-    assert_eq!(answer(&mut ring).id, 1);
-    assert_eq!(answer(&mut ring).id, 2);
-    assert_eq!(ring.seen[1].load(Ordering::SeqCst), 2);
+    within_deadline("a_pass_that_arrives_twice_runs_once", || {
+        let mut ring = ring(2, true, Duration::ZERO, 2000);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        ring.client.send(&pass(2, 5, 10).encode()).unwrap();
+        assert_eq!(answer(&mut ring).id, 1);
+        assert_eq!(answer(&mut ring).id, 2);
+        assert_eq!(ring.seen[1].load(Ordering::SeqCst), 2);
+    });
 }
 
 #[test]
 fn the_entry_drops_a_late_result_from_an_older_generation() {
-    let mut ring = ring(2, true, Duration::from_millis(100), 2000);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    ring.client.send(&Pass { generation: 2, ..pass(2, 5, 0) }.encode()).unwrap();
-    assert_eq!(answer(&mut ring).id, 2);
-    assert!(ring.nodes[0].stats().dropped >= 1);
+    within_deadline("the_entry_drops_a_late_result_from_an_older_generation", || {
+        let mut ring = ring(2, true, Duration::from_millis(100), 2000);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        ring.client.send(&Pass { generation: 2, ..pass(2, 5, 0) }.encode()).unwrap();
+        assert_eq!(answer(&mut ring).id, 2);
+        assert!(ring.nodes[0].stats().dropped >= 1);
+    });
 }
 
 /// Says what the last stage says, from outside it, as a stage that lost track could.
@@ -925,155 +1139,173 @@ fn closing_voice(ring: &Ring) -> Arc<Link> {
 
 #[test]
 fn the_entry_passes_on_an_answer_it_has_already_seen_only_once() {
-    let mut ring = ring(2, false, Duration::ZERO, 2000);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    let first = answer(&mut ring);
-    let voice = closing_voice(&ring);
-    voice.send(&first.encode()).unwrap();
-    voice.send(&Answer { id: 2, ..first.clone() }.sealed(CLOSING).encode()).unwrap();
-    voice.send(&Answer { id: 2, ..first.clone() }.sealed(CLOSING).encode()).unwrap();
-    voice.send(&Answer { id: 3, ..first }.sealed(CLOSING).encode()).unwrap();
-    assert_eq!(answer(&mut ring).id, 2);
-    assert_eq!(answer(&mut ring).id, 3);
-    wait_until("both repeats dropped", || ring.nodes[0].stats().dropped == 2);
-    voice.close();
+    within_deadline("the_entry_passes_on_an_answer_it_has_already_seen_only_once", || {
+        let mut ring = ring(2, false, Duration::ZERO, 2000);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        let first = answer(&mut ring);
+        let voice = closing_voice(&ring);
+        voice.send(&first.encode()).unwrap();
+        voice.send(&Answer { id: 2, ..first.clone() }.sealed(CLOSING).encode()).unwrap();
+        voice.send(&Answer { id: 2, ..first.clone() }.sealed(CLOSING).encode()).unwrap();
+        voice.send(&Answer { id: 3, ..first }.sealed(CLOSING).encode()).unwrap();
+        assert_eq!(answer(&mut ring).id, 2);
+        assert_eq!(answer(&mut ring).id, 3);
+        wait_until("both repeats dropped", || ring.nodes[0].stats().dropped == 2);
+        voice.close();
+    });
 }
 
 #[test]
 fn an_answer_from_no_reply_this_entry_knows_is_dropped() {
-    let mut ring = ring(2, false, Duration::ZERO, 2000);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    let first = answer(&mut ring);
-    let voice = closing_voice(&ring);
-    voice.send(&Answer { id: 2, generation: 99, ..first.clone() }.sealed(CLOSING).encode()).unwrap();
-    voice.send(&Answer { id: 3, slot: 4, ..first.clone() }.sealed(CLOSING).encode()).unwrap();
-    voice.send(&Answer { id: 4, ..first }.sealed(CLOSING).encode()).unwrap();
-    assert_eq!(answer(&mut ring).id, 4);
-    assert_eq!(ring.nodes[0].stats().dropped, 2);
-    voice.close();
+    within_deadline("an_answer_from_no_reply_this_entry_knows_is_dropped", || {
+        let mut ring = ring(2, false, Duration::ZERO, 2000);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        let first = answer(&mut ring);
+        let voice = closing_voice(&ring);
+        voice.send(&Answer { id: 2, generation: 99, ..first.clone() }.sealed(CLOSING).encode()).unwrap();
+        voice.send(&Answer { id: 3, slot: 4, ..first.clone() }.sealed(CLOSING).encode()).unwrap();
+        voice.send(&Answer { id: 4, ..first }.sealed(CLOSING).encode()).unwrap();
+        assert_eq!(answer(&mut ring).id, 4);
+        assert_eq!(ring.nodes[0].stats().dropped, 2);
+        voice.close();
+    });
 }
 
 #[test]
 fn a_stage_can_speak_only_on_the_links_it_is_part_of() {
-    let mut ring = ring(3, true, Duration::ZERO, 2000);
-    {
-        let dial = |at: usize, key: &[u8], role: Role| {
-            let door = &ring.doors[at];
-            link::dial(&format!("127.0.0.1:{}", door.port), Some(&door.fingerprint), key, role, 7, Duration::from_secs(3))
-        };
-        // Stage one holds the keys of the hops on either side of it, and nothing else.
-        for key in [hop_key(0), hop_key(1)] {
-            assert!(dial(0, &key, Role::Closing).is_err(), "it closed the ring as if it were the last stage");
+    within_deadline("a_stage_can_speak_only_on_the_links_it_is_part_of", || {
+        let mut ring = ring(3, true, Duration::ZERO, 2000);
+        {
+            let dial = |at: usize, key: &[u8], role: Role| {
+                let door = &ring.doors[at];
+                link::dial(&format!("127.0.0.1:{}", door.port), Some(&door.fingerprint), key, role, 7, Duration::from_secs(3))
+            };
+            // Stage one holds the keys of the hops on either side of it, and nothing else.
+            for key in [hop_key(0), hop_key(1)] {
+                assert!(dial(0, &key, Role::Closing).is_err(), "it closed the ring as if it were the last stage");
+            }
+            assert!(dial(2, &hop_key(0), Role::Hop).is_err(), "it dialled past its neighbour");
+            assert!(dial(1, &hop_key(1), Role::Hop).is_err(), "a key went the wrong way along its link");
+            assert!(dial(1, CLOSING, Role::Closing).is_err(), "a stage in the middle took a closing link");
+            assert!(dial(0, &hop_key(0), Role::Hop).is_err(), "the entry took a hop");
         }
-        assert!(dial(2, &hop_key(0), Role::Hop).is_err(), "it dialled past its neighbour");
-        assert!(dial(1, &hop_key(1), Role::Hop).is_err(), "a key went the wrong way along its link");
-        assert!(dial(1, CLOSING, Role::Closing).is_err(), "a stage in the middle took a closing link");
-        assert!(dial(0, &hop_key(0), Role::Hop).is_err(), "the entry took a hop");
-    }
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    assert_eq!(answer(&mut ring), sealed(1, vec![5123, 9]));
-    let (entry, middle, last) = (ring.nodes[0].stats(), ring.nodes[1].stats(), ring.nodes[2].stats());
-    assert!(entry.next_up && entry.closing_up && middle.next_up && last.closing_up);
-    assert_eq!(ring.nodes[2].stats().resent, 0);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        assert_eq!(answer(&mut ring), sealed(1, vec![5123, 9]));
+        let (entry, middle, last) = (ring.nodes[0].stats(), ring.nodes[1].stats(), ring.nodes[2].stats());
+        assert!(entry.next_up && entry.closing_up && middle.next_up && last.closing_up);
+        assert_eq!(ring.nodes[2].stats().resent, 0);
+    });
 }
 
 #[test]
 fn an_answer_a_middle_stage_makes_up_is_dropped_and_its_link_stays_up() {
-    // The test stands in for stage one of three, holding only what stage one would hold.
-    let entry = Node::new().unwrap();
-    entry.set_compute(Box::new(Adder { stage: 1, last: false, delay: Duration::ZERO, seen: Arc::default() }));
-    let door = listening(&entry);
-    entry.open(Plan { epoch: 7, index: 0, count: 3, keys: keys_for(0, 3), ack_timeout_ms: 5000, silence_timeout_ms: 5000, merge_passes: true, merge_most: None }).unwrap();
-    let identity = Identity::generate().unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = Address { address: listener.local_addr().unwrap().to_string(), fingerprint: identity.fingerprint.clone() };
-    let middle = thread::spawn(move || {
-        let (socket, _) = listener.accept().unwrap();
-        let (link, frames, _) = link::accept(socket, Some(&identity), link::HANDSHAKE, |role, _| (role == Role::Hop).then(|| hop_key(0))).unwrap();
-        (link, frames)
-    });
-    entry.connect(Links { next: Some(address), entry: None, timeout_ms: 3000 }).unwrap();
-    let (link, mut frames) = middle.join().unwrap();
-    let client = link::dial(&format!("127.0.0.1:{}", door.local_port), None, &door.local_key, Role::Local, 0, Duration::from_secs(3)).unwrap();
-    let mut answers = client.reader(1 << 20);
-    client.send(&pass(1, 5, 9).encode()).unwrap();
-    let id = loop {
-        let (kind, body) = frames.next().unwrap();
-        if kind == Kind::Pass {
-            break Pass::decode(body).unwrap().id;
+    within_deadline("an_answer_a_middle_stage_makes_up_is_dropped_and_its_link_stays_up", || {
+        // The test stands in for stage one of three, holding only what stage one would hold.
+        let entry = Node::new().unwrap();
+        entry.set_compute(Box::new(Adder { stage: 1, last: false, delay: Duration::ZERO, seen: Arc::default() }));
+        let door = listening(&entry);
+        entry.open(Plan { epoch: 7, index: 0, count: 3, keys: keys_for(0, 3), ack_timeout_ms: 5000, silence_timeout_ms: 5000, merge_passes: true, merge_most: None }).unwrap();
+        let identity = Identity::generate().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = Address { address: listener.local_addr().unwrap().to_string(), fingerprint: identity.fingerprint.clone() };
+        let middle = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let (link, frames, _) = link::accept(socket, Some(&identity), link::HANDSHAKE, |role, _| (role == Role::Hop).then(|| hop_key(0))).unwrap();
+            (link, frames)
+        });
+        entry.connect(Links { next: Some(address), entry: None, timeout_ms: 3000 }).unwrap();
+        let (link, mut frames) = middle.join().unwrap();
+        let client = link::dial(&format!("127.0.0.1:{}", door.local_port), None, &door.local_key, Role::Local, 0, Duration::from_secs(3)).unwrap();
+        let mut answers = client.reader(1 << 20);
+        client.send(&pass(1, 5, 9).encode()).unwrap();
+        let id = loop {
+            let (kind, body) = frames.next().unwrap();
+            if kind == Kind::Pass {
+                break Pass::decode(body).unwrap().id;
+            }
+        };
+        link.beat(&Ack { id }.encode()).unwrap();
+        let made_up = Answer { id, generation: 1, epoch: 7, slot: 0, tokens: vec![42, 9], seal: [0; MAC_BYTES] };
+        link.send(&made_up.encode()).unwrap();
+        for key in [hop_key(0), hop_key(1)] {
+            link.send(&made_up.clone().sealed(&key).encode()).unwrap();
         }
-    };
-    link.beat(&Ack { id }.encode()).unwrap();
-    let made_up = Answer { id, generation: 1, epoch: 7, slot: 0, tokens: vec![42, 9], seal: [0; MAC_BYTES] };
-    link.send(&made_up.encode()).unwrap();
-    for key in [hop_key(0), hop_key(1)] {
-        link.send(&made_up.clone().sealed(&key).encode()).unwrap();
-    }
-    // What the last stage really sealed, walking back through this stage, still lands.
-    link.send(&sealed(id, vec![5123, 9]).encode()).unwrap();
-    let (kind, body) = answers.next().unwrap();
-    assert_eq!(kind, Kind::Result);
-    assert_eq!(Answer::decode(body).unwrap().tokens, vec![5123, 9]);
-    let stats = entry.stats();
-    assert_eq!((stats.forged, stats.answers), (3, 1));
-    assert!(stats.next_up && !link.is_closed());
-    link.close();
-    client.close();
+        // What the last stage really sealed, walking back through this stage, still lands.
+        link.send(&sealed(id, vec![5123, 9]).encode()).unwrap();
+        let (kind, body) = answers.next().unwrap();
+        assert_eq!(kind, Kind::Result);
+        assert_eq!(Answer::decode(body).unwrap().tokens, vec![5123, 9]);
+        let stats = entry.stats();
+        assert_eq!((stats.forged, stats.answers), (3, 1));
+        assert!(stats.next_up && !link.is_closed());
+        link.close();
+        client.close();
+    });
 }
 
 #[test]
 fn stopping_frees_a_nodes_ports_at_once() {
-    let mut ring = ring(2, true, Duration::ZERO, 2000);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    answer(&mut ring);
-    for (node, door) in ring.nodes.iter().zip(&ring.doors) {
-        node.stop();
-        for port in [door.port, door.local_port] {
-            TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|error| panic!("port {port} is still held: {error}"));
+    within_deadline("stopping_frees_a_nodes_ports_at_once", || {
+        let mut ring = ring(2, true, Duration::ZERO, 2000);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        answer(&mut ring);
+        for (node, door) in ring.nodes.iter().zip(&ring.doors) {
+            node.stop();
+            for port in [door.port, door.local_port] {
+                TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|error| panic!("port {port} is still held: {error}"));
+            }
         }
-    }
+    });
 }
 
 #[test]
 fn hop_time_is_a_round_trip_that_leaves_out_the_next_stages_work() {
-    let delay = Duration::from_millis(300);
-    let mut ring = ring(2, true, delay, 2000);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    answer(&mut ring);
-    wait_until("a hop time", || ring.nodes[0].stats().hop_us > 0);
-    let stats = ring.nodes[0].stats();
-    assert!(stats.hop_us < delay.as_micros() as u64, "{}", stats.hop_us);
-    assert_eq!(serde_json::to_value(&stats).unwrap()["hop_us"], stats.hop_us);
-    assert_eq!(ring.nodes[1].stats().hop_us, 0);
+    within_deadline("hop_time_is_a_round_trip_that_leaves_out_the_next_stages_work", || {
+        let delay = Duration::from_millis(300);
+        let mut ring = ring(2, true, delay, 2000);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        answer(&mut ring);
+        wait_until("a hop time", || ring.nodes[0].stats().hop_us > 0);
+        let stats = ring.nodes[0].stats();
+        assert!(stats.hop_us < delay.as_micros() as u64, "{}", stats.hop_us);
+        assert_eq!(serde_json::to_value(&stats).unwrap()["hop_us"], stats.hop_us);
+        assert_eq!(ring.nodes[1].stats().hop_us, 0);
+    });
 }
 
 #[test]
 fn nobody_reaches_the_local_door_without_its_key() {
-    let node = Node::new().unwrap();
-    let door = listening(&node);
-    let got = link::dial(&format!("127.0.0.1:{}", door.local_port), None, b"wrong", Role::Local, 0, Duration::from_secs(3));
-    assert!(got.is_err());
+    within_deadline("nobody_reaches_the_local_door_without_its_key", || {
+        let node = Node::new().unwrap();
+        let door = listening(&node);
+        let got = link::dial(&format!("127.0.0.1:{}", door.local_port), None, b"wrong", Role::Local, 0, Duration::from_secs(3));
+        assert!(got.is_err());
+    });
 }
 
 #[test]
 fn the_local_role_is_refused_on_the_public_door() {
-    let node = Node::new().unwrap();
-    let door = listening(&node);
-    let got = link::dial(&format!("127.0.0.1:{}", door.port), Some(&door.fingerprint), &door.local_key, Role::Local, 0, Duration::from_secs(3));
-    assert!(got.is_err());
+    within_deadline("the_local_role_is_refused_on_the_public_door", || {
+        let node = Node::new().unwrap();
+        let door = listening(&node);
+        let got = link::dial(&format!("127.0.0.1:{}", door.port), Some(&door.fingerprint), &door.local_key, Role::Local, 0, Duration::from_secs(3));
+        assert!(got.is_err());
+    });
 }
 
 #[test]
 fn a_route_cannot_be_joined_with_the_wrong_key_or_epoch() {
-    let node = Node::new().unwrap();
-    let door = listening(&node);
-    node.open(Plan { epoch: 7, index: 1, count: 2, keys: keys_for(1, 2), ack_timeout_ms: 1000, silence_timeout_ms: 1000, merge_passes: true, merge_most: None }).unwrap();
-    let address = format!("127.0.0.1:{}", door.port);
-    let key = hop_key(0);
-    assert!(link::dial(&address, Some(&door.fingerprint), b"wrong", Role::Hop, 7, Duration::from_secs(3)).is_err());
-    assert!(link::dial(&address, Some(&door.fingerprint), CLOSING, Role::Hop, 7, Duration::from_secs(3)).is_err());
-    assert!(link::dial(&address, Some(&door.fingerprint), &key, Role::Hop, 8, Duration::from_secs(3)).is_err());
-    assert!(link::dial(&address, Some(&door.fingerprint), &key, Role::Hop, 7, Duration::from_secs(3)).is_ok());
+    within_deadline("a_route_cannot_be_joined_with_the_wrong_key_or_epoch", || {
+        let node = Node::new().unwrap();
+        let door = listening(&node);
+        node.open(Plan { epoch: 7, index: 1, count: 2, keys: keys_for(1, 2), ack_timeout_ms: 1000, silence_timeout_ms: 1000, merge_passes: true, merge_most: None }).unwrap();
+        let address = format!("127.0.0.1:{}", door.port);
+        let key = hop_key(0);
+        assert!(link::dial(&address, Some(&door.fingerprint), b"wrong", Role::Hop, 7, Duration::from_secs(3)).is_err());
+        assert!(link::dial(&address, Some(&door.fingerprint), CLOSING, Role::Hop, 7, Duration::from_secs(3)).is_err());
+        assert!(link::dial(&address, Some(&door.fingerprint), &key, Role::Hop, 8, Duration::from_secs(3)).is_err());
+        assert!(link::dial(&address, Some(&door.fingerprint), &key, Role::Hop, 7, Duration::from_secs(3)).is_ok());
+    });
 }
 
 /// What a next stage that only listens heard from a ring's first stage.
@@ -1112,33 +1344,37 @@ fn listen_as_next_stage() -> (Address, thread::JoinHandle<Heard>) {
 
 #[test]
 fn a_ring_pads_the_link_it_dials_before_any_pass_and_beats_ten_times_a_second() {
-    let node = Node::new().unwrap();
-    let door = listening(&node);
-    node.set_compute(Box::new(Adder { stage: 1, last: false, delay: Duration::ZERO, seen: Arc::default() }));
-    node.open(Plan { epoch: 7, index: 0, count: 2, keys: keys_for(0, 2), ack_timeout_ms: 5000, silence_timeout_ms: 5000, merge_passes: true, merge_most: None }).unwrap();
-    let (next, reading) = listen_as_next_stage();
-    node.connect(Links { next: Some(next), entry: None, timeout_ms: 3000 }).unwrap();
-    let client = link::dial(&format!("127.0.0.1:{}", door.local_port), None, &door.local_key, Role::Local, 0, Duration::from_secs(3)).unwrap();
-    client.send(&pass(1, 5, 9).encode()).unwrap();
-    let heard = reading.join().unwrap();
-    assert_eq!(heard.padding, 1 << 20);
-    assert_eq!(heard.padding_after_the_pass, 0);
-    // Once a second before, so even a slow machine stays far from that.
-    assert!((7..=16).contains(&heard.pings_in_a_second_and_a_half), "{} pings", heard.pings_in_a_second_and_a_half);
-    node.stop();
+    within_deadline("a_ring_pads_the_link_it_dials_before_any_pass_and_beats_ten_times_a_second", || {
+        let node = Node::new().unwrap();
+        let door = listening(&node);
+        node.set_compute(Box::new(Adder { stage: 1, last: false, delay: Duration::ZERO, seen: Arc::default() }));
+        node.open(Plan { epoch: 7, index: 0, count: 2, keys: keys_for(0, 2), ack_timeout_ms: 5000, silence_timeout_ms: 5000, merge_passes: true, merge_most: None }).unwrap();
+        let (next, reading) = listen_as_next_stage();
+        node.connect(Links { next: Some(next), entry: None, timeout_ms: 3000 }).unwrap();
+        let client = link::dial(&format!("127.0.0.1:{}", door.local_port), None, &door.local_key, Role::Local, 0, Duration::from_secs(3)).unwrap();
+        client.send(&pass(1, 5, 9).encode()).unwrap();
+        let heard = reading.join().unwrap();
+        assert_eq!(heard.padding, 1 << 20);
+        assert_eq!(heard.padding_after_the_pass, 0);
+        // Once a second before, so even a slow machine stays far from that.
+        assert!((7..=16).contains(&heard.pings_in_a_second_and_a_half), "{} pings", heard.pings_in_a_second_and_a_half);
+        node.stop();
+    });
 }
 
 #[test]
 fn padding_is_dropped_by_whoever_gets_it_and_what_follows_still_arrives() {
-    let mut ring = ring(3, true, Duration::ZERO, 2000);
-    ring.client.send(&pass(1, 5, 9).encode()).unwrap();
-    let first = answer(&mut ring);
-    // Every link of this ring was padded as it opened, and none of them was lost for it.
-    assert!(ring.nodes.iter().all(|node| node.stats().resent == 0 && node.stats().refusals == 0));
-    assert!(ring.nodes[2].stats().closing_up);
-    let voice = closing_voice(&ring);
-    voice.send(&wire::pad(1000)).unwrap();
-    voice.send(&Answer { id: 2, ..first }.sealed(CLOSING).encode()).unwrap();
-    assert_eq!(answer(&mut ring).id, 2);
-    voice.close();
+    within_deadline("padding_is_dropped_by_whoever_gets_it_and_what_follows_still_arrives", || {
+        let mut ring = ring(3, true, Duration::ZERO, 2000);
+        ring.client.send(&pass(1, 5, 9).encode()).unwrap();
+        let first = answer(&mut ring);
+        // Every link of this ring was padded as it opened, and none of them was lost for it.
+        assert!(ring.nodes.iter().all(|node| node.stats().resent == 0 && node.stats().refusals == 0));
+        assert!(ring.nodes[2].stats().closing_up);
+        let voice = closing_voice(&ring);
+        voice.send(&wire::pad(1000)).unwrap();
+        voice.send(&Answer { id: 2, ..first }.sealed(CLOSING).encode()).unwrap();
+        assert_eq!(answer(&mut ring).id, 2);
+        voice.close();
+    });
 }

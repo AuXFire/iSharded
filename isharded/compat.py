@@ -26,8 +26,19 @@ from pydantic import ValidationError
 
 from . import __version__
 from .gguf import quantization_name
+from .parameters import (
+    CLAUDE_KNOWN,
+    CLAUDE_LIMITS,
+    OLLAMA_LIMITS,
+    OLLAMA_OPTION_LIMITS,
+    RESPONSES_KNOWN,
+    RESPONSES_LIMITS,
+    RESPONSES_TEXT_LIMITS,
+    Limit,
+    refusal,
+)
 from .protocol import ChatCompletionRequest, ChatMessage, CompletionRequest, EmbeddingRequest
-from .replies import render_prompts, whole_reply
+from .replies import CLIENT_GONE, ClientGone, render_prompts, unless_client_leaves, whole_reply
 from .toolcalls import THINK_CLOSE, ThoughtSplitter, ToolRequestError, plan_tools, template_messages, tool_format
 from .vision import ImageRefused, chat_images
 
@@ -126,6 +137,13 @@ def translate(build: Callable[[dict[str, Any]], Any], body: dict[str, Any]) -> A
         raise refuse("; ".join(f"{'.'.join(map(str, problem['loc']))}: {problem['msg']}" for problem in exc.errors())) from exc
     except (AttributeError, KeyError, TypeError) as exc:
         raise refuse(f"this request does not have the shape this API takes: {exc!r}") from exc
+
+
+def honoured(fields: Any, limits: dict[str, Limit], known: Any = (), unknown: bool = True) -> None:
+    """Refuses a field this API defines that would change a reply here, and any it does not define."""
+    problem = refusal(fields if isinstance(fields, dict) else {}, limits, known, unknown)
+    if problem:
+        raise refuse(problem)
 
 
 def reply_tokens(asked: Any) -> int:
@@ -309,6 +327,7 @@ def anthropic_choice(choice: dict[str, Any]) -> str | dict[str, Any] | None:
 
 
 def anthropic_chat(body: dict[str, Any]) -> ChatCompletionRequest:
+    honoured(body, CLAUDE_LIMITS, CLAUDE_KNOWN)
     choice = body.get("tool_choice") or {}
     thinking = body.get("thinking")
     return ChatCompletionRequest(
@@ -500,6 +519,8 @@ def responses_chat(body: dict[str, Any]) -> ChatCompletionRequest:
         raise refuse("max_output_tokens: a whole number above 0 is required")
     if ((body.get("text") or {}).get("format") or {}).get("type", "text") != "text":
         raise refuse("text.format is refused: the chat path cannot hold a reply to a format, so only plain text is honest")
+    honoured(body, RESPONSES_LIMITS, RESPONSES_KNOWN)
+    honoured(body.get("text"), RESPONSES_TEXT_LIMITS)
     choice = body.get("tool_choice")
     if isinstance(choice, dict) and choice.get("type") == "function":
         choice = {"type": "function", "function": {"name": choice["name"]}}
@@ -650,6 +671,9 @@ def ollama_time() -> str:
 
 def ollama_options(body: dict[str, Any]) -> dict[str, Any]:
     options = body.get("options") or {}
+    # Ollama ignores a name it does not know, so only the ones it knows are checked.
+    honoured(body, OLLAMA_LIMITS, unknown=False)
+    honoured(options, OLLAMA_OPTION_LIMITS, unknown=False)
     chosen = picked(options, "temperature", "top_p", "top_k", "seed", "stop")
     if chosen.get("seed") == -1:  # Ollama's way of saying no seed
         del chosen["seed"]
@@ -985,7 +1009,13 @@ def answering(node: Node, route: Any, shape: Callable[[int, str], dict[str, Any]
         try:
             # First, so a stranger learns nothing about a body from how it is refused.
             node.guard(authorization)
-            answer = await route(node, request, authorization)
+            # Read now and kept, so the watch below cannot take any of it from the route.
+            await request.body()
+            # A reply sent whole stops if its client goes first. A stream is returned at once,
+            # and stops when the stream is closed, so the watch is over before it starts.
+            answer = await unless_client_leaves(request.receive, route(node, request, authorization))
+        except ClientGone:
+            return Response(status_code=CLIENT_GONE)
         except HTTPException as exc:
             return JSONResponse(status_code=exc.status_code, content=shape(exc.status_code, str(exc.detail)), headers=exc.headers)
         return answer if isinstance(answer, Response) else JSONResponse(answer)

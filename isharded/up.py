@@ -31,12 +31,13 @@ import sys
 import threading
 import time
 from typing import Any, Callable
+from urllib.parse import urlsplit
 import webbrowser
 
 import httpx
 import psutil
 
-from .access import create_key, digest, new_key
+from .access import create_key, digest, new_key, node_of
 from .commons import identity_name, make_identity, write_policy
 from .discovery import find_meshes
 from .engine import ABI_VERSION, find_library
@@ -47,7 +48,7 @@ from .optional import has_torch
 from .tls import OWN_ADDRESS, stay_on_this_machine
 from .pool import _private_link, _write_private, add_node, admission_entries, bearer_headers, home as pool_home, init_pool, request_membership, sign_entry
 from .statements import VERIFIER_LENGTH, key_verifier
-from .tickets import _decode, _encode
+from .tickets import TicketMaker, _decode, _encode
 
 DEFAULT_PORT = 8209
 INVITE_PREFIX = "isi-"
@@ -57,7 +58,12 @@ APPROVAL_WAIT_SECONDS = 180.0
 PERSON_WAIT_SECONDS = 1800.0  # someone has to come and click
 HEALTH_WAIT_SECONDS = 180.0
 SETTLE_WAIT_SECONDS = 60.0  # a node answers about 9 s before it can take a load
-STOP_WAIT_SECONDS = 60.0  # each process gets 10 s, and a node can run several
+STOP_WAIT_SECONDS = 60.0  # the services stop together, each given 10 s; this is the last resort
+# How long a planned stop waits for the route to move off this node before it stops anyway.
+STOP_DRAIN_SECONDS = float(os.getenv("ISHARDED_STOP_DRAIN_SECONDS", "30"))
+STOP_LOOK_SECONDS = 0.25
+# Left by a stop that cordoned its own node, so the next start puts it back in service.
+STOPPED_CORDON = "stopped.cordon"
 ENGINE_ADVICE = "Tokens take the slower Python path. Run the installer again for a release that has the engine, or build it with python scripts/build_engine.py"
 
 
@@ -481,6 +487,8 @@ def keep_watch(home: Path, settings: dict[str, Any], args: argparse.Namespace) -
             print(f"The node did not come up. Its log is {home / 'node.log'}.", flush=True)
             return
         settled = say_ready(home, settings, client, args.no_browser)
+        if settled:
+            back_in_service(settings, home, client)
         holds_authority = (home / "ca.key").is_file()
         if args.model and settled:
             # A big model takes minutes, and invited machines should not wait behind it.
@@ -725,13 +733,130 @@ def run_up(args: argparse.Namespace) -> int:
         (home / "up.pid").unlink(missing_ok=True)
 
 
-def run_stop(_: argparse.Namespace) -> int:
-    """Stops the node started from this machine's folder, foreground or background."""
+def stages_on(status: dict[str, Any], name: str) -> list[str]:
+    """This node's workers in the running route, as a coordinator's status shows it."""
+    return [stage["worker_id"] for stage in status.get("route") or [] if node_of(str(stage.get("worker_id", ""))) == name]
+
+
+def route_moved_off(status: dict[str, Any], name: str) -> bool:
+    """Whether replies run without this node: a route is installed and none of it is here."""
+    return bool(status.get("route")) and not stages_on(status, name)
+
+
+def move_route_off(settings: dict[str, Any], home: Path, wait: float, clock: Callable[[], float] = time.monotonic, pause: Callable[[float], None] = time.sleep) -> str:
+    """Before a planned stop: cordon this node and wait, up to ``wait`` seconds, for the route to leave it.
+
+    The cordon lets replies finish and moves only this node's share, so replies pause for
+    the move and not for a route that lost a stage. With no coordinator answering, or a pool
+    that cannot hold the model without this node, the stop goes on as it always did, and
+    the pool repairs itself as it would after any loss. Says what happened, in words.
+    """
+    name, base = settings["name"], local_url(settings)
+    headers = bearer_headers(sign_in_key(home))
+    with client_for(settings, home) as client:
+        try:
+            answer = client.get(base + "/admin/status", headers=headers, timeout=5.0)
+            status = answer.json() if answer.status_code == 200 else None
+        except (httpx.HTTPError, ValueError):
+            status = None
+        if status is None:
+            return "no coordinator answered, so nothing was moved first"
+        if not stages_on(status, name):
+            return "the route does not use this node"
+        held = name in (status.get("cordoned_nodes") or [])
+        if not held:
+            try:
+                answer = ask_for_self(settings, home, client, f"/admin/nodes/{name}/cordon?force=true")
+            except httpx.HTTPError as exc:
+                return f"the cordon did not go through ({exc}), so nothing was moved first"
+            if answer.status_code != 200:
+                return f"the cordon was refused ({detail_of(answer)}), so nothing was moved first"
+            (home / STOPPED_CORDON).write_text(name, encoding="utf-8")
+        print(f"Moving the route off {name} first, for up to {wait:g} s.", flush=True)
+        began = clock()
+        while clock() - began < wait:
+            pause(STOP_LOOK_SECONDS)
+            try:
+                answer = client.get(base + "/admin/status", headers=headers, timeout=5.0)
+                status = answer.json() if answer.status_code == 200 else status
+            except (httpx.HTTPError, ValueError):
+                continue  # the coordinator is busy moving the route
+            if route_moved_off(status, name):
+                return f"the route moved off this node in {clock() - began:.1f} s"
+    return f"the route was still on this node after {wait:g} s, so it stops anyway"
+
+
+def detail_of(answer: httpx.Response) -> str:
+    try:
+        detail = answer.json().get("detail", answer.text)
+    except (ValueError, AttributeError):
+        detail = answer.text
+    return str(detail)[:200]
+
+
+def node_ticket(home: Path, name: str, url: str) -> dict[str, str] | None:
+    """Headers that prove this machine is node ``name`` to whoever serves ``url``, or None without its certificate."""
+    certificate, key = home / f"{name}.pem", home / f"{name}.key"
+    if not (certificate.is_file() and key.is_file()):
+        return None
+    return bearer_headers(TicketMaker(str(certificate), str(key)).fresh(urlsplit(url).netloc))
+
+
+def ask_for_self(settings: dict[str, Any], home: Path, client: httpx.Client, path: str) -> httpx.Response:
+    """POST a node's request about itself, a cordon or its lifting, to the coordinator.
+
+    The operator's key goes first. An invited machine holds only a user key, so on a refusal
+    the node asks as itself, with a ticket made from its own certificate, straight to the
+    coordinator, which lets a node step out of service and back in, and nothing more.
+    """
+    name, base = settings["name"], local_url(settings)
+    answer = client.post(base + path, headers=bearer_headers(sign_in_key(home)), timeout=30.0)
+    if answer.status_code not in (401, 403) or settings.get("ownerless"):
+        return answer
+    asking = node_ticket(home, name, base)
+    if asking is None:
+        return answer
+    lane = client.get(base + "/internal/lane", headers=asking, timeout=10.0)
+    leader = lane.json().get("leader_url") if lane.status_code == 200 else None
+    if not leader:
+        return answer
+    leader = str(leader).rstrip("/")
+    return client.post(leader + path, headers=node_ticket(home, name, leader), timeout=30.0)
+
+
+def back_in_service(settings: dict[str, Any], home: Path, client: httpx.Client) -> None:
+    """Undoes the cordon a planned stop put on this node. A cordon someone set by hand stays."""
+    marker = home / STOPPED_CORDON
+    if not marker.is_file():
+        return
+    name = settings["name"]
+    try:
+        answer = ask_for_self(settings, home, client, f"/admin/nodes/{name}/uncordon")
+    except httpx.HTTPError as exc:
+        print(f"Could not put {name} back in service: {exc}. Run: isharded uncordon {name}", flush=True)
+        return
+    if answer.status_code == 200:
+        marker.unlink(missing_ok=True)
+        print(f"{name} is back in service.", flush=True)
+    else:
+        print(f"Could not put {name} back in service: {detail_of(answer)}. Run: isharded uncordon {name}", flush=True)
+
+
+def run_stop(args: argparse.Namespace) -> int:
+    """Stops the node started from this machine's folder, foreground or background.
+
+    The route moves off the node first, so a running reply pauses for the move and not for
+    a lost stage. Then the node's services stop together.
+    """
     home = up_home()
     process = running_node(home)
     if process is None:
         print(f"No node is running from {home}.")
         return 0
+    settings = read_settings(home)
+    wait = getattr(args, "wait", STOP_DRAIN_SECONDS)
+    if settings is not None and wait > 0:
+        print(f"{move_route_off(settings, home, wait).capitalize()}.", flush=True)
     (home / "stop.request").touch()
     try:
         process.wait(STOP_WAIT_SECONDS)
@@ -895,7 +1020,9 @@ def add_arguments(subparsers: Any) -> None:
         change.set_defaults(handler=run_approve, join_command=name)
     doctor = subparsers.add_parser("doctor", help="check this machine, and say what to fix")
     doctor.set_defaults(handler=run_doctor)
-    subparsers.add_parser("stop", help="stop the node isharded up started on this machine").set_defaults(handler=run_stop)
+    stop = subparsers.add_parser("stop", help="stop the node isharded up started on this machine")
+    stop.add_argument("--wait", type=float, default=STOP_DRAIN_SECONDS, help="seconds to wait for the route to move off this node first; 0 stops at once")
+    stop.set_defaults(handler=run_stop)
     service = subparsers.add_parser("service", help="start this node when you log in")
     service_commands = service.add_subparsers(dest="service_command", required=True)
     service_commands.add_parser("install", help="start at login, for this user").set_defaults(handler=run_service)

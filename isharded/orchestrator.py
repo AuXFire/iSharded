@@ -29,12 +29,13 @@ import httpx
 import numpy as np
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from pydantic import BaseModel
 
 from starlette.background import BackgroundTask
 
 from . import __version__, source_commit
 from .addresses import host_port
-from .access import INVITE_FIELDS, load_authority, NeedsAuthority, node_of, ROLE_ADMIN, ROLE_MEMBER, ROLE_NODE, ROLE_USER, AccessControl, AuditLog, Caller
+from .access import INVITE_FIELDS, load_authority, NeedsAuthority, node_of, ROLE_ADMIN, ROLE_MEMBER, ROLE_NODE, ROLE_PEER, ROLE_USER, AccessControl, AuditLog, Caller
 from .embedding import POOLED_TYPES, dimensions_problem, encoded, inputs_problem, length_problem, passes, shaped, smallest_dimensions
 from .engine import find_library
 from .gguf import GgufHeader, parse_source, quantization_name, split_parts
@@ -75,7 +76,8 @@ from .protocol import (
     auth_headers,
 )
 from .pool import LOOPBACK, check_exposure, home as pool_home, load_token, read_membership_request
-from .replies import event_stream, first_stop, render_prompts, scanned, usage_of, whole_reply
+from .parameters import CHAT_LIMITS, COMPLETION_LIMITS, EMBEDDING_LIMITS, Limit, refused_field
+from .replies import CLIENT_GONE, ClientGone, event_stream, first_stop, render_prompts, scanned, unless_client_leaves, usage_of, whole_reply
 from .serving import MAX_STRANGER_BYTES, AddressLimit, BodyLimit, ChunkedResponses, client_address, serve, where_everything_is
 from .mesh import clean_url
 from .statements import Refused, Statements, make_statement
@@ -128,6 +130,19 @@ LOGGED_EVENTS = {"failure", "recovery", "mesh", "rebalance", "security"}
 # A live worker that failed to activate gets this many more tries, this far apart.
 ACTIVATE_RETRIES = 2
 ACTIVATE_RETRY_SECONDS = 5.0
+# A stage's load gets this long, plus its bytes at the worker's load rate, and longer for
+# as long as it shows progress. Past that it has stalled: it is let go, the worker is
+# quarantined, and the route is planned without it. The pool has no route meanwhile, and
+# replies wait ROUTE_WAIT_SECONDS for one, so these stay well under that.
+CONFIGURE_FLOOR_SECONDS = float(os.getenv("ISHARDED_CONFIGURE_FLOOR_SECONDS", "30"))
+CONFIGURE_STALL_SECONDS = float(os.getenv("ISHARDED_CONFIGURE_STALL_SECONDS", "30"))
+# A slow disk, for a worker that has not loaded anything big yet. One that has goes at half
+# the rate it showed, since the next load may find nothing in the system's cache.
+LOAD_BYTES_PER_SECOND = 50e6
+CONFIGURE_LOOK_SECONDS = 2.0
+CONFIGURE_SIGNS_SECONDS = 5.0
+GIVE_UP_TELL_SECONDS = 600.0
+STALLED = "stopped loading"
 # How long a measured link is believed, how many tries make one measurement, and the
 # most a load waits for measuring.
 RING_RETRY_SECONDS = 30.0
@@ -247,6 +262,20 @@ class WorkerSilent(Exception):
     """A worker stopped answering without any error, as a lost link does."""
 
 
+class ConfigureStalled(RuntimeError):
+    """A stage's load showed no progress past its deadline."""
+
+
+def configure_seconds(stage_bytes: int, measured_rate: float = 0.0) -> float:
+    """How long a stage's load may take before progress has to show, from its size."""
+    rate = measured_rate / 2 if measured_rate > 0 else LOAD_BYTES_PER_SECOND
+    return CONFIGURE_FLOOR_SECONDS + stage_bytes / rate
+
+
+def stalled(reason: str) -> bool:
+    return reason.startswith(STALLED)
+
+
 @dataclass(slots=True)
 class WorkerRecord:
     registration: WorkerRegistration
@@ -261,6 +290,8 @@ class WorkerRecord:
     health: dict[str, Any] | None = None
     # Measured download speed from the model host, once a load has shown it.
     fetch_bytes_per_second: float = 0.0
+    # How fast a load into memory went here, once a big one has shown it.
+    load_bytes_per_second: float = 0.0
 
     @property
     def live(self) -> bool:
@@ -346,6 +377,14 @@ class LoadJob:
     workers: dict[str, dict[str, Any]] = field(default_factory=dict)
     total_bytes: int = 0
     cancelled: bool = False
+    # Each plan in a load fetches under its own name. A worker takes a second request
+    # under a name it knows as a repeat, so a re-plan that gives a worker more layers
+    # would otherwise be told the first plan's download was its own, and load without them.
+    attempt: int = 0
+
+    @property
+    def fetch_id(self) -> str:
+        return self.job_id if self.attempt == 0 else f"{self.job_id}-{self.attempt}"
 
     def snapshot(self) -> dict[str, Any]:
         def total(key: str) -> int:
@@ -2471,7 +2510,7 @@ class Orchestrator:
             # A zero-byte placement shares the head's tensors: nothing to fetch.
             units = [target.units[item.unit] for item in stage.placements if item.bytes]
             request = PrepareRequest(
-                job_id=job.job_id,
+                job_id=job.fetch_id,
                 model_id=target.model_id,
                 source=target.source_for(stage.worker_id),
                 revision=target.manifest.revision,
@@ -2500,7 +2539,7 @@ class Orchestrator:
             for worker_id, stage in list(pending.items()):
                 try:
                     response = await self.client.get(
-                        stage.url.rstrip("/") + f"/internal/prepare/{job.job_id}",
+                        stage.url.rstrip("/") + f"/internal/prepare/{job.fetch_id}",
                         headers=headers,
                         timeout=10.0,
                     )
@@ -2528,7 +2567,7 @@ class Orchestrator:
             await asyncio.gather(
                 *(
                     self.client.delete(
-                        stage.url.rstrip("/") + f"/internal/prepare/{job.job_id}",
+                        stage.url.rstrip("/") + f"/internal/prepare/{job.fetch_id}",
                         headers=headers,
                         timeout=10.0,
                     )
@@ -2584,12 +2623,9 @@ class Orchestrator:
                     for item in stage.placements
                     if item.unit in (target.request.model_hashes or {})
                 },
+                load_id=uuid.uuid4().hex,
             )
-            response = await self.client.post(
-                stage.url.rstrip("/") + "/internal/configure",
-                json=request.model_dump(),
-                headers=auth_headers(self.pool_token),
-            )
+            response = await self._configure_in_time(stage, request)
             if response.status_code >= 400:
                 raise RuntimeError(response.text[:400])
 
@@ -2628,6 +2664,79 @@ class Orchestrator:
         summary = " → ".join(f"{stage.worker_id} L{stage.start_layer}–{stage.end_layer - 1}" for stage in route)
         self.add_event("rebalance", f"Pipeline epoch {new_epoch}", summary)
         return {}
+
+    async def _configure_in_time(self, stage: StageAssignment, request: ConfigureRequest) -> httpx.Response:
+        """Configure one stage, giving up if its load stalls.
+
+        The deadline comes from the stage's bytes, and moves on for as long as the worker
+        shows its load moving: units done, bytes read, or its stage process working. A
+        worker that is suspended, or whose load hangs, shows none of that, and is given up
+        on when the deadline passes. The pool has no route meanwhile, so an hour's wait, as
+        the client's own timeout would allow, holds every reply.
+        """
+        url = stage.url.rstrip("/")
+        size = sum(item.bytes for item in stage.placements)
+        record = self.workers.get(stage.worker_id)
+        allowed = configure_seconds(size, record.load_bytes_per_second if record else 0.0)
+        began = time.monotonic()
+        give_up_at = began + allowed
+        moved_at = began
+        sending = asyncio.ensure_future(
+            self.client.post(url + "/internal/configure", json=request.model_dump(), headers=auth_headers(self.pool_token), timeout=httpx.Timeout(None, connect=10.0))
+        )
+        seen: dict[str, Any] | None = None
+        try:
+            while not sending.done():
+                # Each look and each question ends by the deadline, so a suspended worker,
+                # which answers nothing, is let go at the deadline and not a question later.
+                await asyncio.wait({sending}, timeout=max(0.1, min(CONFIGURE_LOOK_SECONDS, give_up_at - time.monotonic())))
+                if sending.done():
+                    break
+                signs = await self._configure_signs(url, max(0.5, min(CONFIGURE_SIGNS_SECONDS, give_up_at - time.monotonic())))
+                now = time.monotonic()
+                if signs is not None and signs.get("load_id") == request.load_id:
+                    if seen is not None and signs != seen:
+                        moved_at = now
+                        give_up_at = max(give_up_at, now + CONFIGURE_STALL_SECONDS)
+                    seen = signs
+                if now >= give_up_at:
+                    raise ConfigureStalled(
+                        f"{STALLED}: nothing moved for {now - moved_at:.0f} s, {now - began:.0f} s into a load"
+                        f" given {allowed:.0f} s for {size / 1024**3:.2f} GiB"
+                    )
+        except BaseException:
+            sending.cancel()
+            if request.load_id:
+                self.spawn(self._tell_given_up(url, request.load_id))
+            raise
+        response = sending.result()
+        took = time.monotonic() - began
+        if response.status_code < 400 and record is not None and size >= 256 * 1024**2 and took >= 1.0:
+            record.load_bytes_per_second = size / took
+        return response
+
+    async def _configure_signs(self, url: str, timeout: float = CONFIGURE_SIGNS_SECONDS) -> dict[str, Any] | None:
+        """A load's signs of progress, or None from a worker that did not say. See worker.configure_signs."""
+        try:
+            response = await self.client.get(url + "/internal/configure/progress", headers=auth_headers(self.pool_token), timeout=timeout)
+            return response.json() if response.status_code == 200 else None
+        except (httpx.HTTPError, ValueError):
+            return None
+
+    async def _tell_given_up(self, url: str, load_id: str) -> None:
+        """Tells a worker its load was given up on, so it lets the weights go if it ever finishes.
+
+        A suspended worker hears nothing until it wakes, so this keeps trying for a while.
+        """
+        stop_at = time.monotonic() + GIVE_UP_TELL_SECONDS
+        while time.monotonic() < stop_at:
+            try:
+                response = await self.client.post(f"{url}/internal/configure/{load_id}/give-up", headers=auth_headers(self.pool_token), timeout=10.0)
+                if response.status_code < 500:
+                    return
+            except httpx.HTTPError:
+                pass
+            await asyncio.sleep(10.0)
 
     async def _warm_route(self, epoch: int) -> None:
         """Run a 64-row reply with one token out, so that a new route's first real reply does not pay for first use.
@@ -2724,7 +2833,8 @@ class Orchestrator:
             raise
 
     async def _deploy(self, target: ModelTarget, job: LoadJob, *, generation_lock_held: bool) -> list[StageAssignment]:
-        for _ in range(MAX_DEPLOY_ATTEMPTS):
+        for attempt in range(MAX_DEPLOY_ATTEMPTS):
+            job.attempt = attempt
             await self.refresh_worker_metrics()
             await self.refresh_holdings(target)
             await self.measure_links(row_bytes(target))
@@ -2743,8 +2853,9 @@ class Orchestrator:
                 async with gate:
                     failed = await self._activate(target, route)
                     for _ in range(ACTIVATE_RETRIES):
-                        # Often a passing shortage, such as memory not yet returned.
-                        if not failed or job.cancelled:
+                        # Often a passing shortage, such as memory not yet returned. A stall
+                        # is not, and trying it again would hold the pool for another deadline.
+                        if not failed or job.cancelled or any(stalled(reason) for reason in failed.values()):
                             break
                         self.add_event("failure", "Activation failed, retrying", str(failed)[:300])
                         await asyncio.sleep(ACTIVATE_RETRY_SECONDS)
@@ -2765,10 +2876,11 @@ class Orchestrator:
         it, and can land the model somewhere slow. So that takes a person.
         """
         await self.refresh_worker_metrics()
+        # A stalled load counts as a lost worker: it would hold the pool with no route.
         alive = [
             worker_id
-            for worker_id in failed
-            if (record := self.workers.get(worker_id)) and record.live and (record.health or {}).get("status") == "ok"
+            for worker_id, reason in failed.items()
+            if not stalled(reason) and (record := self.workers.get(worker_id)) and record.live and (record.health or {}).get("status") == "ok"
         ]
         if not alive:
             return
@@ -3812,6 +3924,23 @@ def network_caller(authorization: str | None) -> Caller:
     return caller
 
 
+def node_itself(authorization: str | None, name: str) -> Caller | None:
+    """The node ``name``, proven by its own certificate or ticket, asking for itself.
+
+    An invited machine's operator holds only a user key, yet `isharded stop` there must
+    take the route off the node before it ends it. The node's certificate proves the
+    machine, and what it may do with it is limited to stepping out of service and back.
+    """
+    peer = PEER.get()
+    if peer is None or peer != name or BEHALF.get():
+        return None
+    caller = runtime.access.identify(authorization, peer)
+    if caller is None or caller.role != ROLE_PEER:
+        return None
+    node_proven()
+    return caller
+
+
 def require_own_node(authorization: str | None, name: str) -> Caller:
     """An admin, or a member acting on their own node."""
     caller = network_caller(authorization)
@@ -4406,24 +4535,30 @@ async def cordon_node(
     authorization: str | None = Header(default=None),
 ) -> dict[str, str]:
     """Take a node out of service for maintenance, without dropping a reply."""
-    caller = require_own_node(authorization, name)
+    itself = node_itself(authorization, name)
+    caller = itself or require_own_node(authorization, name)
     cost = await runtime.cost_of_losing(name)
     if cost is None:
         raise HTTPException(status_code=409, detail=f"the rest of the pool cannot hold this model without {name}")
     if cost > REPLAN_MOVE_LIMIT_BYTES and not force:
         detail = f"cordoning {name} would transfer {cost / 1024**3:.1f} GiB between nodes; use force if that is what you want"
         raise HTTPException(status_code=409, detail=detail)
-    runtime.access.cordon(name)
-    runtime.add_event("recovery", "Node cordoned", f"Moving {name}'s share elsewhere")
+    runtime.access.cordon(name, by_itself=itself is not None)
+    runtime.add_event("recovery", "Node cordoned", f"Moving {name}'s share elsewhere" + (", as it is stopping" if itself else ""))
     if runtime.active is not None:
         runtime.spawn(runtime.move_off())
-    runtime.spawn(runtime.lanes.tell_all(f"/admin/nodes/{name}/cordon?force=true", caller))
+    if itself is None:  # a node's own word is for this coordinator; a lane's needs a person's statement
+        runtime.spawn(runtime.lanes.tell_all(f"/admin/nodes/{name}/cordon?force=true", caller))
     return {"status": "cordoned"}
 
 
 @app.post("/admin/nodes/{name}/uncordon")
 async def uncordon_node(name: str, authorization: str | None = Header(default=None)) -> dict[str, str]:
-    require_own_node(authorization, name)
+    if node_itself(authorization, name) is not None:
+        if name in runtime.access.cordoned and name not in runtime.access.leaving:
+            raise HTTPException(status_code=403, detail=f"{name} was cordoned by someone else, who has to lift it")
+    else:
+        require_own_node(authorization, name)
     if name not in runtime.access.cordoned:
         return {"status": "uncordoned"}  # nothing changed, so nothing should move
     runtime.access.uncordon(name)
@@ -4594,12 +4729,37 @@ def reply_detail(response: httpx.Response) -> Any:
         return f"HTTP {response.status_code}"
 
 
+def unhonoured(body: BaseModel, limits: dict[str, Limit]) -> JSONResponse | None:
+    """A field the route would not honour is refused by name, rather than ignored. See parameters.py.
+
+    The answer carries OpenAI's error object beside this API's own detail, so OpenAI's
+    libraries show the reason and name the field, where a bare detail shows only the status.
+    """
+    found = refused_field(body.model_extra or {}, limits)
+    if found is None:
+        return None
+    name, problem = found
+    error = {"message": problem, "type": "invalid_request_error", "param": name, "code": "unsupported_parameter"}
+    return JSONResponse(status_code=400, content={"detail": problem, "error": error})
+
+
+async def from_lane(request: Request | None, relay: Any) -> Any:
+    """Another lane's reply. A whole one only answers once it is done, so it stops if its
+    client goes first: the call to the lane is closed, and that lane stops it in turn."""
+    try:
+        return await unless_client_leaves(request and request.receive, relay)
+    except ClientGone:
+        return Response(status_code=CLIENT_GONE)
+
+
 @app.post("/v1/embeddings")
 async def embeddings(
     body: EmbeddingRequest,
     authorization: str | None = Header(default=None),
 ) -> Any:
     caller = verify_user(authorization)
+    if refused := unhonoured(body, EMBEDDING_LIMITS):
+        return refused
     lane = await runtime.lanes.locate(body.model)
     if lane:
         return await runtime.lanes.forward(lane, "/v1/embeddings", body.model_dump(exclude_none=True), caller)
@@ -4628,11 +4788,14 @@ async def embeddings(
 async def completions(
     body: CompletionRequest,
     authorization: str | None = Header(default=None),
+    request: Request = None,  # type: ignore[assignment]  # FastAPI gives it; a direct call has none
 ) -> Any:
     caller = verify_user(authorization)
+    if refused := unhonoured(body, COMPLETION_LIMITS):
+        return refused
     lane = await runtime.lanes.locate(body.model)
     if lane:
-        return await runtime.lanes.forward(lane, "/v1/completions", body.model_dump(exclude_none=True), caller)
+        return await from_lane(request, runtime.lanes.forward(lane, "/v1/completions", body.model_dump(exclude_none=True), caller))
     await check_request(body.model)
     if isinstance(body.prompt, list):
         if len(body.prompt) != 1:
@@ -4654,7 +4817,10 @@ async def completions(
             ),
             media_type="text/event-stream",
         )
-    message, summary = await whole_reply(runtime.stream_tokens(prompt, *options))
+    try:
+        message, summary = await unless_client_leaves(request and request.receive, whole_reply(runtime.stream_tokens(prompt, *options)))
+    except ClientGone:
+        return Response(status_code=CLIENT_GONE)
     return {
         "id": identifier,
         "object": "text_completion",
@@ -4669,11 +4835,14 @@ async def completions(
 async def chat_completions(
     body: ChatCompletionRequest,
     authorization: str | None = Header(default=None),
+    request: Request = None,  # type: ignore[assignment]  # FastAPI gives it; a direct call has none
 ) -> Any:
     caller = verify_user(authorization)
+    if refused := unhonoured(body, CHAT_LIMITS):
+        return refused
     lane = await runtime.lanes.locate(body.model)
     if lane:
-        return await runtime.lanes.forward(lane, "/v1/chat/completions", body.model_dump(exclude_none=True), caller)
+        return await from_lane(request, runtime.lanes.forward(lane, "/v1/chat/completions", body.model_dump(exclude_none=True), caller))
     await check_request(body.model)
     assert runtime.tokenizer is not None
     try:
@@ -4723,7 +4892,10 @@ async def chat_completions(
             ),
             media_type="text/event-stream",
         )
-    message, summary = await whole_reply(items)
+    try:
+        message, summary = await unless_client_leaves(request and request.receive, whole_reply(items))
+    except ClientGone:
+        return Response(status_code=CLIENT_GONE)
     return {
         "id": identifier,
         "object": "chat.completion",

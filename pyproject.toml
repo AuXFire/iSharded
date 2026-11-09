@@ -45,4 +45,6 @@ isharded = ["dashboard.html", "chat.html", "ui.css", "ui.js", "flags.svg", "coun
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# A test still running after this long prints every thread's stack, so a hang shows where it waits.
+faulthandler_timeout = 600
 

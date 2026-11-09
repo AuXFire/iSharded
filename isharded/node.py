@@ -327,14 +327,36 @@ class Service:
         print(f"{self.label} exited with code {code}; restarting in {self.delay:.0f} s.", flush=True)
         self.delay = min(self.delay * 2, self.LONGEST_DELAY_SECONDS)
 
+    STOP_SECONDS = 10.0
+
     def stop(self) -> None:
+        stop_together([self])
+
+    def ask_to_stop(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+
+    def finish(self, deadline: float) -> None:
+        """Waits until ``deadline`` for the process to end after ``ask_to_stop``, then kills it."""
         if self.process is None or self.process.poll() is not None:
             return
-        self.process.terminate()
         try:
-            self.process.wait(timeout=10)
+            self.process.wait(timeout=max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             self.process.kill()
+
+
+def stop_together(services: list[Service]) -> None:
+    """Asks every service to stop at once, then gives them one shared wait.
+
+    One at a time, each waiting its turn, a node with several processes took up to ten
+    seconds apiece to stop. Together, the slowest one sets the time.
+    """
+    for service in services:
+        service.ask_to_stop()
+    deadline = time.monotonic() + Service.STOP_SECONDS
+    for service in services:
+        service.finish(deadline)
 
 
 def _has_accelerator() -> bool:
@@ -427,8 +449,7 @@ class LaneKeeper:
     def supervise(self) -> None:
         wanted, _ = read_lanes(self.path)
         for name in [name for name in self.running if name not in wanted]:
-            for service in reversed(self.running.pop(name)):
-                service.stop()
+            stop_together(self.running.pop(name))
             lane_state_file(self.args.node_id, name).unlink(missing_ok=True)
             print(f"Lane {name} stopped.", flush=True)
         for name, lane in wanted.items():
@@ -442,10 +463,11 @@ class LaneKeeper:
             for service in services:
                 service.supervise()
 
+    def services(self) -> list[Service]:
+        return [service for services in self.running.values() for service in services]
+
     def stop(self) -> None:
-        for services in self.running.values():
-            for service in reversed(services):
-                service.stop()
+        stop_together(self.services())
 
 
 def join_commons(args: argparse.Namespace) -> None:
@@ -552,7 +574,4 @@ def run_node(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         return 0
     finally:
-        if keeper is not None:
-            keeper.stop()
-        for service in reversed(services):
-            service.stop()
+        stop_together([*(keeper.services() if keeper is not None else []), *reversed(services)])
