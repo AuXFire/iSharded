@@ -64,6 +64,9 @@ STOP_DRAIN_SECONDS = float(os.getenv("ISHARDED_STOP_DRAIN_SECONDS", "30"))
 STOP_LOOK_SECONDS = 0.25
 # Left by a stop that cordoned its own node, so the next start puts it back in service.
 STOPPED_CORDON = "stopped.cordon"
+# Left by a rejoin under a name the mesh already knew. Its folder, and any stop's marker, is
+# gone, so the next start lifts a cordon the name's own stop set, and only that one.
+REJOINED_CORDON = "rejoined.cordon"
 ENGINE_ADVICE = "Tokens take the slower Python path. Run the installer again for a release that has the engine, or build it with python scripts/build_engine.py"
 
 
@@ -333,6 +336,8 @@ def join_mesh(home: Path, invite: dict[str, Any], name: str, address: str) -> st
                 if certificate_matches_key(certificate, home / f"{name}.key"):
                     (home / f"{name}.pem").write_text(certificate, encoding="utf-8")
                     _write_private(home / "user.key", key.encode())
+                    if replaces:
+                        (home / REJOINED_CORDON).write_text(name, encoding="utf-8")
                     return url
                 old = True  # the name's certificate before the owner answers, for the key it had
             time.sleep(2.0)
@@ -802,17 +807,21 @@ def node_ticket(home: Path, name: str, url: str) -> dict[str, str] | None:
     return bearer_headers(TicketMaker(str(certificate), str(key)).fresh(urlsplit(url).netloc))
 
 
-def ask_for_self(settings: dict[str, Any], home: Path, client: httpx.Client, path: str) -> httpx.Response:
+def ask_for_self(settings: dict[str, Any], home: Path, client: httpx.Client, path: str, only_as_itself: bool = False) -> httpx.Response | None:
     """POST a node's request about itself, a cordon or its lifting, to the coordinator.
 
     The operator's key goes first. An invited machine holds only a user key, so on a refusal
     the node asks as itself, with a ticket made from its own certificate, straight to the
     coordinator, which lets a node step out of service and back in, and nothing more.
+    ``only_as_itself`` skips the key, so an owner's key cannot lift a cordon someone else set;
+    it gives None where the node cannot ask as itself.
     """
     name, base = settings["name"], local_url(settings)
-    answer = client.post(base + path, headers=bearer_headers(sign_in_key(home)), timeout=30.0)
-    if answer.status_code not in (401, 403) or settings.get("ownerless"):
-        return answer
+    answer = None
+    if not only_as_itself or settings.get("ownerless"):
+        answer = client.post(base + path, headers=bearer_headers(sign_in_key(home)), timeout=30.0)
+        if answer.status_code not in (401, 403) or settings.get("ownerless"):
+            return answer
     asking = node_ticket(home, name, base)
     if asking is None:
         return answer
@@ -825,18 +834,36 @@ def ask_for_self(settings: dict[str, Any], home: Path, client: httpx.Client, pat
 
 
 def back_in_service(settings: dict[str, Any], home: Path, client: httpx.Client) -> None:
-    """Undoes the cordon a planned stop put on this node. A cordon someone set by hand stays."""
+    """Undoes the cordon a planned stop put on this node. A cordon someone set by hand stays.
+
+    A machine that rejoined under its name has a new folder without the stop's marker, so it
+    asks as itself, which the coordinator grants only for a cordon the node set on itself.
+    """
+    name = settings["name"]
+    rejoined = home / REJOINED_CORDON
+    if rejoined.is_file() and not (home / STOPPED_CORDON).is_file():
+        try:
+            answer = ask_for_self(settings, home, client, f"/admin/nodes/{name}/uncordon", only_as_itself=True)
+        except httpx.HTTPError as exc:
+            print(f"Could not check whether {name} was left out of service: {exc}. If it was, run: isharded uncordon {name}", flush=True)
+            return
+        if answer is not None and answer.status_code in (200, 403):
+            rejoined.unlink(missing_ok=True)  # lifted, or never this node's to lift
+        if answer is not None and answer.status_code == 403:
+            print(f"{name} stays out of service: {detail_of(answer)}", flush=True)
+        return
     marker = home / STOPPED_CORDON
     if not marker.is_file():
         return
-    name = settings["name"]
     try:
         answer = ask_for_self(settings, home, client, f"/admin/nodes/{name}/uncordon")
     except httpx.HTTPError as exc:
         print(f"Could not put {name} back in service: {exc}. Run: isharded uncordon {name}", flush=True)
         return
+    assert answer is not None  # asking with the key always answers
     if answer.status_code == 200:
         marker.unlink(missing_ok=True)
+        rejoined.unlink(missing_ok=True)
         print(f"{name} is back in service.", flush=True)
     else:
         print(f"Could not put {name} back in service: {detail_of(answer)}. Run: isharded uncordon {name}", flush=True)

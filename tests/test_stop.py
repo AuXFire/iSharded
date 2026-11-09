@@ -338,6 +338,48 @@ def test_an_invited_node_moves_the_route_off_as_itself_when_its_key_cannot(home,
     assert not node.moved and not (home / up.STOPPED_CORDON).exists()
 
 
+class SelfCordoned(InvitedNode):
+    """The coordinator holds this node cordoned, by its own stop or by someone else."""
+
+    def __init__(self, by_itself: bool) -> None:
+        super().__init__()
+        self.by_itself = by_itself
+        self.moved = True
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/uncordon"):
+            where = f"{request.url.scheme}://{request.url.netloc.decode()}"
+            asked = request.headers.get("authorization", "")
+            self.calls.append((request.method, where + request.url.path, asked[:11]))
+            if where == self.LEADER and asked.startswith("Bearer smn-") and self.by_itself:
+                self.moved = False
+                return httpx.Response(200, json={"status": "uncordoned"})
+            return httpx.Response(403, json={"detail": f"{NAME} was cordoned by someone else, who has to lift it"})
+        return super().__call__(request)
+
+
+def test_a_node_that_rejoined_after_its_stop_lifts_its_own_cordon_as_itself(home, monkeypatch):
+    """A rejoin is for a lost folder, and the stop's marker went with it."""
+    node_certificate(home)
+    (home / up.REJOINED_CORDON).write_text(NAME, encoding="utf-8")
+    node = SelfCordoned(by_itself=True)
+    up.back_in_service(SETTINGS, home, httpx.Client(transport=httpx.MockTransport(node)))
+    assert not node.moved, "the node is back in service"
+    posted = [(where, asked) for method, where, asked in node.calls if method == "POST"]
+    assert posted == [("http://desk:8300/admin/nodes/laptop/uncordon", "Bearer smn-")], "only as itself, never with the key"
+    assert not (home / up.REJOINED_CORDON).exists()
+
+
+def test_a_node_that_rejoined_leaves_a_cordon_someone_else_set(home, monkeypatch, capsys):
+    """An owner's key could lift any cordon, so a rejoin asks only as the node, which cannot."""
+    node_certificate(home)
+    (home / up.REJOINED_CORDON).write_text(NAME, encoding="utf-8")
+    node = SelfCordoned(by_itself=False)
+    up.back_in_service(SETTINGS, home, httpx.Client(transport=httpx.MockTransport(node)))
+    assert node.moved and not (home / up.REJOINED_CORDON).exists()
+    assert "stays out of service" in capsys.readouterr().out
+
+
 def test_without_its_certificate_a_refused_node_stops_as_before(home, monkeypatch):
     (home / "admin.key").unlink()
     (home / "user.key").write_text("isk-user", encoding="utf-8")

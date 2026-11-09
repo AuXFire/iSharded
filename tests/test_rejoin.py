@@ -109,6 +109,18 @@ def test_a_node_whose_folder_was_wiped_rejoins_under_its_name_with_one_invite(ow
     assert client.post("/join/requests", json={"request": request_with_key(kept / "second.key", "second")}).json()["status"] == "refused"
 
 
+def test_a_rejoin_leaves_word_for_the_next_start_to_lift_its_own_stop(owners_node, tmp_path: Path) -> None:
+    """A stop cordons the node and marks its folder; the rejoin's new folder has no such mark."""
+    home, runtime, client, _ = owners_node
+    folder = tmp_path / "second"
+    up.join_mesh(folder, invite_for(home), "second", "100.64.0.2")
+    assert not (folder / up.REJOINED_CORDON).exists(), "a first join has no stop to undo"
+    runtime.access.cordon("second", by_itself=True)
+    shutil.rmtree(folder)
+    up.join_mesh(folder, invite_for(home), "second", "100.64.0.2")
+    assert (folder / up.REJOINED_CORDON).read_text(encoding="utf-8") == "second"
+
+
 def test_another_machine_cannot_take_a_name_without_an_invite_or_the_owner(owners_node, tmp_path: Path) -> None:
     home, runtime, client, key = owners_node
     member = tmp_path / "second"
