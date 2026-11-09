@@ -480,7 +480,8 @@ class Pool:
         return count("peers-", live), count("workers-", live_workers)
 
     async def status(self) -> dict[str, Any]:
-        """The dashboard's call. It probes every worker before it answers, so its time grows with N."""
+        """The dashboard's call. It answers from the background health snapshot, so its time grows with N
+        only through the size of its reply. Before round seven it probed every worker first."""
         follower = self.names[len(self.names) // 2]
         results: dict[str, dict[str, Any]] = {}
         for name in (self.reports[self.leader]["leader"] or self.leader, follower):
