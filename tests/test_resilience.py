@@ -1026,6 +1026,25 @@ def test_a_slow_first_token_from_a_live_worker_is_not_silence():
     assert asyncio.run(scenario()) == ["late"]
 
 
+def test_cordoning_a_node_that_holds_no_stage_moves_nothing(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    orchestrator = pool(w1=record("w1"), other=record("other"))
+    orchestrator.active = object()
+    orchestrator.route = [stage("other")]
+    monkeypatch.setattr(orchestrator_module, "runtime", orchestrator)
+    moves = []
+
+    async def move_off():
+        moves.append(True)
+
+    monkeypatch.setattr(orchestrator, "move_off", move_off)
+    client = TestClient(orchestrator_module.app)
+    assert client.post("/admin/nodes/w1/cordon", params={"force": "true"}).status_code == 200
+    assert "w1" in orchestrator.access.cordoned and not moves, "a node with no stage has no share to move"
+    assert any("holds no stage" in str(event) for event in orchestrator.events)
+
+
 def test_a_node_holding_nothing_costs_nothing_to_cordon():
     orchestrator = pool(w1=record("w1"))
     orchestrator.active = object()

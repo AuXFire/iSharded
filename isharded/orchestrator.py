@@ -4959,9 +4959,15 @@ async def cordon_node(
     if cost > REPLAN_MOVE_LIMIT_BYTES and not force:
         detail = f"cordoning {name} would transfer {cost / 1024**3:.1f} GiB between nodes; use force if that is what you want"
         raise HTTPException(status_code=409, detail=detail)
+    # A node with no stage has no share to move. Starting a move for it would plan and place the
+    # running model again for nothing, and that took the place of a load that was fetching: on
+    # eight A40s, cordoning a machine that had only joined to watch ended a 235B load at 212 of
+    # 233 GiB and put the 27B back.
+    holds = runtime.active is not None and any(node_of(stage.worker_id) == name for stage in runtime.route)
     runtime.access.cordon(name, by_itself=itself is not None)
-    runtime.add_event("recovery", "Node cordoned", f"Moving {name}'s share elsewhere" + (", as it is stopping" if itself else ""))
-    if runtime.active is not None:
+    share = f"Moving {name}'s share elsewhere" if holds else f"{name} holds no stage, so nothing moves"
+    runtime.add_event("recovery", "Node cordoned", share + (", as it is stopping" if itself else ""))
+    if holds:
         runtime.spawn(runtime.move_off())
     if itself is None:  # a node's own word is for this coordinator; a lane's needs a person's statement
         runtime.spawn(runtime.lanes.tell_all(f"/admin/nodes/{name}/cordon?force=true", caller))
