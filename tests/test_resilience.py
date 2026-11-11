@@ -1382,6 +1382,33 @@ def test_links_are_measured_from_each_end_and_a_dead_one_stays_on_record() -> No
     done(orchestrator)
 
 
+def test_a_worker_that_cannot_be_asked_is_asked_once_and_a_cordoned_one_not_at_all() -> None:
+    from isharded import orchestrator as module
+
+    orchestrator = pool(one=record("one"), two=record("two"), gone=record("gone"), watching=record("watching"))
+    orchestrator.access.cordon("watching")
+    asked = []
+
+    def handler(request):
+        asked.append(request.url.host)
+        if request.url.host == "gone":
+            raise httpx.ConnectTimeout("no route to it")
+        return httpx.Response(200, json={"100": {"median_ms": 7.0}})
+
+    measure(orchestrator, handler, 0)
+    # Nobody is asked about a cordoned worker's links, and it is not asked about anyone's.
+    assert "watching" not in asked and not any("watching" in pair for pair in orchestrator.links)
+    # The worker that could not be reached was tried once, not once for every other worker.
+    assert asked.count("gone") == 1
+    assert orchestrator.links["gone", "one"] == orchestrator.links["gone", "two"] == module.UNREACHABLE_LINK_MS
+    assert orchestrator.links["one", "two"] == 7.0
+    # All of it is on record, so the next plan sends nothing again.
+    before = len(asked)
+    measure(orchestrator, handler, 0)
+    assert len(asked) == before
+    done(orchestrator)
+
+
 def measure(orchestrator, handler, *rows):
     async def run():
         orchestrator.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))

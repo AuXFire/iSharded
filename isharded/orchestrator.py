@@ -2224,7 +2224,17 @@ class Orchestrator:
         return links
 
     def _link_urls(self) -> dict[str, str]:
-        return {worker_id: worker_url(record) for worker_id, record in self.workers.items() if record.live and not record.quarantined}
+        """The workers whose links are worth timing: those a route could use.
+
+        A cordoned worker carries no route, so its links say nothing a plan needs. Timing them
+        cost every plan its whole allowance when the worker could not be reached: on eight A40s
+        a machine at home that had joined only to watch held each load up for minutes.
+        """
+        return {
+            worker_id: worker_url(record)
+            for worker_id, record in self.workers.items()
+            if record.live and not record.quarantined and not self._cordoned(worker_id)
+        }
 
     async def _probe_links(
         self,
@@ -2237,8 +2247,10 @@ class Orchestrator:
         now = time.monotonic()
         sizes = [LINK_PROBE_BYTES, row] if row > LINK_PROBE_BYTES else [LINK_PROBE_BYTES]
 
-        async def probe(source: str, target: str) -> None:
+        async def probe(source: str, target: str) -> bool:
+            """Times one link, and says whether the source could be asked at all."""
             reading: dict[str, Any] = {"median_ms": None, "max_ms": None, "cost_ms": UNREACHABLE_LINK_MS}
+            asked = True
             try:
                 # The time allowed grows with the work, or a slow link would pass for a dead one.
                 response = await self.client.post(
@@ -2249,18 +2261,30 @@ class Orchestrator:
                 )
                 response.raise_for_status()
                 reading = link_reading(response.json(), sizes)
+            except httpx.TransportError:
+                asked = False
             except (httpx.HTTPError, KeyError, TypeError, ValueError):
                 pass
             links[source, target] = reading["cost_ms"]
             readings[source, target] = {**reading, "checked_at": int(time.time())}
             checked[source, target] = now
+            return asked
 
         async def from_one(source: str) -> None:
+            asked = True
             for target in urls:
                 # A link on a shorter address is timed there, and one the ring times is timed better.
                 kept = links is self.links and ((source, target) in self.hops or (source, target) in self.ring_links)
-                if target != source and not kept and now - checked.get((source, target), -LINK_TTL_SECONDS) >= LINK_TTL_SECONDS:
-                    await probe(source, target)
+                if target == source or kept or now - checked.get((source, target), -LINK_TTL_SECONDS) < LINK_TTL_SECONDS:
+                    continue
+                if asked:
+                    asked = await probe(source, target)
+                else:
+                    # A worker that could not be asked once is not asked about every other link in
+                    # turn. Each of those waits ran out the time every other worker's links had.
+                    links[source, target] = UNREACHABLE_LINK_MS
+                    readings[source, target] = {"median_ms": None, "max_ms": None, "cost_ms": UNREACHABLE_LINK_MS, "checked_at": int(time.time())}
+                    checked[source, target] = now
 
         allowed = LINK_PROBE_SECONDS * len(sizes)
         try:
