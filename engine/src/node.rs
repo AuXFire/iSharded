@@ -210,8 +210,12 @@ pub struct Stats {
     pub write_us: u64,
     /// From a pass's frame being read whole to it being queued for compute.
     pub enqueue_us: u64,
-    /// From being queued for compute to compute starting.
+    /// From being queued for compute to compute starting, any hold for other passes included.
     pub wait_us: u64,
+    /// Holding a trip for passes that were on their way, so replies that run side by side
+    /// share it: a recent average of one hold, and how many trips were held.
+    pub gather_us: u64,
+    pub gathers: u64,
     pub link_rtt_us: u64,
     /// A pass's trip to the next stage and its acknowledgement's trip back.
     pub hop_us: u64,
@@ -258,6 +262,8 @@ struct Counters {
     queue_us: AtomicU64,
     enqueue_us: AtomicU64,
     wait_us: AtomicU64,
+    gather_us: AtomicU64,
+    gathers: AtomicU64,
     link_rtt_us: AtomicU64,
     hop_us: AtomicU64,
     turnaround_us: AtomicU64,
@@ -515,6 +521,43 @@ impl Rings {
 /// No batch is running.
 const IDLE: u64 = u64::MAX;
 
+/// The longest a stage holds a trip for passes that are on their way, whatever a trip costs.
+const GATHER_MOST: Duration = Duration::from_millis(20);
+/// What a pass is always allowed past when it is due, as no two arrive at the same instant.
+const GATHER_SLACK_US: u64 = 200;
+
+/// When a slot's passes come round. A reply's next pass arrives about one round trip after its
+/// last one left here, and replies that left together come back together. So a stage can tell
+/// who is about to arrive, and hold a trip a moment for them instead of running it twice.
+#[derive(Default)]
+struct Pace {
+    generation: u64,
+    epoch: u64,
+    /// When the slot's newest pass left this stage, while the one after it has not come.
+    left: Option<Instant>,
+    /// From a pass leaving to the next arriving, the last time round. Not an average: a reply
+    /// that paused once would be expected late for many rounds after.
+    gap_us: u64,
+}
+
+impl Pace {
+    fn arrived(&mut self, pass: &Pass, now: Instant) {
+        if self.generation != pass.generation {
+            *self = Pace { generation: pass.generation, ..Pace::default() };
+        }
+        if let Some(left) = self.left.take() {
+            self.gap_us = (now.saturating_duration_since(left).as_micros() as u64).max(1);
+        }
+    }
+
+    /// When the slot's next pass is due, and when to stop expecting it.
+    fn due(&self) -> Option<(Instant, Instant)> {
+        let left = self.left.filter(|_| self.gap_us > 0)?;
+        let due = left + Duration::from_micros(self.gap_us);
+        Some((due, due + Duration::from_micros(self.gap_us / 4 + GATHER_SLACK_US)))
+    }
+}
+
 struct Inner {
     identity: Identity,
     /// Whoever holds this may touch the model. Python takes it for what it does rarely.
@@ -528,6 +571,8 @@ struct Inner {
     jobs: Mutex<VecDeque<Job>>,
     /// Taken only inside `jobs`, or with no other lock held.
     lines: Mutex<HashMap<u32, Line>>,
+    /// Taken only inside `jobs`, or with no other lock held.
+    paces: Mutex<HashMap<u32, Pace>>,
     ready: Condvar,
     /// The most passes one trip takes, as the route chose. Kept here so taking work needs no
     /// lock but `jobs`.
@@ -559,6 +604,7 @@ impl Node {
             local_key: link::random_bytes(),
             jobs: Mutex::new(VecDeque::new()),
             lines: Mutex::default(),
+            paces: Mutex::default(),
             ready: Condvar::new(),
             merge_most: AtomicUsize::new(MAX_MERGED),
             stopping: AtomicBool::new(false),
@@ -856,6 +902,8 @@ impl Node {
             write_us: ring.as_ref().and_then(|item| item.next.lock().clone().or_else(|| item.closing.lock().clone())).map_or(0, |peer| peer.link.write_us()),
             enqueue_us: counters.enqueue_us.load(Ordering::Relaxed),
             wait_us: counters.wait_us.load(Ordering::Relaxed),
+            gather_us: counters.gather_us.load(Ordering::Relaxed),
+            gathers: counters.gathers.load(Ordering::Relaxed),
             link_rtt_us: counters.link_rtt_us.load(Ordering::Relaxed),
             hop_us: counters.hop_us.load(Ordering::Relaxed),
             sample_us: crate::sample::average_us(),
@@ -1278,7 +1326,9 @@ fn enqueue(inner: &Inner, pass: Pass, via: Option<&Arc<Ring>>) {
         jobs.retain(|job| job.pass.slot != pass.slot || job.pass.epoch != pass.epoch || job.pass.position < keep || job.refused.is_some());
     }
     inner.counters.dropped.fetch_add((before - jobs.len()) as u64, Ordering::Relaxed);
-    jobs.push_back(Job { pass, arrived: Instant::now(), refused: None });
+    let arrived = Instant::now();
+    inner.paces.lock().entry(pass.slot).or_default().arrived(&pass, arrived);
+    jobs.push_back(Job { pass, arrived, refused: None });
     drop(jobs);
     inner.ready.notify_one();
 }
@@ -1593,18 +1643,96 @@ fn compute_loop(inner: &Arc<Inner>) {
 /// before letting go of the queue, so a retiring ring never looks drained while it runs.
 fn next_batch(inner: &Inner, last: Option<u64>) -> Option<Vec<Job>> {
     let mut jobs = inner.jobs.lock();
+    // Since when a trip has been held for passes on their way.
+    let mut held = None;
     loop {
         if inner.stopping.load(Ordering::Acquire) {
             return None;
         }
         let at = pick(&jobs, last);
-        if let Some(job) = jobs.remove(at) {
-            let most = trip_most(inner, job.pass.epoch);
-            let batch = take_batch(job, &mut jobs, most);
-            inner.busy.store(batch[0].pass.epoch, Ordering::Release);
-            return Some(batch);
+        if at >= jobs.len() {
+            held = None;
+            inner.ready.wait(&mut jobs);
+            continue;
         }
-        inner.ready.wait(&mut jobs);
+        let now = Instant::now();
+        let most = trip_most(inner, jobs[at].pass.epoch);
+        if let Some(until) = gather_until(inner, &jobs, at, most, held.unwrap_or(now), now) {
+            held.get_or_insert(now);
+            inner.ready.wait_until(&mut jobs, until);
+            continue;
+        }
+        if let Some(since) = held.take() {
+            average(&inner.counters.gather_us, now.saturating_duration_since(since).as_micros() as u64);
+            inner.counters.gathers.fetch_add(1, Ordering::Relaxed);
+        }
+        let Some(job) = jobs.remove(at) else {
+            continue;
+        };
+        let batch = take_batch(job, &mut jobs, most);
+        inner.busy.store(batch[0].pass.epoch, Ordering::Release);
+        return Some(batch);
+    }
+}
+
+/// Until when to hold a trip for passes that are on their way, if at all. Replies that run
+/// side by side each send a pass a round, and a stage that takes the first the moment it
+/// comes runs the round as two trips: that one alone, then the rest. A trip costs much the
+/// same for one pass as for several, so the second trip is nearly all waste.
+///
+/// Two kinds of pass are worth the hold. One is back from the rest of the ring sooner than
+/// a trip takes here: this stage sets the pace, a trip of its own would make every reply
+/// wait behind it, and it is here within a trip. The other is due within half a trip: it
+/// would wait behind this trip anyway, so it is a piece of the same group, which went on as
+/// one frame a pass and comes back that way. A pass due later than that is another group,
+/// and is left to run on its own: groups spread round a ring keep every stage busy, and
+/// one trip for all of them would leave the other stages idle.
+///
+/// Replies that share a trip leave together and come back together, so a hold is paid once
+/// and then is next to nothing. Nothing is held while other work waits, for a reply that is
+/// alone, or for a pass that is late. `began` is when this trip was first held.
+fn gather_until(inner: &Inner, jobs: &VecDeque<Job>, at: usize, most: usize, began: Instant, now: Instant) -> Option<Instant> {
+    let first = &jobs[at];
+    if most < 2 || first.refused.is_some() || !can_merge(&first.pass) {
+        return None;
+    }
+    // Only passes that go on this trip may wait for it. Anything else queued is work the
+    // stage could be doing, and the passes on their way gather behind it as they always did.
+    let mut here = HashSet::new();
+    for job in jobs {
+        if job.refused.is_some() || job.pass.epoch != first.pass.epoch || !can_merge(&job.pass) || !here.insert(job.pass.slot) {
+            return None;
+        }
+    }
+    if here.len() >= most.min(MAX_MERGED) {
+        return None;
+    }
+    let trip_us = inner.counters.compute_us.load(Ordering::Relaxed);
+    let mut until = None;
+    for (slot, pace) in inner.paces.lock().iter() {
+        let Some((due, late)) = pace.due().filter(|_| pace.epoch == first.pass.epoch && !here.contains(slot)) else {
+            continue;
+        };
+        let reach = if pace.gap_us < trip_us { trip_us } else { trip_us / 2 };
+        let limit = began + Duration::from_micros(reach).min(GATHER_MOST);
+        if late > now && due <= limit {
+            until = until.max(Some(late.min(limit)));
+        }
+    }
+    until.filter(|until| *until > now)
+}
+
+/// Says when each pass of a trip left, for whoever waits on its slot's next one. What follows
+/// a verify pass is not a pass that shares a trip, so nobody waits for it.
+fn note_left(inner: &Inner, passes: &[Pass], done: Instant) {
+    let mut paces = inner.paces.lock();
+    for pass in passes {
+        let pace = paces.entry(pass.slot).or_default();
+        // A newer reply's pass may have come while this one ran, and the slot is that reply's.
+        if pace.generation == pass.generation {
+            pace.epoch = pass.epoch;
+            pace.left = (!pass.verifying()).then_some(done);
+        }
     }
 }
 
@@ -1638,8 +1766,9 @@ fn pick(jobs: &VecDeque<Job>, last: Option<u64>) -> usize {
     0
 }
 
-/// A job, and whatever waiting anywhere behind it can share its trip. There is no window to
-/// wait out: passes gather while the stage is busy, so a lone reply goes straight through.
+/// A job, and whatever waiting anywhere behind it can share its trip. Passes gather while the
+/// stage is busy, and `gather_until` holds a trip only for passes it knows are about to come,
+/// so a lone reply goes straight through.
 /// A route that asked for no merging gets its passes one at a time, and one that asked for
 /// exact replies no more together than were seen to round as they do alone.
 fn take_batch(first: Job, jobs: &mut VecDeque<Job>, most: usize) -> Vec<Job> {
@@ -1722,6 +1851,7 @@ fn handle(inner: &Arc<Inner>, mut jobs: Vec<Job>) {
         counters.compute_us_total.fetch_add(spent, Ordering::Relaxed);
         counters.batches_total.fetch_add(1, Ordering::Relaxed);
     }
+    note_left(inner, &passes, done);
     counters.passes.fetch_add(passes.len() as u64, Ordering::Relaxed);
     counters.rows.fetch_add(passes.iter().map(|pass| pass.row_count() as u64).sum(), Ordering::Relaxed);
     if passes.len() > 1 {
@@ -1997,6 +2127,173 @@ mod tests {
         let (taken, left) = batch_of(queue);
         assert_eq!(taken.len(), MAX_MERGED);
         assert_eq!(left, vec![MAX_MERGED as u32, MAX_MERGED as u32 + 1]);
+    }
+
+    const TRIP_US: u64 = 4000;
+
+    /// An idle node whose trips cost `TRIP_US`, with slot 0's pass waiting to go.
+    fn node_with_a_pass_waiting() -> Node {
+        let node = idle_node();
+        node.inner.counters.compute_us.store(TRIP_US, Ordering::Relaxed);
+        enqueue(&node.inner, pass_of(0, 7, 1), None);
+        node
+    }
+
+    /// As if `slot`'s last pass left `ago_us` back, and its passes come round every `gap_us`.
+    fn expect(node: &Node, slot: u32, ago_us: u64, gap_us: u64, now: Instant) {
+        let left = now.checked_sub(Duration::from_micros(ago_us));
+        node.inner.paces.lock().insert(slot, Pace { generation: 7, epoch: 1, left, gap_us });
+    }
+
+    /// How long past its due time a pass with this gap is still expected.
+    fn grace(gap_us: u64) -> u64 {
+        gap_us / 4 + GATHER_SLACK_US
+    }
+
+    fn held_until(node: &Node, most: usize, began: Instant, now: Instant) -> Option<Instant> {
+        gather_until(&node.inner, &node.inner.jobs.lock(), 0, most, began, now)
+    }
+
+    fn micros(count: u64) -> Duration {
+        Duration::from_micros(count)
+    }
+
+    #[test]
+    fn a_reply_that_is_alone_is_never_held() {
+        let node = node_with_a_pass_waiting();
+        let now = Instant::now();
+        assert_eq!(held_until(&node, MAX_MERGED, now, now), None);
+        // Its own last pass having left says nothing: the next one is the one waiting here.
+        expect(&node, 0, 800, 1000, now);
+        assert_eq!(held_until(&node, MAX_MERGED, now, now), None);
+    }
+
+    #[test]
+    fn a_trip_is_held_for_a_pass_that_is_about_to_come() {
+        let node = node_with_a_pass_waiting();
+        let now = Instant::now();
+        expect(&node, 1, 800, 1000, now);
+        assert_eq!(held_until(&node, MAX_MERGED, now, now), Some(now + micros(200 + grace(1000))));
+        // The hold is for the last of them.
+        expect(&node, 2, 500, 1000, now);
+        assert_eq!(held_until(&node, MAX_MERGED, now, now), Some(now + micros(500 + grace(1000))));
+    }
+
+    #[test]
+    fn a_pass_back_sooner_than_a_trip_takes_is_held_for_up_to_a_trip() {
+        let node = node_with_a_pass_waiting();
+        let now = Instant::now();
+        // Slot 1 ran a trip of its own after this one's last, and is back in under a trip.
+        expect(&node, 1, 0, TRIP_US - 500, now);
+        assert_eq!(held_until(&node, MAX_MERGED, now, now), Some(now + micros(TRIP_US)));
+        // A hold that began a while back has that much less left, and then none.
+        expect(&node, 1, 800, 1000, now);
+        let began = |ago_us: u64| now.checked_sub(micros(ago_us)).unwrap();
+        assert_eq!(held_until(&node, MAX_MERGED, began(TRIP_US - 300), now), Some(now + micros(300)));
+        assert_eq!(held_until(&node, MAX_MERGED, began(TRIP_US - 100), now), None);
+    }
+
+    #[test]
+    fn a_pass_from_a_longer_way_round_is_held_for_only_if_due_within_half_a_trip() {
+        let node = node_with_a_pass_waiting();
+        let now = Instant::now();
+        // A piece of the group that is here: it would wait behind this trip anyway.
+        expect(&node, 1, 9000, 10_000, now);
+        assert_eq!(held_until(&node, MAX_MERGED, now, now), Some(now + micros(TRIP_US / 2)));
+        // Another group, which keeps another stage busy while this one runs.
+        expect(&node, 1, 7000, 10_000, now);
+        assert_eq!(held_until(&node, MAX_MERGED, now, now), None);
+    }
+
+    #[test]
+    fn no_hold_is_longer_than_the_most() {
+        let node = node_with_a_pass_waiting();
+        node.inner.counters.compute_us.store(10_000_000, Ordering::Relaxed);
+        let now = Instant::now();
+        expect(&node, 1, 990_000, 1_000_000, now);
+        assert_eq!(held_until(&node, MAX_MERGED, now, now), Some(now + GATHER_MOST));
+        expect(&node, 1, 900_000, 1_000_000, now);
+        assert_eq!(held_until(&node, MAX_MERGED, now, now), None);
+    }
+
+    #[test]
+    fn nothing_is_held_for_a_pass_that_is_late_or_on_another_route() {
+        let node = node_with_a_pass_waiting();
+        let now = Instant::now();
+        // Its reply has likely ended.
+        expect(&node, 1, 5000, 1000, now);
+        assert_eq!(held_until(&node, MAX_MERGED, now, now), None);
+        expect(&node, 1, 800, 1000, now);
+        node.inner.paces.lock().get_mut(&1).unwrap().epoch = 2;
+        assert_eq!(held_until(&node, MAX_MERGED, now, now), None);
+    }
+
+    #[test]
+    fn one_pause_does_not_make_a_slot_look_slow_for_long() {
+        let mut pace = Pace::default();
+        let start = Instant::now();
+        let at = |us: u64| start + micros(us);
+        let round = |pace: &mut Pace, left_us: u64, back_us: u64| {
+            pace.left = Some(at(left_us));
+            pace.arrived(&pass_of(0, 0, 1), at(back_us));
+            pace.gap_us
+        };
+        assert_eq!(round(&mut pace, 0, 1000), 1000);
+        assert_eq!(round(&mut pace, 2000, 900_000), 898_000);
+        assert_eq!(round(&mut pace, 901_000, 902_000), 1000);
+    }
+
+    #[test]
+    fn nothing_is_held_before_a_trip_has_been_timed() {
+        let node = node_with_a_pass_waiting();
+        node.inner.counters.compute_us.store(0, Ordering::Relaxed);
+        let now = Instant::now();
+        expect(&node, 1, 800, 1000, now);
+        assert_eq!(held_until(&node, MAX_MERGED, now, now), None);
+    }
+
+    #[test]
+    fn nothing_is_held_while_other_work_waits_or_the_trip_is_full() {
+        let now = Instant::now();
+        let held = |more: Job, most: usize| {
+            let node = node_with_a_pass_waiting();
+            expect(&node, 5, 800, 1000, now);
+            assert!(held_until(&node, MAX_MERGED, now, now).is_some());
+            node.inner.jobs.lock().push_back(more);
+            held_until(&node, most, now, now)
+        };
+        assert!(held(job(1, 1, 1, 0), MAX_MERGED).is_some(), "a pass that goes on the trip waits with it");
+        assert_eq!(held(job(1, 1, 3, wire::FLAG_VERIFY), MAX_MERGED), None);
+        assert_eq!(held(job(1, 2, 1, 0), MAX_MERGED), None, "another route's pass could run now");
+        assert_eq!(held(job(0, 1, 1, 0), MAX_MERGED), None, "the slot's next pass is behind this one");
+        assert_eq!(held(job(1, 1, 1, 0), 2), None, "the trip holds no more");
+        assert_eq!(held(job(1, 1, 1, 0), 1), None, "the route merges nothing");
+    }
+
+    #[test]
+    fn a_slot_learns_how_long_its_passes_take_to_come_round() {
+        let node = idle_node();
+        let pace = |slot: u32| {
+            let paces = node.inner.paces.lock();
+            (paces[&slot].left.is_some(), paces[&slot].gap_us)
+        };
+        enqueue(&node.inner, pass_of(0, 7, 1), None);
+        assert_eq!(pace(0), (false, 0));
+        let left = Instant::now().checked_sub(micros(3000)).unwrap();
+        note_left(&node.inner, &[pass_of(0, 7, 1)], left);
+        assert_eq!(pace(0), (true, 0));
+        enqueue(&node.inner, pass_of(0, 7, 2), None);
+        let (waiting, gap) = pace(0);
+        assert!(!waiting && (3000..1_000_000).contains(&gap), "{gap}");
+        // What follows a verify pass shares no trip, so nobody waits for it.
+        note_left(&node.inner, &[Pass { flags: wire::FLAG_VERIFY, ..pass_of(0, 7, 2) }], left);
+        assert!(!pace(0).0);
+        // A new reply on the slot comes round at its own pace, and an old reply's pass that
+        // was still running says nothing about it.
+        enqueue(&node.inner, pass_of(0, 8, 1), None);
+        assert_eq!(pace(0), (false, 0));
+        note_left(&node.inner, &[pass_of(0, 7, 2)], left);
+        assert_eq!(pace(0), (false, 0));
     }
 
     #[test]

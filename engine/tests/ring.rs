@@ -1032,6 +1032,36 @@ fn passes_on_one_sequence_never_share_a_trip() {
 }
 
 #[test]
+fn replies_that_arrive_a_moment_apart_are_gathered_into_one_trip() {
+    within_deadline("replies_that_arrive_a_moment_apart_are_gathered_into_one_trip", || {
+        let mut ring = ring(2, true, Duration::from_millis(20), 4000);
+        let slots: u64 = 4;
+        for round in 0..6u64 {
+            // Each reply sends its next pass once the last round's answers are all in, one a
+            // moment after another, as replies do that were answered together.
+            for slot in 1..=slots {
+                let mut item = pass(round * slots + slot, slot as u32, round as u32);
+                item.slot = slot as u32;
+                ring.client.send(&item.encode()).unwrap();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let mut answers: Vec<_> = (0..slots).map(|_| answer(&mut ring)).collect();
+            answers.sort_by_key(|item| item.id);
+            for (index, item) in answers.iter().enumerate() {
+                let slot = index as u32 + 1;
+                assert_eq!(item.id, round * slots + u64::from(slot));
+                assert_eq!(item.tokens[0], (slot * 10 + 1) * 10 + 2, "reply {slot} got another reply's result");
+            }
+        }
+        // The first pass of a round finds the stage free, and waits for the ones it knows
+        // are coming instead of going alone.
+        let stats = ring.nodes[0].stats();
+        assert!(stats.gathers >= 1 && stats.gather_us > 0, "{stats:?}");
+        assert!(stats.gather_us <= 20_000, "{stats:?}");
+    });
+}
+
+#[test]
 fn a_rewind_clears_what_is_queued_past_it() {
     within_deadline("a_rewind_clears_what_is_queued_past_it", || {
         // Long passes, so waiting behind eight of them stands well clear of a slow machine's noise.
