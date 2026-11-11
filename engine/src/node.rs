@@ -546,15 +546,28 @@ struct Pace {
     /// From a pass leaving to the next arriving, the last time round. Not an average: a reply
     /// that paused once would be expected late for many rounds after.
     gap_us: u64,
+    /// Whether the slot's last pass came when its time away before that said it would. Only
+    /// such a slot is waited for. A reply that sends passes ahead of its answers has several
+    /// going round at once, which come at no steady pace: measured on eight GPUs with a
+    /// draft, stages waited half a trip for passes that did not come, about 5 ms a stage, and
+    /// eight replies made 60 tokens a second where 92 were made with no waiting.
+    steady: bool,
 }
 
 impl Pace {
-    fn arrived(&mut self, pass: &Pass, now: Instant) {
+    /// `trip_us` is what a trip costs here: a pass within an eighth of that of when it was
+    /// expected, or a quarter of its time away, came when expected.
+    fn arrived(&mut self, pass: &Pass, now: Instant, trip_us: u64) {
         if self.generation != pass.generation {
             *self = Pace { generation: pass.generation, ..Pace::default() };
         }
         if let Some(left) = self.left.take() {
-            self.gap_us = (now.saturating_duration_since(left).as_micros() as u64).max(1);
+            let gap_us = (now.saturating_duration_since(left).as_micros() as u64).max(1);
+            self.steady = self.gap_us > 0 && gap_us.abs_diff(self.gap_us) <= (self.gap_us / 4).max(trip_us / 8) + GATHER_SLACK_US;
+            self.gap_us = gap_us;
+        } else {
+            // A pass that comes before the slot's last one has left: several are going round.
+            self.steady = false;
         }
     }
 
@@ -563,7 +576,7 @@ impl Pace {
     /// measured on four GPUs, passes 75 ms away were waited on for half a trip, about 5 ms a
     /// stage, long after the rest of their group had come.
     fn due(&self, trip_us: u64) -> Option<(Instant, Instant)> {
-        let left = self.left.filter(|_| self.gap_us > 0)?;
+        let left = self.left.filter(|_| self.gap_us > 0 && self.steady)?;
         let due = left + Duration::from_micros(self.gap_us);
         Some((due, due + Duration::from_micros((self.gap_us / 4).min(trip_us / 8) + GATHER_SLACK_US)))
     }
@@ -1339,7 +1352,8 @@ fn enqueue(inner: &Inner, pass: Pass, via: Option<&Arc<Ring>>) {
     }
     inner.counters.dropped.fetch_add((before - jobs.len()) as u64, Ordering::Relaxed);
     let arrived = Instant::now();
-    inner.paces.lock().entry(pass.slot).or_default().arrived(&pass, arrived);
+    let trip_us = inner.counters.compute_us.load(Ordering::Relaxed);
+    inner.paces.lock().entry(pass.slot).or_default().arrived(&pass, arrived, trip_us);
     jobs.push_back(Job { pass, arrived, refused: None });
     drop(jobs);
     inner.ready.notify_one();
@@ -1725,7 +1739,7 @@ fn gather_until(inner: &Inner, jobs: &VecDeque<Job>, at: usize, most: usize, beg
         return None;
     }
     let paces = inner.paces.lock();
-    let route = || paces.iter().filter(|(_, pace)| pace.epoch == first.pass.epoch && pace.gap_us > 0);
+    let route = || paces.iter().filter(|(_, pace)| pace.epoch == first.pass.epoch && pace.gap_us > 0 && pace.steady);
     // Passes that are out and still expected, soonest first.
     let mut away: Vec<(Instant, Instant)> = route().filter(|(slot, _)| !here.contains(slot)).filter_map(|(_, pace)| pace.due(trip_us)).filter(|(_, late)| *late > now).collect();
     away.sort_unstable();
@@ -2182,7 +2196,7 @@ mod tests {
     /// As if `slot`'s last pass left `ago_us` back, and its passes come round every `gap_us`.
     fn expect(node: &Node, slot: u32, ago_us: u64, gap_us: u64, now: Instant) {
         let left = now.checked_sub(Duration::from_micros(ago_us));
-        node.inner.paces.lock().insert(slot, Pace { generation: 7, epoch: 1, left, gap_us });
+        node.inner.paces.lock().insert(slot, Pace { generation: 7, epoch: 1, left, gap_us, steady: true });
     }
 
     /// How long past its due time a pass with this gap is still expected.
@@ -2304,12 +2318,35 @@ mod tests {
         let at = |us: u64| start + micros(us);
         let round = |pace: &mut Pace, left_us: u64, back_us: u64| {
             pace.left = Some(at(left_us));
-            pace.arrived(&pass_of(0, 0, 1), at(back_us));
+            pace.arrived(&pass_of(0, 0, 1), at(back_us), TRIP_US);
             pace.gap_us
         };
         assert_eq!(round(&mut pace, 0, 1000), 1000);
         assert_eq!(round(&mut pace, 2000, 900_000), 898_000);
         assert_eq!(round(&mut pace, 901_000, 902_000), 1000);
+    }
+
+    #[test]
+    fn only_a_slot_that_comes_when_expected_is_waited_for() {
+        let mut pace = Pace::default();
+        let start = Instant::now();
+        let at = |us: u64| start + micros(us);
+        let mut round = |left_us: u64, back_us: u64| {
+            pace.left = Some(at(left_us));
+            pace.arrived(&pass_of(0, 0, 1), at(back_us), TRIP_US);
+            pace.left = Some(at(back_us));
+            pace.due(TRIP_US).is_some()
+        };
+        assert!(!round(0, 10_000), "one time away says nothing about the next");
+        assert!(round(20_000, 30_300), "the second came when the first said it would");
+        assert!(!round(40_000, 44_000), "this one came 6 ms early: several are going round, or it paused");
+        assert!(!round(50_000, 60_000), "and one right time after a wrong one is not a pace yet");
+        assert!(round(70_000, 80_200));
+        // A pass that comes before the slot's last one has even left is one of several going round.
+        pace.left = None;
+        pace.arrived(&pass_of(0, 0, 1), at(90_000), TRIP_US);
+        pace.left = Some(at(91_000));
+        assert!(pace.due(TRIP_US).is_none());
     }
 
     #[test]
