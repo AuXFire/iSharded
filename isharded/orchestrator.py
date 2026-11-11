@@ -1690,9 +1690,21 @@ class Orchestrator:
         return await self.move_cost(self.active, cordon={name})
 
     def _move_cost(self, target: ModelTarget) -> int | None:
-        """Bytes a fresh plan would transfer, or None if nothing could hold the model."""
+        """Bytes a fresh plan would transfer, or None if nothing could hold the model.
+
+        Slots a load chose for itself are no reason to refuse. The move chooses again when what
+        is left cannot hold them, so this prices the plan the move would make: on two A40s a
+        27B that had taken 38 slots refused a cordon one of them could have served at fewer.
+        """
         try:
             return int(describe_plan(target, self.plan(target))["download_bytes"])
+        except PlacementError:
+            if not target.parallel.get("auto") or target.slots <= 1:
+                return None
+        trial = copy.copy(target)  # the price must not change what the running model holds
+        self.settle_slots(trial, preview=True)
+        try:
+            return int(describe_plan(trial, self.plan(trial))["download_bytes"])
         except PlacementError:
             return None
 

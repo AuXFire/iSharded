@@ -508,6 +508,23 @@ def test_a_pool_that_shrank_past_the_choice_chooses_again(pool):
     assert pool.plan(wanted)
 
 
+def test_a_cordon_is_priced_at_the_slots_the_move_would_choose(pool):
+    wanted = target()
+    choose(pool, wanted)
+    chosen, held = wanted.slots, wanted.profile
+    assert chosen > 1
+    # What is left holds the model at one slot, and not at the slots the load chose.
+    pool.offered = [worker("a", 700 * MIB, 100 * MIB), worker("b", 700 * MIB, 100 * MIB)]
+    assert pool._move_cost(wanted) is not None, "slots the load chose for itself must not refuse a cordon"
+    assert (wanted.slots, wanted.profile) == (chosen, held), "pricing a move changes nothing on the running model"
+    # Slots an operator set are theirs to keep, and a pool that cannot hold them says so.
+    fixed = target(parallel=chosen)
+    assert pool._move_cost(fixed) is None
+    # And nothing holds the model at any count on a pool with no room at all.
+    pool.offered = [worker("a", 10 * MIB, 10 * MIB)]
+    assert pool._move_cost(wanted) is None
+
+
 def test_a_pool_that_holds_nothing_for_now_leaves_the_running_choice_alone(pool):
     wanted = target()
     choose(pool, wanted)
