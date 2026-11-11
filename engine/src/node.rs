@@ -552,11 +552,14 @@ impl Pace {
         }
     }
 
-    /// When the slot's next pass is due, and when to stop expecting it.
-    fn due(&self) -> Option<(Instant, Instant)> {
+    /// When the slot's next pass is due, and when to stop expecting it. A pass is allowed a
+    /// quarter of its time away to be late by, but never more than an eighth of a trip here:
+    /// measured on four GPUs, passes 75 ms away were waited on for half a trip, about 5 ms a
+    /// stage, long after the rest of their group had come.
+    fn due(&self, trip_us: u64) -> Option<(Instant, Instant)> {
         let left = self.left.filter(|_| self.gap_us > 0)?;
         let due = left + Duration::from_micros(self.gap_us);
-        Some((due, due + Duration::from_micros(self.gap_us / 4 + GATHER_SLACK_US)))
+        Some((due, due + Duration::from_micros((self.gap_us / 4).min(trip_us / 8) + GATHER_SLACK_US)))
     }
 }
 
@@ -1737,7 +1740,7 @@ fn gather_until(inner: &Inner, jobs: &VecDeque<Job>, at: usize, most: usize, beg
     let paces = inner.paces.lock();
     let mut until = None;
     for (slot, pace) in &paces.slots {
-        let Some((due, late)) = pace.due().filter(|_| pace.epoch == first.pass.epoch && !here.contains(slot)) else {
+        let Some((due, late)) = pace.due(trip_us).filter(|_| pace.epoch == first.pass.epoch && !here.contains(slot)) else {
             continue;
         };
         // The trips a round has room for here, and one more if this pass went by itself.
@@ -2193,7 +2196,7 @@ mod tests {
 
     /// How long past its due time a pass with this gap is still expected.
     fn grace(gap_us: u64) -> u64 {
-        gap_us / 4 + GATHER_SLACK_US
+        (gap_us / 4).min(TRIP_US / 8) + GATHER_SLACK_US
     }
 
     fn held_until(node: &Node, most: usize, began: Instant, now: Instant) -> Option<Instant> {
@@ -2247,6 +2250,9 @@ mod tests {
         // has room for three trips, and three ran.
         ran(&node, &[9000, 5000, 100], now);
         expect(&node, 1, 9000, 10_000, now);
+        assert_eq!(held_until(&node, MAX_MERGED, now, now), Some(now + micros(1000 + grace(10_000))));
+        // However late it may run, the hold ends at half a trip.
+        expect(&node, 1, 8200, 10_000, now);
         assert_eq!(held_until(&node, MAX_MERGED, now, now), Some(now + micros(TRIP_US / 2)));
         // Another group, which keeps another stage busy while this one runs.
         expect(&node, 1, 7000, 10_000, now);
