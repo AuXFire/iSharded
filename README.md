@@ -41,10 +41,11 @@ The same model at Q8_0, 233 GiB, ran on eight rented A40s in one data center on 
 | 235B at Q8_0 across eight A40s, one reply, plain decoding | 18.4 tokens/s |
 | The same, stages overlapping | 29.3 tokens/s |
 | The same, 8 replies at once | 92 tokens/s in all |
+| The same on this version, a day later on other A40s, 8 replies at once | 136 to 137 tokens/s in all |
 | 27B across four A40s, 16 replies at once | 167 to 172 tokens/s in all, against 100 to 115 before a stage's replies shared one cache |
 | 27B across four A40s, 4 replies at once | 95 tokens/s in all, each reply as fast as one alone |
 
-The 235B rows and the 4-reply row were measured on the version before this one. This version changes when a stage waits to run several replies in one pass, and those changes have unit tests but no measurement on rented GPUs yet. [Test results](docs/RESULTS.md) holds every speed, failure and security result measured so far, each with its setup, and what has not been measured yet.
+All but the fourth row were measured on the version before this one. This version changes when a stage waits to run several replies in one pass. On the 235B that took 8 replies at once from 92 to 136 tokens/s, with one reply where it was, and the 27B rows have not been run again. [Test results](docs/RESULTS.md) holds every speed, failure and security result measured so far, each with its setup, and what has not been measured yet.
 
 ## What it does
 
