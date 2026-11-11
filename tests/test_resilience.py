@@ -1599,8 +1599,52 @@ def test_a_big_move_waits_for_a_lost_worker_to_return(monkeypatch) -> None:
             orchestrator.workers["two"].quarantined = False
 
     monkeypatch.setattr(orchestrator, "_review_quarantine", review)
-    asyncio.run(orchestrator._await_lost_workers())
+    assert asyncio.run(orchestrator._await_lost_workers()) is True
     assert len(checks) == 3
+    done(orchestrator)
+
+
+def test_a_lost_worker_that_returns_with_its_stage_moves_nothing(monkeypatch) -> None:
+    """A repair that waited for a worker went on to deploy the route again once it was back,
+    which planned afresh, moved layers between two other workers and stopped a reply for two minutes."""
+    orchestrator, module = waiting_pool(monkeypatch, 40 * 1024**3)
+    before = [(stage.worker_id, stage.start_layer, stage.end_layer) for stage in orchestrator.route]
+    epoch, job = orchestrator.epoch, orchestrator.job
+
+    def review():
+        orchestrator.workers["two"].quarantined = False
+
+    async def deploy(*args, **kwargs):
+        pytest.fail("the route was whole again, so no load should start")
+
+    monkeypatch.setattr(orchestrator, "_review_quarantine", review)
+    monkeypatch.setattr(orchestrator, "deploy", deploy)
+    route = asyncio.run(orchestrator.rebalance())
+    assert [(stage.worker_id, stage.start_layer, stage.end_layer) for stage in route] == before
+    assert (orchestrator.epoch, orchestrator.job) == (epoch, job)
+    done(orchestrator)
+
+
+def test_a_lost_worker_that_returns_empty_gets_its_layers_again(monkeypatch) -> None:
+    """Back, but its stage process restarted with nothing loaded: the route is not whole, so it is deployed."""
+    from types import SimpleNamespace
+
+    orchestrator, module = waiting_pool(monkeypatch, 40 * 1024**3)
+    orchestrator.active = SimpleNamespace(model_id="a-model")
+    deployed = []
+
+    def review():
+        orchestrator.workers["two"].quarantined = False
+
+    async def deploy(*args, **kwargs):
+        deployed.append(1)
+        return list(orchestrator.route)
+
+    monkeypatch.setattr(orchestrator, "_review_quarantine", review)
+    monkeypatch.setattr(orchestrator, "_lost_its_stage", lambda worker_id: worker_id == "two")
+    monkeypatch.setattr(orchestrator, "deploy", deploy)
+    asyncio.run(orchestrator.rebalance())
+    assert deployed == [1]
     done(orchestrator)
 
 

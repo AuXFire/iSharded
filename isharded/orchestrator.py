@@ -3362,29 +3362,37 @@ class Orchestrator:
                     record.quarantined = False
                     record.quarantine_reason = None
         elif not staged:
-            await self._await_lost_workers()
+            if await self._await_lost_workers() and self._route_whole():
+                # The worker that was lost came back with its stage, so the route is as it was.
+                # Deploying it again would plan afresh, which can move layers between workers
+                # the fault never touched, and it stops every reply while the stages reload.
+                self.add_event("recovery", "Route kept", "the worker that was lost came back with its stage, so nothing moved")
+                return list(self.route)
         self.job = LoadJob(job_id=uuid.uuid4().hex, model_id=self.active.model_id)
         return await self.run_job(
             self.job,
             self.deploy(self.active, self.job, generation_lock_held=generation_lock_held, staged=staged),
         )
 
-    async def _await_lost_workers(self) -> None:
+    async def _await_lost_workers(self) -> bool:
         """Give a lost worker time to come back, when replacing it would move many weights.
 
         Nothing is lost by waiting, since the replies on this route would wait for the
-        move anyway. A worker that does not return is replaced as before.
+        move anyway. A worker that does not return is replaced as before. True if a worker
+        was missing from the route and every one is back.
         """
         deadline = time.monotonic() + WORKER_RETURN_SECONDS
         assert self.active is not None
+        lost = bool(self._absent_from_route())
         while self._absent_from_route() and time.monotonic() < deadline:
             await self.refresh_holdings(self.active)
             moved = await self.move_cost(self.active)
             if moved is not None and moved <= REPLAN_MOVE_LIMIT_BYTES:
-                return
+                return False
             await asyncio.sleep(WORKER_RETURN_CHECK_SECONDS)
             await self.refresh_worker_metrics()
             self._review_quarantine()
+        return lost and not self._absent_from_route()
 
     async def restore_session_from_cache(
         self,
