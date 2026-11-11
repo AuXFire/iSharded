@@ -778,7 +778,7 @@ def test_a_model_says_whether_it_has_a_thinking_switch(pool):
     pool.tokenizer = SimpleNamespace(tool_template="{%- if enable_thinking is defined and enable_thinking is false %}<think></think>{%- endif %}")
     assert pool.thinking_switch() and pool.model_kind()["thinking"] is True
     pool.tokenizer = SimpleNamespace(tool_template="{{- '<|im_start|>assistant' }}")
-    assert not pool.thinking_switch() and pool.model_kind() == {"kind": "chat", "vision": False, "thinking": False}
+    assert not pool.thinking_switch() and pool.model_kind() == {"kind": "chat", "vision": False, "thinking": False, "builtin_tools": []}
     pool.tokenizer = None
     assert not pool.thinking_switch()
 

@@ -505,6 +505,8 @@ class ChatCompletionRequest(BaseModel):
     tools: list[dict[str, Any]] | None = None
     tool_choice: str | dict[str, Any] | None = None
     parallel_tool_calls: bool | None = None
+    # Offer the mesh's own tools, which the answering node runs itself. See builtin_tools.py.
+    builtin_tools: bool | None = None
 
 
 def auth_headers(token: str | None) -> dict[str, str]:

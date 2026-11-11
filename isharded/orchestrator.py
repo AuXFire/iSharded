@@ -36,6 +36,7 @@ from starlette.background import BackgroundTask
 
 from . import __version__, source_commit
 from .addresses import host_port
+from . import builtin_tools
 from .access import INVITE_FIELDS, load_authority, NeedsAuthority, node_of, ROLE_ADMIN, ROLE_MEMBER, ROLE_NODE, ROLE_PEER, ROLE_USER, AccessControl, AuditLog, Caller
 from .embedding import POOLED_TYPES, dimensions_problem, encoded, inputs_problem, length_problem, passes, shaped, smallest_dimensions
 from .engine import find_library
@@ -75,10 +76,11 @@ from .protocol import (
     WeightUnit,
     WorkerRegistration,
     auth_headers,
+    ChatMessage,
 )
 from .pool import LOOPBACK, check_exposure, home as pool_home, load_token, read_membership_request
 from .parameters import CHAT_LIMITS, COMPLETION_LIMITS, EMBEDDING_LIMITS, Limit, refused_field
-from .replies import CLIENT_GONE, ClientGone, event_stream, first_stop, render_prompts, scanned, unless_client_leaves, usage_of, whole_reply
+from .replies import CLIENT_GONE, ClientGone, event_stream, first_stop, render_prompts, scanned, unless_client_leaves, usage_of, whole_reply, with_builtin_tools
 from .serving import MAX_STRANGER_BYTES, AddressLimit, BodyLimit, ChunkedResponses, client_address, serve, where_everything_is
 from .mesh import clean_url
 from .statements import Refused, Statements, make_statement
@@ -95,6 +97,7 @@ from .toolcalls import (
     reply_limit,
     template_messages,
     uses_tools,
+    tool_format,
 )
 from .vision import ImageRefused, chat_images, expand_prompt, image_id, projector_marker
 from .weights import apply_model_hashes, Manifest, WeightSourceError, build_manifest, has_model_host
@@ -1041,6 +1044,8 @@ class Orchestrator:
         self.stage_errors = 0
         self.replies_in_flight = 0
         self.replies_peak = 0  # the most replies it ever ran at once, which is what slots are sized for
+        # Whether chats may be offered the mesh's own tools. --no-builtin-tools turns them off.
+        self.builtin_tools = os.getenv("ISHARDED_BUILTIN_TOOLS", "1") != "0"
         self.warned_interception: set[str] = set()
         self.drained: set[str] = set()
         self.reply_checker: TicketChecker | None = None
@@ -3758,8 +3763,47 @@ class Orchestrator:
         active = self.active
         if active is not None and active.embedding:
             assert isinstance(active.adapter, GgufAdapter)
-            return {"kind": "embedding", "vision": False, "thinking": False, "dimensions": active.adapter.output_width}
-        return {"kind": "chat", "vision": bool(active and active.projector), "thinking": self.thinking_switch()}
+            return {"kind": "embedding", "vision": False, "thinking": False, "builtin_tools": [], "dimensions": active.adapter.output_width}
+        return {"kind": "chat", "vision": bool(active and active.projector), "thinking": self.thinking_switch(), "builtin_tools": self.builtin_names()}
+
+    def builtin_names(self) -> list[str]:
+        """The mesh's own tools this model can be offered, which is none when they are off or it cannot call tools."""
+        template = getattr(getattr(self, "tokenizer", None), "tool_template", None)
+        return list(builtin_tools.NAMES) if self.builtin_tools and tool_format(template) is not None else []
+
+    def builtin_offer(self, body: ChatCompletionRequest) -> list[dict[str, Any]] | None:
+        """The built-in tools for a chat that asked for them, or None for one that did not.
+
+        A chat that asks and cannot have them is told why. Offering them changes the prompt,
+        so a chat that did not ask gets none, and an OpenAI client sees no difference.
+        """
+        if not body.builtin_tools:
+            return None
+        if not self.builtin_tools:
+            raise HTTPException(status_code=400, detail="built-in tools are off on this mesh; its nodes were started with --no-builtin-tools")
+        if body.tools:
+            raise HTTPException(status_code=400, detail="built-in tools join a chat that sends no tools of its own; send one or the other")
+        if body.tool_choice not in (None, "auto"):
+            raise HTTPException(status_code=400, detail='built-in tools are the model\'s to call or not; leave tool_choice out or send "auto"')
+        if not self.builtin_names():
+            raise HTTPException(status_code=400, detail=f"{self.model_id} has no tool format iSharded can read, so it cannot use the built-in tools")
+        return builtin_tools.DEFINITIONS
+
+    def mesh_facts(self) -> dict[str, Any]:
+        """What a model may be told about where it runs. Nothing here names a machine or an address."""
+        active = self.active
+        return {
+            "model": Path(self.model_id or "").name,
+            "machines_sharing_the_model": len({node_of(stage.worker_id) for stage in self.route}),
+            "stages": len(self.route),
+            "replies_at_once": active.slots if active else 1,
+            "context_tokens": active.profile.context_tokens if active else None,
+            "draft_model": Path(active.draft.file).name if active and active.draft else None,
+            "software": "iSharded",
+        }
+
+    def run_builtin(self, name: str, arguments: Any) -> str:
+        return builtin_tools.run(name, arguments, self.mesh_facts)
 
     def thinking_switch(self) -> bool:
         """Whether asking this model to think, or not to, changes anything.
@@ -5314,16 +5358,19 @@ async def chat_completions(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if images and not (runtime.active and runtime.active.projector):
         raise HTTPException(status_code=400, detail=f"{runtime.model_id} has no image projector, so it cannot see images; load it with --mmproj FILE")
+    builtin = runtime.builtin_offer(body)
+    tools = builtin or body.tools
     try:
-        plan = plan_tools(body.tools, body.tool_choice, body.parallel_tool_calls, runtime.tokenizer.tool_template)
-        messages = template_messages([message.model_copy(update={"content": item["content"]}) for message, item in zip(body.messages, plain)])
+        plan = plan_tools(tools, body.tool_choice, body.parallel_tool_calls, runtime.tokenizer.tool_template)
+        asked = [message.model_copy(update={"content": item["content"]}) for message, item in zip(body.messages, plain)]
+        messages = template_messages(asked)
         # A forced call starts straight away. Told nothing, Qwen3 took one for its
         # reasoning, closed that, and wrote the call a second time.
         thinking = False if plan and plan.forced is not None else body.enable_thinking
         prompt, history = await asyncio.to_thread(render_prompts, runtime.tokenizer, messages, thinking, plan.tools if plan else None)
     except ToolRequestError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    limit = reply_limit(body.max_tokens, body.max_completion_tokens, uses_tools(body.tools, body.messages))
+    limit = reply_limit(body.max_tokens, body.max_completion_tokens, uses_tools(tools, body.messages))
     scanner = None
     in_thought = opens_in_thought(prompt)
     if plan:
@@ -5336,6 +5383,16 @@ async def chat_completions(
     items = runtime.stream_tokens(prompt, *options, keep_markers=scanner is not None)
     if scanner:
         items = scanned(items, scanner)
+    if builtin and plan:
+
+        async def again(extra: list[dict[str, Any]], final: bool) -> AsyncIterator[dict[str, Any]]:
+            """The model's next pass, with the calls it made and what they returned. The last offers no tools."""
+            more = template_messages([*asked, *(ChatMessage(**item) for item in extra)])
+            prompt, history = await asyncio.to_thread(render_prompts, runtime.tokenizer, more, thinking, None if final else plan.tools)
+            follow = runtime.stream_tokens(prompt, limit, body.temperature, body.top_p, body.top_k, body.seed, body.stop, history, images, keep_markers=not final)
+            return follow if final else scanned(follow, ReplyScanner(plan, opens_in_thought(prompt), ""))
+
+        items = with_builtin_tools(items, again, runtime.run_builtin, builtin_tools.ROUNDS)
     identifier = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     # Taken as the reply starts. One that moves to another route partway keeps the first one's.
@@ -5378,6 +5435,7 @@ async def chat_completions(
             }
         ],
         "usage": usage_of(summary),
+        **({"isharded": {"tool_uses": summary["tool_uses"]}} if summary.get("tool_uses") else {}),
     }
 
 
@@ -5451,6 +5509,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trusted-network", action="store_true", help="send pool credentials unencrypted, because nobody else can read this network")
     parser.add_argument("--open", action="store_true", help="serve a network with no credentials, trusting everyone on it")
     parser.add_argument("--audit-file", default=os.getenv("ISHARDED_AUDIT_FILE"), help="where to record who did what")
+    parser.add_argument("--no-builtin-tools", action="store_true", help="do not offer chats the mesh's own tools (the time, a calculator, facts about the mesh)")
     parser.add_argument("--lane", default=None, help="run as this lane, beside a node's main control plane")
     return parser
 
@@ -5465,6 +5524,8 @@ def main() -> None:
     base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".cache") / "iSharded"
     os.environ["ISHARDED_STATE_FILE"] = args.state_file or str(base / "orchestrator-state.json")
     os.environ["ISHARDED_AUDIT_FILE"] = args.audit_file or str(base / "audit.jsonl")
+    if args.no_builtin_tools:
+        os.environ["ISHARDED_BUILTIN_TOOLS"] = "0"
     if args.no_reuse_cached:
         os.environ["ISHARDED_REUSE_CACHED"] = "0"
     if args.no_peer_fetch:

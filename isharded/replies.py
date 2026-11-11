@@ -101,6 +101,10 @@ async def event_stream(
                     yield delta_event(delta)
                 calls += 1
                 continue
+            if "tool_use" in item:
+                # A built-in tool this node ran itself. Clients that do not know the field skip it.
+                yield delta_event({"isharded": {"tool_use": item["tool_use"]}})
+                continue
             timing = {
                 "time_to_first_token_ms": item["time_to_first_token_ms"],
                 "tokens_per_second": item["tokens_per_second"],
@@ -148,11 +152,60 @@ async def scanned(tokens: AsyncIterator[dict[str, Any]], scanner: ReplyScanner) 
             yield {**item, "finish_reason": "tool_calls"} if scanner.calls else item
 
 
+async def with_builtin_tools(
+    items: AsyncIterator[dict[str, Any]],
+    again: Callable[[list[dict[str, Any]], bool], Awaitable[AsyncIterator[dict[str, Any]]]],
+    run_tool: Callable[[str, Any], str],
+    rounds: int,
+) -> AsyncIterator[dict[str, Any]]:
+    """A reply whose calls to the mesh's own tools are run here, so what comes out is the answer.
+
+    Each round is one pass of the model. Its text goes on as it comes. Its calls are run,
+    each reported as ``{"tool_use": ...}``, and ``again`` asks the model to go on with the
+    results. After ``rounds`` rounds of calls ``again`` is told this is the last, and offers
+    no tools, so a model that keeps calling still ends with an answer. The summary at the end
+    counts every round's tokens, with the first round's time to first token.
+    """
+    extra: list[dict[str, Any]] = []
+    spent = {"prompt_tokens": 0, "completion_tokens": 0}
+    first_ms: Any = None
+    for round_number in range(rounds + 1):
+        pieces: list[str] = []
+        calls: list[dict[str, Any]] = []
+        summary: dict[str, Any] = {}
+        async with aclosing(items) as source:
+            async for item in source:
+                if "text" in item:
+                    pieces.append(item["text"])
+                    yield item
+                elif "tool_call" in item:
+                    calls.append(item["tool_call"])
+                elif "finish_reason" in item:
+                    summary = item
+                else:
+                    yield item
+        for name in spent:
+            spent[name] += summary.get(name, 0)
+        if first_ms is None:
+            first_ms = summary.get("time_to_first_token_ms")
+        if not calls or round_number == rounds:
+            yield {**summary, **spent, "time_to_first_token_ms": first_ms, "finish_reason": "stop" if calls else summary.get("finish_reason")}
+            return
+        extra.append({"role": "assistant", "content": "".join(pieces) or None, "tool_calls": calls})
+        for call in calls:
+            name, arguments = call["function"]["name"], call["function"].get("arguments", "")
+            result = await asyncio.to_thread(run_tool, name, arguments)
+            yield {"tool_use": {"name": name, "arguments": arguments, "result": result}}
+            extra.append({"role": "tool", "tool_call_id": call.get("id") or name, "name": name, "content": result})
+        items = await again(extra, round_number + 1 == rounds)
+
+
 async def whole_reply(items: AsyncIterator[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
     """The assistant message a reply comes to, and its summary."""
     pieces: list[str] = []
     thoughts: list[str] = []
     calls: list[dict[str, Any]] = []
+    uses: list[dict[str, Any]] = []
     summary: dict[str, Any] = {}
     async for item in items:
         if "text" in item:
@@ -161,8 +214,12 @@ async def whole_reply(items: AsyncIterator[dict[str, Any]]) -> tuple[dict[str, A
             thoughts.append(item["thinking"])
         elif "tool_call" in item:
             calls.append(item["tool_call"])
+        elif "tool_use" in item:
+            uses.append(item["tool_use"])
         else:
             summary = item
+    if uses:
+        summary = {**summary, "tool_uses": uses}
     text = "".join(pieces)
     reasoned = {"thinking": "".join(thoughts)} if thoughts else {}
     if calls:

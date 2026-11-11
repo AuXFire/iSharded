@@ -107,7 +107,9 @@
   <dialog class="sheet" id="toolsSheet" aria-labelledby="toolsTitle">
     <form class="sheet-body" id="toolsForm">
       <h2 id="toolsTitle">Tools the model may ask for</h2>
-      <p>Paste function definitions as JSON, in OpenAI's shape. Nothing runs on its own: when the model asks for a call, you type what it returned.</p>
+      <label class="switch" id="builtinRow"><input type="checkbox" id="builtinTools"><i></i><span id="builtinLabel">Built-in tools</span></label>
+      <p id="builtinNote">The mesh runs these itself and the model gets the result: the date and time, a calculator, and facts about the mesh it runs on.</p>
+      <p>Or paste function definitions as JSON, in OpenAI's shape. Those do not run on their own: when the model asks for a call, you type what it returned. While any are set, the built-in tools are left out.</p>
       <label class="field">Definitions
         <textarea class="input code-input" id="toolsText" rows="9" spellcheck="false" placeholder='[{"type": "function", "function": {"name": "get_time", "description": "The time in a city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]'></textarea>
       </label>
@@ -165,7 +167,7 @@
     };
     // What one request can carry. A conversation resends its images on every turn.
     const MOST_IMAGE_BYTES = 10 * 1024 * 1024;
-    const MOST_CHATS = 50, CHATS_KEY = 'isharded-chats', TOOLS_KEY = 'isharded-chat-tools';
+    const MOST_CHATS = 50, CHATS_KEY = 'isharded-chats', TOOLS_KEY = 'isharded-chat-tools', BUILTIN_KEY = 'isharded-chat-builtin-tools';
     const QUIET_STREAM_MS = 15000, QUIET_NODE_MS = 30000, HELD_MS = 4000, SEAM_MS = 1500;
     const state = { attachments: [], approved: new Set(), token: store.get('isharded-token') || '', status: null, chats: [], chat: null, turns: [], streaming: false, abort: null, link: null, selected: '', previewTimer: null, previewId: 0, lastPulse: 0, failures: 0, signedOut: false, members: {}, catalog: null, catalogFailed: false, heardAt: performance.now(), lastByte: 0, tools: [], routeAll: false, tab: {}, laneTab: {}, chatsFull: false, joins: 0, joinsAt: 0, joinsHidden: false };
     const PHASE = { resolving: 'Reading the model\'s tensor list', fetching: 'Downloading each worker\'s shards', loading: 'Moving weights into memory' };
@@ -347,12 +349,23 @@
       }).join('');
       return `<div class="tool-calls"><p>${turn.calls.length === 1 ? 'The model asked for a tool.' : `The model asked for ${turn.calls.length} tools.`}${waiting ? ' Nothing ran. Type what came back to continue.' : ''}</p>${rows}${waiting ? `<button class="btn small" type="button" data-action="send-results">${turn.calls.length === 1 ? 'Send result' : 'Send results'}</button>` : ''}</div>`;
     }
+    function usesHtml(turn) {
+      if (!turn.uses?.length) return '';
+      const rows = turn.uses.map(use => {
+        let args = use.arguments || '', result = use.result || '';
+        try { args = Object.entries(JSON.parse(args)).map(([name, value]) => `${name}: ${value}`).join(', '); } catch {}
+        try { const parsed = JSON.parse(result); result = parsed.error ? `could not: ${parsed.error}` : JSON.stringify(parsed.result ?? parsed); } catch {}
+        return `<li><b>${esc(use.name)}</b>${args ? ` (${esc(args)})` : ''} gave ${esc(result)}</li>`;
+      }).join('');
+      return `<details class="reasoning"><summary>${turn.uses.length === 1 ? 'Used a built-in tool' : `Used ${turn.uses.length} built-in tools`}</summary><ul>${rows}</ul></details>`;
+    }
     function renderAnswer(turn) {
       const { reasoning, answer, thinking } = splitReasoning(turn.text);
       let html = '';
       if (turn.moved) html += seamHtml(`This node stopped answering, so the reply started again on ${turn.moved}.`);
       if (turn.lost) html += `<details class="reasoning"><summary>Show what the first node wrote</summary><div>${esc(turn.lost)}</div></details>`;
       if (reasoning) html += `<details class="reasoning"${thinking ? ' open' : ''}><summary>${thinking ? 'Thinking' : 'Show reasoning'}</summary><div>${esc(reasoning)}</div></details>`;
+      html += usesHtml(turn);
       if (answer) html += `<div class="answer">${answerHtml(turn, answer)}</div>`;
       else if (turn.pending && !reasoning && !turn.live?.held) html += `<div class="waiting"><i class="glyph work"></i>Running the prompt through the route</div>`;
       if (turn.live?.held) html += `<div class="waiting"><i class="glyph work"></i>A stage stopped answering. This reply carries on when the route is repaired.</div>`;
@@ -488,7 +501,7 @@
           const response = await fetch(base + '/v1/chat/completions', {
             method: 'POST', signal: link.signal,
             headers: { 'Content-Type': 'application/json', ...headers() },
-            body: JSON.stringify({ model: $('modelChoice').hidden ? undefined : $('modelChoice').value, messages: history, stream: true, temperature: Number($('temperature').value), top_p: 0.9, top_k: 40, max_tokens: Number($('maxTokens').value), enable_thinking: $('thinking').checked, tools: state.tools.length ? state.tools : undefined }),
+            body: JSON.stringify({ model: $('modelChoice').hidden ? undefined : $('modelChoice').value, messages: history, stream: true, temperature: Number($('temperature').value), top_p: 0.9, top_k: 40, max_tokens: Number($('maxTokens').value), enable_thinking: $('thinking').checked, builtin_tools: usesBuiltins() || undefined, tools: state.tools.length ? state.tools : undefined }),
           });
           if (!response.ok) { let message = `The request failed with HTTP ${response.status}.`; try { message = (await response.json()).detail; } catch {} throw new Error(message); }
           const reader = response.body.getReader(), decoder = new TextDecoder();
@@ -513,6 +526,8 @@
                 turn.live.chunkAt = now; turn.live.held = false;
                 turn.text += delta; pulse(); schedule();
               }
+              const used = data.choices?.[0]?.delta?.isharded?.tool_use;
+              if (used) { (turn.uses ||= []).push(used); schedule(); }
               for (const part of data.choices?.[0]?.delta?.tool_calls || []) {
                 const call = (turn.calls ||= [])[part.index] ||= { id: part.id, type: 'function', function: { name: '', arguments: '' } };
                 call.function.name += part.function?.name || '';
@@ -582,7 +597,7 @@
       switchBox.parentElement.title = thinks ? 'Lets the model reason before it answers, on models that support it' : 'This model has no thinking switch: it answers the same way with it on or off';
       switchBox.parentElement.classList.toggle('off', !thinks);
       if (!sees && state.attachments.length) { state.attachments = []; renderAttachments(); }
-      $('toolsButton').textContent = state.tools.length ? `Tools, ${state.tools.length} on` : 'Tools';
+      $('toolsButton').textContent = state.tools.length ? `Tools, ${state.tools.length} on` : usesBuiltins() ? 'Tools, built in' : 'Tools';
       renderChats();
     }
     const currentModel = () => { const pick = $('modelChoice'); return pick.hidden ? state.status?.model : pick.value; };
@@ -590,6 +605,13 @@
       const status = state.status, name = currentModel();
       return Boolean(name === status?.model ? status?.vision : (status?.lanes || []).find(lane => lane.model === name)?.vision);
     }
+    function builtinsOffered() {
+      const status = state.status, name = currentModel();
+      const found = name === status?.model ? status?.builtin_tools : (status?.lanes || []).find(lane => lane.model === name)?.builtin_tools;
+      return Array.isArray(found) ? found : [];
+    }
+    // The mesh's own tools join a chat unless a person turned them off or set tools of their own.
+    const usesBuiltins = () => store.get(BUILTIN_KEY) !== 'off' && !state.tools.length && builtinsOffered().length > 0;
     function chatThinks() {
       const status = state.status, name = currentModel();
       const found = name === status?.model ? status?.thinking : (status?.lanes || []).find(lane => lane.model === name)?.thinking;
@@ -896,10 +918,19 @@
     function readTools() { try { const saved = JSON.parse(store.get(TOOLS_KEY) || '[]'); state.tools = Array.isArray(saved) ? saved : []; } catch { state.tools = []; } }
     function openTools() {
       $('toolsText').value = state.tools.length ? JSON.stringify(state.tools, null, 2) : '';
+      const offered = builtinsOffered(), box = $('builtinTools');
+      box.disabled = !offered.length;
+      box.checked = offered.length > 0 && store.get(BUILTIN_KEY) !== 'off';
+      $('builtinRow').classList.toggle('off', !offered.length);
+      $('builtinLabel').textContent = offered.length ? `Built-in tools: ${offered.join(', ')}` : 'Built-in tools';
+      $('builtinNote').textContent = offered.length
+        ? 'The mesh runs these itself and the model gets the result: the date and time, a calculator, and facts about the mesh it runs on.'
+        : state.status?.model ? 'Not on offer here: this model cannot call tools, or the mesh was started with --no-builtin-tools.' : 'Load a model to see which built-in tools it can use.';
       $('toolsError').hidden = true;
       $('toolsSheet').showModal();
     }
     function setTools(tools) {
+      if (!$('builtinTools').disabled) { if ($('builtinTools').checked) store.drop(BUILTIN_KEY); else store.set(BUILTIN_KEY, 'off'); }
       state.tools = tools;
       if (tools.length) store.set(TOOLS_KEY, JSON.stringify(tools)); else store.drop(TOOLS_KEY);
       $('toolsSheet').close(); syncComposer();

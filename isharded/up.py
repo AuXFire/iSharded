@@ -649,6 +649,7 @@ def first_settings(args: argparse.Namespace) -> dict[str, Any]:
         "ownerless": bool(args.ownerless),
         "join": [args.join] if args.join else [],
         "discoverable": not args.no_discovery and not args.ownerless,
+        "builtin_tools": not getattr(args, "no_builtin_tools", False),
     }
 
 
@@ -707,6 +708,12 @@ def run_up(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+    # Whether chats are offered the mesh's own tools: what the command says, kept for next time.
+    off, on = getattr(args, "no_builtin_tools", False), getattr(args, "builtin_tools", False)
+    if (off or on) and settings.get("builtin_tools", True) != (not off):
+        settings["builtin_tools"] = not off
+        write_settings(home, settings)
+    os.environ["ISHARDED_BUILTIN_TOOLS"] = "1" if settings.get("builtin_tools", True) else "0"
     if args.location and args.location != settings.get("location"):  # a node that already exists can say where it is
         settings["location"] = args.location
         write_settings(home, settings)
@@ -1032,6 +1039,9 @@ def add_arguments(subparsers: Any) -> None:
     up.add_argument("--find", action="store_true", help="ask to join the one mesh on this network, without asking you first")
     up.add_argument("--new-mesh", action="store_true", help="start a new mesh even if one is on this network")
     up.add_argument("--no-discovery", action="store_true", help="do not look for a mesh, and do not answer machines looking for this one")
+    tools = up.add_mutually_exclusive_group()
+    tools.add_argument("--no-builtin-tools", action="store_true", help="do not offer chats the mesh's own tools (the time, a calculator, facts about the mesh); kept for next time")
+    tools.add_argument("--builtin-tools", action="store_true", help="offer them again after --no-builtin-tools")
     up.add_argument("--ownerless", action="store_true", help="make or join a network nobody owns")
     up.add_argument("--joining", choices=["open", "vouched"], default="vouched", help="with --ownerless: who this node accepts")
     up.add_argument("--trust", action="append", default=[], help="with --ownerless: a node to accept from the start; repeatable")

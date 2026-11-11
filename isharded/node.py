@@ -67,6 +67,7 @@ def add_node_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--identity-cert", default=None, help="this node's certificate, to prove its name without TLS")
     parser.add_argument("--identity-key", default=None, help="the key for --identity-cert")
     parser.add_argument("--keys-file", default=None, help="where this node keeps the pool's API keys")
+    parser.add_argument("--no-builtin-tools", action="store_true", help="do not offer chats the mesh's own tools (the time, a calculator, facts about the mesh)")
     parser.add_argument("--log-file", default=None, help="write this node's output here; the last one is kept as .1")
     parser.add_argument("--pool-token-file", default=None, help="file holding the pool token; default is pool.token in the iSharded folder")
     parser.add_argument("--open", dest="open_pool", action="store_true", help="serve a network with no credentials, trusting everyone on it")
@@ -540,6 +541,8 @@ def _child_environment(args: argparse.Namespace) -> tuple[dict[str, str], Path]:
     ):
         if getattr(args, option, None):
             env[variable] = str(Path(getattr(args, option)).resolve())
+    if getattr(args, "no_builtin_tools", False):
+        env["ISHARDED_BUILTIN_TOOLS"] = "0"  # the control plane and every lane read it
     return env, code_root
 
 
