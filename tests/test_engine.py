@@ -1459,6 +1459,12 @@ def test_a_stage_fed_hidden_states_on_its_gpu_reports_the_whole_hop_trace(tmp_pa
             made = [(await real_pass(client, PROMPT, 0))[0]]
             for position in range(len(PROMPT), len(PROMPT) + 6):
                 made += (await real_pass(client, made[-1:], position))[:1]
+            # The link's own round trip comes from a heartbeat, and the first leaves 100 ms after
+            # the link came up. Seven passes on a quick GPU are over before that.
+            for _ in range(150):
+                if hosts[0].call("ring_stats")[0]["link_rtt_us"]:
+                    break
+                await asyncio.sleep(0.02)
             return [host.call("ring_stats")[0] for host in hosts]
         finally:
             client.close()
