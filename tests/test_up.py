@@ -111,6 +111,82 @@ def test_the_owners_machine_signs_a_good_request_once_and_ignores_the_rest(tmp_p
     assert access.certificates["joiner"]
 
 
+def test_an_invite_made_while_a_join_is_signed_still_admits_its_machine(tmp_path: Path) -> None:
+    """Signing a join read the invites, posted, and wrote its own copy back, wiping an invite made meanwhile."""
+    home = owner(tmp_path)
+    names = ["one", "two", "three", "four"]
+    secrets_by_name = {"one": up.read_invite(up.create_invite(home, ["http://a:1"])["code"])["secret"]}
+    asked: dict[str, dict[str, str]] = {}
+
+    def ask(name: str) -> None:
+        text = request_membership(str(tmp_path / name), name, ["100.64.0.2"])
+        asked[name] = {**read_membership_request(text), "request": text, "proof": up.invite_proof(secrets_by_name[name], text, "")}
+
+    ask("one")
+    posted: list[dict[str, str]] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"requests": list(asked.values())})
+        posted.append(json.loads(request.content))
+        later = [name for name in names if name not in secrets_by_name]
+        if later:  # the owner makes the next machine's invite while this one is being signed
+            secrets_by_name[later[0]] = up.read_invite(up.create_invite(home, ["http://a:1"])["code"])["secret"]
+            ask(later[0])
+        return httpx.Response(200, json={"status": "accepted"})
+
+    admitted: list[str] = []
+    with httpx.Client(transport=httpx.MockTransport(answer)) as client:
+        for _ in range(len(names) + 1):
+            admitted += up.approve_invited(home, client, "http://a:1", "key")
+            for name in admitted:
+                asked.pop(name, None)
+    assert sorted(admitted) == sorted(names)
+    assert all(invite["uses"] == 0 for invite in up.read_invites(home)), "each invite let one machine in and no more"
+
+
+def test_invites_made_at_once_are_all_kept(tmp_path: Path) -> None:
+    """Seven ``isharded invite`` commands at once left fewer than seven invites in the file."""
+    import threading
+
+    home = owner(tmp_path)
+    start = threading.Barrier(8)
+    codes: list[str] = []
+
+    def make() -> None:
+        start.wait()
+        codes.append(up.create_invite(home, ["http://a:1"])["code"])
+
+    makers = [threading.Thread(target=make) for _ in range(8)]
+    for maker in makers:
+        maker.start()
+    for maker in makers:
+        maker.join()
+    kept = {invite["secret"] for invite in up.read_invites(home)}
+    assert kept == {up.read_invite(code)["secret"] for code in codes} and len(kept) == 8
+    assert not (home / "invites.lock").exists()
+
+
+def test_an_invite_is_not_spent_when_the_node_does_not_take_the_member(tmp_path: Path) -> None:
+    home = owner(tmp_path)
+    secret = up.read_invite(up.create_invite(home, ["http://a:1"])["code"])["secret"]
+    text = request_membership(str(tmp_path / "joiner"), "joiner", ["100.64.0.2"])
+    requests = [{**read_membership_request(text), "request": text, "proof": up.invite_proof(secret, text, "")}]
+    refuse = [True]
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"requests": requests})
+        return httpx.Response(503 if refuse[0] else 200, json={})
+
+    with httpx.Client(transport=httpx.MockTransport(answer)) as client:
+        assert up.approve_invited(home, client, "http://a:1", "key") == []
+        assert up.read_invites(home)[0]["uses"] == 1
+        refuse[0] = False
+        assert up.approve_invited(home, client, "http://a:1", "key") == ["joiner"]
+    assert up.read_invites(home)[0]["uses"] == 0
+
+
 def test_the_invite_fields_travel_with_a_request_through_gossip(tmp_path: Path) -> None:
     text = request_membership(str(tmp_path / "joiner"), "joiner", ["100.64.0.2"])
     held = {**read_membership_request(text), "request": text, "proof": "p" * 64, "key_sha256": "k" * 64, "key_verifier": "v" * 43, "role": "admin"}

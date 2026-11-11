@@ -159,15 +159,64 @@ def read_invites(home: Path) -> list[dict[str, Any]]:
 
 
 def write_invites(home: Path, invites: list[dict[str, Any]]) -> None:
-    _write_private(home / "invites.json", json.dumps(invites).encode())
+    """Whole or not at all: a reader that met a half-written file took it for no invites."""
+    part = home / "invites.json.part"
+    _write_private(part, json.dumps(invites).encode())
+    os.replace(part, home / "invites.json")
+
+
+INVITES_LOCK_SECONDS = 10.0
+INVITES_LOCK_STALE_SECONDS = 30.0
+
+
+def change_invites(home: Path, change: Any) -> list[dict[str, Any]]:
+    """Read the invites, change them and write them back, one process at a time.
+
+    Several ``isharded invite`` commands at once, or one beside a join being signed, each
+    read the file, changed its own copy and wrote that back, so one wiped what another
+    had added and a machine holding a good code was never let in.
+    """
+    lock = home / "invites.lock"
+    deadline = time.monotonic() + INVITES_LOCK_SECONDS
+    while True:
+        try:
+            handle = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except OSError:
+            with suppress(OSError):
+                if time.time() - lock.stat().st_mtime > INVITES_LOCK_STALE_SECONDS:
+                    lock.unlink()  # whoever held it died with it
+                    continue
+            if time.monotonic() > deadline:
+                raise TimeoutError("another isharded command is changing the invites; try again") from None
+            time.sleep(0.01)
+    try:
+        invites = change(read_invites(home))
+        write_invites(home, invites)
+        return invites
+    finally:
+        os.close(handle)
+        with suppress(OSError):
+            lock.unlink()
+
+
+def spend_invite(home: Path, secret: str) -> None:
+    def spend(invites: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        for invite in invites:
+            if invite["secret"] == secret and invite["uses"] > 0:
+                invite["uses"] -= 1
+                break
+        return invites
+
+    change_invites(home, spend)
 
 
 def create_invite(home: Path, urls: list[str], uses: int = 1, hours: float = 24.0, clock: Any = time.time) -> dict[str, Any]:
     """A code for adding machines. Only the machine holding the authority can honor it."""
     secret = secrets.token_urlsafe(24)
     expires_at = clock() + hours * 3600
-    invites = [invite for invite in read_invites(home) if invite["expires_at"] > clock() and invite["uses"] > 0]
-    write_invites(home, [*invites, {"secret": secret, "uses": max(int(uses), 1), "expires_at": expires_at}])
+    mine = {"secret": secret, "uses": max(int(uses), 1), "expires_at": expires_at}
+    change_invites(home, lambda invites: [*(invite for invite in invites if invite["expires_at"] > clock() and invite["uses"] > 0), mine])
     body = {"urls": urls[:INVITE_ADDRESSES], "authority": authority_hash((home / "ca.pem").read_text(encoding="utf-8")), "secret": secret}
     code = INVITE_PREFIX + _encode(json.dumps(body, separators=(",", ":")).encode())
     return {"code": code, "command": f"isharded up --invite {code}", "expires_at": expires_at}
@@ -232,8 +281,9 @@ def approve_invited(home: Path, client: httpx.Client, base: str, key: str, clock
         if invite is None and not item.get("approved"):
             announce_waiting(name, item)
             continue
-        for entry in admission_entries(str(home), item):
-            client.post(base + "/access/entries", json=sign_entry(str(home), entry))
+        taken = [client.post(base + "/access/entries", json=sign_entry(str(home), entry)).is_success for entry in admission_entries(str(home), item)]
+        if not all(taken):
+            continue  # the node did not take it, so the invite is not spent and the next look tries again
         key_hash = str(item.get("key_sha256", ""))
         if re.fullmatch(r"[0-9a-f]{64}", key_hash):
             entry = {"type": "key", "name": f"{name}-user", "role": "user", "sha256": key_hash, "requests_per_minute": 0}
@@ -242,8 +292,8 @@ def approve_invited(home: Path, client: httpx.Client, base: str, key: str, clock
                 entry["verifier"] = verifier
             client.post(base + "/access/entries", json=sign_entry(str(home), entry))
         if invite is not None:
-            invite["uses"] -= 1
-            write_invites(home, invites)
+            # By its secret, on a fresh read: an invite made since this look began stays.
+            spend_invite(home, invite["secret"])
         added.append(name)
     return added
 
