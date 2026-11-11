@@ -206,13 +206,24 @@ def while_ticking(work):
     return asyncio.run(scenario())
 
 
+def kept_ticking(ticks, hold):
+    """Fails if a plan that held the interpreter for ``hold`` seconds kept the loop from its ticks.
+
+    A plan on the loop makes a tick late by ``hold`` less the 0.1 s it slept. Off the loop a tick still
+    waits for the interpreter lock, which a busy thread gives up slowly on some systems: GitHub's macOS
+    runners ran ticks 60 to 120 ms late. Half of ``hold`` is above the one and below the other.
+    """
+    worst = max(ticks.late)
+    assert worst < hold / 2, f"a tick ran {worst * 1000:.0f} ms late while a plan held {hold} s"
+
+
 def test_the_loop_keeps_ticking_while_a_plan_runs(pool, monkeypatch):
     monkeypatch.setattr(Orchestrator, "plan", slow_plan(1.5))
     target = SimpleNamespace(draft=None, request=None)
     ticks, took, route = while_ticking(lambda: pool.planned(target))
     assert took >= 1.5 and [item.worker_id for item in route] == ["a"]
-    assert len(ticks.late) >= 15
-    assert max(ticks.late) < 0.1, f"a tick ran {max(ticks.late) * 1000:.0f} ms late"
+    assert len(ticks.late) >= 8, "on the loop the plan leaves 3 ticks, and off it 17 at most"
+    kept_ticking(ticks, 1.5)
 
 
 def test_the_loop_keeps_ticking_while_a_cordon_is_priced(pool, monkeypatch):
@@ -223,7 +234,7 @@ def test_the_loop_keeps_ticking_while_a_cordon_is_priced(pool, monkeypatch):
     pool.route = [stage("a")]
     ticks, took, cost = while_ticking(lambda: pool.cost_of_losing("a"))
     assert cost == 5 and took >= 1.0
-    assert max(ticks.late) < 0.1, f"a tick ran {max(ticks.late) * 1000:.0f} ms late"
+    kept_ticking(ticks, 1.0)
 
 
 def test_the_loop_keeps_ticking_through_the_slot_search(pool, monkeypatch):
@@ -236,7 +247,7 @@ def test_the_loop_keeps_ticking_through_the_slot_search(pool, monkeypatch):
 
     def plan(self, target, **options):
         plans.append(threading.current_thread() is threading.main_thread())
-        ended = time.perf_counter() + 0.3
+        ended = time.perf_counter() + 0.6
         while time.perf_counter() < ended:
             sum(range(200))
         return real_plan(self, target, **options)
@@ -246,7 +257,7 @@ def test_the_loop_keeps_ticking_through_the_slot_search(pool, monkeypatch):
     ticks, took, _ = while_ticking(lambda: pool.choose_slots(item))
     assert len(plans) >= 3 and not any(plans), "every plan of the search ran off the loop"
     assert item.parallel["auto"] and item.slots > 1, "what the search settled reached the target"
-    assert max(ticks.late) < 0.1, f"a tick ran {max(ticks.late) * 1000:.0f} ms late"
+    kept_ticking(ticks, 0.6)
 
 
 def test_a_plan_overtaken_by_a_cordon_is_made_again(pool, monkeypatch):

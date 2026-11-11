@@ -447,11 +447,16 @@ def test_heartbeats_get_a_turn_while_a_load_chooses(pool):
                 await asyncio.sleep(0)
 
         beating = asyncio.create_task(beat())
+        await asyncio.sleep(0)  # the heartbeat is running before the load begins to choose
+        before = len(turns)
         await pool.choose_slots(target())
         beating.cancel()
+        return before, type(asyncio.get_running_loop()).__name__
 
-    asyncio.run(both())
-    assert turns
+    before, loop = asyncio.run(both())
+    assert before == 1 and len(turns) > before, (
+        f"{len(turns) - before} turns while the load chose, {before} before it, on a {loop} with to_thread from {asyncio.to_thread.__module__}"
+    )
 
 
 def test_a_choice_stands_when_the_links_change_later(pool):

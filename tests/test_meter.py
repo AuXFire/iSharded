@@ -157,9 +157,12 @@ def test_a_worker_reports_power_only_when_its_node_asked(monkeypatch) -> None:
 
 def test_a_workers_health_carries_the_measuring_fields(monkeypatch) -> None:
     from isharded import worker
+    from isharded.protocol import HardwareInfo
 
     monkeypatch.setattr(worker, "authorized", lambda authorization: True)
     monkeypatch.setattr(worker.runtime, "gguf", None)
+    # Whatever this machine computes on, the worker is one on CUDA, which is the only kind with graphs to report.
+    monkeypatch.setattr(worker.runtime, "hardware", HardwareInfo(device="cuda:0", backend="cuda", cpu_cores=1, ram_total_bytes=1))
     monkeypatch.setenv("ISHARDED_PRICE_PER_HOUR", "0.59")
     monkeypatch.setenv("GGML_CUDA_DISABLE_GRAPHS", "1")
     monkeypatch.delenv("ISHARDED_POWER_SAMPLE_MS", raising=False)
