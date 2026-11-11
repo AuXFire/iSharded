@@ -3758,8 +3758,18 @@ class Orchestrator:
         active = self.active
         if active is not None and active.embedding:
             assert isinstance(active.adapter, GgufAdapter)
-            return {"kind": "embedding", "vision": False, "dimensions": active.adapter.output_width}
-        return {"kind": "chat", "vision": bool(active and active.projector)}
+            return {"kind": "embedding", "vision": False, "thinking": False, "dimensions": active.adapter.output_width}
+        return {"kind": "chat", "vision": bool(active and active.projector), "thinking": self.thinking_switch()}
+
+    def thinking_switch(self) -> bool:
+        """Whether asking this model to think, or not to, changes anything.
+
+        A model's chat template reads ``enable_thinking`` if it has the switch. One that always
+        reasons, or never does, has no such line, and a page that offered the switch for it
+        would be offering nothing: Qwen3-235B-A22B-Instruct-2507 is one that never does.
+        """
+        template = getattr(getattr(self, "tokenizer", None), "tool_template", None)
+        return isinstance(template, str) and "enable_thinking" in template
 
     async def ask_entry(self, path: str, payload: dict[str, Any], seconds: float) -> dict[str, Any]:
         """One request to the entry worker, following the route through any failure.

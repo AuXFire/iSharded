@@ -574,6 +574,13 @@
       $('prompt').placeholder = ready ? 'Message the model' : state.signedOut ? 'Sign in to start chatting' : state.status?.model ? 'Replies wait for the route' : 'Load a model to start chatting';
       const sees = ready && chatSees();
       $('attach').hidden = !sees;
+      // A model with no thinking switch ignores the setting, so the page does not offer it.
+      const thinks = !ready || chatThinks();
+      const switchBox = $('thinking');
+      switchBox.disabled = !thinks;
+      if (!thinks) switchBox.checked = false;
+      switchBox.parentElement.title = thinks ? 'Lets the model reason before it answers, on models that support it' : 'This model has no thinking switch: it answers the same way with it on or off';
+      switchBox.parentElement.classList.toggle('off', !thinks);
       if (!sees && state.attachments.length) { state.attachments = []; renderAttachments(); }
       $('toolsButton').textContent = state.tools.length ? `Tools, ${state.tools.length} on` : 'Tools';
       renderChats();
@@ -582,6 +589,11 @@
     function chatSees() {
       const status = state.status, name = currentModel();
       return Boolean(name === status?.model ? status?.vision : (status?.lanes || []).find(lane => lane.model === name)?.vision);
+    }
+    function chatThinks() {
+      const status = state.status, name = currentModel();
+      const found = name === status?.model ? status?.thinking : (status?.lanes || []).find(lane => lane.model === name)?.thinking;
+      return found !== false;  // a node that does not say is taken to have the switch, as before
     }
     function renderAttachments(note = '') {
       const box = $('attachments');

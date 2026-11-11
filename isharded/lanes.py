@@ -462,6 +462,7 @@ class LaneDoor:
                     "budgets": lane["budgets"],
                     "kind": info.get("kind", "chat"),
                     "vision": bool(info.get("vision")),
+                    "thinking": info.get("thinking"),  # None from a lane that does not say
                 }
             )
         return rows

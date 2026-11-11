@@ -257,6 +257,8 @@ b { font-weight: 600; }
 .switch input:checked + i { background: var(--ink); border-color: var(--ink); }
 .switch input:checked + i::after { background: var(--paper); transform: translateX(14px); }
 .switch input:focus-visible + i { outline: 2px solid var(--focus); outline-offset: 2px; }
+.switch.off, .switch.off input { cursor: not-allowed; }
+.switch.off { opacity: 0.45; }
 
 /* Chips: filters only */
 

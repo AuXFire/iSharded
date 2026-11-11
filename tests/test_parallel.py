@@ -773,6 +773,16 @@ def test_the_entry_keeps_what_it_hears_about_the_route_only_for_its_own_epoch(mo
     assert runtime.route_verifies is None
 
 
+def test_a_model_says_whether_it_has_a_thinking_switch(pool):
+    # Qwen3's template reads enable_thinking. The 235B Instruct release never reasons and has no such line.
+    pool.tokenizer = SimpleNamespace(tool_template="{%- if enable_thinking is defined and enable_thinking is false %}<think></think>{%- endif %}")
+    assert pool.thinking_switch() and pool.model_kind()["thinking"] is True
+    pool.tokenizer = SimpleNamespace(tool_template="{{- '<|im_start|>assistant' }}")
+    assert not pool.thinking_switch() and pool.model_kind() == {"kind": "chat", "vision": False, "thinking": False}
+    pool.tokenizer = None
+    assert not pool.thinking_switch()
+
+
 def test_a_pass_costs_what_was_measured_with_straight_lines_between():
     cost = pass_cost(10.0, {1: 4.0, 2: 5.0, 8: 11.0})
     assert [cost(replies) for replies in (1, 2, 5, 8)] == [4.0, 5.0, 8.0, 11.0]
