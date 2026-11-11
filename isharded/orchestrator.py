@@ -1699,7 +1699,8 @@ class Orchestrator:
         try:
             return int(describe_plan(target, self.plan(target))["download_bytes"])
         except PlacementError:
-            if not target.parallel.get("auto") or target.slots <= 1:
+            chosen = getattr(target, "parallel", None) or {}
+            if not chosen.get("auto") or target.slots <= 1:
                 return None
         trial = copy.copy(target)  # the price must not change what the running model holds
         self.settle_slots(trial, preview=True)
