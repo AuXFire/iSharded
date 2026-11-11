@@ -98,6 +98,17 @@ def shares_cache(meta: dict[str, Any]) -> bool:
     return choice == "shared"
 
 
+def holds_trips(meta: dict[str, Any]) -> bool:
+    """Whether a stage may hold a trip for passes that are on their way.
+
+    Only where a trip of several replies costs little more than a trip of one: with one cache for
+    the slots, or with one slot. With a cache each, llama.cpp runs a trip for each run of
+    neighbouring slots, so a held trip costs as much as its replies alone and makes them wait as
+    well: on four A40s, 16 replies made 61 tokens a second held together and 100 to 115 left alone.
+    """
+    return shares_cache(meta) or meta.get("slots", 1) == 1
+
+
 def seconds_for(operation: str, rows: int) -> float | None:
     """How long a stage may take over a call, or None if nothing can say."""
     if operation in LOADS:
@@ -122,6 +133,9 @@ class _Host:
         self.found: dict[str, Any] | None = None
         # What a pass of 1, 2, 4 ... rows cost at load, as the engine timed it. None if it could not.
         self.passes: dict[str, list[float]] | None = None
+        # Whether a trip may wait for passes on their way. Only where the slots share a cache, or
+        # there is one slot: with a cache each, a trip of spread-out replies costs a trip for each.
+        self.gathers = True
 
     def prime(self, meta: dict[str, Any], _: bytes) -> Reply:
         """Brings the library and its devices up with no model, so a load later skips that.
@@ -152,6 +166,7 @@ class _Host:
             kv_type=meta.get("kv_type", "f16"),
             native=not meta.get("embedding", False),
         )
+        self.gathers = holds_trips(meta)
         self.states = StateStore(meta.get("state_dir"), meta.get("state_ram_bytes", 0), meta.get("state_disk_bytes", 0))
         table = meta.get("table")
         if table:
@@ -356,7 +371,10 @@ class _Host:
         # The engine's watchdog holds a pass to what this process holds a call to.
         limits = (meta.get("pass_ms", PASS_MS), meta.get("row_ms", ROW_MS))
         keys = {name: bytes.fromhex(key) for name, key in meta["keys"].items() if key is not None}
-        self.engine.open(meta["epoch"], meta["index"], meta["count"], keys, meta["ack_timeout_ms"], meta["silence_timeout_ms"], *limits, merge_passes=meta.get("merge_passes", True), merge_most=meta.get("merge_most"))
+        self.engine.open(
+            meta["epoch"], meta["index"], meta["count"], keys, meta["ack_timeout_ms"], meta["silence_timeout_ms"], *limits,
+            merge_passes=meta.get("merge_passes", True), merge_most=meta.get("merge_most"), gather=self.gathers,
+        )  # fmt: skip
         return {"engine": True, **door}, b""
 
     def ring_connect(self, meta: dict[str, Any], _: bytes) -> Reply:
@@ -370,7 +388,10 @@ class _Host:
             return {"engine": False}, b""
         limits = (meta.get("pass_ms", PASS_MS), meta.get("row_ms", ROW_MS))
         keys = {name: bytes.fromhex(key) for name, key in meta["keys"].items() if key is not None}
-        self.engine.stage(meta["epoch"], meta["index"], meta["count"], keys, meta["ack_timeout_ms"], meta["silence_timeout_ms"], *limits, merge_passes=meta.get("merge_passes", True), merge_most=meta.get("merge_most"))
+        self.engine.stage(
+            meta["epoch"], meta["index"], meta["count"], keys, meta["ack_timeout_ms"], meta["silence_timeout_ms"], *limits,
+            merge_passes=meta.get("merge_passes", True), merge_most=meta.get("merge_most"), gather=self.gathers,
+        )  # fmt: skip
         return {"engine": True}, b""
 
     def ring_connect_staged(self, meta: dict[str, Any], _: bytes) -> Reply:

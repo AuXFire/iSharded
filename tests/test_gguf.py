@@ -1204,6 +1204,18 @@ def test_a_stage_with_several_slots_shares_one_cache_unless_told_or_exact():
     assert shares_cache({"slots": 4, "cache": "shared", "exact": True})
 
 
+def test_only_a_stage_whose_slots_share_a_cache_holds_trips_for_more_replies():
+    from isharded.engine import Engine
+    from isharded.llama_host import holds_trips
+
+    assert holds_trips({"slots": 1}) and holds_trips({"slots": 8})
+    assert not holds_trips({"slots": 8, "exact": True})
+    assert not holds_trips({"slots": 8, "cache": "split"})
+    assert holds_trips({"slots": 8, "cache": "shared", "exact": True})
+    plan = Engine._plan(1, 0, 1, {}, 1000, 1000, 0, 0, True, None, False)
+    assert plan["gather"] is False and Engine._plan(1, 0, 1, {}, 1000, 1000, 0, 0, True, None)["gather"] is True
+
+
 def test_a_worker_refuses_a_cache_setting_it_does_not_know():
     from isharded.worker import kv_cache_choice
 

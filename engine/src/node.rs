@@ -136,6 +136,12 @@ pub struct Plan {
     /// this stage's probe found merges as rows run alone.
     #[serde(default)]
     pub merge_most: Option<u32>,
+    /// Whether a trip may be held for passes that are on their way. A stage that keeps a
+    /// cache for each slot says no: there a trip of several replies costs a trip for each run
+    /// of neighbouring slots, so gathering more into it saves nothing. Measured on four GPUs,
+    /// 16 replies made 61 tokens a second held together on such a stage and 100 to 115 left alone.
+    #[serde(default = "default_merge_passes")]
+    pub gather: bool,
 }
 
 impl Plan {
@@ -402,6 +408,8 @@ struct Ring {
     shut: AtomicBool,
     /// The most passes one of this ring's trips may hold, from its plan.
     merge_most: usize,
+    /// Whether this ring's trips may be held for passes on their way, from its plan.
+    gather: bool,
     /// At the entry: (slot, id) of passes sent on and not yet answered or refused, so a
     /// retiring ring knows when nothing of it is still out on the route.
     in_flight: Mutex<HashSet<(u32, u64)>>,
@@ -966,6 +974,7 @@ fn new_ring(plan: Plan) -> Result<Arc<Ring>, String> {
         next_dialling: AtomicBool::new(false),
         shut: AtomicBool::new(false),
         merge_most,
+        gather: plan.gather,
         in_flight: Mutex::default(),
     }))
 }
@@ -1659,8 +1668,8 @@ fn next_batch(inner: &Inner, last: Option<u64>) -> Option<Vec<Job>> {
             continue;
         }
         let now = Instant::now();
-        let most = trip_most(inner, jobs[at].pass.epoch);
-        if let Some(until) = gather_until(inner, &jobs, at, most, held.unwrap_or(now), now) {
+        let (most, gathers) = trip_rules(inner, jobs[at].pass.epoch);
+        if let Some(until) = gather_until(inner, &jobs, at, if gathers { most } else { 1 }, held.unwrap_or(now), now) {
             held.get_or_insert(now);
             inner.ready.wait_until(&mut jobs, until);
             continue;
@@ -1752,13 +1761,15 @@ fn note_left(inner: &Inner, passes: &[Pass], done: Instant) {
     }
 }
 
-/// The most passes a trip of this epoch may hold: the current ring's from the node, a staged
-/// or retiring ring's from its own plan.
-fn trip_most(inner: &Inner, epoch: u64) -> usize {
+/// The most passes a trip of this epoch may hold, and whether it may be held for more: the
+/// current ring's count from the node, a staged or retiring ring's from its own plan.
+fn trip_rules(inner: &Inner, epoch: u64) -> (usize, bool) {
     let rings = inner.rings.read();
-    match rings.any(epoch) {
-        Some(ring) if !rings.current.as_ref().is_some_and(|current| Arc::ptr_eq(current, ring)) => ring.merge_most,
-        _ => inner.merge_most.load(Ordering::Acquire),
+    let ring = rings.any(epoch);
+    let gathers = ring.is_none_or(|ring| ring.gather);
+    match ring {
+        Some(ring) if !rings.current.as_ref().is_some_and(|current| Arc::ptr_eq(current, ring)) => (ring.merge_most, gathers),
+        _ => (inner.merge_most.load(Ordering::Acquire), gathers),
     }
 }
 
@@ -2099,6 +2110,19 @@ mod tests {
     }
 
     #[test]
+    fn a_plan_says_whether_trips_may_be_held_and_holds_them_when_it_does_not_say() {
+        let node = Node::new().unwrap();
+        let keys = r#""keys": {"next": [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1], "closing": [9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9]}"#;
+        let rules = |epoch: u64, extra: &str| {
+            node.open(serde_json::from_str(&format!(r#"{{"epoch": {epoch}, "index": 0, "count": 2, {keys}{extra}}}"#)).unwrap()).unwrap();
+            trip_rules(&node.inner, epoch)
+        };
+        assert_eq!(rules(1, ""), (MAX_MERGED, true));
+        assert_eq!(rules(2, r#", "gather": false"#), (MAX_MERGED, false));
+        assert_eq!(rules(3, r#", "gather": true, "merge_most": 4"#), (4, true));
+    }
+
+    #[test]
     fn an_exact_route_merges_no_more_than_its_plan_allows() {
         let node = Node::new().unwrap();
         let keys = r#""keys": {"next": [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1], "closing": [9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9]}"#;
@@ -2385,7 +2409,7 @@ mod tests {
     #[test]
     fn a_plan_whose_keys_do_not_fit_is_refused_and_the_old_route_stays() {
         let (node, _) = stage(0);
-        let wrong = Plan { epoch: 2, index: 1, count: 3, keys: keys_for(0, 3), ack_timeout_ms: 1, silence_timeout_ms: 1, merge_passes: true, merge_most: None };
+        let wrong = Plan { epoch: 2, index: 1, count: 3, keys: keys_for(0, 3), ack_timeout_ms: 1, silence_timeout_ms: 1, gather: true, merge_passes: true, merge_most: None };
         assert!(node.open(wrong).is_err());
         assert_eq!(node.stats().epoch, Some(1));
     }
@@ -2400,7 +2424,7 @@ mod tests {
     fn stage(index: u16) -> (Node, Address) {
         let node = Node::new().unwrap();
         node.listen("127.0.0.1", 0).unwrap();
-        node.open(Plan { epoch: 1, index, count: 2, keys: keys_for(index, 2), ack_timeout_ms: 60_000, silence_timeout_ms: 60_000, merge_passes: true, merge_most: None }).unwrap();
+        node.open(Plan { epoch: 1, index, count: 2, keys: keys_for(index, 2), ack_timeout_ms: 60_000, silence_timeout_ms: 60_000, gather: true, merge_passes: true, merge_most: None }).unwrap();
         let listening = node.inner.listening.lock();
         let door = listening.as_ref().unwrap();
         let address = Address { address: format!("127.0.0.1:{}", door.port), fingerprint: door.fingerprint.clone() };
@@ -2454,7 +2478,7 @@ mod tests {
         // No route is open at the entry yet, so it turns the dial away.
         assert_eq!(last.connect(Links { next: None, entry: Some(door), timeout_ms: 100 }), Ok(false));
         assert!(!last.stats().closing_up);
-        entry.open(Plan { epoch: 1, index: 0, count: 2, keys: keys_for(0, 2), ack_timeout_ms: 60_000, silence_timeout_ms: 60_000, merge_passes: true, merge_most: None }).unwrap();
+        entry.open(Plan { epoch: 1, index: 0, count: 2, keys: keys_for(0, 2), ack_timeout_ms: 60_000, silence_timeout_ms: 60_000, gather: true, merge_passes: true, merge_most: None }).unwrap();
         let began = Instant::now();
         while !last.stats().closing_up {
             assert!(began.elapsed() < Duration::from_secs(5), "it never came up");

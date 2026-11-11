@@ -248,23 +248,25 @@ class Engine:
 
     def open(
         self, epoch: int, index: int, count: int, keys: dict[str, bytes], ack_timeout_ms: int, silence_timeout_ms: int, pass_ms: int = 0, row_ms: int = 0, merge_passes: bool = True,
-        merge_most: int | None = None,
+        merge_most: int | None = None, gather: bool = True,
     ) -> None:
         """Takes a place in a route, with the keys of this stage's own links: back, next, closing.
 
         ``merge_most`` is the most passes one trip may hold. None leaves it to the engine.
+        ``gather`` lets a trip be held for passes on their way, which pays only where a trip of
+        several replies costs little more than a trip of one.
         """
-        plan = self._plan(epoch, index, count, keys, ack_timeout_ms, silence_timeout_ms, pass_ms, row_ms, merge_passes, merge_most)
+        plan = self._plan(epoch, index, count, keys, ack_timeout_ms, silence_timeout_ms, pass_ms, row_ms, merge_passes, merge_most, gather)
         if self.lib.isharded_engine_open(self.handle, json.dumps(plan).encode()) != 0:
             raise OSError("the engine refused its place in the route")
 
     def stage(
         self, epoch: int, index: int, count: int, keys: dict[str, bytes], ack_timeout_ms: int, silence_timeout_ms: int, pass_ms: int = 0, row_ms: int = 0, merge_passes: bool = True,
-        merge_most: int | None = None,
+        merge_most: int | None = None, gather: bool = True,
     ) -> None:
         """Takes a place in the next route beside the current one, which goes on serving."""
         self._staging()
-        plan = self._plan(epoch, index, count, keys, ack_timeout_ms, silence_timeout_ms, pass_ms, row_ms, merge_passes, merge_most)
+        plan = self._plan(epoch, index, count, keys, ack_timeout_ms, silence_timeout_ms, pass_ms, row_ms, merge_passes, merge_most, gather)
         if self.lib.isharded_engine_stage(self.handle, json.dumps(plan).encode()) != 0:
             raise OSError("the engine refused its place in the next route")
 
@@ -301,11 +303,13 @@ class Engine:
 
     @staticmethod
     def _plan(
-        epoch: int, index: int, count: int, keys: dict[str, bytes], ack_timeout_ms: int, silence_timeout_ms: int, pass_ms: int, row_ms: int, merge_passes: bool, merge_most: int | None
+        epoch: int, index: int, count: int, keys: dict[str, bytes], ack_timeout_ms: int, silence_timeout_ms: int, pass_ms: int, row_ms: int, merge_passes: bool, merge_most: int | None,
+        gather: bool = True,
     ) -> dict[str, Any]:
         return {
             "merge_passes": merge_passes,
             "merge_most": merge_most,
+            "gather": gather,
             "epoch": epoch,
             "index": index,
             "count": count,
