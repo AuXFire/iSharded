@@ -1246,6 +1246,7 @@ A flag takes priority over its variable.
 | `ISHARDED_CACHE_DIR`, `ISHARDED_LLAMA_DIR` | `--cache-dir`, `--llama-dir` |
 | `ISHARDED_KV_CACHE` | How a worker's stage keeps attention state for its slots: `shared` is one cache for all of them, `split` is one each, and `auto`, the default, shares when a stage has several slots and the model was not loaded for exact replies. Shared is faster when replies run side by side |
 | `ISHARDED_BUILTIN_TOOLS` | `0` is `--no-builtin-tools`. `isharded up` and `isharded node` set it for the control plane they start |
+| `ISHARDED_HOLD_TRIPS` | `0` stops a worker's stage holding a trip for steps that are about to arrive. See [several conversations at once](#several-conversations-at-once). Steps that are already waiting still share a trip |
 | `ISHARDED_LANE`, `ISHARDED_LANES_FILE` | Set by `isharded node`: which lane a process is, and where a node keeps the lanes it should run |
 | `ISHARDED_OWNERLESS` | `--ownerless` |
 | `ISHARDED_UP_HOME` | Where `isharded up` keeps its settings and keys |

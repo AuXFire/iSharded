@@ -106,6 +106,8 @@ def holds_trips(meta: dict[str, Any]) -> bool:
     neighbouring slots, so a held trip costs as much as its replies alone and makes them wait as
     well: on four A40s, 16 replies made 61 tokens a second held together and 100 to 115 left alone.
     """
+    if os.environ.get("ISHARDED_HOLD_TRIPS", "1") == "0":
+        return False  # the worker's own word, for a mesh where holding turns out to cost
     return shares_cache(meta) or meta.get("slots", 1) == 1
 
 

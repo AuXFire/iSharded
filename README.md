@@ -32,7 +32,19 @@ Qwen3-235B-A22B Instruct at Q5_K_M, 155 GiB and 94 layers, ran on four rented A4
 | A stage's engine killed mid-reply | Paused 7.5 s and finished with the same text |
 | A worker process killed mid-reply | Paused 41 s and finished with the same text |
 
-After a failure, the last words of a reply can differ from an unbroken run where two tokens are nearly tied. [Measured across data centers](docs/GUIDE.md#measured-across-data-centers) has the full table and its limits. [Test results](docs/RESULTS.md) holds every speed, failure and security result measured so far, each with its setup, and what has not been measured yet.
+After a failure, the last words of a reply can differ from an unbroken run where two tokens are nearly tied. [Measured across data centers](docs/GUIDE.md#measured-across-data-centers) has the full table and its limits.
+
+The same model at Q8_0, 233 GiB, ran on eight rented A40s in one data center on 10 November 2026, and Qwen3.6-27B ran on four of them with many replies at once:
+
+| What | Result |
+|---|---|
+| 235B at Q8_0 across eight A40s, one reply, plain decoding | 18.4 tokens/s |
+| The same, stages overlapping | 29.3 tokens/s |
+| The same, 8 replies at once | 92 tokens/s in all |
+| 27B across four A40s, 16 replies at once | 167 to 172 tokens/s in all, against 100 to 115 before a stage's replies shared one cache |
+| 27B across four A40s, 4 replies at once | 95 tokens/s in all, each reply as fast as one alone |
+
+The 235B rows and the 4-reply row were measured on the version before this one. This version changes when a stage waits to run several replies in one pass, and those changes have unit tests but no measurement on rented GPUs yet. [Test results](docs/RESULTS.md) holds every speed, failure and security result measured so far, each with its setup, and what has not been measured yet.
 
 ## What it does
 
@@ -41,7 +53,9 @@ After a failure, the last words of a reply can differ from an unbroken run where
 - Spans memory types: one node can hold layers in VRAM, RAM, and disk at once, and nodes do not have to match.
 - Runs GGUF models on stock llama.cpp, on any GPU with a Vulkan driver, and safetensors models on its own PyTorch code.
 - Runs several models at once on the same mesh.
+- Runs many conversations at once through one split model, with each machine working on several of them in one pass.
 - Serves an OpenAI-shaped API with streaming, tool calling, and image input, plus a chat page and a live dashboard on every node.
+- Gives every model a few tools of its own, which the mesh runs itself: the date and time, a calculator, and facts about the mesh.
 - Speaks MCP both ways: MCP clients can use a mesh, and models on a mesh can use the tools of MCP servers.
 - Keeps replies going through a crashed stage, a dead node, a dead coordinator, a silent link, or a split network.
 - Runs as a network one person owns, or as one nobody owns.
