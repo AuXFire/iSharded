@@ -808,6 +808,8 @@ Starts a node with everything worked out, and is the easy way in. See [Quick sta
 | `--find` | Off | Ask to join the one mesh on this network, without asking you first |
 | `--new-mesh` | Off | Start a new mesh even if one is on this network |
 | `--no-discovery` | Off | Do not look for a mesh, and do not answer machines looking for this one |
+| `--no-builtin-tools` | Off | Do not offer chats the mesh's [built-in tools](#built-in-tools). Kept for next time |
+| `--builtin-tools` | Off | Offer them again after `--no-builtin-tools` |
 | `--ownerless` | Off | Make or join a [network nobody owns](#a-network-nobody-owns). It never adds TLS, so off Tailscale it needs `--trusted-network` |
 | `--joining` | `vouched` | With `--ownerless`: who this node accepts, `open` or `vouched` |
 | `--trust` | None | With `--ownerless`: a node to accept from the start. Repeatable |
@@ -885,6 +887,7 @@ Security:
 | `--identity-cert`, `--identity-key` | None | This node's certificate and key, to prove its name with tickets, without TLS |
 | `--tls-cert`, `--tls-key` | None | Certificate and key for this node's servers, for TLS |
 | `--keys-file` | `access.json` in the iSharded folder | Where this node keeps the pool's API keys |
+| `--no-builtin-tools` | Off | Do not offer chats the mesh's [built-in tools](#built-in-tools) |
 | `--open` | Off | Serve a network with no credentials, trusting everyone on it |
 | `--trusted-network` | Off | Send credentials unencrypted, because nobody else can read this network |
 
@@ -1178,6 +1181,7 @@ Runs [the assistant](#the-assistant). [Its guide](ASSISTANT.md) covers its comma
 | `--state-file` | `orchestrator-state.json` in the state folder | Where the running route is saved |
 | `--keys-file` | `access.json` in the iSharded folder | Where this node keeps the pool's API keys |
 | `--audit-file` | `audit.jsonl` in the state folder | Where to record who did what |
+| `--no-builtin-tools` | Off | Do not offer chats the mesh's [built-in tools](#built-in-tools) |
 | `--lane` | None | Run as this lane, beside a node's main control plane. `isharded node` sets this for you |
 | `--no-reuse-cached` | Off | Plan as if no worker held any shards |
 | `--no-peer-fetch` | Off | Always download from the model host |
@@ -1241,6 +1245,7 @@ A flag takes priority over its variable.
 | `ISHARDED_STATE_RAM_GB`, `ISHARDED_STATE_DISK_GB`, `ISHARDED_STATE_COPY_MB` | `--state-ram-gb`, `--state-disk-gb`, `--state-copy-mb` |
 | `ISHARDED_CACHE_DIR`, `ISHARDED_LLAMA_DIR` | `--cache-dir`, `--llama-dir` |
 | `ISHARDED_KV_CACHE` | How a worker's stage keeps attention state for its slots: `shared` is one cache for all of them, `split` is one each, and `auto`, the default, shares when a stage has several slots and the model was not loaded for exact replies. Shared is faster when replies run side by side |
+| `ISHARDED_BUILTIN_TOOLS` | `0` is `--no-builtin-tools`. `isharded up` and `isharded node` set it for the control plane they start |
 | `ISHARDED_LANE`, `ISHARDED_LANES_FILE` | Set by `isharded node`: which lane a process is, and where a node keeps the lanes it should run |
 | `ISHARDED_OWNERLESS` | `--ownerless` |
 | `ISHARDED_UP_HOME` | Where `isharded up` keeps its settings and keys |
@@ -1355,6 +1360,7 @@ Routes under `/internal` are for nodes only. `GET /internal/mesh` shows a node's
 | `tools` | None | Chat only: functions the model may call. See [tool calling](#tool-calling) |
 | `tool_choice` | `auto` | Chat only: `auto`, `none`, `required`, or a named function |
 | `parallel_tool_calls` | `true` | Chat only: `false` keeps only the first call in a reply |
+| `builtin_tools` | None | Chat only: `true` offers the mesh's own tools, which the answering node runs itself. See [built-in tools](#built-in-tools) |
 
 Prompts longer than the loaded context are refused with a 400. A reply that would overrun it is cut short.
 
@@ -1661,6 +1667,34 @@ Each tool, resource, and prompt is a call to the node's own API with your key, s
 
 The official `mcp` Python package, version 2.3.0, has used this as a client in both eras, over both stdio and HTTP, resources and prompts included. In the current era that included a reply from a real model. `chat` with an image and `embed` have each answered from a real model over HTTP, sent by a plain client in the older era.
 
+### Built-in tools
+
+Every mesh has a few tools of its own, which a model can use with no client bringing any. The node that answers a chat runs each call itself and gives the model the result, so what reaches the client is the finished answer.
+
+| Tool | What it does |
+|---|---|
+| `current_time` | The date, time and weekday, in UTC or a named time zone such as `Europe/Paris` |
+| `calculate` | Works out an arithmetic expression: numbers, `+ - * / // % **`, brackets, `pi`, `e`, `tau`, and functions such as `sqrt`, `round`, `log` and `sin` |
+| `mesh_facts` | What the model runs on: its name, how many machines share it, how many replies it runs at once, its context size and its draft model. It names no machine and no address |
+
+None of them reads a file, opens a connection or runs a program, so they are safe for anyone who may chat. There is no web search or page fetch among them.
+
+The chat page asks for them by default. Its Tools button has the switch, and each reply shows which tools it used and what they returned. A chat with tools of its own pasted in leaves the built-in ones out.
+
+Over the API they join a chat only when it asks, with `"builtin_tools": true`, because offering tools changes the prompt, and a client that did not ask should get the reply it always got:
+
+```python
+reply = client.chat.completions.create(
+    model="any",
+    messages=[{"role": "user", "content": "What is 17 times 23, and what day is it?"}],
+    extra_body={"builtin_tools": True},
+)
+```
+
+A stream carries each use as `delta.isharded.tool_use`, with `name`, `arguments` and `result`, and a reply that is not streamed lists them in `isharded.tool_uses`. Neither has `tool_calls`: those calls were the node's to run. `usage` counts the tokens of every pass. A reply may make 4 rounds of calls, and after that the model is asked once more with no tools on offer, so it ends with an answer.
+
+A chat that asks and cannot have them gets a 400 that says why: it sent `tools` of its own, it set `tool_choice` to something other than `auto`, the model's chat template has no tool format iSharded can read (see [tool calling](#tool-calling)), or the mesh has them off. `--no-builtin-tools` on `isharded up`, `isharded node` or a control plane turns them off for every chat that node answers, and `isharded up` remembers it until `--builtin-tools`. `builtin_tools` in `/admin/status` and `/v1/models` lists the ones the running model can be offered, which is none when they are off.
+
 ### MCP tools for models on the mesh
 
 `isharded mcp run` is an agent loop. It starts MCP stdio servers, or connects to Streamable HTTP ones, gives the model their tools, runs the calls it asks for, and prints its answer to stdout. Everything else goes to stderr.
@@ -1855,18 +1889,21 @@ A trip of less than two rows stays at one, because replies that share a route wi
 
 Single-token steps from different conversations also share a pass through a stage, because reading the weights is what a pass costs. On one stage, four conversations went from 12 to 32 tokens per second. Across two stages the same load gained only 10%, from 34 to 37, because the stages stagger the conversations. A merge takes every waiting step it can, wherever it sits in the queue, and a reply's own steps still run in order.
 
-A stage also holds a trip for steps it knows are about to arrive. Replies that run side by side each send a step a round, a moment apart, and a stage that took the first one the moment it came ran every round as two trips: that step alone, then the rest. So each stage keeps, for every slot, how long its steps take to come back, and holds a trip in two cases:
+A stage also holds a trip for steps it knows are about to arrive, when the trip would otherwise be smaller than it should be. Replies that run side by side each send a step a round, a moment apart, and a stage that took the first one the moment it came ran every round as two trips: that step alone, then the rest. A trip costs much the same for one step as for several, so small trips waste the stage. So each stage keeps, for every slot, how long its steps take to come back.
 
-| A step that | Is held for | Why |
-|---|---|---|
-| Comes back sooner than a trip takes here | Up to one trip | This stage sets the pace, and a trip of its own would make every reply wait behind it |
-| Is due within half a trip | Until it is due, and no later than half a trip | It would wait behind this trip anyway, so it belongs to the group that is here |
+How large a trip should be depends on the rest of the ring. While a step is away at the other stages, this stage can run other trips: as many as fit in the step's round, which is its time away plus one trip here. A ring is fullest when each stage runs just that many trips a round, each with an equal share of the replies. Fewer, larger trips leave the other stages idle, and more, smaller ones make steps queue. So a trip waits while it holds less than its share and the rest of that share is about to come:
 
-A step due later than that belongs to another group and runs on its own, because groups spread round a ring keep every stage busy, and one trip for all of them would leave the other stages idle. Nothing is held for a reply that is alone, for a step that is late, or while other work waits, and no hold is longer than 20 ms. Replies that share a trip leave together and come back together, so a hold is paid once: measured holds lasted 0.1 to 0.2 ms. `gather_us` and `gathers` in a stage's ring figures are the average hold and how many trips were held.
+| Where | Trips a round | A trip's share | Longest wait |
+|---|---|---|---|
+| One stage, or a stage the rest of the ring is quicker than | One | Every reply | One trip |
+| A ring of like stages, with no more replies than stages | One for each reply | One reply, so nothing waits | None |
+| The same ring with more replies than stages | About one for each stage | The replies divided by the trips | Half a trip |
 
-Measured on a laptop RTX 3060 with Qwen3-0.6B and one stage, a round of 16 replies went from 18.6 to 9.1 ms, and a round of 2 from 13.7 to 4.2 ms. Through the whole stack on the same laptop, 16 replies on 16 slots went from 149 to 774 tokens per second on one GPU stage, from 175 to 441 on two stages sharing the GPU, and 16 replies on 8 slots went from 188 to 474 on a CPU stage and a GPU stage. A ring of several GPUs is not measured yet. [Many replies at once](RESULTS.md#many-replies-at-once) has the rows.
+When a whole share cannot arrive in time, the trip still waits for a step that is right behind it, and for nothing else. A step that is late is waited on for a quarter of its time away, and never more than an eighth of a trip. Nothing is held for a reply that is alone or while other work waits, and no hold is longer than 20 ms. `gather_us` and `gathers` in a stage's ring figures are the average hold and how many trips were held.
 
-A stage with several slots keeps their attention state in one cache. With a cache for each slot, llama.cpp runs the slots of a pass together only when they are next to each other, so eight replies on slots 0, 2, 4 and so on took 53 ms a round against 8 ms, and a pass on other slots than the last one could not reuse the GPU's captured graph, which doubled its time. One cache has neither cost and is the same size, and it was no slower with 16 slots each holding 1,600 tokens. A model loaded with `--exact` keeps a cache for each slot, because in one cache a row is worked out beside every other reply's state and could round differently for it. `ISHARDED_KV_CACHE` on a worker sets it to `shared` or `split` whatever the load. A step a stage refuses is refused alone, and the rest of its merge runs. Steps with speculative guesses do not merge, so a draft limits this. `--no-merge-passes` turns it off, on the native path as well as over HTTP. A merged pass can round differently from a row alone, which [Exact replies](#exact-replies) is about.
+Measured on a laptop RTX 3060 with Qwen3-0.6B and one stage, a round of 16 replies went from 18.6 to 9.1 ms, and a round of 2 from 13.7 to 4.2 ms. Through the whole stack on the same laptop, 16 replies on 16 slots went from 149 to 774 tokens per second on one GPU stage, from 175 to 441 on two stages sharing the GPU, and 16 replies on 8 slots went from 188 to 474 on a CPU stage and a GPU stage. On four rented A40s a first version of this rule, which held for any pass due within half a trip, made 167 to 172 tokens per second at 16 replies against 100 to 115 on `main`, but 75 against 95 at 4 replies, and on eight A40s with the 235B and its draft it made 60 against 92 at 8 replies, because it held trips for passes that were not coming. The rule above is the one written after that run. It has not run on rented GPUs yet. [Many replies at once](RESULTS.md#many-replies-at-once) has the rows.
+
+A stage with several slots keeps their attention state in one cache. With a cache for each slot, llama.cpp runs the slots of a pass together only when they are next to each other, so eight replies on slots 0, 2, 4 and so on took 53 ms a round against 8 ms, and a pass on other slots than the last one could not reuse the GPU's captured graph, which doubled its time. One cache has neither cost and is the same size, and it was no slower with 16 slots each holding 1,600 tokens. On four rented A40s with the 27B, 16 replies made 154 tokens per second on one cache and 61 with a cache each, and 16 replies each holding 3,000 tokens cost the one cache about 6%. A stage that keeps a cache for each slot holds no trips. A model loaded with `--exact` keeps a cache for each slot, because in one cache a row is worked out beside every other reply's state and could round differently for it. `ISHARDED_KV_CACHE` on a worker sets it to `shared` or `split` whatever the load. A step a stage refuses is refused alone, and the rest of its merge runs. Steps with speculative guesses do not merge, so a draft limits this. `--no-merge-passes` turns it off, on the native path as well as over HTTP. A merged pass can round differently from a row alone, which [Exact replies](#exact-replies) is about.
 
 Past `--parallel`, replies queue at the entry worker, and past 32 waiting they are refused with a 429.
 
