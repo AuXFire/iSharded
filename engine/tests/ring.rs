@@ -1034,7 +1034,9 @@ fn passes_on_one_sequence_never_share_a_trip() {
 #[test]
 fn replies_that_arrive_a_moment_apart_are_gathered_into_one_trip() {
     within_deadline("replies_that_arrive_a_moment_apart_are_gathered_into_one_trip", || {
-        let mut ring = ring(2, true, Duration::from_millis(20), 4000);
+        // One stage, so nothing else in the ring could run while its passes are away: the
+        // round has room for one trip, and a pass that went alone would make the rest queue.
+        let mut ring = ring(1, false, Duration::from_millis(20), 4000);
         let slots: u64 = 4;
         for round in 0..6u64 {
             // Each reply sends its next pass once the last round's answers are all in, one a
@@ -1050,7 +1052,7 @@ fn replies_that_arrive_a_moment_apart_are_gathered_into_one_trip() {
             for (index, item) in answers.iter().enumerate() {
                 let slot = index as u32 + 1;
                 assert_eq!(item.id, round * slots + u64::from(slot));
-                assert_eq!(item.tokens[0], (slot * 10 + 1) * 10 + 2, "reply {slot} got another reply's result");
+                assert_eq!(item.tokens[0], slot * 10 + 1, "reply {slot} got another reply's result");
             }
         }
         // The first pass of a round finds the stage free, and waits for the ones it knows
