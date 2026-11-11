@@ -142,6 +142,14 @@ def choose_dtype_name(requested: str) -> str:
     return name
 
 
+def kv_cache_choice(requested: str | None) -> str:
+    """How a stage's slots keep their attention state: ``shared``, ``split``, or by the stage."""
+    choice = (requested or "auto").strip().lower()
+    if choice not in ("auto", "shared", "split"):
+        raise ValueError(f"ISHARDED_KV_CACHE is {requested!r}: use auto, shared or split")
+    return choice
+
+
 def choose_dtype(requested: str) -> torch.dtype | None:
     """Torch dtype for a pool, or None when weights must stay as stored."""
     if requested == "checkpoint":
@@ -276,6 +284,19 @@ class NextHop:
     @property
     def options(self) -> dict[str, Any]:
         return reach_options(self.via)
+
+
+def timed_passes(found: dict[str, Any] | None) -> dict[int, float]:
+    """A stage's load-time pass timings as ms by rows, or nothing unless they start at one row.
+
+    Sizing counts each as so many times the one-row pass, so timings without that say nothing.
+    """
+    try:
+        times = {int(rows): float(ms) for rows, ms in zip(found["rows"], found["ms"])}
+    except (TypeError, KeyError, ValueError):
+        return {}
+    usable = {rows: round(ms, 3) for rows, ms in times.items() if rows >= 1 and ms > 0}
+    return usable if 1 in usable else {}
 
 
 def stage_threads(asked: int, beside_gpu: bool) -> int:
@@ -493,6 +514,8 @@ class WorkerRuntime:
         self.hardware: HardwareInfo | None = None
         self.pools: dict[str, MemoryPool] = {}
         self.llama_dir = os.getenv("ISHARDED_LLAMA_DIR") or None
+        # One attention cache for all of a stage's slots, or one each. See ``shares_cache``.
+        self.kv_cache = kv_cache_choice(os.getenv("ISHARDED_KV_CACHE"))
         self.gguf: GgufStage | None = None
         self.gguf_logits: torch.Tensor | None = None
         self.merge_passes = False
@@ -593,6 +616,9 @@ class WorkerRuntime:
         self.row_ms_ema: float | None = None
         # A pass's time by how many replies rode in it, so a load can count what merging saves.
         self.batch_ms: dict[int, float] = {}
+        # A pass's time by its rows as the stage timed it at load, before any reply. It reaches
+        # sizes no reply has yet made, so a load can tell what more slots would give.
+        self.pass_probe: dict[int, float] = {}
         # The fraction of the time since the last look that this stage spent computing.
         self.busy_share: float | None = None
         self.ring_counted: tuple[int, int, int] | None = None
@@ -1306,6 +1332,7 @@ class WorkerRuntime:
             self.state_ram_bytes if caching else 0,
             self.state_disk_bytes if caching else 0,
             self.dtype_name != "float32",
+            self.kv_cache,
         )
         self._load_draft(request, folder, threads)
         self._load_projector(request, adapter, folder, threads)
@@ -1412,6 +1439,7 @@ class WorkerRuntime:
         self.row_clock = RowClock()
         self.row_ms_ema = None  # another stage's rows say nothing about this one's
         self.batch_ms = {}
+        self.pass_probe = {}
         self.busy_share = None
         self.ring_counted = self.ring_busy = None
         adapter = create_adapter(request.architecture)
@@ -1454,7 +1482,9 @@ class WorkerRuntime:
         self.merge_passes = request.merge_passes
         self.exact = request.exact
         # The stage process probed at load, before this worker could send it a reply.
-        self.exactness = None if self.gguf is None else (await asyncio.to_thread(self.gguf.ring_call, "exactness")).get("found")
+        probed = {} if self.gguf is None else await asyncio.to_thread(self.gguf.ring_call, "exactness")
+        self.exactness = probed.get("found")
+        self.pass_probe = timed_passes(probed.get("passes"))
         if self.gate.size != request.slots:
             self.gate.resize(request.slots)
         if staged:
@@ -2711,6 +2741,7 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
             "compute_ms_ema": runtime.compute_ms_ema,
             "row_ms_ema": runtime.row_ms_ema,
             "batch_ms": {str(size): ms for size, ms in sorted(runtime.batch_ms.items())},
+            "pass_probe": {str(size): ms for size, ms in sorted(runtime.pass_probe.items())},
             "busy_share": runtime.busy_share,
             "exact": runtime.exact_report(),
             "downstream_ms_ema": runtime.downstream_ms_ema,

@@ -1191,8 +1191,30 @@ def test_workers_only_serve_files_from_their_index(tmp_path, monkeypatch):
     assert client.get("/internal/gguf/range", params={"name": "m.gguf", "start": 0, "end": 99}).status_code == 404
 
 
+def test_a_stage_with_several_slots_shares_one_cache_unless_told_or_exact():
+    from isharded.llama_host import shares_cache
+
+    assert not shares_cache({"slots": 1})
+    assert shares_cache({"slots": 4})
+    assert shares_cache({"slots": 4, "cache": "auto", "exact": False})
+    # A reply that must come out the same to the bit is not worked out beside other replies' cells.
+    assert not shares_cache({"slots": 4, "exact": True})
+    assert not shares_cache({"slots": 4, "cache": "split"})
+    assert shares_cache({"slots": 1, "cache": "shared"})
+    assert shares_cache({"slots": 4, "cache": "shared", "exact": True})
+
+
+def test_a_worker_refuses_a_cache_setting_it_does_not_know():
+    from isharded.worker import kv_cache_choice
+
+    assert [kv_cache_choice(item) for item in (None, "", "auto", " Shared ", "split")] == ["auto", "auto", "auto", "shared", "split"]
+    with pytest.raises(ValueError, match="ISHARDED_KV_CACHE"):
+        kv_cache_choice("unified")
+
+
 @needs_real_model
-def test_two_conversations_do_not_touch_each_other():
+@pytest.mark.parametrize("cache", ["shared", "split"])
+def test_two_conversations_do_not_touch_each_other(cache):
     """The same stage, two sequences, interleaved, each matching a run on its own."""
     from isharded.gguf import read_file_header
     from isharded.llama_host import StageHost
@@ -1204,7 +1226,7 @@ def test_two_conversations_do_not_touch_each_other():
     try:
         host.call(
             "load", folder=BUILD, extra_paths=[], path=MODEL, last=True, context_tokens=128, gpu_layers=-1,
-            threads=4, table=embed, cpu_tensors=[], rollback_tokens=0, slots=2,
+            threads=4, table=embed, cpu_tensors=[], rollback_tokens=0, slots=2, cache=cache,
         )
 
         def step(tokens, position, slot):

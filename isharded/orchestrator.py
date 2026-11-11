@@ -706,17 +706,52 @@ def stage_devices(route: list[StageAssignment], candidates: list[Candidate]) -> 
 REPLY_COUNTS = [count for count in (1, 2, 4, 8, 16, 32, 64) if count <= MAX_PARALLEL]
 # What a count of replies must get, against the best any slot count gives it.
 SLOTS_GOOD_ENOUGH = 0.97
+# The fewest slots a pool's own history of replies can hold a load to.
+SLOTS_FLOOR = 8
 
 
 def pass_cost(row: float, measured: dict[int, float] | None) -> Callable[[int], float]:
-    """A stage's pass of k replies: one row, plus what each further reply added as measured.
+    """A stage's pass of k replies: straight lines through the sizes it measured.
 
-    With nothing measured past one reply, each reply costs a whole row, as with no merging.
+    With nothing measured past one reply, each reply costs a whole row, as with no merging. Past
+    the largest size measured, each further reply adds what one added on average up to there. A
+    larger pass never counts as cheaper than a smaller one, whatever a noisy reading said.
     """
     alone = (measured or {}).get(1, row)
-    larger = max((size for size in measured or {} if size > 1), default=None)
-    extra = row if larger is None else max(measured[larger] - alone, 0.0) / (larger - 1)
-    return lambda replies: alone + extra * (replies - 1)
+    known = [(1, alone)]
+    for size in sorted(size for size in measured or {} if size > 1):
+        known.append((size, max(measured[size], known[-1][1])))
+    largest, top = known[-1]
+    extra = row if largest == 1 else (top - alone) / (largest - 1)
+
+    def cost(replies: int) -> float:
+        if replies >= largest:
+            return top + extra * (replies - largest)
+        (low, low_ms), (high, high_ms) = next(pair for pair in pairwise(known) if replies <= pair[1][0])
+        return low_ms + (high_ms - low_ms) * (replies - low) / (high - low)
+
+    return cost
+
+
+def pass_curve(live: dict[int, float] | None, timed: dict[int, float] | None) -> dict[int, float]:
+    """A stage's pass time by replies in it: what replies measured, carried on by what the load timed.
+
+    Replies only measure passes as large as the slots they ran on, so by themselves they can never
+    say what more slots would give. The load timed passes of up to 64 rows on an idle stage. That
+    shape, scaled to meet the largest pass replies measured, stands in past it. Replies' own
+    readings win wherever there are any, because they were taken with the whole route working.
+    """
+    live, timed = dict(live or {}), dict(timed or {})
+    if not timed or 1 not in timed:
+        return live
+    if not live:
+        return timed
+    largest = max(live)
+    scale = live[largest] / pass_cost(timed[1], timed)(largest)
+    curve = {size: ms * scale for size, ms in timed.items() if size > largest}
+    if 1 not in live:
+        curve[1] = min(timed[1] * scale, min(live.values()))
+    return {**curve, **live}
 
 
 def reply_speed(slots: int, replies: int, network: float, costs: list[Callable[[int], float]], devices: list[str], merge_most: int) -> float:
@@ -757,8 +792,11 @@ def wanted_slots(
     GPU stage, a trip of 1.8 rows gave two replies 58 tokens/s on two slots and 65 to 112 on one. So
     a trip of less than two rows stays at one. Stages on one device take turns on it, so their rows
     add up, and a route on a single device has nothing to overlap: two stages on one GPU went from
-    128 to 70 at two slots. A row is each stage's measured time when ``rows`` gives it, and its
-    memory's speed otherwise.
+    128 to 70 at two slots. Those two rules are for replies that take turns. Where passes are
+    known to merge, replies gain on one device and on a short trip too: once stages gathered the
+    passes of a round into one trip, 16 replies on one GPU stage took 9 ms a round against 3.7 ms
+    for one alone. A row is each stage's measured time when ``rows`` gives it, and its memory's
+    speed otherwise.
     """
     names = [stage.worker_id for stage in route]
     hops = list(pairwise(names)) + ([(names[-1], names[0])] if ring and len(names) > 1 else [])
@@ -773,12 +811,12 @@ def wanted_slots(
     network = route_network_ms(route, links, ring)
     round_trip = sum(busy.values()) + network
     merging = merge_most > 1 and passes is not None
+    # A pass is counted only as large as every stage has measured one: a CPU stage that took
+    # 19 ms for one reply took 41 for three, and nothing says how the line goes past that.
+    together = min(merge_most, *(max(measured, default=1) for measured in passes)) if merging else 1
     wanted = min(math.floor(round_trip / row), MAX_PARALLEL) if len(busy) > 1 else 1
-    if wanted > 1:
+    if wanted > 1 or together > 1:
         costs = [pass_cost(stage_row, measured if merging else None) for stage_row, measured in zip(stage_rows, passes or [None] * len(route))]
-        # A pass is counted only as large as every stage has measured one: a CPU stage that took
-        # 19 ms for one reply took 41 for three, and nothing says how the line goes past that.
-        together = min(merge_most, *(max(measured, default=1) for measured in passes)) if merging else 1
         speeds = {slots: [reply_speed(slots, replies, network, costs, devices, together) for replies in REPLY_COUNTS] for slots in range(1, MAX_PARALLEL + 1)}
         best = [max(column) for column in zip(*speeds.values())]
         wanted = next(slots for slots, row_speeds in speeds.items() if all(speed >= SLOTS_GOOD_ENOUGH * most for speed, most in zip(row_speeds, best)))
@@ -951,6 +989,8 @@ class Orchestrator:
         self.pass_readings: dict[tuple[str, str, str, str, bool], dict[int, float]] = {}
         # The most companions a row had on a worker's stage and still came out exact, by model.
         self.merge_limits: dict[tuple[str, str], int] = {}
+        # A pass's time by its rows as each stage timed it at load, ms a layer, under the same key.
+        self.pass_probes: dict[tuple[str, str, str, str, bool], dict[int, float]] = {}
         # The proven address each link of the route uses, where it is not the advertised one.
         self.hops: dict[tuple[str, str], str] = {}
         self.hops_checked_at = float("-inf")
@@ -1000,6 +1040,7 @@ class Orchestrator:
         self.stream_fallbacks = 0
         self.stage_errors = 0
         self.replies_in_flight = 0
+        self.replies_peak = 0  # the most replies it ever ran at once, which is what slots are sized for
         self.warned_interception: set[str] = set()
         self.drained: set[str] = set()
         self.reply_checker: TicketChecker | None = None
@@ -1697,6 +1738,8 @@ class Orchestrator:
         view.row_readings = dict(self.row_readings)
         view.pass_readings = {key: dict(value) for key, value in self.pass_readings.items()}
         view.merge_limits = dict(self.merge_limits)
+        view.pass_probes = {key: dict(value) for key, value in self.pass_probes.items()}
+        view.replies_peak = self.replies_peak
         copied = copy.copy(target)
         if target is self.active:
             view.active = copied  # planning tells the running model apart by identity
@@ -2430,31 +2473,46 @@ class Orchestrator:
             held = health.get("assignment") or {}
             row = telemetry_of(record).get("row_ms_ema")
             same = health.get("model") == target.model_id and health.get("epoch") == self.epoch
-            if row and same and (held.get("start_layer"), held.get("end_layer")) == (stage.start_layer, stage.end_layer):
-                key = row_key(target, stage, device, index == len(self.route) - 1)
-                layers = stage.end_layer - stage.start_layer
+            if not same or (held.get("start_layer"), held.get("end_layer")) != (stage.start_layer, stage.end_layer):
+                continue
+            key = row_key(target, stage, device, index == len(self.route) - 1)
+            layers = stage.end_layer - stage.start_layer
+            timed = telemetry_of(record).get("pass_probe") or {}
+            if timed:  # known from the load on, before any reply has measured a row
+                self.pass_probes[key] = {int(size): float(ms) / layers for size, ms in timed.items()}
+            if row:
                 self.row_readings[key] = float(row) / layers
                 merged = telemetry_of(record).get("batch_ms") or {}
                 self.pass_readings[key] = {int(size): float(ms) / layers for size, ms in merged.items()}
-                limit = (telemetry_of(record).get("exact") or {}).get("exact_merge_limit")
-                if limit is not None:
-                    self.merge_limits[(target.model_id, stage.worker_id)] = int(limit)
+            limit = (telemetry_of(record).get("exact") or {}).get("exact_merge_limit")
+            if limit is not None:  # the load's probe found it, so it too is known before any reply
+                self.merge_limits[(target.model_id, stage.worker_id)] = int(limit)
 
     def measured_rows(self, target: ModelTarget, route: list[StageAssignment], devices: list[str]) -> list[float] | None:
-        """Each stage's row as this model measured it before on the same device, or None unless all are known."""
+        """Each stage's row as this model measured it before on the same device, or None unless all are known.
+
+        A stage no reply has reached yet still timed a one-row pass when it loaded, and that counts.
+        """
         rows = []
         for index, (stage, device) in enumerate(zip(route, devices)):
-            per_layer = self.row_readings.get(row_key(target, stage, device, index == len(route) - 1))
+            key = row_key(target, stage, device, index == len(route) - 1)
+            # A reply's reading is its share of a pass, which is less than a row where passes
+            # merge. So a pass of one row is the row wherever one was measured or timed.
+            per_layer = pass_curve(self.pass_readings.get(key), self.pass_probes.get(key)).get(1, self.row_readings.get(key))
             if per_layer is None:
                 return None
             rows.append(per_layer * (stage.end_layer - stage.start_layer))
         return rows
 
     def measured_passes(self, target: ModelTarget, route: list[StageAssignment], devices: list[str]) -> list[dict[int, float]] | None:
-        """Each stage's pass time by replies in it, as this model measured before, or None unless all are known."""
+        """Each stage's pass time by replies in it, as this model measured before, or None unless all are known.
+
+        What replies measured is carried past their largest pass by what the load timed, see ``pass_curve``.
+        """
         found = []
         for index, (stage, device) in enumerate(zip(route, devices)):
-            per_layer = self.pass_readings.get(row_key(target, stage, device, index == len(route) - 1))
+            key = row_key(target, stage, device, index == len(route) - 1)
+            per_layer = pass_curve(self.pass_readings.get(key), self.pass_probes.get(key))
             if not per_layer:
                 return None
             found.append({size: ms * (stage.end_layer - stage.start_layer) for size, ms in per_layer.items()})
@@ -2484,8 +2542,13 @@ class Orchestrator:
             rows, passes = self.measured_rows(target, plan, devices), self.measured_passes(target, plan, devices)
             return wanted_slots(plan, devices, links, target.profile.ring, rows, passes, self.planned_merge_most(target, plan))
 
+        # A slot's cache takes room whether a reply uses it or not, and that room can be what
+        # keeps a layer on a fast device. So a pool that has run replies is sized for twice the
+        # most it ran at once, and never under SLOTS_FLOOR. One that has run none has no say.
+        demand = max(SLOTS_FLOOR, 2 * self.replies_peak) if self.replies_peak else MAX_PARALLEL
+
         def goal(choice: dict[str, Any]) -> int:
-            return choice["wanted"] if choice["measured"] else max(choice["wanted"] // 2, 1)
+            return min(choice["wanted"] if choice["measured"] else max(choice["wanted"] // 2, 1), demand)
 
         chosen = wants(route)
         if chosen is None:
@@ -2513,13 +2576,15 @@ class Orchestrator:
             low, high, chosen = (middle, high, choice) if choice is not None else (low, middle, chosen)
         with_slots(target, low)
         trip = f"a {chosen['round_trip_ms']:.1f} ms round trip at {chosen['row_ms']:.1f} ms a row"
-        if chosen["devices"] == 1:
+        if chosen["devices"] == 1 and chosen["wanted"] == 1:
             trip = "every stage runs on one device, so replies could only take turns on it"
         elif chosen["measured"]:
             merged = ", with merged passes costing what they measured," if chosen.get("merging") else ""
-            trip = f"{trip}{merged} as this model measured on these devices, wants {goal(chosen)}"
+            trip = f"{trip}{merged} as this model measured on these devices, wants {chosen['wanted']}"
         else:
-            trip = f"{trip}, from memory speeds, would want {chosen['wanted']}; with nothing measured yet a load takes {goal(chosen)}"
+            trip = f"{trip}, from memory speeds, would want {chosen['wanted']}; with nothing measured yet a load takes {max(chosen['wanted'] // 2, 1)}"
+        if goal(chosen) == demand < chosen["wanted"]:
+            trip += f", and {demand} is twice the most replies this pool has run at once" if demand > SLOTS_FLOOR else f", and this pool has run no more than {self.replies_peak} at once, so it takes {demand}"
         if low < goal(chosen):
             trip += f", and {low + 1} would put layers on slower devices" if low + 1 in crowded else f", and {low} fit in memory"
         return {"auto": True, "slots": low, **chosen, "reason": trip}
@@ -3887,6 +3952,7 @@ class Orchestrator:
         reader = tokenizer.keeping(MARKER_TOKENS) if keep_markers else tokenizer
         decoder = IncrementalText(reader)
         self.replies_in_flight += 1
+        self.replies_peak = max(self.replies_peak, self.replies_in_flight)
         try:
             source = self.token_stream(session, max_tokens, temperature, top_p, top_k, seed, boundary)
             async with aclosing(source) as tokens:

@@ -172,6 +172,7 @@ class GgufStage:
         state_ram_bytes: int = 0,
         state_disk_bytes: int = 0,
         wire_bf16: bool = True,
+        kv_cache: str = "auto",
     ) -> None:
         assignment = request.assignment
         self.first = assignment.start_layer == 0
@@ -211,6 +212,7 @@ class GgufStage:
             "map_file": needs_mapping(placements, pools),
             "embedding": request.embedding,
             "kv_type": request.kv_type,
+            "cache": kv_cache,
             "wire_bf16": wire_bf16,
             "state_dir": None if state_folder is None else str(state_folder),
             "state_ram_bytes": state_ram_bytes,

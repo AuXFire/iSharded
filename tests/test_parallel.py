@@ -12,7 +12,7 @@ import pytest
 from isharded import orchestrator as orchestrator_module
 from isharded import worker as worker_module
 from isharded.models import UnsupportedModel
-from isharded.orchestrator import ModelTarget, Orchestrator, describe_plan, draft_sizes, exactness_of, settled_parallel, stage_devices, wanted_slots, with_slots
+from isharded.orchestrator import ModelTarget, Orchestrator, describe_plan, draft_sizes, exactness_of, pass_cost, pass_curve, settled_parallel, stage_devices, wanted_slots, with_slots
 from isharded import planner
 from isharded.planner import Candidate, ModelProfile
 from isharded.protocol import MAX_PARALLEL, DraftModel, InferRequest, LoadModelRequest, MemoryPool, StageAssignment, TensorRef, UnitPlacement, WeightUnit
@@ -754,3 +754,96 @@ def test_the_entry_keeps_what_it_hears_about_the_route_only_for_its_own_epoch(mo
     assert not runtime.route_verifies_exactly(), "its own stage must have proved it too"
     assert client.post("/internal/route/exact", json={"epoch": 7, "verify_exact": False}).status_code == 200
     assert runtime.route_verifies is None
+
+
+def test_a_pass_costs_what_was_measured_with_straight_lines_between():
+    cost = pass_cost(10.0, {1: 4.0, 2: 5.0, 8: 11.0})
+    assert [cost(replies) for replies in (1, 2, 5, 8)] == [4.0, 5.0, 8.0, 11.0]
+    # Past the largest pass measured, a reply adds what one added on average up to there.
+    assert cost(10) == 13.0
+
+
+def test_a_pass_with_nothing_measured_past_one_reply_costs_a_row_for_each_more():
+    assert pass_cost(10.0, None)(3) == 30.0
+    assert pass_cost(10.0, {1: 4.0})(3) == 24.0
+
+
+def test_a_noisy_reading_never_makes_a_larger_pass_the_cheaper_one():
+    cost = pass_cost(10.0, {1: 4.0, 2: 6.0, 4: 5.0})
+    assert (cost(2), cost(3), cost(4)) == (6.0, 6.0, 6.0)
+
+
+def test_what_a_load_timed_carries_a_stage_past_the_passes_its_replies_measured():
+    timed = {1: 4.0, 2: 5.0, 4: 6.0, 8: 8.0, 16: 12.0}
+    # Two slots ran, and with the whole route working a pass took half as long again.
+    assert pass_curve({1: 5.0, 2: 7.5}, timed) == {1: 5.0, 2: 7.5, 4: 9.0, 8: 12.0, 16: 18.0}
+    assert pass_curve(None, timed) == timed
+    assert pass_curve({1: 5.0, 2: 7.5}, None) == {1: 5.0, 2: 7.5}
+    assert pass_curve({2: 7.5}, {2: 5.0, 4: 6.0}) == {2: 7.5}, "a load that timed no pass of one row has no shape to give"
+    # Replies that never ran alone still get a pass of one row, and it is no dearer than theirs.
+    assert pass_curve({4: 9.0}, timed) == {1: 6.0, 4: 9.0, 8: 12.0, 16: 18.0}
+    assert pass_curve({4: 5.0}, {1: 4.0, 4: 4.0, 8: 8.0})[1] == 5.0
+
+
+def test_a_stage_no_reply_has_reached_still_says_what_its_load_timed(pool):
+    item = target()
+    choose(pool, item)
+    route = running(pool, item, [None, None])
+    devices = stage_devices(route, pool.offered)
+    assert pool.measured_rows(item, route, devices) is None
+    for placed in route:
+        pool.workers[placed.worker_id].health["telemetry"]["pass_probe"] = {"1": 8.0, "2": 10.0, "4": 12.0}
+    pool.note_rows()
+    assert pool.row_readings == {}
+    assert pool.measured_rows(item, route, devices) == [8.0, 8.0]
+    assert pool.measured_passes(item, route, devices) == [{1: 8.0, 2: 10.0, 4: 12.0}] * 2
+
+
+def test_what_another_route_timed_at_load_does_not_count(pool):
+    item = target()
+    choose(pool, item)
+    route = running(pool, item, [None, None], epoch=4)
+    for placed in route:
+        pool.workers[placed.worker_id].health["telemetry"]["pass_probe"] = {"1": 8.0}
+    pool.note_rows()
+    assert pool.pass_probes == {}
+
+
+def test_replies_that_share_passes_open_slots_on_one_device_too():
+    # One GPU stage as measured with passes gathered: 16 replies took 8.6 ms a round, one alone 3.6.
+    lone = [stage("a", 0, 8, 3.6)]
+    passes = [{1: 3.6, 2: 4.2, 4: 5.3, 8: 6.9, 16: 8.6}]
+    chosen = wanted_slots(lone, ["gpu"], {}, True, [3.6], passes, merge_most=64)
+    assert chosen["merging"] is True and chosen["devices"] == 1 and chosen["wanted"] == 16
+    # A route that merges nothing has its replies take turns, as before.
+    assert wanted_slots(lone, ["gpu"], {}, True, [3.6], passes, merge_most=1)["wanted"] == 1
+    # Two stages on one GPU share it, and their merged passes still add up to less than turns.
+    both = [stage("a", 0, 4, 2.0), stage("b", 4, 8, 12.0)]
+    merged = [{1: 2.0, 8: 3.0}, {1: 12.0, 8: 20.0}]
+    assert wanted_slots(both, ["gpu", "gpu"], {("a", "b"): 6.0}, True, [2.0, 12.0], merged, merge_most=64)["wanted"] == 16
+
+
+def test_a_short_trip_opens_slots_only_where_a_merged_pass_costs_less_than_its_rows():
+    route = [stage("a", 0, 4, 2.0), stage("b", 4, 8, 12.0)]
+    links = {("a", "b"): 6.0}
+    assert wanted_slots(route, ["a", "b"], links, True, [2.0, 12.0], [{1: 2.0, 8: 3.0}, {1: 12.0, 8: 20.0}], merge_most=64)["wanted"] == 16
+    # A stage whose pass of eight costs eight rows gains nothing from running them together.
+    assert wanted_slots(route, ["a", "b"], links, True, [2.0, 12.0], [{1: 2.0, 8: 3.0}, {1: 12.0, 8: 184.0}], merge_most=64)["wanted"] == 1
+
+
+def test_a_pool_that_has_run_replies_is_sized_for_twice_the_most_it_ran_at_once(pool):
+    fresh = target()
+    choose(pool, fresh)
+    assert fresh.slots == 32, "a pool that has run nothing has no say"
+    pool.replies_peak = 6
+    busy = target()
+    choose(pool, busy)
+    assert busy.slots == 12 and "12 is twice the most replies this pool has run at once" in busy.parallel["reason"]
+    pool.replies_peak = 1
+    quiet = target()
+    choose(pool, quiet)
+    assert quiet.slots == 8 and "has run no more than 1 at once, so it takes 8" in quiet.parallel["reason"]
+    pool.replies_peak = 40
+    crowd = target()
+    choose(pool, crowd)
+    assert crowd.slots == 32, "more demand than the route wants changes nothing"

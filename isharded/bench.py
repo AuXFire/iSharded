@@ -39,7 +39,7 @@ CACHED_REPLY_TOKENS = 8  # only the first token is being timed
 LONGEST_ERROR = 200
 REPORT_FORMAT = 3
 # The engine's averages for one stage, each taken on that stage's own clock, in microseconds.
-TRACE_FIELDS = ("compute_us", "keep_us", "queue_us", "write_us", "enqueue_us", "wait_us", "hop_us", "link_rtt_us", "sample_us", "turnaround_us")
+TRACE_FIELDS = ("compute_us", "keep_us", "queue_us", "write_us", "enqueue_us", "wait_us", "gather_us", "hop_us", "link_rtt_us", "sample_us", "turnaround_us")
 
 PROSE = (
     "The ferry left the harbour an hour late because the tide had turned early.",

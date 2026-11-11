@@ -1154,6 +1154,35 @@ def test_a_stage_probes_nothing_unless_exact_replies_are_asked_for() -> None:
 
 
 @needs_real_stage
+@pytest.mark.parametrize("slots", [1, 4])
+def test_a_real_stage_times_merged_passes_at_load_and_leaves_every_slot_empty(slots: int) -> None:
+    """Every load times passes, past its own slots too, and a reply after it sees none of them."""
+
+    async def reply(host) -> list[int]:
+        client = await real_ring(host)
+        try:
+            tokens = [(await real_pass(client, PROMPT, 0, slot=slots - 1))[0]]
+            for position in range(len(PROMPT), len(PROMPT) + 8):
+                tokens += await real_pass(client, tokens[-1:], position, slot=slots - 1)
+            return tokens
+        finally:
+            client.close()
+
+    host, _ = real_stage(slots=slots)
+    try:
+        passes = host.call("exactness")[0]["passes"]
+        assert passes["rows"][:2] == [1, 2] and len(passes["rows"]) == len(passes["ms"])
+        assert passes["rows"] == sorted(set(passes["rows"])) and passes["rows"][-1] <= 64
+        assert all(ms > 0 for ms in passes["ms"])
+        after_timing = asyncio.run(reply(host))
+        host.call("ring_close")
+        host.call("clear")
+        assert asyncio.run(reply(host)) == after_timing
+    finally:
+        host.close()
+
+
+@needs_real_stage
 def test_a_seeded_top_k_reply_is_the_same_in_the_engine_and_on_the_python_path() -> None:
     """A reply leaves the ring when a stage fails, and must not change course when it does."""
     sampling = {"temperature": 1.0, "top_k": 40, "seed": 7}
@@ -1382,7 +1411,7 @@ def test_a_real_stage_reports_its_compute_totals_and_hop_trace() -> None:
     assert stats["batches_total"] == 5 and stats["compute_us_total"] >= stats["batches_total"]
     # One stage is the entry and the last: it picks tokens and waits on its worker.
     assert stats["sample_us"] > 0 and stats["turnaround_us"] > 0
-    assert {"queue_us", "write_us", "enqueue_us", "wait_us"} <= stats.keys()
+    assert {"queue_us", "write_us", "enqueue_us", "wait_us", "gather_us", "gathers"} <= stats.keys()
 
 
 @needs_real_stage

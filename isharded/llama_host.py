@@ -34,6 +34,10 @@ from .deadlines import PASS_SECONDS, PASS_SECONDS_PER_TOKEN, pass_seconds
 from .llamacpp import LlamaError, LlamaLibrary, LlamaStage, StageLost, TokenEmbedding
 from .statestore import HISTORY, PARTIAL, StateStore
 
+# The largest pass a load times, and how long it may spend on it. A pass holds at most 64 replies.
+TIMED_ROWS = 64
+TIMED_MS = 1500
+
 # What every operation answers with: fields for the reply, and any raw bytes.
 Reply = tuple[dict[str, Any], bytes]
 
@@ -74,6 +78,26 @@ BELOW_NORMAL = 0x00004000  # BELOW_NORMAL_PRIORITY_CLASS, for a spare's start on
 PASS_MS, ROW_MS = round(PASS_SECONDS * 1000), round(PASS_SECONDS_PER_TOKEN * 1000)
 
 
+def shares_cache(meta: dict[str, Any]) -> bool:
+    """Whether a stage's sequences keep their attention state in one cache or in one each.
+
+    With a cache each, llama.cpp runs a pass's sequences together only when they are next to
+    each other: replies on slots 0, 2, 4 ... cost a trip through the model each, measured at
+    53 ms for eight replies against 8 ms. And a pass on other sequences than the last one
+    cannot reuse the device's captured graph, which doubled a small stage's pass. One cache
+    has neither cost, at the same size, and measured no slower with every slot holding a long
+    reply. So a stage with several slots shares, unless the worker says otherwise.
+
+    A reply that must come out the same to the bit keeps a cache each: in a shared cache a
+    row is worked out alongside every other reply's cells, and how it rounds could depend on
+    how many there are.
+    """
+    choice = meta.get("cache") or "auto"
+    if choice == "auto":
+        return meta.get("slots", 1) > 1 and not meta.get("exact")
+    return choice == "shared"
+
+
 def seconds_for(operation: str, rows: int) -> float | None:
     """How long a stage may take over a call, or None if nothing can say."""
     if operation in LOADS:
@@ -96,6 +120,8 @@ class _Host:
         self.encoded: OrderedDict[str, tuple[dict[str, Any], bytes]] = OrderedDict()
         # What the load's probe found about merged passes. None means nothing was probed.
         self.found: dict[str, Any] | None = None
+        # What a pass of 1, 2, 4 ... rows cost at load, as the engine timed it. None if it could not.
+        self.passes: dict[str, list[float]] | None = None
 
     def prime(self, meta: dict[str, Any], _: bytes) -> Reply:
         """Brings the library and its devices up with no model, so a load later skips that.
@@ -120,6 +146,7 @@ class _Host:
             cpu_tensors=meta["cpu_tensors"],
             rollback_tokens=meta.get("rollback_tokens", 0),
             sequences=meta.get("slots", 1),
+            unified_cache=shares_cache(meta),
             map_file=meta.get("map_file", True),
             embedding=meta.get("embedding", False),
             kv_type=meta.get("kv_type", "f16"),
@@ -145,6 +172,7 @@ class _Host:
             )
             # Only exact replies use what it finds, and on a CPU stage with many slots it takes seconds.
             self.found = self._probe(meta.get("slots", 1)) if meta.get("exact") else None
+            self.passes = self._time_passes(meta.get("slots", 1), meta["context_tokens"])
         return {"hidden_size": self.stage.hidden_size, "vocab_size": self.stage.vocab_size, "engine": self.stage.engine is not None}, b""
 
     def _probe(self, slots: int) -> dict[str, Any]:
@@ -154,8 +182,19 @@ class _Host:
         except OSError as exc:
             return {"exact_merge_limit": 0, "verify_exact": False, "error": str(exc)}
 
+    def _time_passes(self, slots: int, context_tokens: int) -> dict[str, list[float]] | None:
+        """What merged passes cost here, so a first load can size its slots. Before any reply, like the probe.
+
+        A stage with one slot still times passes of many rows, which cost about what they would
+        over many slots, so a load that had no reason to open slots learns whether to.
+        """
+        try:
+            return self.stage.engine.time_passes(slots, min(TIMED_ROWS, context_tokens), TIMED_MS)
+        except OSError:
+            return None  # sizing then goes on what replies measure, as it did before
+
     def exactness(self, _: dict[str, Any], __: bytes) -> Reply:
-        return {"found": self.found}, b""
+        return {"found": self.found, "passes": self.passes}, b""
 
     def embed(self, meta: dict[str, Any], _: bytes) -> Reply:
         if self.embedding is None:

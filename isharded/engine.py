@@ -87,6 +87,7 @@ SIGNATURES: dict[str, tuple[list[Any], Any]] = {
     "connect": ([C.c_void_p, C.c_char_p], C.c_int32),
     "stats": ([C.c_void_p, C.c_char_p, C.c_size_t], C.c_int32),
     "probe": ([C.c_void_p, C.c_uint32, C.c_char_p, C.c_size_t], C.c_int32),
+    "time_passes": ([C.c_void_p, C.c_uint32, C.c_uint32, C.c_uint32, C.c_char_p, C.c_size_t], C.c_int32),
 }
 # Calls that hold the next route beside the current one. Every library of this ABI version has
 # them; ``Engine.stages`` still checks, so a build without them says so instead of failing a call.
@@ -197,6 +198,18 @@ class Engine:
         out = C.create_string_buffer(TEXT_BYTES)
         if self.lib.isharded_engine_probe(self.handle, slots, out, TEXT_BYTES) < 0:
             raise OSError(out.value.decode("utf-8", "replace") or "the probe failed")
+        return json.loads(out.value)
+
+    def time_passes(self, slots: int, most: int, budget_ms: int) -> dict[str, list[float]]:
+        """What a pass of 1, 2, 4 ... rows costs this stage, as ``{"rows": [...], "ms": [...]}``.
+
+        Up to ``slots`` rows a pass holds one row a slot, and past that the same rows in every
+        slot, up to ``most`` rows. It stops early rather than run past ``budget_ms``. Like the
+        probe it uses every slot and empties them, so it must come before any reply.
+        """
+        out = C.create_string_buffer(TEXT_BYTES)
+        if self.lib.isharded_engine_time_passes(self.handle, slots, most, budget_ms, out, TEXT_BYTES) < 0:
+            raise OSError(out.value.decode("utf-8", "replace") or "timing passes failed")
         return json.loads(out.value)
 
     def forget(self, slot: int | None) -> None:
