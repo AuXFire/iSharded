@@ -362,6 +362,46 @@ fn wait_until(what: &str, done: impl Fn() -> bool) {
     }
 }
 
+/// The first of the slots no test's replies use, one for each stage, and the ids of the
+/// passes sent on them.
+const SPARE_SLOT: u32 = 900;
+static SPARE_ID: AtomicU64 = AtomicU64::new(1 << 40);
+
+/// Returns once a stage has read, and so queued, every pass sent before this was called.
+/// A test that acts the moment it sees one pass running is ahead of the passes sent just
+/// behind it: they may still be on a link or in a reader's hands, and nothing a stage counts
+/// shows them until they run. So this sends one more pass behind them, on a slot nothing
+/// uses, of a reply the stage is told has ended. A stage drops such a pass as it reads it,
+/// and counts that. The pass has two rows, so at the stages before it shares no trip and
+/// cannot leave ahead of an older pass. Past the entry it is never answered, so a test whose
+/// old route must drain at the entry cannot use this for a later stage.
+fn wait_until_queued_at(ring: &Ring, stage: usize) {
+    let node = &ring.nodes[stage];
+    let slot = SPARE_SLOT + stage as u32;
+    let dropped = node.stats().dropped;
+    node.begin(slot, 1);
+    node.begin(slot, 2);
+    let id = SPARE_ID.fetch_add(1, Ordering::SeqCst);
+    ring.client.send(&Pass { slot, tokens: vec![0, 0], ..pass(id, 0, 0) }.encode()).unwrap();
+    wait_until("a stage reading everything sent to it", || node.stats().dropped > dropped);
+}
+
+/// A stage that keeps the pass it runs until the test lets go, so what the test sends
+/// meanwhile is certain to queue behind it. A slow stage only makes that likely.
+struct Held {
+    adder: Adder,
+    open: Arc<AtomicBool>,
+}
+
+impl Compute for Held {
+    fn run(&mut self, pass: &Pass) -> Result<Output, Failure> {
+        while !self.open.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        self.adder.run(pass)
+    }
+}
+
 /// Reads refusals until the one that says a link was lost, and checks which stage it names.
 fn wait_for_loss(ring: &mut Ring, stage: u16) {
     loop {
@@ -1036,9 +1076,16 @@ fn replies_that_arrive_a_moment_apart_are_gathered_into_one_trip() {
     within_deadline("replies_that_arrive_a_moment_apart_are_gathered_into_one_trip", || {
         // One stage, so nothing else in the ring could run while its passes are away: the
         // round has room for one trip, and a pass that went alone would make the rest queue.
-        let mut ring = ring(1, false, Duration::from_millis(20), 4000);
+        // A stage waits only for a reply that keeps a steady pace, to within an eighth of a
+        // trip here. The trip is long so that a busy machine's few milliseconds of jitter stay
+        // inside that: at 20 ms, a machine with four times the work it had cores for held no
+        // trip in six rounds, one run in ten.
+        let mut ring = ring(1, false, Duration::from_millis(80), 4000);
         let slots: u64 = 4;
-        for round in 0..6u64 {
+        // A pace takes three rounds to learn, and a round that jitter spoils teaches nothing.
+        // So the rounds go on until a trip has been held, instead of for a number that a quiet
+        // machine needs.
+        for round in 0..40u64 {
             // Each reply sends its next pass once the last round's answers are all in, one a
             // moment after another, as replies do that were answered together.
             for slot in 1..=slots {
@@ -1053,6 +1100,9 @@ fn replies_that_arrive_a_moment_apart_are_gathered_into_one_trip() {
                 let slot = index as u32 + 1;
                 assert_eq!(item.id, round * slots + u64::from(slot));
                 assert_eq!(item.tokens[0], slot * 10 + 1, "reply {slot} got another reply's result");
+            }
+            if ring.nodes[0].stats().gathers >= 1 {
+                break;
             }
         }
         // The first pass of a round finds the stage free, and waits for the ones it knows
@@ -1348,11 +1398,14 @@ struct Heard {
 }
 
 /// Stands in for a next stage: takes the link a ring dials, reads it without answering, and
-/// counts what came. It stops a second and a half after the first pass.
-fn listen_as_next_stage() -> (Address, thread::JoinHandle<Heard>) {
+/// counts what came. It stops a second and a half after the first pass. The count beside it
+/// is the padding heard so far, for a test that must not send its pass before the padding is in.
+fn listen_as_next_stage() -> (Address, thread::JoinHandle<Heard>, Arc<AtomicU64>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let identity = link::Identity::generate().unwrap();
     let address = Address { address: listener.local_addr().unwrap().to_string(), fingerprint: identity.fingerprint.clone() };
+    let padded = Arc::new(AtomicU64::new(0));
+    let so_far = padded.clone();
     let reading = thread::spawn(move || {
         let (socket, _) = listener.accept().unwrap();
         let key_for = |role, epoch| (role == Role::Hop && epoch == 7).then(|| hop_key(0));
@@ -1362,7 +1415,10 @@ fn listen_as_next_stage() -> (Address, thread::JoinHandle<Heard>) {
         while passed.is_none_or(|at| at.elapsed() < Duration::from_millis(1500)) {
             let (kind, body) = frames.next().unwrap();
             match (kind, passed) {
-                (Kind::Pad, None) => heard.padding += body.len(),
+                (Kind::Pad, None) => {
+                    heard.padding += body.len();
+                    so_far.store(heard.padding as u64, Ordering::SeqCst);
+                }
                 (Kind::Pad, Some(_)) => heard.padding_after_the_pass += body.len(),
                 (Kind::Pass, None) => passed = Some(Instant::now()),
                 (Kind::Ping, Some(_)) => heard.pings_in_a_second_and_a_half += 1,
@@ -1371,7 +1427,7 @@ fn listen_as_next_stage() -> (Address, thread::JoinHandle<Heard>) {
         }
         heard
     });
-    (address, reading)
+    (address, reading, padded)
 }
 
 #[test]
@@ -1381,9 +1437,12 @@ fn a_ring_pads_the_link_it_dials_before_any_pass_and_beats_ten_times_a_second() 
         let door = listening(&node);
         node.set_compute(Box::new(Adder { stage: 1, last: false, delay: Duration::ZERO, seen: Arc::default() }));
         node.open(Plan { epoch: 7, index: 0, count: 2, keys: keys_for(0, 2), ack_timeout_ms: 5000, silence_timeout_ms: 5000, gather: true, merge_passes: true, merge_most: None }).unwrap();
-        let (next, reading) = listen_as_next_stage();
+        let (next, reading, padded) = listen_as_next_stage();
         node.connect(Links { next: Some(next), entry: None, timeout_ms: 3000 }).unwrap();
         let client = link::dial(&format!("127.0.0.1:{}", door.local_port), None, &door.local_key, Role::Local, 0, Duration::from_secs(3)).unwrap();
+        // Padding only warms a link nothing uses yet: a pass queued behind it takes its place,
+        // and what was not yet written is never sent. So the pass waits for all of it.
+        wait_until("the padding reaching the next stage", || padded.load(Ordering::SeqCst) >= 1 << 20);
         client.send(&pass(1, 5, 9).encode()).unwrap();
         let heard = reading.join().unwrap();
         assert_eq!(heard.padding, 1 << 20);
@@ -1755,6 +1814,9 @@ fn a_refusal_waits_behind_the_older_passes_of_its_slot() {
             ring.client.send(&on(7, 0, id, 1).encode()).unwrap();
         }
         wait_until("the first pass running at the last stage", || ring.seen[1].load(Ordering::SeqCst) >= 1);
+        // Passes 2 and 3 must be in its queue before the slot changes hands. Read after that,
+        // they would be refused as well, and ahead of the pass this is about.
+        wait_until_queued_at(&ring, 1);
         // The slot goes to route 8 there while passes 2 and 3 still wait; a later one is refused.
         ring.nodes[1].give_slots(NEXT, &[0]).unwrap();
         ring.client.send(&on(7, 0, 4, 1).encode()).unwrap();
@@ -1785,6 +1847,9 @@ fn a_flip_hands_every_slot_over_once_the_old_routes_queue_here_has_run() {
         for id in 1..=3 {
             ring.client.send(&on(7, 0, id, 1).encode()).unwrap();
         }
+        // All three must be in the entry's queue before it flips. Route 7 takes nothing new
+        // from then on, so one the entry had yet to read would be refused instead of run.
+        wait_until_queued_at(&ring, 0);
         wait_until("route 7's first pass running at the entry", || ring.seen[0].load(Ordering::SeqCst) >= 1);
         // The entry flips first and returns once its own queue of route 7 has run, then the next.
         assert!(ring.nodes[0].flip(NEXT, &[0, 1], Duration::from_secs(2)).unwrap());
@@ -1883,16 +1948,21 @@ fn a_pass_dropped_further_along_does_not_hold_the_old_ring_open() {
         // Limits long enough that the retiring ring's own deadline cannot be what ends it.
         let mut ring = ring(2, true, Duration::ZERO, 3000);
         patient_client(&ring);
-        let slow = Adder { stage: 2, last: true, delay: Duration::from_millis(80), seen: ring.seen[1].clone() };
-        ring.nodes[1].set_compute(Box::new(slow));
+        // The last stage keeps the first pass until the others have queued behind it.
+        let open = Arc::new(AtomicBool::new(false));
+        let adder = Adder { stage: 2, last: true, delay: Duration::ZERO, seen: ring.seen[1].clone() };
+        ring.nodes[1].set_compute(Box::new(Held { adder, open: open.clone() }));
         for id in 1..=3 {
             ring.client.send(&pass(id, 1, id as u32).encode()).unwrap();
         }
-        wait_until("the first pass running at the last stage", || ring.seen[1].load(Ordering::SeqCst) >= 1);
+        // A new reply drops the old one's passes at the first stage that still has them
+        // queued. All three must have left the entry, or it is the entry that drops them.
+        wait_until("the entry sending all three on", || ring.nodes[0].stats().passes >= 3);
         // A new reply on the slot: the last stage drops passes 2 and 3, which are never answered.
         ring.client.send(&Pass { generation: 2, ..pass(4, 1, 0) }.encode()).unwrap();
+        wait_until("the last stage dropping passes 2 and 3", || ring.nodes[1].stats().dropped >= 2);
+        open.store(true, Ordering::SeqCst);
         while answer(&mut ring).id != 4 {}
-        assert!(ring.nodes[1].stats().dropped >= 1, "nothing was dropped, so this proves nothing");
         stage_next(&ring, NEXT, 3000, &[], None);
         for node in &ring.nodes {
             node.promote(NEXT).unwrap();
