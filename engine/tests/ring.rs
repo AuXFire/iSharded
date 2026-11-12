@@ -1109,7 +1109,9 @@ fn replies_that_arrive_a_moment_apart_are_gathered_into_one_trip() {
         // are coming instead of going alone.
         let stats = ring.nodes[0].stats();
         assert!(stats.gathers >= 1 && stats.gather_us > 0, "{stats:?}");
-        assert!(stats.gather_us <= 20_000, "{stats:?}");
+        // A hold ends by 20 ms. What is timed is when the stage woke, which a busy machine
+        // does late: a runner read 21.6 ms. Twice the limit is still far under the 80 ms trip.
+        assert!(stats.gather_us <= 40_000, "{stats:?}");
     });
 }
 

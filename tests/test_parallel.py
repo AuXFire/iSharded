@@ -437,8 +437,19 @@ def test_with_a_link_unmeasured_a_load_stays_at_one_and_says_why(pool):
     assert "not been measured" in wanted.parallel["reason"]
 
 
-def test_heartbeats_get_a_turn_while_a_load_chooses(pool):
+def test_heartbeats_get_a_turn_while_a_load_chooses(pool, monkeypatch):
+    import time
+
     turns = []
+    settle = Orchestrator.settle_slots
+
+    def slow_settle(self, *args, **options):
+        # A search that takes a while, as on a real pool. This pool's is over in microseconds,
+        # and a thread that is done before the loop waits for it leaves no turn to give.
+        time.sleep(0.05)
+        return settle(self, *args, **options)
+
+    monkeypatch.setattr(Orchestrator, "settle_slots", slow_settle)
 
     async def both():
         async def beat():
